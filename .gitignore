@@ -1,2 +1,4 @@
 /target/
+bootstrap/*/target/
 .omo/
+.codegraph/

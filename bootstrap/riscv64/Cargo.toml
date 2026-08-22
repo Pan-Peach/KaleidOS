@@ -1,0 +1,12 @@
+[package]
+name = "bootstrap"
+version = "0.1.0"
+edition = "2021"
+
+# 独立于根 workspace（当前是 M0 实验 crate，不进主构建）
+[workspace]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"        # 裸机没有 unwinding，panic 直接停
