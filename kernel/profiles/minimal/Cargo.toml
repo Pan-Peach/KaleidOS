@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 # FDT 解析器（git submodule，见 third_party/ 与 AGENTS.md 子模块约定）
-fdt = { path = "../../../third_party/fdt" }
+# pretty-printing：上游 example 依赖该 feature 的 Display（无 required-features，不开则 cargo test 编译 example 失败）；顺带用于调试期打印 DTB
+fdt = { path = "../../../third_party/fdt", features = ["pretty-printing"] }
