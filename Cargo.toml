@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel/core",
+    "kernel/arch/riscv64",
+    "kernel/interfaces",
+    "kernel/components/scheduler_rr",
+    "kernel/components/allocator_simple",
+    "kernel/components/core_test",
+    "kernel/components/logger",
+    "kernel/profiles/minimal",
+]

@@ -1,0 +1,9 @@
+[package]
+name = "minimal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# FDT 解析器（git submodule，见 third_party/ 与 AGENTS.md 子模块约定）
+fdt = { path = "../../../third_party/fdt" }
