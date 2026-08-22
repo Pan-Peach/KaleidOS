@@ -21,7 +21,7 @@ v0（当前）：native Rust only + 静态组件注册 + 单一 minimal profile
 QEMU RISC-V 启动
   → early console（早期控制台）
   → Arch init（架构初始化，_start 接收 a0=hartid / a1=dtb）
-  → FDT 解析（机器信息：内存映射/设备清单，运行时 DTB）
+  → Machine Discovery（FDT backend）：解析 DTB → MachineInfo（内存映射/设备清单）
   → Core init（Core 初始化）
 ```
 

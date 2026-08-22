@@ -22,7 +22,7 @@ Applications / System Personality（应用 / 系统性格）
                 │
           Resource Core（资源权威核心）
                 │
-        Arch + Platform（架构 + 平台）
+   Arch + Machine Discovery（架构 + 机器发现）
                 │
             Hardware（硬件）
 ```
@@ -35,12 +35,26 @@ Applications / System Personality（应用 / 系统性格）
 | Services / Devices | 跨组件聚合的系统服务（文件系统服务、网络服务、图形服务） | 组件图组合的结果 |
 | Components | 可替换的算法、策略、协议、驱动 | 组件 |
 | Resource Core | 真实资源的存在、状态、权限、生命周期；不可破坏的不变式 | 核心（最小可信基） |
-| Arch + FDT | 消化机器差异（ISA 原语 / 机器描述数据） | 核心下方 |
+| Arch + Machine Discovery | 消化机器差异（ISA 原语 / 机器发现） | 核心下方 |
 | Hardware | 真实硬件或 QEMU | —— |
 
 **分层原则**：Core 以下解决机器差异，Core 以上解决 OS 功能差异。
 
-## 3. Arch 与机器描述（FDT，无 platform 层）
+### 一组必须保持分离的边界（≠）
+
+KaleidOS 最重要的边界不是"模块"，而是一组概念分离：
+
+```text
+Identity         ≠  Authority           —— 名字 ≠ 权限
+Interface        ≠  Transport           —— 契约 ≠ 调用方式
+ResourceDomain   ≠  ExecutionDomain     —— 拥有什么 ≠ 在哪里运行
+Ownership Tree   ≠  Dependency DAG      —— 生命周期 ≠ 依赖关系
+Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体机制
+```
+
+其中 Core owns Truth；Component 拥有 Derived / Ephemeral State、Policy、Protocol、Semantics（状态三级分类见 `core-philosophy.md` §2）。
+
+## 3. Arch 与 Machine Discovery
 
 ### arch/ —— 架构层（ISA 本身）
 
@@ -52,31 +66,45 @@ Applications / System Personality（应用 / 系统性格）
 - 用户态模式切换（user mode transition）
 - 中断开关（interrupt enable/disable）
 - 原子操作 / CPU 原语
+- 固件调用原语（firmware-call primitives，如 RISC-V SBI、x86 UEFI runtime 调用）
 
 目录：`kernel/arch/riscv64`（每个 ISA 一个 crate）。后续：`x86_64` / `aarch64` / `loongarch64`。
 
-### 机器描述 —— FDT 数据（不设 platform 层）
+### Machine Discovery —— 机器发现（不设 platform 层）
 
-不设 platform 层：机器差异由 **FDT 数据**描述（参照 Linux `arch/riscv/boot/dts/` + `libfdt`）：
+不设 platform 层：机器差异由 **Machine Discovery** 消化 —— 从各种来源发现
+RAM、CPU topology、中断控制器、总线、MMIO 设备与固件设备信息，归一化为
+KaleidOS 内部概念：`MachineInfo` / `DeviceDescriptor` / `MemoryRegion` / `CpuInfo`。
 
-- 内存映射（memory 节点）→ Core 记录可用/保留区域
-- 中断控制器（PLIC / GIC / APIC）、定时器（CLINT / arch timer）→ 普通**驱动**，由 FDT 发现（compatible 匹配）
-- 固件交接（OpenSBI / QEMU 经 a1 传入 DTB 指针；SBI 调用属于 arch 层）
-- CPU bring-up（arch 层 + FDT cpu 节点）
-- 设备清单（MMIO 设备的 compatible + reg + interrupt）
+**FDT 只是 Machine Discovery 的一种 backend**（RISC-V / ARM 常用），未来还可能有：
+
+```text
+FDT      —— 设备树（当前唯一 backend，QEMU 经 a1 传入 DTB）
+ACPI     —— x86 / ARM Server（未来）
+UEFI tables / PCI bus probing / 其他 firmware description（未来）
+```
+
+- 中断控制器（PLIC / GIC / APIC）、定时器（CLINT / arch timer）→ 普通**驱动**，由 discovery 发现（compatible / _HID 匹配）；
+- 固件交接（OpenSBI / QEMU 经 a1 传入 DTB 指针；SBI 调用属于 arch 层）；
+- CPU bring-up（arch 层 + discovery 提供的 CPU 信息）。
+
+**Core 不应知道信息来自 FDT 还是 ACPI** —— boot 编排把各种 backend 归一化成 MachineInfo 后再交给 Core。
 
 目录：
 
-- `third_party/fdt`（git submodule，github.com/repnop/fdt）—— FDT 解析器：纯库、no_std、零依赖；只解析字节格式，**不感知** Core/驱动/QEMU
-- `kernel/arch/<isa>/dts/` —— 解析器**测试 fixture**（运行时 DTB 由机器提供，仓库内 dts 不参与引导）
+- `third_party/fdt`（git submodule，github.com/repnop/fdt）—— 当前 discovery backend 的解析器：纯库、no_std、零依赖，只解析字节格式
+- `kernel/arch/<isa>/dts/` —— 解析器**测试 fixture**（运行时 DTB 由机器提供）
 
-新板子 = 新 DTB（运行时提供）+ 对应驱动，不需要新 crate、不需要改代码。
+新板子 = 新的机器描述来源 + 对应驱动，不需要新 crate。
 
-### Arch 与 FDT 的关系
+> **platform quirks**（未来）：少数无法用标准描述 / probing 表达的怪异硬件行为，
+> 允许少量特例代码作为 escape hatch —— 但它是例外，不是默认架构。
 
-- Arch 提供 ISA 能力（含固件调用），FDT 提供机器数据，两者都位于 Core 之下；
-- Core 不直接处理机器细节：boot 编排（最终镜像 profiles/*）解析 FDT → MachineInfo → Core 初始化；
-- 换架构时改 Arch，换板子时换 DTB + 驱动，Core 不变 —— 这是多架构支持的根基；
+### Arch 与 Machine Discovery 的关系
+
+- Arch 提供 ISA 能力（含固件调用原语），Machine Discovery 提供机器数据，两者都位于 Core 之下；
+- Core 不直接处理机器细节：boot 编排（最终镜像 profiles/*）做 discovery → 归一化 MachineInfo → Core 初始化；
+- 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基；
 - 依赖方向：kernel 不依赖 fdt/arch；components → kernel 词汇 + interfaces；fdt 无 KaleidOS 依赖。
 
 ## 4. Resource Core
@@ -161,7 +189,7 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录，组件停止时 Core 统一回收（IRQ mask → DMA/MMIO revoke → timer cancel → resource release）；
+- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，见 component-model.md §3，不预设 universal revoke order）；
 - **ExecutionDomain**：第一阶段只需要 `KernelNative`（内核地址空间中的 Rust 函数）；未来可以有 `UserAddressSpace`、`WasmSandbox`。
 
 > 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"。契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核、微内核或混合形态。

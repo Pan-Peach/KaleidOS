@@ -2,13 +2,16 @@
 //! （quiesce → stop → IRQ mask → DMA/MMIO revoke → timer cancel → resource release → destroy）。
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
-/// 组件身份（M1 最小词汇表）。
+/// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
 /// 由 Core 分配；组件的 ResourceDomain 以 ComponentId 为键记录。
+/// 可被猜测/构造/传递，但真正的操作权限来自 Core 授予的组件凭证（token），
+/// 任何来自 Component/IPC/Wasm 的 ID 都要过 Core 验证。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComponentId(u32);
 
 impl ComponentId {
-    /// 用原始编号构造（仅限 Core 内部使用）。
+    /// ID 是身份标识，不是授权：可从 raw 值构造、可序列化/传递。
+    /// 来自 Component/IPC/Wasm 的 ID 必须由 Core 重新验证。
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }

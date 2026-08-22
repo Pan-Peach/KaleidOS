@@ -36,6 +36,27 @@
 
 **判断方法**：把状态从组件里拿走，组件还能不能工作？—— 不能（runqueue 被删调度器没法转）。把状态从 Core 里拿走，系统会不会被骗？—— 会（所有权记录没了，两个组件可能同时用一块帧）。前者归 Component，后者归 Core。
 
+### 状态三级分类：Truth / Derived / Ephemeral
+
+把"这个状态到底放 Core 还是 Component"细化为三类：
+
+| 分类 | 定义 | 例子 | 归属 |
+|---|---|---|---|
+| **Truth** | 真实世界不可丢失的事实；错了会破坏全局 invariant | Frame owner、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
+| **Derived** | 由 Truth 构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、buddy free list、LRU list、CFS vruntime、缓存索引 | Component |
+| **Ephemeral** | 丢失完全不影响正确性的短暂状态 | debug buffer、临时统计、部分 trace 聚合 | Component |
+
+判断规则：
+
+```text
+这个状态完全丢失以后：
+  会让系统不知道真实资源世界是什么样？  → Truth      → Core
+  能从 Truth 构造出正确但可能不同的状态？ → Derived   → Component
+  丢掉完全不影响系统正确性？             → Ephemeral → Component
+```
+
+注意：Derived 丢失后可能降低性能、改变短期行为、降低策略连续性（例如 CFS 丢失 vruntime、网络栈丢失 RTT 估计）—— 但这**不会破坏 safety、不会导致资源账本错误**，这正是 restart / replace 能成立的要求。这个分类以后是判断"字段到底该放 Core 还是 Component"的重要工具。
+
 ## 3. Policy proposes, Core validates and commits
 
 ### 为什么必须有验证
@@ -70,7 +91,7 @@ Core 验证：
 
 - 任何对真实资源的操作，代码路径上必须有一个"Core 验证点"；
 - 验证点要有 trace（proposal 事件 + 结果），这是调试与 CoreTest 的基础（见 testing.md）；
-- 策略组件因此可以随时 reset / 替换：它丢了 runqueue 不要紧，从 Core 的真相重新扫描重建即可。
+- 策略组件因此可以随时 reset / 替换：它丢的是 Derived 状态（runqueue 等），从 Core 的 Truth 重新构造即可 —— 但重建目标是**安全可用状态，而非完全等价状态**（见 §2 状态分类）。
 
 ## 4. Authority ≠ Interface
 

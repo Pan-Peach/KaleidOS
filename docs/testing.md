@@ -2,10 +2,24 @@
 
 ## 1. 开发者优先（Developer-First）原则
 
-> **Core 逻辑必须 host-testable —— 永远不需要启动 QEMU 才能测试 Core。**
+> **Core 中所有与硬件无关的 truth logic 必须 host-testable；Core 与 Arch / Hardware 的真实契约通过 QEMU / CoreTest / 真机验证。**
 
-如果某个 Core 功能只能通过启动整个 OS 来测试，第一反应应该是：**它是不是和 Arch 耦合得太深了？**
-正确姿势是把真相逻辑（任务状态机、所有权、handle 生命周期）做成与 Arch 无关的纯逻辑，在宿主上直接 `cargo test`。
+如果某段 Core 逻辑只能通过启动整个 OS 来测试，第一反应应该是：**它是不是和 Arch 耦合得太深了？**
+正确姿势是把与硬件无关的 truth logic（任务状态机、所有权、handle 生命周期）做成纯逻辑，在宿主上直接 `cargo test`。
+
+### Host Test（与硬件无关的 truth logic）
+
+```text
+帧所有权 / 任务状态机 / handle 生命周期 / ResourceDomain
+组件生命周期 / 权限验证 / 策略验证（policy validation）
+```
+
+### QEMU / CoreTest / 真机（与硬件相关的真实契约）
+
+```text
+context switch 是否真的保存寄存器 / 页表是否真的生效 / TLB flush 是否正确
+IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
+```
 
 架构原则：
 
@@ -22,13 +36,13 @@
     Host Test（宿主单测 —— 主体，日常主力）
 ```
 
-- **Host Test**：Core 的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；
+- **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；
 - **Property Test**：对 Core 的不变式做随机化验证（未来引入 proptest 类工具）；
 - **Model Checking / Concurrency Exploration**：未来用 Kani / Loom 类工具（见 references.md）；
-- **QEMU CoreTest**：集成验证 Arch/Platform/Core 的真实行为；
+- **QEMU CoreTest**：验证 Core 与 Arch / Machine Discovery 之间的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）；
 - **Real Hardware**：最终在真机上验证。
 
-## 3. CoreTest 组件（components/core_test/）
+## 3. CoreTest 组件（kernel/components/core_test/）
 
 CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Core 与 Arch 的**真实行为**。
 

@@ -2,13 +2,16 @@
 //! 调度策略数据（runqueue、vruntime 等）不在此模块 —— 属于 Scheduler Component。
 //! 状态机、跨 CPU 检查等真相逻辑由人类实现；本模块只提供词汇表占位与 host test 样板。
 
-/// 任务身份（M1 最小词汇表）。
+/// 任务身份（M1 最小词汇表）—— **Identity，不是 Authority**。
 /// 由 Core 分配与记录；调度器等策略组件只持有值，不持有真相。
+/// 可被猜测/构造/传递（如 `TaskId(7)`），但"知道存在"≠"有权操作"；
+/// 真实权限来自 Core 授予的 `TaskHandle`，任何来自 Component 的 ID 都要过 Core 验证。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskId(u32);
 
 impl TaskId {
-    /// 用原始编号构造（仅限 Core 内部使用，组件不可自行伪造）。
+    /// ID 是身份标识，不是授权：可从 raw 值构造、可序列化/传递。
+    /// 来自 Component/IPC/Wasm 的 ID 必须由 Core 重新验证。
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }

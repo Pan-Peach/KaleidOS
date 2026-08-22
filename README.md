@@ -23,7 +23,7 @@ Applications / System Personality
         │
    Resource Core         ← 资源权威：存在性/状态/所有权/生命周期
         │
-   Arch + FDT            ← arch/（ISA） + FDT（机器描述数据）
+   Arch + Machine Discovery ← arch/（ISA） + 机器发现（FDT / ACPI / Probe）
         │
      Hardware
 ```
@@ -38,7 +38,7 @@ kernel/       全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根�
   arch/            ISA 层 crate：riscv64/（dts/ = 解析器测试 fixture）
   interfaces/      Interface 契约 crate：device/ service/ policy/
   components/      策略/服务组件 crates：scheduler_rr/ allocator_simple/ core_test/ logger/
-  drivers/         设备驱动组件（预留，由 FDT 发现）
+  drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
   profiles/        最终镜像/Profile 组合点（启动编排 + panic handler）：minimal/
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器，no_std 零依赖）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）

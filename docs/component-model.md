@@ -55,21 +55,42 @@ owns:
     TimerHandle #11
 ```
 
-### 组件停止时的回收顺序（Core 执行）
+### 组件停止时的回收 —— 两条路径，不预设 universal revoke order
+
+> Core 的保证是 **eventual revocation / containment**：组件生命周期结束后，Core 最终必须收回其 ResourceDomain。
+> 具体顺序**不写死** —— 不同设备要求不同：有的要先停 DMA、reset 设备再 mask IRQ；有的要先 unmap。
+
+#### Graceful shutdown（正常关闭）
 
 ```text
-quiesce                      —— 停止接受新请求，清理进行中状态
+quiesce                        —— 停止接受新请求
+  ↓
+component-specific shutdown    —— 设备相关收尾（停 DMA / reset / mask IRQ ...，顺序由设备定）
   ↓
 stop
   ↓
-Core revoke ResourceDomain
+Core revoke remaining authority
   ↓
-IRQ mask → DMA revoke → MMIO revoke → Timer cancel → Resource release
-  ↓
-destroy
+ResourceDomain becomes empty
 ```
 
-**意义**：restart、replace、fault recovery 全部建立在同一套 ResourceDomain 机制上 —— 只要回收是确定的，重建就是安全的。
+#### Forced containment（强制隔离）
+
+组件 crashed / hung / 恶意行为时：
+
+```text
+Component Failed
+  ↓
+Core containment               —— 阻止它继续访问资源
+  ↓
+reset / isolate device（尽可能）
+  ↓
+force revoke authority
+  ↓
+reclaim resources
+```
+
+**意义**：restart、replace、fault recovery 全部建立在"Core 最终能收回 ResourceDomain"这一保证上。
 
 ## 4. ExecutionDomain
 
@@ -175,8 +196,13 @@ quiesce → stop → unbind → reset → replace → bind → start
 
 ### 为什么策略组件可以安全 reset
 
-Scheduler 丢失 runqueue 不要紧：从 Core 的真相（Runnable 任务列表）重新扫描重建；
-Buddy 丢失 free list 不要紧：从 Core 的帧表重建。**真相在 Core，策略状态永远可重建** —— 这是替换模型成立的根本原因。
+Scheduler 丢失 runqueue 不要紧：从 Core 的 Truth（Runnable 任务列表）重新构造；
+Buddy 丢失 free list 不要紧：从 Core 的帧表重新构造。
+
+但要求是 **reconstructible to a safe state, not necessarily an equivalent state**：
+Derived 状态（vruntime、LRU history、RTT 估计等）丢失后，系统必须能继续**安全正确**运行，
+但短期行为、性能、策略连续性可能不同 —— 这不会破坏 safety、不会导致资源账本错误。
+这是 restart / replace 成立的根本原因（状态分类见 `core-philosophy.md` §2）。
 
 ## 9. 完整示例：VFS 组件图
 
