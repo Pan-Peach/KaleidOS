@@ -1,5 +1,6 @@
-// FDT 解析器测试 fixture（结构参照 QEMU virt 自动生成的 DTB）。
-// 运行时 DTB 由 QEMU 经 a1 传入，本文件不参与引导 —— 仅用于 fdt/ 的 host test。
+// Machine Discovery 测试 fixture（结构参照 QEMU virt 自动生成的 DTB）。
+// DTS 描述的是机器而非 ISA（riscv64 只是恰好使用），故放在 tests/fixtures/fdt/。
+// 运行时 DTB 由 QEMU 经 a1 传入，本文件不参与引导 —— 仅用于 discovery 的 host test。
 /dts-v1/;
 
 / {

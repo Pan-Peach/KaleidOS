@@ -35,12 +35,13 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 ```
 kernel/       全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
   core/            Resource Core crate：task/memory/object/handle/component/irq/timer/trace/inspector
-  arch/            ISA 层 crate：riscv64/（dts/ = 解析器测试 fixture）
+  arch/            ISA 层 crate：riscv64/
   interfaces/      Interface 契约 crate：device/ service/ policy/
   components/      策略/服务组件 crates：scheduler_rr/ allocator_simple/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
   profiles/        最终镜像/Profile 组合点（启动编排 + panic handler）：minimal/
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器，no_std 零依赖）
+tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
 tools/         工具脚本（待建设）
 ```

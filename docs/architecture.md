@@ -93,7 +93,7 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 目录：
 
 - `third_party/fdt`（git submodule，github.com/repnop/fdt）—— 当前 discovery backend 的解析器：纯库、no_std、零依赖，只解析字节格式
-- `kernel/arch/<isa>/dts/` —— 解析器**测试 fixture**（运行时 DTB 由机器提供）
+- `tests/fixtures/fdt/` —— discovery backend 的解析器**测试 fixture**（如 qemu-virt.dts；DTS 描述机器而非 ISA；运行时 DTB 由机器提供）
 
 新板子 = 新的机器描述来源 + 对应驱动，不需要新 crate。
 
@@ -105,7 +105,21 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 - Arch 提供 ISA 能力（含固件调用原语），Machine Discovery 提供机器数据，两者都位于 Core 之下；
 - Core 不直接处理机器细节：boot 编排（最终镜像 profiles/*）做 discovery → 归一化 MachineInfo → Core 初始化；
 - 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基；
-- 依赖方向：kernel 不依赖 fdt/arch；components → kernel 词汇 + interfaces；fdt 无 KaleidOS 依赖。
+依赖方向（精确表述）：
+
+```text
+fdt library / ACPI ...
+        ↓  （discovery backend）
+   MachineInfo
+        ↓
+boot/profile ──── 使用 arch（ISA 原语）
+        │
+        ▼
+       Core        ← 只消费 MachineInfo，不知道 FDT / ACPI / QEMU / 具体板子
+```
+
+- **Resource Core 不依赖具体 Arch 和 Discovery backend**（不是"整个 kernel 不依赖 arch"——boot/profile 当然会用 arch 和 fdt）；
+- components → Core 词汇 + interfaces；fdt 无 KaleidOS 依赖。
 
 ## 4. Resource Core
 
