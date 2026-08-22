@@ -6,4 +6,4 @@
 //! 合并固件/内核镜像/DTB 自身保留区）→ Core 初始化 → compatible 匹配驱动 →
 //! Core 授予类型化 Handle → 静态组件图启动。
 //!
-//! 验收：BOOT ARCH_ENTRY OK / BOOT FDT OK / BOOT MEMORY OK / BOOT CORE OK。
+//! 验收：BOOT ARCH_ENTRY OK / BOOT DISCOVERY OK backend=fdt / BOOT MEMORY OK / BOOT CORE OK。

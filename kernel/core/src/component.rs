@@ -1,5 +1,7 @@
-//! ComponentId 与 ResourceDomain：组件身份、资源集合、回收顺序
-//! （quiesce → stop → IRQ mask → DMA/MMIO revoke → timer cancel → resource release → destroy）。
+//! ComponentId 与 ResourceDomain：组件身份、资源集合、最终回收。
+//! 回收不预设 universal revoke order（graceful shutdown / forced containment 双路径，
+//! 见 docs/component-model.md §3）：Core 保证 eventual revocation，
+//! 具体设备 shutdown 顺序由组件/驱动决定，不由 ResourceDomain 写死。
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。

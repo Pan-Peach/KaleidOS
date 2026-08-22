@@ -52,7 +52,7 @@ Ownership Tree   ≠  Dependency DAG      —— 生命周期 ≠ 依赖关系
 Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体机制
 ```
 
-其中 Core owns Truth；Component 拥有 Derived / Ephemeral State、Policy、Protocol、Semantics（状态三级分类见 `core-philosophy.md` §2）。
+其中 Core owns Resource Truth（含跨组件安全真相）；Component 拥有 Semantic / Derived / Ephemeral State、Policy、Protocol、Semantics（状态四级分类见 `core-philosophy.md` §2）。
 
 ## 3. Arch 与 Machine Discovery
 
@@ -66,7 +66,7 @@ Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体�
 - 用户态模式切换（user mode transition）
 - 中断开关（interrupt enable/disable）
 - 原子操作 / CPU 原语
-- 固件调用原语（firmware-call primitives，如 RISC-V SBI、x86 UEFI runtime 调用）
+- 固件调用原语（firmware-call primitives，如 RISC-V SBI 调用；**UEFI runtime 调用属于 Boot/Firmware environment，不是 ISA 属性**，不归 x86 arch 所有）
 
 目录：`kernel/arch/riscv64`（每个 ISA 一个 crate）。后续：`x86_64` / `aarch64` / `loongarch64`。
 
@@ -84,7 +84,7 @@ ACPI     —— x86 / ARM Server（未来）
 UEFI tables / PCI bus probing / 其他 firmware description（未来）
 ```
 
-- 中断控制器（PLIC / GIC / APIC）、定时器（CLINT / arch timer）→ 普通**驱动**，由 discovery 发现（compatible / _HID 匹配）；
+- 中断控制器（PLIC、外部 PCI 中断控制器、SoC 中断控制器）、定时器（CLINT）→ 尽可能作为**驱动**由 discovery 发现；但 **CPU architected facilities**（per-CPU timer、CPU-local 中断机制）与 ISA/CPU 执行模型强相关，可以保留在 Arch / Core mechanism，不必一律降为驱动；
 - 固件交接（OpenSBI / QEMU 经 a1 传入 DTB 指针；SBI 调用属于 arch 层）；
 - CPU bring-up（arch 层 + discovery 提供的 CPU 信息）。
 

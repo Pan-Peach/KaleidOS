@@ -8,6 +8,15 @@
 > **Core owns truth. Components own policy and semantics.**
 > Core 保存真实且不可撒谎的系统状态；Component 实现可替换的算法、策略、协议和高级 OS 语义。
 
+这句口号要读得更严谨一点：
+
+> **Core owns resource truth and cross-component safety truth. Components may own their own semantic truth.**
+> 中文：Core 掌握**资源真相**和**跨组件安全真相**；Component 可以拥有自己领域内的**语义真相**。
+
+"Core owns truth" 不意味着"全世界一切权威状态都得进 Core"——VFS 的 mount 表、TCP 的连接状态、
+POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级分类），它们不属于 Core，
+但也不是"丢了可以随便重建"的东西。
+
 配套的第二句话：
 
 > **Policy proposes, Core validates and commits.**
@@ -36,26 +45,35 @@
 
 **判断方法**：把状态从组件里拿走，组件还能不能工作？—— 不能（runqueue 被删调度器没法转）。把状态从 Core 里拿走，系统会不会被骗？—— 会（所有权记录没了，两个组件可能同时用一块帧）。前者归 Component，后者归 Core。
 
-### 状态三级分类：Truth / Derived / Ephemeral
+### 状态四级分类：Core Resource Truth / Component Semantic State / Derived / Ephemeral
 
-把"这个状态到底放 Core 还是 Component"细化为三类：
+把"这个状态到底放 Core 还是 Component"细化为四类：
 
 | 分类 | 定义 | 例子 | 归属 |
 |---|---|---|---|
-| **Truth** | 真实世界不可丢失的事实；错了会破坏全局 invariant | Frame owner、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
-| **Derived** | 由 Truth 构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、buddy free list、LRU list、CFS vruntime、缓存索引 | Component |
+| **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | Frame owner、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
+| **Component Semantic State** | 某个 Component 自己负责的"业务真相"；**不能随便丢**，但也不是 Core 的责任 | VFS mount 表、TCP 连接状态、POSIX fd table、文件系统事务状态、game runtime 会话状态 | Component |
+| **Derived** | 从权威状态构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、buddy free list、LRU list、CFS vruntime、缓存索引 | Component |
 | **Ephemeral** | 丢失完全不影响正确性的短暂状态 | debug buffer、临时统计、部分 trace 聚合 | Component |
 
 判断规则：
 
 ```text
 这个状态完全丢失以后：
-  会让系统不知道真实资源世界是什么样？  → Truth      → Core
-  能从 Truth 构造出正确但可能不同的状态？ → Derived   → Component
-  丢掉完全不影响系统正确性？             → Ephemeral → Component
+  会让系统不知道真实资源世界是什么样？    → Core Resource Truth     → Core
+  是某组件领域内的业务真相，不能随便丢？  → Component Semantic State → Component
+  能从权威状态构造出正确但可能不同的状态？ → Derived                 → Component
+  丢掉完全不影响系统正确性？              → Ephemeral               → Component
 ```
 
-注意：Derived 丢失后可能降低性能、改变短期行为、降低策略连续性（例如 CFS 丢失 vruntime、网络栈丢失 RTT 估计）—— 但这**不会破坏 safety、不会导致资源账本错误**，这正是 restart / replace 能成立的要求。这个分类以后是判断"字段到底该放 Core 还是 Component"的重要工具。
+关键边界：
+
+- **不属于 Core ≠ 可以丢了重建。** 不属于 Core 只代表"它不会破坏全局资源安全"；
+  Component Semantic State（mount 表、TCP 连接、fd table）可能完全无法从 Core 的
+  Task / Frame / Handle / IRQ 推导出来，是组件自己必须认真维护的语义真相；
+- Derived 丢失后可能降低性能、改变短期行为、降低策略连续性（例如 CFS 丢失 vruntime、
+  网络栈丢失 RTT 估计）—— 但这**不会破坏 safety、不会导致资源账本错误**；
+- 这个分类以后是判断"字段到底该放 Core 还是 Component"的重要工具。
 
 ## 3. Policy proposes, Core validates and commits
 

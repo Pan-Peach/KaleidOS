@@ -181,9 +181,16 @@ VFS
 | 类别 | 含义 | 例子 |
 |---|---|---|
 | Static | 不可替换 | Arch、极底层机制 |
-| Restartable | 可重启（状态可重建） | Scheduler、FileSystem、Network stack |
+| Restartable | 可重启（能重新进入 Ready；是否保留旧 semantic state 由组件 recovery contract 决定） | Scheduler、FileSystem、Network stack |
 | Replaceable | 可整体替换 | Logger、Debug 组件 |
 | Ephemeral | 临时存在 | 一次性工具组件 |
+
+> **Restartable ≠ state-preserving restart。** 例如：
+> - Scheduler restart → task 还在、runqueue 重建，基本无语义损失；
+> - TCP stack restart → 服务能重新起来，但旧 connections 可能全部死亡 —— 仍然是 Restartable；
+> - Ext4 restart → 从 block device + journal 重建，可恢复大量 semantic state。
+>
+> 定义：组件能够重新进入 Ready 状态；是否保留旧的 semantic state 由该组件自己的 recovery contract 决定。
 
 ### 第一阶段替换流程（不做热迁移）
 
