@@ -6,6 +6,11 @@ edition = "2021"
 # 独立于根 workspace（当前是 M0 实验 crate，不进主构建）
 [workspace]
 
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --tests
+
 [dependencies]
 
 [profile.release]
