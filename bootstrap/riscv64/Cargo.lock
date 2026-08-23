@@ -5,3 +5,15 @@ version = 4
 [[package]]
 name = "bootstrap"
 version = "0.1.0"
+dependencies = [
+ "fdt",
+ "kernel",
+]
+
+[[package]]
+name = "fdt"
+version = "0.2.0-alpha2"
+
+[[package]]
+name = "kernel"
+version = "0.1.0"

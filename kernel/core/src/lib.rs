@@ -15,6 +15,7 @@ pub mod component;
 pub mod handle;
 pub mod inspector;
 pub mod irq;
+pub mod machine;
 pub mod memory;
 pub mod object;
 pub mod task;

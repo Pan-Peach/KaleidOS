@@ -12,6 +12,8 @@ path = "src/main.rs"
 test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --tests
 
 [dependencies]
+fdt = { path = "../../third_party/fdt" }
+kernel = { path = "../../kernel/core" }
 
 [profile.release]
 panic = "abort"        # 裸机没有 unwinding，panic 直接停
