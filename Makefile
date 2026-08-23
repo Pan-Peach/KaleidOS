@@ -24,8 +24,9 @@ kernel:
 	@echo "built: $(OUTPUT)"
 
 # 调试看输出（串口打印 + Ctrl-A X 退出 QEMU）
+# -smp 2: 2 核（hart 0 boot，hart 1 被 OpenSBI park）；-m 4G: 4GB RAM
 qemu: kernel
-	qemu-system-riscv64 -machine virt -bios default -kernel $(OUTPUT) -nographic
+	qemu-system-riscv64 -machine virt -smp 2 -m 4G -bios default -kernel $(OUTPUT) -nographic
 
 clean:
 	rm -f $(OUTPUT)
