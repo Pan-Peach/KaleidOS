@@ -33,22 +33,26 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 ## 目录
 
 ```
+bootstrap/     启动阶段 crate（firmware 世界，按目标架构分目录）：riscv64/ ——
+               _start → early console → FDT discovery → MachineInfo → core::init()，
+               与 kernel/core 链接成 kaleidos.elf（单镜像，职责分离装载合一）
 kernel/       全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
-  core/            Resource Core crate：task/memory/object/handle/component/irq/timer/trace/inspector
+  core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine
   arch/            ISA 层 crate：riscv64/
   interfaces/      Interface 契约 crate：device/ service/ policy/
   components/      策略/服务组件 crates：scheduler_rr/ allocator_simple/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
-  profiles/        最终镜像/Profile 组合点（启动编排 + panic handler）：minimal/
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器，no_std 零依赖）
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
 tools/         工具脚本（待建设）
 ```
 
+> **Cargo 依赖图 ≠ Component 图。** 组件运行时的加载/组合由 Component Manager 决定（未来：.kcomp + cpio + manifest，Linux insmod/depmod/initramfs 模式）——不写在 Cargo.toml 里。
+
 ## 当前状态
 
-仓库骨架与设计文档已就绪，代码尚未开始。目标里程碑：**M0（QEMU RISC-V 启动，产出结构化 BOOT 日志）**。详见 `docs/roadmap.md`。
+**架构定案：`kaleidos.elf` 单镜像（bootstrap + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成：bootstrap 阶段（early console + FDT discovery → MachineInfo + `[bootstrap]`/`[core]` 前缀日志）已跑通 `BOOT DISCOVERY OK → BOOT CORE OK`；Core library（kernel/core）与 MachineInfo 类型就位。目标里程碑：**M0 收尾（QEMU 完整启动日志）**。详见 `docs/roadmap.md`。
 
 ## 构建
 

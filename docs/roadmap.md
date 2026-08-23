@@ -3,8 +3,11 @@
 ## 1. 总体阶段
 
 ```text
-v0（当前）：native Rust only + 静态组件注册 + 单一 minimal profile
-之后：     动态组件 → Wasm 执行后端 → IPC/隔离 → 多 profile → 多架构 → 热替换
+v0（当前）：kaleidos.elf 单镜像（bootstrap + core 链接，职责分离装载合一）
+  ↑ bootstrap 阶段：firmware 世界（FDT/MachineInfo）；core 阶段：KaleidOS 世界（资源真相）。
+    Bootstrap 与 Core 都只启动一次、永不热替换 → 不放独立装载边界。
+    Cargo 依赖图 ≠ 运行时组件图：组件层的 .kcomp/cpio/manifest（Linux insmod 模式）是未来方向。
+之后：     组件动态加载（.kcomp）→ 组件持久化（Persistent Store）→ Wasm 执行后端 → IPC/隔离 → 多 profile → 多架构 → 热替换
 ```
 
 **v0 的野心很小**：不是"功能完整"，而是"架构骨架立起来，边界验证舒服"。
@@ -19,10 +22,10 @@ v0（当前）：native Rust only + 静态组件注册 + 单一 minimal profile
 
 ```text
 QEMU RISC-V 启动
-  → early console（早期控制台）
-  → Arch init（架构初始化，_start 接收 a0=hartid / a1=dtb）
-  → Machine Discovery（FDT backend）：解析 DTB → MachineInfo（内存映射/设备清单）
-  → Core init（Core 初始化）
+  → bootstrap 阶段（kaleidos.elf）：early console（_start 接收 a0=hartid / a1=dtb）
+  → Machine Discovery（FDT backend）：解析 DTB → MachineInfo（内存映射/CPU 清单）
+  → core::init(&MachineInfo) → Core 初始化（校验 → 提交资源真相）
+  → BOOT DISCOVERY OK / BOOT CORE OK
 ```
 
 **验收标准**：结构化启动日志，四行全 OK：
@@ -32,6 +35,19 @@ BOOT ARCH_ENTRY OK
 BOOT DISCOVERY OK backend=fdt
 BOOT MEMORY OK
 BOOT CORE OK
+```
+
+**打包方式（组件层面，Linux 模式，既定方向）**：
+
+```text
+kaleidos.elf = bootstrap + core（链接，firmware 能启动的外壳：普通 ELF，entry=_start）
+                 └ .initpkg（opaque blob，KaleidOS 自己解析，firmware 不理解）
+                    → cpio 归档（initramfs 模式）：组件 .kcomp + manifest（文本）
+组件 .kcomp = ELF 可重定位文件 + 符号表（.ko 模式：insmod = 放段+重定位+调 init）
+manifest   = 文本清单（modules.dep 模式：depmod 生成 / modprobe 读取）
+热替换 ≠ 永久安装：embedded init.kpkg（fallback）→ Persistent Store（用户安装）
+                → Runtime Graph（真正在跑），manifest 决定选择
+开发/发布：开发分开（kaleidos.elf + 外部 init.kpkg）；发布内嵌（重打包 → 单文件）
 ```
 
 ## 3. M1 —— 最小 Resource Core

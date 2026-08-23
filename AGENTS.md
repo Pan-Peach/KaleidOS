@@ -17,9 +17,10 @@ KaleidOS —— 组件化、多架构操作系统，面向学习、实验与个�
 - **Authority ≠ Interface。** 驱动只能拿 Core 授予的类型化 Handle（`FrameHandle`/`MmioHandle`/`IrqHandle`/`DmaHandle`/`TaskHandle`/`TimerHandle`/`AddressSpaceHandle`），**永远不能**拿裸物理地址、裸 IRQ 号或裸指针。Interface（`BlockDevice`、`SchedulerPolicy`...）是语义；传输（direct call / IPC / Wasm host call）是绑定策略，不要写死。
 - **Core 只收真相，不收功能。** Core 不包含：buddy/RR/CFS 算法、文件系统格式、VFS、TCP/IP、VirtIO/NVMe 协议、POSIX 进程语义、ELF loader、Wasm runtime。
 - **判断标准**：如果一个完全错误的 Component 能通过某个 API 破坏其他 Component 或全局 invariant，就缩小 API，或把最终 authority 收回 Core。
-- **第一阶段不做**：动态加载、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。组件注册是静态的。
+- **架构定案：`kaleidos.elf` 单镜像 + 组件独立镜像（目标）。** bootstrap 与 Core 职责分离、装载合一（都只启动一次、永不热替换 → 链接成一个 `kaleidos.elf`，bootstrap 阶段 → `core::init(&MachineInfo)` 函数调用交接；职责边界 ≠ 装载边界，高半区 = 链接两段 + 页表双映射，Linux 同款）。**组件才是热插拔边界**（`.kcomp` = ELF 可重定位文件 + 符号表，Linux `.ko` 模式；打包 = cpio 归档 + 文本 manifest，`initramfs`/`modules.dep` 模式；embedded init.kpkg fallback → Persistent Store → Runtime Graph）。**当前不做**：组件 loader/kpkg 实现（方向定，等动态组件里程碑）、热迁移、复杂 IPC、微内核执行域、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。
+- **Cargo 依赖图 ≠ Component/运行时组合图。** Cargo 边是编译期构建关系；运行时组件加载什么、如何组合由 Component Manager 决定，不写在 Cargo.toml 里。**实现 crate ≠ 运行时镜像**：`kernel/core` 是 host-testable 的 Rust library（`cargo test` 专用）；组件 .kcomp 才是运行时加载的镜像（未来）。
 - **人类是实现者。** 代码保持极简、可手写。不要为了展示架构生成大量抽象、宏、动态注册系统、复杂 trait 层级、unsafe loader 或 runtime。小模块（几十行）就是普通 module，不要强行造 crate。**测试（host test / 单元测试 / CoreTest 用例）可由 Agent 编写；实现逻辑由人类手写。**
-- **OS 源码统一收敛在 `kernel/` 下**（core/ arch/ interfaces/ components/ drivers/ profiles/），不要散到仓库根或另起平行目录。
+- **OS 源码统一收敛在 `kernel/` 下**（core/ arch/ interfaces/ components/ drivers/）；顶层只允许 `bootstrap/`（loader，按目标架构分目录）与 `abi/`（跨 binary 协议），不要散到任意位置。
 - **外部依赖一律用 git submodule**（放 `third_party/`；克隆后先 `git submodule update --init --recursive`），不要本地 vendored 一份拷贝。
 - **Core 与硬件无关的 truth logic 必须 host-testable。** Core 与 Arch/硬件 的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）走 QEMU/CoreTest/真机验证；若某段 Core 逻辑只能整机测，先怀疑 Arch 耦合。CoreTest 无 god-mode，只能走真实 Core API（最多只读 `TestInspector`）。
 - **Wasm 只是未来 Component 的执行后端之一，永远不是整个内核。** Core/Arch 保持 native Rust。

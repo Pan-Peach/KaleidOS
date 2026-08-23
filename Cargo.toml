@@ -8,5 +8,4 @@ members = [
     "kernel/components/allocator_simple",
     "kernel/components/core_test",
     "kernel/components/logger",
-    "kernel/profiles/minimal",
 ]

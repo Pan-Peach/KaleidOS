@@ -15,10 +15,6 @@ name = "core_test"
 version = "0.1.0"
 
 [[package]]
-name = "fdt"
-version = "0.2.0-alpha2"
-
-[[package]]
 name = "interfaces"
 version = "0.1.0"
 
@@ -29,13 +25,6 @@ version = "0.1.0"
 [[package]]
 name = "logger"
 version = "0.1.0"
-
-[[package]]
-name = "minimal"
-version = "0.1.0"
-dependencies = [
- "fdt",
-]
 
 [[package]]
 name = "scheduler_rr"

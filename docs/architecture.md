@@ -103,23 +103,35 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 ### Arch 与 Machine Discovery 的关系
 
 - Arch 提供 ISA 能力（含固件调用原语），Machine Discovery 提供机器数据，两者都位于 Core 之下；
-- Core 不直接处理机器细节：boot 编排（最终镜像 profiles/*）做 discovery → 归一化 MachineInfo → Core 初始化；
-- 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基；
-依赖方向（精确表述）：
+- Core 不直接处理机器细节：bootstrap 阶段做 discovery → 归一化 MachineInfo → `core::init(&MachineInfo)`（单镜像内函数调用）；
+- 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基。
+
+依赖方向（当前模型，精确表述）：
 
 ```text
-fdt library / ACPI ...
-        ↓  （discovery backend）
-   MachineInfo
-        ↓
-boot/profile ──── 使用 arch（ISA 原语）
-        │
-        ▼
-       Core        ← 只消费 MachineInfo，不知道 FDT / ACPI / QEMU / 具体板子
+BUILD TIME：bootstrap(riscv64) ──► kernel/core（library）+ arch（ISA）＋ fdt
+                     │
+                     ▼ (链接)
+              kaleidos.elf（单镜像）
+   ┌──────────────────────────────────────────┐
+   │ 阶段一 Bootstrap：FDT → MachineInfo       │
+   │        ↓ core::init(&MachineInfo)        │
+   │ 阶段二 Resource Core（消费 MachineInfo）   │
+   └──────────────────────────────────────────┘
+
+RUN TIME（未来：组件热插拔）：
+
+OpenSBI → kaleidos.elf
+  → bootstrap：discover（fdt/ACPI... backend）→ MachineInfo
+  → core::init(MachineInfo)（校验 → 提交资源真相）
+  → Component Manager 解包内嵌 .initpkg（cpio 归档）
+  → 按 manifest（文本）加载组件 .kcomp（ELF，Linux insmod/depmod 模式）
 ```
 
-- **Resource Core 不依赖具体 Arch 和 Discovery backend**（不是"整个 kernel 不依赖 arch"——boot/profile 当然会用 arch 和 fdt）；
-- components → Core 词汇 + interfaces；fdt 无 KaleidOS 依赖。
+- **Resource Core 不依赖具体 Arch 和 Discovery backend**（core-lib 不依赖 arch/fdt；bootstrap 阶段才用）；
+- **Bootstrap 与 Core 职责分离、装载合一**——两者都只在启动时加载一次、永不热替换，所以链接成一个 `kaleidos.elf`（职责边界 ≠ 装载边界；单镜像 + 高半区问题由链接脚本两段 + 页表双映射解决，Linux 同款，见 roadmap）；
+- **Component 才需要独立装载边界**（`.kcomp` = ELF 可重定位文件 + 符号表，Linux `.ko` 模式）；打包用 **cpio 归档**（`initramfs` 模式）而非自定义二进制格式；manifest 是纯文本（`modules.dep` 模式）；
+- **Cargo 依赖图 ≠ Component 图**：Cargo 边是编译期构建关系，运行时组件组合由 Component Manager 决定——组件热替换是 KaleidOS 的核心目标，但只在组件层（bootstrap/core 不做）。
 
 ## 4. Resource Core
 
