@@ -24,15 +24,27 @@ pub mod task;
 pub mod timer;
 pub mod trace;
 
+/// 帧池容量：4 GiB 物理内存 ÷ 4 KiB 帧 = 1,048,576 帧。
+/// Core 持有帧真相的全量数组（BSS 区，~8 MiB）；切片式：FrameDatabase 只借用它。
+/// boot 阶段单 hart、无并发，`static mut` 安全；多核唤醒后需改用同步容器。
+const MAX_FRAMES: usize = 1 << 20;
+static mut FRAME_POOL: [memory::FrameMeta; MAX_FRAMES] = [memory::FrameMeta::new(memory::FrameState::Free); MAX_FRAMES];
+
+/// 借用帧池（boot 单线程，无 race；`static mut` 用 `addr_of_mut!` 规避 `static_mut_refs`）。
+fn frame_pool() -> &'static mut [memory::FrameMeta] {
+    unsafe { &mut *core::ptr::addr_of_mut!(FRAME_POOL) }
+}
+
 /// Core 初始化入口：消费 bootstrap 发现的 MachineInfo（提案），校验后提交资源真相
-/// （Resource Truth）。M0 只做 sanity 校验；FrameId 资源模型（memory.rs）由人类实现者填充。
-pub fn init(info: &machine::MachineInfo<'_>) -> Result<(), &'static str> {
-    if info.memory_regions.is_empty() {
+/// （Resource Truth）。`reserved` 是需保留的区间（由 bootstrap 提供：ELF image range 等）。
+/// 流程：sanity 校验 → `memory::init`（帧真相建表 + reserved 标记）→ 提交。
+pub fn init(info: &machine::MachineInfo, reserved: &[machine::MemoryRegion]) -> Result<(), &'static str> {
+    if info.mem_count == 0 {
         return Err("no memory regions");
     }
-    if info.cpu_info.is_empty() {
+    if info.cpu_count == 0 {
         return Err("no cpu info");
     }
-    // TODO(人类实现者): 校验 region 对齐/重叠 → 建立 FrameId 真相 → 提交
+    memory::init(&info.memory_regions[..info.mem_count], reserved, frame_pool())?;
     Ok(())
 }

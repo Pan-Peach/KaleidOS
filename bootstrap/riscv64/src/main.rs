@@ -3,12 +3,20 @@
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use kernel::machine::{CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
+use fdt::properties::values::StringList;
+use kernel::machine::{CompatStr, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
 
 mod console;
 mod sbi;
 
 global_asm!(include_str!("entry.S"));
+
+// 链接脚本符号：本文档镜像（bootstrap + core 单一 kaleidos.elf）的物理范围。
+// 取地址（不是值）：这段是 Core 自己，启动后永久 Reserved。
+unsafe extern "C" {
+    static __bootstrap_start: u8;
+    static __bootstrap_end: u8;
+}
 
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
@@ -21,10 +29,11 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
         Ok(tree) => {
             console::log("bootstrap", "FDT magic: OK\n");
 
-            // 归一化：fdt 类型 → core::machine 类型（单镜像内函数调用，无需 POD 协议）
+            // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
+            // MachineInfo 是定长数组 + count（无借用），字符串用 CompatStr 内嵌复制。
             let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
             let mut cpu_info = [CpuInfo { boot_cpu: false, hart_id: 0 }; 8];
-            let mut devices = [DeviceDescriptor { mmio_base: 0, mmio_size: 0, irq: None, compatible: "" }; 26];
+            let mut devices = [DeviceDescriptor::empty(); 26];
 
             let mut mem_count = 0usize;
             for region in tree.root().memory().reg().iter::<u64, u64>() {
@@ -48,6 +57,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             }
 
             // 设备清单：遍历 /soc 下带 reg 的子节点（virtio/mmio uart 等）
+            // CompatStr 内嵌复制 → 单遍填充，无需字符串池
             let mut dev_count = 0usize;
             if let Some(soc) = tree.find_node("/soc") {
                 for child in soc.children() {
@@ -59,7 +69,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                                     mmio_base: reg.address as usize,
                                     mmio_size: reg.len as usize,
                                     irq: None,
-                                    compatible: "",
+                                    compatibles: [CompatStr::empty(); 4],
+                                    compat_count: 0,
                                 });
                                 break;
                             }
@@ -67,8 +78,15 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                     }
                     if let Some(mut d) = descriptor {
                         if let Some(comp) = child.properties().find("compatible") {
-                            // compatible 是 null 分隔的多值字符串，取第一个
-                            d.compatible = comp.as_value::<&str>().unwrap_or("").split('\0').next().unwrap_or("");
+                            if let Ok(list) = comp.as_value::<StringList>() {
+                                for s in list {
+                                    let idx = d.compat_count as usize;
+                                    if idx < d.compatibles.len() {
+                                        d.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
+                                        d.compat_count += 1;
+                                    }
+                                }
+                            }
                         }
                         if let Some(irqs) = child.properties().find("interrupts") {
                             d.irq = irqs.as_value::<u32>().ok();
@@ -81,9 +99,12 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
 
             let info = MachineInfo {
                 boot_hart: hart_id,
-                cpu_info: &cpu_info[..cpu_count],
-                memory_regions: &memory_regions[..mem_count],
-                devices: &devices[..dev_count],
+                cpu_count,
+                cpu_info,
+                mem_count,
+                memory_regions,
+                dev_count,
+                devices,
             };
 
             // 只有 boot hart 进入 Core；其余 hart 停在这里（等 Core 未来唤醒）
@@ -94,9 +115,14 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             console::log("bootstrap", "MachineInfo dump:\n");
             console::print(format_args!("{:#?}\n", info));
 
+            // 本文档镜像范围 → reserved（Core 自己，永久保留）
+            let image_start = core::ptr::addr_of!(__bootstrap_start) as usize;
+            let image_end = core::ptr::addr_of!(__bootstrap_end) as usize;
+            let reserved = [MemoryRegion { base: image_start, size: image_end - image_start }];
+
             console::log("bootstrap", "BOOT DISCOVERY OK\n");
             console::log("core", "core init: ");
-            match kernel::init(&info) {
+            match kernel::init(&info, &reserved) {
                 Ok(()) => {
                     console::puts("OK\n");
                     console::log("core", "BOOT CORE OK\n");
