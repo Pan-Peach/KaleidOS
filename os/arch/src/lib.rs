@@ -13,6 +13,7 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(not(target_arch = "riscv64"))]
 pub mod fake;
 
 #[cfg(target_arch = "riscv64")]

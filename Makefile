@@ -35,18 +35,22 @@ clean:
 # —— 质量工具链（fmt / clippy / check）——
 .PHONY: fmt clippy check
 
-# 代码格式化（rustfmt，全 workspace）
-# 只格式化自己的 crate（-p 显式列出；third_party 是 submodule，不归我们格式化）
+# 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
+OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
+
+# 代码格式化（rustfmt）
 fmt:
-	cargo fmt -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
+	cargo fmt $(OUR_CRATES)
 	cd os/boot/riscv64 && cargo fmt
 
-# lint（clippy，只查我们自己：third_party 已 exclude）
+# lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
 clippy:
-	cargo clippy --workspace 2>&1 | grep -v "third_party" || true
+	cargo clippy --workspace --all-targets
 
-# 一键质量检查（fmt 检查 + clippy + 构建）
-check: clippy
-	cargo fmt --all
-	# third_party 是 submodule，不归我们格式化（rustfmt 会误扫，手动排除） --check
-	cargo build
+# 一键质量门禁：任何一步失败即整体失败（CI 可直接用）
+check:
+	cargo fmt $(OUR_CRATES) -- --check
+	cd os/boot/riscv64 && cargo fmt -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo test --workspace
+	cd os/boot/riscv64 && cargo build

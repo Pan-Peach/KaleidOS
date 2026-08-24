@@ -251,7 +251,7 @@ mod tests {
             n += 1;
             assert!(n <= 1024, "runaway alloc");
             // 释放一半，验证合并后再分配（避免残留）
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 unsafe { heap.dealloc_pages(run) };
             }
         }
