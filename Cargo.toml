@@ -8,3 +8,7 @@ members = [
     "os/components/core_test",
     "os/components/logger",
 ]
+exclude = [
+    "third_party/buddy_system_allocator",
+    "third_party/fdt",
+]
