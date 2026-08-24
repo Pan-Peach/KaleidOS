@@ -21,6 +21,7 @@ pub mod machine;
 pub mod memory;
 pub mod monitor;
 pub mod object;
+#[macro_use]
 pub mod print;
 pub mod task;
 pub mod timer;
@@ -60,7 +61,7 @@ pub fn init(
     let probe = memory::alloc_frame().map_err(|_| "alloc probe failed")?;
     memory::free_frame(probe).map_err(|_| "free probe failed")?;
 
-    print::log("core", format_args!("init OK"));
+    log!("core", "init OK");
     monitor::mount(info);
     Ok(())
 }

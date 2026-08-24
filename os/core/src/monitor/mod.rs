@@ -7,9 +7,9 @@
 //! - 不因拥有 console 而获得 authority（Oracle 审查结论）。
 //!
 //! 主循环：`core> _` 提示符 → 读行 → token 解析 → 命令表分发 → 循环。
-//! 输入走注入（print::install_reader），输出走注入（print::install）。
+//! 输入/输出都走 arch（read_line / console_getc / console_write_byte），无注入层。
 
-use crate::print;
+use crate::{print, printk};
 
 mod cmds;
 
@@ -20,36 +20,51 @@ const LINE_BUF: usize = 64;
 /// 命令表：名称 + 执行函数（返回是否已执行；为未来多值参数预留 args）。
 struct Command {
     name: &'static str,
+    help: &'static str,
     run: fn(line: &[u8]),
 }
 
 const COMMANDS: &[Command] = &[
     Command {
         name: "help",
+        help: "this message",
         run: cmds::help,
     },
     Command {
         name: "machine",
+        help: "dump MachineInfo",
         run: cmds::machine,
     },
     Command {
         name: "memory",
+        help: "frame allocator stats",
         run: cmds::memory,
     },
     Command {
         name: "frame",
+        help: "query frame by physical address (hex)",
         run: cmds::frame,
+    },
+    Command {
+        name: "shutdown",
+        help: "shutdown the system",
+        run: cmds::shutdown,
+    },
+    Command {
+        name: "reboot",
+        help: "reboot the system",
+        run: cmds::reboot,
     },
 ];
 
 /// 进入 Monitor 主循环（永不返回）。
 pub fn run() -> ! {
-    print::print(format_args!("KaleidOS Core Monitor\n"));
-    print::print(format_args!("type 'help' for commands\n"));
+    printk!("KaleidOS Core Monitor\n");
+    printk!("type 'help' for commands\n");
 
     let mut buf = [0u8; LINE_BUF];
     loop {
-        print::print(format_args!("core> "));
+        printk!("core> ");
         let n = print::read_line(&mut buf);
         if n == 0 {
             continue;
@@ -58,13 +73,13 @@ pub fn run() -> ! {
         let first = line.split(|&b| b == b' ').next().unwrap_or(b"");
         // 匹配命令名（大小写敏感，精确）
         let cmd = COMMANDS.iter().find(|c| c.name.as_bytes() == first);
-        print::print(format_args!("\n"));
+        printk!("\n");
         match cmd {
             Some(c) => (c.run)(line),
             None => {
-                print::print(format_args!("unknown command '"));
+                printk!("unknown command '");
                 print::print_bytes(first);
-                print::print(format_args!("' (try 'help')\n"));
+                printk!("' (try 'help')\n");
             }
         }
     }

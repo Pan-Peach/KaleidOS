@@ -13,6 +13,7 @@
 //!
 //! FrameId = 帧身份；从 `PageRun.base / FRAME_SIZE` 换算。
 
+use crate::log;
 use buddy_system_allocator::{MetadataHeap, PageOrder, PageRun};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
@@ -111,14 +112,11 @@ pub fn init(frame_start: usize, frame_end: usize) -> Result<(), &'static str> {
     match &init_result {
         Ok(()) => {
             let span_frames = (frame_end - frame_start) / FRAME_SIZE;
-            crate::print::log(
-                "memory",
-                format_args!("region 0x{:x}-0x{:x} span_frames={}", frame_start, frame_end, span_frames),
-            );
-            crate::print::log("memory", format_args!("init OK"));
+            log!("memory", "region 0x{:x}-0x{:x} span_frames={}", frame_start, frame_end, span_frames);
+            log!("memory", "init OK");
         }
         Err(e) => {
-            crate::print::log("memory", format_args!("init FAILED: {}", e));
+            log!("memory", "init FAILED: {}", e);
         }
     }
     init_result

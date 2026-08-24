@@ -20,20 +20,13 @@ unsafe extern "C" {
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
-    // 安装日志/输入（core::print / monitor 依赖）：失败即重复 install，卡死。
-    let _ = kernel::print::install(console::write);
-    let _ = kernel::print::install_reader(console::getc);
-
-    kernel::print::log("bootstrap", format_args!("KaleidOS bootstrap"));
-    kernel::print::log(
-        "bootstrap",
-        format_args!("========================================"),
-    );
+    kernel::log!("bootstrap", "KaleidOS bootstrap");
+    kernel::log!("bootstrap", "========================================");
 
     // FDT 发现：直接吃 OpenSBI 给的 dtb 物理地址（unsafe：该地址有效性 Rust 无从验证）
     match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
         Ok(tree) => {
-            kernel::print::log("bootstrap", format_args!("FDT magic: OK"));
+            kernel::log!("bootstrap", "FDT magic: OK");
 
             // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
             // MachineInfo 是定长数组 + count（无借用），字符串用 CompatStr 内嵌复制。
@@ -117,8 +110,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             };
 
             // 汇编已保证只有 boot hart（hartid 0，QEMU virt 主 hart）进入 Rust。
-            kernel::print::log("bootstrap", format_args!("MachineInfo dump:"));
-            kernel::print::print(format_args!("{:#?}\n", info));
+            kernel::log!("bootstrap", "MachineInfo dump:");
+            kernel::printk!("{:#?}\n", info);
 
             // 本文档镜像范围 → reserved（Core 自己，永久保留）
             let image_start = core::ptr::addr_of!(__bootstrap_start) as usize;
@@ -128,16 +121,16 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 size: image_end - image_start,
             }];
 
-            kernel::print::log("bootstrap", format_args!("BOOT DISCOVERY OK"));
-            kernel::print::log("core", format_args!("core init: "));
+            kernel::log!("bootstrap", "BOOT DISCOVERY OK");
+            kernel::log!("core", "core init: ");
             match kernel::init(&info, &reserved) {
                 Ok(()) => {
-                    kernel::print::log("core", format_args!("BOOT CORE OK"));
+                    kernel::log!("core", "BOOT CORE OK");
                     // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                     kernel::monitor::run();
                 }
                 Err(e) => {
-                    kernel::print::log("core", format_args!("core init FAILED: {}", e));
+                    kernel::log!("core", "core init FAILED: {}", e);
                     // init 失败：无 monitor（可能内存/链路未就绪），挂起
                     loop {
                         core::hint::spin_loop();
@@ -146,7 +139,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             }
         }
         Err(_) => {
-            kernel::print::log("bootstrap", format_args!("FDT magic: BAD!"));
+            kernel::log!("bootstrap", "FDT magic: BAD!");
             loop {
                 core::hint::spin_loop();
             }
