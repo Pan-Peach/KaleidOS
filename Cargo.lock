@@ -37,7 +37,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
-name = "arch-riscv64"
+name = "arch"
 version = "0.1.0"
 dependencies = [
  "sbi-rt",
@@ -306,10 +306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "interfaces"
-version = "0.1.0"
-
-[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -339,6 +335,7 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "arch",
  "buddy_system_allocator",
  "spin",
 ]

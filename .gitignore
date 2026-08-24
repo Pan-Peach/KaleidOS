@@ -1,5 +1,5 @@
 /target/
-bootstrap/*/target/
+**/target/
 kaleidos-*
 .omo/
 .codegraph/

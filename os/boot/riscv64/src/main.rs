@@ -25,7 +25,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
     let _ = kernel::print::install_reader(console::getc);
 
     kernel::print::log("bootstrap", format_args!("KaleidOS bootstrap"));
-    kernel::print::log("bootstrap", format_args!("========================================"));
+    kernel::print::log(
+        "bootstrap",
+        format_args!("========================================"),
+    );
 
     // FDT 发现：直接吃 OpenSBI 给的 dtb 物理地址（unsafe：该地址有效性 Rust 无从验证）
     match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
@@ -35,7 +38,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
             // MachineInfo 是定长数组 + count（无借用），字符串用 CompatStr 内嵌复制。
             let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
-            let mut cpu_info = [CpuInfo { boot_cpu: false, hart_id: 0 }; 8];
+            let mut cpu_info = [CpuInfo {
+                boot_cpu: false,
+                hart_id: 0,
+            }; 8];
             let mut devices = [DeviceDescriptor::empty(); 26];
 
             let mut mem_count = 0usize;
@@ -117,7 +123,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             // 本文档镜像范围 → reserved（Core 自己，永久保留）
             let image_start = core::ptr::addr_of!(__bootstrap_start) as usize;
             let image_end = core::ptr::addr_of!(__bootstrap_end) as usize;
-            let reserved = [MemoryRegion { base: image_start, size: image_end - image_start }];
+            let reserved = [MemoryRegion {
+                base: image_start,
+                size: image_end - image_start,
+            }];
 
             kernel::print::log("bootstrap", format_args!("BOOT DISCOVERY OK"));
             kernel::print::log("core", format_args!("core init: "));
@@ -142,10 +151,6 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 core::hint::spin_loop();
             }
         }
-    }
-
-    loop {
-        core::hint::spin_loop();
     }
 }
 

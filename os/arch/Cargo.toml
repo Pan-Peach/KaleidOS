@@ -1,0 +1,10 @@
+[package]
+name = "arch"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+sbi-rt = { version = "0.0.4", default-features = false, features = ["legacy"] }

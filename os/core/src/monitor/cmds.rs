@@ -6,6 +6,7 @@
 use crate::machine::MachineInfo;
 use crate::memory;
 use crate::print;
+use arch::{Arch, ResetType};
 use spin::Mutex;
 
 /// Monitor 持有的 MachineInfo 副本（core::init 时 mount）。
@@ -19,9 +20,13 @@ pub fn mount(info: &MachineInfo) {
 /// `help`：列出可用命令。
 pub fn help(_line: &[u8]) {
     print::print(format_args!("commands:\n"));
-    print::print(format_args!("  machine      - dump MachineInfo (cpu/memory/devices)\n"));
+    print::print(format_args!(
+        "  machine      - dump MachineInfo (cpu/memory/devices)\n"
+    ));
     print::print(format_args!("  memory       - frame allocator stats\n"));
-    print::print(format_args!("  frame <addr> - query frame by physical address (hex)\n"));
+    print::print(format_args!(
+        "  frame <addr> - query frame by physical address (hex)\n"
+    ));
     print::print(format_args!("  help         - this message\n"));
 }
 
@@ -41,12 +46,20 @@ pub fn machine(_line: &[u8]) {
     print::print(format_args!("memory regions: {}\n", info.mem_count));
     for i in 0..info.mem_count {
         let r = &info.memory_regions[i];
-        print::print(format_args!("  [{:#x}, {:#x}) size={:#x}\n", r.base, r.base + r.size, r.size));
+        print::print(format_args!(
+            "  [{:#x}, {:#x}) size={:#x}\n",
+            r.base,
+            r.base + r.size,
+            r.size
+        ));
     }
     print::print(format_args!("devices: {}\n", info.dev_count));
     for i in 0..info.dev_count {
         let d = &info.devices[i];
-        print::print(format_args!("  mmio {:#x}+{:#x} irq={:?}\n", d.mmio_base, d.mmio_size, d.irq));
+        print::print(format_args!(
+            "  mmio {:#x}+{:#x} irq={:?}\n",
+            d.mmio_base, d.mmio_size, d.irq
+        ));
     }
 }
 
@@ -58,11 +71,20 @@ pub fn memory(_line: &[u8]) {
     for (order, &n) in counts.iter().enumerate() {
         if n > 0 && order >= 12 {
             let block_frames = 1u64 << (order - 12); // order 12=1 frame
-            print::print(format_args!("free order{} ({:#x}): {} blocks\n", order, 1usize << order, n));
+            print::print(format_args!(
+                "free order{} ({:#x}): {} blocks\n",
+                order,
+                1usize << order,
+                n
+            ));
             free_frames = free_frames.saturating_add((n as u64 * block_frames) as usize);
         }
     }
-    print::print(format_args!("free frames: {} (~{:#x} bytes)\n", free_frames, free_frames * memory::FRAME_SIZE));
+    print::print(format_args!(
+        "free frames: {} (~{:#x} bytes)\n",
+        free_frames,
+        free_frames * memory::FRAME_SIZE
+    ));
 }
 
 /// `frame <addr>`：按物理地址（hex）显示帧归属 —— 现在只显示"帧号对应范围"，
@@ -84,8 +106,17 @@ pub fn frame(line: &[u8]) {
     match addr {
         Ok(pa) => {
             let frame = memory::FrameId::from_pa(pa);
-            print::print(format_args!("pa {:#x} -> frame {} (start {:#x})\n", pa, frame.raw(), frame.start_pa()));
+            print::print(format_args!(
+                "pa {:#x} -> frame {} (start {:#x})\n",
+                pa,
+                frame.raw(),
+                frame.start_pa()
+            ));
         }
         Err(_) => print::print(format_args!("invalid address: '{}'\n", addr_str)),
     }
+}
+
+pub fn shutdown() {
+    arch::ArchImpl::system_reset(ResetType::Shutdown);
 }

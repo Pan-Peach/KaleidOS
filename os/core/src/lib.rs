@@ -34,7 +34,10 @@ static ALLOCATOR: memory::KernelAllocator = memory::KernelAllocator;
 /// Core 初始化入口：消费 bootstrap 发现的 MachineInfo（提案），校验后提交资源真相。
 /// `reserved` 是需保留的区间（bootstrap 提供：ELF image range）。
 /// 流程：sanity 校验 → 帧区域初始化（frame_start 由 bootstrap 传对齐后的镜像末尾）。
-pub fn init(info: &machine::MachineInfo, reserved: &[machine::MemoryRegion]) -> Result<(), &'static str> {
+pub fn init(
+    info: &machine::MachineInfo,
+    reserved: &[machine::MemoryRegion],
+) -> Result<(), &'static str> {
     if info.mem_count == 0 {
         return Err("no memory regions");
     }

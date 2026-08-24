@@ -1,7 +1,7 @@
 # KaleidOS 构建入口（Linux Kbuild 风格：根 Makefile 驱动，tools/ 放辅助脚本）
 #
 # 用法：
-#   make kernel            # 构建 kaleidos.elf（bootstrap + core 链接）
+#   make kernel            # 构建 kaleidos.elf（os/riscv64 + core 链接）
 #   make kernel ARCH=...   # 指定架构（当前只有 rv64）
 #   make qemu              # 在 QEMU 上运行（Ctrl-A X 退出）
 #   make clean
@@ -9,9 +9,9 @@
 ARCH      ?= rv64
 # ARCH 名 → 源码目录（rv64 → riscv64）
 ifeq ($(ARCH),rv64)
-BOOT_DIR  := bootstrap/riscv64
+BOOT_DIR  := os/boot/riscv64
 endif
-BOOT_DIR  ?= bootstrap/$(ARCH)
+BOOT_DIR  ?= os/boot/$(ARCH)
 KERNEL    := $(BOOT_DIR)/target/riscv64gc-unknown-none-elf/release/bootstrap
 OUTPUT    := kaleidos-$(ARCH)
 
