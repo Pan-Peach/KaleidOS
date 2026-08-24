@@ -24,10 +24,22 @@ struct Command {
 }
 
 const COMMANDS: &[Command] = &[
-    Command { name: "help", run: cmds::help },
-    Command { name: "machine", run: cmds::machine },
-    Command { name: "memory", run: cmds::memory },
-    Command { name: "frame", run: cmds::frame },
+    Command {
+        name: "help",
+        run: cmds::help,
+    },
+    Command {
+        name: "machine",
+        run: cmds::machine,
+    },
+    Command {
+        name: "memory",
+        run: cmds::memory,
+    },
+    Command {
+        name: "frame",
+        run: cmds::frame,
+    },
 ];
 
 /// 进入 Monitor 主循环（永不返回）。
@@ -46,6 +58,7 @@ pub fn run() -> ! {
         let first = line.split(|&b| b == b' ').next().unwrap_or(b"");
         // 匹配命令名（大小写敏感，精确）
         let cmd = COMMANDS.iter().find(|c| c.name.as_bytes() == first);
+        print::print(format_args!("\n"));
         match cmd {
             Some(c) => (c.run)(line),
             None => {

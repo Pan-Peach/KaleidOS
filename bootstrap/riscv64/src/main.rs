@@ -20,8 +20,9 @@ unsafe extern "C" {
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
-    // 安装日志写入器 → core::print::log 才能工作（一次性；失败即卡死，说明重复 install）
+    // 安装日志/输入（core::print / monitor 依赖）：失败即重复 install，卡死。
     let _ = kernel::print::install(console::write);
+    let _ = kernel::print::install_reader(console::getc);
 
     kernel::print::log("bootstrap", format_args!("KaleidOS bootstrap"));
     kernel::print::log("bootstrap", format_args!("========================================"));
@@ -123,14 +124,23 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             match kernel::init(&info, &reserved) {
                 Ok(()) => {
                     kernel::print::log("core", format_args!("BOOT CORE OK"));
+                    // 转交 Core Monitor（boot hart 同步主循环，永不返回）
+                    kernel::monitor::run();
                 }
                 Err(e) => {
                     kernel::print::log("core", format_args!("core init FAILED: {}", e));
+                    // init 失败：无 monitor（可能内存/链路未就绪），挂起
+                    loop {
+                        core::hint::spin_loop();
+                    }
                 }
             }
         }
         Err(_) => {
             kernel::print::log("bootstrap", format_args!("FDT magic: BAD!"));
+            loop {
+                core::hint::spin_loop();
+            }
         }
     }
 

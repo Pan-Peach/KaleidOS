@@ -6,12 +6,18 @@
 //! 直接调 SBI 输出；且 panic 消息不经过任何格式化）。
 
 use arch_riscv64::sbi::debug_console_write_byte;
+use arch_riscv64::sbi::debug_console_getc;
 
 /// 写原始字节串（无缓冲、无格式）。
 pub fn write(s: &str) {
     for byte in s.as_bytes() {
         debug_console_write_byte(*byte);
     }
+}
+
+/// 读一个字符（无输入返回 None；Monitor 行输入用）。
+pub fn getc() -> Option<u8> {
+    debug_console_getc()
 }
 
 /// panic 紧急输出：同 write，但命名上强调"绕过 print 锁"。
