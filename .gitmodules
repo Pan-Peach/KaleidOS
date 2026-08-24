@@ -1,3 +1,7 @@
 [submodule "third_party/fdt"]
 	path = third_party/fdt
 	url = https://github.com/repnop/fdt.git
+[submodule "third_party/buddy_system_allocator"]
+	path = third_party/buddy_system_allocator
+	url = https://github.com/Mango-Iced-Americano/buddy_system_allocator.git
+	branch = feat/metadata-heap

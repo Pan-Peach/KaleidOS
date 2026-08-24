@@ -60,6 +60,7 @@ FrameId       —— 物理帧身份
 ComponentId   —— 组件身份
 Handle        —— 不可伪造的授权（类型化，如 FrameHandle）
 ResourceDomain—— 组件资源集合（拥有什么、如何回收）
+Core 物理内存 —— 帧真相 + canonical 帧分配器机制（`buddy_system_allocator::MetadataHeap`，per-unit metadata O(1) buddy，metadata 自托管前端；区域 `[align_up(__bootstrap_end), RAM 末尾)`，ELF/DTB 天然保留）
 ```
 
 **验收标准**：host test 覆盖上述类型的创建/存在性/所有权语义；CoreTest 能在 QEMU 上跑基础断言。
@@ -70,16 +71,20 @@ ResourceDomain—— 组件资源集合（拥有什么、如何回收）
 
 ```text
 RR Scheduler      （轮转调度器）
-Simple Allocator  （简单帧分配器）
 Logger            （日志组件）
 CoreTest          （核心测试组件）
 ```
 
-**验收标准**：完整走通 **propose → validate → commit** 链路：
+**验收标准**：完整走通 **propose → validate → commit** 链路（调度）：
 
 ```text
 Scheduler 提议运行 Task #7  →  Core 验证（存在/Runnable/未在别 CPU）→ commit
-Allocator 提议 Frame #100   →  Core 验证（存在/空闲/权限）→ commit ownership
+```
+
+物理帧分配是 Core 内部机制，验收标准为 **Core 帧分配测试 / 分配器测试**：
+
+```text
+请求者向 Core 要帧 → Core 分配器选择/验证/commit → grant FrameHandle
 ```
 
 对抗性测试开始建立：double free、wrong owner、invalid scheduler proposal 全部被 Core 拒绝。
@@ -96,7 +101,7 @@ provides / requires / bind / start / stop
 - 生命周期状态机（Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destroyed）落地；
 - Ownership Tree 与 Dependency DAG 两套关系分开维护。
 
-**验收标准**：一个配置好的 minimal profile 能按声明完成 bind → start → stop → destroy 全流程，资源完整回收。
+**验收标准**：一个配置好的 minimal profile 能按声明完成 bind → start → stop → destroy 全流程，authority-backed 资源（handle）被 revoke。
 
 ## 6. M4 —— 第一个 Device Component
 
@@ -111,7 +116,7 @@ Device Interface（如 BlockDevice / UART 设备）
 ```
 
 **验收标准**：上层组件只通过 Interface 使用设备，从不接触裸地址/裸 IRQ；
-驱动可以被 stop → 回收 → 重新 start。走到这里如果边界仍然舒服，说明架构基本成立。
+驱动可以被 stop → revoke authority（handle）→ 重新 start。走到这里如果边界仍然舒服，说明架构基本成立。
 
 ## 7. 第一阶段明确不做（务必遵守）
 
@@ -136,7 +141,8 @@ Device Interface（如 BlockDevice / UART 设备）
 - **多架构**：x86_64 → aarch64 → loongarch64（Arch 层换实现，Core 不动）；
 - **热替换**：在 Phase-1 替换模型（quiesce → stop → unbind → reset → replace → bind → start）基础上，向无感替换演进；
 - **验证工具链**：Kani / Loom / Miri / Verus 逐步引入；
-- **确定性测试**：Test Scheduler / Hunt Mode（CHESS 思路）。
+- **确定性测试**：Test Scheduler / Hunt Mode（CHESS 思路）；
+- **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、panic recovery —— 均推迟到显式未来里程碑；phase 1 只做 authority-backed 资源 revoke，不承诺共享堆字节回收。
 
 ## 9. 长期愿景
 

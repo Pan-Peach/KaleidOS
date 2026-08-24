@@ -21,7 +21,7 @@ Interface 表达"这个组件提供什么能力"，按领域分三类：
 |---|---|---|
 | Device | 访问硬件的抽象 | BlockDevice、NetDevice、InputDevice、DisplayDevice、AudioDevice |
 | Service | 跨组件的系统服务 | FileSystemService、NetworkService、GraphicsService、LoggerService、GameRuntimeService |
-| Policy | 可替换的策略算法 | SchedulerPolicy、FrameAllocatorPolicy、PageReplacementPolicy |
+| Policy | 可替换的策略算法 | SchedulerPolicy、PageReplacementPolicy（未来：MemoryPolicy） |
 
 ### 例子：驱动组件图
 
@@ -55,6 +55,8 @@ owns:
     TimerHandle #11
 ```
 
+> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA/frame handle），用于保护与 revoke。
+
 ### 组件停止时的回收 —— 两条路径，不预设 universal revoke order
 
 > Core 的保证是 **eventual revocation / containment**：组件生命周期结束后，Core 最终必须收回其 ResourceDomain。
@@ -87,8 +89,10 @@ reset / isolate device（尽可能）
   ↓
 force revoke authority
   ↓
-reclaim resources
+revoke authority-backed resources（handles）
 ```
+
+> 强制隔离回收的是 **authority-backed 资源（handle）**。堆内存的清理走正常 Drop 路径；完整的内存回收需要未来的 ExecutionDomain（Wasm / 地址空间）——phase 1 的 KernelNative 组件不承诺内存回收。
 
 **意义**：restart、replace、fault recovery 全部建立在"Core 最终能收回 ResourceDomain"这一保证上。
 
@@ -120,6 +124,8 @@ Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destr
 | Stopped | 已停止 |
 | Destroyed | 生命周期结束 |
 | Failed | 运行过程中失败（可触发恢复流程） |
+
+> **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。目标上暂无 panic recovery（panic=abort），phase 1 用 Result 传播错误。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 
@@ -203,8 +209,7 @@ quiesce → stop → unbind → reset → replace → bind → start
 
 ### 为什么策略组件可以安全 reset
 
-Scheduler 丢失 runqueue 不要紧：从 Core 的 Truth（Runnable 任务列表）重新构造；
-Buddy 丢失 free list 不要紧：从 Core 的帧表重新构造。
+Scheduler 丢失 runqueue 不要紧：从 Core 的 Truth（Runnable 任务列表）重新构造。
 
 但要求是 **reconstructible to a safe state, not necessarily an equivalent state**：
 Derived 状态（vruntime、LRU history、RTT 估计等）丢失后，系统必须能继续**安全正确**运行，

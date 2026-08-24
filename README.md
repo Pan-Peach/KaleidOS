@@ -8,8 +8,8 @@
 
 ## 核心哲学
 
-- **Core owns truth. Components own policy and semantics.** Core 保存真实且不可撒谎的系统状态；Component 实现可替换的算法、策略与语义。
-- **Policy proposes, Core validates and commits.** 调度器/分配器只能"提议"，由 Core 验证存在性、状态、所有权后才生效。
+- **Core owns truth. Components own policy and semantics.** Core 保存真实且不可撒谎的系统状态，并拥有为保存这份真相、推进 Core 自身资源/生命周期操作所必需的机制；Component 实现可替换的算法、策略与语义。
+- **Policy proposes, Core validates and commits.** 策略/调度器只能"提议"，由 Core 验证存在性、状态、所有权后才生效；物理帧分配本身是 Core 内部机制（canonical，不热卸载），不是"提议"的策略。
 - **Authority ≠ Interface。** 驱动拿类型化 Handle（`MmioHandle`/`IrqHandle`/`DmaHandle`...），永远不拿裸地址/裸 IRQ；Interface 是语义，传输是绑定策略。
 
 ## 架构
@@ -40,7 +40,7 @@ kernel/       全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根�
   core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine
   arch/            ISA 层 crate：riscv64/
   interfaces/      Interface 契约 crate：device/ service/ policy/
-  components/      策略/服务组件 crates：scheduler_rr/ allocator_simple/ core_test/ logger/
+  components/      策略/服务组件 crates：scheduler_rr/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器，no_std 零依赖）
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）

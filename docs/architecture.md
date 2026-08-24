@@ -140,7 +140,8 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 ### Core 持有（owns truth）
 
 - Task 与 CPU 执行状态（Task 身份、状态、运行在哪个 CPU、上下文）
-- 物理帧（Physical Frame）的存在性、所有权
+- 物理内存（Physical Memory）：帧真相 + **canonical 帧分配器作为 Core 机制**（静态帧池，不热卸载）
+- 共享 Core heap（Core 与组件共用，无 per-component 记账）
 - AddressSpace
 - IRQ / Timer / MMIO / DMA
 - 内核对象（Kernel Object）
@@ -152,7 +153,6 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 
 ### Core 不包含（这些属于 Component）
 
-- Buddy 分配算法
 - RR / CFS 调度算法
 - Ext4 / FAT 文件系统格式
 - VFS
@@ -187,7 +187,7 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 |---|---|
 | Device（设备） | BlockDevice、NetDevice、InputDevice、DisplayDevice、AudioDevice |
 | Service（服务） | FileSystemService、NetworkService、GraphicsService、LoggerService、GameRuntimeService |
-| Policy（策略） | SchedulerPolicy、FrameAllocatorPolicy、PageReplacementPolicy |
+| Policy（策略） | SchedulerPolicy、PageReplacementPolicy（未来：MemoryPolicy） |
 
 > **Interface 是语义，传输（transport）是绑定策略。**
 > 第一阶段用 Rust trait + direct call；未来可以换成 IPC stub 或 Wasm host call。
@@ -215,7 +215,7 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，见 component-model.md §3，不预设 universal revoke order）；
+- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是 **authority handle**（MMIO/IRQ/DMA/frame handle），**不是**堆字节数，也没有 per-component arena。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，见 component-model.md §3，不预设 universal revoke order）；
 - **ExecutionDomain**：第一阶段只需要 `KernelNative`（内核地址空间中的 Rust 函数）；未来可以有 `UserAddressSpace`、`WasmSandbox`。
 
 > 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"。契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核、微内核或混合形态。
@@ -227,7 +227,7 @@ OS = Resource Core + Component Graph + Profile
 ```
 
 - Profile 描述一套完整的组件图（谁提供什么、谁依赖什么、各自执行域）；
-- 预想 profile：`tiny`（RR 调度 + 简单分配器 + UART + RAMFS，全 native）、`game`、`unix`（POSIX personality）、`micro`（独立执行域 + IPC）、`wasm`、`debug`（调试分配器 + CoreTest + fault injection）；
+- 预想 profile：`tiny`（RR 调度 + UART + RAMFS，全 native）、`game`、`unix`（POSIX personality）、`micro`（独立执行域 + IPC）、`wasm`、`debug`（调试分配器 + CoreTest + fault injection）；
 - 第一个 profile：`minimal`。
 
 同一份 Core，不同的 Profile = 完全不同的操作系统形态。这是 KaleidOS 区别于一般"模块化"架构的核心特点。
@@ -247,16 +247,21 @@ Scheduler（Component）         Core
     │ ◄──────────────────────── │ commit / reject（记录 trace）
 ```
 
-### 分配示例
+### 分配示例（Core 内部机制）
+
+物理帧分配是 Core 内部机制，不是"提议 → 验证"的策略流：
 
 ```text
-Buddy（Component）              Core
+请求者（Component）            Core
     │                           │
-    │  propose: Frame #100      │
-    │ ────────────────────────► │ 检查：存在？空闲？归属合法？
-    │                           │
-    │ ◄──────────────────────── │ commit ownership
+    │  请求一帧                 │
+    │ ────────────────────────► │ 分配器选择一帧（如 Frame #100）
+    │                           │ 验证：存在？空闲？归属合法？
+    │                           │ commit ownership
+    │ ◄──────────────────────── │ grant authority（FrameHandle）
 ```
+
+未来若引入 `MemoryPolicy` 组件，它只能提议偏好（NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
 
 **含义**：策略可以随便想、随便错；但任何对真实资源的改动，都必须经过 Core 验证并记录。Core 拒绝时留下 trace（policy proposal / Core rejection），这是调试和 CoreTest 的抓手。
 

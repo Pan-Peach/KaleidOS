@@ -5,8 +5,10 @@
 
 ## 1. 一句话原则
 
-> **Core owns truth. Components own policy and semantics.**
-> Core 保存真实且不可撒谎的系统状态；Component 实现可替换的算法、策略、协议和高级 OS 语义。
+> **Core owns global resource truth AND the mechanisms required to preserve that truth and make forward progress. Components own replaceable semantics, policy, and derived state.**
+> Core 保存真实且不可撒谎的系统状态，并拥有**为保存这份真相、推进 Core 自身资源/生命周期操作所必需的机制**；Component 实现可替换的算法、策略、协议和高级 OS 语义。
+>
+> 注："forward progress" 指 Core 自身资源/生命周期操作的推进，**不是**继续提供应用服务。
 
 这句口号要读得更严谨一点：
 
@@ -21,6 +23,8 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 
 > **Policy proposes, Core validates and commits.**
 > 策略可以提议任何事，但只有 Core 验证通过后，真实资源才会被改动。
+>
+> 注意：这条只适用于**可替换的策略组件**（如调度器）。物理帧分配是 Core 内部机制，不是"提议"的策略 —— 见 §3 分配示例。
 
 ## 2. 状态归属：谁存什么
 
@@ -39,7 +43,6 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 | 组件 | 保存 | 来源 |
 |---|---|---|
 | Scheduler | runqueue、RR cursor、vruntime | 调度策略私有 |
-| Buddy allocator | buddy tree、free lists | 分配算法私有 |
 | VFS | mount 表、dentry cache | 语义私有 |
 | Ext4 | inode 缓存、位图 | 格式私有 |
 
@@ -53,7 +56,7 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 |---|---|---|---|
 | **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | Frame owner、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
 | **Component Semantic State** | 某个 Component 自己负责的"业务真相"；**不能随便丢**，但也不是 Core 的责任 | VFS mount 表、TCP 连接状态、POSIX fd table、文件系统事务状态、game runtime 会话状态 | Component |
-| **Derived** | 从权威状态构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、buddy free list、LRU list、CFS vruntime、缓存索引 | Component |
+| **Derived** | 从权威状态构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、LRU list、CFS vruntime、缓存索引 | Component |
 | **Ephemeral** | 丢失完全不影响正确性的短暂状态 | debug buffer、临时统计、部分 trace 聚合 | Component |
 
 判断规则：
@@ -96,14 +99,18 @@ Core 验证：
 
 ### 分配示例
 
+物理帧分配是 **Core 内部机制**（canonical，不热卸载；可能按 build/profile 选择实现）。请求者不"提议"帧号，而是向 Core 要一帧：
+
 ```text
-Buddy 提议：分配 Frame #100
-Core 验证：
-  - Frame #100 存在？
-  - 是 Free 状态？
-  - 请求者有权限？
-通过 → Core commit ownership（从此 Frame #100 归请求者）
+请求者：请给我一帧
+Core 的分配器：
+  - 选择一帧（如 Frame #100）
+  - 验证：Frame #100 存在？是 Free 状态？请求者有权限？
+  - commit ownership（从此 Frame #100 归请求者）
+  - grant authority（FrameHandle）
 ```
+
+未来若引入 `MemoryPolicy` 组件，它只能**提议偏好**（如 NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
 
 ### 工程含义
 
@@ -134,7 +141,7 @@ TaskHandle   TimerHandle AddressSpaceHandle
 ```text
 Device:   BlockDevice  NetDevice  InputDevice  DisplayDevice  AudioDevice
 Service:  FileSystemService  NetworkService  GraphicsService  LoggerService
-Policy:   SchedulerPolicy  FrameAllocatorPolicy  PageReplacementPolicy
+Policy:   SchedulerPolicy  PageReplacementPolicy  （未来：MemoryPolicy）
 ```
 
 ### 两者关系
@@ -166,7 +173,24 @@ BlockDevice（Interface）
 > 如果一个完全错误的 Component 能通过某个 API 破坏其他 Component 或全局 invariant，
 > 那么应该缩小 API，或者把最终 authority 收回 Core。
 
-**反例自查**：Buddy 算法放进 Core？—— 不需要。它错了只会浪费内存，不会破坏所有权真相（真相在 Core 的帧表里）。RR 算法放进 Core？—— 不需要。它错了只会调度得烂，不会让两个任务同时占一个 CPU（检查在 Core）。
+**反例自查**：RR 算法放进 Core？—— 不需要。它错了只会调度得烂，不会让两个任务同时占一个 CPU（检查在 Core）。物理帧分配则相反：它是 Core 内部机制 —— 分配错了会破坏所有权真相，必须由 Core 掌握（见 §3 分配示例）。
+
+## 5.5 内存：无 per-component 记账
+
+- **Core 与组件共享一个 Core heap**：没有 per-ComponentId 的字节计费，没有 per-component arena / 私有堆；
+- **ResourceDomain 记录的是 authority handle**（Mmio / Irq / Dma / Frame ...），用于保护与 revoke，**不是**内存字节数；
+- 因此组件失败时，Core 不承诺回收其堆内存（见 §5.6 组件失败语义）。
+
+## 5.6 组件定义（4 项测试）
+
+一个东西是否算"Component"，用四项测试判定：
+
+1. **裸 Core 能否在缺少它时存活？**（Core 不依赖它也能推进自身资源/生命周期操作）
+2. **它死了，Core 的真相是否仍然完整？**（它不持有 Core 的全局资源真相）
+3. **它能否真正 stop / unload？**（有明确的停止/卸载路径）
+4. **它的状态是否 loss-tolerant / 可重建？**（丢失后能重建到 safe usable state）
+
+> 组件失败 = **逻辑死亡、物理驻留**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例（逻辑重启）。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain（Wasm / 地址空间）里程碑。目标上暂无 panic recovery（panic=abort），phase 1 用 Result 传播错误。
 
 ## 6. 由哲学推导出的工程约束
 
