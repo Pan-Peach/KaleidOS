@@ -114,6 +114,7 @@ impl core::fmt::Debug for DeviceDescriptor {
 
 /// 定长机器信息（owned）：bootstrap 填满 → core::init 校验提交。
 /// 所有字段都是值，无借用 → DTB 可丢，MachineInfo 可自由传递/持久化。
+#[derive(Clone, Copy)]
 pub struct MachineInfo {
     pub boot_hart: usize,
     pub cpu_count: usize,

@@ -19,6 +19,7 @@ pub mod inspector;
 pub mod irq;
 pub mod machine;
 pub mod memory;
+pub mod monitor;
 pub mod object;
 pub mod print;
 pub mod task;
@@ -57,5 +58,6 @@ pub fn init(info: &machine::MachineInfo, reserved: &[machine::MemoryRegion]) -> 
     memory::free_frame(probe).map_err(|_| "free probe failed")?;
 
     print::log("core", format_args!("init OK"));
+    monitor::mount(info);
     Ok(())
 }
