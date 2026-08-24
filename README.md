@@ -33,16 +33,15 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 ## 目录
 
 ```
-bootstrap/     启动阶段 crate（firmware 世界，按目标架构分目录）：riscv64/ ——
-               _start → early console → FDT discovery → MachineInfo → core::init()，
-               与 kernel/core 链接成 kaleidos.elf（单镜像，职责分离装载合一）
-kernel/       全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
-  core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine
-  arch/            ISA 层 crate：riscv64/
-  interfaces/      Interface 契约 crate：device/ service/ policy/
+os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
+  boot/            成品镜像层（bin，按目标架构分目录）：riscv64/ ——
+                   _start → FDT discovery → MachineInfo → core::init() → Core Monitor，
+                   与 core 链接成 kaleidos.elf（单镜像，职责分离装载合一）
+  core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine/print
+  arch/            统一 arch crate：trait Arch（静态方法接口）+ ArchImpl（cfg 选择 riscv64 / fake）
   components/      策略/服务组件 crates：scheduler_rr/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
-third_party/   外部依赖（git submodule）：fdt/（FDT 解析器，no_std 零依赖）
+third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）——workspace exclude，clippy 不检索
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
 tools/         工具脚本（待建设）
@@ -52,7 +51,7 @@ tools/         工具脚本（待建设）
 
 ## 当前状态
 
-**架构定案：`kaleidos.elf` 单镜像（bootstrap + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成：bootstrap 阶段（early console + FDT discovery → MachineInfo + `[bootstrap]`/`[core]` 前缀日志）已跑通 `BOOT DISCOVERY OK → BOOT CORE OK`；Core library（kernel/core）与 MachineInfo 类型就位。目标里程碑：**M0 收尾（QEMU 完整启动日志）**。详见 `docs/roadmap.md`。
+**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成：boot 阶段（FDT discovery → MachineInfo）→ `core::init`（BSS 清零 + MetadataHeap 帧分配器 + 探测）→ **Core Monitor 交互 shell**（`core> machine/memory/frame/help/shutdown/reboot`），全链路 `BOOT DISCOVERY OK → BOOT CORE OK → core>`。日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch：host=FakeArch/std，riscv64=SBI DBCN）。质量工具链：`make fmt` / `make clippy` / `make check`。详见 `docs/roadmap.md`。
 
 ## 构建
 

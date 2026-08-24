@@ -68,7 +68,7 @@ Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体�
 - 原子操作 / CPU 原语
 - 固件调用原语（firmware-call primitives，如 RISC-V SBI 调用；**UEFI runtime 调用属于 Boot/Firmware environment，不是 ISA 属性**，不归 x86 arch 所有）
 
-目录：`kernel/arch/riscv64`（每个 ISA 一个 crate）。后续：`x86_64` / `aarch64` / `loongarch64`。
+目录：`os/arch`（统一 crate：`trait Arch` 静态方法接口 + `ArchImpl` cfg 选择——host 编译用 fake 实现，交叉编译用 riscv64 实现）。后续 ISA：`x86_64` / `aarch64` / `loongarch64`（各自模块 + cfg 分支）。
 
 ### Machine Discovery —— 机器发现（不设 platform 层）
 
@@ -109,23 +109,26 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 依赖方向（当前模型，精确表述）：
 
 ```text
-BUILD TIME：bootstrap(riscv64) ──► kernel/core（library）+ arch（ISA）＋ fdt
+BUILD TIME：os/boot/riscv64（bin）──► os/core（library）+ os/arch（trait+ArchImpl）＋ fdt
                      │
                      ▼ (链接)
               kaleidos.elf（单镜像）
    ┌──────────────────────────────────────────┐
-   │ 阶段一 Bootstrap：FDT → MachineInfo       │
+   │ 阶段一 Boot：FDT → MachineInfo            │
    │        ↓ core::init(&MachineInfo)        │
    │ 阶段二 Resource Core（消费 MachineInfo）   │
+   │        ↓ monitor::run()                  │
+   │ 阶段三 Core Monitor（core> 交互 shell）    │
    └──────────────────────────────────────────┘
 
 RUN TIME（未来：组件热插拔）：
 
 OpenSBI → kaleidos.elf
-  → bootstrap：discover（fdt/ACPI... backend）→ MachineInfo
-  → core::init(MachineInfo)（校验 → 提交资源真相）
-  → Component Manager 解包内嵌 .initpkg（cpio 归档）
-  → 按 manifest（文本）加载组件 .kcomp（ELF，Linux insmod/depmod 模式）
+  → boot：discover（fdt/ACPI... backend）→ MachineInfo
+  → core::init(MachineInfo)（BSS 清零 → MetadataHeap 帧分配器 → 探测）
+  → Core Monitor（core> 交互调试面，裸 Core 常态能力）
+  → （未来）Component Manager 解包内嵌 .initpkg（cpio 归档）
+  → （未来）按 manifest（文本）加载组件 .kcomp（ELF，Linux insmod/depmod 模式）
 ```
 
 - **Resource Core 不依赖具体 Arch 和 Discovery backend**（core-lib 不依赖 arch/fdt；bootstrap 阶段才用）；
