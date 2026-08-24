@@ -12,6 +12,7 @@ path = "src/main.rs"
 test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --tests
 
 [dependencies]
+arch-riscv64 = { path = "../../kernel/arch/riscv64" }
 fdt = { path = "../../third_party/fdt" }
 kernel = { path = "../../kernel/core" }
 

@@ -3,11 +3,32 @@
 version = 4
 
 [[package]]
+name = "arch-riscv64"
+version = "0.1.0"
+dependencies = [
+ "sbi-rt",
+]
+
+[[package]]
+name = "bitflags"
+version = "2.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[package]]
 name = "bootstrap"
 version = "0.1.0"
 dependencies = [
+ "arch-riscv64",
  "fdt",
  "kernel",
+]
+
+[[package]]
+name = "buddy_system_allocator"
+version = "0.13.0"
+dependencies = [
+ "spin",
 ]
 
 [[package]]
@@ -17,3 +38,31 @@ version = "0.2.0-alpha2"
 [[package]]
 name = "kernel"
 version = "0.1.0"
+dependencies = [
+ "buddy_system_allocator",
+ "spin",
+]
+
+[[package]]
+name = "sbi-rt"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f7bf85822c8b453d7e3fca7de39684032f5c06c1ed338ad8d47f4a79c1d49a"
+dependencies = [
+ "sbi-spec",
+]
+
+[[package]]
+name = "sbi-spec"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "785b91fcc41c7426fc07510be49ed1db44f002b45d45c175ec7f155c3cd447a9"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "spin"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"

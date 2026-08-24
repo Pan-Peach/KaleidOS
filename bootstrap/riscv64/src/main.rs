@@ -7,7 +7,6 @@ use fdt::properties::values::StringList;
 use kernel::machine::{CompatStr, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
 
 mod console;
-mod sbi;
 
 global_asm!(include_str!("entry.S"));
 
@@ -21,13 +20,16 @@ unsafe extern "C" {
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
-    console::log("bootstrap", "KaleidOS bootstrap\n");
-    console::log("bootstrap", "========================================\n");
+    // 安装日志写入器 → core::print::log 才能工作（一次性；失败即卡死，说明重复 install）
+    let _ = kernel::print::install(console::write);
+
+    kernel::print::log("bootstrap", format_args!("KaleidOS bootstrap"));
+    kernel::print::log("bootstrap", format_args!("========================================"));
 
     // FDT 发现：直接吃 OpenSBI 给的 dtb 物理地址（unsafe：该地址有效性 Rust 无从验证）
     match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
         Ok(tree) => {
-            console::log("bootstrap", "FDT magic: OK\n");
+            kernel::print::log("bootstrap", format_args!("FDT magic: OK"));
 
             // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
             // MachineInfo 是定长数组 + count（无借用），字符串用 CompatStr 内嵌复制。
@@ -107,35 +109,28 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 devices,
             };
 
-            // 只有 boot hart 进入 Core；其余 hart 停在这里（等 Core 未来唤醒）
-            if !cpu_info[..cpu_count].iter().any(|c| c.boot_cpu && c.hart_id == hart_id) {
-                console::log("bootstrap", "non-boot hart parked\n");
-                park_hart();
-            }
-            console::log("bootstrap", "MachineInfo dump:\n");
-            console::print(format_args!("{:#?}\n", info));
+            // 汇编已保证只有 boot hart（hartid 0，QEMU virt 主 hart）进入 Rust。
+            kernel::print::log("bootstrap", format_args!("MachineInfo dump:"));
+            kernel::print::print(format_args!("{:#?}\n", info));
 
             // 本文档镜像范围 → reserved（Core 自己，永久保留）
             let image_start = core::ptr::addr_of!(__bootstrap_start) as usize;
             let image_end = core::ptr::addr_of!(__bootstrap_end) as usize;
             let reserved = [MemoryRegion { base: image_start, size: image_end - image_start }];
 
-            console::log("bootstrap", "BOOT DISCOVERY OK\n");
-            console::log("core", "core init: ");
+            kernel::print::log("bootstrap", format_args!("BOOT DISCOVERY OK"));
+            kernel::print::log("core", format_args!("core init: "));
             match kernel::init(&info, &reserved) {
                 Ok(()) => {
-                    console::puts("OK\n");
-                    console::log("core", "BOOT CORE OK\n");
+                    kernel::print::log("core", format_args!("BOOT CORE OK"));
                 }
                 Err(e) => {
-                    console::puts("FAILED: ");
-                    console::puts(e);
-                    console::puts("\n");
+                    kernel::print::log("core", format_args!("core init FAILED: {}", e));
                 }
             }
         }
         Err(_) => {
-            console::log("bootstrap", "FDT magic: BAD!\n");
+            kernel::print::log("bootstrap", format_args!("FDT magic: BAD!"));
         }
     }
 
@@ -144,16 +139,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
     }
 }
 
-/// 非 boot hart：WFI 循环（未接内核唤醒前，永久停驻）。
-fn park_hart() -> ! {
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
-}
-
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    console::puts("BOOTSTRAP PANIC");
+    // 绕过 print（panic 时其锁可能已损坏），直接 SBI 紧急输出。
+    console::puts_direct("BOOTSTRAP PANIC");
     loop {
         core::hint::spin_loop();
     }
