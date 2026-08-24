@@ -12,6 +12,8 @@ impl Arch for Fake {
     }
 
     fn system_reset(_reset_type: ResetType) -> ! {
-        loop {}
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }

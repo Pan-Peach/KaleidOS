@@ -31,3 +31,19 @@ qemu: kernel
 clean:
 	rm -f $(OUTPUT)
 	cd $(BOOT_DIR) && cargo clean --release
+
+# —— 质量工具链（fmt / clippy / check）——
+.PHONY: fmt clippy check
+
+# 代码格式化（rustfmt，全 workspace）
+fmt:
+	cargo fmt
+
+# lint（clippy，只查我们自己：third_party 已 exclude）
+clippy:
+	cargo clippy --workspace 2>&1 | grep -v "third_party" || true
+
+# 一键质量检查（fmt 检查 + clippy + 构建）
+check: clippy
+	cargo fmt --check
+	cargo build

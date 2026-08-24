@@ -13,7 +13,10 @@ pub struct CompatStr {
 
 impl CompatStr {
     pub const fn empty() -> Self {
-        Self { len: 0, bytes: [0; 32] }
+        Self {
+            len: 0,
+            bytes: [0; 32],
+        }
     }
 
     /// 从字节切片复制（截断至容量）。
@@ -53,11 +56,11 @@ fn write_size(f: &mut core::fmt::Formatter<'_>, bytes: usize) -> core::fmt::Resu
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
-    if bytes >= GIB && bytes % GIB == 0 {
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
         write!(f, "{} GiB", bytes / GIB)
-    } else if bytes >= MIB && bytes % MIB == 0 {
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
         write!(f, "{} MiB", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
         write!(f, "{} KiB", bytes / KIB)
     } else {
         write!(f, "{} B", bytes)
@@ -95,14 +98,21 @@ impl DeviceDescriptor {
 
 impl core::fmt::Debug for DeviceDescriptor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "DeviceDescriptor {{ mmio_base: {:#x}, mmio_size: ", self.mmio_base)?;
+        write!(
+            f,
+            "DeviceDescriptor {{ mmio_base: {:#x}, mmio_size: ",
+            self.mmio_base
+        )?;
         write_size(f, self.mmio_size)?;
         match self.irq {
             Some(irq) => write!(f, ", irq: {irq}, compatibles: ")?,
             None => write!(f, ", irq: None, compatibles: ")?,
         }
         f.write_str("[")?;
-        for (i, c) in self.compatibles[..self.compat_count as usize].iter().enumerate() {
+        for (i, c) in self.compatibles[..self.compat_count as usize]
+            .iter()
+            .enumerate()
+        {
             if i > 0 {
                 f.write_str(", ")?;
             }

@@ -3,9 +3,9 @@
 //! 全部只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
 
-use crate::printk;
 use crate::machine::MachineInfo;
 use crate::memory;
+use crate::printk;
 use arch::{Arch, ResetType};
 use spin::Mutex;
 
@@ -40,12 +40,22 @@ pub fn machine(_line: &[u8]) {
     printk!("memory regions: {}\n", info.mem_count);
     for i in 0..info.mem_count {
         let r = &info.memory_regions[i];
-        printk!("  [{:#x}, {:#x}) size={:#x}\n", r.base, r.base + r.size, r.size);
+        printk!(
+            "  [{:#x}, {:#x}) size={:#x}\n",
+            r.base,
+            r.base + r.size,
+            r.size
+        );
     }
     printk!("devices: {}\n", info.dev_count);
     for i in 0..info.dev_count {
         let d = &info.devices[i];
-        printk!("  mmio {:#x}+{:#x} irq={:?}\n", d.mmio_base, d.mmio_size, d.irq);
+        printk!(
+            "  mmio {:#x}+{:#x} irq={:?}\n",
+            d.mmio_base,
+            d.mmio_size,
+            d.irq
+        );
     }
 }
 
@@ -57,11 +67,20 @@ pub fn memory(_line: &[u8]) {
     for (order, &n) in counts.iter().enumerate() {
         if n > 0 && order >= 12 {
             let block_frames = 1u64 << (order - 12); // order 12=1 frame
-            printk!("free order{} ({:#x}): {} blocks\n", order, 1usize << order, n);
+            printk!(
+                "free order{} ({:#x}): {} blocks\n",
+                order,
+                1usize << order,
+                n
+            );
             free_frames = free_frames.saturating_add((n as u64 * block_frames) as usize);
         }
     }
-    printk!("free frames: {} (~{:#x} bytes)\n", free_frames, free_frames * memory::FRAME_SIZE);
+    printk!(
+        "free frames: {} (~{:#x} bytes)\n",
+        free_frames,
+        free_frames * memory::FRAME_SIZE
+    );
 }
 
 /// `frame <addr>`：按物理地址（hex）显示帧归属 —— 现在只显示"帧号对应范围"，
@@ -83,7 +102,12 @@ pub fn frame(line: &[u8]) {
     match addr {
         Ok(pa) => {
             let frame = memory::FrameId::from_pa(pa);
-            printk!("pa {:#x} -> frame {} (start {:#x})\n", pa, frame.raw(), frame.start_pa());
+            printk!(
+                "pa {:#x} -> frame {} (start {:#x})\n",
+                pa,
+                frame.raw(),
+                frame.start_pa()
+            );
         }
         Err(_) => printk!("invalid address: '{}'\n", addr_str),
     }

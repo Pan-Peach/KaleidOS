@@ -112,7 +112,13 @@ pub fn init(frame_start: usize, frame_end: usize) -> Result<(), &'static str> {
     match &init_result {
         Ok(()) => {
             let span_frames = (frame_end - frame_start) / FRAME_SIZE;
-            log!("memory", "region 0x{:x}-0x{:x} span_frames={}", frame_start, frame_end, span_frames);
+            log!(
+                "memory",
+                "region 0x{:x}-0x{:x} span_frames={}",
+                frame_start,
+                frame_end,
+                span_frames
+            );
             log!("memory", "init OK");
         }
         Err(e) => {
