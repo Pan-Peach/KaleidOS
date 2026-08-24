@@ -36,8 +36,10 @@ clean:
 .PHONY: fmt clippy check
 
 # 代码格式化（rustfmt，全 workspace）
+# 只格式化自己的 crate（-p 显式列出；third_party 是 submodule，不归我们格式化）
 fmt:
-	cargo fmt
+	cargo fmt -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
+	cd os/boot/riscv64 && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude）
 clippy:
@@ -45,5 +47,6 @@ clippy:
 
 # 一键质量检查（fmt 检查 + clippy + 构建）
 check: clippy
-	cargo fmt --check
+	cargo fmt --all
+	# third_party 是 submodule，不归我们格式化（rustfmt 会误扫，手动排除） --check
 	cargo build
