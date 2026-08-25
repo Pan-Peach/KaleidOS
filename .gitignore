@@ -3,4 +3,4 @@
 kaleidos-*
 .omo/
 .codegraph/
-init.kpkg
+/tools/qemu/init.kpkg
