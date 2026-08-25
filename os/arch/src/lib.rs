@@ -39,11 +39,6 @@ pub trait Arch {
     fn console_write_byte(byte: u8);
     fn console_getc() -> Option<u8>;
     fn system_reset(reset_type: ResetType) -> !;
-
-    /// 组件仓库 backend（实现由人类完成）。默认 None = 无仓库。
-    fn component_store() -> Option<&'static dyn ComponentStore> {
-        None
-    }
 }
 
 /// 当前平台的 Arch 实现（编译期确定：host → FakeArch，riscv64 → Riscv64）。

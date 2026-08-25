@@ -63,11 +63,6 @@ impl Arch for Fake {
             core::hint::spin_loop();
         }
     }
-
-    fn component_store() -> Option<&'static dyn crate::ComponentStore> {
-        static STORE: std::sync::OnceLock<store::FakeStore> = std::sync::OnceLock::new();
-        Some(STORE.get_or_init(store::FakeStore::new))
-    }
 }
 
 #[cfg(test)]
