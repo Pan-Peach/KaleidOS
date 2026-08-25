@@ -65,7 +65,7 @@ pub fn parse_entries(blob: &'static [u8]) -> Result<Vec<CpioEntry<'static>>, Sto
 }
 
 /// 嵌入式仓库：持有 .initpkg 字节切片（无状态，blob 即一切）。
-#[allow(dead_code)] // blob 在 list/read 实现后读取
+// blob 在 list/read 实现后读取
 pub struct EmbeddedStore {
     blob: &'static [u8],
 }
@@ -78,11 +78,27 @@ impl EmbeddedStore {
 
 impl ComponentStore for EmbeddedStore {
     fn list(&self) -> Result<Vec<StoreEntry>, StoreError> {
-        todo!("人类实现：parse_entries(self.blob) → StoreEntry 列表")
+        let entries = parse_entries(self.blob)?
+            .into_iter()
+            .map(|e| StoreEntry {
+                name: e.name.to_vec(),
+                len: e.data.len(),
+            })
+            .collect();
+        Ok(entries)
     }
 
-    fn read(&self, _name: &[u8], _buf: &mut [u8]) -> Result<(), StoreError> {
-        todo!("人类实现：按 name 找条目 → 越界检查后拷贝")
+    fn read(&self, name: &[u8], buf: &mut [u8]) -> Result<(), StoreError> {
+        let entries = parse_entries(self.blob)?;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or(StoreError::NotFound)?;
+        if buf.len() < entry.data.len() {
+            return Err(StoreError::TooSmall);
+        }
+        buf[..entry.data.len()].copy_from_slice(entry.data);
+        Ok(())
     }
 }
 
@@ -119,5 +135,41 @@ mod tests {
         let entries = parse_entries(REAL_KPKG).expect("parse real kpkg");
         let pos = entries[0].data.as_ptr() as usize - REAL_KPKG.as_ptr() as usize;
         assert_eq!(pos, 120, "data 切片应直接借用 blob 内部（零拷贝）");
+    }
+
+    #[test]
+    fn list_returns_directory_entries() {
+        let store = EmbeddedStore::new(REAL_KPKG);
+        let entries = store.list().expect("list real kpkg");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b"manifest");
+        assert_eq!(entries[0].len, 18);
+        assert_eq!(entries[1].name, b"kcomp_smoke.kcomp");
+        assert_eq!(entries[1].len, 1016);
+    }
+
+    #[test]
+    fn read_manifest_returns_content() {
+        let store = EmbeddedStore::new(REAL_KPKG);
+        let mut buf = [0u8; 64];
+        store.read(b"manifest", &mut buf).expect("read manifest");
+        assert_eq!(&buf[..18], b"kcomp_smoke.kcomp\n");
+    }
+
+    #[test]
+    fn read_missing_name_is_not_found() {
+        let store = EmbeddedStore::new(REAL_KPKG);
+        let mut buf = [0u8; 64];
+        assert_eq!(store.read(b"nope", &mut buf), Err(StoreError::NotFound));
+    }
+
+    #[test]
+    fn read_small_buffer_is_too_small() {
+        let store = EmbeddedStore::new(REAL_KPKG);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            store.read(b"kcomp_smoke.kcomp", &mut buf),
+            Err(StoreError::TooSmall)
+        );
     }
 }
