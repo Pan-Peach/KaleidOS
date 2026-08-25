@@ -69,6 +69,21 @@ fn trim_leading(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// 命令解析结果：命中命令（含剥离后的参数）或未知（含首个 token）。
+enum Resolved<'a> {
+    Known(&'static Command, &'a [u8]),
+    Unknown(&'a [u8]),
+}
+
+/// 行 → (命令, 参数)，无 I/O；run() 负责分发，这里供 host 测试直接调用。
+fn resolve_command(line: &[u8]) -> Resolved<'_> {
+    let first = line.split(|&b| b == b' ').next().unwrap_or(b"");
+    match COMMANDS.iter().find(|c| c.name.as_bytes() == first) {
+        Some(c) => Resolved::Known(c, trim_leading(&line[first.len()..])),
+        None => Resolved::Unknown(first),
+    }
+}
+
 /// 进入 Monitor 主循环（永不返回）。
 pub fn run() -> ! {
     printk!("KaleidOS Core Monitor\n");
@@ -82,21 +97,84 @@ pub fn run() -> ! {
             continue;
         }
         let line = &buf[..n];
-        let first = line.split(|&b| b == b' ').next().unwrap_or(b"");
-        // 匹配命令名（大小写敏感，精确）
-        let cmd = COMMANDS.iter().find(|c| c.name.as_bytes() == first);
         printk!("\n");
-        match cmd {
-            Some(c) => {
-                // handler 只收参数：命令名之后的部分（剥前导空白）
-                let args = trim_leading(&line[first.len()..]);
-                (c.run)(args);
-            }
-            None => {
+        match resolve_command(line) {
+            Resolved::Known(cmd, args) => (cmd.run)(args),
+            Resolved::Unknown(first) => {
                 printk!("unknown command '");
                 print::print_bytes(first);
                 printk!("' (try 'help')\n");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::string::ToString;
+
+    fn name(res: &Resolved<'_>) -> String {
+        match res {
+            Resolved::Known(c, _) => c.name.to_string(),
+            Resolved::Unknown(tok) => core::str::from_utf8(tok).unwrap_or("<bad>").to_string(),
+        }
+    }
+
+    fn args<'a>(res: &'a Resolved<'a>) -> &'a [u8] {
+        match res {
+            Resolved::Known(_, a) => a,
+            Resolved::Unknown(_) => b"",
+        }
+    }
+
+    #[test]
+    fn known_command_with_args() {
+        let r = resolve_command(b"frame 0x1000");
+        assert_eq!(name(&r), "frame");
+        assert_eq!(args(&r), b"0x1000");
+    }
+
+    #[test]
+    fn multiple_spaces_are_stripped() {
+        let r = resolve_command(b"frame    0x1000");
+        assert_eq!(name(&r), "frame");
+        assert_eq!(args(&r), b"0x1000");
+    }
+
+    #[test]
+    fn command_only_has_empty_args() {
+        let r = resolve_command(b"frame");
+        assert_eq!(name(&r), "frame");
+        assert!(args(&r).is_empty());
+    }
+
+    #[test]
+    fn tab_is_whitespace_but_not_understood_as_separator() {
+        // trim_leading 认 tab；但 first-token 分离只认空格 → 命令名含 tab 前缀时
+        // first 不是纯命令名。这里记录现状：tab 分隔的后续参数被剥离，
+        // 但命令名本身以 tab 开头时作为未知处理（与空格行为不同）。
+        let r = resolve_command(b"frame\t0x1000");
+        // 实际上 "frame\t0x1000" 中 first = "frame\t0x1000"（无空格）→ 未知
+        assert!(matches!(r, Resolved::Unknown(_)));
+    }
+
+    #[test]
+    fn case_sensitive() {
+        assert!(matches!(resolve_command(b"FRAME"), Resolved::Unknown(_)));
+        assert!(matches!(resolve_command(b"Frame"), Resolved::Unknown(_)));
+    }
+
+    #[test]
+    fn unknown_returns_first_token() {
+        let r = resolve_command(b"wat value");
+        assert_eq!(name(&r), "wat");
+    }
+
+    #[test]
+    fn empty_input_is_unknown_empty() {
+        let r = resolve_command(b"");
+        assert!(matches!(r, Resolved::Unknown(_)));
     }
 }

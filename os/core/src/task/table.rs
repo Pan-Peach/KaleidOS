@@ -87,3 +87,145 @@ impl TaskTable {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machine::CpuId;
+    use crate::memory::test_support;
+    use crate::task::state::TaskState;
+    use alloc::vec::Vec;
+
+    const ENTRY: usize = 0x8000_0000;
+
+    fn setup() -> test_support::Guard<'static> {
+        test_support::ensure_init();
+        test_support::GUARD.lock()
+    }
+
+    #[test]
+    fn new_and_default_are_empty() {
+        let mut t = TaskTable::new();
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.iter().next(), None);
+        assert_eq!(t.remove(TaskId::from_raw(0)), Err(TaskError::NotFound));
+
+        let d = TaskTable::default();
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn create_get_roundtrip() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(ENTRY).expect("create");
+        assert_eq!(id.raw(), 0, "first id is 0");
+
+        assert_eq!(t.len(), 1);
+        assert!(t.contains(id));
+        let rec = t.get(id).expect("get after create");
+        assert_eq!(rec.state, TaskState::Created);
+        assert!(
+            rec.kstack.base.is_multiple_of(memory::FRAME_SIZE),
+            "kstack base frame-aligned"
+        );
+        assert_eq!(rec.kstack.size, memory::FRAME_SIZE);
+    }
+
+    #[test]
+    fn get_mut_mutation_is_visible() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(ENTRY).unwrap();
+        assert!(matches!(t.get(id).unwrap().state, TaskState::Created));
+
+        t.get_mut(id).unwrap().state = TaskState::Running(CpuId(0));
+        assert!(matches!(t.get(id).unwrap().state, TaskState::Running(_)));
+    }
+
+    #[test]
+    fn sequential_ids_are_unique_and_iterated_in_order() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(t.create(ENTRY).expect("create").raw());
+        }
+        assert_eq!(ids, [0, 1, 2], "sequential unique ids");
+
+        let iter: Vec<u32> = t.iter().map(|(id, _)| id.raw()).collect();
+        assert_eq!(iter, [0, 1, 2], "BTreeMap iterates in id order");
+    }
+
+    #[test]
+    fn remove_returns_record_and_empties() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(ENTRY).unwrap();
+        let rec = t.remove(id).expect("remove");
+        assert_eq!(rec.kstack.size, memory::FRAME_SIZE);
+        assert!(t.is_empty());
+        assert_eq!(
+            t.remove(id),
+            Err(TaskError::NotFound),
+            "second remove fails"
+        );
+        memory::free_frame(crate::memory::FrameId::from_pa(rec.kstack.base))
+            .expect("free removed task's frame");
+    }
+
+    #[test]
+    fn create_reports_no_memory_without_insertion() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let mut held = Vec::new();
+        while let Ok(f) = memory::alloc_frame() {
+            held.push(f);
+        }
+        assert!(matches!(t.create(ENTRY), Err(TaskError::NoMemory)));
+        assert!(t.is_empty(), "failed create must not register");
+
+        for f in held {
+            memory::free_frame(f).expect("free held frame");
+        }
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_without_overwrite() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let f1 = memory::alloc_frame().unwrap();
+        let rec1 = TaskRecord::new(
+            Box::new(ArchImpl::new_context(
+                ENTRY,
+                f1.start_pa() + memory::FRAME_SIZE,
+            )),
+            Kernelstack::new(f1.start_pa(), memory::FRAME_SIZE),
+        );
+        let id = TaskId::from_raw(7);
+        assert_eq!(t.insert(id, rec1), Ok(()));
+
+        let f2 = memory::alloc_frame().unwrap();
+        let rec2 = TaskRecord::new(
+            Box::new(ArchImpl::new_context(
+                ENTRY,
+                f2.start_pa() + memory::FRAME_SIZE,
+            )),
+            Kernelstack::new(f2.start_pa(), memory::FRAME_SIZE),
+        );
+
+        assert_eq!(t.insert(id, rec2), Err(TaskError::AlreadyExists));
+        assert_eq!(t.len(), 1, "no overwrite");
+        let stored = t.get(id).expect("stored");
+        assert_eq!(stored.kstack.base, f1.start_pa());
+        memory::free_frame(f1).unwrap();
+        memory::free_frame(f2).unwrap();
+    }
+}

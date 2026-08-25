@@ -1,5 +1,6 @@
 //! TaskTable 操作的错误类型。
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum TaskError {
     /// 同一 id 已存在（create/insert 撞号，真相上不应发生：id 由 Core 单调分配）。
     AlreadyExists,

@@ -189,30 +189,16 @@ pub fn free_block_counts() -> [usize; HEAP_ORDER] {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use spin::Mutex;
-
-    /// 全局 HEAP 的公共 API 测试（务必各自分配后释放，不耗尽）。
-    static GUARD: Mutex<()> = Mutex::new(());
-    static INIT: std::sync::Once = std::sync::Once::new();
-
-    /// 只初始化一次全局 HEAP（try_init 非幂等）；backing 泄漏到进程结束。
-    fn ensure_init() {
-        INIT.call_once(|| {
-            let mut buf = std::vec![0u8; 1 << 21];
-            let base = buf.as_mut_ptr() as usize;
-            let start = (base + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
-            let mut heap = HEAP.lock();
-            unsafe { heap.try_init(start, 1 << 21).expect("test init failed") };
-            core::mem::forget(buf);
-        });
-    }
 
     #[test]
     fn init_frame_alloc_and_free() {
-        let _g = GUARD.lock();
-        ensure_init();
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
 
         let f = alloc_frame().expect("alloc should succeed");
         assert_eq!(f.start_pa() % FRAME_SIZE, 0);
@@ -224,8 +210,8 @@ mod tests {
 
     #[test]
     fn alloc_after_free_reuses() {
-        let _g = GUARD.lock();
-        ensure_init();
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
 
         let f1 = alloc_frame().expect("alloc f1");
         free_frame(f1).expect("free f1");

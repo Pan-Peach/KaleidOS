@@ -13,10 +13,20 @@ use std::{io::Write, println};
 pub struct Fake;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FakeContext {
     regs: [usize; 32],
     pc: usize,
+}
+
+impl FakeContext {
+    pub const fn pc(&self) -> usize {
+        self.pc
+    }
+
+    pub const fn reg(&self, idx: usize) -> usize {
+        self.regs[idx]
+    }
 }
 
 impl Arch for Fake {
@@ -49,6 +59,24 @@ impl Arch for Fake {
     fn system_reset(_reset_type: ResetType) -> ! {
         loop {
             core::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_context_sets_entry_sp_and_clears_rest() {
+        let ctx = Fake::new_context(0x8000_0000, 0x9000_0000);
+        assert_eq!(ctx.pc(), 0x8000_0000, "pc = entry (resume point)");
+        assert_eq!(ctx.reg(2), 0x9000_0000, "regs[2] = sp (stack top)");
+        // 其余寄存器必须清零（ABI 首启未定义，清零安全）
+        for i in 0..32 {
+            if i != 2 {
+                assert_eq!(ctx.reg(i), 0, "regs[{i}] should be zero");
+            }
         }
     }
 }

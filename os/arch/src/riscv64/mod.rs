@@ -7,7 +7,7 @@ global_asm!(include_str!("switch.S"));
 pub struct Riscv64;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Riscv64Context {
     ra: usize,
     sp: usize,

@@ -5,6 +5,7 @@ use crate::task::state::TaskState;
 use alloc::boxed::Box;
 use arch::ContextImpl;
 
+#[derive(Debug, PartialEq)]
 pub struct TaskRecord {
     pub state: TaskState,
     pub context: Box<ContextImpl>,
