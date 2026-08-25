@@ -11,7 +11,7 @@ pub struct Riscv64;
 pub struct Riscv64Context {
     ra: usize,
     sp: usize,
-    x: [usize; 12], // a0-a7, t0-t2
+    s: [usize; 12], // s0-s11
 }
 
 impl Arch for Riscv64 {
@@ -30,7 +30,7 @@ impl Arch for Riscv64 {
         Riscv64Context {
             ra: entry,
             sp: stack_top,
-            x: [0; 12],
+            s: [0; 12],
         }
     }
 
