@@ -19,6 +19,14 @@ SECTIONS
         *(.srodata .srodata.*)
     }
 
+    /* 内嵌组件归档（init.kpkg = cpio），由 Makefile 的 rust-objcopy 生成 initpkg.o 提供 */
+    .initpkg : ALIGN(4k)
+    {
+        __initpkg_start = .;
+        *(.initpkg)
+        __initpkg_end = .;
+    }
+
     .data : ALIGN(4k)
     {
         *(.data .data.*)

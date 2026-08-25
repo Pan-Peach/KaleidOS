@@ -96,10 +96,18 @@ impl core::fmt::Debug for MemoryRegion {
     }
 }
 
+/// 设备的一个空间条目：MMIO 窗口或 PIO 窗口，互斥由类型保证。
+/// x86 特有 PIO（RISC-V/ARM 只有 MMIO）；一个设备可占多条目（如 PCI 双 BAR）。
+/// 预留：X86_64 arch 发 Pio 条目，Core 的 Handle 机制据此选择访问原语。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoSpace {
+    Mmio { base: usize, size: usize },
+    Pio { base: usize, size: usize },
+}
+
 #[derive(Clone, Copy)]
 pub struct DeviceDescriptor {
-    pub mmio_base: usize,
-    pub mmio_size: usize,
+    pub space: IoSpace,
     pub irq: Option<u32>,
     pub compatibles: [CompatStr; 4],
     pub compat_count: u8,
@@ -108,8 +116,7 @@ pub struct DeviceDescriptor {
 impl DeviceDescriptor {
     pub const fn empty() -> Self {
         Self {
-            mmio_base: 0,
-            mmio_size: 0,
+            space: IoSpace::Mmio { base: 0, size: 0 },
             irq: None,
             compatibles: [CompatStr::empty(); 4],
             compat_count: 0,
@@ -119,12 +126,12 @@ impl DeviceDescriptor {
 
 impl core::fmt::Debug for DeviceDescriptor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "DeviceDescriptor {{ mmio_base: {:#x}, mmio_size: ",
-            self.mmio_base
-        )?;
-        write_size(f, self.mmio_size)?;
+        let (space, base, size) = match self.space {
+            IoSpace::Mmio { base, size } => ("mmio", base, size),
+            IoSpace::Pio { base, size } => ("pio", base, size),
+        };
+        write!(f, "DeviceDescriptor {{ {space}: {base:#x}, size: ")?;
+        write_size(f, size)?;
         match self.irq {
             Some(irq) => write!(f, ", irq: {irq}, compatibles: ")?,
             None => write!(f, ", irq: None, compatibles: ")?,

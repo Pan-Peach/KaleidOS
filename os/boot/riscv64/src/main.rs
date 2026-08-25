@@ -5,7 +5,9 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
-use kernel::machine::{CompatStr, CpuId, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
+use kernel::machine::{
+    CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
+};
 
 mod console;
 
@@ -13,10 +15,20 @@ global_asm!(include_str!("entry.S"));
 
 // 链接脚本符号：本文档镜像（bootstrap + core 单一 kaleidos.elf）的物理范围。
 // 取地址（不是值）：这段是 Core 自己，启动后永久 Reserved。
+// __initpkg_*：内嵌组件归档（init.kpkg = cpio）所在段（见下方 INITPKG 注入）。
 unsafe extern "C" {
     static __bootstrap_start: u8;
     static __bootstrap_end: u8;
+    static __initpkg_start: u8;
+    static __initpkg_end: u8;
 }
+
+// 内嵌组件归档：编译期把 init.kpkg（make init.kpkg 生成）注入 .initpkg 段。
+// rustc 原生 link_section → ABI 与镜像一致，无需 objcopy。
+#[used]
+#[unsafe(link_section = ".initpkg")]
+static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
+    *include_bytes!("../../../../tools/qemu/init.kpkg");
 
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
@@ -97,6 +109,26 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             match kernel::init(&info, &reserved) {
                 Ok(()) => {
                     kernel::log!("core", "BOOT CORE OK");
+
+                    // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
+                    let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
+                    let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
+                    let pkg = unsafe {
+                        core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start)
+                    };
+                    kernel::component::store::init(pkg);
+                    if let Some(store) = kernel::component::store::get_component_store() {
+                        let list = store.list();
+                        match list {
+                            Ok(entries) => {
+                                kernel::log!("store", "embedded kpkg: {} components", entries.len())
+                            }
+                            Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
+                        }
+                    } else {
+                        kernel::log!("store", "store: not initialized");
+                    }
+
                     // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                     kernel::monitor::run();
                 }
@@ -131,8 +163,10 @@ fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<
         for entry in r.iter::<u64, u64>() {
             if let Ok(reg) = entry {
                 descriptor = Some(DeviceDescriptor {
-                    mmio_base: reg.address as usize,
-                    mmio_size: reg.len as usize,
+                    space: IoSpace::Mmio {
+                        base: reg.address as usize,
+                        size: reg.len as usize,
+                    },
                     irq: None,
                     compatibles: [CompatStr::empty(); 4],
                     compat_count: 0,

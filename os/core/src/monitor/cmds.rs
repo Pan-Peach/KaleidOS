@@ -3,7 +3,7 @@
 //! 全部只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
 
-use crate::machine::MachineInfo;
+use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
 use alloc::vec::Vec;
@@ -51,10 +51,12 @@ pub fn machine(_line: &[u8]) {
     printk!("devices: {}\n", info.dev_count);
     for i in 0..info.dev_count {
         let d = &info.devices[i];
+        let (space, base, size) = match d.space {
+            IoSpace::Mmio { base, size } => ("mmio", base, size),
+            IoSpace::Pio { base, size } => ("pio", base, size),
+        };
         printk!(
-            "  mmio {:#x}+{:#x} irq={:?} compatible={:?}\n",
-            d.mmio_base,
-            d.mmio_size,
+            "  {space} {base:#x}+{size:#x} irq={:?} compatible={:?}\n",
             d.irq,
             d.compatibles[..d.compat_count as usize]
                 .iter()

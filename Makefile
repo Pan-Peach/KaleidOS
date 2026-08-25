@@ -23,30 +23,38 @@ kernel:
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT)"
 
-# 调试看输出（串口打印 + Ctrl-A X 退出 QEMU）
-# -smp 2: 2 核（hart 0 boot，hart 1 被 OpenSBI park）；-m 4G: 4GB RAM
-# -fw_cfg: 把 init.kpkg（cpio 归档）作为 fw_cfg 文件传给内核 —— 
-#          "内核可以直接找"的组件仓库（开发模式：kaleidos.elf + 外部 init.kpkg）
-qemu: kernel init.kpkg
-	qemu-system-riscv64 -machine virt -smp 2 -m 4G -bios default \
-		-kernel $(OUTPUT) -nographic \
-		-fw_cfg file=tools/qemu/init.kpkg,name=opt/kaleid/init.kpkg
-
-# —— 组件 .kcomp 打包（Linux insmod/depmod 模式）——
-# 开发模式：kaleidos.elf（内核）+ init.kpkg（组件归档）分开；
-# 发布模式：init.kpkg 内嵌进 kaleidos.elf 的 .initpkg（重打包，未来）
-KCOMP_SRC  := os/components/kcomp_smoke
-KCOMP_OBJ  := $(shell find $(KCOMP_SRC)/target/riscv64gc-unknown-none-elf/release/deps -name "*.o" 2>/dev/null | head -1)
+# —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
+# 组件名 → 源码目录；每个组件编译成 ET_REL 对象（= .kcomp）
+KCOMP_COMPONENTS := core_test kcomp_smoke
+KCOMP_DIRS := $(addprefix os/components/,$(KCOMP_COMPONENTS))
 KPKG_DIR   := /tmp/opencode/kpkg
 
-# 编译组件（ET_REL 对象 = .kcomp）→ cpio newc 归档 + 文本 manifest
+# 构建所有组件对象（ET_REL）→ 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
-	cd $(KCOMP_SRC) && cargo rustc --release --target riscv64gc-unknown-none-elf -- --emit=obj
-	mkdir -p $(KPKG_DIR)
-	cp $(KCOMP_OBJ) $(KPKG_DIR)/kcomp_smoke.kcomp
-	printf "kcomp_smoke.kcomp\n" > $(KPKG_DIR)/manifest
+	@for d in $(KCOMP_DIRS); do \
+		( cd $$d && cargo rustc --release --target riscv64gc-unknown-none-elf -- --emit=obj ); \
+	done
+	@mkdir -p $(KPKG_DIR)
+	@for d in $(KCOMP_DIRS); do \
+		name=$$(basename $$d); \
+		obj=$$(find $$d/target/riscv64gc-unknown-none-elf/release/deps target/riscv64gc-unknown-none-elf/release/deps -maxdepth 1 -name "$$name-*.o" 2>/dev/null | head -1); \
+		cp $$obj $(KPKG_DIR)/$$name.kcomp; \
+	done
+	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest
 	cd $(KPKG_DIR) && find . -type f | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
-	@echo "packed: tools/qemu/init.kpkg"
+	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_COMPONENTS))"
+
+# 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
+kernel: init.kpkg
+	cd $(BOOT_DIR) && cargo build --release
+	cp $(KERNEL) $(OUTPUT)
+	@echo "built: $(OUTPUT) (with embedded init.kpkg)"
+
+# 调试看输出（串口打印 + Ctrl-A X 退出 QEMU）
+# -smp 2: 2 核（hart 0 boot，hart 1 被 OpenSBI park）；-m 4G: 4GB RAM
+qemu: kernel
+	qemu-system-riscv64 -machine virt -smp 2 -m 4G -bios default \
+		-kernel $(OUTPUT) -nographic
 
 clean:
 	rm -f $(OUTPUT)
@@ -69,7 +77,8 @@ clippy:
 	cargo clippy --workspace --all-targets
 
 # 一键质量门禁：任何一步失败即整体失败（CI 可直接用）
-check:
+# 依赖 $(INITPKG_O)：boot 链接需要 .initpkg 对象存在
+check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
 	cd os/boot/riscv64 && cargo fmt -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
