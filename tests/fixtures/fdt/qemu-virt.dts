@@ -14,6 +14,18 @@
         stdout-path = "/soc/serial@10000000";
     };
 
+    // root 级系统设备：QEMU 把 fw-cfg/flash 挂在 / 而不是 /soc，
+    // discovery 必须两层遍历才能看到（见 os/boot/riscv64/src/main.rs）
+    fw-cfg@10100000 {
+        compatible = "qemu,fw-cfg-mmio";
+        reg = <0x0 0x10100000 0x0 0x18>;
+    };
+
+    flash@20000000 {
+        compatible = "cfi-flash";
+        reg = <0x0 0x20000000 0x0 0x2000000 0x0 0x22000000 0x0 0x2000000>;
+    };
+
     memory@80000000 {
         device_type = "memory";
         reg = <0x0 0x80000000 0x0 0x8000000>;
@@ -44,7 +56,7 @@
             reg = <0x0 0x2000000 0x0 0x10000>;
         };
 
-        plic@c000000 {
+        plic: plic@c000000 {
             compatible = "sifive,plic-1.0.0";
             reg = <0x0 0xc000000 0x0 0x4000000>;
             #interrupt-cells = <1>;

@@ -3,6 +3,7 @@
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{CompatStr, CpuId, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
 
@@ -58,45 +59,15 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 cpu_count += 1;
             }
 
-            // 设备清单：遍历 /soc 下带 reg 的子节点（virtio/mmio uart 等）
-            // CompatStr 内嵌复制 → 单遍填充，无需字符串池
+            // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
             let mut dev_count = 0usize;
+            collect_devices(
+                tree.root().as_node().children(),
+                &mut devices,
+                &mut dev_count,
+            );
             if let Some(soc) = tree.find_node("/soc") {
-                for child in soc.children() {
-                    let mut descriptor = None;
-                    if let Some(r) = child.reg() {
-                        for entry in r.iter::<u64, u64>() {
-                            if let Ok(reg) = entry {
-                                descriptor = Some(DeviceDescriptor {
-                                    mmio_base: reg.address as usize,
-                                    mmio_size: reg.len as usize,
-                                    irq: None,
-                                    compatibles: [CompatStr::empty(); 4],
-                                    compat_count: 0,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(mut d) = descriptor {
-                        if let Some(comp) = child.properties().find("compatible") {
-                            if let Ok(list) = comp.as_value::<StringList>() {
-                                for s in list {
-                                    let idx = d.compat_count as usize;
-                                    if idx < d.compatibles.len() {
-                                        d.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
-                                        d.compat_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(irqs) = child.properties().find("interrupts") {
-                            d.irq = irqs.as_value::<u32>().ok();
-                        }
-                        devices[dev_count] = d;
-                        dev_count += 1;
-                    }
-                }
+                collect_devices(soc.children(), &mut devices, &mut dev_count);
             }
 
             let info = MachineInfo {
@@ -142,6 +113,66 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             kernel::log!("bootstrap", "FDT magic: BAD!");
             loop {
                 core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// 提取一个 FDT 节点的设备描述。
+/// 过滤规则：必须有 reg 且 compatible 非空（memory 无 compatible、cpus/chosen/pmu 无 reg，天然跳过）。
+type FdtParser<'a> = (
+    fdt::parsing::unaligned::UnalignedParser<'a>,
+    fdt::parsing::Panic,
+);
+
+fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<DeviceDescriptor> {
+    let mut descriptor = None;
+    if let Some(r) = child.reg() {
+        for entry in r.iter::<u64, u64>() {
+            if let Ok(reg) = entry {
+                descriptor = Some(DeviceDescriptor {
+                    mmio_base: reg.address as usize,
+                    mmio_size: reg.len as usize,
+                    irq: None,
+                    compatibles: [CompatStr::empty(); 4],
+                    compat_count: 0,
+                });
+                break;
+            }
+        }
+    }
+    let mut d = descriptor?;
+    if let Some(comp) = child.properties().find("compatible") {
+        if let Ok(list) = comp.as_value::<StringList>() {
+            for s in list {
+                let idx = d.compat_count as usize;
+                if idx < d.compatibles.len() {
+                    d.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
+                    d.compat_count += 1;
+                }
+            }
+        }
+    }
+    if d.compat_count == 0 {
+        return None;
+    }
+    if let Some(irqs) = child.properties().find("interrupts") {
+        d.irq = irqs.as_value::<u32>().ok();
+    }
+    Some(d)
+}
+
+/// 把一批 FDT 子节点中符合规则的设备收集进 MachineInfo 的定长设备表。
+fn collect_devices<'a>(
+    children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
+    devices: &mut [DeviceDescriptor; 26],
+    dev_count: &mut usize,
+) {
+    for child in children {
+        if let Some(d) = device_descriptor(&child) {
+            if *dev_count < devices.len() {
+                devices[*dev_count] = d;
+                *dev_count += 1;
             }
         }
     }
