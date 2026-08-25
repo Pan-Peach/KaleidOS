@@ -6,6 +6,7 @@
 use crate::machine::MachineInfo;
 use crate::memory;
 use crate::printk;
+use alloc::vec::Vec;
 use arch::{Arch, ResetType};
 use spin::Mutex;
 
@@ -51,10 +52,14 @@ pub fn machine(_line: &[u8]) {
     for i in 0..info.dev_count {
         let d = &info.devices[i];
         printk!(
-            "  mmio {:#x}+{:#x} irq={:?}\n",
+            "  mmio {:#x}+{:#x} irq={:?} compatible={:?}\n",
             d.mmio_base,
             d.mmio_size,
-            d.irq
+            d.irq,
+            d.compatibles[..d.compat_count as usize]
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

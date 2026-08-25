@@ -5,4 +5,6 @@ pub enum TaskError {
     AlreadyExists,
     /// 表内没有该 id（存在性验证失败：ID 可被猜测，查无此人才是真相）。
     NotFound,
+    /// 内存不足。
+    NoMemory,
 }

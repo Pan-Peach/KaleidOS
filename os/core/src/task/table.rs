@@ -1,5 +1,6 @@
 //! 任务真相存储：Core 唯一的任务清单（id → TaskRecord）。
 
+use crate::memory;
 use crate::task::error::TaskError;
 use crate::task::id::TaskId;
 use crate::task::kstack::Kernelstack;
@@ -7,7 +8,7 @@ use crate::task::record::TaskRecord;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
-use arch::ContextImpl;
+use arch::{Arch, ArchImpl};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub struct TaskTable {
@@ -30,13 +31,12 @@ impl TaskTable {
     }
 
     /// 唯二创建入口（public）：分配 id + 登记 record。
-    pub fn create(
-        &mut self,
-        context: Box<ContextImpl>,
-        kstack: Kernelstack,
-    ) -> Result<TaskId, TaskError> {
+    pub fn create(&mut self, entry: usize) -> Result<TaskId, TaskError> {
         let id = self.alloc();
-        let record = TaskRecord::new(context, kstack);
+        let frame = memory::alloc_frame().map_err(|_| TaskError::NoMemory)?;
+        let kstack = Kernelstack::new(frame.start_pa(), memory::FRAME_SIZE);
+        let context = ArchImpl::new_context(entry, kstack.base + kstack.size);
+        let record = TaskRecord::new(Box::new(context), kstack);
         self.insert(id, record)?;
         Ok(id)
     }
