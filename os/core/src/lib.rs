@@ -62,6 +62,7 @@ pub fn init(
     let probe = memory::alloc_frame().map_err(|_| "alloc probe failed")?;
     memory::free_frame(probe).map_err(|_| "free probe failed")?;
 
+    task::init();
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

@@ -31,7 +31,7 @@ pub trait Arch {
     /// 寄存器上下文类型。
     type Context;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
-    fn new_context(entry: usize, arg: usize, stack_top: usize) -> Self::Context;
+    fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     fn console_write_byte(byte: u8);
     fn console_getc() -> Option<u8>;
     fn system_reset(reset_type: ResetType) -> !;

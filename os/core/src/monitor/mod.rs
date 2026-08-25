@@ -62,6 +62,13 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
+fn trim_leading(mut s: &[u8]) -> &[u8] {
+    while let Some(&b' ' | &b'\t') = s.first() {
+        s = &s[1..];
+    }
+    s
+}
+
 /// 进入 Monitor 主循环（永不返回）。
 pub fn run() -> ! {
     printk!("KaleidOS Core Monitor\n");
@@ -80,7 +87,11 @@ pub fn run() -> ! {
         let cmd = COMMANDS.iter().find(|c| c.name.as_bytes() == first);
         printk!("\n");
         match cmd {
-            Some(c) => (c.run)(line),
+            Some(c) => {
+                // handler 只收参数：命令名之后的部分（剥前导空白）
+                let args = trim_leading(&line[first.len()..]);
+                (c.run)(args);
+            }
             None => {
                 printk!("unknown command '");
                 print::print_bytes(first);

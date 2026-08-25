@@ -1,12 +1,17 @@
 use crate::{Arch, ResetType};
+use core::arch::global_asm;
 use sbi_rt;
+
+global_asm!(include_str!("switch.S"));
 
 pub struct Riscv64;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Riscv64Context {
-    x: [usize; 32],
+    ra: usize,
+    sp: usize,
+    x: [usize; 12], // a0-a7, t0-t2
     sstate: usize,
     sepc: usize,
 }
@@ -14,17 +19,23 @@ pub struct Riscv64Context {
 impl Arch for Riscv64 {
     type Context = Riscv64Context;
 
-    fn context_switch(from: &mut Self::Context, to: &Self::Context) {}
+    fn context_switch(from: &mut Self::Context, to: &Self::Context) {
+        unsafe extern "C" {
+            fn __switch(from: *mut Riscv64Context, to: *const Riscv64Context);
+        }
+        unsafe {
+            __switch(from as *mut Riscv64Context, to as *const Riscv64Context);
+        }
+    }
 
-    fn new_context(entry: usize, arg: usize, stack_top: usize) -> Self::Context {
-        let mut ctx = Riscv64Context {
-            x: [0; 32],
+    fn new_context(entry: usize, stack_top: usize) -> Self::Context {
+        Riscv64Context {
+            ra: entry,
+            sp: stack_top,
+            x: [0; 12],
             sstate: 0,
             sepc: entry,
-        };
-        ctx.x[10] = arg; // a0
-        ctx.x[2] = stack_top; // sp
-        ctx
+        }
     }
 
     fn console_write_byte(byte: u8) {

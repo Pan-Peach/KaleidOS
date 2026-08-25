@@ -27,12 +27,11 @@ impl Arch for Fake {
         println!("Switching context from {:?} to {:?}", from, to);
     }
 
-    fn new_context(entry: usize, arg: usize, stack_top: usize) -> Self::Context {
+    fn new_context(entry: usize, stack_top: usize) -> Self::Context {
         let mut ctx = Self::Context {
             regs: [0; 32],
             pc: entry,
         };
-        ctx.regs[10] = arg; // a0
         ctx.regs[2] = stack_top; // sp
         ctx
     }

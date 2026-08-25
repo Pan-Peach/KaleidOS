@@ -147,10 +147,21 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
     }
 }
 
+struct DirectWriter;
+impl core::fmt::Write for DirectWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.bytes() {
+            console::write(s);
+        }
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // 绕过 print（panic 时其锁可能已损坏），直接 SBI 紧急输出。
-    console::puts_direct("BOOTSTRAP PANIC");
+    let mut writer = DirectWriter;
+    let _ = core::fmt::write(&mut writer, format_args!("\nPANIC: {}\n", _info));
     loop {
         core::hint::spin_loop();
     }
