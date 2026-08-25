@@ -4,6 +4,8 @@ use crate::{Arch, ResetType};
 extern crate std;
 use std::{io::Write, println};
 
+pub mod store;
+
 /// Host 实现：console 直通 std stdout/stdin。
 ///
 /// - `console_write_byte`：逐字节写 stdout 并 flush——串口语义（无缓冲、保序），
@@ -60,6 +62,11 @@ impl Arch for Fake {
         loop {
             core::hint::spin_loop();
         }
+    }
+
+    fn component_store() -> Option<&'static dyn crate::ComponentStore> {
+        static STORE: std::sync::OnceLock<store::FakeStore> = std::sync::OnceLock::new();
+        Some(STORE.get_or_init(store::FakeStore::new))
     }
 }
 
