@@ -46,6 +46,11 @@ const COMMANDS: &[Command] = &[
         run: cmds::frame,
     },
     Command {
+        name: "tasks",
+        help: "list tasks",
+        run: cmds::tasks,
+    },
+    Command {
         name: "shutdown",
         help: "shutdown the system",
         run: cmds::shutdown,

@@ -113,6 +113,19 @@ pub fn frame(line: &[u8]) {
     }
 }
 
+pub fn tasks(_line: &[u8]) {
+    let table = crate::task::get_task_table().lock();
+    printk!("tasks: {}\n", table.len());
+    for (id, record) in table.iter() {
+        printk!(
+            "  id={} kstack={:#x} context={:?}\n",
+            id,
+            record.kstack.base,
+            record.context
+        );
+    }
+}
+
 pub fn shutdown(_line: &[u8]) {
     arch::ArchImpl::system_reset(ResetType::Shutdown);
 }

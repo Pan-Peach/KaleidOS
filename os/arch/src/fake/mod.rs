@@ -2,7 +2,7 @@ use crate::{Arch, ResetType};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 riscv64），显式引入 std 供 console 直通。
 extern crate std;
-use std::io::Write;
+use std::{io::Write, println};
 
 /// Host 实现：console 直通 std stdout/stdin。
 ///
@@ -12,7 +12,31 @@ use std::io::Write;
 ///   host 测试中调用它会挂死——需要交互输入时走 QEMU 层，不在 fake 里读 stdin。
 pub struct Fake;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FakeContext {
+    regs: [usize; 32],
+    pc: usize,
+}
+
 impl Arch for Fake {
+    type Context = FakeContext;
+
+    fn context_switch(from: &mut Self::Context, to: &Self::Context) {
+        // Placeholder for context switch logic
+        println!("Switching context from {:?} to {:?}", from, to);
+    }
+
+    fn new_context(entry: usize, arg: usize, stack_top: usize) -> Self::Context {
+        let mut ctx = Self::Context {
+            regs: [0; 32],
+            pc: entry,
+        };
+        ctx.regs[10] = arg; // a0
+        ctx.regs[2] = stack_top; // sp
+        ctx
+    }
+
     fn console_write_byte(byte: u8) {
         let mut out = std::io::stdout();
         let _ = out.write_all(&[byte]);

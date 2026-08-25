@@ -28,6 +28,10 @@ pub enum ResetType {
 /// Arch 接口：ISA 无关的统一操作面（静态方法，无实例）。
 /// host 编译用 FakeArch 实现，riscv64 用 Riscv64 实现（cfg 选择）。
 pub trait Arch {
+    /// 寄存器上下文类型。
+    type Context;
+    fn context_switch(from: &mut Self::Context, to: &Self::Context);
+    fn new_context(entry: usize, arg: usize, stack_top: usize) -> Self::Context;
     fn console_write_byte(byte: u8);
     fn console_getc() -> Option<u8>;
     fn system_reset(reset_type: ResetType) -> !;
@@ -40,3 +44,7 @@ pub type ArchImpl = riscv64::Riscv64;
 
 #[cfg(not(target_arch = "riscv64"))]
 pub type ArchImpl = fake::Fake;
+
+/// 当前平台的任务上下文类型（对称于 `ArchImpl`，供 Core 直接使用）。
+/// Core 只依赖 `ContextImpl`，不关心具体 ISA 的寄存器布局。
+pub type ContextImpl = <ArchImpl as Arch>::Context;

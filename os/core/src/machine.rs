@@ -4,6 +4,8 @@
 //! 定长数组后，DTB 即可丢弃；core::init 消费的是 Core 自己的真相。
 //! 字段语义：Core Resource Truth 的"提案"，由 core::init 校验后提交。
 
+use core::fmt::Debug;
+
 /// 兼容性字符串块：内嵌定长（FDT compatible 一般 ≤ 32B），值类型可 Copy。
 #[derive(Clone, Copy)]
 pub struct CompatStr {
@@ -39,10 +41,29 @@ impl core::fmt::Debug for CompatStr {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CpuId(pub usize);
+
+impl core::fmt::Display for CpuId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "CPU{}", self.0)
+    }
+}
+
+impl CpuId {
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CpuInfo {
     pub boot_cpu: bool,
-    pub hart_id: usize,
+    pub hart_id: CpuId,
 }
 
 #[derive(Clone, Copy)]

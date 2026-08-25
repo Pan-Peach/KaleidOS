@@ -9,6 +9,7 @@
 //! 设计契约见 `docs/architecture.md` 与 `docs/core-philosophy.md`。
 
 #![no_std]
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;

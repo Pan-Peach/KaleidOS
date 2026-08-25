@@ -4,7 +4,7 @@
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use fdt::properties::values::StringList;
-use kernel::machine::{CompatStr, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
+use kernel::machine::{CompatStr, CpuId, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
 
 mod console;
 
@@ -33,7 +33,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
             let mut cpu_info = [CpuInfo {
                 boot_cpu: false,
-                hart_id: 0,
+                hart_id: CpuId(0),
             }; 8];
             let mut devices = [DeviceDescriptor::empty(); 26];
 
@@ -53,7 +53,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 let hart = cpu.reg::<u64>().first().unwrap_or(0);
                 cpu_info[cpu_count] = CpuInfo {
                     boot_cpu: hart == hart_id as u64,
-                    hart_id: hart as usize,
+                    hart_id: CpuId(hart as usize),
                 };
                 cpu_count += 1;
             }
