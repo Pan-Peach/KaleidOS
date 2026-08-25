@@ -15,10 +15,10 @@ jobs:
         run: git submodule update --init --recursive
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: riscv64gc-unknown-none-elf
-      - name: Install rustfmt and clippy
-        run: rustup component add rustfmt clippy
+      - name: Install riscv64 target, rustfmt, clippy
+        run: |
+          rustup target add riscv64gc-unknown-none-elf
+          rustup component add rustfmt clippy
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -36,8 +36,8 @@ jobs:
         run: git submodule update --init --recursive
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: riscv64gc-unknown-none-elf
+      - name: Install riscv64 target
+        run: rustup target add riscv64gc-unknown-none-elf
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-riscv
       - name: Rust cache
