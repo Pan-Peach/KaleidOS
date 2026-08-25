@@ -1,0 +1,10 @@
+[package]
+name = "kcomp_smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）
+[workspace]
+
+[dependencies]
