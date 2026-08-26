@@ -51,7 +51,21 @@ tools/         工具脚本（待建设）
 
 ## 当前状态
 
-**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成：boot 阶段（FDT discovery → MachineInfo）→ `core::init`（BSS 清零 + MetadataHeap 帧分配器 + 探测）→ **Core Monitor 交互 shell**（`core> machine/memory/frame/help/shutdown/reboot`），全链路 `BOOT DISCOVERY OK → BOOT CORE OK → core>`。日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch：host=FakeArch/std，riscv64=SBI DBCN）。质量工具链：`make fmt` / `make clippy` / `make check`。详见 `docs/roadmap.md`。
+**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（2026-08，全部 QEMU 端到端验证）：
+
+- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）
+- **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + 重定位：R_RISCV_CALL/PCREL/R_RISCV_64）→ `registry`（生命周期状态机）→ monitor `load` 命令
+- **导出白名单**（EXPORT_SYMBOL 教学版，7 条 `kcore_*`）：组件只能调白名单，未导出符号 → 加载失败
+
+实机输出：
+
+```text
+core> load kcomp_smoke
+[smoke] hex=12            ← 组件调内核 console/count（通过白名单重定位）
+!load kcomp_smoke: OK (id=1, entry=0x81a00000)
+```
+
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch：host=FakeArch/std，riscv64=SBI DBCN）。质量工具链：`make fmt` / `make clippy` / `make check`（host test 47 个）。详见 `docs/roadmap.md`（含缺口地图与下个里程碑 Sv39）。
 
 ## 构建
 
