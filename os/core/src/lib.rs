@@ -63,6 +63,7 @@ pub fn init(
     memory::free_frame(probe).map_err(|_| "free probe failed")?;
 
     task::init();
+    component::registry::init();
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

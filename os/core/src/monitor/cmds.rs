@@ -6,6 +6,7 @@
 use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
+use alloc::string::String;
 use alloc::vec::Vec;
 use arch::{Arch, ResetType};
 use spin::Mutex;
@@ -129,6 +130,98 @@ pub fn tasks(_line: &[u8]) {
             id,
             record.kstack.base,
             record.context
+        );
+    }
+}
+
+/// `load <name>`：仓库读 kcomp → 放段 → registry 登记 → 调入口。
+pub fn load(args: &[u8]) {
+    let name = args.trim_ascii();
+    if name.is_empty() {
+        printk!("usage: load <name>\n");
+        return;
+    }
+    let Some(store) = crate::component::store::get_component_store() else {
+        printk!("load: store not mounted\n");
+        return;
+    };
+
+    let kname = [name, b".kcomp"].concat();
+    let Ok(entries) = store.list() else {
+        printk!("load: store list failed\n");
+        return;
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.name.as_slice() == kname.as_slice())
+    else {
+        printk!(
+            "load: '{}' not found in store\n",
+            String::from_utf8_lossy(name)
+        );
+        return;
+    };
+    let mut blob = alloc::vec![0u8; entry.len];
+    if store.read(&kname, &mut blob).is_err() {
+        printk!("load: read '{}' failed\n", String::from_utf8_lossy(name));
+        return;
+    }
+
+    let comp = match crate::component::loader::load_component(&blob, arch::ArchImpl::ELF_MACHINE) {
+        Ok(c) => c,
+        Err(e) => {
+            printk!("load: {}: {e:?}\n", String::from_utf8_lossy(name));
+            return;
+        }
+    };
+
+    let mut reg = crate::component::registry::get_registry().lock();
+    let id = match reg.declare(name, comp.entry, comp.base) {
+        Ok(id) => id,
+        Err(e) => {
+            printk!("load: declare failed: {e:?}\n");
+            return;
+        }
+    };
+    if let Err(e) = reg.start(id) {
+        printk!("load: start failed: {e:?}\n");
+        return;
+    }
+    drop(reg);
+
+    let code = crate::component::loader::call_init(&comp);
+    if code == 0 {
+        printk!(
+            "load {}: OK (id={}, entry={:#x})\n",
+            String::from_utf8_lossy(name),
+            id.raw(),
+            comp.entry
+        );
+    } else {
+        crate::component::registry::get_registry()
+            .lock()
+            .mark_failed(id)
+            .ok();
+        printk!(
+            "load {}: FAILED (code={code}, id={})\n",
+            String::from_utf8_lossy(name),
+            id.raw()
+        );
+    }
+}
+
+/// `components`：已加载组件列表。
+pub fn components(_line: &[u8]) {
+    let reg = crate::component::registry::get_registry().lock();
+    printk!("components: {}\n", reg.len());
+    for rec in reg.iter() {
+        printk!(
+            "  id={} state={:?} entry={:#x} base={:#x} name={}\n",
+            rec.id.raw(),
+            rec.state,
+            rec.entry,
+            rec.base,
+            String::from_utf8_lossy(&rec.name)
         );
     }
 }

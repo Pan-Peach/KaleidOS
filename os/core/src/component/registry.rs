@@ -117,6 +117,10 @@ impl Registry {
         self.records.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     fn record_mut(&mut self, id: ComponentId) -> Result<&mut ComponentRecord, RegistryError> {
         self.records
             .iter_mut()

@@ -51,6 +51,16 @@ const COMMANDS: &[Command] = &[
         run: cmds::tasks,
     },
     Command {
+        name: "load",
+        help: "load a kcomp by name (e.g. load core_test)",
+        run: cmds::load,
+    },
+    Command {
+        name: "components",
+        help: "list loaded components",
+        run: cmds::components,
+    },
+    Command {
         name: "shutdown",
         help: "shutdown the system",
         run: cmds::shutdown,
