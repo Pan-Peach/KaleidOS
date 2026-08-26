@@ -16,7 +16,7 @@ pub struct Riscv64Context {
 
 impl Arch for Riscv64 {
     type Context = Riscv64Context;
-
+    const ELF_MACHINE: u16 = 0xF3;
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         unsafe extern "C" {
             fn __switch(from: *mut Riscv64Context, to: *const Riscv64Context);

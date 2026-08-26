@@ -34,6 +34,7 @@ pub enum ResetType {
 pub trait Arch {
     /// 寄存器上下文类型。
     type Context;
+    const ELF_MACHINE: u16;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     fn console_write_byte(byte: u8);

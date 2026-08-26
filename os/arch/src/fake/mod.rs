@@ -33,7 +33,7 @@ impl FakeContext {
 
 impl Arch for Fake {
     type Context = FakeContext;
-
+    const ELF_MACHINE: u16 = 0xF3; // 暂时先用RISC-V
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         // Placeholder for context switch logic
         println!("Switching context from {:?} to {:?}", from, to);
