@@ -5,6 +5,7 @@
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
 pub mod loader;
+pub mod registry;
 pub mod store;
 
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
@@ -25,6 +26,14 @@ impl ComponentId {
     pub const fn raw(self) -> u32 {
         self.0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComponentState {
+    Declared,
+    Starting,
+    Ready,
+    Failed,
 }
 
 #[cfg(test)]
