@@ -27,19 +27,20 @@ static INIT: Once = Once::new();
 /// 测试堆大小（4 MiB；对齐 slack 另加）。
 const TEST_HEAP_SIZE: usize = 1 << 22;
 
+/// 静态 backing：位于测试二进制的 .bss（与代码同段），模拟"组件与内核同物理区"——
+/// 重定位的 ±2GB PC-relative 约束在 host 上也成立（堆分配的地址会被 ASLR 打散）。
+#[cfg(test)]
+static mut TEST_HEAP_BACKING: [u8; TEST_HEAP_SIZE + super::FRAME_SIZE] =
+    [0; TEST_HEAP_SIZE + super::FRAME_SIZE];
+
 /// 确保全局 HEAP 已初始化（进程内一次；重复调用无副作用）。
-/// backing 泄漏到进程结束（`core::mem::forget`——测试进程生命周期即 backing 生命周期）。
 pub(crate) fn ensure_init() {
     INIT.call_once(|| {
-        // 分配 + 对齐 slack：向上对齐最多损失 FRAME_SIZE-1 字节，
-        // 因此多分配 FRAME_SIZE 保证对齐后仍在 backing 内。
-        let mut buf = std::vec![0u8; TEST_HEAP_SIZE + FRAME_SIZE];
-        let base = buf.as_mut_ptr() as usize;
-        let start = align_up_frame(base);
-        let avail = TEST_HEAP_SIZE + FRAME_SIZE - (start - base);
+        let ptr = core::ptr::addr_of_mut!(TEST_HEAP_BACKING) as usize;
+        let start = align_up_frame(ptr);
+        let avail = TEST_HEAP_SIZE + super::FRAME_SIZE - (start - ptr);
 
         let mut heap = HEAP.lock();
         unsafe { heap.try_init(start, avail).expect("test init failed") };
-        core::mem::forget(buf);
     });
 }

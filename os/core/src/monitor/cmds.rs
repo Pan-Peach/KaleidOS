@@ -9,14 +9,10 @@ use crate::printk;
 use alloc::string::String;
 use alloc::vec::Vec;
 use arch::{Arch, ResetType};
-use spin::Mutex;
 
-/// Monitor 持有的 MachineInfo 副本（core::init 时 mount）。
-static MACHINE: Mutex<Option<MachineInfo>> = Mutex::new(None);
-
-/// 挂载 MachineInfo（core::init 完成时调用一次）。
+/// 挂载 MachineInfo（core::init 完成时调用一次）：写入 machine 模块的唯一真相点。
 pub fn mount(info: &MachineInfo) {
-    *MACHINE.lock() = Some(*info);
+    crate::machine::commit(*info);
 }
 
 /// `help`：列出可用命令。
@@ -28,8 +24,7 @@ pub fn help(_line: &[u8]) {
 
 /// `machine`：CPU / RAM 区域 / 设备清单。
 pub fn machine(_line: &[u8]) {
-    let guard = MACHINE.lock();
-    let Some(info) = guard.as_ref() else {
+    let Some(info) = crate::machine::committed() else {
         printk!("machine: not mounted\n");
         return;
     };

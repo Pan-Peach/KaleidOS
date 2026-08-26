@@ -176,3 +176,15 @@ impl core::fmt::Debug for MachineInfo {
             .finish()
     }
 }
+
+static COMMITTED: spin::Mutex<Option<MachineInfo>> = spin::Mutex::new(None);
+
+/// 提交 MachineInfo（core::init 校验通过后调用一次）：唯一真相存放点。
+pub fn commit(info: MachineInfo) {
+    *COMMITTED.lock() = Some(info);
+}
+
+/// 读已提交的 MachineInfo（monitor / export table 共用同一份快照）。
+pub fn committed() -> Option<MachineInfo> {
+    *COMMITTED.lock()
+}
