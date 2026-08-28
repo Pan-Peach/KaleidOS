@@ -1,6 +1,6 @@
 {
   "rust-analyzer.linkedProjects": [
     "Cargo.toml",
-    "bootstrap/riscv64/Cargo.toml"
+    "os/boot/riscv64/Cargo.toml"
   ]
 }

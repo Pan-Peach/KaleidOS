@@ -1,10 +1,26 @@
 use crate::{Arch, ResetType};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 riscv64），显式引入 std 供 console 直通。
 extern crate std;
 use std::{io::Write, println};
 
 pub mod store;
+
+/// Host 上的 trap 模拟：记录架构初始化是否已经安装了 trap 入口。
+pub mod trap {
+    use super::{AtomicBool, Ordering};
+
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    pub fn init() {
+        INITIALIZED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_initialized() -> bool {
+        INITIALIZED.load(Ordering::SeqCst)
+    }
+}
 
 /// Host 实现：console 直通 std stdout/stdin。
 ///
@@ -63,6 +79,10 @@ impl Arch for Fake {
             core::hint::spin_loop();
         }
     }
+
+    fn init() {
+        trap::init();
+    }
 }
 
 #[cfg(test)]
@@ -80,5 +100,12 @@ mod tests {
                 assert_eq!(ctx.reg(i), 0, "regs[{i}] should be zero");
             }
         }
+    }
+
+    #[test]
+    fn init_installs_fake_trap() {
+        assert!(!trap::is_initialized());
+        Fake::init();
+        assert!(trap::is_initialized());
     }
 }

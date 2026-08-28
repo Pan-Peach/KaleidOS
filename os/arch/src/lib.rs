@@ -40,6 +40,7 @@ pub trait Arch {
     fn console_write_byte(byte: u8);
     fn console_getc() -> Option<u8>;
     fn system_reset(reset_type: ResetType) -> !;
+    fn init();
 }
 
 /// 当前平台的 Arch 实现（编译期确定：host → FakeArch，riscv64 → Riscv64）。

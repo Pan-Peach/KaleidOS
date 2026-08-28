@@ -2,6 +2,8 @@ use crate::{Arch, ResetType};
 use core::arch::global_asm;
 use sbi_rt;
 
+pub mod trap;
+
 global_asm!(include_str!("switch.S"));
 
 pub struct Riscv64;
@@ -53,5 +55,9 @@ impl Arch for Riscv64 {
                 ResetType::WarmReboot => sbi_rt::system_reset(sbi_rt::WarmReboot, sbi_rt::NoReason),
             };
         }
+    }
+
+    fn init() {
+        trap::init();
     }
 }
