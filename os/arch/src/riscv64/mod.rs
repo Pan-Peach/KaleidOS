@@ -3,6 +3,7 @@ use core::arch::global_asm;
 use sbi_rt;
 
 pub mod trap;
+pub mod sv39;
 
 global_asm!(include_str!("switch.S"));
 

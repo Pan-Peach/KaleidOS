@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+bitflags = { version = "2", default-features = false }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 sbi-rt = { version = "0.0.4", default-features = false, features = ["legacy"] }

@@ -10,6 +10,7 @@ version = "0.1.0"
 name = "arch"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "sbi-rt",
 ]
 
