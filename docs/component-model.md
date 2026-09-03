@@ -42,25 +42,120 @@ provides:  FileSystemService
 > Interface 是语义，传输是绑定策略。第一阶段用 Rust trait + direct call；
 > 未来可换 IPC stub / Wasm host call。接口文档里写"契约"（方法、语义、错误），不写"怎么调用"。
 
-## 3. ResourceDomain
+## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
-每个 Component 有一个由 Core 维护的资源域，记录它拥有的全部真实资源：
+**实现决策：ResourceDomain 第一版没有 struct。**
 
 ```text
-virtio-net #7
-owns:
-    MmioHandle #3
-    IrqHandle #5
-    DmaHandle #8
-    TimerHandle #11
+ResourceDomain(ComponentId(7))
+=
+Core 里所有 owner == ComponentId(7) 的 authority 资源
+```
+
+不写外置集合：
+
+```rust
+// ✗ 不要这样
+struct ResourceDomain {
+    irq_handles: Vec<IrqHandle>,
+    mmio_handles: Vec<MmioHandle>,
+    dma_handles: Vec<DmaHandle>,
+}
+```
+
+而是资源自己的表记录 owner（数据库"视图"的直觉）：
+
+```rust
+struct IrqRecord {
+    owner: ComponentId,
+    irq: IrqId,
+    generation: u32,
+}
+
+struct MmioRecord {
+    owner: ComponentId,
+    range: PhysRange,
+    generation: u32,
+}
+
+struct DmaRecord {
+    owner: ComponentId,
+    // ...
+    generation: u32,
+}
 ```
 
 > **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA/frame handle），用于保护与 revoke。
+>
+> `ComponentId` 是 identity（不是 authority），`handle.rs` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
 
-### 组件停止时的回收 —— 两条路径，不预设 universal revoke order
+### 3.1 Handle table 可以非常普通
+
+```rust
+struct Slot<T> {
+    generation: u32,
+    owner: ComponentId,
+    object: T,
+}
+
+pub struct Handle<T> {
+    slot: u32,
+    generation: u32,
+    _marker: PhantomData<T>,
+}
+```
+
+```rust
+type IrqHandle = Handle<Irq>;
+type MmioHandle = Handle<MmioRegion>;
+type DmaHandle = Handle<DmaMapping>;
+```
+
+control path（Core 校验，必须记录 trace）：
+
+```rust
+fn get_irq(caller: ComponentId, handle: IrqHandle) -> Result<&Irq, HandleError> {
+    let slot = IRQ_TABLE.get(handle.slot)?;
+    if slot.generation != handle.generation {
+        return Err(HandleError::Stale);
+    }
+    if slot.owner != caller {
+        return Err(HandleError::WrongOwner);
+    }
+    Ok(&slot.object)
+}
+```
+
+### 3.2 回收：revoke_owner
+
+```rust
+fn revoke_component_resources(id: ComponentId) {
+    irq::revoke_owner(id);
+    mmio::revoke_owner(id);
+    dma::revoke_owner(id);
+    timer::revoke_owner(id);
+}
+```
+
+每张表内部：
+
+```rust
+fn revoke_owner(owner: ComponentId) {
+    for slot in TABLE.iter_mut() {
+        if slot.owner == owner {
+            revoke(slot);
+        }
+    }
+}
+```
+
+> 第一反应可能是"扫表性能是不是不好？"——但这条路径是 **component unload / failure / restart，不是 fast path**，O(全部 IRQ + MMIO + DMA handle) 完全可接受。第一版不做 `ComponentId -> Vec<ResourceRef>` 反向索引；等真发现资源量大再维护。
+
+### 3.3 组件停止时的回收 —— 两条路径，不预设 universal revoke order
 
 > Core 的保证是 **eventual revocation / containment**：组件生命周期结束后，Core 最终必须收回其 ResourceDomain。
 > 具体顺序**不写死** —— 不同设备要求不同：有的要先停 DMA、reset 设备再 mask IRQ；有的要先 unmap。
+> 落地原语统一收敛为上面的 `revoke_component_resources(id)`。
 
 #### Graceful shutdown（正常关闭）
 
@@ -71,7 +166,7 @@ component-specific shutdown    —— 设备相关收尾（停 DMA / reset / mas
   ↓
 stop
   ↓
-Core revoke remaining authority
+revoke_component_resources(id) —— Core 兜底，收回剩余 authority
   ↓
 ResourceDomain becomes empty
 ```
@@ -89,20 +184,303 @@ reset / isolate device（尽可能）
   ↓
 force revoke authority
   ↓
-revoke authority-backed resources（handles）
+revoke_component_resources(id) —— 收回 authority-backed resources（handles）
 ```
 
-> 强制隔离回收的是 **authority-backed 资源（handle）**。堆内存的清理走正常 Drop 路径；完整的内存回收需要未来的 ExecutionDomain（Wasm / 地址空间）——phase 1 的 KernelNative 组件不承诺内存回收。
+> 强制隔离回收的是 **authority-backed 资源（handle）**。堆内存的清理走正常 Drop 路径；完整的内存回收属于 ExecutionDomain 的职责（见 §4）——phase 1 的 KernelNative 组件不承诺内存回收。
 
 **意义**：restart、replace、fault recovery 全部建立在"Core 最终能收回 ResourceDomain"这一保证上。
 
-## 4. ExecutionDomain
+## 4. ExecutionDomain —— 这里才真的有 enum
 
 - **ResourceDomain** 回答"它拥有什么"；
 - **ExecutionDomain** 回答"它在哪里运行"。
 
-未来可能的执行域：`KernelNative`（内核地址空间 Rust 函数）、`UserAddressSpace`、`WasmSandbox`。
-第一阶段只需要 `KernelNative`，但**契约不能 ABI 锁定**：Interface 和 Handle 的定义必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
+**两个 Domain 的形态故意不对称**：ResourceDomain 无 struct（§3，一个视图）；ExecutionDomain 是真正 owning 的 enum —— 它代表需要建立、切换、最终销毁的运行环境：
+
+```rust
+pub enum ExecutionDomain {
+    KernelNative,
+    IsolatedNative(AddressSpace),
+    // future: Wasm(WasmInstance)
+}
+```
+
+> **契约不能 ABI 锁定**：Interface 和 Handle 的定义必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
+
+### 4.1 不塞进 ComponentRecord
+
+`ComponentRecord`（现状：`{id, name, state, entry, base}`）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
+
+```rust
+pub struct ComponentRecord {
+    pub id: ComponentId,
+    pub name: Vec<u8>,
+    pub state: ComponentState,
+    pub execution_kind: ExecutionKind,   // 只加一个轻量种类字段
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ExecutionKind {
+    KernelNative,
+    IsolatedNative,
+}
+```
+
+真正 runtime：
+
+```rust
+pub struct ComponentRuntime {
+    pub id: ComponentId,
+    pub image: LoadedComponent,
+    pub execution: ExecutionDomain,
+}
+```
+
+分工：
+
+```text
+Registry —— "系统里有哪些 Component，是什么状态"（metadata）
+Runtime  —— "这个 Component 现在实际占着什么运行环境"（runtime）
+```
+
+### 4.2 ComponentManager（未来把 loader / registry / execution 串起来）
+
+```rust
+pub struct ComponentManager {
+    registry: Registry,
+    runtimes: Vec<ComponentRuntime>,
+}
+
+impl ComponentManager {
+    pub fn load(&mut self, name: &[u8], blob: &[u8], kind: ExecutionKind)
+        -> Result<ComponentId, ComponentError>;
+    pub fn start(&mut self, id: ComponentId) -> Result<(), ComponentError>;
+    pub fn stop(&mut self, id: ComponentId) -> Result<(), ComponentError>;
+    pub fn fail(&mut self, id: ComponentId, reason: ComponentError);
+}
+```
+
+（概念代码；落地时按现有 Registry 状态机 `Declared → Starting → Ready + Failed` 接轨。当前 unload 只删记录、不释放放段内存。）
+
+### 4.3 KernelNative 具体是什么
+
+甚至什么都不用存：
+
+```text
+ComponentRuntime
+├── LoadedComponent
+└── ExecutionDomain::KernelNative
+```
+
+调用方式与现在完全一样（loader 的 `call_init`）：
+
+```rust
+let ret = loader::call_init(&runtime.image);   // extern "C" fn() -> i32
+```
+
+以后只是把 `0 = Ok / 非 0 = Err` 改得正式一点。
+
+### 4.4 IsolatedNative 才多一个 AddressSpace
+
+```rust
+pub struct AddressSpace {
+    root: FrameId,   // 第一版甚至可以只放这一个字段
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Self, VmError>;
+    pub fn map_owned(&mut self, va: VirtAddr, frame: FrameId, flags: MapFlags) -> Result<(), VmError>;
+    pub fn map_borrowed(&mut self, va: VirtAddr, frame: FrameId, flags: MapFlags) -> Result<(), VmError>;
+    pub fn activate(&self);
+}
+```
+
+### 4.5 RSW bit —— ownership 直接贴在 PTE 上
+
+不需要维护 `Vec<Mapping>`：Sv39 PTE 的 **RSW 字段是 supervisor software 保留、硬件忽略**的（RISC-V Privileged Spec [Supervisor-Level ISA, v1.13](https://docs.riscv.org/reference/isa/priv/supervisor.html)），正好留给我们：
+
+```text
+PTE
+
+| PPN | RSW | D A G U X W R V |
+        ↑
+        │
+     OWNED bit (RSW[0])
+
+map_owned    → PTE.RSW[0] = 1
+map_borrowed → PTE.RSW[0] = 0
+```
+
+> 能由底层机制自己表达的东西，就别在 Core 上面再建一层账本 —— 这正是这几轮一直在做的减法。
+
+### 4.6 AddressSpace::drop 真的能扫页表
+
+```rust
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        destroy_page_table(self.root);
+    }
+}
+
+fn destroy_page_table(table: FrameId) {
+    for pte in table.entries() {
+        if !pte.valid() {
+            continue;
+        }
+        if pte.is_branch() {
+            let child = pte.frame();
+            destroy_page_table(child);
+            free_frame(child);          // page-table page 永远属于 AddressSpace 自己
+        } else if pte.owned() {
+            free_frame(pte.frame());    // OWNED frame：free
+        }
+        // BORROWED mapping：只取消映射，不 free PA
+    }
+    free_frame(table);
+}
+```
+
+于是之前"Arc cycle / mem::forget / Box::leak / 组件 allocator"的纠结全部消失：
+
+```text
+drop AddressSpace → 扫 PTE → OWNED frame 全 free
+```
+
+### 4.7 Shared memory 第一版不做
+
+IsolatedNative 第一阶段只有 OWNED / BORROWED 两种：
+
+- **Owned**：heap / stack / private data / private code —— AddressSpace 死了直接 free；
+- **Borrowed**：Core trampoline / MMIO / kernel shared code —— AddressSpace 死了只 unmap。
+
+将来真要 SharedMemory 再引入 `SharedMapping`，RSW 可扩展为 `00 borrowed / 01 owned / 10 shared`，或 shared 单独做 metadata / refcount。**不要提前解决。**
+
+### 4.8 Loader 自然分叉
+
+现状 `load_component(blob, expected_machine)` 内部直接 `memory::alloc_frame()`，拿 PA 当 VA 拷贝，返回 `LoadedComponent { base, entry, text_size }`。未来：
+
+```rust
+fn load_component(blob: &[u8], target: &mut dyn LoadTarget)
+    -> Result<LoadedComponent, LoaderError>
+```
+
+- KernelNative target：alloc frame → identity / kernel VA → copy；
+- IsolatedNative target：alloc frame → `map_owned(frame, component_va)` → copy。
+
+loader 不需要知道 satp / Sv39 / KernelNative / IsolatedNative，它只知道"给我一块能放 section 的 memory"——保持 arch / mechanism 分层。
+
+### 4.9 失败与退出的实际代码流
+
+```rust
+pub fn fail_component(&mut self, id: ComponentId, reason: ComponentError) {
+    self.registry.mark_failed(id).unwrap();
+    self.stop_component_tasks(id);
+    revoke_component_resources(id);
+    self.drop_runtime(id);   // KernelNative: drop Rust state 结束；
+                             // IsolatedNative: Drop → AddressSpace → 页表 walk → free OWNED
+}
+```
+
+正常退出：
+
+```rust
+match run_component(id) {
+    Ok(()) => {}
+    Err(err) => shutdown(id),
+}
+```
+
+graceful path：
+
+```text
+Component 返回 Err
+  ↓
+Quiesce
+  ↓
+Component shutdown()
+  ↓
+Rust Drop
+  ↓
+绝大部分 Handle/Lease 自己释放
+  ↓
+revoke_owner(id)   ← 只是保险："还有没释放的 authority？有就 Core 扫掉。"
+```
+
+### 4.10 代码结构（目标形态）
+
+```text
+component/
+├── mod.rs
+│   ├── ComponentId
+│   ├── ComponentState
+│   └── ExecutionKind
+│
+├── registry.rs
+│   └── ComponentRecord
+│       ├── id
+│       ├── name
+│       ├── state
+│       └── execution_kind
+│
+├── manager.rs                 ← 以后新增
+│   ├── ComponentManager
+│   └── ComponentRuntime
+│       ├── LoadedComponent
+│       └── ExecutionDomain
+│
+└── loader.rs
+    └── load_component()
+
+
+execution/
+├── mod.rs
+│   └── ExecutionDomain
+│       ├── KernelNative
+│       └── IsolatedNative(AddressSpace)
+│
+└── address_space.rs
+    └── AddressSpace
+
+
+irq.rs       —— IrqTable，record 带 owner: ComponentId
+mmio.rs      —— MmioTable，record 带 owner: ComponentId
+dma.rs       —— DmaTable，record 带 owner: ComponentId
+
+handle.rs    —— 类型化 Handle<...> + Slot{generation, owner, object}
+```
+
+ownership 结构：
+
+```text
+ComponentManager
+      │
+      ├── Registry
+      │       └── metadata
+      │
+      └── ComponentRuntime
+              ├── LoadedComponent
+              └── ExecutionDomain
+                     │
+               ┌─────┴─────┐
+               │           │
+         KernelNative   AddressSpace
+                             │
+                          page table
+```
+
+而 ResourceDomain 根本不在这棵树里：
+
+```text
+IRQ table  ─ owner=A ─┐
+MMIO table ─ owner=A ─┼── ResourceDomain(A)
+DMA table  ─ owner=A ─┘
+```
+
+### 4.11 落地顺序：现在只做两小步
+
+1. **先不要写 ResourceDomain**。等 MMIO/IRQ 真正开始做的时候，在每个 authority record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
+2. **Sv39 做完以后**，写一个非常薄的 `AddressSpace { root: FrameId }`，做到 `new / map_owned / map_borrowed / activate / Drop`。其中 **Drop → 页表 walk → free OWNED frame** 这一条跑通，ExecutionDomain 最核心的机制就出来了。
 
 ## 5. 生命周期
 
