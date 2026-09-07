@@ -181,6 +181,28 @@ BlockDevice（Interface）
 - **ResourceDomain 记录的是 authority handle**（Mmio / Irq / Dma / Frame ...），用于保护与 revoke，**不是**内存字节数；
 - 因此组件失败时，Core 不承诺回收其堆内存（见 §5.6 组件失败语义）。
 
+#### 5.5.1 内存三分法
+
+内存模型中需要分开讨论三件事：
+
+```text
+Physical Memory       RAM、物理帧、保留区、分配与 ownership
+Protection             谁可以访问哪些 region，以及访问权限
+Address Translation    VA 如何映射到 PA
+```
+
+`MemoryDomain` 是 Core 层的语义抽象，记录 domain 的资源归属、可见区域和
+权限约束；它不等于 `PageTable`，也不携带 Sv39-specific knowledge。
+
+MMU 平台可以用 paged `AddressSpace` 同时提供翻译和硬件权限检查；NoMMU 平台
+则可能只有 flat address space，再由 PMP、MPU 或其他机制提供 protection。
+两者不强行伪装成同一个能力集合：没有 MMU 也不意味着拥有虚拟地址空间、
+page fault、COW 或 lazy mapping。
+
+Sv39、Sv32、PMP、MPU 都是 backend/mechanism。当前阶段只实现 Sv39，未来再
+根据机器能力选择 backend；Core API 应使用 Frame/AddressSpace 等 typed
+authority 和抽象 region/permission，裸 PA、PTE、VPN、`satp` 只属于 arch 层。
+
 ## 5.6 组件定义（4 项测试）
 
 一个东西是否算"Component"，用四项测试判定：

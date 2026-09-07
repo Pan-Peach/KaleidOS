@@ -154,6 +154,36 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 - 基础同步机制
 - Trace / invariant 支持
 
+### 内存模型：语义与机制分离
+
+Core 的内存模型不等于某一种页表格式。内存相关概念保持三层分离：
+
+```text
+Physical Memory
+    机器有哪些 RAM、哪些帧可分配、帧的 owner 是谁
+
+Protection
+    某个 Domain/Component 是否拥有访问某个区域的权利
+
+Address Translation
+    一个地址如何从 VA 翻译到 PA
+```
+
+Core 面向 `MemoryDomain`、region、ownership 和 permission；它不应该知道
+`VPN`、`PTE`、`satp` 或某个具体页表遍历算法。`MemoryDomain` 表达执行实体
+拥有哪些内存、允许访问哪些区域，以及这些区域的权限。
+
+有 MMU 的平台可以由 `MemoryDomain` 关联 paged `AddressSpace`，由架构 backend
+实现地址翻译和硬件权限；没有 MMU 的平台则可以使用 flat memory 加 PMP/MPU
+等 protection backend。NoMMU 不是一种特殊的页表，也不承诺具备 page fault、
+COW 或任意虚拟地址空间等 MMU 语义。
+
+当前只实现 RISC-V Sv39，但 Sv39 只是第一个 address-translation backend，
+不是 KaleidOS 的内存模型。Core 公共路径使用 typed handle、virtual region、
+permission 等抽象；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
+arch/backend 内部。具体映射、撤销和地址空间激活接口随实现阶段演进，
+不在这里提前固定完整 API。
+
 ### Core 不包含（这些属于 Component）
 
 - RR / CFS 调度算法

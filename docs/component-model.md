@@ -283,6 +283,11 @@ let ret = loader::call_init(&runtime.image);   // extern "C" fn() -> i32
 
 ### 4.4 IsolatedNative 才多一个 AddressSpace
 
+这里的 `AddressSpace` 是 ExecutionDomain 使用的运行时机制，不是 Component
+直接操作的 Sv39 页表对象。上层只表达 region、frame authority 和 permission；
+Core 负责校验 ownership/handle，具体 PTE、VPN、`satp`、TLB 操作由 arch
+backend 完成。当前只需要支持 Sv39，接口不要因此把 Core 绑定到 Sv39。
+
 ```rust
 pub struct AddressSpace {
     root: FrameId,   // 第一版甚至可以只放这一个字段
