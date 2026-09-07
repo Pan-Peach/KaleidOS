@@ -4,6 +4,7 @@ use sbi_rt;
 
 pub mod trap;
 pub mod sv39;
+pub mod console;
 
 global_asm!(include_str!("switch.S"));
 
@@ -38,7 +39,7 @@ impl Arch for Riscv64 {
     }
 
     fn console_write_byte(byte: u8) {
-        sbi_rt::console_write_byte(byte);
+        console::write_byte(byte);
     }
 
     fn console_getc() -> Option<u8> {
