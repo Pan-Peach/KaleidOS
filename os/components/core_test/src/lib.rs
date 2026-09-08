@@ -1,26 +1,105 @@
-//! CoreTest 测试组件（第一个 .kcomp）：验证组件加载链路正确性。
+//! CoreTest 测试组件（第一个 .kcomp）：核内自检 Core 的真实接口。
 //!
-//! - `kcomp_init`：约定导出符号（loader 放段后调用）；返回 0 = 加载正确
-//! - 自检逻辑（纯逻辑，host-testable）：校验 .data 段放段正确（值保持原样）
-//! - 无 god-mode：组件只走加载协议（导出符号），不看内核内部
+//! - `kcomp_init`：loader 放段 + 重定位后调用；返回 0 = 全部通过，
+//!   非 0 = 失败位图（`load` 命令会据此报告 FAILED）
+//! - 自检项（核内，QEMU `load core_test` 时真实执行）：
+//!   `.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表
+//! - 只走导出白名单（`kcore_*`），无 god-mode
+//! - host 测试只覆盖纯逻辑；真实执行在核内
 
 #![no_std]
 
 #[cfg(test)]
 extern crate std;
 
-/// 静态数据，.data 段。放段/重定位正确性锚点：值保持原样 = 段被正确搬运。
+/// 静态数据，.data 段。放段/重定位正确性锚点：值原样保持 = 段被正确搬运。
 static MAGIC: u32 = 0xC0FFEE;
 
-/// 组件入口（Linux module_init 约定）。0 = OK；非 0 = 加载失败错误码。
-#[unsafe(no_mangle)]
-pub extern "C" fn kcomp_init() -> i32 {
-    if self_check() { 0 } else { 1 }
+/// 纯逻辑（host-testable）：.data 段的值在放段后必须原样可读。
+fn data_ok() -> bool {
+    MAGIC == 0xC0FFEE
 }
 
-/// 自检：.data 段的值在放段后必须原样可读。
-fn self_check() -> bool {
-    MAGIC == 0xC0FFEE
+/// 核内自检：仅在非 test 编译生成（组件 .kcomp / 真机）。
+/// host `cargo test` 不引用 `kcore_*`，避免未定义符号链接失败；
+/// 组件镜像里的 UNDEF 符号由 loader 按导出白名单重定位解析。
+#[cfg(not(test))]
+mod runtime {
+    use super::data_ok;
+
+    // 白名单 API（与 kernel `export.rs` 一一对应；C ABI 声明即契约）。
+    unsafe extern "C" {
+        #[link_name = "kcore_console_write_byte"]
+        fn console_write_byte(byte: u8);
+        #[link_name = "kcore_machine_boot_hart"]
+        fn machine_boot_hart() -> usize;
+        #[link_name = "kcore_machine_cpu_count"]
+        fn machine_cpu_count() -> usize;
+        #[link_name = "kcore_free_page_count"]
+        fn free_page_count() -> usize;
+        #[link_name = "kcore_component_count"]
+        fn component_count() -> usize;
+    }
+
+    fn puts(s: &str) {
+        for &b in s.as_bytes() {
+            unsafe {
+                console_write_byte(b);
+            }
+        }
+    }
+
+    /// 报告一项检查：`[core-test] <name>: PASS|FAIL\n`。
+    fn report(name: &str, ok: bool) {
+        puts("[core-test] ");
+        puts(name);
+        puts(": ");
+        puts(if ok { "PASS\n" } else { "FAIL\n" });
+    }
+
+    /// 机器真相：至少一个 CPU，且 boot hart 在有效范围。
+    fn machine_ok() -> bool {
+        let cpus = unsafe { machine_cpu_count() };
+        let boot = unsafe { machine_boot_hart() };
+        cpus >= 1 && boot < cpus
+    }
+
+    /// 内存分配器已初始化（存在可分配空闲页）。
+    fn memory_ok() -> bool {
+        let free = unsafe { free_page_count() };
+        free > 0
+    }
+
+    /// 组件注册表已登记（至少包含当前组件）。
+    fn component_ok() -> bool {
+        let count = unsafe { component_count() };
+        count >= 1
+    }
+
+    /// 组件入口（Linux module_init 约定）：0 = 全部通过；非 0 = 失败位图。
+    #[unsafe(no_mangle)]
+    pub extern "C" fn kcomp_init() -> i32 {
+        let mut failed = 0u32;
+
+        let ok = data_ok();
+        failed |= !ok as u32;
+        report("data", ok);
+
+        let ok = machine_ok();
+        failed |= (!ok as u32) << 1;
+        report("machine", ok);
+
+        let ok = memory_ok();
+        failed |= (!ok as u32) << 2;
+        report("memory", ok);
+
+        let ok = component_ok();
+        failed |= (!ok as u32) << 3;
+        report("component", ok);
+
+        report("all", failed == 0);
+        failed as i32
+    }
 }
 
 #[cfg(test)]
@@ -28,12 +107,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn self_check_passes() {
-        assert!(self_check());
-    }
-
-    #[test]
-    fn kcomp_init_returns_zero() {
-        assert_eq!(kcomp_init(), 0);
+    fn data_ok_passes() {
+        assert!(data_ok());
     }
 }

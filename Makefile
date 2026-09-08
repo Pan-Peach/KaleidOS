@@ -38,7 +38,7 @@ init.kpkg:
 	@mkdir -p $(KPKG_DIR)
 	@for d in $(KCOMP_DIRS); do \
 		name=$$(basename $$d); \
-		obj=$$(find $$d/target/riscv64gc-unknown-none-elf/release/deps target/riscv64gc-unknown-none-elf/release/deps -maxdepth 1 -name "$$name-*.o" 2>/dev/null | head -1); \
+		obj=$$(find $$d/target/riscv64gc-unknown-none-elf/release/deps target/riscv64gc-unknown-none-elf/release/deps -maxdepth 1 -name "$$name-*.o" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
 		cp $$obj $(KPKG_DIR)/$$name.kcomp; \
 	done
 	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest

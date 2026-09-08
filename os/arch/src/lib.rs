@@ -24,6 +24,20 @@ pub mod riscv64;
 
 pub use store::{ComponentStore, StoreEntry, StoreError};
 
+/// Normalize a linked high-half address to its early identity/physical view.
+///
+/// Early boot keeps the whole RAM window identity-mapped, so the low alias of
+/// a high-half kernel symbol is reachable from a low-address component (an
+/// auipc+jalr pair only covers ±2 GiB).  Host builds have no high-half split
+/// and use the address as-is.
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::boot_vm::physical_address_of;
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn physical_address_of(address: usize) -> usize {
+    address
+}
+
 pub enum ResetType {
     Shutdown,
     ColdReboot,
