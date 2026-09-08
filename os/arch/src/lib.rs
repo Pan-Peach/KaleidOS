@@ -14,6 +14,7 @@
 extern crate std;
 
 pub mod store;
+pub mod vm;
 
 #[cfg(not(target_arch = "riscv64"))]
 pub mod fake;

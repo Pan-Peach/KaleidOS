@@ -5,7 +5,6 @@
 
 ## 1. 一句话原则
 
-> **Core owns global resource truth AND the mechanisms required to preserve that truth and make forward progress. Components own replaceable semantics, policy, and derived state.**
 > Core 保存真实且不可撒谎的系统状态，并拥有**为保存这份真相、推进 Core 自身资源/生命周期操作所必需的机制**；Component 实现可替换的算法、策略、协议和高级 OS 语义。
 >
 > 注："forward progress" 指 Core 自身资源/生命周期操作的推进，**不是**继续提供应用服务。
@@ -54,7 +53,7 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 
 | 分类 | 定义 | 例子 | 归属 |
 |---|---|---|---|
-| **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | Frame owner、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
+| **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | PhysicalRegion 占用与归属、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
 | **Component Semantic State** | 某个 Component 自己负责的"业务真相"；**不能随便丢**，但也不是 Core 的责任 | VFS mount 表、TCP 连接状态、POSIX fd table、文件系统事务状态、game runtime 会话状态 | Component |
 | **Derived** | 从权威状态构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、LRU list、CFS vruntime、缓存索引 | Component |
 | **Ephemeral** | 丢失完全不影响正确性的短暂状态 | debug buffer、临时统计、部分 trace 聚合 | Component |
@@ -71,12 +70,9 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 
 关键边界：
 
-- **不属于 Core ≠ 可以丢了重建。** 不属于 Core 只代表"它不会破坏全局资源安全"；
   Component Semantic State（mount 表、TCP 连接、fd table）可能完全无法从 Core 的
   Task / Frame / Handle / IRQ 推导出来，是组件自己必须认真维护的语义真相；
-- Derived 丢失后可能降低性能、改变短期行为、降低策略连续性（例如 CFS 丢失 vruntime、
   网络栈丢失 RTT 估计）—— 但这**不会破坏 safety、不会导致资源账本错误**；
-- 这个分类以后是判断"字段到底该放 Core 还是 Component"的重要工具。
 
 ## 3. Policy proposes, Core validates and commits
 
@@ -97,26 +93,23 @@ Core 验证：
 拒绝 → 记录 Core rejection，调度器自行修正
 ```
 
-### 分配示例
+### 内存区域分配示例
 
-物理帧分配是 **Core 内部机制**（canonical，不热卸载；可能按 build/profile 选择实现）。请求者不"提议"帧号，而是向 Core 要一帧：
+物理内存分配是 **Core 内部机制**（canonical，不热卸载；可能按 build/profile 选择实现）。请求者不"提议"物理地址，而是向 Core 要一段区域：
 
 ```text
 请求者：请给我一帧
 Core 的分配器：
-  - 选择一帧（如 Frame #100）
-  - 验证：Frame #100 存在？是 Free 状态？请求者有权限？
-  - commit ownership（从此 Frame #100 归请求者）
-  - grant authority（FrameHandle）
+  - 选择一个 PhysicalRange
+  - 验证：区域存在？空闲？范围合法？
+  - commit region ownership
+  - grant memory region / address-space authority
 ```
 
 未来若引入 `MemoryPolicy` 组件，它只能**提议偏好**（如 NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
 
 ### 工程含义
 
-- 任何对真实资源的操作，代码路径上必须有一个"Core 验证点"；
-- 验证点要有 trace（proposal 事件 + 结果），这是调试与 CoreTest 的基础（见 testing.md）；
-- 策略组件因此可以随时 reset / 替换：它丢的是 Derived 状态（runqueue 等），从 Core 的 Truth 重新构造即可 —— 但重建目标是**安全可用状态，而非完全等价状态**（见 §2 状态分类）。
 
 ## 4. Authority ≠ Interface
 
@@ -127,8 +120,8 @@ Core 的分配器：
 由 Core 产生、不可伪造、最终由 Core 验证：
 
 ```text
-FrameHandle  MmioHandle  IrqHandle  DmaHandle
-TaskHandle   TimerHandle AddressSpaceHandle
+MmioHandle  IrqHandle  DmaHandle
+TaskHandle  TimerHandle AddressSpaceHandle
 ```
 
 **硬性要求**：驱动永远不应该拿到裸物理地址、裸 IRQ 号、裸 DMA 指针或任意 MMIO 指针。
@@ -156,9 +149,6 @@ NVMe Component
 BlockDevice（Interface）
 ```
 
-- Handle 是**权限凭证**，Interface 是**能力契约**；
-- 一个组件可以"有权动硬件"（有 Handle）但"不对外提供能力"（没有 Interface），反之亦然；
-- 驱动协议逻辑因此可以脱离 ISA：Native NVMe / Wasm NVMe / Fake NVMe 只要都提供 BlockDevice，上层无感知。
 
 ## 5. 什么应该进 Core（判断标准）
 
@@ -177,9 +167,6 @@ BlockDevice（Interface）
 
 ## 5.5 内存：无 per-component 记账
 
-- **Core 与组件共享一个 Core heap**：没有 per-ComponentId 的字节计费，没有 per-component arena / 私有堆；
-- **ResourceDomain 记录的是 authority handle**（Mmio / Irq / Dma / Frame ...），用于保护与 revoke，**不是**内存字节数；
-- 因此组件失败时，Core 不承诺回收其堆内存（见 §5.6 组件失败语义）。
 
 #### 5.5.1 内存三分法
 
@@ -200,8 +187,8 @@ MMU 平台可以用 paged `AddressSpace` 同时提供翻译和硬件权限检查
 page fault、COW 或 lazy mapping。
 
 Sv39、Sv32、PMP、MPU 都是 backend/mechanism。当前阶段只实现 Sv39，未来再
-根据机器能力选择 backend；Core API 应使用 Frame/AddressSpace 等 typed
-authority 和抽象 region/permission，裸 PA、PTE、VPN、`satp` 只属于 arch 层。
+根据机器能力选择 backend；Core API 应使用 AddressSpace、PhysicalRange、
+VirtualRange 和抽象 permission，裸 PA、PTE、VPN、`satp` 只属于 arch 层。
 
 ## 5.6 组件定义（4 项测试）
 
@@ -216,16 +203,5 @@ authority 和抽象 region/permission，裸 PA、PTE、VPN、`satp` 只属于 ar
 
 ## 6. 由哲学推导出的工程约束
 
-- **Core 必须 host-testable**：真相逻辑不能依赖 QEMU 才能验证（见 testing.md）；
-- **CoreTest 没有 god-mode**：测试组件也只能走真实 Core API，不能改 Core 私有状态；
-- **接口是语义，不是调用方式**：Rust trait + direct call 只是第一阶段的传输绑定；
-- **组件注册静态**：第一阶段不做动态加载，架构先立住，再谈弹性；
-- **Core 词汇表保持最小**：每加一个 Core API，都是一份必须永远保持正确、可验证的承诺。
 
 ## 7. 哲学来源（详见 references.md）
-
-- **Exokernel**：保护与管理分离 —— "Core 保护资源，Component 决定策略"的思想源头；
-- **Asterinas**：策略移出 TCB、策略输出必须验证 —— propose/validate 的工程先例；
-- **seL4**：typed authority、不可伪造 capability —— Handle 类型化的直接来源；
-- **Theseus / RedLeaf**：明确的状态归属、资源回收 —— ResourceDomain 思想；
-- **SPIN**：类型安全组件可以安全运行在内核地址空间 —— KernelNative 域的依据。

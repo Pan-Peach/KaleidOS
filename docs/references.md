@@ -49,12 +49,12 @@
 **是什么**：形式化验证的微内核，以 capability 为核心：一切内核对象（task、frame、IRQ、IPC endpoint...）都通过不可伪造、不可混淆的 capability 访问，授权粒度极细（typed capability）。
 
 **借鉴什么**：
-- **typed authority**：每种授权有明确类型，`FrameHandle` 只能操作 frame，不能当 IRQ 用 —— 我们 Handle 的类型化设计直接来源于此；
+- **typed authority**：设备和执行域授权有明确类型，不能把一种 handle 当成另一种资源使用；内存映射采用 Core 管理的 region/address-space 语义，不把每个 frame 暴露成组件 authority；
 - **不可伪造**：capability 只能由内核创建和传递，用户无法构造 —— 我们要求"驱动永远拿不到裸物理地址/裸 IRQ 号/裸指针"就是这个原则；
 - 内核对象（kernel object）作为资源存在性/所有权记录在核心 —— 我们的 `Handle / Authority` + 内核对象表。
 
 **怎么映射**：
-- `FrameHandle`、`MmioHandle`、`IrqHandle`、`DmaHandle`、`TaskHandle`、`TimerHandle`、`AddressSpaceHandle` 就是 seL4 风格 typed capability 的简化形态；
+- `MmioHandle`、`IrqHandle`、`DmaHandle`、`TaskHandle`、`TimerHandle`、`AddressSpaceHandle` 是 seL4 风格 typed capability 的简化形态；
 - Core 校验 handle 的持有者、状态、生命周期 = capability 的 access control。
 
 **不照搬**：完整 capability 系统（派生、revoke 树、badge 等）、形式化证明、IPC endpoint 体系 —— 第一阶段只做"不可伪造的类型化 Handle + Core 验证"。

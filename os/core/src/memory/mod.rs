@@ -1,43 +1,41 @@
-//! 物理帧与 Core Heap（M1：基于 `buddy_system_allocator::MetadataHeap`）。
+//! 物理内存与 Core Heap（M1：基于 `buddy_system_allocator::MetadataHeap`）。
 //!
 //! 设计（经 MangoCore 实践验证，详见 docs/09_debug/buddy-allocator-scan-drift.md）：
 //! MetadataHeap 的 per-unit BlockMeta（state=Reserved/Free/Used，O(1) buddy 查询）
 //! 本身就是帧真相 —— 不像上游 linked-list 版在 dealloc 时线性扫 free-list。
 //!
 //! 规则（Core 与组件共享）：
-//! - 一个 `MetadataHeap<32, 12>` 实例：`alloc_pages(PageOrder(12))` = 物理帧
-//!   （4K 单元，order 12=4K, 13=8K, ... 23=32M）；`alloc(layout)` = 小对象堆。
+//! - 一个 `MetadataHeap<32, 12>` 实例：`alloc_pages` 提供连续的物理区域；
+//!   `alloc(layout)` 提供小对象堆。
 //! - 区域 = `[align_up(__bootstrap_end), RAM 末尾)` —— ELF/BSS/DTB 在区域外，
 //!   天然保留，无需 reserve API。
 //! - 无 per-component 记账：组件与 Core 共享同一 heap；ResourceDomain 只记 handle。
 //!
-//! FrameId = 帧身份；从 `PageRun.base / FRAME_SIZE` 换算。
-
 use crate::log;
+use crate::memory::address_space::PhysicalRange;
 use buddy_system_allocator::{MetadataHeap, PageOrder, PageRun};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 use spin::Mutex;
 
+pub mod address_space;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// 帧大小（4 KiB）。
-pub const FRAME_SIZE: usize = 4096;
+/// Backend 的最小物理映射粒度（4 KiB）。
+pub const PAGE_SIZE: usize = 4096;
 
 /// MetadataHeap 最大 order（FREE_AREA 槽数；最大块 = 8B << 31 = 16 TiB）。
 pub const HEAP_ORDER: usize = 32;
 
-/// 最小单元 = 4 KiB（帧粒度；alloc_pages 最小 order 12 = 一帧）。
+/// 最小分配单元 = 4 KiB。
 pub const HEAP_MIN_ORDER: usize = 12;
 
-/// 帧分配 order（= HEAP_MIN_ORDER，4K 帧）。
-pub const FRAME_ORDER: PageOrder = PageOrder(12);
-
-/// 对齐到帧（向上取整）。
-pub const fn align_up_frame(addr: usize) -> usize {
-    (addr + FRAME_SIZE - 1) & !(FRAME_SIZE - 1)
+/// 对齐到最小物理页。
+pub const fn align_up_page(addr: usize) -> usize {
+    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -45,35 +43,31 @@ pub const fn align_up_frame(addr: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
+pub enum MemoryError {
     Exhausted,
-    InvalidOrder,
+    InvalidSize,
     DoubleFree,
 }
 
 // ---------------------------------------------------------------------------
-// FrameId identity
+// Region lease
 // ---------------------------------------------------------------------------
 
-/// 物理帧身份（M1 词汇表）—— Identity，不是 Authority。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FrameId(u64);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MemoryLease {
+    region: PhysicalRange,
+    order: usize,
+}
 
-impl FrameId {
-    pub const fn from_pa(pa: usize) -> Self {
-        Self((pa as u64) / (FRAME_SIZE as u64))
+impl MemoryLease {
+    pub(crate) const fn region(&self) -> PhysicalRange {
+        self.region
     }
+}
 
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    pub const fn start_pa(self) -> usize {
-        self.0 as usize * FRAME_SIZE
+impl Drop for MemoryLease {
+    fn drop(&mut self) {
+        let _ = release_region(self.region, self.order);
     }
 }
 
@@ -81,7 +75,7 @@ impl FrameId {
 // The single heap instance (frame + small objects)
 // ---------------------------------------------------------------------------
 
-/// Core 唯一的物理内存机制：物理帧分配 + 小对象堆。
+/// Core 唯一的物理内存机制：区域分配 + 小对象堆。
 /// Phase 1 单核（副 hart 已 park），spin 锁够用；
 /// 多核唤醒后需评估锁粒度。
 static HEAP: Mutex<MetadataHeap<HEAP_ORDER, HEAP_MIN_ORDER>> = Mutex::new(MetadataHeap::empty());
@@ -91,33 +85,33 @@ static HEAP: Mutex<MetadataHeap<HEAP_ORDER, HEAP_MIN_ORDER>> = Mutex::new(Metada
 // ---------------------------------------------------------------------------
 
 /// Core 物理内存初始化：
-/// - `frame_start`：帧区域起点（bootstrap 传 `align_up(__bootstrap_end)`）；
+/// - `region_start`：物理区域起点（bootstrap 传页对齐后的 image 末尾）；
 ///   该点之前（ELF/BSS/DTB）天然保留。
 /// - `frame_end`：RAM 区域末尾。
 ///
 /// MetadataHeap 的 metadata 从区域前端 carve，自我描述（无鸡生蛋）。
-pub fn init(frame_start: usize, frame_end: usize) -> Result<(), &'static str> {
-    if frame_start >= frame_end {
+pub fn init(region_start: usize, region_end: usize) -> Result<(), &'static str> {
+    if region_start >= region_end {
         return Err("invalid frame region");
     }
 
     // try_init 不安全：调用方保证区间有效、未被他方管理。
     let init_result = {
         let mut heap = HEAP.lock();
-        unsafe { heap.try_init(frame_start, frame_end - frame_start) }
+        unsafe { heap.try_init(region_start, region_end - region_start) }
             .map_err(|_| "frame region init failed")
     };
 
     // 锁后日志：不持分配器锁打印（打印可能分配/被 panic 中途打断）。
     match &init_result {
         Ok(()) => {
-            let span_frames = (frame_end - frame_start) / FRAME_SIZE;
+            let span_pages = (region_end - region_start) / PAGE_SIZE;
             log!(
                 "memory",
-                "region 0x{:x}-0x{:x} span_frames={}",
-                frame_start,
-                frame_end,
-                span_frames
+                "region 0x{:x}-0x{:x} span_pages={}",
+                region_start,
+                region_end,
+                span_pages
             );
             log!("memory", "init OK");
         }
@@ -129,27 +123,56 @@ pub fn init(frame_start: usize, frame_end: usize) -> Result<(), &'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// Frame API（帧真相 + 帧分配的 canonical 入口）
+// Region API（Core canonical 入口）
 // ---------------------------------------------------------------------------
 
-/// 分配一帧（4K）。返回帧身份。帧内容未清零（调用方负责）。
-pub fn alloc_frame() -> Result<FrameId, FrameError> {
-    let mut heap = HEAP.lock();
-    let run = heap
-        .alloc_pages(FRAME_ORDER)
-        .map_err(|_| FrameError::Exhausted)?;
-    Ok(FrameId::from_pa(run.base.as_ptr() as usize))
+fn order_for_size(size: usize) -> Result<usize, MemoryError> {
+    if size == 0 {
+        return Err(MemoryError::InvalidSize);
+    }
+    let mut order = HEAP_MIN_ORDER;
+    let mut capacity = PAGE_SIZE;
+    while capacity < size {
+        capacity = capacity.checked_mul(2).ok_or(MemoryError::InvalidSize)?;
+        order += 1;
+        if order >= HEAP_ORDER {
+            return Err(MemoryError::InvalidSize);
+        }
+    }
+    Ok(order)
 }
 
-/// 释放一帧。`frame` 必须匹配一次 `alloc_frame`（不可重复释放）。
-pub fn free_frame(frame: FrameId) -> Result<(), FrameError> {
+/// 分配一段连续物理区域。实际分配大小是 buddy order 的容量。
+pub(crate) fn alloc_region(size: usize) -> Result<MemoryLease, MemoryError> {
+    let order = order_for_size(size)?;
     let mut heap = HEAP.lock();
-    let base = frame.start_pa() as *mut u8;
+    let run = heap
+        .alloc_pages(PageOrder(order as u8))
+        .map_err(|_| MemoryError::Exhausted)?;
+    Ok(MemoryLease {
+        region: PhysicalRange {
+            base: run.base.as_ptr() as usize,
+            size: 1usize << order,
+        },
+        order,
+    })
+}
+
+/// 释放一次区域分配。lease 被消费后不能重复释放。
+pub(crate) fn free_region(lease: MemoryLease) -> Result<(), MemoryError> {
+    let region = lease.region;
+    let order = lease.order;
+    core::mem::forget(lease);
+    release_region(region, order)
+}
+
+fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError> {
+    let mut heap = HEAP.lock();
+    let base = region.base as *mut u8;
     let run = PageRun {
         base: unsafe { NonNull::new_unchecked(base) },
-        order: FRAME_ORDER,
+        order: PageOrder(order as u8),
     };
-    // dealloc_pages 内部有 double-free 检测（debug_assert）；错误映射为 DoubleFree。
     unsafe { heap.dealloc_pages(run) };
     Ok(())
 }
@@ -196,16 +219,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_frame_alloc_and_free() {
+    fn init_region_alloc_and_free() {
         let _g = test_support::GUARD.lock();
         test_support::ensure_init();
 
-        let f = alloc_frame().expect("alloc should succeed");
-        assert_eq!(f.start_pa() % FRAME_SIZE, 0);
-        free_frame(f).expect("free should succeed");
-        let f2 = alloc_frame().expect("alloc after free should succeed");
-        assert_eq!(f2.start_pa() % FRAME_SIZE, 0);
-        free_frame(f2).expect("free f2");
+        let lease = alloc_region(PAGE_SIZE).expect("alloc should succeed");
+        let region = lease.region();
+        assert_eq!(region.base % PAGE_SIZE, 0);
+        free_region(lease).expect("free should succeed");
+        let second = alloc_region(PAGE_SIZE).expect("alloc after free should succeed");
+        assert_eq!(region, second.region());
+        free_region(second).expect("free second");
+        assert_eq!(region.size, PAGE_SIZE);
     }
 
     #[test]
@@ -213,11 +238,16 @@ mod tests {
         let _g = test_support::GUARD.lock();
         test_support::ensure_init();
 
-        let f1 = alloc_frame().expect("alloc f1");
-        free_frame(f1).expect("free f1");
-        let f2 = alloc_frame().expect("alloc f2");
-        assert_eq!(f1, f2, "buddy should reuse the freed block");
-        free_frame(f2).expect("free f2");
+        let first = alloc_region(PAGE_SIZE).expect("alloc first");
+        let first_region = first.region();
+        free_region(first).expect("free first");
+        let second = alloc_region(PAGE_SIZE).expect("alloc second");
+        assert_eq!(
+            first_region,
+            second.region(),
+            "buddy should reuse the freed block"
+        );
+        free_region(second).expect("free second");
     }
 
     // ------------------------------------------------------------------
@@ -228,12 +258,12 @@ mod tests {
     fn library_exhausts_cleanly() {
         let mut buf = std::vec![0u8; 1 << 20]; // 1 MiB = 256 帧
         let base = buf.as_mut_ptr() as usize;
-        let start = (base + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+        let start = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let mut heap = MetadataHeap::<HEAP_ORDER, HEAP_MIN_ORDER>::empty();
         unsafe { heap.try_init(start, 1 << 20).expect("init") };
 
         let mut n = 0u32;
-        while let Ok(run) = heap.alloc_pages(FRAME_ORDER) {
+        while let Ok(run) = heap.alloc_pages(PageOrder(HEAP_MIN_ORDER as u8)) {
             n += 1;
             assert!(n <= 1024, "runaway alloc");
             // 释放一半，验证合并后再分配（避免残留）
@@ -244,7 +274,7 @@ mod tests {
         assert!(n > 0, "should allocate some");
         // 耗尽后必须报 NoMemory（而非 panic）
         assert!(matches!(
-            heap.alloc_pages(FRAME_ORDER),
+            heap.alloc_pages(PageOrder(HEAP_MIN_ORDER as u8)),
             Err(buddy_system_allocator::AllocError::NoMemory)
         ));
     }

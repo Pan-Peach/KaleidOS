@@ -33,10 +33,11 @@ impl TaskTable {
     /// 唯二创建入口（public）：分配 id + 登记 record。
     pub fn create(&mut self, entry: usize) -> Result<TaskId, TaskError> {
         let id = self.alloc();
-        let frame = memory::alloc_frame().map_err(|_| TaskError::NoMemory)?;
-        let kstack = Kernelstack::new(frame.start_pa(), memory::FRAME_SIZE);
+        let memory = memory::alloc_region(memory::PAGE_SIZE).map_err(|_| TaskError::NoMemory)?;
+        let region = memory.region();
+        let kstack = Kernelstack::new(region.base, memory::PAGE_SIZE);
         let context = ArchImpl::new_context(entry, kstack.base + kstack.size);
-        let record = TaskRecord::new(Box::new(context), kstack);
+        let record = TaskRecord::new(Box::new(context), kstack, memory);
         self.insert(id, record)?;
         Ok(id)
     }
@@ -128,10 +129,10 @@ mod tests {
         let rec = t.get(id).expect("get after create");
         assert_eq!(rec.state, TaskState::Created);
         assert!(
-            rec.kstack.base.is_multiple_of(memory::FRAME_SIZE),
-            "kstack base frame-aligned"
+            rec.kstack.base.is_multiple_of(memory::PAGE_SIZE),
+            "kstack base page-aligned"
         );
-        assert_eq!(rec.kstack.size, memory::FRAME_SIZE);
+        assert_eq!(rec.kstack.size, memory::PAGE_SIZE);
     }
 
     #[test]
@@ -168,15 +169,13 @@ mod tests {
         let mut t = TaskTable::new();
         let id = t.create(ENTRY).unwrap();
         let rec = t.remove(id).expect("remove");
-        assert_eq!(rec.kstack.size, memory::FRAME_SIZE);
+        assert_eq!(rec.kstack.size, memory::PAGE_SIZE);
         assert!(t.is_empty());
         assert_eq!(
             t.remove(id),
             Err(TaskError::NotFound),
             "second remove fails"
         );
-        memory::free_frame(crate::memory::FrameId::from_pa(rec.kstack.base))
-            .expect("free removed task's frame");
     }
 
     #[test]
@@ -185,15 +184,13 @@ mod tests {
 
         let mut t = TaskTable::new();
         let mut held = Vec::new();
-        while let Ok(f) = memory::alloc_frame() {
-            held.push(f);
+        while let Ok(lease) = memory::alloc_region(memory::PAGE_SIZE) {
+            held.push(lease);
         }
         assert!(matches!(t.create(ENTRY), Err(TaskError::NoMemory)));
         assert!(t.is_empty(), "failed create must not register");
 
-        for f in held {
-            memory::free_frame(f).expect("free held frame");
-        }
+        drop(held);
     }
 
     #[test]
@@ -201,31 +198,33 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let f1 = memory::alloc_frame().unwrap();
+        let f1 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
+        let r1 = f1.region();
         let rec1 = TaskRecord::new(
             Box::new(ArchImpl::new_context(
                 ENTRY,
-                f1.start_pa() + memory::FRAME_SIZE,
+                r1.base + memory::PAGE_SIZE,
             )),
-            Kernelstack::new(f1.start_pa(), memory::FRAME_SIZE),
+            Kernelstack::new(r1.base, memory::PAGE_SIZE),
+            f1,
         );
         let id = TaskId::from_raw(7);
         assert_eq!(t.insert(id, rec1), Ok(()));
 
-        let f2 = memory::alloc_frame().unwrap();
+        let f2 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
+        let r2 = f2.region();
         let rec2 = TaskRecord::new(
             Box::new(ArchImpl::new_context(
                 ENTRY,
-                f2.start_pa() + memory::FRAME_SIZE,
+                r2.base + memory::PAGE_SIZE,
             )),
-            Kernelstack::new(f2.start_pa(), memory::FRAME_SIZE),
+            Kernelstack::new(r2.base, memory::PAGE_SIZE),
+            f2,
         );
 
         assert_eq!(t.insert(id, rec2), Err(TaskError::AlreadyExists));
         assert_eq!(t.len(), 1, "no overwrite");
         let stored = t.get(id).expect("stored");
-        assert_eq!(stored.kstack.base, f1.start_pa());
-        memory::free_frame(f1).unwrap();
-        memory::free_frame(f2).unwrap();
+        assert_eq!(stored.kstack.base, r1.base);
     }
 }

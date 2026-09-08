@@ -34,11 +34,18 @@ const R_RISCV_RELAX: u32 = 51;
 const SHN_UNDEF: usize = 0;
 
 /// 加载完成的组件：代码已在内存中，入口已定位（未调用）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct LoadedComponent {
     pub base: usize,
     pub entry: usize,
     pub text_size: usize,
+    pub(crate) memory: Option<memory::MemoryLease>,
+}
+
+impl LoadedComponent {
+    pub(crate) fn take_memory(&mut self) -> Option<memory::MemoryLease> {
+        self.memory.take()
+    }
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
@@ -173,14 +180,9 @@ pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedCompon
         .ok_or(LoaderError::NoEntrySymbol)?
         .1;
 
-    // 放段：逐帧分配（物理地址 = 恒等映射），按布局拷贝所有执行段
-    let frames = code_size.div_ceil(memory::FRAME_SIZE);
-    let mut fids = Vec::new();
-    for _ in 0..frames {
-        let fid = memory::alloc_frame().map_err(|_| LoaderError::OutOfMemory)?;
-        fids.push(fid);
-    }
-    let base = fids[0].start_pa();
+    // 放段：一次分配连续区域（物理地址 = 恒等映射），按布局拷贝所有执行段。
+    let image_memory = memory::alloc_region(code_size).map_err(|_| LoaderError::OutOfMemory)?;
+    let base = image_memory.region().base;
     for &(idx, put) in &seg_place {
         let (_, off, size, _, _, _) = sections[idx];
         let dst = unsafe { core::slice::from_raw_parts_mut((base + put) as *mut u8, size) };
@@ -194,6 +196,7 @@ pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedCompon
         base,
         entry: base + entry_put + entry_seg_off,
         text_size: code_size,
+        memory: Some(image_memory),
     })
 }
 
@@ -320,10 +323,9 @@ fn apply_relocations(
 mod tests {
     use super::*;
 
-    const CORETEST_KCOMP: &[u8] = include_bytes!("../../../../tests/fixtures/kpkg/core_test.kcomp");
-    const SMOKE_KCOMP: &[u8] = include_bytes!("../../../../tests/fixtures/kpkg/smoke.kcomp");
-    const SMOKE_MIN_KCOMP: &[u8] =
-        include_bytes!("../../../../tests/fixtures/kpkg/smoke_min.kcomp");
+    const CORETEST_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_test.kcomp"));
+    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
+    const SMOKE_MIN_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smoke_min.kcomp"));
 
     #[test]
     fn parses_header_of_core_test() {

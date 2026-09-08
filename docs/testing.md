@@ -48,7 +48,7 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 
 ### 验证清单（Core truth）
 
-- 帧所有权（frame ownership）：分配、归属、释放
+- 内存区域占用（region ownership）：分配、归属、释放
 - 任务状态转换（task state transitions）：所有合法路径
 - 地址空间映射（address-space mapping）
 - 定时器（timer）

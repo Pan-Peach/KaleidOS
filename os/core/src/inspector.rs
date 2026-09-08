@@ -5,6 +5,6 @@
 //!
 //! 计划接口（M1 随第一个真相存储落地）：
 //! - task(TaskId) -> Option<TaskSnapshot>         状态/owner/generation/CPU
-//! - frame(FrameId) -> Option<FrameSnapshot>      状态/owner/generation
+//! - memory_region(base) -> Option<MemoryRegionSnapshot>
 //! - component(ComponentId) -> Option<ComponentSnapshot>
 //! - visit_trace_since(seq, visitor)              只读遍历 trace

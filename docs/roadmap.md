@@ -15,7 +15,7 @@ Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core M
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
   7 条 kcore_*（console_write_byte / log_line / machine_boot_hart / machine_cpu_count /
-  free_frame_count / task_count / component_count）
+  free_page_count / task_count / component_count）
   —— 组件只能调白名单；未导出符号 → UnresolvedSymbol 整次加载失败
 ```
 
@@ -23,7 +23,7 @@ QEMU 验证输出（真实）：
 
 ```text
 core> load kcomp_smoke
-[smoke] hex=12            ← 组件通过白名单调用内核（component_count + free_frame_count）
+[smoke] hex=12            ← 组件通过白名单调用内核（component_count + free_page_count）
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
@@ -41,7 +41,7 @@ P2 中断/驱动雏形：
   C6  IRQ/PLIC + 驱动模型（virtio 等）—— MmioHandle/IrqHandle 实战入口
 P3 组件化进阶：
   C7  区域分配（alloc_pages(order) 替代逐帧）+ 分配失败回滚
-  C8  FrameHandle（opaque）+ Core 验证的原子 owner transfer（Phase B）
+  C8  MemoryRegion lease + Core 验证的原子 region ownership transfer
   C9  任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
 P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
   C10 Core AddressSpaceManager + 每域 Sv39 根 + ASID + U-mode（见 §10 性能模型）
@@ -86,7 +86,7 @@ P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔
 
 - 纯 Sv39 逻辑放 host 可编译的 `os/arch/src/sv39.rs`（PTE 编解码/walk → host test）；
   CSR/TLB 操作留 `riscv64/mmu.rs`
-- 页表页来源：map 接口收零页分配回调（bootstrap 注入 memory::alloc_frame），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceHandle
+- 页表页来源：map 接口收零页分配回调（bootstrap 注入 region allocator），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceHandle
 - API 只暴露 `map_range / translate`（unmap 推迟：表回收/shootdown 未到）
 - 新根在 buddy allocator 活后建（Phase B 兜底），预映射全部 RAM（4G ≈ 8MiB 页表页）
 - 权限分段：.text=RX / .rodata+.initpkg=R / .data+.bss+栈+页表=RW/NX；
@@ -178,9 +178,9 @@ manifest   = 文本清单（modules.dep 模式：depmod 生成 / modprobe 读取
 
 ```text
 TaskId        —— 任务身份
-FrameId       —— 物理帧身份
+PhysicalRange —— Core 管理的物理内存区域
 ComponentId   —— 组件身份
-Handle        —— 不可伪造的授权（类型化，如 FrameHandle）
+Handle        —— 不可伪造的授权（类型化，如 AddressSpaceHandle）
 ResourceDomain—— 组件资源集合（拥有什么、如何回收）
 Core 物理内存 —— 帧真相 + canonical 帧分配器机制（`buddy_system_allocator::MetadataHeap`，per-unit metadata O(1) buddy，metadata 自托管前端；区域 `[align_up(__bootstrap_end), RAM 末尾)`，ELF/DTB 天然保留）
 ```
@@ -206,7 +206,7 @@ Scheduler 提议运行 Task #7  →  Core 验证（存在/Runnable/未在别 CPU
 物理帧分配是 Core 内部机制，验收标准为 **Core 帧分配测试 / 分配器测试**：
 
 ```text
-请求者向 Core 要帧 → Core 分配器选择/验证/commit → grant FrameHandle
+请求者向 Core 要区域 → Core 分配器选择/验证/commit → 返回 memory lease
 ```
 
 对抗性测试开始建立：double free、wrong owner、invalid scheduler proposal 全部被 Core 拒绝。

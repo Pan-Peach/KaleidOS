@@ -9,18 +9,21 @@
 use alloc::vec::Vec;
 
 use crate::component::{ComponentId, ComponentState};
+use crate::memory::MemoryLease;
 use spin::{Mutex, Once};
 
 const MAX_NAME_LEN: usize = 64;
 
 /// 一个已加载组件（加载完 loader 的调用方填充）。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ComponentRecord {
     pub id: ComponentId,
     pub name: Vec<u8>,
     pub state: ComponentState,
     pub entry: usize,
     pub base: usize,
+    #[allow(dead_code)]
+    pub(crate) memory: Option<MemoryLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +55,12 @@ impl Registry {
     }
 
     /// 声明一个组件（loader 放段完成 → Declared）。
-    pub fn declare(
+    pub(crate) fn declare(
         &mut self,
         name: &[u8],
         entry: usize,
         base: usize,
+        memory: Option<MemoryLease>,
     ) -> Result<ComponentId, RegistryError> {
         if name.len() > MAX_NAME_LEN {
             return Err(RegistryError::NameTooLong);
@@ -74,6 +78,7 @@ impl Registry {
             state: ComponentState::Declared,
             entry,
             base,
+            memory,
         });
         Ok(id)
     }
@@ -160,8 +165,8 @@ mod tests {
     #[test]
     fn declare_assigns_increasing_ids() {
         let mut reg = r();
-        let a = reg.declare(b"a", 0x100, 0x200).unwrap();
-        let b = reg.declare(b"b", 0x300, 0x400).unwrap();
+        let a = reg.declare(b"a", 0x100, 0x200, None).unwrap();
+        let b = reg.declare(b"b", 0x300, 0x400, None).unwrap();
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
     }
@@ -169,9 +174,9 @@ mod tests {
     #[test]
     fn duplicate_name_is_rejected() {
         let mut reg = r();
-        reg.declare(b"dup", 1, 2).unwrap();
+        reg.declare(b"dup", 1, 2, None).unwrap();
         assert_eq!(
-            reg.declare(b"dup", 3, 4),
+            reg.declare(b"dup", 3, 4, None),
             Err(RegistryError::AlreadyDeclared)
         );
     }
@@ -179,7 +184,7 @@ mod tests {
     #[test]
     fn start_transitions_declared_to_ready() {
         let mut reg = r();
-        let id = reg.declare(b"x", 1, 2).unwrap();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.start(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
     }
@@ -187,7 +192,7 @@ mod tests {
     #[test]
     fn start_twice_is_invalid_transition() {
         let mut reg = r();
-        let id = reg.declare(b"x", 1, 2).unwrap();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.start(id).unwrap();
         assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
     }
@@ -202,7 +207,7 @@ mod tests {
     #[test]
     fn unload_removes_record() {
         let mut reg = r();
-        let id = reg.declare(b"x", 1, 2).unwrap();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.unload(id).unwrap();
         assert_eq!(reg.len(), 0);
         assert!(reg.get(id).is_none());
@@ -211,7 +216,7 @@ mod tests {
     #[test]
     fn failed_is_reachable_from_any_state() {
         let mut reg = r();
-        let id = reg.declare(b"x", 1, 2).unwrap();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.start(id).unwrap();
         reg.mark_failed(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
@@ -221,6 +226,6 @@ mod tests {
     fn name_too_long_is_rejected() {
         let mut reg = r();
         let long = [b'x'; MAX_NAME_LEN + 1];
-        assert_eq!(reg.declare(&long, 1, 2), Err(RegistryError::NameTooLong));
+        assert_eq!(reg.declare(&long, 1, 2, None), Err(RegistryError::NameTooLong));
     }
 }

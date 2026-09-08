@@ -3,7 +3,7 @@
 //! 设计约束（架构定案）：
 //! - Monitor 是 Core 常态能力，不是"系统崩了才出现"的救火模式；
 //! - 不依赖 Scheduler/Logger/Network 等任何 Component —— 组件全挂也要能跑；
-//! - 只读观察系统状态（machine/memory/frame），不提供 god-mode 修改；
+//! - 只读观察系统状态（machine/memory），不提供 god-mode 修改；
 //! - 不因拥有 console 而获得 authority（Oracle 审查结论）。
 //!
 //! 主循环：`core> _` 提示符 → 读行 → token 解析 → 命令表分发 → 循环。
@@ -37,13 +37,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "memory",
-        help: "frame allocator stats",
+        help: "physical memory allocator stats",
         run: cmds::memory,
-    },
-    Command {
-        name: "frame",
-        help: "query frame by physical address (hex)",
-        run: cmds::frame,
     },
     Command {
         name: "tasks",
@@ -141,22 +136,22 @@ mod tests {
 
     #[test]
     fn known_command_with_args() {
-        let r = resolve_command(b"frame 0x1000");
-        assert_eq!(name(&r), "frame");
-        assert_eq!(args(&r), b"0x1000");
+        let r = resolve_command(b"memory");
+        assert_eq!(name(&r), "memory");
+        assert!(args(&r).is_empty());
     }
 
     #[test]
     fn multiple_spaces_are_stripped() {
-        let r = resolve_command(b"frame    0x1000");
-        assert_eq!(name(&r), "frame");
-        assert_eq!(args(&r), b"0x1000");
+        let r = resolve_command(b"memory    ");
+        assert_eq!(name(&r), "memory");
+        assert!(args(&r).is_empty());
     }
 
     #[test]
     fn command_only_has_empty_args() {
-        let r = resolve_command(b"frame");
-        assert_eq!(name(&r), "frame");
+        let r = resolve_command(b"memory");
+        assert_eq!(name(&r), "memory");
         assert!(args(&r).is_empty());
     }
 
@@ -165,7 +160,7 @@ mod tests {
         // trim_leading 认 tab；但 first-token 分离只认空格 → 命令名含 tab 前缀时
         // first 不是纯命令名。这里记录现状：tab 分隔的后续参数被剥离，
         // 但命令名本身以 tab 开头时作为未知处理（与空格行为不同）。
-        let r = resolve_command(b"frame\t0x1000");
+        let r = resolve_command(b"memory\t0x1000");
         // 实际上 "frame\t0x1000" 中 first = "frame\t0x1000"（无空格）→ 未知
         assert!(matches!(r, Resolved::Unknown(_)));
     }

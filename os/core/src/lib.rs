@@ -53,14 +53,14 @@ pub fn init(
     let reserved_end = reserved
         .last()
         .map_or(info.memory_regions[0].base, |r| r.base + r.size);
-    let frame_start = memory::align_up_frame(reserved_end);
-    let frame_end = info.memory_regions[0].base + info.memory_regions[0].size;
+    let region_start = memory::align_up_page(reserved_end);
+    let region_end = info.memory_regions[0].base + info.memory_regions[0].size;
 
-    memory::init(frame_start, frame_end)?;
+    memory::init(region_start, region_end)?;
 
     // 帧真相验证：可分配一帧并释放（自证 allocator 可用）。
-    let probe = memory::alloc_frame().map_err(|_| "alloc probe failed")?;
-    memory::free_frame(probe).map_err(|_| "free probe failed")?;
+    let probe = memory::alloc_region(memory::PAGE_SIZE).map_err(|_| "alloc probe failed")?;
+    memory::free_region(probe).map_err(|_| "free probe failed")?;
 
     task::init();
     component::registry::init();

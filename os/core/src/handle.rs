@@ -1,8 +1,8 @@
 //! Handle / Authority：类型化、不可伪造的授权。
-//! FrameHandle / MmioHandle / IrqHandle / DmaHandle / TaskHandle / TimerHandle / AddressSpaceHandle。
+//! MmioHandle / IrqHandle / DmaHandle / TaskHandle / TimerHandle / AddressSpaceHandle。
 //! 驱动永远不应拿到裸物理地址、裸 IRQ 号或裸指针。
 //!
-//! 与 ID（TaskId/FrameId/ComponentId，可伪造、可传递的身份标识）不同：
+//! 与 ID（TaskId/ComponentId，可伪造、可传递的身份标识）不同：
 //! Handle 是 **Authority** —— 只能由 Core 创建与校验，不可伪造。
 //! ID 可以是不可信输入；任何来自 Component / IPC / Wasm 的 ID 都必须重新经过 Core validation。
 //!

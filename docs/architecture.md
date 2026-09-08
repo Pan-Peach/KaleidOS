@@ -253,7 +253,7 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是 **authority handle**（MMIO/IRQ/DMA/frame handle），**不是**堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的资源），owner 字段直接落在各资源表（irq/mmio/dma/timer）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
+- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是设备/执行域 authority 和受管理的内存区域，**不是**逐帧 handle、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的资源），owner 字段直接落在各资源表（irq/mmio/dma/timer）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
 - **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `Wasm`）。`ComponentRecord` 只记轻量 `execution_kind`，真正的 runtime（`LoadedComponent` + `ExecutionDomain`）放 `ComponentRuntime`，由 `ComponentManager` 串起来（见 component-model.md §4）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
 
 > 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"。契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核、微内核或混合形态。
@@ -292,11 +292,11 @@ Scheduler（Component）         Core
 ```text
 请求者（Component）            Core
     │                           │
-    │  请求一帧                 │
-    │ ────────────────────────► │ 分配器选择一帧（如 Frame #100）
-    │                           │ 验证：存在？空闲？归属合法？
-    │                           │ commit ownership
-    │ ◄──────────────────────── │ grant authority（FrameHandle）
+    │  请求一段内存区域         │
+    │ ────────────────────────► │ 分配器选择可用 PhysicalRange
+    │                           │ 验证：存在？空闲？范围合法？
+    │                           │ commit region ownership
+    │ ◄──────────────────────── │ 返回受 Core 管理的 memory lease
 ```
 
 未来若引入 `MemoryPolicy` 组件，它只能提议偏好（NUMA 偏好、配额），最终选择/验证/提交仍在 Core。

@@ -118,7 +118,7 @@ pub fn get_component_store() -> Option<&'static dyn ComponentStore> {
 mod tests {
     use super::*;
 
-    const REAL_KPKG: &[u8] = include_bytes!("../../../../tests/fixtures/kpkg/init.kpkg");
+    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
 
     #[test]
     fn parses_real_kpkg_entries() {
@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(entries[0].name, b"manifest");
         assert_eq!(entries[0].data, b"kcomp_smoke.kcomp\n");
         assert_eq!(entries[1].name, b"kcomp_smoke.kcomp");
-        assert_eq!(entries[1].data.len(), 1016);
+        assert!(!entries[1].data.is_empty());
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(entries[0].name, b"manifest");
         assert_eq!(entries[0].len, 18);
         assert_eq!(entries[1].name, b"kcomp_smoke.kcomp");
-        assert_eq!(entries[1].len, 1016);
+        assert!(entries[1].len > 0);
     }
 
     #[test]

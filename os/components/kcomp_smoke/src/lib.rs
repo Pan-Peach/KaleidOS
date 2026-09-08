@@ -10,8 +10,8 @@ unsafe extern "C" {
     fn console_write_byte(byte: u8);
     #[link_name = "kcore_component_count"]
     fn component_count() -> usize;
-    #[link_name = "kcore_free_frame_count"]
-    fn free_frame_count() -> usize;
+    #[link_name = "kcore_free_page_count"]
+    fn free_page_count() -> usize;
 }
 
 fn hex_digit(d: usize) -> u8 {
@@ -42,7 +42,7 @@ fn write_hex(v: usize) {
 }
 
 fn do_smoke() -> usize {
-    unsafe { component_count().wrapping_add(free_frame_count()) }
+    unsafe { component_count().wrapping_add(free_page_count()) }
 }
 
 /// 组件入口：加载器在放段 + 重定位之后调用。

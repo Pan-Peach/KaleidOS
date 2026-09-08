@@ -58,8 +58,13 @@ extern "C" fn kcore_machine_cpu_count() -> usize {
     machine::committed().map_or(0, |m| m.cpu_count)
 }
 
-extern "C" fn kcore_free_frame_count() -> usize {
-    memory::free_block_counts().iter().sum()
+extern "C" fn kcore_free_page_count() -> usize {
+    memory::free_block_counts()
+        .iter()
+        .enumerate()
+        .skip(memory::HEAP_MIN_ORDER)
+        .map(|(order, &blocks)| blocks * (1usize << (order - memory::HEAP_MIN_ORDER)))
+        .sum()
 }
 
 extern "C" fn kcore_task_count() -> usize {
@@ -88,8 +93,8 @@ static EXPORTS: [Export; 7] = [
         address: ExportAddress(kcore_machine_cpu_count as *const ()),
     },
     Export {
-        name: b"kcore_free_frame_count",
-        address: ExportAddress(kcore_free_frame_count as *const ()),
+        name: b"kcore_free_page_count",
+        address: ExportAddress(kcore_free_page_count as *const ()),
     },
     Export {
         name: b"kcore_task_count",
@@ -120,7 +125,7 @@ mod tests {
         assert!(resolve(b"kcore_log_line").is_some());
         assert!(resolve(b"kcore_machine_boot_hart").is_some());
         assert!(resolve(b"kcore_machine_cpu_count").is_some());
-        assert!(resolve(b"kcore_free_frame_count").is_some());
+        assert!(resolve(b"kcore_free_page_count").is_some());
         assert!(resolve(b"kcore_task_count").is_some());
         assert!(resolve(b"kcore_component_count").is_some());
     }

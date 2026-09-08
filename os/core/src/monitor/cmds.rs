@@ -1,4 +1,4 @@
-//! Core Monitor 命令实现（machine / memory / frame / help）。
+//! Core Monitor 命令实现（machine / memory / help）。
 //!
 //! 全部只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
@@ -62,58 +62,28 @@ pub fn machine(_line: &[u8]) {
     }
 }
 
-/// `memory`：帧分配器统计（free_block_counts 直方图）。
+/// `memory`：物理内存分配器统计（free_block_counts 直方图）。
 pub fn memory(_line: &[u8]) {
     let counts = memory::free_block_counts();
-    // 只显示非空 order（4K 起：order 12 起）
-    let mut free_frames = 0usize;
+    // 只显示非空 order（4K 起：order 12 起）。
+    let mut free_pages = 0usize;
     for (order, &n) in counts.iter().enumerate() {
         if n > 0 && order >= 12 {
-            let block_frames = 1u64 << (order - 12); // order 12=1 frame
+            let block_pages = 1u64 << (order - 12);
             printk!(
                 "free order{} ({:#x}): {} blocks\n",
                 order,
                 1usize << order,
                 n
             );
-            free_frames = free_frames.saturating_add((n as u64 * block_frames) as usize);
+            free_pages = free_pages.saturating_add((n as u64 * block_pages) as usize);
         }
     }
     printk!(
-        "free frames: {} (~{:#x} bytes)\n",
-        free_frames,
-        free_frames * memory::FRAME_SIZE
+        "free pages: {} (~{:#x} bytes)\n",
+        free_pages,
+        free_pages * memory::PAGE_SIZE
     );
-}
-
-/// `frame <addr>`：按物理地址（hex）显示帧归属 —— 现在只显示"帧号对应范围"，
-/// per-frame 归属查询待帧真相 API（M1/M2 真相存储落地）。
-pub fn frame(line: &[u8]) {
-    // 解析 addr 参数（hex）
-    let mut addr_str = "";
-    for tok in line.split(|&b| b == b' ') {
-        if !tok.is_empty() {
-            addr_str = core::str::from_utf8(tok).unwrap_or("");
-            break;
-        }
-    }
-    if addr_str.is_empty() {
-        printk!("usage: frame <addr>\n");
-        return;
-    }
-    let addr = usize::from_str_radix(addr_str.trim_start_matches("0x"), 16);
-    match addr {
-        Ok(pa) => {
-            let frame = memory::FrameId::from_pa(pa);
-            printk!(
-                "pa {:#x} -> frame {} (start {:#x})\n",
-                pa,
-                frame.raw(),
-                frame.start_pa()
-            );
-        }
-        Err(_) => printk!("invalid address: '{}'\n", addr_str),
-    }
 }
 
 pub fn tasks(_line: &[u8]) {
@@ -162,7 +132,7 @@ pub fn load(args: &[u8]) {
         return;
     }
 
-    let comp = match crate::component::loader::load_component(&blob, arch::ArchImpl::ELF_MACHINE) {
+    let mut comp = match crate::component::loader::load_component(&blob, arch::ArchImpl::ELF_MACHINE) {
         Ok(c) => c,
         Err(e) => {
             printk!("load: {}: {e:?}\n", String::from_utf8_lossy(name));
@@ -171,7 +141,7 @@ pub fn load(args: &[u8]) {
     };
 
     let mut reg = crate::component::registry::get_registry().lock();
-    let id = match reg.declare(name, comp.entry, comp.base) {
+    let id = match reg.declare(name, comp.entry, comp.base, comp.take_memory()) {
         Ok(id) => id,
         Err(e) => {
             printk!("load: declare failed: {e:?}\n");

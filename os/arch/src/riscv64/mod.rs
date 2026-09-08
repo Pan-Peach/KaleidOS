@@ -2,6 +2,7 @@ use crate::{Arch, ResetType};
 use core::arch::global_asm;
 use sbi_rt;
 
+pub mod address_space;
 pub mod console;
 pub mod mmu;
 pub mod sv39;

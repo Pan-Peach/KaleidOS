@@ -85,7 +85,7 @@ struct DmaRecord {
 }
 ```
 
-> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA/frame handle），用于保护与 revoke。
+> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA）和受管理的内存区域，用于保护与 revoke。
 >
 > `ComponentId` 是 identity（不是 authority），`handle.rs` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
 
@@ -288,18 +288,19 @@ Core AddressSpaceTable
 `ExecutionDomain` 只保存 `AddressSpaceId`，不拥有可以绕过 Core 修改映射的页表
 对象。Core 保存地址空间的语义真相；PTE 只是 backend 的硬件投影。
 
-Core 公开入口只接受 `AddressSpaceHandle`、`FrameHandle`、虚拟页和抽象权限：
+Core 公开入口只接受 `AddressSpaceHandle`、虚拟/物理区域和抽象权限：
 
 ```text
-map_page(caller, space_handle, virtual_page, frame_handle, permission)
-  → validate handle / owner / overlap / permission
+map_range(caller, space_handle, virtual_range, physical_range, permission)
+  → validate space / region / overlap / permission
   → install backend mapping
   → commit mapping record and trace
 ```
 
-物理帧 ownership 永远由 Core FrameTable 保存，不放进 PTE 的 RSW 字段；映射销毁
-也不依赖 `Drop` 扫页表。私有、借用和共享关系由 Core 的 frame owner 与 grant
-记录表达，页表 backend 只负责安装、撤销和激活硬件映射。
+物理内存的占用和区域归属由 Core 保存，不放进 PTE 的 RSW 字段；映射销毁也不
+依赖 `Drop` 扫页表。私有、借用和共享关系由 Core 的 region/lifetime 记录表达，
+页表 backend 只负责安装、撤销和激活硬件映射。backend 内部可以按 4 KiB 拆分，
+但这不改变 Core 的 region 粒度。
 
 映射和销毁必须是 Core 控制的显式事务：地址空间进入 `Dying` 后拒绝新操作，
 停止引用它的任务，确认没有 CPU 正在使用，再由 backend 销毁页表，最后由 Core
@@ -310,15 +311,15 @@ map_page(caller, space_handle, virtual_page, frame_handle, permission)
 
 ### 4.8 Loader 自然分叉
 
-现状 `load_component(blob, expected_machine)` 内部直接 `memory::alloc_frame()`，拿 PA 当 VA 拷贝，返回 `LoadedComponent { base, entry, text_size }`。未来：
+现状 `load_component(blob, expected_machine)` 内部直接从 Core 内部 allocator 取得存储，拿 PA 当 VA 拷贝，返回 `LoadedComponent { base, entry, text_size }`。未来：
 
 ```rust
 fn load_component(blob: &[u8], target: &mut dyn LoadTarget)
     -> Result<LoadedComponent, LoaderError>
 ```
 
-- KernelNative target：alloc frame → identity / kernel VA → copy；
-- IsolatedNative target：向 Core 请求 frame authority → Core 提交映射 → copy。
+- KernelNative target：alloc memory region → identity / kernel VA → copy；
+- IsolatedNative target：向 Core 请求 memory region → Core 提交 range mapping → copy。
 
 loader 不需要知道 satp / Sv39 / KernelNative / IsolatedNative，它只知道"给我一块能放 section 的 memory"——保持 arch / mechanism 分层。
 
@@ -432,7 +433,7 @@ DMA table  ─ owner=A ─┘
 ### 4.11 落地顺序：现在只做两小步
 
 1. **先不要写 ResourceDomain**。等 MMIO/IRQ 真正开始做的时候，在每个 authority record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
-2. **C8 完成 FrameHandle 后、真正需要隔离执行时**，再引入 `AddressSpaceManager`。
+2. **完成 region allocation contract 后、真正需要隔离执行时**，再引入 `AddressSpaceManager`。
   它维护 `AddressSpaceSlot`、generation、语义 mapping ledger，并通过 Core 控制的
   backend 完成 map/unmap/activate/destroy；不使用 RSW ownership，也不依赖 `Drop`
   扫页表释放帧。
