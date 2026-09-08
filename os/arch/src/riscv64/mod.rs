@@ -2,9 +2,10 @@ use crate::{Arch, ResetType};
 use core::arch::global_asm;
 use sbi_rt;
 
-pub mod trap;
-pub mod sv39;
 pub mod console;
+pub mod mmu;
+pub mod sv39;
+pub mod trap;
 
 global_asm!(include_str!("switch.S"));
 

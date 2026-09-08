@@ -1,3 +1,4 @@
+.align 2
 .global trap_vec
 trap_vec:
     addi sp, sp, -272

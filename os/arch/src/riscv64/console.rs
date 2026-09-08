@@ -4,7 +4,7 @@ use core::fmt::{self, Write};
 use sbi_rt;
 
 pub fn write_byte(byte: u8) {
-    sbi_rt::console_write_byte(byte);
+    let _ = sbi_rt::legacy::console_putchar(byte as usize);
 }
 
 pub fn write_fmt(args: fmt::Arguments<'_>) {

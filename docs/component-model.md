@@ -201,7 +201,7 @@ revoke_component_resources(id) —— 收回 authority-backed resources（handle
 ```rust
 pub enum ExecutionDomain {
     KernelNative,
-    IsolatedNative(AddressSpace),
+  IsolatedNative(AddressSpaceId),
     // future: Wasm(WasmInstance)
 }
 ```
@@ -223,17 +223,16 @@ pub struct ComponentRecord {
 #[derive(Clone, Copy, Debug)]
 pub enum ExecutionKind {
     KernelNative,
-    IsolatedNative,
+  IsolatedNative,
 }
-```
 
 真正 runtime：
 
 ```rust
 pub struct ComponentRuntime {
-    pub id: ComponentId,
-    pub image: LoadedComponent,
-    pub execution: ExecutionDomain,
+  pub id: ComponentId,
+  pub image: LoadedComponent,
+  pub execution: ExecutionDomain,
 }
 ```
 
@@ -248,118 +247,66 @@ Runtime  —— "这个 Component 现在实际占着什么运行环境"（runtim
 
 ```rust
 pub struct ComponentManager {
-    registry: Registry,
-    runtimes: Vec<ComponentRuntime>,
+  registry: Registry,
+  runtimes: Vec<ComponentRuntime>,
 }
 
 impl ComponentManager {
-    pub fn load(&mut self, name: &[u8], blob: &[u8], kind: ExecutionKind)
-        -> Result<ComponentId, ComponentError>;
-    pub fn start(&mut self, id: ComponentId) -> Result<(), ComponentError>;
-    pub fn stop(&mut self, id: ComponentId) -> Result<(), ComponentError>;
-    pub fn fail(&mut self, id: ComponentId, reason: ComponentError);
+  pub fn load(&mut self, name: &[u8], blob: &[u8], kind: ExecutionKind)
+    -> Result<ComponentId, ComponentError>;
+  pub fn start(&mut self, id: ComponentId) -> Result<(), ComponentError>;
+  pub fn stop(&mut self, id: ComponentId) -> Result<(), ComponentError>;
+  pub fn fail(&mut self, id: ComponentId, reason: ComponentError);
 }
 ```
 
-（概念代码；落地时按现有 Registry 状态机 `Declared → Starting → Ready + Failed` 接轨。当前 unload 只删记录、不释放放段内存。）
+（概念代码；落地时按现有 Registry 状态机 `Declared → Starting → Ready + Failed`
+接轨。当前 unload 只删记录、不释放放段内存。）
 
 ### 4.3 KernelNative 具体是什么
 
-甚至什么都不用存：
-
-```text
-ComponentRuntime
-├── LoadedComponent
-└── ExecutionDomain::KernelNative
-```
-
-调用方式与现在完全一样（loader 的 `call_init`）：
+`KernelNative` 只需要保存已加载镜像和执行种类，调用方式与现在一致：
 
 ```rust
-let ret = loader::call_init(&runtime.image);   // extern "C" fn() -> i32
+let ret = loader::call_init(&runtime.image);
 ```
 
-以后只是把 `0 = Ok / 非 0 = Err` 改得正式一点。
+### 4.4 IsolatedNative 的 AddressSpace（未来 C10）
 
-### 4.4 IsolatedNative 才多一个 AddressSpace
-
-这里的 `AddressSpace` 是 ExecutionDomain 使用的运行时机制，不是 Component
-直接操作的 Sv39 页表对象。上层只表达 region、frame authority 和 permission；
-Core 负责校验 ownership/handle，具体 PTE、VPN、`satp`、TLB 操作由 arch
-backend 完成。当前只需要支持 Sv39，接口不要因此把 Core 绑定到 Sv39。
-
-```rust
-pub struct AddressSpace {
-    root: FrameId,   // 第一版甚至可以只放这一个字段
-}
-
-impl AddressSpace {
-    pub fn new() -> Result<Self, VmError>;
-    pub fn map_owned(&mut self, va: VirtAddr, frame: FrameId, flags: MapFlags) -> Result<(), VmError>;
-    pub fn map_borrowed(&mut self, va: VirtAddr, frame: FrameId, flags: MapFlags) -> Result<(), VmError>;
-    pub fn activate(&self);
-}
-```
-
-### 4.5 RSW bit —— ownership 直接贴在 PTE 上
-
-不需要维护 `Vec<Mapping>`：Sv39 PTE 的 **RSW 字段是 supervisor software 保留、硬件忽略**的（RISC-V Privileged Spec [Supervisor-Level ISA, v1.13](https://docs.riscv.org/reference/isa/priv/supervisor.html)），正好留给我们：
+M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间在需要
+U-mode、故障隔离或可执行回收时才引入，由 Core 的 AddressSpaceManager 统一管理。
 
 ```text
-PTE
-
-| PPN | RSW | D A G U X W R V |
-        ↑
-        │
-     OWNED bit (RSW[0])
-
-map_owned    → PTE.RSW[0] = 1
-map_borrowed → PTE.RSW[0] = 0
+Core AddressSpaceTable
+└── AddressSpaceSlot
+  ├── owner / generation / lifecycle
+  ├── semantic mappings
+  └── opaque ArchSpace
+    └── Sv39 root / PTE pages
 ```
 
-> 能由底层机制自己表达的东西，就别在 Core 上面再建一层账本 —— 这正是这几轮一直在做的减法。
+`ExecutionDomain` 只保存 `AddressSpaceId`，不拥有可以绕过 Core 修改映射的页表
+对象。Core 保存地址空间的语义真相；PTE 只是 backend 的硬件投影。
 
-### 4.6 AddressSpace::drop 真的能扫页表
-
-```rust
-impl Drop for AddressSpace {
-    fn drop(&mut self) {
-        destroy_page_table(self.root);
-    }
-}
-
-fn destroy_page_table(table: FrameId) {
-    for pte in table.entries() {
-        if !pte.valid() {
-            continue;
-        }
-        if pte.is_branch() {
-            let child = pte.frame();
-            destroy_page_table(child);
-            free_frame(child);          // page-table page 永远属于 AddressSpace 自己
-        } else if pte.owned() {
-            free_frame(pte.frame());    // OWNED frame：free
-        }
-        // BORROWED mapping：只取消映射，不 free PA
-    }
-    free_frame(table);
-}
-```
-
-于是之前"Arc cycle / mem::forget / Box::leak / 组件 allocator"的纠结全部消失：
+Core 公开入口只接受 `AddressSpaceHandle`、`FrameHandle`、虚拟页和抽象权限：
 
 ```text
-drop AddressSpace → 扫 PTE → OWNED frame 全 free
+map_page(caller, space_handle, virtual_page, frame_handle, permission)
+  → validate handle / owner / overlap / permission
+  → install backend mapping
+  → commit mapping record and trace
 ```
 
-### 4.7 Shared memory 第一版不做
+物理帧 ownership 永远由 Core FrameTable 保存，不放进 PTE 的 RSW 字段；映射销毁
+也不依赖 `Drop` 扫页表。私有、借用和共享关系由 Core 的 frame owner 与 grant
+记录表达，页表 backend 只负责安装、撤销和激活硬件映射。
 
-IsolatedNative 第一阶段只有 OWNED / BORROWED 两种：
+映射和销毁必须是 Core 控制的显式事务：地址空间进入 `Dying` 后拒绝新操作，
+停止引用它的任务，确认没有 CPU 正在使用，再由 backend 销毁页表，最后由 Core
+按 ownership 回收资源并递增 generation。
 
-- **Owned**：heap / stack / private data / private code —— AddressSpace 死了直接 free；
-- **Borrowed**：Core trampoline / MMIO / kernel shared code —— AddressSpace 死了只 unmap。
-
-将来真要 SharedMemory 再引入 `SharedMapping`，RSW 可扩展为 `00 borrowed / 01 owned / 10 shared`，或 shared 单独做 metadata / refcount。**不要提前解决。**
+具体的 backend contract 和 `ArchSpace` 所在 crate 仍需遵守当前依赖方向；在真正
+实现 C10 前，不把 Core 绑定到 `Sv39`、`Pte`、`satp` 或某个 Arch crate。
 
 ### 4.8 Loader 自然分叉
 
@@ -371,7 +318,7 @@ fn load_component(blob: &[u8], target: &mut dyn LoadTarget)
 ```
 
 - KernelNative target：alloc frame → identity / kernel VA → copy；
-- IsolatedNative target：alloc frame → `map_owned(frame, component_va)` → copy。
+- IsolatedNative target：向 Core 请求 frame authority → Core 提交映射 → copy。
 
 loader 不需要知道 satp / Sv39 / KernelNative / IsolatedNative，它只知道"给我一块能放 section 的 memory"——保持 arch / mechanism 分层。
 
@@ -383,7 +330,7 @@ pub fn fail_component(&mut self, id: ComponentId, reason: ComponentError) {
     self.stop_component_tasks(id);
     revoke_component_resources(id);
     self.drop_runtime(id);   // KernelNative: drop Rust state 结束；
-                             // IsolatedNative: Drop → AddressSpace → 页表 walk → free OWNED
+                 // IsolatedNative: Core 显式销毁 AddressSpace
 }
 ```
 
@@ -442,10 +389,10 @@ execution/
 ├── mod.rs
 │   └── ExecutionDomain
 │       ├── KernelNative
-│       └── IsolatedNative(AddressSpace)
+│       └── IsolatedNative(AddressSpaceId)
 │
 └── address_space.rs
-    └── AddressSpace
+  └── AddressSpaceManager / AddressSpaceSlot（未来 C10）
 
 
 irq.rs       —— IrqTable，record 带 owner: ComponentId
@@ -469,9 +416,9 @@ ComponentManager
                      │
                ┌─────┴─────┐
                │           │
-         KernelNative   AddressSpace
-                             │
-                          page table
+          KernelNative   AddressSpaceId
+                        │
+                Core-controlled backend
 ```
 
 而 ResourceDomain 根本不在这棵树里：
@@ -485,7 +432,10 @@ DMA table  ─ owner=A ─┘
 ### 4.11 落地顺序：现在只做两小步
 
 1. **先不要写 ResourceDomain**。等 MMIO/IRQ 真正开始做的时候，在每个 authority record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
-2. **Sv39 做完以后**，写一个非常薄的 `AddressSpace { root: FrameId }`，做到 `new / map_owned / map_borrowed / activate / Drop`。其中 **Drop → 页表 walk → free OWNED frame** 这一条跑通，ExecutionDomain 最核心的机制就出来了。
+2. **C8 完成 FrameHandle 后、真正需要隔离执行时**，再引入 `AddressSpaceManager`。
+  它维护 `AddressSpaceSlot`、generation、语义 mapping ledger，并通过 Core 控制的
+  backend 完成 map/unmap/activate/destroy；不使用 RSW ownership，也不依赖 `Drop`
+  扫页表释放帧。
 
 ## 5. 生命周期
 

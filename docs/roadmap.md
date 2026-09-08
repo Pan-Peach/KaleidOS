@@ -44,7 +44,7 @@ P3 组件化进阶：
   C8  FrameHandle（opaque）+ Core 验证的原子 owner transfer（Phase B）
   C9  任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
 P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
-  C10 每域 Sv39 根 + ASID + U-mode（见 §10 性能模型）
+  C10 Core AddressSpaceManager + 每域 Sv39 根 + ASID + U-mode（见 §10 性能模型）
 ```
 
 ### 下一个里程碑：M0.5 —— Sv39（手敲重点，2026-08 Oracle 方案）
@@ -86,13 +86,18 @@ P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔
 
 - 纯 Sv39 逻辑放 host 可编译的 `os/arch/src/sv39.rs`（PTE 编解码/walk → host test）；
   CSR/TLB 操作留 `riscv64/mmu.rs`
-- 页表页来源：map 接口收零页分配回调（bootstrap 注入 memory::alloc_frame），避免 arch→core 反向依赖
+- 页表页来源：map 接口收零页分配回调（bootstrap 注入 memory::alloc_frame），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceHandle
 - API 只暴露 `map_range / translate`（unmap 推迟：表回收/shootdown 未到）
 - 新根在 buddy allocator 活后建（Phase B 兜底），预映射全部 RAM（4G ≈ 8MiB 页表页）
 - 权限分段：.text=RX / .rodata+.initpkg=R / .data+.bss+栈+页表=RW/NX；
   **组件池暂时 RWX（loader 正从那里执行代码！设 NX 会静默弄坏现有加载器）**
 
 验收：host tests + make check 绿；boot/monitor/load 正常；写 rodata → cause 15；读未映射 → cause 13。
+
+M0.5 只构建永久的 KernelPageTable：不引入 AddressSpaceHandle、ExecutionDomain
+隔离实例、ASID 管理或通用 AddressSpaceManager。运行期地址空间属于 C10；届时
+Core 保存 owner、generation、生命周期和语义 mapping ledger，backend 保存 opaque
+页表投影，所有 map/unmap/activate/destroy 都由 Core 串行化和提交。
 
 #### M0.5 阅读计划（规范版本固定：RISC-V Ratified Specs Library **20240411 快照，Supervisor ISA 1.13**）
 

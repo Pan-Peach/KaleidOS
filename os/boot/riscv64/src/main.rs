@@ -35,6 +35,7 @@ static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
     arch::ArchImpl::init();
+    kernel::log!("bootstrap", "arch init OK");
     kernel::log!("bootstrap", "KaleidOS bootstrap");
     kernel::log!("bootstrap", "========================================");
 
@@ -93,6 +94,12 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 dev_count,
                 devices,
             };
+
+            unsafe {
+                arch::riscv64::mmu::init_identity();
+                arch::riscv64::mmu::activate();
+            }
+            kernel::log!("bootstrap", "Sv39 identity map OK");
 
             // 汇编已保证只有 boot hart（hartid 0，QEMU virt 主 hart）进入 Rust。
             kernel::log!("bootstrap", "MachineInfo dump:");
