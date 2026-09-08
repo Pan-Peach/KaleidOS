@@ -10,19 +10,15 @@ _start:
     # this is the runtime kernel PA, independent of the link-time LMA.
     auipc s1, 0
 
-    # 非 boot hart（hartid != 0）直接永久 park：
-    # 不进 Rust、不碰栈（早期每个 hart 共用 boot_stack_top，若都进 Rust
-    # 会踩同一个栈 = UB）。
-    beq a0, zero, .Lboot_hart
-
-.Lpark:
-    wfi
-    j .Lpark
-
-.Lboot_hart:
+    # OpenSBI 只把选定的 boot hart 送入 _start（其余 hart 留在 OpenSBI
+    # warm-boot 路径等待，等未来 SMP 协议唤醒）；a0 = 该 hart 的 hartid，
+    # 由 bootstrap_main 接收并记为 MachineInfo.boot_hart，因此不做 hart 0
+    # 假设，也不需要原子竞争选主——进来的就是 boot hart。
+    # （Linux 同思路：per-CPU 栈 + 非启动 CPU spinwait，启动 CPU 由平台
+    # /DTB 约定；OpenSBI 阶段只有 boot hart 到达，无需 atomic pick。）
     la sp, boot_stack_top
 
-    # 清零正式内核 .bss 的物理 LMA（boot hart 专属；副 hart 已 park）。
+    # 清零正式内核 .bss 的物理 LMA（boot hart 专属）。
     # linker 将 .bss 的 VMA 放到高半区，因此这里必须使用 LMA symbols。
     la t0, __bss_load_start
     la t1, __bss_load_end
