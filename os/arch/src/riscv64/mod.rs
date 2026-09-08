@@ -3,6 +3,7 @@ use core::arch::global_asm;
 use sbi_rt;
 
 pub mod address_space;
+pub mod boot_vm;
 pub mod console;
 pub mod mmu;
 pub mod sv39;
@@ -50,15 +51,14 @@ impl Arch for Riscv64 {
     }
 
     fn system_reset(reset_type: ResetType) -> ! {
-        loop {
-            // sbi_rt::Shutdown/ColdReboot/WarmReboot 是分别实现 ResetType trait 的
-            // 不同 unit struct，无法 match 出统一类型 → 每个分支直接调用。
-            let _ = match reset_type {
-                ResetType::Shutdown => sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason),
-                ResetType::ColdReboot => sbi_rt::system_reset(sbi_rt::ColdReboot, sbi_rt::NoReason),
-                ResetType::WarmReboot => sbi_rt::system_reset(sbi_rt::WarmReboot, sbi_rt::NoReason),
-            };
-        }
+        // sbi_rt::Shutdown/ColdReboot/WarmReboot 是分别实现 ResetType trait 的
+        // 不同 unit struct，无法 match 出统一类型 → 每个分支直接调用。
+        let _ = match reset_type {
+            ResetType::Shutdown => sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason),
+            ResetType::ColdReboot => sbi_rt::system_reset(sbi_rt::ColdReboot, sbi_rt::NoReason),
+            ResetType::WarmReboot => sbi_rt::system_reset(sbi_rt::WarmReboot, sbi_rt::NoReason),
+        };
+        panic!("SBI system reset returned unexpectedly");
     }
 
     fn init() {

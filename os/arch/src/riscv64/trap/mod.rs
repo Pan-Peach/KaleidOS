@@ -1,7 +1,5 @@
 use core::arch::global_asm;
 
-use super::console;
-
 global_asm!(include_str!("trap.S"));
 
 #[repr(C)]
@@ -123,28 +121,13 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, st
     let sepc = unsafe { (*trap_frame).sepc };
 
     match trap {
-        Trap::Interrupt(interrupt) => match interrupt {
-            Interrupt::SupervisorSoft | Interrupt::SupervisorTimer | Interrupt::Unknown(_) => {
-                console::write_fmt(format_args!(
-                    "Unhandled interrupt: scause = {:#x}, sepc = {:#x}, stval = {:#x}\n",
-                    raw_scause, sepc, stval
-                ));
-            }
-            Interrupt::SupervisorExternal => {
-                // TODO: dispatch through the PLIC/IRQ subsystem.
-            }
-        },
-        Trap::Exception(exception) => match exception {
-            _ => {
-                console::write_fmt(format_args!(
-                    "Unhandled exception: scause = {:#x}, sepc = {:#x}, stval = {:#x}\n",
-                    raw_scause, sepc, stval
-                ));
-            }
-        },
-    }
-
-    loop {
-        core::hint::spin_loop();
+        Trap::Interrupt(_) => panic!(
+            "unhandled interrupt: scause={:#x}, sepc={:#x}, stval={:#x}",
+            raw_scause, sepc, stval
+        ),
+        Trap::Exception(_) => panic!(
+            "unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}",
+            raw_scause, sepc, stval
+        ),
     }
 }

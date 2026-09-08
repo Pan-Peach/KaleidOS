@@ -75,9 +75,7 @@ impl Arch for Fake {
     }
 
     fn system_reset(_reset_type: ResetType) -> ! {
-        loop {
-            core::hint::spin_loop();
-        }
+        panic!("fake system reset requested");
     }
 
     fn init() {

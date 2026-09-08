@@ -14,6 +14,14 @@ mod console;
 
 global_asm!(include_str!("entry.S"));
 
+// Set true only while manually validating the H0 high-half alias. The normal
+// boot path remains identity-mapped until the linker transition is ready.
+const RUN_HIGH_HALF_PROBE: bool = false;
+
+unsafe extern "C" {
+    fn high_alias_probe();
+}
+
 // 链接脚本符号：本文档镜像（bootstrap + core 单一 kaleidos.elf）的物理范围。
 // 取地址（不是值）：这段是 Core 自己，启动后永久 Reserved。
 // __initpkg_*：内嵌组件归档（init.kpkg = cpio）所在段（见下方 INITPKG 注入）。
@@ -95,9 +103,27 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                 devices,
             };
 
+            if mem_count == 0 {
+                panic!("Sv39 early map failed: no RAM region");
+            }
+
+            // Bootstrap owns discovery.  Arch only receives the primitive facts
+            // needed to build its first root, so it does not depend on FDT or
+            // on Core's MachineInfo type.
+            let kernel_pa = core::ptr::addr_of!(__bootstrap_start) as usize;
+            let ram = memory_regions[0];
+            match unsafe {
+                arch::riscv64::mmu::init_identity(kernel_pa, ram.base, ram.size)
+            } {
+                Ok(()) => {}
+                Err(error) => panic!("Sv39 early map failed: {:?}", error),
+            }
+
             unsafe {
-                arch::riscv64::mmu::init_identity();
                 arch::riscv64::mmu::activate();
+                if RUN_HIGH_HALF_PROBE {
+                    arch::riscv64::mmu::jump_to_high_alias(high_alias_probe as *const () as usize);
+                }
             }
             kernel::log!("bootstrap", "Sv39 identity map OK");
 
@@ -142,19 +168,12 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
                     kernel::monitor::run();
                 }
                 Err(e) => {
-                    kernel::log!("core", "core init FAILED: {}", e);
-                    // init 失败：无 monitor（可能内存/链路未就绪），挂起
-                    loop {
-                        core::hint::spin_loop();
-                    }
+                    panic!("core init failed: {}", e);
                 }
             }
         }
         Err(_) => {
-            kernel::log!("bootstrap", "FDT magic: BAD!");
-            loop {
-                core::hint::spin_loop();
-            }
+            panic!("FDT magic: BAD");
         }
     }
 }
@@ -225,7 +244,7 @@ struct DirectWriter;
 impl core::fmt::Write for DirectWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for byte in s.bytes() {
-            console::write(s);
+            console::write_byte(byte);
         }
         Ok(())
     }
@@ -236,6 +255,8 @@ fn panic(_info: &PanicInfo) -> ! {
     // 绕过 print（panic 时其锁可能已损坏），直接 SBI 紧急输出。
     let mut writer = DirectWriter;
     let _ = core::fmt::write(&mut writer, format_args!("\nPANIC: {}\n", _info));
+    // This is the final fatal halt. Unlike ordinary error paths, there is no
+    // caller to return to after the panic handler has reported the reason.
     loop {
         core::hint::spin_loop();
     }

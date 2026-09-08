@@ -42,3 +42,16 @@ boot_stack:
     .space 4096*4
 
 boot_stack_top:
+
+# Temporary H0 probe. The code intentionally uses only absolute MMIO and a
+# local loop, so it remains valid when entered through the high-half alias.
+.section .text.entry
+.align 2
+.global high_alias_probe
+high_alias_probe:
+    li t0, 0x10000000
+    li t1, 0x48              # 'H'
+    sb t1, 0(t0)
+1:
+    wfi
+    j 1b

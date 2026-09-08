@@ -14,6 +14,12 @@ pub fn write(s: &str) {
     }
 }
 
+/// Write one byte without going through the formatted printer.
+#[inline]
+pub fn write_byte(byte: u8) {
+    ArchImpl::console_write_byte(byte);
+}
+
 /// 读一个字符（无输入返回 None；Monitor 行输入用）。
 pub fn getc() -> Option<u8> {
     ArchImpl::console_getc()

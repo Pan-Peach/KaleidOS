@@ -7,7 +7,6 @@ use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
 use alloc::string::String;
-use alloc::vec::Vec;
 use arch::{Arch, ResetType};
 
 /// 挂载 MachineInfo（core::init 完成时调用一次）：写入 machine 模块的唯一真相点。
@@ -51,14 +50,14 @@ pub fn machine(_line: &[u8]) {
             IoSpace::Mmio { base, size } => ("mmio", base, size),
             IoSpace::Pio { base, size } => ("pio", base, size),
         };
-        printk!(
-            "  {space} {base:#x}+{size:#x} irq={:?} compatible={:?}\n",
-            d.irq,
-            d.compatibles[..d.compat_count as usize]
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-        );
+        printk!("  {space} {base:#x}+{size:#x} irq={:?} compatible=[", d.irq);
+        for j in 0..d.compat_count as usize {
+            if j > 0 {
+                printk!(", ");
+            }
+            printk!("{:?}", d.compatibles[j].as_str());
+        }
+        printk!("]\n");
     }
 }
 

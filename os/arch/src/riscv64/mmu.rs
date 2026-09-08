@@ -1,38 +1,19 @@
-use crate::riscv64::sv39::{PageTable, Pte, PteFlags};
+use super::boot_vm;
 
 const SV39_MODE: usize = 8;
-const GIGAPAGE_SIZE: usize = 1 << 30;
 
-const IDENTITY_FLAGS: PteFlags = PteFlags::R
-    .union(PteFlags::W)
-    .union(PteFlags::X)
-    .union(PteFlags::A)
-    .union(PteFlags::D);
-const MMIO_FLAGS: PteFlags = PteFlags::R
-    .union(PteFlags::W)
-    .union(PteFlags::A)
-    .union(PteFlags::D);
+pub use super::boot_vm::root as get_root_table;
 
-static mut ROOT_TABLE: PageTable = PageTable::empty();
-
-pub fn get_root_table() -> &'static mut PageTable {
-    unsafe { &mut *core::ptr::addr_of_mut!(ROOT_TABLE) }
-}
-
-pub unsafe fn init_identity() {
-    let root = get_root_table();
-
-    // Root-level leaf PTEs are 1 GiB Sv39 gigapages. The low gigapage covers
-    // the QEMU MMIO area; finer-grained holes and permissions wait for Phase C.
-    root.entries[0] = Pte::new_leaf_pa(0, MMIO_FLAGS);
-    for index in 0..4 {
-        let pa = 0x8000_0000 + index * GIGAPAGE_SIZE;
-        root.entries[index + 2] = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
-    }
+pub unsafe fn init_identity(
+    kernel_pa: usize,
+    ram_base: usize,
+    ram_size: usize,
+) -> Result<(), boot_vm::BootVmError> {
+    unsafe { boot_vm::init(kernel_pa, ram_base, ram_size) }
 }
 
 pub unsafe fn activate() {
-    let root_pa = get_root_table() as *const PageTable as usize;
+    let root_pa = boot_vm::root_pa();
     let satp = (SV39_MODE << 60) | (root_pa >> 12);
 
     unsafe {
@@ -43,5 +24,19 @@ pub unsafe fn activate() {
             options(nostack, preserves_flags),
         );
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+    }
+}
+
+/// Temporary H0 probe: jump from a low identity VA to its high-half alias.
+/// The target must be a position-independent assembly probe for now; a full
+/// high-linked Rust entry comes with the linker VMA/LMA transition later.
+pub unsafe fn jump_to_high_alias(low_entry: usize) -> ! {
+    let high_entry = boot_vm::high_alias_of(low_entry);
+    unsafe {
+        core::arch::asm!(
+            "jr {entry}",
+            entry = in(reg) high_entry,
+            options(noreturn),
+        );
     }
 }
