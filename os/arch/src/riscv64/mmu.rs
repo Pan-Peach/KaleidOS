@@ -11,15 +11,7 @@ pub unsafe fn init_identity(
     ram_base: usize,
     ram_size: usize,
 ) -> Result<(), boot_vm::BootVmError> {
-    unsafe {
-        boot_vm::init(
-            kernel_pa,
-            linked_kernel_pa,
-            image_size,
-            ram_base,
-            ram_size,
-        )
-    }
+    unsafe { boot_vm::init(kernel_pa, linked_kernel_pa, image_size, ram_base, ram_size) }
 }
 
 pub unsafe fn activate() {

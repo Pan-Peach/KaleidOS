@@ -121,7 +121,7 @@ fn append_newc_entry(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
 }
 
 fn pad4(buffer: &mut Vec<u8>) {
-    while buffer.len() % 4 != 0 {
+    while !buffer.len().is_multiple_of(4) {
         buffer.push(0);
     }
 }

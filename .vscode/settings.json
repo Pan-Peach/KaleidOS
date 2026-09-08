@@ -2,5 +2,9 @@
   "rust-analyzer.linkedProjects": [
     "Cargo.toml",
     "os/boot/riscv64/Cargo.toml"
-  ]
+  ],
+  // 裸机 #![no_std] bin 无 test crate；默认 allTargets=true 会让 rust-analyzer
+  // 尝试检查 test target 并报 "can't find crate for 'test'"（编辑器误报）。
+  // 关掉后只检查 lib+bin，测试仍由 `cargo test`/`make check` 正常运行。
+  "rust-analyzer.check.allTargets": false
 }

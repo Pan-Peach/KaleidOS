@@ -11,7 +11,10 @@ pub struct Sv39AddressSpace {
 
 impl Sv39AddressSpace {
     pub const fn placeholder() -> Self {
-        Self { root_ppn: 0, asid: 0 }
+        Self {
+            root_ppn: 0,
+            asid: 0,
+        }
     }
 
     pub const fn root_ppn(self) -> usize {

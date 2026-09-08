@@ -201,10 +201,7 @@ mod tests {
         let f1 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
         let r1 = f1.region();
         let rec1 = TaskRecord::new(
-            Box::new(CpuImpl::new_context(
-                ENTRY,
-                r1.base + memory::PAGE_SIZE,
-            )),
+            Box::new(CpuImpl::new_context(ENTRY, r1.base + memory::PAGE_SIZE)),
             Kernelstack::new(r1.base, memory::PAGE_SIZE),
             f1,
         );
@@ -214,10 +211,7 @@ mod tests {
         let f2 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
         let r2 = f2.region();
         let rec2 = TaskRecord::new(
-            Box::new(CpuImpl::new_context(
-                ENTRY,
-                r2.base + memory::PAGE_SIZE,
-            )),
+            Box::new(CpuImpl::new_context(ENTRY, r2.base + memory::PAGE_SIZE)),
             Kernelstack::new(r2.base, memory::PAGE_SIZE),
             f2,
         );

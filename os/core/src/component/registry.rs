@@ -226,6 +226,9 @@ mod tests {
     fn name_too_long_is_rejected() {
         let mut reg = r();
         let long = [b'x'; MAX_NAME_LEN + 1];
-        assert_eq!(reg.declare(&long, 1, 2, None), Err(RegistryError::NameTooLong));
+        assert_eq!(
+            reg.declare(&long, 1, 2, None),
+            Err(RegistryError::NameTooLong)
+        );
     }
 }

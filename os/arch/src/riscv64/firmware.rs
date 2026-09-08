@@ -7,10 +7,16 @@
 use crate::ResetType;
 use sbi_rt;
 
+/// 刻意保留 legacy：当前 QEMU 的旧 OpenSBI (0.8) 未暴露 DBCN 扩展，
+/// legacy console 是可移植的兜底。
+#[allow(deprecated)]
 pub fn console_putchar(byte: u8) {
     let _ = sbi_rt::legacy::console_putchar(byte as usize);
 }
 
+/// 刻意保留 legacy：当前 QEMU 的旧 OpenSBI (0.8) 未暴露 DBCN 扩展，
+/// legacy console 是可移植的兜底。
+#[allow(deprecated)]
 pub fn console_getc() -> Option<u8> {
     let ch = sbi_rt::legacy::console_getchar();
     (ch != usize::MAX).then_some(ch as u8)
@@ -30,6 +36,8 @@ pub fn system_reset(reset_type: ResetType) -> ! {
     // Keep reboot failures explicit: there is no portable legacy reboot
     // equivalent in the SBI interface.
     if is_shutdown && ret == sbi_rt::SbiRet::not_supported() {
+        // 旧 OpenSBI 无 SRST → fallback 到 legacy shutdown。
+        #[allow(deprecated)]
         sbi_rt::legacy::shutdown();
     }
     match ret.into_result() {

@@ -24,12 +24,6 @@ OUTPUT    := kaleidos-$(ARCH)
 
 .PHONY: kernel qemu clean
 
-# 构建单镜像并复制到仓库根（/kaleidos-* 已在 .gitignore）
-kernel:
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --release
-	cp $(KERNEL) $(OUTPUT)
-	@echo "built: $(OUTPUT)"
-
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 组件名 → 源码目录；每个组件编译成 ET_REL 对象（= .kcomp）
 KCOMP_COMPONENTS := core_test kcomp_smoke

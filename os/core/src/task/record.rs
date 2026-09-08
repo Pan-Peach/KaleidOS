@@ -1,8 +1,8 @@
 //! 任务记录：Core 真相的载体。
 
+use crate::memory::MemoryLease;
 use crate::task::Kernelstack;
 use crate::task::state::TaskState;
-use crate::memory::MemoryLease;
 use alloc::boxed::Box;
 use arch::ContextImpl;
 

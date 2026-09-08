@@ -5,7 +5,7 @@
 //! high-half alias alive.  A later final-kernel mapping will replace this root
 //! after memory discovery and allocation are available.
 
-use super::sv39::{vpn, PageTable, Pte, PteFlags, PAGE_SIZE};
+use super::sv39::{PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
 
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
@@ -136,19 +136,10 @@ pub unsafe fn init(
     }
 
     unsafe {
-        install_kernel_alias(
-            root,
-            kernel_pa,
-            linked_kernel_pa,
-            image_size,
-        )?;
+        install_kernel_alias(root, kernel_pa, linked_kernel_pa, image_size)?;
 
         let linked_root_pa = physical_address_of(root as *const PageTable as usize);
-        BOOT_ROOT_PA = runtime_physical_address(
-            linked_root_pa,
-            kernel_pa,
-            linked_kernel_pa,
-        )?;
+        BOOT_ROOT_PA = runtime_physical_address(linked_root_pa, kernel_pa, linked_kernel_pa)?;
     }
 
     Ok(())
