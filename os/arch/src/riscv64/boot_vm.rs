@@ -5,12 +5,11 @@
 //! high-half alias alive.  A later final-kernel mapping will replace this root
 //! after memory discovery and allocation are available.
 
-use super::sv39::{PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
+use super::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
 
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
 pub const GIGAPAGE_SIZE: usize = 1 << 30;
-const MEGAPAGE_SIZE: usize = 1 << 21;
 
 const IDENTITY_FLAGS: PteFlags = PteFlags::R
     .union(PteFlags::W)
@@ -21,17 +20,44 @@ const MMIO_FLAGS: PteFlags = PteFlags::R
     .union(PteFlags::W)
     .union(PteFlags::A)
     .union(PteFlags::D);
-const KERNEL_FLAGS: PteFlags = PteFlags::R
-    .union(PteFlags::W)
+/// Permission set for the executable text segment: read + execute.
+pub const KERNEL_TEXT_FLAGS: PteFlags = PteFlags::R
     .union(PteFlags::X)
     .union(PteFlags::A)
     .union(PteFlags::D);
+/// Permission set for read-only data (`.rodata`, embedded `.initpkg`).
+pub const KERNEL_RODATA_FLAGS: PteFlags = PteFlags::R.union(PteFlags::A).union(PteFlags::D);
+/// Permission set for writable data (`.data`, `.bss`).
+pub const KERNEL_DATA_FLAGS: PteFlags = PteFlags::R
+    .union(PteFlags::W)
+    .union(PteFlags::A)
+    .union(PteFlags::D);
+
+/// One contiguous linked-image run mapped with a single permission set.
+///
+/// `va_start`/`va_end` are high-half virtual addresses (exclusive end).  The
+/// physical address of each page is derived from `linked_kernel_pa` and the
+/// offset from the link-time kernel VMA, so the boot crate only needs to pass
+/// the linker section ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelSection {
+    pub va_start: usize,
+    pub va_end: usize,
+    pub flags: PteFlags,
+}
 
 /// Early root storage. It lives in the image's BSS and is never used as the
 /// future per-domain AddressSpace root.
 static mut BOOT_ROOT: PageTable = PageTable::empty();
 static mut KERNEL_L1: PageTable = PageTable::empty();
-static mut KERNEL_L0: PageTable = PageTable::empty();
+
+/// Pool of level-0 tables used to map the kernel image at 4 KiB granularity.
+/// The early boot path has no allocator, so it carves these from a static
+/// pool; one table covers a 2 MiB level-1 slot.  16 slots span a 32 MiB
+/// image, comfortably above the previous hard 2 MiB cap.
+const MAX_KERNEL_L0: usize = 16;
+static mut KERNEL_L0S: [PageTable; MAX_KERNEL_L0] = [PageTable::empty(); MAX_KERNEL_L0];
+static mut KERNEL_L0_COUNT: usize = 0;
 static mut BOOT_ROOT_PA: usize = 0;
 
 pub fn root() -> &'static mut PageTable {
@@ -54,6 +80,7 @@ pub enum BootVmError {
     KernelOutsideRam,
     KernelMappingTooLarge,
     RootIndexConflict,
+    KernelL0TableExhausted,
 }
 
 /// Install the temporary Linux-shaped boot mapping.
@@ -74,6 +101,7 @@ pub unsafe fn init(
     image_size: usize,
     ram_base: usize,
     ram_size: usize,
+    sections: &[KernelSection],
 ) -> Result<(), BootVmError> {
     if ram_size == 0 {
         return Err(BootVmError::EmptyRam);
@@ -84,13 +112,6 @@ pub unsafe fn init(
         || image_size == 0
     {
         return Err(BootVmError::AddressUnaligned);
-    }
-
-    // The first version uses one level-0 table for the fixed kernel VMA.
-    // Keep the image within one 2 MiB level-1 slot until a multi-table
-    // mapping is needed.
-    if image_size > MEGAPAGE_SIZE {
-        return Err(BootVmError::KernelMappingTooLarge);
     }
 
     let ram_end = ram_base
@@ -136,7 +157,7 @@ pub unsafe fn init(
     }
 
     unsafe {
-        install_kernel_alias(root, kernel_pa, linked_kernel_pa, image_size)?;
+        install_kernel_alias(root, kernel_pa, linked_kernel_pa, image_size, sections)?;
 
         let linked_root_pa = physical_address_of(root as *const PageTable as usize);
         BOOT_ROOT_PA = runtime_physical_address(linked_root_pa, kernel_pa, linked_kernel_pa)?;
@@ -150,37 +171,25 @@ unsafe fn install_kernel_alias(
     kernel_pa: usize,
     linked_kernel_pa: usize,
     image_size: usize,
+    sections: &[KernelSection],
 ) -> Result<(), BootVmError> {
-    let last_kernel_va = KERNEL_VMA
-        .checked_add(image_size - 1)
-        .ok_or(BootVmError::AddressOverflow)?;
-    if vpn(KERNEL_VMA, 1) != vpn(last_kernel_va, 1) {
-        return Err(BootVmError::KernelMappingTooLarge);
+    // Reset the single level-1 table and release every level-0 table.
+    unsafe {
+        KERNEL_L0_COUNT = 0;
     }
-
-    let l1_link_pa = physical_address_of(core::ptr::addr_of!(KERNEL_L1) as usize);
-    let l0_link_pa = physical_address_of(core::ptr::addr_of!(KERNEL_L0) as usize);
-    let l1_pa = runtime_physical_address(l1_link_pa, kernel_pa, linked_kernel_pa)?;
-    let l0_pa = runtime_physical_address(l0_link_pa, kernel_pa, linked_kernel_pa)?;
     let l1 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_L1) };
-    let l0 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_L0) };
-
-    // Preserve the original 1 GiB high alias as 2 MiB leaves, then replace
-    // the one slot occupied by KERNEL_VMA with a 4 KiB table for the image.
-    let linked_window = linked_kernel_pa & !(GIGAPAGE_SIZE - 1);
-    for (index, entry) in l1.entries.iter_mut().enumerate() {
-        let pa = linked_window
-            .checked_add(index * MEGAPAGE_SIZE)
-            .ok_or(BootVmError::AddressOverflow)?;
-        *entry = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
-    }
-    for entry in l0.entries.iter_mut() {
+    for entry in l1.entries.iter_mut() {
         *entry = Pte::invalid();
     }
 
+    let l1_link_pa = physical_address_of(core::ptr::addr_of!(KERNEL_L1) as usize);
+    let l1_pa = runtime_physical_address(l1_link_pa, kernel_pa, linked_kernel_pa)?;
     root.entries[vpn(KERNEL_VMA, 2)] = Pte::new_table_pa(l1_pa);
-    l1.entries[vpn(KERNEL_VMA, 1)] = Pte::new_table_pa(l0_pa);
 
+    // Pass 1: map the entire image range (including the low bootstrap
+    // trampoline's high-half shadow and any padding between sections) with a
+    // permissive RWX baseline.  This keeps the high-half alias hole-free so
+    // the early hand-off cannot fault before Core takes over.
     let mapped_size = image_size
         .checked_add(PAGE_SIZE - 1)
         .ok_or(BootVmError::AddressOverflow)?
@@ -192,10 +201,74 @@ unsafe fn install_kernel_alias(
         let pa = kernel_pa
             .checked_add(offset)
             .ok_or(BootVmError::AddressOverflow)?;
-        l0.entries[vpn(va, 0)] = Pte::new_leaf_pa(pa, KERNEL_FLAGS);
+        let l1_index = vpn(va, 1);
+        let l0 = unsafe { l0_for(l1, l1_index, kernel_pa, linked_kernel_pa)? };
+        l0[vpn(va, 0)] = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
+    }
+
+    // Pass 2: tighten each linker section to its real permission set.  This is
+    // what turns Sv39 from address relocation into actual protection.
+    for section in sections {
+        if section.va_start >= section.va_end {
+            continue;
+        }
+        if section.va_start & (PAGE_SIZE - 1) != 0 {
+            return Err(BootVmError::AddressUnaligned);
+        }
+
+        let mut va = section.va_start;
+        while va < section.va_end {
+            let l1_index = vpn(va, 1);
+            let l0 = unsafe { l0_for(l1, l1_index, kernel_pa, linked_kernel_pa)? };
+            let offset = va - KERNEL_VMA;
+            let pa = kernel_pa
+                .checked_add(offset)
+                .ok_or(BootVmError::AddressOverflow)?;
+            l0[vpn(va, 0)] = Pte::new_leaf_pa(pa, section.flags);
+            va += PAGE_SIZE;
+        }
     }
 
     Ok(())
+}
+
+/// Return the level-0 table for a level-1 slot, allocating one on first use.
+unsafe fn l0_for(
+    l1: &mut PageTable,
+    l1_index: usize,
+    kernel_pa: usize,
+    linked_kernel_pa: usize,
+) -> Result<&'static mut [Pte; ENTRIES], BootVmError> {
+    match l1.entries[l1_index] {
+        pte if pte.is_valid() => pte.get_pte_array().ok_or(BootVmError::RootIndexConflict),
+        _ => unsafe { alloc_l0(l1, l1_index, kernel_pa, linked_kernel_pa) },
+    }
+}
+
+/// Reserve a fresh level-0 table from the static pool and wire it into the
+/// level-1 slot `l1_index` as a 4 KiB-granularity table.
+unsafe fn alloc_l0(
+    l1: &mut PageTable,
+    l1_index: usize,
+    kernel_pa: usize,
+    linked_kernel_pa: usize,
+) -> Result<&'static mut [Pte; ENTRIES], BootVmError> {
+    let idx = unsafe { KERNEL_L0_COUNT };
+    if idx >= MAX_KERNEL_L0 {
+        return Err(BootVmError::KernelL0TableExhausted);
+    }
+    unsafe {
+        KERNEL_L0_COUNT += 1;
+    }
+
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_L0S[idx]) };
+    for entry in table.entries.iter_mut() {
+        *entry = Pte::invalid();
+    }
+    let l0_link_pa = unsafe { physical_address_of(core::ptr::addr_of!(KERNEL_L0S[idx]) as usize) };
+    let l0_pa = runtime_physical_address(l0_link_pa, kernel_pa, linked_kernel_pa)?;
+    l1.entries[l1_index] = Pte::new_table_pa(l0_pa);
+    Ok(&mut table.entries)
 }
 
 fn runtime_physical_address(

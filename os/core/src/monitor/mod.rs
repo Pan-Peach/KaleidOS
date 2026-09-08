@@ -124,6 +124,19 @@ mod tests {
     use alloc::string::String;
     use alloc::string::ToString;
 
+    #[test]
+    fn load_underscore_stays_one_token() {
+        // `_` (0x5f) is not ASCII whitespace, so `core_test` must stay one
+        // token and be handed to the `load` command as a single argument.
+        match resolve_command(b"load core_test") {
+            Resolved::Known(cmd, args) => {
+                assert_eq!(cmd.name, "load");
+                assert_eq!(args, b"core_test".as_slice());
+            }
+            Resolved::Unknown(_) => panic!("expected a Known 'load' command"),
+        }
+    }
+
     fn name(res: &Resolved<'_>) -> String {
         match res {
             Resolved::Known(c, _) => c.name.to_string(),

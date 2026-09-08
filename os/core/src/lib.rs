@@ -48,14 +48,23 @@ pub fn init(
         return Err("no cpu info");
     }
 
-    // 帧区域：reserved[0] 的末尾（对齐帧）→ 第一个内存 region 的末尾。
+    // 帧区域：reserved[0] 的末尾（对齐帧）→ 包含内核镜像的那个 RAM region
+    // 的末尾。多 region 平台内核可能不在 memory_regions[0]，不能硬编码 [0]。
     // 前提：BSS 已在 bootstrap 启动汇编里清零（本轮迁移，见 entry.S）；
     // core 不再负责 BSS 清零（那是启动路径职责）。
+    let reserved_start = reserved.first().map_or(0, |r| r.base);
     let reserved_end = reserved
         .last()
         .map_or(info.memory_regions[0].base, |r| r.base + r.size);
     let region_start = memory::align_up_page(reserved_end);
-    let region_end = info.memory_regions[0].base + info.memory_regions[0].size;
+
+    let region_end = info.memory_regions[..info.mem_count]
+        .iter()
+        .find(|r| r.base <= reserved_start && reserved_end <= r.base + r.size)
+        .map_or(
+            info.memory_regions[0].base + info.memory_regions[0].size,
+            |r| r.base + r.size,
+        );
 
     memory::init(region_start, region_end)?;
 

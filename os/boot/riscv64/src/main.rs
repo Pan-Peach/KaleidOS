@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use arch::riscv64::boot_vm::KernelSection;
+use arch::riscv64::sv39::PteFlags;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -160,17 +162,24 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 
             let mut mem_count = 0usize;
             for region in tree.root().memory().reg().iter::<u64, u64>() {
-                if let Ok(r) = region {
-                    memory_regions[mem_count] = MemoryRegion {
-                        base: r.address as usize,
-                        size: r.len as usize,
-                    };
-                    mem_count += 1;
+                let Ok(r) = region else { continue };
+                if mem_count >= memory_regions.len() {
+                    kernel::log!("discovery", "too many RAM regions; dropping");
+                    continue;
                 }
+                memory_regions[mem_count] = MemoryRegion {
+                    base: r.address as usize,
+                    size: r.len as usize,
+                };
+                mem_count += 1;
             }
 
             let mut cpu_count = 0usize;
             for cpu in tree.root().cpus().iter() {
+                if cpu_count >= cpu_info.len() {
+                    kernel::log!("discovery", "too many CPUs; dropping");
+                    continue;
+                }
                 let hart = cpu.reg::<u64>().first().unwrap_or(0);
                 cpu_info[cpu_count] = CpuInfo {
                     boot_cpu: hart == hart_id as u64,
@@ -204,10 +213,6 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 panic!("Sv39 early map failed: no RAM region");
             }
 
-            // Bootstrap owns discovery.  Arch only receives the primitive facts
-            // needed to build its first root, so it does not depend on FDT or
-            // on Core's MachineInfo type.
-            let ram = memory_regions[0];
             let linked_image_start = arch::riscv64::boot_vm::physical_address_of(linker_addr(
                 core::ptr::addr_of!(__bootstrap_start),
             ));
@@ -218,6 +223,60 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 .checked_sub(linked_image_start)
                 .expect("invalid linked kernel image range");
 
+            // Pick the RAM region that actually contains the loaded kernel
+            // image instead of assuming it is the first one.  This keeps the
+            // boot mapping correct on platforms with multiple RAM regions.
+            let ram = memory_regions[..mem_count]
+                .iter()
+                .find(|r| {
+                    r.base <= kernel_pa
+                        && kernel_pa
+                            .checked_add(image_size)
+                            .is_some_and(|end| end <= r.base + r.size)
+                })
+                .copied()
+                .unwrap_or(memory_regions[0]);
+
+            // Section-aware high-half alias: map each linker section with the
+            // permission it actually needs.  Sv39 enforces W^X / no-write on
+            // the formal image once the high-half alias is active.
+            let sections = [
+                KernelSection {
+                    va_start: linker_addr(core::ptr::addr_of!(__text_vma_start)),
+                    va_end: linker_addr(core::ptr::addr_of!(__text_vma_end)),
+                    flags: PteFlags::R
+                        .union(PteFlags::X)
+                        .union(PteFlags::A)
+                        .union(PteFlags::D),
+                },
+                KernelSection {
+                    va_start: linker_addr(core::ptr::addr_of!(__rodata_vma_start)),
+                    va_end: linker_addr(core::ptr::addr_of!(__rodata_vma_end)),
+                    flags: PteFlags::R.union(PteFlags::A).union(PteFlags::D),
+                },
+                KernelSection {
+                    va_start: linker_addr(core::ptr::addr_of!(__initpkg_start)),
+                    va_end: linker_addr(core::ptr::addr_of!(__initpkg_end)),
+                    flags: PteFlags::R.union(PteFlags::A).union(PteFlags::D),
+                },
+                KernelSection {
+                    va_start: linker_addr(core::ptr::addr_of!(__data_vma_start)),
+                    va_end: linker_addr(core::ptr::addr_of!(__data_vma_end)),
+                    flags: PteFlags::R
+                        .union(PteFlags::W)
+                        .union(PteFlags::A)
+                        .union(PteFlags::D),
+                },
+                KernelSection {
+                    va_start: linker_addr(core::ptr::addr_of!(__bss_vma_start)),
+                    va_end: linker_addr(core::ptr::addr_of!(__bss_vma_end)),
+                    flags: PteFlags::R
+                        .union(PteFlags::W)
+                        .union(PteFlags::A)
+                        .union(PteFlags::D),
+                },
+            ];
+
             match unsafe {
                 arch::riscv64::mmu::init_identity(
                     kernel_pa,
@@ -225,6 +284,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                     image_size,
                     ram.base,
                     ram.size,
+                    &sections,
                 )
             } {
                 Ok(()) => {}

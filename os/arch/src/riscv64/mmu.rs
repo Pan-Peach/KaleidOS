@@ -2,7 +2,7 @@ use super::boot_vm;
 
 const SV39_MODE: usize = 8;
 
-pub use super::boot_vm::root as get_root_table;
+pub use super::boot_vm::{KernelSection, root as get_root_table};
 
 pub unsafe fn init_identity(
     kernel_pa: usize,
@@ -10,8 +10,18 @@ pub unsafe fn init_identity(
     image_size: usize,
     ram_base: usize,
     ram_size: usize,
+    sections: &[KernelSection],
 ) -> Result<(), boot_vm::BootVmError> {
-    unsafe { boot_vm::init(kernel_pa, linked_kernel_pa, image_size, ram_base, ram_size) }
+    unsafe {
+        boot_vm::init(
+            kernel_pa,
+            linked_kernel_pa,
+            image_size,
+            ram_base,
+            ram_size,
+            sections,
+        )
+    }
 }
 
 pub unsafe fn activate() {

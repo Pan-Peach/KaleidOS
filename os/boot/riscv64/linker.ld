@@ -118,9 +118,5 @@ SECTIONS
     __bootstrap_load_start = PHYS_BASE;
     __bootstrap_load_end = LOADADDR(.bss) + SIZEOF(.bss);
 
-    /* The early bootstrap mapper currently uses one level-0 table. */
-    ASSERT((__bootstrap_end - __bootstrap_start) <= 0x200000,
-           "kernel image exceeds early 2 MiB mapping slot")
-
     /DISCARD/ : { *(.eh_frame) }
 }
