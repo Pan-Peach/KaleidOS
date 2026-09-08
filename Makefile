@@ -7,6 +7,13 @@
 #   make clean
 
 ARCH      ?= rv64
+# Rust embeds source locations in panic messages.  Keep them independent of
+# the checkout path while retaining the boot crate's linker script when
+# RUSTFLAGS from the environment overrides Cargo's target-specific flags.
+PROJECT_ROOT := $(abspath $(CURDIR))
+REMAP_RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(PROJECT_ROOT)=.
+BOOT_RUSTFLAGS := $(REMAP_RUSTFLAGS) -C link-arg=-Tlinker.ld
+
 # ARCH 名 → 源码目录（rv64 → riscv64）
 ifeq ($(ARCH),rv64)
 BOOT_DIR  := os/boot/riscv64
@@ -19,7 +26,7 @@ OUTPUT    := kaleidos-$(ARCH)
 
 # 构建单镜像并复制到仓库根（/kaleidos-* 已在 .gitignore）
 kernel:
-	cd $(BOOT_DIR) && cargo build --release
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT)"
 
@@ -32,7 +39,7 @@ KPKG_DIR   := /tmp/opencode/kpkg
 # 构建所有组件对象（ET_REL）→ 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
 	@for d in $(KCOMP_DIRS); do \
-		( cd $$d && cargo rustc --release --target riscv64gc-unknown-none-elf -- --emit=obj ); \
+		( cd $$d && RUSTFLAGS="$(REMAP_RUSTFLAGS)" cargo rustc --release --target riscv64gc-unknown-none-elf -- --emit=obj ); \
 	done
 	@mkdir -p $(KPKG_DIR)
 	@for d in $(KCOMP_DIRS); do \
@@ -46,7 +53,7 @@ init.kpkg:
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 kernel: init.kpkg
-	cd $(BOOT_DIR) && cargo build --release
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (with embedded init.kpkg)"
 
@@ -83,4 +90,4 @@ check: init.kpkg
 	cd os/boot/riscv64 && cargo fmt -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
-	cd os/boot/riscv64 && cargo build
+	cd os/boot/riscv64 && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build

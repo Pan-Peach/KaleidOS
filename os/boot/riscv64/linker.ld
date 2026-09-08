@@ -1,52 +1,126 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/*
+ * Current QEMU virt/OpenSBI ELF-loader contract.  This is the preferred
+ * physical image address for this boot path, not Core's memory model and not
+ * a per-machine build knob.  A future relocatable Image path will keep the
+ * link-time offset but derive the actual physical address at _start.
+ */
+PHYS_BASE = 0x80200000;
+HIGH_OFFSET = 0xffffffc000000000;
+/* Fixed virtual link address; it is deliberately independent of PHYS_BASE. */
+KERNEL_VMA = 0xffffffc080200000;
+
 SECTIONS
 {
-    . = 0x80200000;
+    /* Low physical/VMA bootstrap: OpenSBI enters here before MMU. */
+    . = PHYS_BASE;
+    __image_load_start = .;
 
-    __bootstrap_start = .;
-
-    .text : ALIGN(4k)
+    . = ALIGN(4k);
+    .text.entry :
     {
         KEEP(*(.text.entry))
-        *(.text .text.*)
+    }
+    __text_entry_vma_start = ADDR(.text.entry);
+    __text_entry_vma_end = ADDR(.text.entry) + SIZEOF(.text.entry);
+    __text_entry_lma_start = LOADADDR(.text.entry);
+    __text_entry_lma_end = LOADADDR(.text.entry) + SIZEOF(.text.entry);
+
+    . = ALIGN(8);
+    .rodata.entry :
+    {
+        KEEP(*(.rodata.entry))
+    }
+    __rodata_entry_vma_start = ADDR(.rodata.entry);
+    __rodata_entry_vma_end = ADDR(.rodata.entry) + SIZEOF(.rodata.entry);
+    __rodata_entry_lma_start = LOADADDR(.rodata.entry);
+    __rodata_entry_lma_end = LOADADDR(.rodata.entry) + SIZEOF(.rodata.entry);
+
+    . = ALIGN(4k);
+    .bss.stack (NOLOAD) :
+    {
+        KEEP(*(.bss.stack))
     }
 
-    .rodata : ALIGN(4k)
+    . = ALIGN(4k);
+    .bss.early_root (NOLOAD) :
+    {
+        KEEP(*(.bss.early_root))
+    }
+
+    __low_bootstrap_end = .;
+
+    /* Formal kernel sections: high VMA, low physical LMA. */
+    . = KERNEL_VMA + ALIGN(__low_bootstrap_end - PHYS_BASE, 4k);
+
+    .text : AT(PHYS_BASE + (ADDR(.text) - KERNEL_VMA))
+    {
+        *(.text .text.*)
+    }
+    __text_vma_start = ADDR(.text);
+    __text_vma_end = ADDR(.text) + SIZEOF(.text);
+    __text_lma_start = LOADADDR(.text);
+    __text_lma_end = LOADADDR(.text) + SIZEOF(.text);
+
+    . = ALIGN(4k);
+    .rodata : AT(PHYS_BASE + (ADDR(.rodata) - KERNEL_VMA))
     {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
     }
+    __rodata_vma_start = ADDR(.rodata);
+    __rodata_vma_end = ADDR(.rodata) + SIZEOF(.rodata);
+    __rodata_lma_start = LOADADDR(.rodata);
+    __rodata_lma_end = LOADADDR(.rodata) + SIZEOF(.rodata);
 
-    /* 内嵌组件归档（init.kpkg = cpio），由 Makefile 的 rust-objcopy 生成 initpkg.o 提供 */
-    .initpkg : ALIGN(4k)
+    /* Embedded init.kpkg follows the same high-VMA / low-LMA rule. */
+    . = ALIGN(4k);
+    .initpkg : AT(PHYS_BASE + (ADDR(.initpkg) - KERNEL_VMA))
     {
         __initpkg_start = .;
         *(.initpkg)
         __initpkg_end = .;
     }
+    __initpkg_lma_start = LOADADDR(.initpkg);
+    __initpkg_lma_end = LOADADDR(.initpkg) + SIZEOF(.initpkg);
 
-    .data : ALIGN(4k)
+    . = ALIGN(4k);
+    .data : AT(PHYS_BASE + (ADDR(.data) - KERNEL_VMA))
     {
         *(.data .data.*)
         *(.sdata .sdata.*)
     }
+    __data_vma_start = ADDR(.data);
+    __data_vma_end = ADDR(.data) + SIZEOF(.data);
+    __data_lma_start = LOADADDR(.data);
+    __data_lma_end = LOADADDR(.data) + SIZEOF(.data);
 
-    .bss (NOLOAD) : ALIGN(4k)
+    . = ALIGN(4k);
+    .bss (NOLOAD) : AT(PHYS_BASE + (ADDR(.bss) - KERNEL_VMA))
     {
-        *(.bss.stack)   # 预留栈空间，避免 bss 段被清零时覆盖栈
-
         __bss_start = .;
+        __bss_load_start = LOADADDR(.bss);
 
         *(.bss .bss.*)
         *(.sbss .sbss.*)
 
         __bss_end = .;
+        __bss_load_end = LOADADDR(.bss) + SIZEOF(.bss);
     }
+    __bss_vma_start = ADDR(.bss);
+    __bss_vma_end = ADDR(.bss) + SIZEOF(.bss);
 
-    . = ALIGN(4k);
+    /* These are VMA symbols; bootstrap converts them back to PA. */
+    __bootstrap_start = KERNEL_VMA;
     __bootstrap_end = .;
+    __bootstrap_load_start = PHYS_BASE;
+    __bootstrap_load_end = LOADADDR(.bss) + SIZEOF(.bss);
+
+    /* The early bootstrap mapper currently uses one level-0 table. */
+    ASSERT((__bootstrap_end - __bootstrap_start) <= 0x200000,
+           "kernel image exceeds early 2 MiB mapping slot")
 
     /DISCARD/ : { *(.eh_frame) }
 }

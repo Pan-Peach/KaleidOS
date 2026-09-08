@@ -82,7 +82,11 @@ enum Resolved<'a> {
 
 /// 行 → (命令, 参数)，无 I/O；run() 负责分发，这里供 host 测试直接调用。
 fn resolve_command(line: &[u8]) -> Resolved<'_> {
-    let first = line.split(|&b| b == b' ').next().unwrap_or(b"");
+    let line = line.trim_ascii();
+    let first = line
+        .split(|&b| b.is_ascii_whitespace())
+        .next()
+        .unwrap_or(b"");
     match COMMANDS.iter().find(|c| c.name.as_bytes() == first) {
         Some(c) => Resolved::Known(c, trim_leading(&line[first.len()..])),
         None => Resolved::Unknown(first),
@@ -156,13 +160,17 @@ mod tests {
     }
 
     #[test]
-    fn tab_is_whitespace_but_not_understood_as_separator() {
-        // trim_leading 认 tab；但 first-token 分离只认空格 → 命令名含 tab 前缀时
-        // first 不是纯命令名。这里记录现状：tab 分隔的后续参数被剥离，
-        // 但命令名本身以 tab 开头时作为未知处理（与空格行为不同）。
+    fn ascii_whitespace_separates_command_and_args() {
         let r = resolve_command(b"memory\t0x1000");
-        // 实际上 "frame\t0x1000" 中 first = "frame\t0x1000"（无空格）→ 未知
-        assert!(matches!(r, Resolved::Unknown(_)));
+        assert_eq!(name(&r), "memory");
+        assert_eq!(args(&r), b"0x1000");
+    }
+
+    #[test]
+    fn leading_and_trailing_whitespace_is_ignored() {
+        let r = resolve_command(b"\t shutdown  \t");
+        assert_eq!(name(&r), "shutdown");
+        assert!(args(&r).is_empty());
     }
 
     #[test]

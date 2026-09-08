@@ -14,22 +14,119 @@ mod console;
 
 global_asm!(include_str!("entry.S"));
 
-// Set true only while manually validating the H0 high-half alias. The normal
-// boot path remains identity-mapped until the linker transition is ready.
-const RUN_HIGH_HALF_PROBE: bool = false;
-
-unsafe extern "C" {
-    fn high_alias_probe();
-}
-
 // 链接脚本符号：本文档镜像（bootstrap + core 单一 kaleidos.elf）的物理范围。
 // 取地址（不是值）：这段是 Core 自己，启动后永久 Reserved。
 // __initpkg_*：内嵌组件归档（init.kpkg = cpio）所在段（见下方 INITPKG 注入）。
 unsafe extern "C" {
     static __bootstrap_start: u8;
     static __bootstrap_end: u8;
+    static __text_vma_start: u8;
+    static __text_vma_end: u8;
+    static __rodata_vma_start: u8;
+    static __rodata_vma_end: u8;
     static __initpkg_start: u8;
     static __initpkg_end: u8;
+    static __data_vma_start: u8;
+    static __data_vma_end: u8;
+    static __bss_vma_start: u8;
+    static __bss_vma_end: u8;
+    static high_boot_stack_top: u8;
+}
+
+/// Data that must survive the low-to-high-half control-flow hand-off.
+///
+/// The object remains on the original discovery stack while
+/// `enter_high_half` switches to a separate high-half stack.
+#[repr(C)]
+struct BootContext {
+    info: MachineInfo,
+    reserved: [MemoryRegion; 1],
+}
+
+fn linker_addr(symbol: *const u8) -> usize {
+    symbol as usize
+}
+
+fn print_linker_layout() {
+    let image_start = arch::riscv64::boot_vm::physical_address_of(linker_addr(
+        core::ptr::addr_of!(__bootstrap_start),
+    ));
+    let text_start_vma = linker_addr(core::ptr::addr_of!(__text_vma_start));
+    let low_end = arch::riscv64::boot_vm::physical_address_of(text_start_vma);
+    kernel::log!(
+        "layout",
+        "early bootstrap VMA/LMA: {:#x}-{:#x}",
+        image_start,
+        low_end
+    );
+    kernel::log!(
+        "layout",
+        ".text VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
+        text_start_vma,
+        linker_addr(core::ptr::addr_of!(__text_vma_end)),
+        arch::riscv64::boot_vm::physical_address_of(text_start_vma),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __text_vma_end
+        ),))
+    );
+    kernel::log!(
+        "layout",
+        ".rodata VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
+        linker_addr(core::ptr::addr_of!(__rodata_vma_start)),
+        linker_addr(core::ptr::addr_of!(__rodata_vma_end)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __rodata_vma_start
+        ),)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __rodata_vma_end
+        ),))
+    );
+    kernel::log!(
+        "layout",
+        ".initpkg VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
+        linker_addr(core::ptr::addr_of!(__initpkg_start)),
+        linker_addr(core::ptr::addr_of!(__initpkg_end)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __initpkg_start
+        ),)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __initpkg_end
+        ),))
+    );
+    kernel::log!(
+        "layout",
+        ".data VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
+        linker_addr(core::ptr::addr_of!(__data_vma_start)),
+        linker_addr(core::ptr::addr_of!(__data_vma_end)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __data_vma_start
+        ),)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __data_vma_end
+        ),))
+    );
+    kernel::log!(
+        "layout",
+        ".bss VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
+        linker_addr(core::ptr::addr_of!(__bss_vma_start)),
+        linker_addr(core::ptr::addr_of!(__bss_vma_end)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __bss_vma_start
+        ),)),
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __bss_vma_end
+        ),))
+    );
+    kernel::log!(
+        "layout",
+        "kernel VMA {:#x}-{:#x}, image LMA {:#x}-{:#x}",
+        linker_addr(core::ptr::addr_of!(__bootstrap_start)),
+        linker_addr(core::ptr::addr_of!(__bootstrap_end)),
+        image_start,
+        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+            __bootstrap_end
+        ),))
+    );
 }
 
 // 内嵌组件归档：编译期把 init.kpkg（make init.kpkg 生成）注入 .initpkg 段。
@@ -41,7 +138,7 @@ static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
 
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
-extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
+extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::ArchImpl::init();
     kernel::log!("bootstrap", "arch init OK");
     kernel::log!("bootstrap", "KaleidOS bootstrap");
@@ -110,70 +207,105 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize) -> ! {
             // Bootstrap owns discovery.  Arch only receives the primitive facts
             // needed to build its first root, so it does not depend on FDT or
             // on Core's MachineInfo type.
-            let kernel_pa = core::ptr::addr_of!(__bootstrap_start) as usize;
             let ram = memory_regions[0];
+            let linked_image_start = arch::riscv64::boot_vm::physical_address_of(linker_addr(
+                core::ptr::addr_of!(__bootstrap_start),
+            ));
+            let linked_image_end = arch::riscv64::boot_vm::physical_address_of(linker_addr(
+                core::ptr::addr_of!(__bootstrap_end),
+            ));
+            let image_size = linked_image_end
+                .checked_sub(linked_image_start)
+                .expect("invalid linked kernel image range");
+
             match unsafe {
-                arch::riscv64::mmu::init_identity(kernel_pa, ram.base, ram.size)
+                arch::riscv64::mmu::init_identity(
+                    kernel_pa,
+                    linked_image_start,
+                    image_size,
+                    ram.base,
+                    ram.size,
+                )
             } {
                 Ok(()) => {}
                 Err(error) => panic!("Sv39 early map failed: {:?}", error),
             }
 
+            // 本文档镜像范围 → reserved（Core 自己，永久保留）
+            let image_start = kernel_pa;
+            let context = BootContext {
+                info,
+                reserved: [MemoryRegion {
+                    base: image_start,
+                    size: image_size,
+                }],
+            };
+
+            // Keep the context pointer in the original stack while the
+            // hand-off switches to a separate high-half stack.  FDT discovery
+            // and the early root remain low-address work; Core starts only
+            // after the high-half hand-off.
+            let context_ptr = &context as *const BootContext as usize;
+            kernel::log!("bootstrap", "Sv39 dual map OK; entering high-half");
             unsafe {
                 arch::riscv64::mmu::activate();
-                if RUN_HIGH_HALF_PROBE {
-                    arch::riscv64::mmu::jump_to_high_alias(high_alias_probe as *const () as usize);
-                }
-            }
-            kernel::log!("bootstrap", "Sv39 identity map OK");
-
-            // 汇编已保证只有 boot hart（hartid 0，QEMU virt 主 hart）进入 Rust。
-            kernel::log!("bootstrap", "MachineInfo dump:");
-            kernel::printk!("{:#?}\n", info);
-
-            // 本文档镜像范围 → reserved（Core 自己，永久保留）
-            let image_start = core::ptr::addr_of!(__bootstrap_start) as usize;
-            let image_end = core::ptr::addr_of!(__bootstrap_end) as usize;
-            let reserved = [MemoryRegion {
-                base: image_start,
-                size: image_end - image_start,
-            }];
-
-            kernel::log!("bootstrap", "BOOT DISCOVERY OK");
-            kernel::log!("core", "core init: ");
-            match kernel::init(&info, &reserved) {
-                Ok(()) => {
-                    kernel::log!("core", "BOOT CORE OK");
-
-                    // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
-                    let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
-                    let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
-                    let pkg = unsafe {
-                        core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start)
-                    };
-                    kernel::component::store::init(pkg);
-                    if let Some(store) = kernel::component::store::get_component_store() {
-                        let list = store.list();
-                        match list {
-                            Ok(entries) => {
-                                kernel::log!("store", "embedded kpkg: {} components", entries.len())
-                            }
-                            Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
-                        }
-                    } else {
-                        kernel::log!("store", "store: not initialized");
-                    }
-
-                    // 转交 Core Monitor（boot hart 同步主循环，永不返回）
-                    kernel::monitor::run();
-                }
-                Err(e) => {
-                    panic!("core init failed: {}", e);
-                }
+                arch::riscv64::mmu::enter_high_half(
+                    bootstrap_high as *const () as usize,
+                    context_ptr,
+                    core::ptr::addr_of!(high_boot_stack_top) as usize,
+                );
             }
         }
         Err(_) => {
             panic!("FDT magic: BAD");
+        }
+    }
+}
+
+/// First Rust entry reached through the high-half alias.
+///
+/// The identity mapping is still present only as a bootstrap safety alias;
+/// this function and the rest of the kernel are already linked in the high
+/// VMA, with their bytes loaded at the low physical LMA.
+#[unsafe(no_mangle)]
+extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
+    arch::ArchImpl::init();
+
+    let context = unsafe { &*(context_ptr as *const BootContext) };
+    kernel::log!("bootstrap", "entered high-half kernel");
+    print_linker_layout();
+    kernel::log!("bootstrap", "MachineInfo dump:");
+    kernel::printk!("{:#?}\n", context.info);
+    kernel::log!("bootstrap", "BOOT DISCOVERY OK");
+    kernel::log!("core", "core init: ");
+
+    match kernel::init(&context.info, &context.reserved) {
+        Ok(()) => {
+            kernel::log!("core", "BOOT CORE OK");
+
+            // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
+            let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
+            let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
+            let pkg =
+                unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
+            kernel::component::store::init(pkg);
+            if let Some(store) = kernel::component::store::get_component_store() {
+                let list = store.list();
+                match list {
+                    Ok(entries) => {
+                        kernel::log!("store", "embedded kpkg: {} components", entries.len())
+                    }
+                    Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
+                }
+            } else {
+                kernel::log!("store", "store: not initialized");
+            }
+
+            // 转交 Core Monitor（boot hart 同步主循环，永不返回）
+            kernel::monitor::run();
+        }
+        Err(e) => {
+            panic!("core init failed: {}", e);
         }
     }
 }
