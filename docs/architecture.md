@@ -66,9 +66,13 @@ Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体�
 - 用户态模式切换（user mode transition）
 - 中断开关（interrupt enable/disable）
 - 原子操作 / CPU 原语
-- 固件调用原语（firmware-call primitives，如 RISC-V SBI 调用；**UEFI runtime 调用属于 Boot/Firmware environment，不是 ISA 属性**，不归 x86 arch 所有）
+- CPU-local firmware-call boundary（如 RISC-V SBI）可以由对应 backend 提供；**UEFI runtime 调用属于 Boot/Firmware environment，不是 ISA 属性**，不归 x86 arch 所有
 
-目录：`os/arch`（统一 crate：`trait Arch` 静态方法接口 + `ArchImpl` cfg 选择——host 编译用 fake 实现，交叉编译用 riscv64 实现）。后续 ISA：`x86_64` / `aarch64` / `loongarch64`（各自模块 + cfg 分支）。
+目录：`os/arch`（统一 crate：`CpuArch`、`Console`、`SystemReset` backend trait + cfg 选择——host 编译用 fake 实现，交叉编译用 riscv64 实现）。后续 ISA：`x86_64` / `aarch64` / `loongarch64`（各自模块 + cfg 分支）。
+
+当前先拆出窄的 backend contract，不提前建立独立 Platform crate：RISC-V 的
+SBI 调用集中在 `riscv64/firmware.rs`，CPU/陷阱/上下文仍在 `riscv64/mod.rs`，
+同一 ISA 支持多个板卡时再由 boot profile 选择对应的 Console/SystemReset backend。
 
 ### Machine Discovery —— 机器发现（不设 platform 层）
 
@@ -102,14 +106,14 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 
 ### Arch 与 Machine Discovery 的关系
 
-- Arch 提供 ISA 能力（含固件调用原语），Machine Discovery 提供机器数据，两者都位于 Core 之下；
+- Arch 提供 ISA 能力，Console/SystemReset 等固件服务由 backend adapter 提供；Machine Discovery 提供机器数据，两者都位于 Core 之下；
 - Core 不直接处理机器细节：bootstrap 阶段做 discovery → 归一化 MachineInfo → `core::init(&MachineInfo)`（单镜像内函数调用）；
 - 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基。
 
 依赖方向（当前模型，精确表述）：
 
 ```text
-BUILD TIME：os/boot/riscv64（bin）──► os/core（library）+ os/arch（trait+ArchImpl）＋ fdt
+BUILD TIME：os/boot/riscv64（bin）──► os/core（library）+ os/arch（backend traits）＋ fdt
                      │
                      ▼ (链接)
               kaleidos.elf（单镜像）
@@ -131,7 +135,7 @@ OpenSBI → kaleidos.elf
   → （未来）按 manifest（文本）加载组件 .kcomp（ELF，Linux insmod/depmod 模式）
 ```
 
-- **Resource Core 不依赖具体 Arch 和 Discovery backend**（core-lib 不依赖 arch/fdt；bootstrap 阶段才用）；
+- **Resource Core 不依赖具体 ISA 实现和 Discovery backend**（core-lib 只依赖 `os/arch` 的稳定 contract，不依赖 fdt；bootstrap 负责组合具体实现）；
 - **Bootstrap 与 Core 职责分离、装载合一**——两者都只在启动时加载一次、永不热替换，所以链接成一个 `kaleidos.elf`（职责边界 ≠ 装载边界；单镜像 + 高半区问题由链接脚本两段 + 页表双映射解决，Linux 同款，见 roadmap）；
 - **Component 才需要独立装载边界**（`.kcomp` = ELF 可重定位文件 + 符号表，Linux `.ko` 模式）；打包用 **cpio 归档**（`initramfs` 模式）而非自定义二进制格式；manifest 是纯文本（`modules.dep` 模式）；
 - **Cargo 依赖图 ≠ Component 图**：Cargo 边是编译期构建关系，运行时组件组合由 Component Manager 决定——组件热替换是 KaleidOS 的核心目标，但只在组件层（bootstrap/core 不做）。

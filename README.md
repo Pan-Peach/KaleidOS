@@ -38,7 +38,7 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
                    _start → FDT discovery → MachineInfo → core::init() → Core Monitor，
                    与 core 链接成 kaleidos.elf（单镜像，职责分离装载合一）
   core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine/print
-  arch/            统一 arch crate：trait Arch（静态方法接口）+ ArchImpl（cfg 选择 riscv64 / fake）
+  arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv64 / fake
   components/      策略/服务组件 crates：scheduler_rr/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）——workspace exclude，clippy 不检索
@@ -65,7 +65,7 @@ core> load kcomp_smoke
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch：host=FakeArch/std，riscv64=SBI DBCN）。质量工具链：`make fmt` / `make clippy` / `make check`（host test 47 个）。详见 `docs/roadmap.md`（含缺口地图与下个里程碑 Sv39）。
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，riscv64=SBI）。质量工具链：`make fmt` / `make clippy` / `make check`（host test 48 个）。详见 `docs/roadmap.md`（含缺口地图与下个里程碑 Sv39）。
 
 ## 构建
 

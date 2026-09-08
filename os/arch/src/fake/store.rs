@@ -1,4 +1,4 @@
-//! FakeStore：host 侧组件仓库（内存实现）—— 与 FakeArch 同层。
+//! FakeStore：host 侧组件仓库（内存实现）—— 与 Fake backend 同层。
 
 use crate::store::{ComponentStore, StoreEntry, StoreError};
 extern crate alloc;

@@ -1,4 +1,4 @@
-use crate::{Arch, ResetType};
+use crate::{Console, CpuArch, ResetType, SystemReset};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 riscv64），显式引入 std 供 console 直通。
@@ -24,9 +24,9 @@ pub mod trap {
 
 /// Host 实现：console 直通 std stdout/stdin。
 ///
-/// - `console_write_byte`：逐字节写 stdout 并 flush——串口语义（无缓冲、保序），
+/// - `Console::write_byte`：逐字节写 stdout 并 flush——串口语义（无缓冲、保序），
 ///   让 `printk!`/`log!` 在 host 测试里真实可见（cargo test 会捕获到测试输出）。
-/// - `console_getc`：恒返回 `None`。`core::print::read_line()` 会忙等轮询，
+/// - `Console::getc`：恒返回 `None`。`core::print::read_line()` 会忙等轮询，
 ///   host 测试中调用它会挂死——需要交互输入时走 QEMU 层，不在 fake 里读 stdin。
 pub struct Fake;
 
@@ -47,7 +47,7 @@ impl FakeContext {
     }
 }
 
-impl Arch for Fake {
+impl CpuArch for Fake {
     type Context = FakeContext;
     const ELF_MACHINE: u16 = 0xF3; // 暂时先用RISC-V
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
@@ -64,22 +64,26 @@ impl Arch for Fake {
         ctx
     }
 
-    fn console_write_byte(byte: u8) {
+    fn init() {
+        trap::init();
+    }
+}
+
+impl Console for Fake {
+    fn write_byte(byte: u8) {
         let mut out = std::io::stdout();
         let _ = out.write_all(&[byte]);
         let _ = out.flush();
     }
 
-    fn console_getc() -> Option<u8> {
+    fn getc() -> Option<u8> {
         None
     }
+}
 
+impl SystemReset for Fake {
     fn system_reset(_reset_type: ResetType) -> ! {
         panic!("fake system reset requested");
-    }
-
-    fn init() {
-        trap::init();
     }
 }
 

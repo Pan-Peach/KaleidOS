@@ -2,7 +2,8 @@
 //!
 //! This is vocabulary only. It is not wired into Core or the boot path yet.
 //! A future contract crate may extract these types when C10 needs multiple
-//! translation backends without making Core depend on a concrete Arch crate.
+//! translation backends without making Core depend on a concrete architecture
+//! implementation.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VirtualRange {

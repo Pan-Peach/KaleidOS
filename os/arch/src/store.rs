@@ -1,8 +1,7 @@
 //! ComponentStore —— 组件仓库的传输层接口。
 //!
-//! 与 console 同层：Core 定义"打印"语义依赖 ArchImpl::console_write_byte；
-//! 这里同理：ComponentStore 是 backend 接口，由 arch 实现（fake / riscv64 各自给一个），
-//! Core 通过 `ArchImpl::component_store()` 拿仓库，不直接依赖 QEMU 细节。
+//! 与 console backend 同层：ComponentStore 是 backend 接口，由具体 boot/profile
+//! 实现（fake / riscv64 各自给一个），Core 不直接依赖 QEMU 细节。
 //! 未来 embedded init.kpkg / Persistent Store 也实现同一个 trait。
 
 use alloc::vec::Vec;

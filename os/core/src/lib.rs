@@ -1,11 +1,12 @@
 //! KaleidOS 内核 —— Resource Core（真相：存在性/状态/所有权/生命周期）。
 //!
-//! 依赖方向：本 crate（Resource Core **library**）不依赖具体 Arch / Discovery backend /
-//! 组件 / bootstrap；Core 只消费归一化的 MachineInfo（`machine::MachineInfo`），
+//! 依赖方向：本 crate（Resource Core **library**）不依赖具体 ISA 实现、Discovery backend、
+//! 组件或 bootstrap；它只依赖 `os/arch` 提供的稳定 backend contract，消费归一化的
+//! MachineInfo（`machine::MachineInfo`），
 //! 不知道 FDT / ACPI / QEMU / 板子，也不知道加载器是谁。
 //! 本 crate 是 host-testable 的 library（`cargo test` 专用）；运行时常与 bootstrap 阶段
 //! 一起链接成 `kaleidos.elf`（单镜像，职责分离装载合一，见 `docs/architecture.md` §3）。
-//! ISA 层（`kernel/arch/`）与 FDT 解析（`third_party/fdt` 子模块）是独立依赖。
+//! ISA backend（`os/arch`）与 FDT 解析（`third_party/fdt` 子模块）由 bootstrap 组合。
 //! 设计契约见 `docs/architecture.md` 与 `docs/core-philosophy.md`。
 
 #![no_std]

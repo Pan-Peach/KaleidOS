@@ -8,7 +8,7 @@ use crate::task::record::TaskRecord;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
-use arch::{Arch, ArchImpl};
+use arch::{CpuArch, CpuImpl};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub struct TaskTable {
@@ -36,7 +36,7 @@ impl TaskTable {
         let memory = memory::alloc_region(memory::PAGE_SIZE).map_err(|_| TaskError::NoMemory)?;
         let region = memory.region();
         let kstack = Kernelstack::new(region.base, memory::PAGE_SIZE);
-        let context = ArchImpl::new_context(entry, kstack.base + kstack.size);
+        let context = CpuImpl::new_context(entry, kstack.base + kstack.size);
         let record = TaskRecord::new(Box::new(context), kstack, memory);
         self.insert(id, record)?;
         Ok(id)
@@ -201,7 +201,7 @@ mod tests {
         let f1 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
         let r1 = f1.region();
         let rec1 = TaskRecord::new(
-            Box::new(ArchImpl::new_context(
+            Box::new(CpuImpl::new_context(
                 ENTRY,
                 r1.base + memory::PAGE_SIZE,
             )),
@@ -214,7 +214,7 @@ mod tests {
         let f2 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
         let r2 = f2.region();
         let rec2 = TaskRecord::new(
-            Box::new(ArchImpl::new_context(
+            Box::new(CpuImpl::new_context(
                 ENTRY,
                 r2.base + memory::PAGE_SIZE,
             )),

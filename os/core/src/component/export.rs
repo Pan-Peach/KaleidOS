@@ -12,7 +12,7 @@ use crate::component::registry;
 use crate::machine;
 use crate::memory;
 use crate::task;
-use arch::{Arch, ArchImpl};
+use arch::{Console, ConsoleImpl};
 
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
@@ -29,7 +29,7 @@ struct ExportAddress(*const ());
 unsafe impl Sync for ExportAddress {}
 
 extern "C" fn kcore_console_write_byte(byte: u8) {
-    ArchImpl::console_write_byte(byte);
+    ConsoleImpl::write_byte(byte);
 }
 
 extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
@@ -38,15 +38,15 @@ extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
     }
     const PREFIX: &[u8] = b"[kcomp] ";
     for &b in PREFIX {
-        ArchImpl::console_write_byte(b);
+        ConsoleImpl::write_byte(b);
     }
     if len > 0 {
         let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
         for &b in bytes {
-            ArchImpl::console_write_byte(b);
+            ConsoleImpl::write_byte(b);
         }
     }
-    ArchImpl::console_write_byte(b'\n');
+    ConsoleImpl::write_byte(b'\n');
     0
 }
 

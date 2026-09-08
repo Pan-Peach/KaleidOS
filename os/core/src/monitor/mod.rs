@@ -7,7 +7,7 @@
 //! - 不因拥有 console 而获得 authority（Oracle 审查结论）。
 //!
 //! 主循环：`core> _` 提示符 → 读行 → token 解析 → 命令表分发 → 循环。
-//! 输入/输出都走 arch（read_line / console_getc / console_write_byte），无注入层。
+//! 输入/输出都走 arch crate 的 Console backend，无注入层。
 
 use crate::{print, printk};
 

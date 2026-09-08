@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use arch::Arch;
+use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use fdt::nodes::AsNode;
@@ -139,7 +139,7 @@ static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
 /// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) -> ! {
-    arch::ArchImpl::init();
+    arch::CpuImpl::init();
     kernel::log!("bootstrap", "arch init OK");
     kernel::log!("bootstrap", "KaleidOS bootstrap");
     kernel::log!("bootstrap", "========================================");
@@ -269,7 +269,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 /// VMA, with their bytes loaded at the low physical LMA.
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
-    arch::ArchImpl::init();
+    arch::CpuImpl::init();
 
     let context = unsafe { &*(context_ptr as *const BootContext) };
     kernel::log!("bootstrap", "entered high-half kernel");

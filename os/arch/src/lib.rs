@@ -30,28 +30,53 @@ pub enum ResetType {
     WarmReboot,
 }
 
-/// Arch 接口：ISA 无关的统一操作面（静态方法，无实例）。
-/// host 编译用 FakeArch 实现，riscv64 用 Riscv64 实现（cfg 选择）。
-pub trait Arch {
+/// CPU/ISA 原语：上下文、寄存器切换和架构初始化。
+///
+/// 这个 trait 不包含 console、reset 或设备操作；那些属于 firmware/platform
+/// 服务，由同一个具体 backend 分别实现相应的 trait。
+pub trait CpuArch {
     /// 寄存器上下文类型。
     type Context;
     const ELF_MACHINE: u16;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
-    fn console_write_byte(byte: u8);
-    fn console_getc() -> Option<u8>;
-    fn system_reset(reset_type: ResetType) -> !;
     fn init();
 }
 
-/// 当前平台的 Arch 实现（编译期确定：host → FakeArch，riscv64 → Riscv64）。
-/// 使用处统一写 `arch::ArchImpl::xxx(...)` 或 `use arch::ArchImpl;`。
+/// 早期 console 服务。它是 boot/firmware 传输能力，不是 CPU ISA 原语。
+pub trait Console {
+    fn write_byte(byte: u8);
+    fn getc() -> Option<u8>;
+}
+
+/// 系统 reset 服务。具体实现通常来自 SBI、UEFI 或平台固件。
+pub trait SystemReset {
+    fn system_reset(reset_type: ResetType) -> !;
+}
+
+/// 当前编译目标的 CPU backend（host → Fake，riscv64 → Riscv64）。
 #[cfg(target_arch = "riscv64")]
-pub type ArchImpl = riscv64::Riscv64;
+pub type CpuImpl = riscv64::Riscv64;
 
 #[cfg(not(target_arch = "riscv64"))]
-pub type ArchImpl = fake::Fake;
+pub type CpuImpl = fake::Fake;
 
-/// 当前平台的任务上下文类型（对称于 `ArchImpl`，供 Core 直接使用）。
-/// Core 只依赖 `ContextImpl`，不关心具体 ISA 的寄存器布局。
-pub type ContextImpl = <ArchImpl as Arch>::Context;
+/// 当前编译目标的 console backend。
+///
+/// 现在与 CPU backend 共享具体类型；当同一 ISA 支持多个 platform 时，
+/// 这里可以改成由 boot profile 选择，而不改变 Core 的 Console trait。
+#[cfg(target_arch = "riscv64")]
+pub type ConsoleImpl = riscv64::Riscv64;
+
+#[cfg(not(target_arch = "riscv64"))]
+pub type ConsoleImpl = fake::Fake;
+
+/// 当前编译目标的 reset backend。
+#[cfg(target_arch = "riscv64")]
+pub type ResetImpl = riscv64::Riscv64;
+
+#[cfg(not(target_arch = "riscv64"))]
+pub type ResetImpl = fake::Fake;
+
+/// Core 使用的任务上下文类型；Core 不关心具体 ISA 的寄存器布局。
+pub type ContextImpl = <CpuImpl as CpuArch>::Context;

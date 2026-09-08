@@ -307,7 +307,7 @@ map_range(caller, space_handle, virtual_range, physical_range, permission)
 按 ownership 回收资源并递增 generation。
 
 具体的 backend contract 和 `ArchSpace` 所在 crate 仍需遵守当前依赖方向；在真正
-实现 C10 前，不把 Core 绑定到 `Sv39`、`Pte`、`satp` 或某个 Arch crate。
+实现 C10 前，不把 Core 绑定到 `Sv39`、`Pte`、`satp` 或某个具体 Arch backend。
 
 ### 4.8 Loader 自然分叉
 
