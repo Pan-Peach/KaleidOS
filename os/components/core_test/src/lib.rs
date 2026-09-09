@@ -20,12 +20,18 @@ fn data_ok() -> bool {
     MAGIC == 0xC0FFEE
 }
 
+/// Validate the machine facts supplied by the Core exports.  The actual hart
+/// membership lookup stays in Core; this pure predicate remains host-testable.
+fn machine_ok(cpu_count: usize, boot_hart_present: bool) -> bool {
+    cpu_count >= 1 && boot_hart_present
+}
+
 /// 核内自检：仅在非 test 编译生成（组件 .kcomp / 真机）。
 /// host `cargo test` 不引用 `kcore_*`，避免未定义符号链接失败；
 /// 组件镜像里的 UNDEF 符号由 loader 按导出白名单重定位解析。
 #[cfg(not(test))]
 mod runtime {
-    use super::data_ok;
+    use super::{data_ok, machine_ok};
 
     // 白名单 API（与 kernel `export.rs` 一一对应；C ABI 声明即契约）。
     unsafe extern "C" {
@@ -35,6 +41,8 @@ mod runtime {
         fn machine_boot_hart() -> usize;
         #[link_name = "kcore_machine_cpu_count"]
         fn machine_cpu_count() -> usize;
+        #[link_name = "kcore_machine_has_hart"]
+        fn machine_has_hart(hart_id: usize) -> i32;
         #[link_name = "kcore_free_page_count"]
         fn free_page_count() -> usize;
         #[link_name = "kcore_component_count"]
@@ -55,13 +63,6 @@ mod runtime {
         puts(name);
         puts(": ");
         puts(if ok { "PASS\n" } else { "FAIL\n" });
-    }
-
-    /// 机器真相：至少一个 CPU，且 boot hart 在有效范围。
-    fn machine_ok() -> bool {
-        let cpus = unsafe { machine_cpu_count() };
-        let boot = unsafe { machine_boot_hart() };
-        cpus >= 1 && boot < cpus
     }
 
     /// 内存分配器已初始化（存在可分配空闲页）。
@@ -85,7 +86,10 @@ mod runtime {
         failed |= !ok as u32;
         report("data", ok);
 
-        let ok = machine_ok();
+        let cpus = unsafe { machine_cpu_count() };
+        let boot = unsafe { machine_boot_hart() };
+        let boot_present = unsafe { machine_has_hart(boot) } != 0;
+        let ok = machine_ok(cpus, boot_present);
         failed |= (!ok as u32) << 1;
         report("machine", ok);
 
@@ -109,5 +113,15 @@ mod tests {
     #[test]
     fn data_ok_passes() {
         assert!(data_ok());
+    }
+
+    #[test]
+    fn machine_check_accepts_sparse_hart_ids() {
+        assert!(machine_ok(2, true));
+    }
+
+    #[test]
+    fn machine_check_rejects_missing_boot_hart() {
+        assert!(!machine_ok(2, false));
     }
 }

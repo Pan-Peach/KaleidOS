@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
 
-use arch::riscv64::boot_vm::KernelSection;
-use arch::riscv64::sv39::PteFlags;
+use arch::riscv64::boot_vm::{
+    KernelSection, KERNEL_DATA_FLAGS, KERNEL_RODATA_FLAGS, KERNEL_TEXT_FLAGS,
+};
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -138,7 +139,7 @@ fn print_linker_layout() {
 static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
     *include_bytes!("../../../../tools/qemu/init.kpkg");
 
-/// 只允许 boot hart 继续启动；其余 hart 全部 park（OpenSBI 会把 domain 内所有 hart 都跳进来）。
+/// OpenSBI 选定的 boot hart 进入 payload；其它 hart 留在 firmware 的 warm-boot 路径。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::CpuImpl::init();
@@ -244,36 +245,27 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 KernelSection {
                     va_start: linker_addr(core::ptr::addr_of!(__text_vma_start)),
                     va_end: linker_addr(core::ptr::addr_of!(__text_vma_end)),
-                    flags: PteFlags::R
-                        .union(PteFlags::X)
-                        .union(PteFlags::A)
-                        .union(PteFlags::D),
+                    flags: KERNEL_TEXT_FLAGS,
                 },
                 KernelSection {
                     va_start: linker_addr(core::ptr::addr_of!(__rodata_vma_start)),
                     va_end: linker_addr(core::ptr::addr_of!(__rodata_vma_end)),
-                    flags: PteFlags::R.union(PteFlags::A).union(PteFlags::D),
+                    flags: KERNEL_RODATA_FLAGS,
                 },
                 KernelSection {
                     va_start: linker_addr(core::ptr::addr_of!(__initpkg_start)),
                     va_end: linker_addr(core::ptr::addr_of!(__initpkg_end)),
-                    flags: PteFlags::R.union(PteFlags::A).union(PteFlags::D),
+                    flags: KERNEL_RODATA_FLAGS,
                 },
                 KernelSection {
                     va_start: linker_addr(core::ptr::addr_of!(__data_vma_start)),
                     va_end: linker_addr(core::ptr::addr_of!(__data_vma_end)),
-                    flags: PteFlags::R
-                        .union(PteFlags::W)
-                        .union(PteFlags::A)
-                        .union(PteFlags::D),
+                    flags: KERNEL_DATA_FLAGS,
                 },
                 KernelSection {
                     va_start: linker_addr(core::ptr::addr_of!(__bss_vma_start)),
                     va_end: linker_addr(core::ptr::addr_of!(__bss_vma_end)),
-                    flags: PteFlags::R
-                        .union(PteFlags::W)
-                        .union(PteFlags::A)
-                        .union(PteFlags::D),
+                    flags: KERNEL_DATA_FLAGS,
                 },
             ];
 

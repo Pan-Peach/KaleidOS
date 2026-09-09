@@ -58,6 +58,15 @@ extern "C" fn kcore_machine_cpu_count() -> usize {
     machine::committed().map_or(0, |m| m.cpu_count)
 }
 
+extern "C" fn kcore_machine_has_hart(hart_id: usize) -> i32 {
+    let Some(machine) = machine::committed() else {
+        return 0;
+    };
+    machine.cpu_info[..machine.cpu_count.min(machine.cpu_info.len())]
+        .iter()
+        .any(|cpu| cpu.hart_id.raw() == hart_id) as i32
+}
+
 extern "C" fn kcore_free_page_count() -> usize {
     memory::free_block_counts()
         .iter()
@@ -75,7 +84,7 @@ extern "C" fn kcore_component_count() -> usize {
     registry::get_registry().lock().len()
 }
 
-static EXPORTS: [Export; 7] = [
+static EXPORTS: [Export; 8] = [
     Export {
         name: b"kcore_console_write_byte",
         address: ExportAddress(kcore_console_write_byte as *const ()),
@@ -91,6 +100,10 @@ static EXPORTS: [Export; 7] = [
     Export {
         name: b"kcore_machine_cpu_count",
         address: ExportAddress(kcore_machine_cpu_count as *const ()),
+    },
+    Export {
+        name: b"kcore_machine_has_hart",
+        address: ExportAddress(kcore_machine_has_hart as *const ()),
     },
     Export {
         name: b"kcore_free_page_count",
@@ -125,6 +138,7 @@ mod tests {
         assert!(resolve(b"kcore_log_line").is_some());
         assert!(resolve(b"kcore_machine_boot_hart").is_some());
         assert!(resolve(b"kcore_machine_cpu_count").is_some());
+        assert!(resolve(b"kcore_machine_has_hart").is_some());
         assert!(resolve(b"kcore_free_page_count").is_some());
         assert!(resolve(b"kcore_task_count").is_some());
         assert!(resolve(b"kcore_component_count").is_some());

@@ -44,8 +44,20 @@ pub fn init(
     if info.mem_count == 0 {
         return Err("no memory regions");
     }
+    if info.mem_count > info.memory_regions.len()
+        || info.cpu_count > info.cpu_info.len()
+        || info.dev_count > info.devices.len()
+    {
+        return Err("machine info count exceeds capacity");
+    }
     if info.cpu_count == 0 {
         return Err("no cpu info");
+    }
+    if !info.cpu_info[..info.cpu_count]
+        .iter()
+        .any(|cpu| cpu.hart_id.raw() == info.boot_hart)
+    {
+        return Err("boot hart is not present in cpu info");
     }
 
     // 帧区域：reserved[0] 的末尾（对齐帧）→ 包含内核镜像的那个 RAM region

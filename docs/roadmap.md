@@ -14,8 +14,8 @@ Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core M
   → registry（declare → start → Ready 状态机）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  7 条 kcore_*（console_write_byte / log_line / machine_boot_hart / machine_cpu_count /
-  free_page_count / task_count / component_count）
+  8 条 kcore_*（console_write_byte / log_line / machine_boot_hart / machine_cpu_count /
+  machine_has_hart / free_page_count / task_count / component_count）
   —— 组件只能调白名单；未导出符号 → UnresolvedSymbol 整次加载失败
 ```
 

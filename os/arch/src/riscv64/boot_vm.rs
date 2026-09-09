@@ -10,6 +10,7 @@ use super::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
 pub const GIGAPAGE_SIZE: usize = 1 << 30;
+const MEGAPAGE_SIZE: usize = 1 << 21;
 
 const IDENTITY_FLAGS: PteFlags = PteFlags::R
     .union(PteFlags::W)
@@ -50,6 +51,9 @@ pub struct KernelSection {
 /// future per-domain AddressSpace root.
 static mut BOOT_ROOT: PageTable = PageTable::empty();
 static mut KERNEL_L1: PageTable = PageTable::empty();
+const MAX_IDENTITY_L1: usize = 4;
+static mut IDENTITY_L1S: [PageTable; MAX_IDENTITY_L1] =
+    [PageTable::empty(); MAX_IDENTITY_L1];
 
 /// Pool of level-0 tables used to map the kernel image at 4 KiB granularity.
 /// The early boot path has no allocator, so it carves these from a static
@@ -58,6 +62,8 @@ static mut KERNEL_L1: PageTable = PageTable::empty();
 const MAX_KERNEL_L0: usize = 16;
 static mut KERNEL_L0S: [PageTable; MAX_KERNEL_L0] = [PageTable::empty(); MAX_KERNEL_L0];
 static mut KERNEL_L0_COUNT: usize = 0;
+static mut IDENTITY_L0S: [PageTable; MAX_KERNEL_L0] = [PageTable::empty(); MAX_KERNEL_L0];
+static mut IDENTITY_L0_COUNT: usize = 0;
 static mut BOOT_ROOT_PA: usize = 0;
 
 pub fn root() -> &'static mut PageTable {
@@ -79,6 +85,7 @@ pub enum BootVmError {
     AddressUnaligned,
     KernelOutsideRam,
     KernelMappingTooLarge,
+    InvalidKernelSection,
     RootIndexConflict,
     KernelL0TableExhausted,
 }
@@ -123,6 +130,7 @@ pub unsafe fn init(
     if kernel_pa < ram_base || kernel_end > ram_end {
         return Err(BootVmError::KernelOutsideRam);
     }
+    validate_sections(image_size, sections)?;
 
     let first_window = ram_base & !(GIGAPAGE_SIZE - 1);
     let last_window = ram_end
@@ -157,10 +165,106 @@ pub unsafe fn init(
     }
 
     unsafe {
+        install_identity_alias(root, kernel_pa, linked_kernel_pa, image_size, sections)?;
         install_kernel_alias(root, kernel_pa, linked_kernel_pa, image_size, sections)?;
 
         let linked_root_pa = physical_address_of(root as *const PageTable as usize);
         BOOT_ROOT_PA = runtime_physical_address(linked_root_pa, kernel_pa, linked_kernel_pa)?;
+    }
+
+    Ok(())
+}
+
+/// Replace the coarse identity leaf covering the kernel with 2 MiB leaves and
+/// 4 KiB tables where the formal kernel sections need tighter permissions.
+///
+/// This is deliberately only a transition mapping: ordinary RAM outside the
+/// kernel image remains covered by the permissive identity leaves.  Keeping
+/// the kernel's low alias in sync prevents its formal text/data pages from
+/// being writable merely because the bootstrap RAM map is still active.
+unsafe fn install_identity_alias(
+    root: &mut PageTable,
+    kernel_pa: usize,
+    linked_kernel_pa: usize,
+    image_size: usize,
+    sections: &[KernelSection],
+) -> Result<(), BootVmError> {
+    let image_end = kernel_pa
+        .checked_add(image_size)
+        .ok_or(BootVmError::AddressOverflow)?;
+    let last_image_pa = image_end
+        .checked_sub(1)
+        .ok_or(BootVmError::AddressOverflow)?;
+    let first_window = kernel_pa & !(GIGAPAGE_SIZE - 1);
+    let last_window = last_image_pa & !(GIGAPAGE_SIZE - 1);
+    let window_count = (last_window - first_window) / GIGAPAGE_SIZE + 1;
+    if window_count > MAX_IDENTITY_L1 {
+        return Err(BootVmError::KernelMappingTooLarge);
+    }
+
+    unsafe {
+        IDENTITY_L0_COUNT = 0;
+    }
+
+    for window_index in 0..window_count {
+        let window_pa = first_window
+            .checked_add(window_index * GIGAPAGE_SIZE)
+            .ok_or(BootVmError::AddressOverflow)?;
+        let root_index = (window_pa >> 30) & 0x1ff;
+        if root_index == 0 {
+            return Err(BootVmError::RootIndexConflict);
+        }
+
+        let l1 = unsafe { &mut *core::ptr::addr_of_mut!(IDENTITY_L1S[window_index]) };
+        for (index, entry) in l1.entries.iter_mut().enumerate() {
+            let pa = window_pa
+                .checked_add(index * MEGAPAGE_SIZE)
+                .ok_or(BootVmError::AddressOverflow)?;
+            *entry = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
+        }
+
+        let l1_link_pa = physical_address_of(l1 as *const PageTable as usize);
+        let l1_pa = runtime_physical_address(l1_link_pa, kernel_pa, linked_kernel_pa)?;
+        root.entries[root_index] = Pte::new_table_pa(l1_pa);
+    }
+
+    // Overlay the formal sections on the low identity view.  The section
+    // addresses are high VMAs; convert each page through the same image
+    // offset used by the high-half alias.
+    for section in sections {
+        if section.va_start >= section.va_end {
+            continue;
+        }
+        let offset = section
+            .va_start
+            .checked_sub(KERNEL_VMA)
+            .ok_or(BootVmError::AddressOverflow)?;
+        let section_pa = kernel_pa
+            .checked_add(offset)
+            .ok_or(BootVmError::AddressOverflow)?;
+        let section_end = kernel_pa
+            .checked_add(
+                section
+                    .va_end
+                    .checked_sub(KERNEL_VMA)
+                    .ok_or(BootVmError::AddressOverflow)?,
+            )
+            .ok_or(BootVmError::AddressOverflow)?;
+
+        let mut pa = section_pa;
+        while pa < section_end {
+            let window_index = (pa - first_window) / GIGAPAGE_SIZE;
+            let l1 = unsafe { &mut *core::ptr::addr_of_mut!(IDENTITY_L1S[window_index]) };
+            let window_pa = first_window
+                .checked_add(window_index * GIGAPAGE_SIZE)
+                .ok_or(BootVmError::AddressOverflow)?;
+            let l0 =
+                unsafe { identity_l0_for(l1, vpn(pa, 1), window_pa, kernel_pa, linked_kernel_pa)? };
+            l0[vpn(pa, 0)] = Pte::new_leaf_pa(pa, section.flags);
+            pa = pa
+                .checked_add(PAGE_SIZE)
+                .ok_or(BootVmError::AddressOverflow)?;
+        }
     }
 
     Ok(())
@@ -188,8 +292,9 @@ unsafe fn install_kernel_alias(
 
     // Pass 1: map the entire image range (including the low bootstrap
     // trampoline's high-half shadow and any padding between sections) with a
-    // permissive RWX baseline.  This keeps the high-half alias hole-free so
-    // the early hand-off cannot fault before Core takes over.
+    // writable, non-executable baseline.  The formal .text section is made
+    // executable in pass 2; the bootstrap shadow only needs data access after
+    // the hand-off, and must not create another RWX kernel alias.
     let mapped_size = image_size
         .checked_add(PAGE_SIZE - 1)
         .ok_or(BootVmError::AddressOverflow)?
@@ -203,7 +308,7 @@ unsafe fn install_kernel_alias(
             .ok_or(BootVmError::AddressOverflow)?;
         let l1_index = vpn(va, 1);
         let l0 = unsafe { l0_for(l1, l1_index, kernel_pa, linked_kernel_pa)? };
-        l0[vpn(va, 0)] = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
+        l0[vpn(va, 0)] = Pte::new_leaf_pa(pa, KERNEL_DATA_FLAGS);
     }
 
     // Pass 2: tighten each linker section to its real permission set.  This is
@@ -229,6 +334,75 @@ unsafe fn install_kernel_alias(
         }
     }
 
+    Ok(())
+}
+
+/// Return a 4 KiB table for an identity-map 2 MiB slot, replacing its coarse
+/// leaf on first use.
+unsafe fn identity_l0_for(
+    l1: &mut PageTable,
+    l1_index: usize,
+    window_pa: usize,
+    kernel_pa: usize,
+    linked_kernel_pa: usize,
+) -> Result<&'static mut [Pte; ENTRIES], BootVmError> {
+    if let Some(pte) = l1.entries[l1_index]
+        .is_valid()
+        .then(|| l1.entries[l1_index])
+    {
+        if !pte.is_leaf() {
+            return pte.get_pte_array().ok_or(BootVmError::RootIndexConflict);
+        }
+    }
+
+    let idx = unsafe { IDENTITY_L0_COUNT };
+    if idx >= MAX_KERNEL_L0 {
+        return Err(BootVmError::KernelL0TableExhausted);
+    }
+    unsafe {
+        IDENTITY_L0_COUNT += 1;
+    }
+
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(IDENTITY_L0S[idx]) };
+    for entry in table.entries.iter_mut() {
+        *entry = Pte::invalid();
+    }
+    let l0_link_pa = physical_address_of(table as *const PageTable as usize);
+    let l0_pa = runtime_physical_address(l0_link_pa, kernel_pa, linked_kernel_pa)?;
+    l1.entries[l1_index] = Pte::new_table_pa(l0_pa);
+    // Preserve the original 2 MiB identity mapping for pages not covered by
+    // a formal section.
+    for (index, entry) in table.entries.iter_mut().enumerate() {
+        let pa = window_pa
+            .checked_add(l1_index * MEGAPAGE_SIZE)
+            .and_then(|pa| pa.checked_add(index * PAGE_SIZE))
+            .ok_or(BootVmError::AddressOverflow)?;
+        *entry = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
+    }
+    Ok(&mut table.entries)
+}
+
+fn validate_sections(image_size: usize, sections: &[KernelSection]) -> Result<(), BootVmError> {
+    let mapped_size = image_size
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(BootVmError::AddressOverflow)?
+        & !(PAGE_SIZE - 1);
+    let image_end = KERNEL_VMA
+        .checked_add(mapped_size)
+        .ok_or(BootVmError::AddressOverflow)?;
+
+    for section in sections {
+        if section.va_start == section.va_end {
+            continue;
+        }
+        if section.va_start > section.va_end
+            || section.va_start < KERNEL_VMA
+            || section.va_start & (PAGE_SIZE - 1) != 0
+            || section.va_end > image_end
+        {
+            return Err(BootVmError::InvalidKernelSection);
+        }
+    }
     Ok(())
 }
 
