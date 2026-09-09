@@ -57,6 +57,7 @@ init.kpkg:
 		cp $$obj $(KPKG_DIR)/$$name.kcomp; \
 	done
 	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest
+	@mkdir -p $(CURDIR)/tools/qemu
 	cd $(KPKG_DIR) && find . -type f | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
 	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_COMPONENTS))"
 
