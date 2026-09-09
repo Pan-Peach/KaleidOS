@@ -323,35 +323,45 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
     kernel::log!("bootstrap", "MachineInfo dump:");
     kernel::printk!("{:#?}\n", context.info);
     kernel::log!("bootstrap", "BOOT DISCOVERY OK");
-    kernel::log!("core", "core init: ");
 
-    match kernel::init(&context.info, &context.reserved) {
-        Ok(()) => {
-            kernel::log!("core", "BOOT CORE OK");
+    #[cfg(feature = "selftest")]
+    {
+        crate::selftest::run();
+    }
 
-            // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
-            let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
-            let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
-            let pkg =
-                unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
-            kernel::component::store::init(pkg);
-            if let Some(store) = kernel::component::store::get_component_store() {
-                let list = store.list();
-                match list {
-                    Ok(entries) => {
-                        kernel::log!("store", "embedded kpkg: {} components", entries.len())
+    #[cfg(not(feature = "selftest"))]
+    {
+        kernel::log!("core", "core init: ");
+
+        match kernel::init(&context.info, &context.reserved) {
+            Ok(()) => {
+                kernel::log!("core", "BOOT CORE OK");
+
+                // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
+                let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
+                let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
+                let pkg = unsafe {
+                    core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start)
+                };
+                kernel::component::store::init(pkg);
+                if let Some(store) = kernel::component::store::get_component_store() {
+                    let list = store.list();
+                    match list {
+                        Ok(entries) => {
+                            kernel::log!("store", "embedded kpkg: {} components", entries.len())
+                        }
+                        Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
                     }
-                    Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
+                } else {
+                    kernel::log!("store", "store: not initialized");
                 }
-            } else {
-                kernel::log!("store", "store: not initialized");
-            }
 
-            // 转交 Core Monitor（boot hart 同步主循环，永不返回）
-            kernel::monitor::run();
-        }
-        Err(e) => {
-            panic!("core init failed: {}", e);
+                // 转交 Core Monitor（boot hart 同步主循环，永不返回）
+                kernel::monitor::run();
+            }
+            Err(e) => {
+                panic!("core init failed: {}", e);
+            }
         }
     }
 }

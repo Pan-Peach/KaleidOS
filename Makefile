@@ -85,7 +85,7 @@ clean:
 #   make test-qemu-rv64 / test-qemu-rv32   自动 QEMU（boot smoke + 自动 CoreTest）
 #   make test-qemu    两个架构都跑
 #   make check        CI 全量门禁 = fmt + clippy + test-host + test-build
-.PHONY: fmt clippy check test-host test-build test-qemu test-qemu-rv64 test-qemu-rv32
+.PHONY: fmt clippy check test-host test-build test-qemu test-qemu-rv64 test-qemu-rv32 test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
@@ -121,6 +121,21 @@ test-qemu-one: kernel
 	@python3 tests/qemu/runner.py $(ARCH)
 
 test-qemu: test-qemu-rv64 test-qemu-rv32
+
+# White-box architectural selftests use a separate feature-gated image.  Keep
+# the normal `kernel` target feature-free so `make qemu` still enters Monitor.
+test-arch-rv64:
+	$(MAKE) ARCH=rv64 test-arch-one
+
+test-arch-rv32:
+	$(MAKE) ARCH=rv32 test-arch-one
+
+test-arch-one: init.kpkg
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --features selftest --target $(TARGET) --release
+	cp $(KERNEL) $(OUTPUT)-selftest
+	@python3 tests/qemu/arch_runner.py $(ARCH)
+
+test-arch: test-arch-rv64 test-arch-rv32
 
 # 一键质量门禁：任何一步失败即整体失败（CI 可直接用）
 # 依赖 $(INITPKG_O)：boot 链接需要 .initpkg 对象存在

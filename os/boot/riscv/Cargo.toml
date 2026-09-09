@@ -11,6 +11,9 @@ name = "bootstrap"
 path = "src/main.rs"
 test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --tests
 
+[features]
+selftest = []
+
 [dependencies]
 arch = { path = "../../arch" }
 fdt = { path = "../../../third_party/fdt" }

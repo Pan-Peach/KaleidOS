@@ -124,15 +124,25 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         size: image_size,
     }];
 
-    match kernel::init(&info, &reserved) {
-        Ok(()) => {
-            kernel::log!("bootstrap", "RV32 CORE OK");
-            let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
-            let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
-            kernel::component::store::init(pkg);
-            kernel::monitor::run();
+    #[cfg(feature = "selftest")]
+    {
+        let _ = (&info, &reserved);
+        crate::selftest::run();
+    }
+
+    #[cfg(not(feature = "selftest"))]
+    {
+        match kernel::init(&info, &reserved) {
+            Ok(()) => {
+                kernel::log!("bootstrap", "RV32 CORE OK");
+                let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
+                let pkg =
+                    unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
+                kernel::component::store::init(pkg);
+                kernel::monitor::run();
+            }
+            Err(error) => panic!("core init failed: {}", error),
         }
-        Err(error) => panic!("core init failed: {}", error),
     }
 }
 
