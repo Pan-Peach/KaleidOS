@@ -10,57 +10,83 @@ use arch::{ComponentStore, StoreEntry, StoreError};
 use spin::Once;
 
 /// 从 newc 归档解析出的一个条目（借用自 blob，零拷贝）。
+#[derive(Debug, PartialEq, Eq)]
 pub struct CpioEntry<'a> {
     pub name: &'a [u8],
     pub data: &'a [u8],
 }
 
-fn hex_u32(bytes: &[u8]) -> u32 {
+/// 解析 8 个 ASCII hex 字符为 u32。newc 头部字段都是 8 hex 位；
+/// 非法字符（任意损坏输入的一部分）返回 `NotSupported`，绝不 panic。
+fn hex_u32(bytes: &[u8]) -> Result<u32, StoreError> {
     let mut val = 0u32;
     for &b in bytes {
-        val <<= 4;
-        val |= match b {
+        let digit = match b {
             b'0'..=b'9' => (b - b'0') as u32,
             b'a'..=b'f' => (b - b'a' + 10) as u32,
             b'A'..=b'F' => (b - b'A' + 10) as u32,
-            _ => panic!("invalid hex digit"),
+            _ => return Err(StoreError::NotSupported),
         };
+        val = val
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(StoreError::NotSupported)?;
     }
-    val
+    Ok(val)
 }
 
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
+fn align4(n: usize) -> Result<usize, StoreError> {
+    n.checked_add(3)
+        .map(|n| n & !3)
+        .ok_or(StoreError::NotSupported)
 }
 
 /// 解析 newc 归档：blob → 条目列表（纯内存逻辑，host-testable）。
+///
+/// 对**任意输入**只返回 `Ok` 或 `Err`，不会 panic：
+/// - 头部/名字/数据区全部用 checked 算术定位；
+/// - `namesize` 必须 ≥ 1（含末尾 NUL），否则 `-1` 会下溢；
+/// - 非法 hex 字段返回 `NotSupported`；
+/// - 截断返回 `TooSmall`。
 pub fn parse_entries(blob: &'static [u8]) -> Result<Vec<CpioEntry<'static>>, StoreError> {
-    let mut pos = 0;
+    let mut pos = 0usize;
     let mut entries = Vec::new();
     loop {
-        if blob.len() - pos < 110 {
+        let header_end = pos.checked_add(110).ok_or(StoreError::NotSupported)?;
+        if header_end > blob.len() {
             return Err(StoreError::TooSmall);
         }
-        let header = &blob[pos..pos + 110];
+        let header = &blob[pos..header_end];
         if &header[..6] != b"070701" {
             return Err(StoreError::NotSupported);
         }
-        let filesize = hex_u32(&header[54..62]) as usize;
-        let namesize = hex_u32(&header[94..102]) as usize;
-        if blob.len() - pos < 110 + namesize {
+        let filesize = hex_u32(&header[54..62])? as usize;
+        let namesize = hex_u32(&header[94..102])? as usize;
+        if namesize == 0 {
+            return Err(StoreError::NotSupported);
+        }
+        let name_end = pos
+            .checked_add(110)
+            .and_then(|end| end.checked_add(namesize))
+            .ok_or(StoreError::NotSupported)?;
+        if name_end > blob.len() {
             return Err(StoreError::TooSmall);
         }
-        let data_off = align4(pos + 110 + namesize);
-        let name = &blob[pos + 110..pos + 110 + namesize - 1];
+        let name = &blob[pos + 110..name_end - 1];
         if name == b"TRAILER!!!" {
             return Ok(entries);
         }
-        if data_off + filesize > blob.len() {
+        let data_off = align4(name_end)?;
+        let data_end = data_off
+            .checked_add(filesize)
+            .ok_or(StoreError::NotSupported)?;
+        if data_end > blob.len() {
             return Err(StoreError::TooSmall);
         }
-        let data = &blob[data_off..data_off + filesize];
+        let data = &blob[data_off..data_end];
         entries.push(CpioEntry { name, data });
-        pos = align4(data_off + filesize);
+        // 下一个条目从对齐后的数据末尾开始；每次至少前进 110+1 字节，必然终止。
+        pos = align4(data_end)?;
     }
 }
 
@@ -117,8 +143,76 @@ pub fn get_component_store() -> Option<&'static dyn ComponentStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::vec;
 
     const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
+
+    // -- 手工构造 newc 归档（与 os/core/build.rs 的 write_newc 语义一致）----
+
+    /// 手工拼一个 newc 条目（与 os/core/build.rs 的 write_newc 语义一致）：
+    /// header + name(NUL 结尾) + 4 对齐 + data（含数据尾部对齐）。
+    fn newc_raw(name: &str, data: &[u8]) -> Vec<u8> {
+        let header = format!(
+            "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            0,
+            0o100644,
+            0,
+            0,
+            1,
+            0,
+            data.len(),
+            0,
+            0,
+            0,
+            0,
+            name.len() + 1,
+            0
+        );
+        assert_eq!(header.len(), 110);
+        let mut entry = Vec::new();
+        entry.extend_from_slice(header.as_bytes());
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(0);
+        while !entry.len().is_multiple_of(4) {
+            entry.push(0);
+        }
+        entry.extend_from_slice(data);
+        while !entry.len().is_multiple_of(4) {
+            entry.push(0);
+        }
+        entry
+    }
+
+    /// 拼一个完整归档（条目对齐 + trailer）。
+    fn newc_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (name, data) in files {
+            let raw = newc_raw(name, data);
+            archive.extend_from_slice(&raw);
+            while !archive.len().is_multiple_of(4) {
+                archive.push(0);
+            }
+        }
+        let raw = newc_raw("TRAILER!!!", &[]);
+        archive.extend_from_slice(&raw);
+        while !archive.len().is_multiple_of(4) {
+            archive.push(0);
+        }
+        archive
+    }
+
+    /// 测试用：Vec → 'static 切片（泄漏到进程结束）。
+    fn leak(v: Vec<u8>) -> &'static [u8] {
+        Box::leak(v.into_boxed_slice())
+    }
+
+    fn align4_test(n: usize) -> usize {
+        (n + 3) & !3
+    }
+
+    // -- 合法路径 -----------------------------------------------------------
 
     #[test]
     fn parses_real_kpkg_entries() {
@@ -131,10 +225,56 @@ mod tests {
     }
 
     #[test]
-    fn entries_are_zero_copy_slices() {
+    fn entries_borrow_the_original_blob_zero_copy() {
+        // 性质断言（不锁定 magic offset）：
+        // 1) name/data 切片必须指向原 blob 内部（零拷贝，不是拷贝）；
+        // 2) data 起点 = 按 newc 规则对齐后的名字末尾；
+        // 3) data 内容与名字/长度字段一致。
         let entries = parse_entries(REAL_KPKG).expect("parse real kpkg");
-        let pos = entries[0].data.as_ptr() as usize - REAL_KPKG.as_ptr() as usize;
-        assert_eq!(pos, 120, "data 切片应直接借用 blob 内部（零拷贝）");
+        let blob_start = REAL_KPKG.as_ptr() as usize;
+        let blob_end = blob_start + REAL_KPKG.len();
+
+        for (i, entry) in entries.iter().enumerate() {
+            let name_start = entry.name.as_ptr() as usize;
+            let name_end = name_start + entry.name.len();
+            let data_start = entry.data.as_ptr() as usize;
+            let data_end = data_start + entry.data.len();
+            assert!(
+                blob_start <= name_start && name_end <= blob_end,
+                "entry[{i}] name 必须在原 blob 内"
+            );
+            assert!(
+                blob_start <= data_start && data_end <= blob_end,
+                "entry[{i}] data 必须在原 blob 内"
+            );
+            // 零拷贝：data 紧跟 name（含 NUL），从 4 对齐处开始 —— 用对齐规则本身验证
+            let expected_data_off = align4_test((name_start - blob_start) + entry.name.len() + 1);
+            assert_eq!(
+                data_start - blob_start,
+                expected_data_off,
+                "entry[{i}] data 偏移必须等于 newc 对齐规则"
+            );
+            assert!(data_start >= name_end, "data 不能与 name 重叠");
+        }
+    }
+
+    #[test]
+    fn parses_hand_built_archive_roundtrip() {
+        let blob = leak(newc_archive(&[("a", b"hello"), ("b.bin", &[0u8; 64])]));
+        let entries = parse_entries(blob).expect("parse hand-built archive");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b"a");
+        assert_eq!(entries[0].data, b"hello");
+        assert_eq!(entries[1].name, b"b.bin");
+        assert_eq!(entries[1].data.len(), 64);
+        assert_eq!(entries[1].data, &[0u8; 64]);
+    }
+
+    #[test]
+    fn trailer_only_archive_is_empty() {
+        let blob = leak(newc_archive(&[]));
+        let entries = parse_entries(blob).expect("trailer-only archive");
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -171,5 +311,121 @@ mod tests {
             store.read(b"kcomp_smoke.kcomp", &mut buf),
             Err(StoreError::TooSmall)
         );
+    }
+
+    // -- 对抗性输入：任意输入只允许 Ok / Err，不允许 panic ----------------
+
+    #[test]
+    fn empty_blob_is_too_small() {
+        assert_eq!(parse_entries(&[]), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn truncated_header_is_too_small() {
+        let blob = leak(newc_raw("x", b"data")[..109].to_vec());
+        assert_eq!(parse_entries(blob), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn bad_magic_is_not_supported() {
+        let mut raw = newc_raw("x", b"data");
+        raw[..6].copy_from_slice(b"070700");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::NotSupported));
+    }
+
+    #[test]
+    fn invalid_hex_field_is_not_supported() {
+        // 名字长度字段填非法 hex（'z'），hex_u32 必须返回 Err 而非 panic。
+        let mut raw = newc_raw("x", b"data");
+        raw[94..102].copy_from_slice(b"zzzzzzzz");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::NotSupported));
+    }
+
+    #[test]
+    fn invalid_hex_in_magic_adjacent_field_is_not_supported() {
+        let mut raw = newc_raw("x", b"data");
+        raw[54..62].copy_from_slice(b"00000g00");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::NotSupported));
+    }
+
+    #[test]
+    fn zero_namesize_is_not_supported() {
+        // namesize=0 时 `namesize - 1` 会下溢 —— parser 必须拒绝而非 panic。
+        let mut raw = newc_raw("x", b"data");
+        raw[94..102].copy_from_slice(b"00000000");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::NotSupported));
+    }
+
+    #[test]
+    fn absurd_namesize_is_too_small() {
+        let mut raw = newc_raw("x", b"data");
+        raw[94..102].copy_from_slice(b"ffffffff");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn absurd_filesize_is_too_small() {
+        let mut raw = newc_raw("x", b"data");
+        raw[54..62].copy_from_slice(b"ffffffff");
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn truncated_filename_is_too_small() {
+        let mut raw = newc_raw("this-name-is-way-too-long-for-the-blob", b"data");
+        raw[94..102].copy_from_slice(format!("{:08x}", 100).as_bytes());
+        // blob 实际只到 ~118 字节，namesize=100 必然越界 → TooSmall
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn truncated_payload_is_too_small() {
+        let mut raw = newc_raw("x", b"data");
+        raw[54..62].copy_from_slice(format!("{:08x}", 1000).as_bytes());
+        assert_eq!(parse_entries(leak(raw)), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn missing_trailer_is_too_small() {
+        // 合法条目 + 数据，但没有 TRAILER：下一轮循环头部不足 → TooSmall
+        let blob = leak(newc_raw("x", b"data"));
+        assert_eq!(parse_entries(blob), Err(StoreError::TooSmall));
+    }
+
+    #[test]
+    fn trailing_garbage_after_valid_entry_is_not_supported() {
+        // 合法条目（无 trailer）+ 足够长的垃圾字节（≥110 才能走到 magic 校验）
+        let mut archive = newc_raw("x", b"data");
+        archive.extend_from_slice(&[b'X'; 200]);
+        assert_eq!(parse_entries(leak(archive)), Err(StoreError::NotSupported));
+    }
+
+    #[test]
+    fn unaligned_payload_still_parses() {
+        // namesize 让 name_end 落在非 4 对齐处：data 从对齐边界开始。
+        // "abc" (4 字节含 NUL) → name_end=114 → data_off=116。
+        let blob = leak(newc_archive(&[("abc", b"payload")]));
+        let entries = parse_entries(blob).expect("unaligned entry parses");
+        assert_eq!(entries[0].name, b"abc");
+        assert_eq!(entries[0].data, b"payload");
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        // 确定性遍历：各类恶意字节串都必须返回 Err（或极少数意外 Ok），不能 panic。
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x07; 109],
+            vec![0x07; 110],
+            vec![0xff; 256],
+            vec![0x30; 1024], // 全 '0'
+            b"070701".to_vec(),
+            newc_raw("x", b"data"),
+            vec![0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07],
+        ];
+        for case in cases.iter() {
+            let blob = leak(case.clone());
+            let _ = parse_entries(blob); // 唯一要求：不 panic
+        }
     }
 }
