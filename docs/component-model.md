@@ -313,9 +313,10 @@ map_range(caller, space_handle, virtual_range, physical_range, permission)
 ### 4.8 Loader 自然分叉
 
 现状 `load_component(blob)` 由 Core 侧 loader 编排：通用 ELF 对象解析在
-`component/elf.rs`，段存储由 Core allocator 提供，架构/ABI 重定位由选中的
-`arch/{riscv,fake}/elf.rs` 实现；loader 返回 `LoadedComponent { base, entry, text_size }`。
-它当前拿 PA 当 VA 拷贝。未来：
+`component/elf.rs`，段存储由 Core allocator 提供，架构/ABI 重定位由
+`arch/riscv/elf.rs` 的 `RiscvRelocator` 实现（该实现可在 host 编译，测试直接驱动
+生产代码）；loader 返回 `LoadedComponent { base, entry, text_size }`。
+当前拿 PA 当 VA 拷贝。未来（按 ExecutionDomain 分叉）：
 
 ```rust
 fn load_component(blob: &[u8], target: &mut dyn LoadTarget)

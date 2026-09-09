@@ -52,9 +52,10 @@ tools/         工具脚本（待建设）
 
 ## 当前状态
 
-**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（2026-08，全部 QEMU 端到端验证）：
+**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（2026-09，全部 QEMU 端到端验证，RV64 + RV32 双 profile）：
 
-- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）
+- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
+- **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
 - **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机）→ monitor `load` 命令
 - **导出白名单**（EXPORT_SYMBOL 教学版，7 条 `kcore_*`）：组件只能调白名单，未导出符号 → 加载失败
 
@@ -66,7 +67,7 @@ core> load kcomp_smoke
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`。默认构建 RV64，也可用 `make kernel ARCH=rv32` 构建 RV32。
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认构建 RV64，也可用 `make kernel ARCH=rv32` 构建 RV32（QEMU 内存 rv32=1G，见 Makefile）。
 
 ## 构建
 

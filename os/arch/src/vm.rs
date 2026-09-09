@@ -1,9 +1,10 @@
-//! Architecture-neutral VM backend contract skeleton.
+//! Architecture-neutral VM backend contract.
 //!
-//! This is vocabulary only. It is not wired into Core or the boot path yet.
-//! A future contract crate may extract these types when C10 needs multiple
-//! translation backends without making Core depend on a concrete architecture
-//! implementation.
+//! Core 的 `KernelAddressSpace`（os/core/src/memory/address_space.rs）直接消费
+//! 这里的 `AddressSpaceBackend` / `VirtualRange` / `PhysicalRange` /
+//! `MappingPermission`；`PageAlloc` 是 core buddy heap 给页表 backend 的窄回调。
+//! 未来的 contract crate 可以把这些类型抽出来，让 Core 支持多种翻译 backend，
+//! 但目前保持在本 crate 内即可。
 
 use bitflags::bitflags;
 

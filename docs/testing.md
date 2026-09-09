@@ -29,17 +29,19 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
 
 ```text
               Real Hardware（真实硬件测试）
-              QEMU CoreTest（板上集成测试）
+              QEMU CoreTest（板上集成测试，黑盒组件身份）
+            QEMU ArchTest（白盒内核 selftest，直接验证硬件契约）
           Concurrency Exploration（并发探索，未来）
         Model Checking（模型检查，未来）
-      Property Test（属性测试）
+      Property Test（属性测试，proptest）
     Host Test（宿主单测 —— 主体，日常主力）
 ```
 
-- **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；
-- **Property Test**：对 Core 的不变式做随机化验证（未来引入 proptest 类工具）；
+- **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；RISC-V 的纯算法（重定位、Sv32/Sv39 页表编码与 walk）同样 host 测生产实现；
+- **Property Test**：对 Core 的不变式做随机化验证（已引入 proptest，dev-dependency、仅 host profile：AddressSpace 随机序列四不变式 + parser never-panic）；
 - **Model Checking / Concurrency Exploration**：未来用 Kani / Loom 类工具（见 references.md）；
-- **QEMU CoreTest**：验证 Core 与 Arch / Machine Discovery 之间的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）；
+- **QEMU ArchTest（白盒内核 selftest）**：feature-gated 的 test kernel，直接验证 Arch/HAL 与真实 CPU 的契约——trap/scause、页表权限生效（RO/NX/未映射 fault）、context switch 寄存器保存；每 case 单独 QEMU 进程；
+- **QEMU CoreTest**：验证 Core 与 Arch / Machine Discovery 之间的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等），以普通 .kcomp 组件身份运行（无 god-mode）；
 - **Real Hardware**：最终在真机上验证。
 
 ## 3. CoreTest 组件（os/components/core_test/）

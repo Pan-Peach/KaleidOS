@@ -1,23 +1,32 @@
 # 路线图（roadmap.md）
 
-## 0. 当前进度（截至 2026-08，v0.2）
+## 0. 当前进度（截至 2026-09，v0.2）
 
 ### 已完成
 
 ```text
-Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core Monitor（QEMU 验证）
+Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core Monitor（QEMU 验证，RV64/RV32 双 profile）
+MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32（RV32，identity）均已落地，
+     KernelAddressSpace（Core 语义 ledger + AddressSpaceBackend contract）+ Sv39PageTable/Sv32PageTable
+     （buddy 回调分配页表页，map/unmap/translate/激活，mid-map 失败回滚）
 组件加载链（Linux insmod 模式教学版，全部 QEMU 端到端验证）：
-  .kcomp（ELF ET_REL，no_std Rust）→ make init.kpkg（cpio + manifest）
+  .kcomp（ELF32/ELF64 ET_REL，no_std Rust）→ make init.kpkg（cpio + manifest）
   → .initpkg 内嵌 → store::init（cpio 解析）
   → loader::load_component（段表/符号表解析、ALLOC 段放置、
-     重定位由 `arch/{riscv,fake}/elf.rs` 提供：R_RISCV_CALL/CALL_PLT
-     + PCREL_HI20/LO12_I + R_RISCV_32/64）
-  → registry（declare → start → Ready 状态机）
+     重定位由 `arch/riscv/elf.rs` 的 RiscvRelocator 提供：R_RISCV_CALL/CALL_PLT
+     + PCREL_HI20/LO12_I + R_RISCV_32/64；host 测试直接测该实现）
+  → registry（declare → start → Ready 状态机，Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
   8 条 kcore_*（console_write_byte / log_line / machine_boot_hart / machine_cpu_count /
   machine_has_hart / free_page_count / task_count / component_count）
   —— 组件只能调白名单；未导出符号 → UnresolvedSymbol 整次加载失败
+测试体系（自动化，见 docs/testing.md）：
+  make check（fmt/clippy/host 单测/RV64 构建/RV32 check）
+  make test-qemu（RV64+RV32 boot smoke + 自动执行 core_test 组件并判定 PASS）
+  make test-arch（ArchTest 白盒 selftest：mapping / context switch / illegal instr /
+    load fault / store-readonly fault / execute-NX fault，每 case 独立 QEMU，精确 scause 判定）
+  168 个 host 单测（含 proptest 属性测试与 parser 对抗测试）
 ```
 
 QEMU 验证输出（真实）：
@@ -31,31 +40,28 @@ core> load kcomp_smoke
 ### 缺口地图（按依赖顺序）
 
 ```text
-P0 地基（一次做对，后面全靠它）：
-  C1  Sv39 启动（MMU：现在仍裸物理地址直跑！页表模型决定后面一切）—— 人类手写，学习重点
-  C2  启动地址去硬编码（内存布局由 FDT/链接脚本决定，不写死 QEMU 布局）
+P0 地基：
+  ✅ C1  Sv39 启动（已完成：identity + 高半区双映射，RV32 另配 Sv32；ArchTest 验证 fault/权限）
+  ✅ C2  启动地址去硬编码（已完成：内存布局由 FDT/链接脚本符号决定，不写死 QEMU 布局）
 P1 任务系统打通：
-  C3  context_switch 实机验证（已写未验）
-  C4  scheduler_rr 组件接线 + monitor 调度命令
+  ✅ C3  context_switch 实机验证（ArchTest：A→B→A 双上下文 s0-s11/sp 保留，RV64+RV32）
+  C4   scheduler_rr 组件接线 + monitor 调度命令（未开始）
 P2 中断/驱动雏形：
-  C5  timer（sbi/虚拟 CLINT）+ 时钟中断
-  C6  IRQ/PLIC + 驱动模型（virtio 等）—— MmioHandle/IrqHandle 实战入口
+  C5   timer（sbi/虚拟 CLINT）+ 时钟中断
+  C6   IRQ/PLIC + 驱动模型（virtio 等）—— MmioHandle/IrqHandle 实战入口
 P3 组件化进阶：
-  C7  区域分配（alloc_pages(order) 替代逐帧）+ 分配失败回滚
-  C8  MemoryRegion lease + Core 验证的原子 region ownership transfer
-  C9  任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
+  ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
+  C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
+  C9   任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
 P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
   C10 Core AddressSpaceManager + 每域 Sv39 根 + ASID + U-mode（见 §10 性能模型）
 ```
 
-### 下一个里程碑：M0.5 —— Sv39（手敲重点，2026-08 Oracle 方案）
+### 下一个里程碑：M0.5 —— Sv39（✅ 已完成，2026-09；本节保留作历史规划）
 
-**为什么先做它**：现在内核无 MMU（裸物理直跑）。页表模型决定后续一切
-（task 地址空间、隔离执行域、内存权限）；且为 C2/C5/C6 提供地基。
-
-**路线决定**：恒等映射起步（VA==PA，链接基址不动）→ 确认无 bug → 再学 Linux 高半区。
-三阶段各自独立可启动、可提交；**两个关键修正**：①QEMU 是 4G RAM → Phase B 需 4 个
-1GB 大叶（0x80000000..0x180000000）；②1GB 叶无法表达段权限 → RX/R/RW 强制到 Phase C。
+> 已完成交付：boot_vm 恒等+高半区双映射、high-half 交接、Sv39PageTable/Sv32PageTable
+> 动态后端、KernelAddressSpace（Core ledger + backend contract）、ArchTest 权限/trap/上下文验证。
+> 下方 Phase T/B/C 与阅读计划是当时的执行记录，不再作为未来工作。
 
 #### Phase T —— 最小 S-mode trap（0.5-1 天）
 
@@ -130,7 +136,8 @@ v0（当前）：kaleidos.elf 单镜像（bootstrap + core 链接，职责分离
   ↑ bootstrap 阶段：firmware 世界（FDT/MachineInfo）；core 阶段：KaleidOS 世界（资源真相）。
     Bootstrap 与 Core 都只启动一次、永不热替换 → 不放独立装载边界。
     Cargo 依赖图 ≠ 运行时组件图：组件层的 .kcomp/cpio/manifest（Linux insmod 模式）是未来方向。
-之后：     组件动态加载（.kcomp）→ 组件持久化（Persistent Store）→ Wasm 执行后端 → IPC/隔离 → 多 profile → 多架构 → 热替换
+之后：     组件持久化（Persistent Store）→ Wasm 执行后端 → IPC/隔离 → 多 profile → 多架构 → 热替换
+          （组件动态加载 .kcomp 已落地：Linux insmod/cpio/manifest 模式）
 ```
 
 **v0 的野心很小**：不是"功能完整"，而是"架构骨架立起来，边界验证舒服"。
@@ -151,13 +158,11 @@ QEMU RISC-V 启动
   → BOOT DISCOVERY OK / BOOT CORE OK
 ```
 
-**验收标准**：结构化启动日志，四行全 OK：
+**验收标准**：结构化启动日志（实际输出见 §0 已完成，RV64/RV32 均已满足）：
 
 ```text
-BOOT ARCH_ENTRY OK
-BOOT DISCOVERY OK backend=fdt
-BOOT MEMORY OK
-BOOT CORE OK
+[bootstrap] FDT magic: OK / BOOT DISCOVERY OK / [core] init OK
+[core] BOOT CORE OK（RV64）/ [bootstrap] RV32 CORE OK（RV32）
 ```
 
 **打包方式（组件层面，Linux 模式，既定方向）**：
