@@ -462,4 +462,180 @@ mod tests {
         assert_eq!(s.mappings().len(), 1);
         let _ = s.handle();
     }
+
+    // -- Property tests（Invariant A–D，docs/testing.md §5）---------------------
+    //
+    // A: 任意时刻 ledger 中不存在 VA overlap
+    // B: 失败操作后 Core truth == 操作前 Core truth（ledger 与 backend 都不变）
+    // C: 成功操作后 ledger 与 FakeBackend 观察结果一致
+    // D: 任意序列不 panic
+    //
+    // 用 proptest 生成随机 map/unmap 序列 + 随机 backend 成败，逐操作验证。
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum OpKind {
+        Map {
+            base: usize,
+            pages: usize,
+            perm: MappingPermission,
+            backend_fail: bool,
+        },
+        Unmap {
+            base: usize,
+            pages: usize,
+        },
+    }
+
+    fn aligned_base() -> impl Strategy<Value = usize> {
+        // 上限压小，让序列里容易产生 overlap / 相邻区间
+        (0usize..0x1000).prop_map(|pages| pages * PAGE_SIZE)
+    }
+
+    /// 序列生成器：随机 map（随机权限 + 随机 backend 失败）与 unmap。
+    fn op_seq() -> impl Strategy<Value = Vec<OpKind>> {
+        proptest::collection::vec(op_kind_strategy(), 1..=40)
+    }
+
+    fn op_kind_strategy() -> impl Strategy<Value = OpKind> {
+        let pages = 1usize..=4;
+        let perm = prop_oneof![
+            Just(MappingPermission::READ),
+            Just(MappingPermission::READ | MappingPermission::WRITE),
+            Just(MappingPermission::READ | MappingPermission::EXECUTE),
+            Just(
+                MappingPermission::READ
+                    | MappingPermission::WRITE
+                    | MappingPermission::EXECUTE
+            ),
+        ];
+        prop_oneof![
+            (aligned_base(), pages.clone(), perm, any::<bool>()).prop_map(
+                |(base, pages, perm, fail)| OpKind::Map {
+                    base,
+                    pages,
+                    perm,
+                    backend_fail: fail,
+                }
+            ),
+            (aligned_base(), pages)
+                .prop_map(|(base, pages)| OpKind::Unmap { base, pages }),
+        ]
+    }
+
+    fn size_of(pages: usize) -> usize {
+        pages * PAGE_SIZE
+    }
+
+    /// Invariant A：ledger 内无 VA overlap（相邻允许，重叠禁止）。
+    fn assert_no_overlap(mappings: &[Mapping]) {
+        let mut sorted: Vec<VirtualRange> = mappings
+            .iter()
+            .map(|m| m.virtual_range)
+            .collect();
+        sorted.sort_by_key(|r| r.base);
+        for pair in sorted.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            assert!(
+                a.base + a.size <= b.base,
+                "VA overlap: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    fn apply_and_check(space: &mut KernelAddressSpace<FakeBackend>, op: OpKind) {
+        let mappings_before: Vec<Mapping> = space.mappings().to_vec();
+        let backend_before = (space.backend.mapped.clone(), space.backend.unmapped.clone());
+
+        match op {
+            OpKind::Map {
+                base,
+                pages,
+                perm,
+                backend_fail,
+            } => {
+                let m = mapping(base, size_of(pages), perm);
+                space.backend.fail_map = backend_fail;
+                let result = space.map(m);
+                match result {
+                    Ok(()) => {
+                        // C: backend 收到精确参数，ledger 与 backend 一致
+                        assert_eq!(
+                            space.mappings().len(),
+                            mappings_before.len() + 1,
+                            "成功 map 必须提交一条"
+                        );
+                        let last = space.backend.mapped.last().expect("backend got the map");
+                        assert_eq!(*last, (m.virtual_range, m.physical_range, m.permission));
+                        assert!(space.mappings().contains(&m));
+                    }
+                    Err(e) => {
+                        // B: 失败后 Core truth 不变（ledger + backend 都保持原样）
+                        assert_eq!(
+                            space.mappings(),
+                            mappings_before.as_slice(),
+                            "失败后 ledger 不得变化 (err={e:?})"
+                        );
+                        assert_eq!(space.backend.mapped, backend_before.0);
+                        assert_eq!(space.backend.unmapped, backend_before.1);
+                    }
+                }
+            }
+            OpKind::Unmap { base, pages } => {
+                let range = VirtualRange {
+                    base,
+                    size: size_of(pages),
+                };
+                let result = space.unmap(&range);
+                match result {
+                    Ok(()) => {
+                        // C: backend 收到整段 unmap，ledger 移除对应记录
+                        assert!(space.backend.unmapped.contains(&range));
+                        assert!(!space
+                            .mappings()
+                            .iter()
+                            .any(|m| m.virtual_range == range));
+                    }
+                    Err(_) => {
+                        assert_eq!(space.mappings(), mappings_before.as_slice());
+                        assert_eq!(space.backend.mapped, backend_before.0);
+                        assert_eq!(space.backend.unmapped, backend_before.1);
+                    }
+                }
+            }
+        }
+        // A: 每步之后 ledger 无 overlap
+        assert_no_overlap(space.mappings());
+    }
+
+    proptest! {
+        #[test]
+        fn random_sequences_keep_invariants(ops in op_seq()) {
+            let mut space = space(FakeBackend::new());
+            for op in ops {
+                apply_and_check(&mut space, op);
+            }
+        }
+    }
+
+    #[test]
+    fn property_test_helpers_are_sane() {
+        // 防呆：op_seq 生成器本身必须产生合法 base（页对齐）
+        let mut space = space(FakeBackend::new());
+        apply_and_check(&mut space, OpKind::Map {
+            base: PAGE_SIZE,
+            pages: 2,
+            perm: rw(),
+            backend_fail: false,
+        });
+        assert_eq!(space.mappings().len(), 1);
+        assert_no_overlap(space.mappings());
+        apply_and_check(&mut space, OpKind::Unmap {
+            base: PAGE_SIZE,
+            pages: 2,
+        });
+        assert_eq!(space.mappings().len(), 0);
+    }
 }

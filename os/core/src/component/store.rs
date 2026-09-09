@@ -428,4 +428,31 @@ mod tests {
             let _ = parse_entries(blob); // 唯一要求：不 panic
         }
     }
+
+    // -- Property：任意字节输入永不 panic（docs/testing.md §8）----------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_blob_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let blob = leak(bytes);
+            let _ = parse_entries(blob);
+        }
+    }
+
+    proptest! {
+        /// 对真实归档做随机字节翻转 + 截断，也不允许 panic。
+        #[test]
+        fn mutated_real_kpkg_never_panics(
+            index in 0..REAL_KPKG.len(),
+            truncate_to in 0..=REAL_KPKG.len(),
+        ) {
+            let mut mutated = REAL_KPKG.to_vec();
+            mutated[index] ^= 0xFF;
+            mutated.truncate(truncate_to);
+            let blob = leak(mutated);
+            let _ = parse_entries(blob);
+        }
+    }
 }

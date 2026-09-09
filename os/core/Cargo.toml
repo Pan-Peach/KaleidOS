@@ -9,3 +9,7 @@ build = "build.rs"
 arch = { path = "../arch" }
 buddy_system_allocator = { path = "../../third_party/buddy_system_allocator", default-features = false, features = ["alloc", "use_spin", "metadata_heap"] }
 spin = { version = "0.12.1", default-features = false, features = ["spin_mutex", "rwlock","once"] }
+
+[dev-dependencies]
+# 仅 host test profile：AddressSpace 随机序列 + parser never-panic（docs/testing.md §2）
+proptest = "1"

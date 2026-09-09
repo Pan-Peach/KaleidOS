@@ -906,4 +906,36 @@ mod tests {
             let _ = ElfObject::parse(blob);
         }
     }
+
+    // -- Property：任意字节输入永不 panic（docs/testing.md §9）----------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_blob_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let blob = leak(bytes);
+            let _ = ElfObject::parse(blob);
+        }
+    }
+
+    proptest! {
+        /// 对合法 ELF32/ELF64 对象做随机翻转 + 截断，不允许 panic。
+        #[test]
+        fn mutated_valid_objects_never_panic(
+            elf32 in Just(build_elf32()),
+            elf64 in Just(build_elf64()),
+            index in 0usize..1 << 20,
+        ) {
+            for base in [&elf32, &elf64] {
+                let mut mutated = base.clone();
+                let i = index % mutated.len();
+                mutated[i] ^= 0xFF;
+                let trunc = (index * 7) % (mutated.len() + 1);
+                mutated.truncate(trunc);
+                let blob = leak(mutated);
+                let _ = ElfObject::parse(blob);
+            }
+        }
+    }
 }
