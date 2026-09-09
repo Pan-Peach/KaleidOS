@@ -1,5 +1,4 @@
 use crate::vm::{MappingPermission, PageAlloc, PhysicalRange, VirtualRange};
-use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
@@ -108,64 +107,6 @@ pub const fn vpn(va: usize, level: usize) -> usize {
 
 pub const fn is_page_aligned(address: usize) -> bool {
     address & (PAGE_SIZE - 1) == 0
-}
-
-/// 低层只读 helper：在单个根页表页 `root` 上沿 `va` 找叶子 PTE。
-///
-/// 这是操作一个裸 `PageTable`（boot 用）的纯函数；`Sv39PageTable::find_pte`
-/// 是持有 root/frames/allocator 的对象版。
-pub fn find_pte(root: &mut PageTable, va: usize) -> Option<&mut Pte> {
-    let mut table = &mut root.entries;
-
-    for level in (0..=2).rev() {
-        let index = vpn(va, level);
-        let entry = table[index];
-
-        if !entry.is_valid() {
-            return None;
-        }
-
-        if entry.is_leaf() {
-            return Some(&mut table[index]);
-        }
-
-        if level == 0 {
-            return None;
-        }
-
-        table = entry.get_pte_array()?;
-    }
-
-    None
-}
-
-/// 低层 helper：在单个根页表页 `root` 上建中间表并返回叶子 PTE。
-///
-/// 中间页表页用全局堆 `Box` 分配（v1 identity 阶段堆地址即物理地址）。
-/// 这也是 `Sv39PageTable::find_pte_create`（allocator 版）的静态对应物。
-pub fn find_pte_create(root: &mut PageTable, va: usize) -> Option<&mut Pte> {
-    let mut table = &mut root.entries;
-
-    for level in (0..=2).rev() {
-        let index = vpn(va, level);
-        let entry = &mut table[index];
-
-        if !entry.is_valid() {
-            if level == 0 {
-                return None;
-            }
-            let new_table = Box::into_raw(Box::new(PageTable::empty()));
-            *entry = Pte::new_table_pa(new_table as usize);
-        }
-
-        if entry.is_leaf() {
-            return Some(entry);
-        }
-
-        table = entry.get_pte_array()?;
-    }
-
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
