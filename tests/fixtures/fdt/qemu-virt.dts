@@ -1,5 +1,5 @@
 // Machine Discovery 测试 fixture（结构参照 QEMU virt 自动生成的 DTB）。
-// DTS 描述的是机器而非 ISA（riscv64 只是恰好使用），故放在 tests/fixtures/fdt/。
+// DTS 描述的是机器而非 ISA（RV32/RV64 都可使用），故放在 tests/fixtures/fdt/。
 // 运行时 DTB 由 QEMU 经 a1 传入，本文件不参与引导 —— 仅用于 discovery 的 host test。
 /dts-v1/;
 
@@ -15,7 +15,7 @@
     };
 
     // root 级系统设备：QEMU 把 fw-cfg/flash 挂在 / 而不是 /soc，
-    // discovery 必须两层遍历才能看到（见 os/boot/riscv64/src/main.rs）
+    // discovery 必须两层遍历才能看到（见 os/boot/riscv/src/main.rs）
     fw-cfg@10100000 {
         compatible = "qemu,fw-cfg-mmio";
         reg = <0x0 0x10100000 0x0 0x18>;

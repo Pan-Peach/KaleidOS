@@ -1,8 +1,8 @@
 # KaleidOS 构建入口（Linux Kbuild 风格：根 Makefile 驱动，tools/ 放辅助脚本）
 #
 # 用法：
-#   make kernel            # 构建 kaleidos.elf（os/riscv64 + core 链接）
-#   make kernel ARCH=...   # 指定架构（当前只有 rv64）
+#   make kernel            # 构建 kaleidos-rv64（os/boot/riscv + core 链接）
+#   make kernel ARCH=rv32  # 构建 RV32/Sv32 profile
 #   make qemu              # 在 QEMU 上运行（Ctrl-A X 退出）
 #   make clean
 
@@ -12,17 +12,28 @@ ARCH      ?= rv64
 # RUSTFLAGS from the environment overrides Cargo's target-specific flags.
 PROJECT_ROOT := $(abspath $(CURDIR))
 REMAP_RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(PROJECT_ROOT)=.
-BOOT_RUSTFLAGS := $(REMAP_RUSTFLAGS) -C link-arg=-Tlinker.ld
 
-# ARCH 名 → 源码目录（rv64 → riscv64）
+# Profile → build contract.  Keep the matrix small until more machines exist.
 ifeq ($(ARCH),rv64)
-BOOT_DIR  := os/boot/riscv64
+TARGET    := riscv64gc-unknown-none-elf
+BOOT_DIR  := os/boot/riscv
+LINKER    := linker.ld
+QEMU      := qemu-system-riscv64
+else ifeq ($(ARCH),rv32)
+TARGET    := riscv32imac-unknown-none-elf
+BOOT_DIR  := os/boot/riscv
+LINKER    := linker32.ld
+QEMU      := qemu-system-riscv32
 endif
 BOOT_DIR  ?= os/boot/$(ARCH)
-KERNEL    := $(BOOT_DIR)/target/riscv64gc-unknown-none-elf/release/bootstrap
+TARGET    ?= riscv64gc-unknown-none-elf
+LINKER    ?= linker.ld
+QEMU      ?= qemu-system-riscv64
+BOOT_RUSTFLAGS := $(REMAP_RUSTFLAGS) -C link-arg=-T$(LINKER)
+KERNEL    := $(BOOT_DIR)/target/$(TARGET)/release/bootstrap
 OUTPUT    := kaleidos-$(ARCH)
 
-.PHONY: kernel qemu clean
+.PHONY: kernel qemu clean init.kpkg
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 组件名 → 源码目录；每个组件编译成 ET_REL 对象（= .kcomp）
@@ -33,12 +44,12 @@ KPKG_DIR   := /tmp/opencode/kpkg
 # 构建所有组件对象（ET_REL）→ 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
 	@for d in $(KCOMP_DIRS); do \
-		( cd $$d && RUSTFLAGS="$(REMAP_RUSTFLAGS)" cargo rustc --release --target riscv64gc-unknown-none-elf -- --emit=obj ); \
+		( cd $$d && RUSTFLAGS="$(REMAP_RUSTFLAGS)" cargo rustc --release --target $(TARGET) -- --emit=obj ); \
 	done
 	@mkdir -p $(KPKG_DIR)
 	@for d in $(KCOMP_DIRS); do \
 		name=$$(basename $$d); \
-		obj=$$(find $$d/target/riscv64gc-unknown-none-elf/release/deps target/riscv64gc-unknown-none-elf/release/deps -maxdepth 1 -name "$$name-*.o" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
+		obj=$$(find $$d/target/$(TARGET)/release/deps target/$(TARGET)/release/deps -maxdepth 1 -name "$$name-*.o" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
 		cp $$obj $(KPKG_DIR)/$$name.kcomp; \
 	done
 	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest
@@ -47,14 +58,14 @@ init.kpkg:
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 kernel: init.kpkg
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --release
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --target $(TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (with embedded init.kpkg)"
 
 # 调试看输出（串口打印 + Ctrl-A X 退出 QEMU）
 # -smp 2: 2 核（boot hart 由 OpenSBI 选择）；-m 4G: 4GB RAM
 qemu: kernel
-	qemu-system-riscv64 -machine virt -smp 2 -m 4G -bios default \
+	$(QEMU) -machine virt -smp 2 -m 4G -bios default \
 		-kernel $(OUTPUT) -nographic
 
 clean:
@@ -71,7 +82,7 @@ OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test
 # 代码格式化（rustfmt）
 fmt:
 	cargo fmt $(OUR_CRATES)
-	cd os/boot/riscv64 && cargo fmt
+	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
 clippy:
@@ -81,7 +92,8 @@ clippy:
 # 依赖 $(INITPKG_O)：boot 链接需要 .initpkg 对象存在
 check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
-	cd os/boot/riscv64 && cargo fmt -- --check
+	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
-	cd os/boot/riscv64 && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build
+	cd os/boot/riscv && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build
+	cd os/boot/riscv && cargo check --target riscv32imac-unknown-none-elf

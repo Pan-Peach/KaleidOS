@@ -179,15 +179,15 @@ Address Translation    VA 如何映射到 PA
 ```
 
 `MemoryDomain` 是 Core 层的语义抽象，记录 domain 的资源归属、可见区域和
-权限约束；它不等于 `PageTable`，也不携带 Sv39-specific knowledge。
+权限约束；它不等于 `PageTable`，也不携带 Sv39/Sv32-specific knowledge。
 
 MMU 平台可以用 paged `AddressSpace` 同时提供翻译和硬件权限检查；NoMMU 平台
 则可能只有 flat address space，再由 PMP、MPU 或其他机制提供 protection。
 两者不强行伪装成同一个能力集合：没有 MMU 也不意味着拥有虚拟地址空间、
 page fault、COW 或 lazy mapping。
 
-Sv39、Sv32、PMP、MPU 都是 backend/mechanism。当前阶段只实现 Sv39，未来再
-根据机器能力选择 backend；Core API 应使用 AddressSpace、PhysicalRange、
+Sv39、Sv32、PMP、MPU 都是 backend/mechanism。当前 RISC-V profile 已实现 Sv39 与
+Sv32，未来仍可根据机器能力选择 backend；Core API 应使用 AddressSpace、PhysicalRange、
 VirtualRange 和抽象 permission，裸 PA、PTE、VPN、`satp` 只属于 arch 层。
 
 ## 5.6 组件定义（4 项测试）

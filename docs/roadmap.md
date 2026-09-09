@@ -84,8 +84,8 @@ P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔
 
 #### Phase C —— 4KiB 三级遍历（拆两步，共 1.5-3 天）
 
-- 纯 Sv39 逻辑放 host 可编译的 `os/arch/src/sv39.rs`（PTE 编解码/walk → host test）；
-  CSR/TLB 操作留 `riscv64/mmu.rs`
+- 纯 Sv39 逻辑放 `os/arch/src/riscv/mmu/sv39.rs`（PTE 编解码/walk）；
+  CSR/TLB 操作留 `riscv/mmu/mod.rs`
 - 页表页来源：map 接口收零页分配回调（bootstrap 注入 region allocator），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceHandle
 - API 只暴露 `map_range / translate`（unmap 推迟：表回收/shootdown 未到）
 - 新根在 buddy allocator 活后建（Phase B 兜底），预映射全部 RAM（4G ≈ 8MiB 页表页）

@@ -178,17 +178,20 @@ fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError
 }
 
 // ---------------------------------------------------------------------------
-// 页表页取页函数（供 Sv39PageTable 通过函数指针调用 buddy heap）
+// 页表页取页函数（供 RISC-V translation backend 通过函数指针调用 buddy heap）
 // ---------------------------------------------------------------------------
 
 /// 从 buddy heap 取一个已归零的页，返回其物理地址。
 ///
-/// 这就是 arch `Sv39PageTable` 用的 `PageAlloc`：core 在 init 后把它塞进页表。
+/// 这是 arch 页表 backend 用的 `PageAlloc`：core 在 init 后把它塞进页表。
 /// v1 仍处 identity 阶段，物理地址可当虚拟地址解引用（pa == va）；
 /// 切纯高半区后需在返回值基础上换算成可写的 `KernelVirtualAddress`。
 ///
 /// 注意：`alloc_region` 不做清零，必须手动 `write_bytes` 归零，
 /// 否则新页表页会继承旧内存里的垃圾（被当成 PTE 就出大问题）。
+// The `()` error is part of arch::vm::PageAlloc's deliberately narrow
+// cross-crate callback contract; allocation diagnostics stay in Core.
+#[allow(clippy::result_unit_err)]
 pub fn vm_page_alloc() -> Result<usize, ()> {
     let lease = alloc_region(PAGE_SIZE).map_err(|_| ())?;
     let base = lease.region().base;

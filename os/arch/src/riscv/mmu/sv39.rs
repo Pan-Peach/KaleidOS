@@ -326,7 +326,10 @@ impl Sv39PageTable {
         {
             return Err(MapError::Unaligned);
         }
-        let end = va.base.checked_add(va.size).ok_or(MapError::AddressOverflow)?;
+        let end = va
+            .base
+            .checked_add(va.size)
+            .ok_or(MapError::AddressOverflow)?;
         pa.base
             .checked_add(pa.size)
             .ok_or(MapError::AddressOverflow)?;
@@ -366,7 +369,10 @@ impl Sv39PageTable {
     ///
     /// 只清叶子，不回收中间表；不分配内存，因此不会失败。
     pub fn unmap_range(&mut self, va: VirtualRange) -> Result<(), MapError> {
-        let end = va.base.checked_add(va.size).ok_or(MapError::AddressOverflow)?;
+        let end = va
+            .base
+            .checked_add(va.size)
+            .ok_or(MapError::AddressOverflow)?;
         let mut v = va.base;
         while v < end {
             if let Some(pte) = self.find_pte_mut(v) {

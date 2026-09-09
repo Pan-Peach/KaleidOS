@@ -1,9 +1,32 @@
+//! RISC-V address-translation backends.
+//!
+//! The family-level RISC-V module owns the ISA and firmware pieces; this
+//! module owns the translation mechanism boundary.  The active XLEN selects
+//! the Sv39 (RV64) or Sv32 (RV32) backend at compile time.
+
+pub mod address_space;
+#[cfg(target_arch = "riscv32")]
+pub mod sv32;
+#[cfg(target_arch = "riscv64")]
+pub mod sv39;
+
+#[cfg(target_arch = "riscv64")]
 use super::boot_vm;
 
+#[cfg(target_arch = "riscv64")]
 const SV39_MODE: usize = 8;
+#[cfg(target_arch = "riscv32")]
+const SV32_MODE: usize = 1;
 
+#[cfg(target_arch = "riscv64")]
+pub type AddressSpace = address_space::Sv39AddressSpace;
+#[cfg(target_arch = "riscv32")]
+pub type AddressSpace = address_space::Sv32AddressSpace;
+
+#[cfg(target_arch = "riscv64")]
 pub use super::boot_vm::{KernelSection, root as get_root_table};
 
+#[cfg(target_arch = "riscv64")]
 pub unsafe fn init_identity(
     kernel_pa: usize,
     linked_kernel_pa: usize,
@@ -31,9 +54,26 @@ pub unsafe fn flush_tlb() {
 }
 
 /// 写 satp 并 flush TLB。这是本模块唯一职责：只碰寄存器，不懂地址空间生命周期。
-/// `root_ppn` 是根页表物理页号（`Sv39AddressSpace::root_ppn()` / `boot_vm::root_pa() >> 12`）。
-pub unsafe fn activate(root_ppn: usize) {
-    let satp = (SV39_MODE << 60) | root_ppn;
+/// `root_ppn` 是根页表物理页号；`asid` 是该地址空间的 ASID。
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn activate(root_ppn: usize, asid: u16) {
+    let satp = (SV39_MODE << 60) | ((asid as usize) << 44) | root_ppn;
+
+    unsafe {
+        core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+        core::arch::asm!(
+            "csrw satp, {satp}",
+            satp = in(reg) satp,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+    }
+}
+
+/// Write an Sv32 `satp` value and flush stale translations.
+#[cfg(target_arch = "riscv32")]
+pub unsafe fn activate(root_ppn: usize, asid: u16) {
+    let satp = (SV32_MODE << 31) | ((asid as usize) << 22) | root_ppn;
 
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
@@ -52,6 +92,7 @@ pub unsafe fn activate(root_ppn: usize) {
 /// image now uses high virtual addresses with low physical load addresses, so
 /// the target itself is already high-linked while the context pointer may
 /// still come from the low bootstrap stack.
+#[cfg(target_arch = "riscv64")]
 pub unsafe fn enter_high_half(low_entry: usize, low_context: usize, low_stack_top: usize) -> ! {
     let high_entry = boot_vm::high_alias_or_self(low_entry);
     let high_context = boot_vm::high_alias_or_self(low_context);

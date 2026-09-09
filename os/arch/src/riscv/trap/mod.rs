@@ -1,6 +1,10 @@
 use core::arch::global_asm;
 
-global_asm!(include_str!("trap.S"));
+#[cfg(target_arch = "riscv32")]
+global_asm!(include_str!("trap32.S"));
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(include_str!("trap64.S"));
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +83,11 @@ impl Scause {
     }
 
     fn is_interrupt(&self) -> bool {
-        (self.0 >> 63) != 0
+        (self.0 >> (usize::BITS - 1)) != 0
     }
 
     fn cause(&self) -> Trap {
-        let code = self.0 & !(1usize << 63);
+        let code = self.0 & !(1usize << (usize::BITS - 1));
 
         if self.is_interrupt() {
             Trap::Interrupt(Interrupt::from_code(code))

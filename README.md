@@ -34,11 +34,12 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 
 ```
 os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
-  boot/            成品镜像层（bin，按目标架构分目录）：riscv64/ ——
+  boot/            成品镜像层（bin，按目标架构分目录）：riscv/ ——
+                   RV64/Sv39 与 RV32/Sv32 profile 共用 RISC-V family，
                    _start → FDT discovery → MachineInfo → core::init() → Core Monitor，
-                   与 core 链接成 kaleidos.elf（单镜像，职责分离装载合一）
+                   与 core 链接成 kaleidos-<arch>（单镜像，职责分离装载合一）
   core/            Resource Core **library**（host-testable）：task/memory/object/handle/component/irq/timer/trace/inspector/machine/print
-  arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv64 / fake
+  arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
   components/      策略/服务组件 crates：scheduler_rr/ core_test/ logger/
   drivers/         设备驱动组件（预留，由 Machine Discovery 发现）
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）——workspace exclude，clippy 不检索
@@ -54,7 +55,7 @@ tools/         工具脚本（待建设）
 **架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（2026-08，全部 QEMU 端到端验证）：
 
 - **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）
-- **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + 重定位：R_RISCV_CALL/PCREL/R_RISCV_64）→ `registry`（生命周期状态机）→ monitor `load` 命令
+- **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机）→ monitor `load` 命令
 - **导出白名单**（EXPORT_SYMBOL 教学版，7 条 `kcore_*`）：组件只能调白名单，未导出符号 → 加载失败
 
 实机输出：
@@ -65,7 +66,7 @@ core> load kcomp_smoke
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，riscv64=SBI）。质量工具链：`make fmt` / `make clippy` / `make check`（host test 48 个）。详见 `docs/roadmap.md`（含缺口地图与下个里程碑 Sv39）。
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`。默认构建 RV64，也可用 `make kernel ARCH=rv32` 构建 RV32。
 
 ## 构建
 
@@ -76,7 +77,7 @@ git submodule update --init --recursive
 cargo check
 ```
 
-QEMU 运行命令待 M0 落地后补充。
+QEMU 运行：`make qemu`（默认 RV64），或 `make qemu ARCH=rv32`。
 
 ## 文档
 

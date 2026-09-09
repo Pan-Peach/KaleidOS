@@ -2,9 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "riscv64gc-unknown-none-elf";
+const RV32_TARGET: &str = "riscv32imac-unknown-none-elf";
+const RV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
 fn main() {
+    let target = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv32") {
+        RV32_TARGET
+    } else {
+        RV64_TARGET
+    };
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest_dir.parent().unwrap().parent().unwrap();
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
@@ -22,9 +28,9 @@ fn main() {
             "cargo:rerun-if-changed={}",
             component_dir.join("src/lib.rs").display()
         );
-        run_component_build(&component_dir, &target_dir);
-        let object =
-            find_object(&target_dir, name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        run_component_build(&component_dir, &target_dir, target);
+        let object = find_object(&target_dir, name, target)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
         let destination = out.join(format!("{name}.kcomp"));
         fs::copy(object, &destination).unwrap();
         objects.push((name, fs::read(destination).unwrap()));
@@ -40,14 +46,14 @@ fn main() {
     fs::copy(out.join("kcomp_min.kcomp"), out.join("smoke_min.kcomp")).unwrap();
 }
 
-fn run_component_build(component_dir: &Path, target_dir: &Path) {
+fn run_component_build(component_dir: &Path, target_dir: &Path, target: &str) {
     let status = Command::new("cargo")
         .current_dir(component_dir)
         .args([
             "rustc",
             "--release",
             "--target",
-            TARGET,
+            target,
             "--target-dir",
             target_dir.to_str().unwrap(),
             "--",
@@ -67,8 +73,8 @@ fn run_component_build(component_dir: &Path, target_dir: &Path) {
     );
 }
 
-fn find_object(target_dir: &Path, name: &str) -> Result<PathBuf, String> {
-    let deps = target_dir.join(TARGET).join("release").join("deps");
+fn find_object(target_dir: &Path, name: &str, target: &str) -> Result<PathBuf, String> {
+    let deps = target_dir.join(target).join("release").join("deps");
     let entries =
         fs::read_dir(&deps).map_err(|error| format!("read {}: {error}", deps.display()))?;
     for entry in entries {

@@ -1,7 +1,7 @@
 # RISC-V 上下文切换参考（Context Switch Reference）
 
 > 归档自开源调研（rCore / xv6 / RISC-V psABI / 特权规范），用于 `os/arch` 的
-> `Riscv64Context` 设计与 trap 入口汇编实现。所有出处为 git 固定 SHA，可直接溯源。
+> RV64 context 设计与 trap 入口汇编实现。所有出处为 git 固定 SHA，可直接溯源。
 
 ## 1. 核心结论
 
@@ -122,7 +122,7 @@ struct trapframe {
 /// 引入 U-mode/多地址空间时按 rCore 补 kernel_satp/kernel_sp/trap_handler。
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Riscv64Context {
+pub struct RiscvContext {
     x: [usize; 32],     // x0 占位恒 0；布局必须与 trap 入口 asm 偏移一致
     sstatus: usize,     // SPP/SIE/SPIE（+未来 FS/VS）
     sepc: usize,        // 恢复 PC（硬件 trap 时写入）

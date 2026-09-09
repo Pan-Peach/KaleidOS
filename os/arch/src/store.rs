@@ -1,7 +1,7 @@
 //! ComponentStore —— 组件仓库的传输层接口。
 //!
 //! 与 console backend 同层：ComponentStore 是 backend 接口，由具体 boot/profile
-//! 实现（fake / riscv64 各自给一个），Core 不直接依赖 QEMU 细节。
+//! 实现（fake / RISC-V 各自给一个），Core 不直接依赖 QEMU 细节。
 //! 未来 embedded init.kpkg / Persistent Store 也实现同一个 trait。
 
 use alloc::vec::Vec;

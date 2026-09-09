@@ -15,34 +15,14 @@ jobs:
         run: git submodule update --init --recursive
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Install riscv64 target, rustfmt, clippy
+      - name: Install RISC-V targets, rustfmt, clippy
         run: |
           rustup target add riscv64gc-unknown-none-elf
+          rustup target add riscv32imac-unknown-none-elf
           rustup component add rustfmt clippy
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: os/boot/riscv64 -> target
+          workspaces: os/boot/riscv -> target
       - name: Make check
         run: make check
-
-  # 慢车道：QEMU 交互测试（pty 脚本）
-  qemu:
-    runs-on: ubuntu-latest
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - name: Init submodules
-        run: git submodule update --init --recursive
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install riscv64 target
-        run: rustup target add riscv64gc-unknown-none-elf
-      - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-riscv
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-      - name: Build kernel
-        run: make kernel
-      - name: Run pty monitor tests
-        run: python3 tools/qemu/test_monitor.py

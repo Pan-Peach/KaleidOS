@@ -68,11 +68,13 @@ Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体�
 - 原子操作 / CPU 原语
 - CPU-local firmware-call boundary（如 RISC-V SBI）可以由对应 backend 提供；**UEFI runtime 调用属于 Boot/Firmware environment，不是 ISA 属性**，不归 x86 arch 所有
 
-目录：`os/arch`（统一 crate：`CpuArch`、`Console`、`SystemReset` backend trait + cfg 选择——host 编译用 fake 实现，交叉编译用 riscv64 实现）。后续 ISA：`x86_64` / `aarch64` / `loongarch64`（各自模块 + cfg 分支）。
+目录：`os/arch`（统一 crate：`CpuArch`、`Console`、`SystemReset` backend trait + cfg 选择——host 编译用 fake 实现，交叉编译用 `riscv` ISA family 实现）。后续 ISA：`x86_64` / `aarch64` / `loongarch64`（各自模块 + cfg 分支）。
 
 当前先拆出窄的 backend contract，不提前建立独立 Platform crate：RISC-V 的
-SBI 调用集中在 `riscv64/firmware.rs`，CPU/陷阱/上下文仍在 `riscv64/mod.rs`，
-同一 ISA 支持多个板卡时再由 boot profile 选择对应的 Console/SystemReset backend。
+SBI 调用集中在 `riscv/firmware.rs`，CPU 原语在 `riscv/cpu.rs`，陷阱和上下文
+分别位于 `riscv/trap/` 与 `riscv/context/`；XLEN-specific 汇编使用
+`trap64.S`/`switch64.S` 这类窄变体。同一 ISA 支持多个板卡时再由 boot profile
+选择对应的 Console/SystemReset backend。
 
 ### Machine Discovery —— 机器发现（不设 platform 层）
 
@@ -113,7 +115,7 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 依赖方向（当前模型，精确表述）：
 
 ```text
-BUILD TIME：os/boot/riscv64（bin）──► os/core（library）+ os/arch（backend traits）＋ fdt
+BUILD TIME：os/boot/riscv（bin）──► os/core（library）+ os/arch（backend traits）＋ fdt
                      │
                      ▼ (链接)
               kaleidos.elf（单镜像）
@@ -160,7 +162,7 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 
 这里的 AddressSpace 只表示 Core 管理的资源真相；当前 M0.5 的启动页表是
 Arch 的一次性机制，不是运行期 AddressSpace。未来运行期地址空间的语义映射由
-Core 独占提交，Sv39 页表只是 Arch backend 维护的硬件投影。Arch 可以保存这份
+Core 独占提交，Sv39/Sv32 页表只是 Arch backend 维护的硬件投影。Arch 可以保存这份
 投影，但不能绕过 Core 独立改变映射、所有权或生命周期。
 
 ### 内存模型：语义与机制分离
@@ -187,8 +189,8 @@ Core 面向 `MemoryDomain`、region、ownership 和 permission；它不应该知
 等 protection backend。NoMMU 不是一种特殊的页表，也不承诺具备 page fault、
 COW 或任意虚拟地址空间等 MMU 语义。
 
-当前只实现 RISC-V Sv39，但 Sv39 只是第一个 address-translation backend，
-不是 KaleidOS 的内存模型。Core 公共路径使用 typed handle、virtual region、
+当前 RISC-V 已提供 RV64/Sv39 与 RV32/Sv32 backend，但它们只是 address-translation
+实现，不是 KaleidOS 的内存模型。Core 公共路径使用 typed handle、virtual region、
 permission 等抽象；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
 arch/backend 内部。具体映射、撤销和地址空间激活接口随实现阶段演进，
 不在这里提前固定完整 API。

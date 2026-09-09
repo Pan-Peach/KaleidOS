@@ -1,7 +1,4 @@
-#![no_std]
-#![no_main]
-
-use arch::riscv64::boot_vm::{
+use arch::riscv::boot_vm::{
     KernelSection, KERNEL_DATA_FLAGS, KERNEL_RODATA_FLAGS, KERNEL_TEXT_FLAGS,
 };
 use arch::CpuArch;
@@ -13,9 +10,10 @@ use kernel::machine::{
     CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
 };
 
+#[path = "console.rs"]
 mod console;
 
-global_asm!(include_str!("entry.S"));
+global_asm!(include_str!("entry64.S"));
 
 // 链接脚本符号：本文档镜像（bootstrap + core 单一 kaleidos.elf）的物理范围。
 // 取地址（不是值）：这段是 Core 自己，启动后永久 Reserved。
@@ -51,11 +49,11 @@ fn linker_addr(symbol: *const u8) -> usize {
 }
 
 fn print_linker_layout() {
-    let image_start = arch::riscv64::boot_vm::physical_address_of(linker_addr(
-        core::ptr::addr_of!(__bootstrap_start),
-    ));
+    let image_start = arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        __bootstrap_start
+    )));
     let text_start_vma = linker_addr(core::ptr::addr_of!(__text_vma_start));
-    let low_end = arch::riscv64::boot_vm::physical_address_of(text_start_vma);
+    let low_end = arch::riscv::boot_vm::physical_address_of(text_start_vma);
     kernel::log!(
         "layout",
         "early bootstrap VMA/LMA: {:#x}-{:#x}",
@@ -67,20 +65,20 @@ fn print_linker_layout() {
         ".text VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
         text_start_vma,
         linker_addr(core::ptr::addr_of!(__text_vma_end)),
-        arch::riscv64::boot_vm::physical_address_of(text_start_vma),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
-            __text_vma_end
-        ),))
+        arch::riscv::boot_vm::physical_address_of(text_start_vma),
+        arch::riscv::boot_vm::physical_address_of(
+            linker_addr(core::ptr::addr_of!(__text_vma_end),)
+        )
     );
     kernel::log!(
         "layout",
         ".rodata VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
         linker_addr(core::ptr::addr_of!(__rodata_vma_start)),
         linker_addr(core::ptr::addr_of!(__rodata_vma_end)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __rodata_vma_start
         ),)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __rodata_vma_end
         ),))
     );
@@ -89,36 +87,32 @@ fn print_linker_layout() {
         ".initpkg VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
         linker_addr(core::ptr::addr_of!(__initpkg_start)),
         linker_addr(core::ptr::addr_of!(__initpkg_end)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __initpkg_start
         ),)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
-            __initpkg_end
-        ),))
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(__initpkg_end),))
     );
     kernel::log!(
         "layout",
         ".data VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
         linker_addr(core::ptr::addr_of!(__data_vma_start)),
         linker_addr(core::ptr::addr_of!(__data_vma_end)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __data_vma_start
         ),)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
-            __data_vma_end
-        ),))
+        arch::riscv::boot_vm::physical_address_of(
+            linker_addr(core::ptr::addr_of!(__data_vma_end),)
+        )
     );
     kernel::log!(
         "layout",
         ".bss VMA {:#x}-{:#x}, LMA {:#x}-{:#x}",
         linker_addr(core::ptr::addr_of!(__bss_vma_start)),
         linker_addr(core::ptr::addr_of!(__bss_vma_end)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __bss_vma_start
         ),)),
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
-            __bss_vma_end
-        ),))
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(__bss_vma_end),))
     );
     kernel::log!(
         "layout",
@@ -126,7 +120,7 @@ fn print_linker_layout() {
         linker_addr(core::ptr::addr_of!(__bootstrap_start)),
         linker_addr(core::ptr::addr_of!(__bootstrap_end)),
         image_start,
-        arch::riscv64::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
+        arch::riscv::boot_vm::physical_address_of(linker_addr(core::ptr::addr_of!(
             __bootstrap_end
         ),))
     );
@@ -214,10 +208,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 panic!("Sv39 early map failed: no RAM region");
             }
 
-            let linked_image_start = arch::riscv64::boot_vm::physical_address_of(linker_addr(
+            let linked_image_start = arch::riscv::boot_vm::physical_address_of(linker_addr(
                 core::ptr::addr_of!(__bootstrap_start),
             ));
-            let linked_image_end = arch::riscv64::boot_vm::physical_address_of(linker_addr(
+            let linked_image_end = arch::riscv::boot_vm::physical_address_of(linker_addr(
                 core::ptr::addr_of!(__bootstrap_end),
             ));
             let image_size = linked_image_end
@@ -270,7 +264,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
             ];
 
             match unsafe {
-                arch::riscv64::mmu::init_identity(
+                arch::riscv::mmu::init_identity(
                     kernel_pa,
                     linked_image_start,
                     image_size,
@@ -300,8 +294,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
             let context_ptr = &context as *const BootContext as usize;
             kernel::log!("bootstrap", "Sv39 dual map OK; entering high-half");
             unsafe {
-                arch::riscv64::mmu::activate(arch::riscv64::boot_vm::root_pa() >> 12);
-                arch::riscv64::mmu::enter_high_half(
+                arch::riscv::mmu::activate(arch::riscv::boot_vm::root_pa() >> 12, 0);
+                arch::riscv::mmu::enter_high_half(
                     bootstrap_high as *const () as usize,
                     context_ptr,
                     core::ptr::addr_of!(high_boot_stack_top) as usize,

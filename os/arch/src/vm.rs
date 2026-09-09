@@ -20,7 +20,7 @@ pub struct PhysicalRange {
 }
 
 // 逻辑权限：正交的位集合（arch 无关）。默认为空 = 无权限。
-// 到具体 arch 的编码（如 Sv39 的 R/W/X/U）由各后端在 `From` 里翻译。
+// 到具体 arch 的编码（如 Sv39/Sv32 的 R/W/X/U）由各后端在 `From` 里翻译。
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
     pub struct MappingPermission: u8 {
@@ -35,12 +35,12 @@ bitflags! {
 ///
 /// 这就是 buddy allocator（`core::memory::alloc_region`）的窄接口：
 /// 因为 `os/arch` 不能依赖 `os/core`，Core 在初始化时把这个函数地址塞进
-/// `Sv39PageTable`。v1 identity 阶段返回的物理地址可直接当虚拟地址解引用。
+/// 当前 RISC-V 页表 backend。v1 identity 阶段返回的物理地址可直接当虚拟地址解引用。
 pub type PageAlloc = fn() -> Result<usize, ()>;
 
 /// Contract `KernelAddressSpace` drives. Methods take raw ranges/permissions;
-/// Core validates & commits around the call. You fill in the `Sv39AddressSpace`
-/// implementation.
+/// Core validates & commits around the call. The active architecture backend
+/// supplies the concrete implementation.
 pub trait AddressSpaceBackend {
     type Error;
 

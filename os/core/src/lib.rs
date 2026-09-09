@@ -30,7 +30,11 @@ pub mod timer;
 pub mod trace;
 
 // 裸机目标才接管全局分配器；host test（std 环境）用 std 默认分配器。
-#[cfg(all(not(test), target_os = "none", target_arch = "riscv64"))]
+#[cfg(all(
+    not(test),
+    target_os = "none",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
 #[global_allocator]
 static ALLOCATOR: memory::KernelAllocator = memory::KernelAllocator;
 

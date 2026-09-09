@@ -8,7 +8,7 @@
 //! - `print`：`printk!` 宏的底层（接受 fmt::Arguments）
 //!
 //! host 测试：Fake console 写 stdout，printk! 自然可见。
-//! 裸机：Riscv64 console 走 SBI。
+//! 裸机：当前 RISC-V console 走 SBI。
 //!
 //! **注意**：panic 路径不走本模块 —— panic 可能发生在锁/堆损坏时，
 //! 由 bootstrap 的静态紧急 console 直连输出（见 bootstrap console.rs）。

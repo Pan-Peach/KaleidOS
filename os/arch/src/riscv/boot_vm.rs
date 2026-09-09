@@ -9,7 +9,7 @@
 //! high-half alias alive.  A later final-kernel mapping (`KernelAddressSpace`)
 //! will replace this root after memory discovery and allocation are available.
 
-use super::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
+use super::mmu::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
 
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
@@ -56,8 +56,7 @@ pub struct KernelSection {
 static mut BOOT_ROOT: PageTable = PageTable::empty();
 static mut KERNEL_L1: PageTable = PageTable::empty();
 const MAX_IDENTITY_L1: usize = 4;
-static mut IDENTITY_L1S: [PageTable; MAX_IDENTITY_L1] =
-    [PageTable::empty(); MAX_IDENTITY_L1];
+static mut IDENTITY_L1S: [PageTable; MAX_IDENTITY_L1] = [PageTable::empty(); MAX_IDENTITY_L1];
 
 /// Pool of level-0 tables used to map the kernel image at 4 KiB granularity.
 /// The early boot path has no allocator, so it carves these from a static

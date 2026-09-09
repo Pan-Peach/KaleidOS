@@ -45,7 +45,7 @@ pub struct Mapping {
 /// Core 把已批准的映射翻译成 arch backend 的原始参数形式。
 /// 现在 `Mapping` 字段本身就是 arch 类型，所以直接透传即可。
 impl Mapping {
-    pub(crate) fn to_backend(&self) -> (VirtualRange, PhysicalRange, MappingPermission) {
+    pub(crate) fn backend_parts(self) -> (VirtualRange, PhysicalRange, MappingPermission) {
         (self.virtual_range, self.physical_range, self.permission)
     }
 }
@@ -163,7 +163,7 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
     /// 后端写 PTE 失败即整体失败，不 record 到 `mappings`（后端内部负责回滚）。
     pub fn map(&mut self, mapping: Mapping) -> Result<(), MapError> {
         self.validate(&mapping)?;
-        let (va, pa, perm) = mapping.to_backend();
+        let (va, pa, perm) = mapping.backend_parts();
         self.backend
             .map(va, pa, perm)
             .map_err(|_| MapError::BackendFailed)?;

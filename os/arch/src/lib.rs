@@ -17,11 +17,11 @@ extern crate std;
 pub mod store;
 pub mod vm;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub mod fake;
 
-#[cfg(target_arch = "riscv64")]
-pub mod riscv64;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub mod riscv;
 
 pub use store::{ComponentStore, StoreEntry, StoreError};
 
@@ -32,9 +32,14 @@ pub use store::{ComponentStore, StoreEntry, StoreError};
 /// auipc+jalr pair only covers ±2 GiB).  Host builds have no high-half split
 /// and use the address as-is.
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::boot_vm::physical_address_of;
+pub use riscv::boot_vm::physical_address_of;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv32")]
+pub fn physical_address_of(address: usize) -> usize {
+    address
+}
+
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub fn physical_address_of(address: usize) -> usize {
     address
 }
@@ -69,28 +74,28 @@ pub trait SystemReset {
     fn system_reset(reset_type: ResetType) -> !;
 }
 
-/// 当前编译目标的 CPU backend（host → Fake，riscv64 → Riscv64）。
-#[cfg(target_arch = "riscv64")]
-pub type CpuImpl = riscv64::Riscv64;
+/// 当前编译目标的 CPU backend（host → Fake，RISC-V → Riscv）。
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type CpuImpl = riscv::Riscv;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub type CpuImpl = fake::Fake;
 
 /// 当前编译目标的 console backend。
 ///
 /// 现在与 CPU backend 共享具体类型；当同一 ISA 支持多个 platform 时，
 /// 这里可以改成由 boot profile 选择，而不改变 Core 的 Console trait。
-#[cfg(target_arch = "riscv64")]
-pub type ConsoleImpl = riscv64::Riscv64;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type ConsoleImpl = riscv::Riscv;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub type ConsoleImpl = fake::Fake;
 
 /// 当前编译目标的 reset backend。
-#[cfg(target_arch = "riscv64")]
-pub type ResetImpl = riscv64::Riscv64;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type ResetImpl = riscv::Riscv;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub type ResetImpl = fake::Fake;
 
 /// Core 使用的任务上下文类型；Core 不关心具体 ISA 的寄存器布局。

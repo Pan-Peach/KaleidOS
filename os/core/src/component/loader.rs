@@ -1,10 +1,9 @@
 //! 组件加载器（Linux insmod 的最小版）：解析 ELF ET_REL → 放段 → 找入口符号。
 //!
-//! 第一版约定（诚实边界）：
-//! - 组件必须无重定位需求（kcomp 不引用未定义符号/内核函数）；
-//!   遇到重定位段（SHT_RELA/SHT_REL）直接拒绝（UnsupportedRelocation）
-//! - 只放段 .text（第一个 PROGBITS），假设单代码段（教学阶段简化）
-//! - 重定位/多段/内核符号表都是第二版（组件调用 printk 时再做）
+//! 当前约定（诚实边界）：
+//! - 接受 RV32/ELF32 与 RV64/ELF64 的 ET_REL 组件；
+//! - 只放置 ALLOC 内容段，按段顺序组成一个连续组件映像；
+//! - 支持组件当前实际产生的 RISC-V CALL/PCREL 与 32/64-bit data relocation。
 
 use crate::memory;
 use alloc::vec::Vec;
@@ -23,13 +22,16 @@ pub enum LoaderError {
     OutOfMemory,
 }
 
-/* 重定位：只支持组件实际产生的最小集（R_RISCV_CALL 对 + 忽略 RELAX），
+/* 重定位：只支持组件实际产生的最小集（CALL/PCREL + 32/64-bit data），
 其余类型诚实拒绝（UnsupportedRelocation），待未来扩展。 */
+const R_RISCV_32: u32 = 1;
 const R_RISCV_64: u32 = 2;
 const R_RISCV_CALL: u32 = 18;
 const R_RISCV_CALL_PLT: u32 = 19;
 const R_RISCV_PCREL_HI20: u32 = 23;
 const R_RISCV_PCREL_LO12_I: u32 = 24;
+const R_RISCV_HI20: u32 = 26;
+const R_RISCV_LO12_I: u32 = 27;
 const R_RISCV_RELAX: u32 = 51;
 const SHN_UNDEF: usize = 0;
 
@@ -58,65 +60,190 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
 
-fn parse_elf_header(blob: &[u8]) -> Result<(usize, usize), LoaderError> {
-    if blob.len() < 64 || &blob[..4] != b"\x7fELF" {
+#[derive(Clone, Copy)]
+enum ElfClass {
+    Bits32,
+    Bits64,
+}
+
+#[derive(Clone, Copy)]
+struct ElfHeader {
+    class: ElfClass,
+    section_offset: usize,
+    section_size: usize,
+    section_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Section {
+    ty: u32,
+    offset: usize,
+    size: usize,
+    link: usize,
+    flags: u64,
+    info: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Symbol {
+    name: usize,
+    shndx: usize,
+    value: u64,
+}
+
+fn parse_elf_header(blob: &[u8]) -> Result<ElfHeader, LoaderError> {
+    if blob.len() < 20 || &blob[..4] != b"\x7fELF" {
         return Err(LoaderError::BadMagic);
     }
-    if blob[4] != 2 || blob[5] != 1 {
+    let class = match blob[4] {
+        1 => ElfClass::Bits32,
+        2 => ElfClass::Bits64,
+        _ => return Err(LoaderError::UnsupportedFormat),
+    };
+    if blob[5] != 1 {
         return Err(LoaderError::UnsupportedFormat);
     }
     if u16_at(blob, 16) != 1 {
         return Err(LoaderError::NotRelocatable);
     }
-    let e_shoff = u64_at(blob, 40) as usize;
-    let e_shnum = u16_at(blob, 60) as usize;
-    Ok((e_shoff, e_shnum))
+
+    let (header_size, section_offset, section_size, section_count) = match class {
+        ElfClass::Bits32 => (
+            52,
+            u32_at(blob, 32) as usize,
+            u16_at(blob, 46) as usize,
+            u16_at(blob, 48) as usize,
+        ),
+        ElfClass::Bits64 => (
+            64,
+            u64_at(blob, 40) as usize,
+            u16_at(blob, 58) as usize,
+            u16_at(blob, 60) as usize,
+        ),
+    };
+    if blob.len() < header_size
+        || section_size
+            != match class {
+                ElfClass::Bits32 => 40,
+                ElfClass::Bits64 => 64,
+            }
+    {
+        return Err(LoaderError::UnsupportedFormat);
+    }
+    let table_size = section_size
+        .checked_mul(section_count)
+        .ok_or(LoaderError::UnsupportedFormat)?;
+    section_offset
+        .checked_add(table_size)
+        .filter(|&end| end <= blob.len())
+        .ok_or(LoaderError::UnsupportedFormat)?;
+    Ok(ElfHeader {
+        class,
+        section_offset,
+        section_size,
+        section_count,
+    })
+}
+
+fn parse_sections(blob: &[u8], header: ElfHeader) -> Result<Vec<Section>, LoaderError> {
+    let mut sections = Vec::new();
+    for i in 0..header.section_count {
+        let off = header
+            .section_offset
+            .checked_add(
+                i.checked_mul(header.section_size)
+                    .ok_or(LoaderError::UnsupportedFormat)?,
+            )
+            .ok_or(LoaderError::UnsupportedFormat)?;
+        let sh = &blob[off..off + header.section_size];
+        let section = match header.class {
+            ElfClass::Bits32 => Section {
+                ty: u32_at(sh, 4),
+                offset: u32_at(sh, 16) as usize,
+                size: u32_at(sh, 20) as usize,
+                link: u32_at(sh, 24) as usize,
+                flags: u32_at(sh, 8) as u64,
+                info: u32_at(sh, 28) as usize,
+            },
+            ElfClass::Bits64 => Section {
+                ty: u32_at(sh, 4),
+                offset: u64_at(sh, 24) as usize,
+                size: u64_at(sh, 32) as usize,
+                link: u32_at(sh, 40) as usize,
+                flags: u64_at(sh, 8),
+                info: u32_at(sh, 44) as usize,
+            },
+        };
+        section
+            .offset
+            .checked_add(section.size)
+            .filter(|&end| end <= blob.len())
+            .ok_or(LoaderError::UnsupportedFormat)?;
+        sections.push(section);
+    }
+    Ok(sections)
+}
+
+fn symbol_at(blob: &[u8], offset: usize, class: ElfClass) -> Result<Symbol, LoaderError> {
+    match class {
+        ElfClass::Bits32 => {
+            let sym = blob
+                .get(offset..offset + 16)
+                .ok_or(LoaderError::UnsupportedFormat)?;
+            Ok(Symbol {
+                name: u32_at(sym, 0) as usize,
+                shndx: u16_at(sym, 14) as usize,
+                value: u32_at(sym, 4) as u64,
+            })
+        }
+        ElfClass::Bits64 => {
+            let sym = blob
+                .get(offset..offset + 24)
+                .ok_or(LoaderError::UnsupportedFormat)?;
+            Ok(Symbol {
+                name: u32_at(sym, 0) as usize,
+                shndx: u16_at(sym, 6) as usize,
+                value: u64_at(sym, 8),
+            })
+        }
+    }
 }
 
 /// 解析 ET_REL + 放段 + 定位入口（不调用）。
 /// `expected_machine` 来自 arch（ELF_MACHINE），loader 本身机器无关。
 pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedComponent, LoaderError> {
-    let (e_shoff, e_shnum) = parse_elf_header(blob)?;
-    if e_shoff + e_shnum * 64 > blob.len() {
-        return Err(LoaderError::UnsupportedFormat);
-    }
+    let header = parse_elf_header(blob)?;
 
     let machine = u16_at(blob, 18);
     if machine != expected_machine {
         return Err(LoaderError::MachineMismatch);
     }
 
-    // 段表收集：(type, offset, size, link, flags, info)
-    let mut sections: Vec<(u32, usize, usize, usize, u64, usize)> = Vec::new();
-    for i in 0..e_shnum {
-        let sh = &blob[e_shoff + i * 64..e_shoff + i * 64 + 64];
-        let ty = u32_at(sh, 4);
-        let off = u64_at(sh, 24) as usize;
-        let size = u64_at(sh, 32) as usize;
-        let link = u32_at(sh, 40) as usize;
-        let flags = u64_at(sh, 8);
-        let info = u32_at(sh, 44) as usize;
-        if off + size > blob.len() {
-            return Err(LoaderError::UnsupportedFormat);
-        }
-        sections.push((ty, off, size, link, flags, info));
-    }
+    let sections = parse_sections(blob, header)?;
 
     // 重定位段（SHT_RELA=4）：收集 (目标段, off, size, symtab_off, symtab_size, strtab_off)。
     // SHT_REL (9) 不支持（rustc 输出 RELA；兼容检查保持诚实拒绝）。
     let mut relas: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
     for s in &sections {
-        if s.0 == 4 {
-            if s.3 >= e_shnum || s.5 >= e_shnum {
+        if s.ty == 4 {
+            if s.link >= header.section_count || s.info >= header.section_count {
                 return Err(LoaderError::UnsupportedFormat);
             }
-            let (_, sym_off, sym_size, sym_link, _, _) = sections[s.3];
-            if sym_link >= e_shnum {
+            let symtab = sections[s.link];
+            let sym_link = symtab.link;
+            if sym_link >= header.section_count {
                 return Err(LoaderError::UnsupportedFormat);
             }
-            let (_, str_off, _, _, _, _) = sections[sym_link];
-            relas.push((s.5, s.1, s.2, sym_off, sym_size, str_off));
-        } else if s.0 == 9 {
+            let strtab = sections[sym_link];
+            relas.push((
+                s.info,
+                s.offset,
+                s.size,
+                symtab.offset,
+                symtab.size,
+                strtab.offset,
+            ));
+        } else if s.ty == 9 {
             return Err(LoaderError::UnsupportedRelocation);
         }
     }
@@ -126,8 +253,8 @@ pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedCompon
     let place_segs: Vec<(usize, usize, usize)> = sections
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.0 == 1 && (s.4 & 0x2) == 0x2)
-        .map(|(i, s)| (i, s.1, s.2))
+        .filter(|(_, s)| s.ty == 1 && (s.flags & 0x2) == 0x2)
+        .map(|(i, s)| (i, s.offset, s.size))
         .collect();
     if place_segs.is_empty() {
         return Err(LoaderError::NoTextSection);
@@ -137,39 +264,53 @@ pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedCompon
     let mut put = 0usize;
     let mut seg_place: Vec<(usize, usize)> = Vec::new();
     for &(idx, _, size) in &place_segs {
-        put = (put + 3) & !3;
+        put = put.checked_add(3).ok_or(LoaderError::UnsupportedFormat)? & !3;
         seg_place.push((idx, put));
-        put += size;
+        put = put
+            .checked_add(size)
+            .ok_or(LoaderError::UnsupportedFormat)?;
     }
     let code_size = put;
 
     // 查找 2：符号表（SYMTAB）+ 它的字符串表（sh_link）
-    let (_, sym_off, sym_size, sym_link, _, _) = *sections
+    let symtab_index = sections
         .iter()
-        .find(|s| s.0 == 2)
+        .position(|s| s.ty == 2)
         .ok_or(LoaderError::NoEntrySymbol)?;
-    if sym_link >= e_shnum {
+    let symtab = sections[symtab_index];
+    if symtab.link >= header.section_count {
         return Err(LoaderError::UnsupportedFormat);
     }
-    let (_, str_off, _, _, _, _) = sections[sym_link];
+    let strtab = sections[symtab.link];
+    let symbol_size = match header.class {
+        ElfClass::Bits32 => 16,
+        ElfClass::Bits64 => 24,
+    };
 
     // 查找 3：kcomp_init（FUNC；st_value + st_shndx 段内偏移）
     let mut entry_off: Option<(usize, usize)> = None;
-    for j in 0..sym_size / 24 {
-        let sym = &blob[sym_off + j * 24..sym_off + j * 24 + 24];
-        if sym[4] & 0x0f != 2 {
+    for j in 0..symtab.size / symbol_size {
+        let symbol = symbol_at(blob, symtab.offset + j * symbol_size, header.class)?;
+        let sym = &blob[symtab.offset + j * symbol_size..symtab.offset + (j + 1) * symbol_size];
+        if sym[match header.class {
+            ElfClass::Bits32 => 12,
+            ElfClass::Bits64 => 4,
+        }] & 0x0f
+            != 2
+        {
             continue;
         }
-        let name_off = u32_at(sym, 0) as usize;
-        let name_start = str_off + name_off;
-        let name_end = blob[name_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| name_start + p)
-            .ok_or(LoaderError::UnsupportedFormat)?;
-        if &blob[name_start..name_end] == b"kcomp_init" {
-            let seg_idx = u16_at(sym, 6) as usize;
-            entry_off = Some((seg_idx, u64_at(sym, 8) as usize));
+        let name = cstr_at(
+            blob,
+            strtab
+                .offset
+                .checked_add(symbol.name)
+                .ok_or(LoaderError::UnsupportedFormat)?,
+        )?;
+        if name == b"kcomp_init" {
+            let value =
+                usize::try_from(symbol.value).map_err(|_| LoaderError::UnsupportedFormat)?;
+            entry_off = Some((symbol.shndx, value));
             break;
         }
     }
@@ -184,13 +325,15 @@ pub fn load_component(blob: &[u8], expected_machine: u16) -> Result<LoadedCompon
     let image_memory = memory::alloc_region(code_size).map_err(|_| LoaderError::OutOfMemory)?;
     let base = image_memory.region().base;
     for &(idx, put) in &seg_place {
-        let (_, off, size, _, _, _) = sections[idx];
+        let section = sections[idx];
+        let off = section.offset;
+        let size = section.size;
         let dst = unsafe { core::slice::from_raw_parts_mut((base + put) as *mut u8, size) };
         dst.copy_from_slice(&blob[off..off + size]);
     }
 
     // 放段完成后应用重定位：UNDEF 符号查导出表（白名单），组件内符号按放置定位。
-    apply_relocations(blob, base, &seg_place, &relas)?;
+    apply_relocations(blob, base, &seg_place, &relas, header.class)?;
 
     Ok(LoadedComponent {
         base,
@@ -227,32 +370,64 @@ fn apply_relocations(
     base: usize,
     seg_place: &[(usize, usize)],
     relas: &[(usize, usize, usize, usize, usize, usize)],
+    class: ElfClass,
 ) -> Result<(), LoaderError> {
+    let rela_size = match class {
+        ElfClass::Bits32 => 12,
+        ElfClass::Bits64 => 24,
+    };
+    let symbol_size = match class {
+        ElfClass::Bits32 => 16,
+        ElfClass::Bits64 => 24,
+    };
     // PCREL_HI20 缓存：(target_shndx, r_in_seg) → (S + A - P_hi)，供配套 LO12_I 查询。
     let mut hi_cache: Vec<((usize, usize), i64)> = Vec::new();
     for &(target, r_off, r_size, sym_off, sym_size, str_off) in relas {
         let Some(&(_, target_put)) = seg_place.iter().find(|(i, _)| *i == target) else {
             return Err(LoaderError::UnsupportedRelocation);
         };
-        for j in 0..r_size / 24 {
-            let e = &blob[r_off + j * 24..r_off + j * 24 + 24];
-            let r_in_seg = u64_at(e, 0) as usize;
-            let r_info = u64_at(e, 8);
-            let r_addend = u64_at(e, 16) as i64;
-            let sym_idx = (r_info >> 32) as usize;
-            let rtype = (r_info & 0xffff_ffff) as u32;
+        if r_size % rela_size != 0 || sym_size % symbol_size != 0 {
+            return Err(LoaderError::UnsupportedFormat);
+        }
+        for j in 0..r_size / rela_size {
+            let e = &blob[r_off + j * rela_size..r_off + (j + 1) * rela_size];
+            let (r_in_seg, sym_idx, rtype, r_addend) = match class {
+                ElfClass::Bits32 => {
+                    let r_info = u32_at(e, 4);
+                    (
+                        u32_at(e, 0) as usize,
+                        (r_info >> 8) as usize,
+                        r_info & 0xff,
+                        u32_at(e, 8) as i32 as i64,
+                    )
+                }
+                ElfClass::Bits64 => {
+                    let r_info = u64_at(e, 8);
+                    (
+                        u64_at(e, 0) as usize,
+                        (r_info >> 32) as usize,
+                        (r_info & 0xffff_ffff) as u32,
+                        u64_at(e, 16) as i64,
+                    )
+                }
+            };
             if rtype == R_RISCV_RELAX || rtype == 0 {
                 continue;
             }
-            if sym_idx >= sym_size / 24 {
+            if sym_idx >= sym_size / symbol_size {
                 return Err(LoaderError::UnsupportedFormat);
             }
-            let sym = &blob[sym_off + sym_idx * 24..sym_off + sym_idx * 24 + 24];
-            let st_shndx = u16_at(sym, 6) as usize;
-            let st_value = u64_at(sym, 8) as i64;
+            let symbol = symbol_at(blob, sym_off + sym_idx * symbol_size, class)?;
+            let st_shndx = symbol.shndx;
+            let st_value = symbol.value as i64;
 
             let s_addr: i64 = if st_shndx == SHN_UNDEF {
-                let name = cstr_at(blob, str_off + u32_at(sym, 0) as usize)?;
+                let name = cstr_at(
+                    blob,
+                    str_off
+                        .checked_add(symbol.name)
+                        .ok_or(LoaderError::UnsupportedFormat)?,
+                )?;
                 let addr =
                     crate::component::export::resolve(name).ok_or(LoaderError::UnresolvedSymbol)?;
                 // Early boot keeps the RAM identity-mapped, so the low alias
@@ -297,6 +472,15 @@ fn apply_relocations(
                         (loc as *mut u32).write(auipc);
                     }
                 }
+                R_RISCV_HI20 => {
+                    let v = s_addr + r_addend;
+                    let imm20 = ((v + 0x800) >> 12) & 0xFFFFF;
+                    let mut lui = unsafe { (loc as *mut u32).read() };
+                    lui = (imm20 as u32) << 12 | (lui & 0xF80) | 0x37;
+                    unsafe {
+                        (loc as *mut u32).write(lui);
+                    }
+                }
                 R_RISCV_PCREL_LO12_I => {
                     let v_hi = hi_cache
                         .iter()
@@ -313,7 +497,28 @@ fn apply_relocations(
                         (loc as *mut u32).write(insn);
                     }
                 }
+                R_RISCV_LO12_I => {
+                    let v = s_addr + r_addend;
+                    let imm12 = (v & 0xFFF) as u32;
+                    let mut insn = unsafe { (loc as *mut u32).read() };
+                    insn = (imm12 << 20) | (insn & 0x000F_FFFF);
+                    unsafe {
+                        (loc as *mut u32).write(insn);
+                    }
+                }
+                R_RISCV_32 => {
+                    if !matches!(class, ElfClass::Bits32) {
+                        return Err(LoaderError::UnsupportedRelocation);
+                    }
+                    let v = s_addr + r_addend;
+                    unsafe {
+                        (loc as *mut u32).write(v as u32);
+                    }
+                }
                 R_RISCV_64 => {
+                    if !matches!(class, ElfClass::Bits64) {
+                        return Err(LoaderError::UnsupportedRelocation);
+                    }
                     let v = s_addr + r_addend;
                     unsafe {
                         (loc as *mut u64).write(v as u64);
@@ -336,10 +541,10 @@ mod tests {
 
     #[test]
     fn parses_header_of_core_test() {
-        let (e_shoff, e_shnum) = parse_elf_header(CORETEST_KCOMP).expect("parse header");
+        let header = parse_elf_header(CORETEST_KCOMP).expect("parse header");
         // 布局随编译器/组件内容变化，只锚定 sanity（非零节区偏移 + 足量节区）。
-        assert!(e_shoff > 0);
-        assert!(e_shnum >= 4);
+        assert!(header.section_offset > 0);
+        assert!(header.section_count >= 4);
     }
 
     #[test]
