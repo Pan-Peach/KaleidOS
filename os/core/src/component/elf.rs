@@ -938,4 +938,33 @@ mod tests {
             }
         }
     }
+
+    proptest! {
+        /// 解析成功 ≠ 安全：继续把全部访问器 API 扫一遍，任何一步不得 panic
+        /// （parse 之外的 relocations/symbol/symbol_name/section_data 也在 fuzz 范围）。
+        #[test]
+        fn parsed_object_apis_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let blob = leak(bytes);
+            let Ok(object) = ElfObject::parse(blob) else {
+                return Ok(());
+            };
+            let _ = object.class();
+            let _ = object.machine();
+            let _ = object.sections();
+            for index in 0..object.sections().len() {
+                let _ = object.section(index);
+                let _ = object.section_data(index);
+            }
+            if let Ok(symtab) = object.symbol_table_index() {
+                if let Ok(count) = object.symbol_count(symtab) {
+                    for index in 0..count {
+                        if let Ok(symbol) = object.symbol(symtab, index) {
+                            let _ = object.symbol_name(symtab, symbol);
+                        }
+                    }
+                }
+                let _ = object.relocations();
+            }
+        }
+    }
 }

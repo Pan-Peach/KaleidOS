@@ -485,6 +485,7 @@ mod tests {
         Unmap {
             base: usize,
             pages: usize,
+            backend_fail: bool,
         },
     }
 
@@ -515,7 +516,11 @@ mod tests {
                     backend_fail: fail,
                 }
             ),
-            (aligned_base(), pages).prop_map(|(base, pages)| OpKind::Unmap { base, pages }),
+            (aligned_base(), pages, any::<bool>()).prop_map(|(base, pages, fail)| OpKind::Unmap {
+                base,
+                pages,
+                backend_fail: fail,
+            }),
         ]
     }
 
@@ -572,11 +577,16 @@ mod tests {
                     }
                 }
             }
-            OpKind::Unmap { base, pages } => {
+            OpKind::Unmap {
+                base,
+                pages,
+                backend_fail,
+            } => {
                 let range = VirtualRange {
                     base,
                     size: size_of(pages),
                 };
+                space.backend.fail_unmap = backend_fail;
                 let result = space.unmap(&range);
                 match result {
                     Ok(()) => {
@@ -626,6 +636,7 @@ mod tests {
             OpKind::Unmap {
                 base: PAGE_SIZE,
                 pages: 2,
+                backend_fail: false,
             },
         );
         assert_eq!(space.mappings().len(), 0);
