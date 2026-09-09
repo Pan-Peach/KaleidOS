@@ -56,6 +56,8 @@ pub enum MapError {
     LengthMismatch,
     Unaligned,
     Overlap,
+    AddressOverflow,
+    NotMapped,
     BackendFailed,
 }
 
@@ -72,12 +74,12 @@ fn ranges_overlap(a: &VirtualRange, b: &VirtualRange) -> bool {
 /// 持有真相（state / owner / mapping 列表）与一个不透明的架构后端 `B`。
 /// 映射流程：Core `validate` -> backend 写 PTE -> Core `commit` 记录真相。
 pub struct KernelAddressSpace<B: AddressSpaceBackend> {
-    pub id: AddressSpaceId,
-    pub generation: u32,
-    pub owner: ComponentId,
-    pub state: AddressSpaceState,
-    pub mappings: alloc::vec::Vec<Mapping>,
-    pub backend: B,
+    id: AddressSpaceId,
+    generation: u32,
+    owner: ComponentId,
+    state: AddressSpaceState,
+    mappings: alloc::vec::Vec<Mapping>,
+    backend: B,
 }
 
 impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
@@ -97,6 +99,24 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
             id: self.id,
             generation: self.generation,
         }
+    }
+
+    /// 只读访问。字段本身是 private，防止外部绕过 `map`/`unmap`/`activate`
+    /// 直接改真相或后端。
+    pub fn id(&self) -> AddressSpaceId {
+        self.id
+    }
+
+    pub fn owner(&self) -> ComponentId {
+        self.owner
+    }
+
+    pub fn state(&self) -> AddressSpaceState {
+        self.state
+    }
+
+    pub fn mappings(&self) -> &[Mapping] {
+        &self.mappings
     }
 
     /// Core 校验一次映射：非空、等长、页对齐、不重叠。只接受批准后的映射。
@@ -122,6 +142,14 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         if !is_page_aligned(vr.size) || !is_page_aligned(pr.size) {
             return Err(MapError::Unaligned);
         }
+        // 先做 checked 溢出，保证后续 `ranges_overlap` 里 `base+size` 不绕回。
+        // 否则溢出的区间可能让 backend 一页不写却报告成功，破坏 Core truth。
+        vr.base
+            .checked_add(vr.size)
+            .ok_or(MapError::AddressOverflow)?;
+        pr.base
+            .checked_add(pr.size)
+            .ok_or(MapError::AddressOverflow)?;
         for m in &self.mappings {
             if ranges_overlap(&m.virtual_range, &vr) {
                 return Err(MapError::Overlap);
@@ -148,15 +176,22 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         self.mappings.push(mapping);
     }
 
-    /// 解除映射：后端清 PTE，Core 从 `mappings` 里移除重叠项。
+    /// 解除一个**精确的**映射：找到虚拟区间完全相等的记录，让后端清整段映射，
+    /// 再从 `mappings` 里移除该记录。v1 不做 partial unmap。
     ///
-    /// 后端 `unmap` 失败则整体失败，不触碰真相列表。
+    /// 若传入的区间不是已记录的整段映射，返回 `NotMapped`，不触碰后端与真相列表。
     pub fn unmap(&mut self, range: &VirtualRange) -> Result<(), MapError> {
+        let index = self
+            .mappings
+            .iter()
+            .position(|m| m.virtual_range == *range)
+            .ok_or(MapError::NotMapped)?;
+
+        let actual_range = self.mappings[index].virtual_range;
         self.backend
-            .unmap(*range)
+            .unmap(actual_range)
             .map_err(|_| MapError::BackendFailed)?;
-        self.mappings
-            .retain(|m| !ranges_overlap(&m.virtual_range, range));
+        self.mappings.remove(index);
         Ok(())
     }
 
@@ -173,7 +208,7 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
 
 /// Core authority boundary for create/get/get_mut。
 pub struct AddressSpaceManager<B: AddressSpaceBackend> {
-    pub spaces: alloc::vec::Vec<KernelAddressSpace<B>>,
+    spaces: alloc::vec::Vec<KernelAddressSpace<B>>,
     next_id: u32,
 }
 
@@ -193,6 +228,11 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         self.spaces.last().unwrap().handle()
     }
 
+    /// 只读访问所有地址空间（用于 inspect / monitor）。
+    pub fn spaces(&self) -> &[KernelAddressSpace<B>] {
+        &self.spaces
+    }
+
     pub fn get(&self, handle: AddressSpaceHandle) -> Option<&KernelAddressSpace<B>> {
         self.spaces
             .iter()
@@ -209,4 +249,217 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
 #[allow(dead_code)]
 const fn _handle_shape(id: AddressSpaceId, generation: u32) -> AddressSpaceHandle {
     AddressSpaceHandle { id, generation }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{vec, vec::Vec};
+
+    // -- FakeBackend：记录调用，可在宿主上锁定 Core invariant -------------
+
+    struct FakeBackend {
+        mapped: Vec<(VirtualRange, PhysicalRange, MappingPermission)>,
+        unmapped: Vec<VirtualRange>,
+        fail_map: bool,
+        fail_unmap: bool,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                mapped: Vec::new(),
+                unmapped: Vec::new(),
+                fail_map: false,
+                fail_unmap: false,
+            }
+        }
+    }
+
+    impl AddressSpaceBackend for FakeBackend {
+        type Error = ();
+
+        fn map(
+            &mut self,
+            va: VirtualRange,
+            pa: PhysicalRange,
+            perm: MappingPermission,
+        ) -> Result<(), ()> {
+            if self.fail_map {
+                return Err(());
+            }
+            self.mapped.push((va, pa, perm));
+            Ok(())
+        }
+
+        fn unmap(&mut self, va: VirtualRange) -> Result<(), ()> {
+            if self.fail_unmap {
+                return Err(());
+            }
+            self.unmapped.push(va);
+            Ok(())
+        }
+
+        fn translate(&self, _va: usize) -> Option<usize> {
+            None
+        }
+
+        fn activate(&self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    // -- helpers ------------------------------------------------------------
+
+    fn rw() -> MappingPermission {
+        MappingPermission::READ | MappingPermission::WRITE
+    }
+
+    fn mapping(base: usize, size: usize, perm: MappingPermission) -> Mapping {
+        Mapping {
+            virtual_range: VirtualRange { base, size },
+            physical_range: PhysicalRange { base, size },
+            permission: perm,
+        }
+    }
+
+    fn space(backend: FakeBackend) -> KernelAddressSpace<FakeBackend> {
+        KernelAddressSpace::new(
+            AddressSpaceId::from_raw(1),
+            1,
+            ComponentId::from_raw(1),
+            backend,
+        )
+    }
+
+    // -- validate ------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_empty() {
+        let mut s = space(FakeBackend::new());
+        assert_eq!(s.map(mapping(0x1000, 0, rw())), Err(MapError::EmptyRange));
+    }
+
+    #[test]
+    fn validate_rejects_length_mismatch() {
+        let mut s = space(FakeBackend::new());
+        let mut m = mapping(0x1000, 0x1000, rw());
+        m.physical_range = PhysicalRange {
+            base: 0x2000,
+            size: 0x2000,
+        };
+        assert_eq!(s.map(m), Err(MapError::LengthMismatch));
+    }
+
+    #[test]
+    fn validate_rejects_unaligned() {
+        let mut s = space(FakeBackend::new());
+        assert_eq!(
+            s.map(mapping(0x1001, 0x1000, rw())),
+            Err(MapError::Unaligned)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overflow() {
+        let mut s = space(FakeBackend::new());
+        // base + size 溢出回绕；必须被拦下，否则 backend 会一页不写却报成功。
+        let m = mapping(0xffff_ffff_ffff_f000, 0x2000, rw());
+        assert_eq!(s.map(m), Err(MapError::AddressOverflow));
+    }
+
+    #[test]
+    fn validate_rejects_overlap() {
+        let mut s = space(FakeBackend::new());
+        s.map(mapping(0x1000, 0x3000, rw())).unwrap();
+        assert_eq!(s.map(mapping(0x2000, 0x1000, rw())), Err(MapError::Overlap));
+    }
+
+    // -- map / commit ----------------------------------------------------------
+
+    #[test]
+    fn map_commits_on_success() {
+        let mut s = space(FakeBackend::new());
+        assert!(s.map(mapping(0x1000, 0x1000, rw())).is_ok());
+        assert_eq!(s.mappings().len(), 1);
+        assert_eq!(s.backend.mapped.len(), 1);
+    }
+
+    #[test]
+    fn backend_failure_does_not_commit() {
+        let mut backend = FakeBackend::new();
+        backend.fail_map = true;
+        let mut s = space(backend);
+        assert_eq!(
+            s.map(mapping(0x1000, 0x1000, rw())),
+            Err(MapError::BackendFailed)
+        );
+        assert_eq!(s.mappings().len(), 0);
+    }
+
+    // -- unmap ---------------------------------------------------------------
+
+    #[test]
+    fn unmap_exact_removes_mapping() {
+        let mut s = space(FakeBackend::new());
+        s.map(mapping(0x1000, 0x3000, rw())).unwrap();
+        let range = VirtualRange {
+            base: 0x1000,
+            size: 0x3000,
+        };
+        assert!(s.unmap(&range).is_ok());
+        assert_eq!(s.mappings().len(), 0);
+        assert_eq!(s.backend.unmapped, vec![range]);
+    }
+
+    #[test]
+    fn unmap_partial_range_is_not_mapped() {
+        let mut s = space(FakeBackend::new());
+        s.map(mapping(0x1000, 0x3000, rw())).unwrap();
+        // v1 不支持 partial unmap：子区间返回 NotMapped，不触碰后端与真相。
+        let sub = VirtualRange {
+            base: 0x2000,
+            size: 0x1000,
+        };
+        assert_eq!(s.unmap(&sub), Err(MapError::NotMapped));
+        assert_eq!(s.mappings().len(), 1);
+        assert!(s.backend.unmapped.is_empty());
+    }
+
+    #[test]
+    fn unmap_unknown_returns_not_mapped() {
+        let mut s = space(FakeBackend::new());
+        let range = VirtualRange {
+            base: 0x9000,
+            size: 0x1000,
+        };
+        assert_eq!(s.unmap(&range), Err(MapError::NotMapped));
+    }
+
+    #[test]
+    fn backend_unmap_failure_keeps_truth() {
+        let mut s = space(FakeBackend::new());
+        s.map(mapping(0x1000, 0x1000, rw())).unwrap();
+        assert_eq!(s.mappings().len(), 1);
+        s.backend.fail_unmap = true;
+        let range = VirtualRange {
+            base: 0x1000,
+            size: 0x1000,
+        };
+        assert_eq!(s.unmap(&range), Err(MapError::BackendFailed));
+        assert_eq!(s.mappings().len(), 1);
+    }
+
+    // -- accessors -----------------------------------------------------------
+
+    #[test]
+    fn accessors_expose_read_only_views() {
+        let mut s = space(FakeBackend::new());
+        s.map(mapping(0x1000, 0x1000, rw())).unwrap();
+        assert_eq!(s.id(), AddressSpaceId::from_raw(1));
+        assert_eq!(s.owner(), ComponentId::from_raw(1));
+        assert_eq!(s.state(), AddressSpaceState::Ready);
+        assert_eq!(s.mappings().len(), 1);
+        let _ = s.handle();
+    }
 }

@@ -187,13 +187,18 @@ fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError
 /// v1 仍处 identity 阶段，物理地址可当虚拟地址解引用（pa == va）；
 /// 切纯高半区后需在返回值基础上换算成可写的 `KernelVirtualAddress`。
 ///
-/// TODO(你)：
-///   1. `let lease = alloc_region(PAGE_SIZE).map_err(|_| ())?;`
-///   2. `let base = lease.region().base;`
-///   3. `core::mem::forget(lease);`   // 页表页在 space 销毁前不归还
-///   4. `Ok(base)`
+/// 注意：`alloc_region` 不做清零，必须手动 `write_bytes` 归零，
+/// 否则新页表页会继承旧内存里的垃圾（被当成 PTE 就出大问题）。
 pub fn vm_page_alloc() -> Result<usize, ()> {
-    todo!("memory::vm_page_alloc")
+    let lease = alloc_region(PAGE_SIZE).map_err(|_| ())?;
+    let base = lease.region().base;
+    // 页表页在 space 销毁前不归还（v1 无回收），因此 forget lease 保活。
+    core::mem::forget(lease);
+    // SAFETY: base 来自 alloc_region，已页对齐且是 4K 有效物理页，可写。
+    unsafe {
+        core::ptr::write_bytes(base as *mut u8, 0, PAGE_SIZE);
+    }
+    Ok(base)
 }
 
 // ---------------------------------------------------------------------------

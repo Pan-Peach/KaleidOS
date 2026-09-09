@@ -173,6 +173,8 @@ pub enum MapError {
     Unaligned,
     AlreadyMapped,
     Exhausted,
+    InvalidPermission,
+    AddressOverflow,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,11 +217,13 @@ impl Sv39PageTable {
         self.root_ppn
     }
 
-    /// 根据物理页号取到可写的页表页（512 个 PTE）。
-    ///
-    /// v1 identity 阶段 `pa == va`，所以 `(ppn << 12)` 直接就是该页的虚拟地址。
-    /// 返回 `&'static mut` 是刻意的：让下游拿到的 `pte` 不借用 `self`，
-    /// 才能在持有 `pte` 的同时继续调 `self.alloc_page()` 分配下一层
+    /// 只读取一个页表页（512 个 PTE）。v1 identity 阶段 `(ppn << 12)` 即虚拟地址。
+    fn table(ppn: usize) -> &'static [Pte; ENTRIES] {
+        unsafe { &*((ppn << 12) as *const [Pte; ENTRIES]) }
+    }
+
+    /// 可写取一个页表页。返回 `&'static mut` 是刻意的：让下游拿到的 `pte`
+    /// 不借用 `self`，才能在持有 `pte` 的同时继续调 `self.alloc_page()` 分配下一层
     /// （rCore 用全局 `frame_alloc()` 规避同一个 borrow 问题）。
     fn table_mut(ppn: usize) -> &'static mut [Pte; ENTRIES] {
         unsafe { &mut *((ppn << 12) as *mut [Pte; ENTRIES]) }
@@ -249,18 +253,39 @@ impl Sv39PageTable {
             if !pte.is_valid() {
                 let page = (self.alloc_page)().map_err(|_| MapError::Exhausted)?;
                 self.frames.push(page);
-                *pte = Pte::new_table_pa(page >> 12);
+                // page 是物理地址；new_table_pa(pa) 内部会 >>12，这里不要再移。
+                *pte = Pte::new_table_pa(page);
             }
             ppn = pte.ppn();
         }
         Err(MapError::Exhausted)
     }
 
-    /// 走表：返回 `va` 对应叶子的 `&mut Pte`（rCore `find_pte`）。缺失/非叶返回 `None`。
+    /// 只读走表：返回 `va` 对应叶子的 `&Pte`（translate 等读操作用）。
     ///
-    /// 返回 `&mut` 是沿用 `table_mut` 的 `&'static mut` 模式（不借用 self），
-    /// 供 unmap/translate 共用；这是 rCore 同款写法。
-    fn find_pte(&self, va: usize) -> Option<&mut Pte> {
+    /// 当前动态后端只创建 4K leaf；若遇到已有的大页 leaf（gigapage/megapage）
+    /// 会返回它，但 translate 只按 4K 计算页内偏移（huge page 的翻译不在本对象内）。
+    fn find_pte(&self, va: usize) -> Option<&Pte> {
+        let mut ppn = self.root_ppn;
+        for level in (0..=2).rev() {
+            let idx = vpn(va, level);
+            let pte = &Self::table(ppn)[idx];
+            if !pte.is_valid() {
+                return None;
+            }
+            if pte.is_leaf() {
+                return Some(pte);
+            }
+            if level == 0 {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        None
+    }
+
+    /// 可变走表：返回 `va` 对应叶子的 `&mut Pte`（unmap 写无效用）。
+    fn find_pte_mut(&mut self, va: usize) -> Option<&mut Pte> {
         let mut ppn = self.root_ppn;
         for level in (0..=2).rev() {
             let idx = vpn(va, level);
@@ -281,8 +306,9 @@ impl Sv39PageTable {
 
     /// 把 `va[base, end)` 逐页映射到 `pa[..]`，每页写一个 4K leaf。
     ///
-    /// - 校验 `va.size == pa.size` 且 base/size 页对齐，否则 `MapError::Unaligned`。
-    /// - 每页先 `find_pte_create` 定位槽位；若已映射返回 `MapError::AlreadyMapped`。
+    /// - 校验 `va.size == pa.size`、base/size 页对齐（否则 `Unaligned`），
+    ///   以及 `base+size` 不溢出（否则 `AddressOverflow`）。
+    /// - 每页先 `find_pte_create` 定位槽位；若已映射返回 `AlreadyMapped`。
     /// - **原子性**：任一页失败（分配失败或 AlreadyMapped）时回滚本次已写入的叶子，
     ///   保证后端页表与 Core 的 `mappings` 列表一致（要么全有、要么全无）。
     ///   失败路径不能直接用 `?`，要用 `match ... break` 才能走到下面的回滚。
@@ -300,9 +326,12 @@ impl Sv39PageTable {
         {
             return Err(MapError::Unaligned);
         }
-        let flags = PteFlags::from(perm);
+        let end = va.base.checked_add(va.size).ok_or(MapError::AddressOverflow)?;
+        pa.base
+            .checked_add(pa.size)
+            .ok_or(MapError::AddressOverflow)?;
+        let flags = PteFlags::try_from(perm).map_err(|_| MapError::InvalidPermission)?;
         let start = va.base;
-        let end = va.base + va.size;
         let mut v = start;
         let mut p = pa.base;
 
@@ -325,28 +354,22 @@ impl Sv39PageTable {
 
         // 失败时回滚本次已写入的叶子，保证 Core 的 mappings 与 arch 页表一致。
         if result.is_err() {
-            match self.unmap_range(VirtualRange {
+            let _ = self.unmap_range(VirtualRange {
                 base: start,
                 size: v - start,
-            }) {
-                Ok(_) => {}
-                Err(e) => {
-                    panic!("unmap_range failed during rollback: {:?}", e);
-                }
-            }
+            });
         }
         result
     }
 
-    /// 解除 `va[base, end)` 的映射：逐页走 `find_pte`，命中叶子则清为无效。
+    /// 解除 `va[base, end)` 的映射：逐页走 `find_pte_mut`，命中叶子则清为无效。
     ///
     /// 只清叶子，不回收中间表；不分配内存，因此不会失败。
     pub fn unmap_range(&mut self, va: VirtualRange) -> Result<(), MapError> {
-        let start = va.base;
-        let end = va.base + va.size;
-        let mut v = start;
+        let end = va.base.checked_add(va.size).ok_or(MapError::AddressOverflow)?;
+        let mut v = va.base;
         while v < end {
-            if let Some(pte) = self.find_pte(v) {
+            if let Some(pte) = self.find_pte_mut(v) {
                 if pte.is_valid() && pte.is_leaf() {
                     *pte = Pte::invalid();
                 }
@@ -357,6 +380,8 @@ impl Sv39PageTable {
     }
 
     /// 翻译 `va` -> 物理地址（叶子 PA | 页内偏移）；未映射返回 `None`。
+    ///
+    /// 当前动态后端只创建 4K leaf，故仅按 4K 计算页内偏移。
     pub fn translate(&self, va: usize) -> Option<usize> {
         if let Some(pte) = self.find_pte(va) {
             if pte.is_valid() && pte.is_leaf() {
@@ -369,15 +394,40 @@ impl Sv39PageTable {
     }
 }
 
-/// `MappingPermission` -> Sv39 `PteFlags`。
+/// `MappingPermission` -> Sv39 `PteFlags`，用可失败的 `TryFrom`。
 ///
-/// R/W/X/U 在 Sv39 里占 bit1–4，而 `MappingPermission` 的 READ/WRITE/EXECUTE/USER
-/// 占 bit0–3，所以左移一位 + 掩码即可对齐（V 由 `Pte::new_leaf` 补上）。
-/// A|D 恒置位（访问/脏位）。
-impl From<MappingPermission> for PteFlags {
-    fn from(perm: MappingPermission) -> Self {
-        PteFlags::from_bits_retain(((perm.bits() as usize) << 1) & 0b1_1110)
-            | PteFlags::A
-            | PteFlags::D
+/// 校验（RISC-V 硬件约束）：
+/// - 必须至少有一个 R/W/X 位，否则会造出"V 但非叶、PPN 指向数据页"的假表项；
+///   Sv39 判定 leaf 的规则是 `R|W|X` 至少 1 位。
+/// - `W` 必须搭配 `R`（`R=0 W=1` 在 RISC-V 里是保留/非法组合）。
+///
+/// A|D 恒置位（访问/脏位），V 由 `Pte::new_leaf` 补上。
+impl TryFrom<MappingPermission> for PteFlags {
+    type Error = MapError;
+
+    fn try_from(perm: MappingPermission) -> Result<Self, Self::Error> {
+        if !perm.intersects(
+            MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE,
+        ) {
+            return Err(MapError::InvalidPermission);
+        }
+        if perm.contains(MappingPermission::WRITE) && !perm.contains(MappingPermission::READ) {
+            return Err(MapError::InvalidPermission);
+        }
+
+        let mut flags = PteFlags::A | PteFlags::D;
+        if perm.contains(MappingPermission::READ) {
+            flags |= PteFlags::R;
+        }
+        if perm.contains(MappingPermission::WRITE) {
+            flags |= PteFlags::W;
+        }
+        if perm.contains(MappingPermission::EXECUTE) {
+            flags |= PteFlags::X;
+        }
+        if perm.contains(MappingPermission::USER) {
+            flags |= PteFlags::U;
+        }
+        Ok(flags)
     }
 }
