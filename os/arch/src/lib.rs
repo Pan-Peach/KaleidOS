@@ -21,17 +21,17 @@ pub mod vm;
 #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub mod fake;
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+// riscv 模块在所有目标都编译，但内部子模块按依赖门控：
+// - ISA/asm 子模块（cpu/context/trap/firmware/console/boot_vm）只在真实 RISC-V 目标；
+// - 纯算法子模块（elf 重定位、mmu 页表编码）host 也可编译 —— host 测试直接测
+//   生产实现，而不是一份复制算法（见 docs/testing.md）。
 pub mod riscv;
 
 pub use store::{ComponentStore, StoreEntry, StoreError};
 
-/// Component object ABI selected by the current build profile.
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+/// Component object ABI 由 RISC-V 实现提供（纯字节/编码逻辑，任何目标都可编译，
+/// host 下行为与 riscv 目标一致——`normalize_symbol_address` 在 host 是恒等映射）。
 pub type ComponentRelocationImpl = riscv::elf::RiscvRelocator;
-
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
-pub type ComponentRelocationImpl = fake::elf::FakeRelocator;
 
 /// Normalize a linked high-half address to its early identity/physical view.
 ///

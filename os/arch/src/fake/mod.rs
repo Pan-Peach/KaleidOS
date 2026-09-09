@@ -5,7 +5,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 extern crate std;
 use std::{io::Write, println};
 
-pub mod elf;
 pub mod store;
 
 /// Host 上的 trap 模拟：记录架构初始化是否已经安装了 trap 入口。

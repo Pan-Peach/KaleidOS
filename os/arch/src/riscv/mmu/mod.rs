@@ -4,11 +4,17 @@
 //! module owns the translation mechanism boundary.  The active XLEN selects
 //! the Sv39 (RV64) or Sv32 (RV32) backend at compile time.
 
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod address_space;
-#[cfg(target_arch = "riscv32")]
+// sv32/sv39 是纯逻辑 + identity 指针解引用；host 的 cfg(test)（64 位）也编译，
+// 便于 host 测试页表编码与 walk（页面 backing 由测试提供）。
+#[cfg(any(target_arch = "riscv32", all(test, target_pointer_width = "64")))]
 pub mod sv32;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", all(test, target_pointer_width = "64")))]
 pub mod sv39;
+
+#[cfg(all(test, target_pointer_width = "64"))]
+pub(crate) mod test_pool;
 
 #[cfg(target_arch = "riscv64")]
 use super::boot_vm;
@@ -47,6 +53,7 @@ pub unsafe fn init_identity(
     }
 }
 
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub unsafe fn flush_tlb() {
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));

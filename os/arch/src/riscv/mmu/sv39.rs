@@ -1,5 +1,6 @@
 use crate::vm::{MappingPermission, PageAlloc, PhysicalRange, VirtualRange};
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
@@ -187,6 +188,7 @@ pub enum MapError {
 
 /// 动态 Sv39 页表。页表页来自 Core 的 buddy heap（通过 `alloc_page` 函数指针），
 /// 不是第二个分配器。v1 identity 阶段，物理地址可直接当虚拟地址解引用。
+#[derive(Debug)]
 pub struct Sv39PageTable {
     root_ppn: usize,
     /// 已分配的页表页物理地址（保活；后续销毁/回收用）。
@@ -203,8 +205,7 @@ impl Sv39PageTable {
     pub fn new(alloc_page: PageAlloc) -> Result<Self, MapError> {
         let page = alloc_page().map_err(|_| MapError::Exhausted)?;
         let root_ppn = page >> 12;
-        let mut frames = Vec::new();
-        frames.push(page);
+        let frames = vec![page];
         Ok(Self {
             root_ppn,
             frames,
@@ -375,10 +376,11 @@ impl Sv39PageTable {
             .ok_or(MapError::AddressOverflow)?;
         let mut v = va.base;
         while v < end {
-            if let Some(pte) = self.find_pte_mut(v) {
-                if pte.is_valid() && pte.is_leaf() {
-                    *pte = Pte::invalid();
-                }
+            if let Some(pte) = self.find_pte_mut(v)
+                && pte.is_valid()
+                && pte.is_leaf()
+            {
+                *pte = Pte::invalid();
             }
             v += PAGE_SIZE;
         }
@@ -389,12 +391,13 @@ impl Sv39PageTable {
     ///
     /// 当前动态后端只创建 4K leaf，故仅按 4K 计算页内偏移。
     pub fn translate(&self, va: usize) -> Option<usize> {
-        if let Some(pte) = self.find_pte(va) {
-            if pte.is_valid() && pte.is_leaf() {
-                let pa = pte.pa();
-                let offset = va & (PAGE_SIZE - 1);
-                return Some(pa | offset);
-            }
+        if let Some(pte) = self.find_pte(va)
+            && pte.is_valid()
+            && pte.is_leaf()
+        {
+            let pa = pte.pa();
+            let offset = va & (PAGE_SIZE - 1);
+            return Some(pa | offset);
         }
         None
     }
@@ -435,5 +438,320 @@ impl TryFrom<MappingPermission> for PteFlags {
             flags |= PteFlags::U;
         }
         Ok(flags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Sv39 纯逻辑 host 测试：PTE/VPN/permission 编码 + 动态页表
+    //! map/translate/unmap + mid-map 分配失败回滚。
+    //! 页面 backing 来自 mmap 页池（见 super::test_pool），生产结构零改动。
+
+    use super::*;
+
+    fn rw() -> MappingPermission {
+        MappingPermission::READ | MappingPermission::WRITE
+    }
+
+    fn rx() -> MappingPermission {
+        MappingPermission::READ | MappingPermission::EXECUTE
+    }
+
+    // -- PTE 编码 ------------------------------------------------------------
+
+    #[test]
+    fn pte_invalid_is_not_valid_not_leaf() {
+        let pte = Pte::invalid();
+        assert!(!pte.is_valid());
+        assert!(!pte.is_leaf());
+        assert_eq!(pte.bits, 0);
+    }
+
+    #[test]
+    fn pte_table_ppn_roundtrip() {
+        for ppn in [0usize, 1, 0x12345, (1 << 44) - 1] {
+            let pte = Pte::new_table(ppn);
+            assert!(pte.is_valid(), "table entry must be valid");
+            assert!(!pte.is_leaf(), "R/W/X 全 0 → 非叶");
+            assert_eq!(pte.ppn(), ppn & PPN_MASK);
+        }
+    }
+
+    #[test]
+    fn pte_leaf_pa_roundtrip() {
+        for pa in [0usize, PAGE_SIZE, 0x8000_0000, 0x1_0000_0000] {
+            let pte = Pte::new_leaf_pa(pa, PteFlags::R);
+            assert!(pte.is_valid());
+            assert!(pte.is_leaf());
+            assert_eq!(pte.pa(), pa, "leaf PA 必须完整往返（44 位 PPN）");
+            assert!(pte.flags().contains(PteFlags::R));
+        }
+    }
+
+    #[test]
+    fn pte_high_ppn_truncation_is_documented() {
+        // 超过 44 位的 PPN 被截断（硬件字段宽度）；编码行为必须稳定可断言。
+        let pte = Pte::new_leaf(1 << 44, PteFlags::R);
+        assert_eq!(pte.ppn(), 0);
+        let pte = Pte::new_leaf((1 << 44) | 0xABCD, PteFlags::R);
+        assert_eq!(pte.ppn(), 0xABCD);
+    }
+
+    #[test]
+    fn pte_flags_roundtrip() {
+        let pte = Pte::new_leaf_pa(0x1000, PteFlags::R | PteFlags::W | PteFlags::X | PteFlags::U);
+        assert_eq!(
+            pte.flags(),
+            PteFlags::R | PteFlags::W | PteFlags::X | PteFlags::U | PteFlags::V
+        );
+    }
+
+    // -- VPN 计算 --------------------------------------------------------------
+
+    #[test]
+    fn vpn_level_indices() {
+        // 0x0000_0000_4000_0000 → level2 index 1（每级 512 × 1GiB 跨度）
+        assert_eq!(vpn(0x0000_0000_4000_0000, 2), 1);
+        // 2 MiB 边界 → level1 index 1
+        assert_eq!(vpn(0x0000_0000_0020_0000, 1), 1);
+        // 4 KiB 边界 → level0 index 1
+        assert_eq!(vpn(0x1000, 0), 1);
+        // 页内偏移不参与
+        assert_eq!(vpn(0x1000, 0), vpn(0x1fff, 0));
+    }
+
+    #[test]
+    fn vpn_max_canonical_within_39_bits() {
+        // Sv39 有效 VA 是 39 位：bit 38 决定高/低半区，VPN2 是 bits 30..38
+        assert_eq!(vpn(0xFFFF_FFFF_C000_0000, 2), 511); // 高半区顶部（bit38=1）
+        assert_eq!(vpn(0x0000_003F_FFFF_FFFF, 2), 0xFF); // 低半区顶部（2^38-1，bit38=0）
+        assert_eq!(vpn(0x0000_0040_0000_0000, 2), 0x100); // 第一个 bit38=1 的地址
+    }
+
+    #[test]
+    fn page_offset_is_low_12_bits() {
+        for va in [0usize, 0xFFF, 0x1000, 0x1234] {
+            assert_eq!(va & (PAGE_SIZE - 1), va & 0xFFF);
+        }
+    }
+
+    // -- Permission 编码 ---------------------------------------------------------
+
+    #[test]
+    fn permission_encodes_read_write_execute_user() {
+        for (perm, want_r, want_w, want_x, want_u) in [
+            (MappingPermission::READ, true, false, false, false),
+            (rx(), true, false, true, false),
+            (rw(), true, true, false, false),
+            (
+                MappingPermission::READ
+                    | MappingPermission::WRITE
+                    | MappingPermission::EXECUTE
+                    | MappingPermission::USER,
+                true,
+                true,
+                true,
+                true,
+            ),
+        ] {
+            let flags = PteFlags::try_from(perm).expect("valid permission");
+            assert_eq!(flags.contains(PteFlags::R), want_r);
+            assert_eq!(flags.contains(PteFlags::W), want_w);
+            assert_eq!(flags.contains(PteFlags::X), want_x);
+            assert_eq!(flags.contains(PteFlags::U), want_u);
+        }
+    }
+
+    #[test]
+    fn permission_empty_is_rejected() {
+        assert_eq!(
+            PteFlags::try_from(MappingPermission::empty()),
+            Err(MapError::InvalidPermission)
+        );
+    }
+
+    #[test]
+    fn permission_write_without_read_is_rejected() {
+        assert_eq!(
+            PteFlags::try_from(MappingPermission::WRITE),
+            Err(MapError::InvalidPermission)
+        );
+    }
+
+    // -- 动态页表 walk（mmap 页池 backing）----------------------------------------
+
+    fn table() -> Sv39PageTable {
+        Sv39PageTable::new(super::super::test_pool::alloc).expect("root alloc")
+    }
+
+    fn vr(base: usize, size: usize) -> VirtualRange {
+        VirtualRange { base, size }
+    }
+    fn pr(base: usize, size: usize) -> PhysicalRange {
+        PhysicalRange { base, size }
+    }
+
+    #[test]
+    fn map_single_page_translate_unmap() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+        let va = 0x1000usize;
+        let pa = 0x9000_0000usize;
+
+        assert!(table.map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw()).is_ok());
+        assert_eq!(table.translate(va), Some(pa));
+        assert_eq!(table.translate(va + 0x500), Some(pa + 0x500), "页内偏移透传");
+        assert_eq!(table.translate(va - 1), None);
+        assert_eq!(table.translate(va + PAGE_SIZE), None);
+
+        assert!(table.unmap_range(vr(va, PAGE_SIZE)).is_ok());
+        assert_eq!(table.translate(va), None);
+    }
+
+    #[test]
+    fn map_multipage_all_translate() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+        let base = 0x2000_0000usize;
+        let pa = 0x8000_0000usize;
+        let size = 3 * PAGE_SIZE;
+
+        assert!(table.map_range(vr(base, size), pr(pa, size), rx()).is_ok());
+        for i in 0..3 {
+            assert_eq!(table.translate(base + i * PAGE_SIZE), Some(pa + i * PAGE_SIZE));
+        }
+        assert!(table.unmap_range(vr(base, size)).is_ok());
+        for i in 0..3 {
+            assert_eq!(table.translate(base + i * PAGE_SIZE), None);
+        }
+    }
+
+    #[test]
+    fn duplicate_map_is_rejected_and_keeps_original() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+        let va = 0x1000usize;
+        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw()).is_ok());
+
+        // 重叠 VA 的第二次映射：AlreadyMapped，且原映射不受影响
+        assert_eq!(
+            table.map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw()),
+            Err(MapError::AlreadyMapped)
+        );
+        assert_eq!(table.translate(va), Some(0x9000_0000), "原映射必须保留");
+    }
+
+    #[test]
+    fn mid_map_alloc_failure_rolls_back_written_leaves() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 256, false);
+        // 范围跨两个 2MiB 边界 → 需要 root + vpn1 + 三个 vpn0 表 = 5 次分配。
+        // 令第 4 次分配之后失败：前两个 vpn0 表已各写入 512 个 leaf，
+        // 第三个 vpn0 表分配失败 → 本次已写入的 1024 个 leaf 必须全部回滚。
+        super::super::test_pool::set_fail_after(4);
+        let mut table = table();
+        let base = 0x0000_0000_4000_0000usize; // 1GiB 边界（vpn2 索引干净）
+        let size = PAGE_SIZE * 512 * 2 + PAGE_SIZE; // 4 MiB + 4 KiB
+        let result = table.map_range(vr(base, size), pr(0x8000_0000, size), rw());
+        assert_eq!(result, Err(MapError::Exhausted));
+        // 本次已写入的 leaf 全部回滚（Core truth 与 backend 一致）
+        for i in 0..1024 {
+            assert_eq!(table.translate(base + i * PAGE_SIZE), None, "leaf {i} 必须回滚");
+        }
+        // 恢复分配能力后整段可以重新映射成功
+        super::super::test_pool::set_fail_after(usize::MAX);
+        assert!(table.map_range(vr(base, size), pr(0x8000_0000, size), rw()).is_ok());
+        assert_eq!(table.translate(base), Some(0x8000_0000));
+        // 回滚没有破坏后续映射：后半段也可翻译
+        assert_eq!(table.translate(base + size - PAGE_SIZE), Some(0x8000_0000 + size - PAGE_SIZE));
+    }
+
+    #[test]
+    fn allocator_exhaustion_at_new_is_exhausted() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 1, false);
+        super::super::test_pool::set_fail_after(0);
+        assert!(matches!(
+            Sv39PageTable::new(super::super::test_pool::alloc),
+            Err(MapError::Exhausted)
+        ));
+    }
+
+    #[test]
+    fn invalid_arguments_are_rejected_before_touching_tables() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+
+        // 长度不匹配
+        assert_eq!(
+            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2000, 2 * PAGE_SIZE), rw()),
+            Err(MapError::Unaligned)
+        );
+        // VA 未对齐
+        assert_eq!(
+            table.map_range(vr(0x1001, PAGE_SIZE), pr(0x2000, PAGE_SIZE), rw()),
+            Err(MapError::Unaligned)
+        );
+        // PA 未对齐
+        assert_eq!(
+            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2001, PAGE_SIZE), rw()),
+            Err(MapError::Unaligned)
+        );
+        // size 未对齐
+        assert_eq!(
+            table.map_range(vr(0x1000, PAGE_SIZE + 1), pr(0x2000, PAGE_SIZE + 1), rw()),
+            Err(MapError::Unaligned)
+        );
+        // 地址溢出
+        assert_eq!(
+            table.map_range(
+                vr(0xFFFF_FFFF_FFFF_F000, 0x2000),
+                pr(0x8000_0000, 0x2000),
+                rw()
+            ),
+            Err(MapError::AddressOverflow)
+        );
+        // 空权限
+        assert_eq!(
+            table.map_range(
+                vr(0x1000, PAGE_SIZE),
+                pr(0x2000, PAGE_SIZE),
+                MappingPermission::empty()
+            ),
+            Err(MapError::InvalidPermission)
+        );
+        // W without R
+        assert_eq!(
+            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2000, PAGE_SIZE), MappingPermission::WRITE),
+            Err(MapError::InvalidPermission)
+        );
+        // 全程未写任何 leaf
+        assert_eq!(table.translate(0x1000), None);
+        assert_eq!(table.translate(0x1001), None);
+    }
+
+    #[test]
+    fn unmap_unknown_range_is_noop() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+        assert!(table.unmap_range(vr(0x5000, PAGE_SIZE)).is_ok());
+        assert_eq!(table.translate(0x5000), None);
+    }
+
+    #[test]
+    fn map_after_unmap_reuses_va() {
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init(0, 64, false);
+        let mut table = table();
+        let va = 0x1000usize;
+        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw()).is_ok());
+        table.unmap_range(vr(va, PAGE_SIZE)).unwrap();
+        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw()).is_ok());
+        assert_eq!(table.translate(va), Some(0xA000_0000));
     }
 }
