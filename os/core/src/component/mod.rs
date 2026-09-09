@@ -4,6 +4,7 @@
 //! 具体设备 shutdown 顺序由组件/驱动决定，不由 ResourceDomain 写死。
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
+mod elf;
 pub mod export;
 pub mod loader;
 pub mod registry;

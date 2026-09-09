@@ -10,7 +10,8 @@ Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core M
   .kcomp（ELF ET_REL，no_std Rust）→ make init.kpkg（cpio + manifest）
   → .initpkg 内嵌 → store::init（cpio 解析）
   → loader::load_component（段表/符号表解析、ALLOC 段放置、
-     重定位：R_RISCV_CALL/CALL_PLT + PCREL_HI20/LO12_I + R_RISCV_64）
+     重定位由 `arch/{riscv,fake}/elf.rs` 提供：R_RISCV_CALL/CALL_PLT
+     + PCREL_HI20/LO12_I + R_RISCV_32/64）
   → registry（declare → start → Ready 状态机）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：

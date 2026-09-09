@@ -7,7 +7,7 @@ use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
 use alloc::string::String;
-use arch::{CpuArch, CpuImpl, ResetImpl, ResetType, SystemReset};
+use arch::{ResetImpl, ResetType, SystemReset};
 
 /// 挂载 MachineInfo（core::init 完成时调用一次）：写入 machine 模块的唯一真相点。
 pub fn mount(info: &MachineInfo) {
@@ -131,7 +131,7 @@ pub fn load(args: &[u8]) {
         return;
     }
 
-    let mut comp = match crate::component::loader::load_component(&blob, CpuImpl::ELF_MACHINE) {
+    let mut comp = match crate::component::loader::load_component(&blob) {
         Ok(c) => c,
         Err(e) => {
             printk!("load: {}: {e:?}\n", String::from_utf8_lossy(name));

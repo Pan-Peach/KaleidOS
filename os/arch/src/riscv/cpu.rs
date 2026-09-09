@@ -19,7 +19,6 @@ pub struct RiscvContext {
 
 impl CpuArch for Riscv {
     type Context = RiscvContext;
-    const ELF_MACHINE: u16 = 0xF3;
 
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         unsafe extern "C" {

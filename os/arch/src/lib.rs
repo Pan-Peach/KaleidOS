@@ -1,4 +1,4 @@
-//! RISC-V 64 架构层（ISA）—— 顶层目录，与 kernel/ 平级。
+//! Architecture backend crate: RISC-V ISA family plus host fake backend.
 //!
 //! 组织方式参照 Linux `arch/<isa>/` 与 seL4 `src/arch/{arm,riscv,x86}`：
 //! 每个 ISA 一个独立单元，内部只放指令集相关代码：
@@ -14,6 +14,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod component;
 pub mod store;
 pub mod vm;
 
@@ -24,6 +25,13 @@ pub mod fake;
 pub mod riscv;
 
 pub use store::{ComponentStore, StoreEntry, StoreError};
+
+/// Component object ABI selected by the current build profile.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type ComponentRelocationImpl = riscv::elf::RiscvRelocator;
+
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+pub type ComponentRelocationImpl = fake::elf::FakeRelocator;
 
 /// Normalize a linked high-half address to its early identity/physical view.
 ///
@@ -57,7 +65,6 @@ pub enum ResetType {
 pub trait CpuArch {
     /// 寄存器上下文类型。
     type Context;
-    const ELF_MACHINE: u16;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     fn init();

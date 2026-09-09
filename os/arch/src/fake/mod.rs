@@ -1,10 +1,11 @@
 use crate::{Console, CpuArch, ResetType, SystemReset};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 riscv64），显式引入 std 供 console 直通。
+// 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
 extern crate std;
 use std::{io::Write, println};
 
+pub mod elf;
 pub mod store;
 
 /// Host 上的 trap 模拟：记录架构初始化是否已经安装了 trap 入口。
@@ -49,7 +50,6 @@ impl FakeContext {
 
 impl CpuArch for Fake {
     type Context = FakeContext;
-    const ELF_MACHINE: u16 = 0xF3; // 暂时先用RISC-V
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         // Placeholder for context switch logic
         println!("Switching context from {:?} to {:?}", from, to);

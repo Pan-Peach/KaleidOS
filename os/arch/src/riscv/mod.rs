@@ -8,6 +8,7 @@ pub mod boot_vm;
 pub mod console;
 pub mod context;
 pub mod cpu;
+pub mod elf;
 pub mod firmware;
 pub mod mmu;
 pub mod trap;
