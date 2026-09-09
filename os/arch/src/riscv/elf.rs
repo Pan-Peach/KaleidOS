@@ -42,6 +42,22 @@ impl RiscvRelocator {
         bytes.copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
+
+    /// S + A - loc，全部 checked。中间量溢出 = 不可表示 = `Unsupported`，
+    /// 绝不能 panic（恶意 addend 如 `i64::MAX` 必须安全拒绝）。
+    fn checked_delta(s_addr: i64, addend: i64, loc: i64) -> Result<i64, RelocationError> {
+        s_addr
+            .checked_add(addend)
+            .and_then(|v| v.checked_sub(loc))
+            .ok_or(RelocationError::Unsupported)
+    }
+
+    /// imm20 = ((v + 0x800) >> 12) & 0xFFFFF；`v + 0x800` 也 checked。
+    fn imm20(v: i64) -> Result<i64, RelocationError> {
+        v.checked_add(0x800)
+            .map(|x| (x >> 12) & 0xFFFFF)
+            .ok_or(RelocationError::Unsupported)
+    }
 }
 
 impl RelocationBackend for RiscvRelocator {
@@ -81,11 +97,11 @@ impl RelocationBackend for RiscvRelocator {
 
         match relocation.kind {
             R_RISCV_CALL | R_RISCV_CALL_PLT => {
-                let v = s_addr + relocation.addend - loc as i64;
+                let v = Self::checked_delta(s_addr, relocation.addend, loc as i64)?;
                 if !(-(1 << 31)..(1 << 31)).contains(&v) {
                     return Err(RelocationError::Unsupported);
                 }
-                let imm20 = ((v + 0x800) >> 12) & 0xFFFFF;
+                let imm20 = Self::imm20(v)?;
                 let imm12 = (v & 0xFFF) as u32;
                 let auipc = Self::read_u32(image, offset)?;
                 let auipc = (imm20 as u32) << 12 | (auipc & 0xF80) | 0x17;
@@ -96,17 +112,27 @@ impl RelocationBackend for RiscvRelocator {
                 Self::write_u32(image, jalr_offset, jalr)?;
             }
             R_RISCV_PCREL_HI20 => {
-                let v = s_addr + relocation.addend - loc as i64;
+                let v = Self::checked_delta(s_addr, relocation.addend, loc as i64)?;
+                // PC-relative 差值必须是 32 位有符号范围（同 CALL）。
+                if !(-(1 << 31)..(1 << 31)).contains(&v) {
+                    return Err(RelocationError::Unsupported);
+                }
                 self.hi_cache
                     .push(((relocation.target_section, relocation.section_offset), v));
-                let imm20 = ((v + 0x800) >> 12) & 0xFFFFF;
+                let imm20 = Self::imm20(v)?;
                 let auipc = Self::read_u32(image, offset)?;
                 let auipc = (imm20 as u32) << 12 | (auipc & 0xF80) | 0x17;
                 Self::write_u32(image, offset, auipc)?;
             }
             R_RISCV_HI20 => {
-                let v = s_addr + relocation.addend;
-                let imm20 = ((v + 0x800) >> 12) & 0xFFFFF;
+                let v = s_addr
+                    .checked_add(relocation.addend)
+                    .ok_or(RelocationError::Unsupported)?;
+                // 绝对地址必须是 32 位无符号范围（lui+addi 只能编码这么多）。
+                if !(0..(1i64 << 32)).contains(&v) {
+                    return Err(RelocationError::Unsupported);
+                }
+                let imm20 = Self::imm20(v)?;
                 let lui = Self::read_u32(image, offset)?;
                 let lui = (imm20 as u32) << 12 | (lui & 0xF80) | 0x37;
                 Self::write_u32(image, offset, lui)?;
@@ -124,7 +150,14 @@ impl RelocationBackend for RiscvRelocator {
                 Self::write_u32(image, offset, insn)?;
             }
             R_RISCV_LO12_I => {
-                let imm12 = ((s_addr + relocation.addend) & 0xFFF) as u32;
+                let v = s_addr
+                    .checked_add(relocation.addend)
+                    .ok_or(RelocationError::Unsupported)?;
+                // 与 HI20 配套：绝对地址必须落在 32 位无符号范围。
+                if !(0..(1i64 << 32)).contains(&v) {
+                    return Err(RelocationError::Unsupported);
+                }
+                let imm12 = (v & 0xFFF) as u32;
                 let insn = Self::read_u32(image, offset)?;
                 let insn = (imm12 << 20) | (insn & 0x000F_FFFF);
                 Self::write_u32(image, offset, insn)?;
@@ -133,13 +166,17 @@ impl RelocationBackend for RiscvRelocator {
                 if !matches!(width, WordSize::Bits32) {
                     return Err(RelocationError::Unsupported);
                 }
-                Self::write_u32(image, offset, (s_addr + relocation.addend) as u32)?;
+                // ABI = S + A (mod 2^32)：wrapping 是定义行为，绝不 panic。
+                let v = s_addr.wrapping_add(relocation.addend) as u32;
+                Self::write_u32(image, offset, v)?;
             }
             R_RISCV_64 => {
                 if !matches!(width, WordSize::Bits64) {
                     return Err(RelocationError::Unsupported);
                 }
-                Self::write_u64(image, offset, (s_addr + relocation.addend) as u64)?;
+                // ABI = S + A (mod 2^64)。
+                let v = s_addr.wrapping_add(relocation.addend) as u64;
+                Self::write_u64(image, offset, v)?;
             }
             _ => return Err(RelocationError::Unsupported),
         }
@@ -568,5 +605,61 @@ mod tests {
         let insn = u32::from_le_bytes(image);
         assert_eq!((insn >> 7) & 0x1F, 3, "rd 保留");
         assert_eq!(insn & 0x7F, 0x37, "opcode 保留");
+    }
+
+    #[test]
+    fn extreme_addends_never_panic_and_overflow_is_rejected() {
+        // 恶意 addend（i64::MIN/MAX）不得让中间加法溢出 panic：
+        // 指令类重定位溢出 = 不可表示 = Err；数据类重定位是 mod 2^N ABI = Ok。
+        let instruction_kinds: [(u32, WordSize); 5] = [
+            (R_RISCV_CALL, WordSize::Bits64),
+            (R_RISCV_CALL_PLT, WordSize::Bits64),
+            (R_RISCV_PCREL_HI20, WordSize::Bits64),
+            (R_RISCV_HI20, WordSize::Bits64),
+            (R_RISCV_LO12_I, WordSize::Bits64),
+        ];
+        for (kind, width) in instruction_kinds {
+            for addend in [i64::MIN, i64::MAX] {
+                let mut image = [0u8; 8];
+                let mut relocator = RiscvRelocator::new();
+                let result = relocator.apply(
+                    width,
+                    &mut image,
+                    BASE,
+                    rel(0, kind, addend, 1, 0, 0, 0),
+                    0x1000,
+                );
+                assert!(
+                    result.is_err(),
+                    "kind {kind:#x} addend {addend}: 溢出必须拒绝而非 panic"
+                );
+            }
+        }
+        // R_RISCV_32：mod 2^32 ABI，wrapping 有定义
+        let mut image = [0u8; 4];
+        let mut relocator = RiscvRelocator::new();
+        relocator
+            .apply(
+                WordSize::Bits32,
+                &mut image,
+                BASE,
+                rel(0, R_RISCV_32, i64::MAX, 1, 0, 0, 0),
+                0x1000,
+            )
+            .expect("R_RISCV_32 是 mod 2^32，必须成功");
+        assert_eq!(image, 0x1000u32.wrapping_add(i64::MAX as u32).to_le_bytes());
+        // R_RISCV_64：mod 2^64 ABI
+        let mut image = [0u8; 8];
+        let mut relocator = RiscvRelocator::new();
+        relocator
+            .apply(
+                WordSize::Bits64,
+                &mut image,
+                BASE,
+                rel(0, R_RISCV_64, i64::MIN, 1, 0, 0, 0),
+                0x1234,
+            )
+            .expect("R_RISCV_64 是 mod 2^64，必须成功");
+        assert_eq!(image, 0x1234u64.wrapping_add(i64::MIN as u64).to_le_bytes());
     }
 }
