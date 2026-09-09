@@ -1,9 +1,13 @@
 //! RISC-V early boot page-table plan.
 //!
+//! ## 这是启动临时页表 `BootPageTable`，不是长期 `KernelAddressSpace`。
+//! 它只活在 bootstrap 到 `kernel::init()` 完成、并切到 `Sv39PageTable` root 之前。
+//! 之后不要再让这里的静态表承担任何长期映射职责。
+//!
 //! This is the small, statically backed mapping used before Core's physical
 //! allocator exists.  It deliberately keeps both the identity window and the
-//! high-half alias alive.  A later final-kernel mapping will replace this root
-//! after memory discovery and allocation are available.
+//! high-half alias alive.  A later final-kernel mapping (`KernelAddressSpace`)
+//! will replace this root after memory discovery and allocation are available.
 
 use super::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
 

@@ -300,7 +300,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
             let context_ptr = &context as *const BootContext as usize;
             kernel::log!("bootstrap", "Sv39 dual map OK; entering high-half");
             unsafe {
-                arch::riscv64::mmu::activate();
+                arch::riscv64::mmu::activate(arch::riscv64::boot_vm::root_pa() >> 12);
                 arch::riscv64::mmu::enter_high_half(
                     bootstrap_high as *const () as usize,
                     context_ptr,

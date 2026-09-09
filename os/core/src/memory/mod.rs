@@ -178,6 +178,25 @@ fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError
 }
 
 // ---------------------------------------------------------------------------
+// 页表页取页函数（供 Sv39PageTable 通过函数指针调用 buddy heap）
+// ---------------------------------------------------------------------------
+
+/// 从 buddy heap 取一个已归零的页，返回其物理地址。
+///
+/// 这就是 arch `Sv39PageTable` 用的 `PageAlloc`：core 在 init 后把它塞进页表。
+/// v1 仍处 identity 阶段，物理地址可当虚拟地址解引用（pa == va）；
+/// 切纯高半区后需在返回值基础上换算成可写的 `KernelVirtualAddress`。
+///
+/// TODO(你)：
+///   1. `let lease = alloc_region(PAGE_SIZE).map_err(|_| ())?;`
+///   2. `let base = lease.region().base;`
+///   3. `core::mem::forget(lease);`   // 页表页在 space 销毁前不归还
+///   4. `Ok(base)`
+pub fn vm_page_alloc() -> Result<usize, ()> {
+    todo!("memory::vm_page_alloc")
+}
+
+// ---------------------------------------------------------------------------
 // GlobalAlloc：小对象堆（组件与 Core 共享）
 // ---------------------------------------------------------------------------
 

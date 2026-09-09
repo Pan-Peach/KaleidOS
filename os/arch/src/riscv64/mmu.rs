@@ -24,9 +24,16 @@ pub unsafe fn init_identity(
     }
 }
 
-pub unsafe fn activate() {
-    let root_pa = boot_vm::root_pa();
-    let satp = (SV39_MODE << 60) | (root_pa >> 12);
+pub unsafe fn flush_tlb() {
+    unsafe {
+        core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+    }
+}
+
+/// 写 satp 并 flush TLB。这是本模块唯一职责：只碰寄存器，不懂地址空间生命周期。
+/// `root_ppn` 是根页表物理页号（`Sv39AddressSpace::root_ppn()` / `boot_vm::root_pa() >> 12`）。
+pub unsafe fn activate(root_ppn: usize) {
+    let satp = (SV39_MODE << 60) | root_ppn;
 
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));

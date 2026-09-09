@@ -25,31 +25,26 @@ pub struct MappingPermission {
     pub user: bool,
 }
 
-pub trait PageTablePageAllocator {
-    type Page;
+/// 一次性"给一个已归零的页，返回其物理地址"的钩子。
+///
+/// 这就是 buddy allocator（`core::memory::alloc_region`）的窄接口：
+/// 因为 `os/arch` 不能依赖 `os/core`，Core 在初始化时把这个函数地址塞进
+/// `Sv39PageTable`。v1 identity 阶段返回的物理地址可直接当虚拟地址解引用。
+pub type PageAlloc = fn() -> Result<usize, ()>;
+
+/// Contract `KernelAddressSpace` drives. Methods take raw ranges/permissions;
+/// Core validates & commits around the call. You fill in the `Sv39AddressSpace`
+/// implementation.
+pub trait AddressSpaceBackend {
     type Error;
 
-    fn allocate_zeroed(&mut self) -> Result<Self::Page, Self::Error>;
-    fn release(&mut self, page: Self::Page) -> Result<(), Self::Error>;
-}
-
-pub trait AddressTranslationBackend {
-    type Space;
-    type Error;
-
-    fn create_space(&mut self) -> Result<Self::Space, Self::Error>;
-    fn map_range(
+    fn map(
         &mut self,
-        space: &mut Self::Space,
-        virtual_range: VirtualRange,
-        physical_range: PhysicalRange,
-        permission: MappingPermission,
+        va: VirtualRange,
+        pa: PhysicalRange,
+        perm: MappingPermission,
     ) -> Result<(), Self::Error>;
-    fn unmap_range(
-        &mut self,
-        space: &mut Self::Space,
-        virtual_range: VirtualRange,
-    ) -> Result<(), Self::Error>;
-    fn activate(&mut self, space: &Self::Space) -> Result<(), Self::Error>;
-    fn destroy_space(&mut self, space: Self::Space) -> Result<(), Self::Error>;
+    fn unmap(&mut self, va: VirtualRange) -> Result<(), Self::Error>;
+    fn translate(&self, va: usize) -> Option<usize>;
+    fn activate(&self) -> Result<(), Self::Error>;
 }

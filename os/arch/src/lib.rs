@@ -9,6 +9,7 @@
 //! 后续架构：x86_64 / aarch64 / loongarch64（各自独立 crate）。
 
 #![no_std]
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
