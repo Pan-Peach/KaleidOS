@@ -5,6 +5,8 @@
 //! translation backends without making Core depend on a concrete architecture
 //! implementation.
 
+use bitflags::bitflags;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VirtualRange {
     pub base: usize,
@@ -17,12 +19,16 @@ pub struct PhysicalRange {
     pub size: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct MappingPermission {
-    pub read: bool,
-    pub write: bool,
-    pub execute: bool,
-    pub user: bool,
+// 逻辑权限：正交的位集合（arch 无关）。默认为空 = 无权限。
+// 到具体 arch 的编码（如 Sv39 的 R/W/X/U）由各后端在 `From` 里翻译。
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub struct MappingPermission: u8 {
+        const READ    = 1 << 0;
+        const WRITE   = 1 << 1;
+        const EXECUTE = 1 << 2;
+        const USER    = 1 << 3;
+    }
 }
 
 /// 一次性"给一个已归零的页，返回其物理地址"的钩子。

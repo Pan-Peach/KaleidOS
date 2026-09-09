@@ -5,7 +5,10 @@
 
 use crate::component::ComponentId;
 use crate::memory::PAGE_SIZE;
-use arch::vm::{AddressSpaceBackend, MappingPermission};
+
+// 共享词汇表直接复用 arch::vm（os/core 依赖 os/arch，方向正确）。
+// 这里 re-export 一份，让 `address_space::PhysicalRange` 等对 memory/mod.rs 仍可用。
+pub use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AddressSpaceId(u32);
@@ -32,54 +35,18 @@ pub enum AddressSpaceState {
     Dying,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VirtualRange {
-    pub base: usize,
-    pub size: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PhysicalRange {
-    pub base: usize,
-    pub size: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct MemoryPermission {
-    pub read: bool,
-    pub write: bool,
-    pub execute: bool,
-    pub user: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mapping {
     pub virtual_range: VirtualRange,
     pub physical_range: PhysicalRange,
-    pub permission: MemoryPermission,
+    pub permission: MappingPermission,
 }
 
 /// Core 把已批准的映射翻译成 arch backend 的原始参数形式。
+/// 现在 `Mapping` 字段本身就是 arch 类型，所以直接透传即可。
 impl Mapping {
-    pub(crate) fn to_backend(
-        &self,
-    ) -> (arch::vm::VirtualRange, arch::vm::PhysicalRange, MappingPermission) {
-        (
-            arch::vm::VirtualRange {
-                base: self.virtual_range.base,
-                size: self.virtual_range.size,
-            },
-            arch::vm::PhysicalRange {
-                base: self.physical_range.base,
-                size: self.physical_range.size,
-            },
-            MappingPermission {
-                read: self.permission.read,
-                write: self.permission.write,
-                execute: self.permission.execute,
-                user: self.permission.user,
-            },
-        )
+    pub(crate) fn to_backend(&self) -> (VirtualRange, PhysicalRange, MappingPermission) {
+        (self.virtual_range, self.physical_range, self.permission)
     }
 }
 
@@ -132,50 +99,75 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         }
     }
 
-    /// Core 校验：非空、等长、页对齐、不重叠。
+    /// Core 校验一次映射：非空、等长、页对齐、不重叠。只接受批准后的映射。
     ///
-    /// TODO(你)：按 `MapError` 变体逐条检查。
-    ///   - `virtual_range.size == 0 || physical_range.size == 0` -> `EmptyRange`
-    ///   - `virtual_range.size != physical_range.size`          -> `LengthMismatch`
-    ///   - `is_page_aligned(base)` 三者                           -> `Unaligned`
-    ///   - 任一已有 mapping 与 `mapping.virtual_range` 重叠        -> `Overlap`
+    /// - `virtual_range.size == 0 || physical_range.size == 0` -> `EmptyRange`
+    /// - `virtual_range.size != physical_range.size`           -> `LengthMismatch`
+    /// - `base` 或 `size` 未页对齐                               -> `Unaligned`
+    /// - 与任一已有 mapping 的虚拟区间重叠                       -> `Overlap`
+    ///
+    /// 物理区重叠不查：同一物理页映射到多个 VA 是合法的（别名映射）。
     fn validate(&self, mapping: &Mapping) -> Result<(), MapError> {
-        let _ = (mapping, ranges_overlap, is_page_aligned);
-        todo!("KernelAddressSpace::validate")
+        let vr = mapping.virtual_range;
+        let pr = mapping.physical_range;
+        if vr.size == 0 || pr.size == 0 {
+            return Err(MapError::EmptyRange);
+        }
+        if vr.size != pr.size {
+            return Err(MapError::LengthMismatch);
+        }
+        if !is_page_aligned(vr.base) || !is_page_aligned(pr.base) {
+            return Err(MapError::Unaligned);
+        }
+        if !is_page_aligned(vr.size) || !is_page_aligned(pr.size) {
+            return Err(MapError::Unaligned);
+        }
+        for m in &self.mappings {
+            if ranges_overlap(&m.virtual_range, &vr) {
+                return Err(MapError::Overlap);
+            }
+        }
+        Ok(())
     }
 
-    /// 1) Core 验证  2) Sv39PageTable 写 PTE  3) Core 记录真相。
+    /// 映射流程：1) Core 验证  2) 后端写 PTE  3) Core 记录真相。
     ///
-    /// TODO(你)：
-    ///   - `self.validate(&mapping)?;`
-    ///   - `let (va, pa, perm) = mapping.to_backend();`
-    ///   - `self.backend.map(va, pa, perm).map_err(|_| MapError::BackendFailed)?;`
-    ///   - `self.commit(mapping);`
-    ///   - `Ok(())`
+    /// 后端写 PTE 失败即整体失败，不 record 到 `mappings`（后端内部负责回滚）。
     pub fn map(&mut self, mapping: Mapping) -> Result<(), MapError> {
-        todo!("KernelAddressSpace::map")
+        self.validate(&mapping)?;
+        let (va, pa, perm) = mapping.to_backend();
+        self.backend
+            .map(va, pa, perm)
+            .map_err(|_| MapError::BackendFailed)?;
+        self.commit(mapping);
+        Ok(())
     }
 
+    /// 把已批准并落地的映射写入真相列表。
     fn commit(&mut self, mapping: Mapping) {
         self.mappings.push(mapping);
     }
 
-    /// TODO(你)：`self.backend.unmap(...)` 失败转 `BackendFailed`；成功后从
-    /// `mappings` 里 `retain` 掉与 `range` 重叠的项。
+    /// 解除映射：后端清 PTE，Core 从 `mappings` 里移除重叠项。
+    ///
+    /// 后端 `unmap` 失败则整体失败，不触碰真相列表。
     pub fn unmap(&mut self, range: &VirtualRange) -> Result<(), MapError> {
-        let _ = range;
-        todo!("KernelAddressSpace::unmap")
+        self.backend
+            .unmap(*range)
+            .map_err(|_| MapError::BackendFailed)?;
+        self.mappings
+            .retain(|m| !ranges_overlap(&m.virtual_range, range));
+        Ok(())
     }
 
-    /// TODO(你)：`self.backend.translate(va)`。
+    /// 把虚拟地址翻译成物理地址，委托给后端。
     pub fn translate(&self, va: usize) -> Option<usize> {
-        let _ = va;
-        todo!("KernelAddressSpace::translate")
+        self.backend.translate(va)
     }
 
-    /// TODO(你)：`self.backend.activate().map_err(|_| MapError::BackendFailed)`。
+    /// 把本地址空间激活为当前 satp（委托后端写 satp + sfence）。
     pub fn activate(&self) -> Result<(), MapError> {
-        todo!("KernelAddressSpace::activate")
+        self.backend.activate().map_err(|_| MapError::BackendFailed)
     }
 }
 
