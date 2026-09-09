@@ -26,3 +26,25 @@ jobs:
           workspaces: os/boot/riscv -> target
       - name: Make check
         run: make check
+
+  # QEMU 车道：RV64/RV32 真实启动 + 自动 CoreTest（慢，独立 job）
+  qemu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: git submodule update --init --recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install RISC-V targets
+        run: |
+          rustup target add riscv64gc-unknown-none-elf
+          rustup target add riscv32imac-unknown-none-elf
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: os/boot/riscv -> target
+      - name: Make test-qemu
+        run: make test-qemu

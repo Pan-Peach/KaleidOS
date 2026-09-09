@@ -6,3 +6,4 @@ kaleidos-*
 /tools/qemu/init.kpkg
 /tests/fixtures/kpkg/*.kcomp
 /tests/fixtures/kpkg/*.kpkg
+tests/qemu/logs/

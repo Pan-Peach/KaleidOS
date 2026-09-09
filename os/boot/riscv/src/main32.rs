@@ -50,6 +50,15 @@ fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
     let mut mem_count = 0;
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(region) = region else { continue };
+        // FDT 描述是 u64；32 位目标只能表达 [0, 2^32) 的区间。
+        // 越界区间（如 -m 4G 的 0x80000000+0x100000000）直接丢弃，
+        // 不能 `as usize` 截断——否则会回绕出虚假区间，core::init 帧区失败。
+        let Some(end) = region.address.checked_add(region.len) else {
+            continue;
+        };
+        if end > u32::MAX as u64 || region.address > u32::MAX as u64 {
+            continue;
+        }
         if mem_count < memory_regions.len() {
             memory_regions[mem_count] = MemoryRegion {
                 base: region.address as usize,
