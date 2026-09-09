@@ -1,10 +1,19 @@
 //! 组件注册表：已加载组件的真相 + 生命周期状态机。
 //!
-//! 状态机：Declared → Starting → Ready；任何阶段可进入 Failed。
+//! 现行状态机（实现即契约，见 docs/component-model.md §5 全量生命周期）：
+//!
+//! ```text
+//! Declared --start--> Ready        （start 是同步的：loader 放段完成即可提供接口）
+//!     any state --mark_failed--> Failed   （恢复 = 全新实例）
+//!     any state --unload--> 记录移除       （phase 1 不回收放段内存）
+//! ```
+//!
+//! `ComponentState::Starting` 属于文档声明的全量生命周期词汇表，但当前
+//! 同步 start 不会经过它；若未来 ComponentManager 引入异步初始化，再把
+//! `Declared -> Starting -> Ready` 接上（见 review 记录，不要用测试掩盖漂移）。
 //! 非法转换返回 Err（Core 验证后才提交状态，Policy proposes 原则）。
 //! id 单调递增、不回收：组件实例 = 身份——unload 后重载同组件是新实例（新 id），
-//! 失败恢复=全新实例（component-model.md）。第一版 unload 不释放放段内存
-//! （phase 1 不承诺组件内存回收，见 AGENTS.md）。
+//! 失败恢复=全新实例（component-model.md）。
 
 use alloc::vec::Vec;
 
@@ -15,7 +24,7 @@ use spin::{Mutex, Once};
 const MAX_NAME_LEN: usize = 64;
 
 /// 一个已加载组件（加载完 loader 的调用方填充）。
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ComponentRecord {
     pub id: ComponentId,
     pub name: Vec<u8>,
@@ -230,5 +239,75 @@ mod tests {
             reg.declare(&long, 1, 2, None),
             Err(RegistryError::NameTooLong)
         );
+    }
+
+    #[test]
+    fn name_at_max_length_is_accepted() {
+        let mut reg = r();
+        let name = [b'x'; MAX_NAME_LEN];
+        assert!(reg.declare(&name, 1, 2, None).is_ok());
+    }
+
+    #[test]
+    fn duplicate_declaration_keeps_original_record() {
+        let mut reg = r();
+        let id = reg.declare(b"dup", 0x100, 0x200, None).unwrap();
+        assert_eq!(
+            reg.declare(b"dup", 0x300, 0x400, None),
+            Err(RegistryError::AlreadyDeclared)
+        );
+        let rec = reg.get(id).unwrap();
+        assert_eq!(rec.entry, 0x100, "原记录不能被覆盖");
+        assert_eq!(rec.state, ComponentState::Declared);
+    }
+
+    #[test]
+    fn unload_unknown_is_not_found() {
+        let mut reg = r();
+        assert_eq!(
+            reg.unload(ComponentId::from_raw(99)),
+            Err(RegistryError::NotFound)
+        );
+    }
+
+    #[test]
+    fn mark_failed_unknown_is_not_found() {
+        let mut reg = r();
+        assert_eq!(
+            reg.mark_failed(ComponentId::from_raw(99)),
+            Err(RegistryError::NotFound)
+        );
+    }
+
+    #[test]
+    fn failed_transition_keeps_original_state() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.start(id).unwrap();
+        // Ready 再 start：拒绝，且状态保持 Ready
+        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
+    }
+
+    #[test]
+    fn start_after_failed_is_invalid_and_keeps_failed() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.mark_failed(id).unwrap();
+        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
+    }
+
+    #[test]
+    fn unload_returns_record_and_ids_are_not_reused() {
+        let mut reg = r();
+        let first = reg.declare(b"a", 1, 2, None).unwrap();
+        let removed = reg.unload(first).unwrap();
+        assert_eq!(removed.id, first);
+        assert_eq!(reg.len(), 0);
+        // 卸载后重载同名组件 = 新实例（新 id），旧 id 不再复用
+        let second = reg.declare(b"a", 3, 4, None).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second.raw(), first.raw() + 1);
     }
 }

@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert!(t.contains(id));
         let rec = t.get(id).expect("get after create");
-        assert_eq!(rec.state, TaskState::Created);
+        assert_eq!(rec.state(), TaskState::Created);
         assert!(
             rec.kstack.base.is_multiple_of(memory::PAGE_SIZE),
             "kstack base page-aligned"
@@ -136,15 +136,18 @@ mod tests {
     }
 
     #[test]
-    fn get_mut_mutation_is_visible() {
+    fn state_is_core_controlled_not_callers_choice() {
         let _g = setup();
 
         let mut t = TaskTable::new();
         let id = t.create(ENTRY).unwrap();
-        assert!(matches!(t.get(id).unwrap().state, TaskState::Created));
-
-        t.get_mut(id).unwrap().state = TaskState::Running(CpuId(0));
-        assert!(matches!(t.get(id).unwrap().state, TaskState::Running(_)));
+        // 组件/外部 crate 拿不到 &mut state：只能走 Core 写入点。
+        // 这里用 Core 内部入口做一次合法写入，验证读取侧一致。
+        assert!(matches!(t.get(id).unwrap().state(), TaskState::Created));
+        t.get_mut(id)
+            .unwrap()
+            .set_state(TaskState::Running(CpuId(0)));
+        assert!(matches!(t.get(id).unwrap().state(), TaskState::Running(_)));
     }
 
     #[test]

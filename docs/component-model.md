@@ -260,8 +260,9 @@ impl ComponentManager {
 }
 ```
 
-（概念代码；落地时按现有 Registry 状态机 `Declared → Starting → Ready + Failed`
-接轨。当前 unload 只删记录、不释放放段内存。）
+（概念代码；落地时按现有 Registry 状态机接轨。当前 Registry 的同步 start
+直接 `Declared → Ready`，`Starting` 属全量生命周期词汇表但未接线——留给
+ComponentManager 的异步初始化阶段。当前 unload 只删记录、不释放段内存。）
 
 ### 4.3 KernelNative 具体是什么
 
