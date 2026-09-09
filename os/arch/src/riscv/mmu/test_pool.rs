@@ -89,7 +89,10 @@ pub(crate) fn init(base: usize, pages: usize, fixed: bool) {
 
 /// 让第 `n` 次及之后的 `alloc()` 失败（测 mid-map 分配失败回滚）。
 pub(crate) fn set_fail_after(n: usize) {
-    STATE.lock().unwrap_or_else(|poison| poison.into_inner()).fail_after = n;
+    STATE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .fail_after = n;
 }
 
 /// `PageAlloc` 兼容签名：返回下一个零页的"物理地址"（即真实地址，identity）。

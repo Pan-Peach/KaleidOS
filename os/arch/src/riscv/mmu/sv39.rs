@@ -499,7 +499,10 @@ mod tests {
 
     #[test]
     fn pte_flags_roundtrip() {
-        let pte = Pte::new_leaf_pa(0x1000, PteFlags::R | PteFlags::W | PteFlags::X | PteFlags::U);
+        let pte = Pte::new_leaf_pa(
+            0x1000,
+            PteFlags::R | PteFlags::W | PteFlags::X | PteFlags::U,
+        );
         assert_eq!(
             pte.flags(),
             PteFlags::R | PteFlags::W | PteFlags::X | PteFlags::U | PteFlags::V
@@ -599,9 +602,17 @@ mod tests {
         let va = 0x1000usize;
         let pa = 0x9000_0000usize;
 
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw())
+                .is_ok()
+        );
         assert_eq!(table.translate(va), Some(pa));
-        assert_eq!(table.translate(va + 0x500), Some(pa + 0x500), "页内偏移透传");
+        assert_eq!(
+            table.translate(va + 0x500),
+            Some(pa + 0x500),
+            "页内偏移透传"
+        );
         assert_eq!(table.translate(va - 1), None);
         assert_eq!(table.translate(va + PAGE_SIZE), None);
 
@@ -620,7 +631,10 @@ mod tests {
 
         assert!(table.map_range(vr(base, size), pr(pa, size), rx()).is_ok());
         for i in 0..3 {
-            assert_eq!(table.translate(base + i * PAGE_SIZE), Some(pa + i * PAGE_SIZE));
+            assert_eq!(
+                table.translate(base + i * PAGE_SIZE),
+                Some(pa + i * PAGE_SIZE)
+            );
         }
         assert!(table.unmap_range(vr(base, size)).is_ok());
         for i in 0..3 {
@@ -634,7 +648,11 @@ mod tests {
         super::super::test_pool::init(0, 64, false);
         let mut table = table();
         let va = 0x1000usize;
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw())
+                .is_ok()
+        );
 
         // 重叠 VA 的第二次映射：AlreadyMapped，且原映射不受影响
         assert_eq!(
@@ -659,14 +677,25 @@ mod tests {
         assert_eq!(result, Err(MapError::Exhausted));
         // 本次已写入的 leaf 全部回滚（Core truth 与 backend 一致）
         for i in 0..1024 {
-            assert_eq!(table.translate(base + i * PAGE_SIZE), None, "leaf {i} 必须回滚");
+            assert_eq!(
+                table.translate(base + i * PAGE_SIZE),
+                None,
+                "leaf {i} 必须回滚"
+            );
         }
         // 恢复分配能力后整段可以重新映射成功
         super::super::test_pool::set_fail_after(usize::MAX);
-        assert!(table.map_range(vr(base, size), pr(0x8000_0000, size), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(base, size), pr(0x8000_0000, size), rw())
+                .is_ok()
+        );
         assert_eq!(table.translate(base), Some(0x8000_0000));
         // 回滚没有破坏后续映射：后半段也可翻译
-        assert_eq!(table.translate(base + size - PAGE_SIZE), Some(0x8000_0000 + size - PAGE_SIZE));
+        assert_eq!(
+            table.translate(base + size - PAGE_SIZE),
+            Some(0x8000_0000 + size - PAGE_SIZE)
+        );
     }
 
     #[test]
@@ -726,7 +755,11 @@ mod tests {
         );
         // W without R
         assert_eq!(
-            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2000, PAGE_SIZE), MappingPermission::WRITE),
+            table.map_range(
+                vr(0x1000, PAGE_SIZE),
+                pr(0x2000, PAGE_SIZE),
+                MappingPermission::WRITE
+            ),
             Err(MapError::InvalidPermission)
         );
         // 全程未写任何 leaf
@@ -749,9 +782,17 @@ mod tests {
         super::super::test_pool::init(0, 64, false);
         let mut table = table();
         let va = 0x1000usize;
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw())
+                .is_ok()
+        );
         table.unmap_range(vr(va, PAGE_SIZE)).unwrap();
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw())
+                .is_ok()
+        );
         assert_eq!(table.translate(va), Some(0xA000_0000));
     }
 }

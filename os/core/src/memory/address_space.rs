@@ -504,11 +504,7 @@ mod tests {
             Just(MappingPermission::READ),
             Just(MappingPermission::READ | MappingPermission::WRITE),
             Just(MappingPermission::READ | MappingPermission::EXECUTE),
-            Just(
-                MappingPermission::READ
-                    | MappingPermission::WRITE
-                    | MappingPermission::EXECUTE
-            ),
+            Just(MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE),
         ];
         prop_oneof![
             (aligned_base(), pages.clone(), perm, any::<bool>()).prop_map(
@@ -519,8 +515,7 @@ mod tests {
                     backend_fail: fail,
                 }
             ),
-            (aligned_base(), pages)
-                .prop_map(|(base, pages)| OpKind::Unmap { base, pages }),
+            (aligned_base(), pages).prop_map(|(base, pages)| OpKind::Unmap { base, pages }),
         ]
     }
 
@@ -530,18 +525,12 @@ mod tests {
 
     /// Invariant A：ledger 内无 VA overlap（相邻允许，重叠禁止）。
     fn assert_no_overlap(mappings: &[Mapping]) {
-        let mut sorted: Vec<VirtualRange> = mappings
-            .iter()
-            .map(|m| m.virtual_range)
-            .collect();
+        let mut sorted: Vec<VirtualRange> = mappings.iter().map(|m| m.virtual_range).collect();
         sorted.sort_by_key(|r| r.base);
         for pair in sorted.windows(2) {
             let a = pair[0];
             let b = pair[1];
-            assert!(
-                a.base + a.size <= b.base,
-                "VA overlap: {a:?} vs {b:?}"
-            );
+            assert!(a.base + a.size <= b.base, "VA overlap: {a:?} vs {b:?}");
         }
     }
 
@@ -593,10 +582,7 @@ mod tests {
                     Ok(()) => {
                         // C: backend 收到整段 unmap，ledger 移除对应记录
                         assert!(space.backend.unmapped.contains(&range));
-                        assert!(!space
-                            .mappings()
-                            .iter()
-                            .any(|m| m.virtual_range == range));
+                        assert!(!space.mappings().iter().any(|m| m.virtual_range == range));
                     }
                     Err(_) => {
                         assert_eq!(space.mappings(), mappings_before.as_slice());
@@ -624,18 +610,24 @@ mod tests {
     fn property_test_helpers_are_sane() {
         // 防呆：op_seq 生成器本身必须产生合法 base（页对齐）
         let mut space = space(FakeBackend::new());
-        apply_and_check(&mut space, OpKind::Map {
-            base: PAGE_SIZE,
-            pages: 2,
-            perm: rw(),
-            backend_fail: false,
-        });
+        apply_and_check(
+            &mut space,
+            OpKind::Map {
+                base: PAGE_SIZE,
+                pages: 2,
+                perm: rw(),
+                backend_fail: false,
+            },
+        );
         assert_eq!(space.mappings().len(), 1);
         assert_no_overlap(space.mappings());
-        apply_and_check(&mut space, OpKind::Unmap {
-            base: PAGE_SIZE,
-            pages: 2,
-        });
+        apply_and_check(
+            &mut space,
+            OpKind::Unmap {
+                base: PAGE_SIZE,
+                pages: 2,
+            },
+        );
         assert_eq!(space.mappings().len(), 0);
     }
 }

@@ -431,7 +431,13 @@ mod tests {
         let mut relocator = RiscvRelocator::new();
         let reloc = rel(0, R_RISCV_64, 0, 1, 0, 0, 0);
         relocator
-            .apply(WordSize::Bits64, &mut image, BASE, reloc, 0x1234_5678_9ABC_DEF0)
+            .apply(
+                WordSize::Bits64,
+                &mut image,
+                BASE,
+                reloc,
+                0x1234_5678_9ABC_DEF0,
+            )
             .expect("64-bit data relocation");
         assert_eq!(image, 0x1234_5678_9ABC_DEF0u64.to_le_bytes());
         let mut image = [0u8; 8];

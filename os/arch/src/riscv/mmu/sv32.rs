@@ -375,7 +375,10 @@ mod tests {
     #[test]
     fn pte_flags_roundtrip() {
         let pte = Pte::new_leaf_pa(0x1000, PteFlags::R | PteFlags::W | PteFlags::U);
-        assert_eq!(pte.flags(), PteFlags::R | PteFlags::W | PteFlags::U | PteFlags::V);
+        assert_eq!(
+            pte.flags(),
+            PteFlags::R | PteFlags::W | PteFlags::U | PteFlags::V
+        );
     }
 
     // -- VPN 计算（10 位 × 2 级）--------------------------------------------------
@@ -437,7 +440,11 @@ mod tests {
         let mut table = table();
         let va = 0x1000usize;
         let pa = 0x9000_0000usize;
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw())
+                .is_ok()
+        );
         assert_eq!(table.translate(va), Some(pa));
         assert_eq!(table.translate(va + 0x500), Some(pa + 0x500));
         assert_eq!(table.translate(va - 1), None);
@@ -457,7 +464,10 @@ mod tests {
         let size = 3 * PAGE_SIZE;
         assert!(table.map_range(vr(base, size), pr(pa, size), rw()).is_ok());
         for i in 0..3 {
-            assert_eq!(table.translate(base + i * PAGE_SIZE), Some(pa + i * PAGE_SIZE));
+            assert_eq!(
+                table.translate(base + i * PAGE_SIZE),
+                Some(pa + i * PAGE_SIZE)
+            );
         }
         assert!(table.unmap_range(vr(base, size)).is_ok());
         for i in 0..3 {
@@ -480,10 +490,18 @@ mod tests {
         let result = table.map_range(vr(base, size), pr(0x8000_0000, size), rw());
         assert_eq!(result, Err(MapError::Exhausted));
         for i in 0..2048 {
-            assert_eq!(table.translate(base + i * PAGE_SIZE), None, "leaf {i} 必须回滚");
+            assert_eq!(
+                table.translate(base + i * PAGE_SIZE),
+                None,
+                "leaf {i} 必须回滚"
+            );
         }
         super::super::test_pool::set_fail_after(usize::MAX);
-        assert!(table.map_range(vr(base, size), pr(0x8000_0000, size), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(base, size), pr(0x8000_0000, size), rw())
+                .is_ok()
+        );
         assert_eq!(table.translate(base), Some(0x8000_0000));
     }
 
@@ -494,7 +512,11 @@ mod tests {
         super::super::test_pool::init_low();
         let mut table = table();
         let va = 0x1000usize;
-        assert!(table.map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw()).is_ok());
+        assert!(
+            table
+                .map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw())
+                .is_ok()
+        );
         assert_eq!(
             table.map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw()),
             Err(MapError::AlreadyMapped)
