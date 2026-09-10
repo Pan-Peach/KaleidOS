@@ -74,6 +74,13 @@ Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体�
 SBI 调用集中在 `riscv/firmware.rs`，CPU 原语在 `riscv/cpu.rs`，陷阱和上下文
 分别位于 `riscv/trap/` 与 `riscv/context/`；XLEN-specific 汇编使用
 `trap64.S`/`switch64.S` 这类窄变体。同一 ISA 支持多个板卡时再由 boot profile
+
+**boot 期内核页表策略不归 arch 所有**：identity + high-half 双映射、段权限、
+临时 root、high-half hand-off 属于 KaleidOS boot policy，位于 boot crate 的
+`vm/`（`layout.rs` = linker symbols 唯一解释者，`bootstrap.rs` = 临时静态页表，
+`runtime.rs` = 长期 buddy 页表骨架）。arch 的 `riscv/mmu` 只保留 Sv39/Sv32
+翻译机制（页表编码/walk、`activate`、`flush_tlb`），不知道 `KERNEL_VMA`、
+`.text`、`.initpkg` 或 bootstrap hand-off。
 选择对应的 Console/SystemReset backend。
 
 ### Machine Discovery —— 机器发现（不设 platform 层）

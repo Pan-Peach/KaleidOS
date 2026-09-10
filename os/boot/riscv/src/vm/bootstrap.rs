@@ -1,18 +1,23 @@
-//! RISC-V early boot page-table plan.
+//! RISC-V early boot page-table plan（**从 `arch::riscv::boot_vm` 原样搬来**，
+//! 只改归属，不改逻辑——见 git history 该文件原版）。
 //!
 //! ## 这是启动临时页表 `BootPageTable`，不是长期 `KernelAddressSpace`。
-//! 它只活在 bootstrap 到 `kernel::init()` 完成、并切到 `Sv39PageTable` root 之前。
+//! 它只活在 bootstrap 到 `kernel::init()` 完成、并切到长期 root
+//! （`super::runtime`，buddy 可用后建立）之前。
 //! 之后不要再让这里的静态表承担任何长期映射职责。
+//!
+//! 本模块是 **boot policy**（映什么、何时映），Sv39 **机制**在
+//! `arch::riscv::mmu`；`super::layout` 提供唯一的段范围/权限来源。
 //!
 //! This is the small, statically backed mapping used before Core's physical
 //! allocator exists.  It deliberately keeps both the identity window and the
-//! high-half alias alive.  A later final-kernel mapping (`KernelAddressSpace`)
-//! will replace this root after memory discovery and allocation are available.
+//! high-half alias alive.  A later final-kernel mapping (`vm::runtime`) will
+//! replace this root after memory discovery and allocation are available.
 
-use super::mmu::sv39::{ENTRIES, PageTable, Pte, PteFlags, VM_PAGE_SIZE, vpn};
+use arch::riscv::mmu::sv39::{vpn, PageTable, Pte, PteFlags, ENTRIES, VM_PAGE_SIZE};
 
-pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
-pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
+use super::layout::{KernelSection, HIGH_HALF_OFFSET, KERNEL_DATA_FLAGS, KERNEL_VMA};
+
 pub const GIGAPAGE_SIZE: usize = 1 << 30;
 const MEGAPAGE_SIZE: usize = 1 << 21;
 
@@ -25,31 +30,6 @@ const MMIO_FLAGS: PteFlags = PteFlags::R
     .union(PteFlags::W)
     .union(PteFlags::A)
     .union(PteFlags::D);
-/// Permission set for the executable text segment: read + execute.
-pub const KERNEL_TEXT_FLAGS: PteFlags = PteFlags::R
-    .union(PteFlags::X)
-    .union(PteFlags::A)
-    .union(PteFlags::D);
-/// Permission set for read-only data (`.rodata`, embedded `.initpkg`).
-pub const KERNEL_RODATA_FLAGS: PteFlags = PteFlags::R.union(PteFlags::A).union(PteFlags::D);
-/// Permission set for writable data (`.data`, `.bss`).
-pub const KERNEL_DATA_FLAGS: PteFlags = PteFlags::R
-    .union(PteFlags::W)
-    .union(PteFlags::A)
-    .union(PteFlags::D);
-
-/// One contiguous linked-image run mapped with a single permission set.
-///
-/// `va_start`/`va_end` are high-half virtual addresses (exclusive end).  The
-/// physical address of each page is derived from `linked_kernel_pa` and the
-/// offset from the link-time kernel VMA, so the boot crate only needs to pass
-/// the linker section ranges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelSection {
-    pub va_start: usize,
-    pub va_end: usize,
-    pub flags: PteFlags,
-}
 
 /// Early root storage. It lives in the image's BSS and is never used as the
 /// future per-domain AddressSpace root.
@@ -100,7 +80,7 @@ pub enum BootVmError {
 /// - root[high_root_index] : high-half aliases of those windows
 ///
 /// The bootstrap initially continues through the identity VA, then switches
-/// to the high alias with `mmu::enter_high_half` after activation.
+/// to the high alias with `enter_high_half` after activation.
 ///
 /// `ram_base` and `ram_size` come from bootstrap discovery (currently FDT).
 /// The mapping is deliberately coarse: one level-2 leaf per 1 GiB window.
@@ -491,5 +471,27 @@ pub const fn physical_address_of(address: usize) -> usize {
         low_address_of(address)
     } else {
         address
+    }
+}
+
+/// Switch to a fresh high-half boot stack and transfer control.
+///
+/// The low entry still hands off through a temporary bootstrap map. The formal
+/// image now uses high virtual addresses with low physical load addresses, so
+/// the target itself is already high-linked while the context pointer may
+/// still come from the low bootstrap stack.
+pub unsafe fn enter_high_half(low_entry: usize, low_context: usize, low_stack_top: usize) -> ! {
+    let high_entry = high_alias_or_self(low_entry);
+    let high_context = high_alias_or_self(low_context);
+    let high_stack_top = high_alias_or_self(low_stack_top);
+    unsafe {
+        core::arch::asm!(
+            "mv sp, {stack_top}",
+            "jr {entry}",
+            stack_top = in(reg) high_stack_top,
+            entry = in(reg) high_entry,
+            in("a0") high_context,
+            options(noreturn),
+        );
     }
 }

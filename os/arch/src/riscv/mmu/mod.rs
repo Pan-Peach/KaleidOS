@@ -3,6 +3,11 @@
 //! The family-level RISC-V module owns the ISA and firmware pieces; this
 //! module owns the translation mechanism boundary.  The active XLEN selects
 //! the Sv39 (RV64) or Sv32 (RV32) backend at compile time.
+//!
+//! 本层只保留**机制**：页表编码/遍历（sv39/sv32）、`activate`（satp+sfence）、
+//! `flush_tlb`。boot 期的映射策略（identity + high-half 双映射、段权限、
+//! 临时 root、enter_high_half）已移出 arch，见 boot crate `vm/`——arch 不
+//! 知道 `KERNEL_VMA` / `.text` / `.initpkg` / bootstrap hand-off。
 
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod address_space;
@@ -17,9 +22,6 @@ pub mod sv39;
 pub(crate) mod test_pool;
 
 #[cfg(target_arch = "riscv64")]
-use super::boot_vm;
-
-#[cfg(target_arch = "riscv64")]
 const SV39_MODE: usize = 8;
 #[cfg(target_arch = "riscv32")]
 const SV32_MODE: usize = 1;
@@ -28,30 +30,6 @@ const SV32_MODE: usize = 1;
 pub type AddressSpace = address_space::Sv39AddressSpace;
 #[cfg(target_arch = "riscv32")]
 pub type AddressSpace = address_space::Sv32AddressSpace;
-
-#[cfg(target_arch = "riscv64")]
-pub use super::boot_vm::{KernelSection, root as get_root_table};
-
-#[cfg(target_arch = "riscv64")]
-pub unsafe fn init_identity(
-    kernel_pa: usize,
-    linked_kernel_pa: usize,
-    image_size: usize,
-    ram_base: usize,
-    ram_size: usize,
-    sections: &[KernelSection],
-) -> Result<(), boot_vm::BootVmError> {
-    unsafe {
-        boot_vm::init(
-            kernel_pa,
-            linked_kernel_pa,
-            image_size,
-            ram_base,
-            ram_size,
-            sections,
-        )
-    }
-}
 
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub unsafe fn flush_tlb() {
@@ -90,28 +68,5 @@ pub unsafe fn activate(root_ppn: usize, asid: u16) {
             options(nostack, preserves_flags),
         );
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
-    }
-}
-
-/// Switch to a fresh high-half boot stack and transfer control.
-///
-/// The low entry still hands off through a temporary bootstrap map. The formal
-/// image now uses high virtual addresses with low physical load addresses, so
-/// the target itself is already high-linked while the context pointer may
-/// still come from the low bootstrap stack.
-#[cfg(target_arch = "riscv64")]
-pub unsafe fn enter_high_half(low_entry: usize, low_context: usize, low_stack_top: usize) -> ! {
-    let high_entry = boot_vm::high_alias_or_self(low_entry);
-    let high_context = boot_vm::high_alias_or_self(low_context);
-    let high_stack_top = boot_vm::high_alias_or_self(low_stack_top);
-    unsafe {
-        core::arch::asm!(
-            "mv sp, {stack_top}",
-            "jr {entry}",
-            stack_top = in(reg) high_stack_top,
-            entry = in(reg) high_entry,
-            in("a0") high_context,
-            options(noreturn),
-        );
     }
 }

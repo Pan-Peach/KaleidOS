@@ -9,6 +9,9 @@ Boot 全链：_start → FDT discovery → MachineInfo → core::init → Core M
 MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32（RV32，identity）均已落地，
      KernelAddressSpace（Core 语义 ledger + AddressSpaceBackend contract）+ Sv39PageTable/Sv32PageTable
      （buddy 回调分配页表页，map/unmap/translate/激活，mid-map 失败回滚）
+内核地址空间分层（boot policy 从 arch 移出）：boot crate `vm/`（layout.rs = linker symbols
+     唯一解释者；bootstrap.rs = 临时静态页表；runtime.rs = 长期 buddy 页表骨架），
+     arch `riscv/mmu` 只留 Sv39/Sv32 翻译机制
 组件加载链（Linux insmod 模式教学版，全部 QEMU 端到端验证）：
   .kcomp（ELF32/ELF64 ET_REL，no_std Rust）→ make init.kpkg（cpio + manifest）
   → .initpkg 内嵌 → store::init（cpio 解析）

@@ -23,9 +23,11 @@ pub mod vm;
 pub mod fake;
 
 // riscv 模块在所有目标都编译，但内部子模块按依赖门控：
-// - ISA/asm 子模块（cpu/context/trap/firmware/console/boot_vm）只在真实 RISC-V 目标；
+// - ISA/asm 子模块（cpu/context/trap/firmware/console）只在真实 RISC-V 目标；
 // - 纯算法子模块（elf 重定位、mmu 页表编码）host 也可编译 —— host 测试直接测
 //   生产实现，而不是一份复制算法（见 docs/testing.md）。
+// boot 期的内核页表策略（identity + high-half 双映射、段权限、临时 root）在
+// boot crate `vm/`，不属于 arch。
 pub mod riscv;
 
 pub use store::{ComponentStore, StoreEntry, StoreError};
@@ -40,8 +42,21 @@ pub type ComponentRelocationImpl = riscv::elf::RiscvRelocator;
 /// a high-half kernel symbol is reachable from a low-address component (an
 /// auipc+jalr pair only covers ±2 GiB).  Host builds have no high-half split
 /// and use the address as-is.
+///
+/// 这是 arch 的地址方案原语（ELf relocator `normalize_symbol_address` 与 boot
+/// selftest 都要用）；boot 侧的映射策略在 boot crate `vm/`，那里的
+/// `HIGH_HALF_OFFSET` 与本处**必须保持一致**（由 linker.ld 布局决定）。
 #[cfg(target_arch = "riscv64")]
-pub use riscv::boot_vm::physical_address_of;
+const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
+
+#[cfg(target_arch = "riscv64")]
+pub fn physical_address_of(address: usize) -> usize {
+    if address >= HIGH_HALF_OFFSET {
+        address.wrapping_sub(HIGH_HALF_OFFSET)
+    } else {
+        address
+    }
+}
 
 #[cfg(target_arch = "riscv32")]
 pub fn physical_address_of(address: usize) -> usize {
