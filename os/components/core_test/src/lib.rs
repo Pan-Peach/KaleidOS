@@ -74,6 +74,18 @@ mod runtime {
     const KIND_POLICY: u32 = 2;
     const STATE_EXITED: i32 = 4;
 
+    // ---- 输出样式（ANSI SGR；终端解释颜色，日志里是可剥离的控制字节）----
+    //
+    // 约束（tests/qemu/runner.py）：runner 用**连续子串**匹配
+    // `[core-test] all: PASS` 和 `load core_test: OK`，且把 "FAIL" 当作
+    // fatal marker。所以颜色码只能包在标记之外，绝不能插进标记内部。
+    mod style {
+        pub const RESET: &[u8] = b"\x1b[0m";
+        pub const BOLD_RED: &[u8] = b"\x1b[1;31m";
+        pub const BOLD_GREEN: &[u8] = b"\x1b[1;32m";
+        pub const BOLD_CYAN: &[u8] = b"\x1b[1;36m";
+    }
+
     fn puts(s: &str) {
         for &b in s.as_bytes() {
             unsafe {
@@ -82,12 +94,112 @@ mod runtime {
         }
     }
 
-    /// 报告一项检查：`[core-test] <name>: PASS|FAIL\n`。
-    fn report(name: &str, ok: bool) {
-        puts("[core-test] ");
-        puts(name);
-        puts(": ");
-        puts(if ok { "PASS\n" } else { "FAIL\n" });
+    fn puts_bytes(bytes: &[u8]) {
+        for &b in bytes {
+            unsafe {
+                console_write_byte(b);
+            }
+        }
+    }
+
+    /// 颜色包裹输出：`<color><text><reset>`。
+    fn puts_colored(color: &[u8], text: &str) {
+        puts_bytes(color);
+        puts(text);
+        puts_bytes(style::RESET);
+    }
+
+    /// 十进制输出（无 alloc 的极简实现，汇总计数用）。
+    fn put_usize(mut n: usize) {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        puts_bytes(&buf[i..]);
+    }
+
+    /// 测试报告器：分组 + 计数 + 颜色（PASS 绿 / FAIL 红）。
+    struct Reporter {
+        passed: usize,
+        total: usize,
+    }
+
+    impl Reporter {
+        const fn new() -> Self {
+            Self {
+                passed: 0,
+                total: 0,
+            }
+        }
+
+        /// 组头：`[core-test] ── <title> ──`（青色加粗，整段一次着色）。
+        fn group(&mut self, title: &str) {
+            puts("[core-test] ");
+            puts_bytes(style::BOLD_CYAN);
+            puts("── ");
+            puts(title);
+            puts(" ──");
+            puts_bytes(style::RESET);
+            puts("\n");
+        }
+
+        /// 一项检查：`[core-test]   <name>: PASS|FAIL`（缩进属于组）。返回是否通过。
+        fn check(&mut self, name: &str, ok: bool) -> bool {
+            puts("[core-test]   ");
+            puts(name);
+            puts(": ");
+            if ok {
+                puts_colored(style::BOLD_GREEN, "PASS");
+            } else {
+                puts_colored(style::BOLD_RED, "FAIL");
+            }
+            puts("\n");
+            self.total += 1;
+            if ok {
+                self.passed += 1;
+            }
+            ok
+        }
+
+        /// 汇总计数：`[core-test]   <passed>/<total> checks PASS`（全过绿，否则红）。
+        fn summary(&self) -> bool {
+            let all_ok = self.passed == self.total;
+            puts("[core-test]   ");
+            put_usize(self.passed);
+            puts("/");
+            put_usize(self.total);
+            puts(" checks ");
+            if all_ok {
+                puts_colored(style::BOLD_GREEN, "PASS");
+            } else {
+                puts_colored(style::BOLD_RED, "FAIL");
+            }
+            puts("\n");
+            all_ok
+        }
+
+        /// 终判行：**必须**保持 `[core-test] all: PASS` 为连续子串
+        /// （runner 标记）。颜色码放在行首/行尾，标记本体不动。
+        fn verdict(&self, ok: bool) {
+            puts_bytes(if ok {
+                style::BOLD_GREEN
+            } else {
+                style::BOLD_RED
+            });
+            puts(if ok {
+                "[core-test] all: PASS"
+            } else {
+                "[core-test] all: FAIL"
+            });
+            puts_bytes(style::RESET);
+            puts("\n");
+        }
     }
 
     /// 内存分配器已初始化（存在可分配空闲页）。
@@ -143,18 +255,23 @@ mod runtime {
         }
     }
     /// 组件入口（Linux module_init 约定）：0 = 全部通过；非 0 = 失败位图。
+    ///
+    /// 输出分组：boot basics（M0/M1 基础链）/ scheduling chain（C4 执行链）/
+    /// summary（计数 + 终判）。PASS 绿、FAIL 红；组头青色。
     #[unsafe(no_mangle)]
     pub extern "C" fn kcomp_init() -> i32 {
         let mut failed = 0u32;
+        let mut report = Reporter::new();
+
         macro_rules! check {
-            ($name:expr, $ok:expr, $bit:expr) => {{
-                let ok = $ok;
-                failed |= (!ok as u32) << $bit;
-                report($name, ok);
-            }};
+            ($name:expr, $ok:expr, $bit:expr) => {
+                if !report.check($name, $ok) {
+                    failed |= 1 << $bit;
+                }
+            };
         }
 
-        // 基础四检（M0/M1 链）
+        report.group("boot basics");
         check!("data", data_ok(), 0);
         let cpus = unsafe { machine_cpu_count() };
         let boot = unsafe { machine_boot_hart() };
@@ -163,7 +280,8 @@ mod runtime {
         check!("memory", memory_ok(), 2);
         check!("component", component_ok(), 3);
 
-        // C4 执行链：scheduler_rr 加载（组件 → Core ABI → 加载链）
+        report.group("scheduling chain");
+        // scheduler_rr 加载（组件 → Core ABI → 加载链）
         let rr_id = unsafe { component_load(b"scheduler_rr".as_ptr(), b"scheduler_rr".len()) };
         check!("scheduler-load", rr_id >= 0, 4);
 
@@ -201,7 +319,9 @@ mod runtime {
         };
         check!("scheduler-rr", rr_ready && rr_id >= 0, 9);
 
-        report("all", failed == 0);
+        report.group("summary");
+        let all_ok = report.summary() && failed == 0;
+        report.verdict(all_ok);
         failed as i32
     }
 }

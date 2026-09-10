@@ -23,6 +23,7 @@ from current develop (do not guess markers from old docs).
 
 import datetime
 import os
+import re
 import select
 import subprocess
 import sys
@@ -54,6 +55,10 @@ CORE_TEST_ALL_PASS = "[core-test] all: PASS"
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
+
+# 终端控制序列（core_test 的 ANSI 颜色码）：判定用原始流，写日志前剥离，
+# 让日志文件保持可 grep 的纯文本（`make qemu` 交互终端仍显示颜色）。
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # 各阶段超时（秒）：hang / 慢启动都算失败
 BOOT_TIMEOUT_S = 45
@@ -175,7 +180,7 @@ def main() -> int:
 
     except RunFailure as error:
         with open(log_path, "w") as log:
-            log.write(output)
+            log.write(ANSI_RE.sub("", output))
             log.write("\n==== RUN FAILED ====\n" + str(error) + "\n")
         print(f"FAIL ({arch}): {error}")
         print(f"log: {log_path}")
@@ -183,7 +188,7 @@ def main() -> int:
         return 1
 
     with open(log_path, "w") as log:
-        log.write(output)
+        log.write(ANSI_RE.sub("", output))
         log.write("\n==== RUN PASSED ====\n")
     for line in summary:
         print(f"[qemu-{arch}] {line}")
