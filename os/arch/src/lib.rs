@@ -15,6 +15,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod component;
+pub mod nommu;
 pub mod store;
 pub mod vm;
 
