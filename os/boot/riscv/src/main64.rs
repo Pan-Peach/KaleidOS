@@ -1,3 +1,4 @@
+use crate::vm::runtime::RuntimeVm;
 use crate::vm::{bootstrap, layout};
 use arch::CpuArch;
 use core::arch::global_asm;
@@ -291,6 +292,19 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
             Ok(()) => {
                 kernel::log!("core", "BOOT CORE OK");
 
+                // 构造 runtime VM（Sv39 动态根）并启用：buddy 已活
+                // （kernel::init 之后），替换 bootstrap 临时 root。
+                // kernel_pa = 镜像加载地址（context.reserved[0] 即镜像 PA 范围）。
+                let runtime_layout = layout::kernel_layout();
+                let kernel_pa = context.reserved[0].base;
+                let runtime_vm = RuntimeVm::build(&runtime_layout, kernel_pa, &context.info)
+                    .expect("Sv39 runtime Vm build failed");
+                runtime_vm
+                    .verify(&runtime_layout, kernel_pa)
+                    .expect("Sv39 runtime Vm verify failed");
+                runtime_vm
+                    .activate()
+                    .expect("Sv39 runtime Vm activate failed");
                 // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
                 let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
                 let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;

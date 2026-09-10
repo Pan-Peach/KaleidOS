@@ -1,4 +1,4 @@
-//! 长期内核地址空间（**骨架**：契约与调用点就位，语义实现由人类完成）。
+//! 长期内核地址空间（buddy 动态根）。
 //!
 //! `super::bootstrap::init` 建立的临时 root 只活到 `kernel::init()` 完成、
 //! buddy allocator 可用之前；此后由本模块用 `Sv39AddressSpace`（buddy 动态
@@ -19,60 +19,240 @@
 //!         Sv39 机制（arch/riscv/mmu）
 //! ```
 //!
-//! TODO(实现)：
-//! 1. `build`：`Sv39AddressSpace::new(kernel::memory::vm_page_alloc, 0)`；
-//! 2. map identity RAM（bootstrap 曾用 1 GiB 大叶的粗映射，这里 4 KiB 粒度）；
-//! 3. 按 `layout.sections()` 映射内核镜像（.text=RX / .rodata+.initpkg=R /
-//!    .data+.bss=RW）——权限与 bootstrap 保证一致（同一 layout 来源）；
-//! 4. `verify`（对照 layout 逐段 translate 校验）+ `activate`（satp 切换，
-//!    ASID 0，替换 bootstrap root）。
+//! # 映射三来源（PA 从哪来）
 //!
-//! Sv39AddressSpace 的机制（map/unmap/translate/权限/失败回滚）已在 arch
-//! crate 的 host 测试覆盖；本模块只做编排。boot crate 是 riscv-only 二进制
-//! （`test = false`），骨架语义由本 TODO 与 arch 测试共同承接。
+//! ```text
+//! layout      → 高半区内核镜像的 VA（段范围 + 权限）→ PA = kernel_pa + (va - KERNEL_VMA)
+//! info RAM    → identity 映射（VA == PA）          → PA 就是 region.base 本身
+//! info 设备   → MMIO 区间（VA == PA，RW-NX）        → PA 就是 device.base 本身
+//! ```
 //!
-//! `#![allow(dead_code)]`：骨架未接线（main64 尚未调用 `RuntimeVm`），实现
-//! 语义后随调用点一起移除。
+//! # TODO(接线与收紧)
+//! - 接线：`bootstrap_high` 在 `kernel::init()` 之后调 `build → verify → activate`，
+//!   替换 bootstrap root（当前未接线，`#![allow(dead_code)]` 待接线后移除）；
+//! - W^X 收紧：identity RAM 目前带 `EXECUTE`（阶段一组件池在 buddy identity 页里
+//!   执行，loader 从那里跑代码，见 roadmap 组件池 RWX 注记）。等 loader 改用
+//!   专用可执行区之后，identity RAM 可降为 RW-NX；
+//! - PTE 权限验证：`AddressSpaceBackend::translate` 只给 PA、不给权限位；要验证
+//!   权限需给 backend 增加只读 accessor（seam，本轮不做）。
+//!
+//! Sv39AddressSpace 的机制（map/unmap/translate/权限/失败回滚）已在 arch crate
+//! 的 host 测试覆盖；本模块只做编排。boot crate 是 riscv-only 二进制
+//! （`test = false`），编排逻辑由 QEMU 端到端验证承接。
 
 #![allow(dead_code)]
 
 use arch::riscv::mmu::address_space::Sv39AddressSpace;
+use arch::riscv::mmu::sv39::{PteFlags, VM_PAGE_SIZE};
+use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
+use kernel::machine::{IoSpace, MachineInfo};
 
-use super::layout::KernelLayout;
+use super::layout::{KernelLayout, KERNEL_VMA};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeVmError {
+    /// 页表页分配失败（buddy 耗尽）。
     PageTableAllocFailed,
+    /// map 失败（未对齐 / 已映射 / backend 错误）。
     MapFailed,
+    /// verify 未通过（段首翻译结果与期望 PA 不符）。
     VerifyFailed,
+    /// activate（satp 切换）失败。
     ActivateFailed,
+    /// 布局非法（段越界 / 算术溢出）。
+    InvalidLayout,
 }
 
 /// 长期内核地址空间（buddy 动态根）。
 pub struct RuntimeVm {
-    /// Sv39 动态根（buddy 支撑）。字段语义实现后使用；
-    /// 骨架阶段不构造，`#[allow(dead_code)]` 待 `build` 落地后移除。
     space: Sv39AddressSpace,
 }
 
+const fn align_up_page(addr: usize) -> usize {
+    (addr + VM_PAGE_SIZE - 1) & !(VM_PAGE_SIZE - 1)
+}
+
+/// layout 的 `PteFlags`（arch 编码）→ 逻辑 `MappingPermission`（backend API）。
+/// 两个位集合语义一致（R/W/X/U），只做位搬运。
+fn section_perm(flags: PteFlags) -> MappingPermission {
+    let mut perm = MappingPermission::empty();
+    if flags.contains(PteFlags::R) {
+        perm.insert(MappingPermission::READ);
+    }
+    if flags.contains(PteFlags::W) {
+        perm.insert(MappingPermission::WRITE);
+    }
+    if flags.contains(PteFlags::X) {
+        perm.insert(MappingPermission::EXECUTE);
+    }
+    if flags.contains(PteFlags::U) {
+        perm.insert(MappingPermission::USER);
+    }
+    perm
+}
+
+/// 段的高半区 VMA → 段在物理镜像内的 PA。
+fn section_pa(va_start: usize, kernel_pa: usize) -> Result<usize, RuntimeVmError> {
+    let offset = va_start
+        .checked_sub(KERNEL_VMA)
+        .ok_or(RuntimeVmError::InvalidLayout)?;
+    kernel_pa
+        .checked_add(offset)
+        .ok_or(RuntimeVmError::InvalidLayout)
+}
+
 impl RuntimeVm {
-    /// 建立长期 root（见模块文档 TODO）：
-    /// `Sv39AddressSpace::new(kernel::memory::vm_page_alloc, 0)` →
-    /// map identity RAM → map `layout.sections()`。
+    /// 建立长期 root。四个输入覆盖全部 PA 来源（见模块文档）：
+    /// 0. 低引导区的高半区影子（`[KERNEL_VMA, text.va_start)`，RW-NX——含
+    ///    `.bss.stack` 高栈与 `.bss.early_root`，bootstrap_high 正跑在上面）；
+    /// 1. identity RAM（`info.memory_regions`，VA == PA，RWX——阶段一组件池）；
+    /// 2. 内核镜像正式段（`layout.sections()`，PA 由 `kernel_pa` 推导，段权限）；
+    /// 3. 设备 MMIO（`info.devices`，VA == PA，RW-NX）。
     pub fn build(
-        _layout: &KernelLayout,
-        _memory: &[kernel::machine::MemoryRegion],
+        layout: &KernelLayout,
+        kernel_pa: usize,
+        info: &MachineInfo,
     ) -> Result<Self, RuntimeVmError> {
-        todo!("RuntimeVm::build —— Sv39AddressSpace::new(vm_page_alloc, 0) → identity RAM → KernelLayout")
+        let mut space = Sv39AddressSpace::new(kernel::memory::vm_page_alloc, 0)
+            .map_err(|_| RuntimeVmError::PageTableAllocFailed)?;
+
+        // 0) 低引导区高半区影子 [KERNEL_VMA, text.va_start)：bootstrap 用
+        //    "Pass 1 整镜像 RW" 覆盖它；runtime 只映正式段之前的影子
+        //    （正式段彼此页对齐贴齐、无 gap）。`.bss.stack` 高栈在这里，
+        //    activate 后 CPU 还在其上运行——漏了必 fault。
+        let shadow_size = layout.text.va_start - KERNEL_VMA;
+        if shadow_size > 0 {
+            let shadow_perm = MappingPermission::READ | MappingPermission::WRITE;
+            space
+                .map(
+                    VirtualRange {
+                        base: KERNEL_VMA,
+                        size: shadow_size,
+                    },
+                    PhysicalRange {
+                        base: kernel_pa,
+                        size: shadow_size,
+                    },
+                    shadow_perm,
+                )
+                .map_err(|_| RuntimeVmError::MapFailed)?;
+        }
+
+        // 1) identity RAM：VA == PA。bootstrap 曾用 1 GiB 大叶的粗映射，这里
+        //    4 KiB 粒度。阶段一带 EXECUTE：组件池在 buddy identity 页里执行
+        //    （loader 从那里跑代码）；W^X 收紧见模块文档 TODO。
+        let ram_perm =
+            MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE;
+        for r in &info.memory_regions[..info.mem_count] {
+            if r.size == 0 {
+                continue;
+            }
+            space
+                .map(
+                    VirtualRange {
+                        base: r.base,
+                        size: r.size,
+                    },
+                    PhysicalRange {
+                        base: r.base,
+                        size: r.size,
+                    },
+                    ram_perm,
+                )
+                .map_err(|_| RuntimeVmError::MapFailed)?;
+        }
+
+        // 2) 内核镜像：段 VA 高半区，PA = kernel_pa + (va_start - KERNEL_VMA)。
+        //    段 end 未必页对齐（如 .text 止于 ..96d6），必须 round_up 到 4K；
+        //    map_range 要求 size 页对齐（sv39.rs 的 is_page_aligned 校验）。
+        for section in layout.sections() {
+            if section.va_start == section.va_end {
+                continue; // 空段（如未内嵌 .initpkg 时）
+            }
+            if section.va_start & (VM_PAGE_SIZE - 1) != 0 {
+                return Err(RuntimeVmError::InvalidLayout);
+            }
+            let pa = section_pa(section.va_start, kernel_pa)?;
+            let size = align_up_page(
+                section
+                    .va_end
+                    .checked_sub(section.va_start)
+                    .ok_or(RuntimeVmError::InvalidLayout)?,
+            );
+            space
+                .map(
+                    VirtualRange {
+                        base: section.va_start,
+                        size,
+                    },
+                    PhysicalRange { base: pa, size },
+                    section_perm(section.flags),
+                )
+                .map_err(|_| RuntimeVmError::MapFailed)?;
+        }
+
+        // 3) 设备 MMIO：VA == PA，RW-NX（设备寄存器永不执行）。
+        //    FDT 的 reg 区间未必页对齐，映射覆盖它的整页窗口（稍大无害）。
+        let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
+        for d in &info.devices[..info.dev_count] {
+            if let IoSpace::Mmio { base, size } = d.space {
+                if size == 0 {
+                    continue;
+                }
+                let map_base = base & !(VM_PAGE_SIZE - 1);
+                let map_end = base
+                    .checked_add(size)
+                    .map(align_up_page)
+                    .ok_or(RuntimeVmError::InvalidLayout)?;
+                let map_size = map_end - map_base;
+                space
+                    .map(
+                        VirtualRange {
+                            base: map_base,
+                            size: map_size,
+                        },
+                        PhysicalRange {
+                            base: map_base,
+                            size: map_size,
+                        },
+                        mmio_perm,
+                    )
+                    .map_err(|_| RuntimeVmError::MapFailed)?;
+            }
+        }
+
+        Ok(Self { space })
     }
 
-    /// 对照 layout 逐段 translate 校验映射已就位。
-    pub fn verify(&self) -> Result<(), RuntimeVmError> {
-        todo!("RuntimeVm::verify —— 逐段 translate 校验")
+    /// 对照 layout 逐段校验：段首地址必须能翻译回期望 PA。
+    ///
+    /// 注意：`translate` 只证明"映上了且 PA 对"，验证不了 PTE 权限位
+    /// （backend accessor 是未来 seam，见模块文档 TODO）。
+    pub fn verify(&self, layout: &KernelLayout, kernel_pa: usize) -> Result<(), RuntimeVmError> {
+        // 低引导影子（高栈）首地址必须可翻译回 kernel_pa。
+        if layout.text.va_start > KERNEL_VMA {
+            match self.space.translate(KERNEL_VMA) {
+                Some(pa) if pa == kernel_pa => {}
+                _ => return Err(RuntimeVmError::VerifyFailed),
+            }
+        }
+        for section in layout.sections() {
+            if section.va_start == section.va_end {
+                continue;
+            }
+            let expected_pa = section_pa(section.va_start, kernel_pa)?;
+            match self.space.translate(section.va_start) {
+                Some(pa) if pa == expected_pa => {}
+                _ => return Err(RuntimeVmError::VerifyFailed),
+            }
+        }
+        Ok(())
     }
 
     /// 激活为当前 satp（替换 bootstrap 临时 root，ASID 0）。
     pub fn activate(&self) -> Result<(), RuntimeVmError> {
-        todo!("RuntimeVm::activate —— backend activate + sfence")
+        self.space
+            .activate()
+            .map_err(|_| RuntimeVmError::ActivateFailed)
     }
 }
