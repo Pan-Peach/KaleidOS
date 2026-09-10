@@ -1,10 +1,14 @@
-use core::arch::global_asm;
-
-#[cfg(target_arch = "riscv32")]
-global_asm!(include_str!("trap32.S"));
-
-#[cfg(target_arch = "riscv64")]
-global_asm!(include_str!("trap64.S"));
+//! RISC-V trap 入口与解码。
+//!
+//! 按 privilege mode 拆成两个实现模块（编译期选实现，不需要动态抽象——
+//! 与 `entry32.S/entry64.S` 同一思路）：
+//!
+//! - `supervisor`：S-mode（`stvec`/`scause`/`sepc`/`stval`），当前唯一实现；
+//! - `machine`：M-mode（`mtvec`/`mcause`/`mepc`/`mtval`），骨架待实现。
+//!
+//! 两模式共享的**解码**部分留在本文件：`TrapFrame`、`Trap`/`Exception`/
+//! `Interrupt` 与 `Scause`（cause 编码在 S/M 模式一致，只差寄存器名与
+//! 中断位位置的处理方式）。
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,8 @@ impl Interrupt {
     }
 }
 
+/// cause 寄存器解码（`Scause` 名称沿用 S-mode；M-mode 下语义相同，
+/// 只是中断位位置与寄存器名不同，由 `machine` 模块自行读取）。
 struct Scause(usize);
 
 impl Scause {
@@ -97,41 +103,8 @@ impl Scause {
     }
 }
 
-pub fn init() {
-    unsafe {
-        set_trap_vector();
-    }
-}
+pub mod machine;
+pub mod supervisor;
 
-unsafe fn set_trap_vector() {
-    unsafe extern "C" {
-        static trap_vec: u8;
-    }
-
-    let addr = core::ptr::addr_of!(trap_vec) as usize;
-
-    unsafe {
-        core::arch::asm!("csrw stvec, {addr}",
-            addr = in(reg) addr,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, stval: usize) -> ! {
-    let scause = Scause::from_bits(raw_scause);
-    let trap = scause.cause();
-    let sepc = unsafe { (*trap_frame).sepc };
-
-    match trap {
-        Trap::Interrupt(_) => panic!(
-            "unhandled interrupt: scause={:#x}, sepc={:#x}, stval={:#x}",
-            raw_scause, sepc, stval
-        ),
-        Trap::Exception(_) => panic!(
-            "unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}",
-            raw_scause, sepc, stval
-        ),
-    }
-}
+/// S-mode trap 安装入口（当前唯一实现；`cpu.rs` 的 `CpuImpl::init` 调用）。
+pub use supervisor::init;
