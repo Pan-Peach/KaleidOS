@@ -421,7 +421,7 @@ execution/
   └── AddressSpaceManager / AddressSpaceSlot（未来 C10）
 
 
-irq.rs       —— IrqTable，record 带 owner: ComponentId
+irq/         —— IrqTable，record 带 owner: ComponentId（模块按概念拆子文件，不堆单文件）
 mmio.rs      —— MmioTable，record 带 owner: ComponentId
 dma.rs       —— DmaTable，record 带 owner: ComponentId
 

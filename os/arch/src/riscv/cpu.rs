@@ -5,7 +5,7 @@
 //! the family-level CPU contract again.
 
 use super::{console, firmware, trap};
-use crate::{Console, CpuArch, ResetType, SystemReset};
+use crate::{Console, CpuArch, ResetType, SystemReset, Timer};
 
 pub struct Riscv;
 
@@ -19,6 +19,7 @@ pub struct RiscvContext {
 
 impl CpuArch for Riscv {
     type Context = RiscvContext;
+    type IrqFlags = usize;
 
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         unsafe extern "C" {
@@ -39,6 +40,28 @@ impl CpuArch for Riscv {
 
     fn init() {
         trap::init();
+    }
+
+    fn disable_irq() -> Self::IrqFlags {
+        // TODO(C5): csrr 保存 sstatus.SIE → 清 SIE → 返回旧 sstatus；irq-save 进入。
+        todo!("C5: sstatus.SIE irq-save")
+    }
+
+    fn restore_irq(_flags: Self::IrqFlags) {
+        // TODO(C5): 恢复 sstatus.SIE（仅当保存值为开时置位）；irq-save 退出。
+        todo!("C5: sstatus.SIE irq-restore")
+    }
+}
+
+impl Timer for Riscv {
+    fn now() -> u64 {
+        // TODO(C5): 委托 `firmware::time()`（rdtime 或 SBI TIME）。
+        todo!("C5: Timer::now")
+    }
+
+    fn set_deadline(_deadline: u64) {
+        // TODO(C5): 委托 `firmware::set_timer(deadline)`（SBI TIME 扩展）。
+        todo!("C5: Timer::set_deadline")
     }
 }
 

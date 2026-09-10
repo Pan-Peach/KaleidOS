@@ -91,6 +91,8 @@ pub fn init(
 
     task::init();
     sched::init();
+    // TODO(C5): timer::init(timebase_hz) —— 时钟中断接线（实现后启用；
+    //   回调注册 + 中断开闸见 core/src/timer.rs 模块文档的接线点）。
     component::registry::init();
     component::interface::init();
     log!("core", "init OK");

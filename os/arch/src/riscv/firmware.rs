@@ -45,3 +45,23 @@ pub fn system_reset(reset_type: ResetType) -> ! {
         Err(error) => panic!("SBI system reset failed: {:?}", error),
     }
 }
+
+/// 读取当前时间（timebase tick，单调递增）。
+///
+/// TODO(C5)：实现。两条路（择一/带兜底）：
+/// - S-mode 直接 `rdtime`（当前 QEMU/OpenSBI 已开 `scounteren`，boot 日志可见）；
+/// - SBI TIME 扩展探测（更可移植，但多一次 ecall）。
+pub fn time() -> u64 {
+    todo!("C5: read time (rdtime / SBI TIME)")
+}
+
+/// 编程下一次时钟中断的绝对 deadline（SBI TIME 扩展）。
+///
+/// 到点后硬件置 `mip.STIP` → OpenSBI 委托为 `sip.STIP` → 在 `sie.STIE`
+/// 打开时向 S-mode 投递时钟中断。`deadline` 与 [`time`] 同一基准。
+///
+/// TODO(C5)：实现（`sbi_rt::set_timer(deadline)`；SBI TIME 自 0.2 起可用，
+/// 当前 QEMU 的 OpenSBI 0.8 兼容；无 sstc，走 SBI 是唯一路径）。
+pub fn set_timer(_deadline: u64) {
+    todo!("C5: SBI TIME set_timer")
+}

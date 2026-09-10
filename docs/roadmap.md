@@ -62,7 +62,8 @@ P1 任务系统打通：
   ✅ C4  调度执行链（已完成：scheduler_rr 组件经 Interface 发布 SchedulerPolicy v1；
          Core propose→validate→commit + 锚点上下文切换；core_test 端到端 11 项自检，RV64+RV32）
 P2 中断/驱动雏形：
-  C5   timer（sbi/虚拟 CLINT）+ 时钟中断
+  🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
+         timer/sched seam、ArchTest 位），逻辑待手写
   C6   IRQ/PLIC + 驱动模型（virtio 等）—— MmioHandle/IrqHandle 实战入口
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）

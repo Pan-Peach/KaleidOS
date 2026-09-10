@@ -126,6 +126,7 @@ pub fn run() -> ! {
         b"load-fault" => load_fault(),
         b"store-readonly" => store_readonly_fault(),
         b"execute-nx" => execute_nx_fault(),
+        b"timer" => timer(),
         _ => fail("unknown command"),
     }
 }
@@ -183,6 +184,16 @@ fn execute_nx_fault() -> ! {
     let entry: unsafe extern "C" fn() = unsafe { core::mem::transmute(address) };
     unsafe { entry() };
     fail("NX execute returned")
+}
+
+/// 定时器 ArchTest（C5 骨架位）：N tick 窗口内时钟中断确实触发，且 `sret`
+/// 返回后被打断的现场（寄存器/栈）不破坏。
+///
+/// TODO(C5)：实现 + 在 `tests/qemu/arch_runner.py` 的 CASES 注册
+/// `("timer", None)`。接线点：`firmware::set_timer`（或 `arch::TimerImpl`）、
+/// `sie.STIE` / `sstatus.SIE` 开闸、ISR 计数；本用例走裸 arch（不依赖 Core）。
+fn timer() -> ! {
+    todo!("C5: timer arch selftest")
 }
 
 fn context_switch() -> ! {

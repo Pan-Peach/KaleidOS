@@ -145,6 +145,11 @@ fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), S
     let next = pick_next(&runnable)?;
 
     // Phase 1：锁内 commit 状态 + 取上下文指针
+    //
+    // TODO(C5): 抢占安全——时钟中断可能在本临界区内打断（被打破的上下文
+    //   持有 cpu/table 锁时，trap 处理器再取同样的锁 = 自死锁）。实现抢占前
+    //   本临界区必须 irq-save：CpuImpl::disable_irq() / restore_irq()，
+    //   决策注记见 core/src/irq.rs。
     let (from_ptr, to_ptr): (*mut ContextImpl, *const ContextImpl) = {
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
@@ -221,6 +226,20 @@ pub fn yield_current() -> Result<(), SchedError> {
 pub fn exit_current() -> Result<(), SchedError> {
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Exited))
+}
+
+/// 时钟抢占入口（`timer::on_trap` 调用；中断上下文）。
+///
+/// # 设计决策（TODO，选型 + 实现留给人）
+///
+/// - **延迟重调度**：只置"需要重调度"标志，安全点消费（实现简单；抢占延迟
+///   一个安全点，安全点的选择本身是设计点）；
+/// - **trap 内直接切换**：处理器里直接走 `schedule_next`——进入前必须先解决
+///   两件事：(1) phase-1 临界区 irq-save（见下）；(2) `__switch` 的 sstatus
+///   语义（trap 上下文 SIE=0，切出去的目标恢复后由谁开中断要想清楚；
+///   协作式模型下 sstatus 不在 RiscvContext 里，这正是需要正面回答的地方）。
+pub fn on_timer_tick() {
+    todo!("C5: 时钟抢占")
 }
 
 #[cfg(test)]

@@ -319,6 +319,10 @@ mod runtime {
         };
         check!("scheduler-rr", rr_ready && rr_id >= 0, 9);
 
+        // TODO(C5): 抢占链用例——两个"不 yield 的忙循环"任务被时钟强行切出
+        //   （当前调度是协作式；timer 实现 + sched::on_timer_tick 接线后，
+        //   在 scheduling chain 组追加 preempt check）。
+
         report.group("summary");
         let all_ok = report.summary() && failed == 0;
         report.verdict(all_ok);

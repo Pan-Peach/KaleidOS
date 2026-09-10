@@ -74,16 +74,36 @@ pub enum ResetType {
     WarmReboot,
 }
 
-/// CPU/ISA 原语：上下文、寄存器切换和架构初始化。
+/// CPU/ISA 原语：上下文、寄存器切换、中断开关和架构初始化。
 ///
 /// 这个 trait 不包含 console、reset 或设备操作；那些属于 firmware/platform
 /// 服务，由同一个具体 backend 分别实现相应的 trait。
 pub trait CpuArch {
     /// 寄存器上下文类型。
     type Context;
+    /// 中断开关的保存状态（RISC-V：`sstatus.SIE`；host fake：`()`）。
+    /// C5 骨架：irq-save 临界区的状态载体。
+    type IrqFlags;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     fn init();
+    /// 关中断并返回先前状态（irq-save 临界区进入）。
+    /// TODO(C5): Riscv 实现 = `sstatus.SIE` 保存 + 清零；fake = no-op。
+    fn disable_irq() -> Self::IrqFlags;
+    /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）。
+    fn restore_irq(flags: Self::IrqFlags);
+}
+
+/// 时钟 / 单次定时器服务（firmware/platform 能力，不是 ISA 原语）。
+///
+/// 与 `Console`/`SystemReset` 同一模式：Core 只依赖本 trait 与 `TimerImpl`，
+/// 不感知 SBI/CLINT 细节。时间单位 = 平台的 timebase tick。
+/// C5 骨架：签名即契约，实现待手写。
+pub trait Timer {
+    /// 当前时间（单调递增）。
+    fn now() -> u64;
+    /// 编程下一次时钟中断的**绝对** deadline（与 `now` 同一基准）。
+    fn set_deadline(deadline: u64);
 }
 
 /// 早期 console 服务。它是 boot/firmware 传输能力，不是 CPU ISA 原语。
@@ -120,6 +140,13 @@ pub type ResetImpl = riscv::Riscv;
 
 #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub type ResetImpl = fake::Fake;
+
+/// 当前编译目标的时钟/定时器 backend（C5 骨架；与 Console/Reset 同模式）。
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type TimerImpl = riscv::Riscv;
+
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+pub type TimerImpl = fake::Fake;
 
 /// Core 使用的任务上下文类型；Core 不关心具体 ISA 的寄存器布局。
 pub type ContextImpl = <CpuImpl as CpuArch>::Context;

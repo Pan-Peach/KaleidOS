@@ -1,4 +1,4 @@
-use crate::{Console, CpuArch, ResetType, SystemReset};
+use crate::{Console, CpuArch, ResetType, SystemReset, Timer};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
@@ -49,6 +49,8 @@ impl FakeContext {
 
 impl CpuArch for Fake {
     type Context = FakeContext;
+    type IrqFlags = ();
+
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         // Placeholder for context switch logic
         println!("Switching context from {:?} to {:?}", from, to);
@@ -65,6 +67,25 @@ impl CpuArch for Fake {
 
     fn init() {
         trap::init();
+    }
+
+    fn disable_irq() -> Self::IrqFlags {
+        // host 无真实中断：no-op 占位（C5 骨架；irq-save 语义在真机上由 Riscv 实现）。
+    }
+
+    fn restore_irq(_flags: Self::IrqFlags) {
+        // host 无真实中断：no-op 占位。
+    }
+}
+
+impl Timer for Fake {
+    fn now() -> u64 {
+        // host 占位时间源（C5 骨架）：非单调 0，仅供编译/接线占位。
+        0
+    }
+
+    fn set_deadline(_deadline: u64) {
+        // host 无定时器硬件：no-op 占位。
     }
 }
 

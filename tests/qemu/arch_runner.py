@@ -32,6 +32,7 @@ CASES = (
     ("load-fault", 13),
     ("store-readonly", 15),
     ("execute-nx", 12),
+    # ("timer", None),  # C5: 等 selftest::timer 实现后注册启用
 )
 
 
