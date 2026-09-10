@@ -81,7 +81,7 @@ pub fn memory(_line: &[u8]) {
     printk!(
         "free pages: {} (~{:#x} bytes)\n",
         free_pages,
-        free_pages * memory::PAGE_SIZE
+        free_pages * memory::ALLOC_GRANULE
     );
 }
 

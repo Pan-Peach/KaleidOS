@@ -4,7 +4,6 @@
 //! translation representation belongs to an architecture backend.
 
 use crate::component::ComponentId;
-use crate::memory::PAGE_SIZE;
 
 // 共享词汇表直接复用 arch::vm（os/core 依赖 os/arch，方向正确）。
 // 这里 re-export 一份，让 `address_space::PhysicalRange` 等对 memory/mod.rs 仍可用。
@@ -61,8 +60,10 @@ pub enum MapError {
     BackendFailed,
 }
 
-fn is_page_aligned(addr: usize) -> bool {
-    addr & (PAGE_SIZE - 1) == 0
+/// 对齐检查委托给 backend 的 `GRANULE`（不引用分配器常量）。
+/// GRANULE 必须是 2 的幂；NoMMU backend 用 1 时这里自动退化为恒真。
+fn is_aligned<B: AddressSpaceBackend>(addr: usize) -> bool {
+    addr & (B::GRANULE - 1) == 0
 }
 
 fn ranges_overlap(a: &VirtualRange, b: &VirtualRange) -> bool {
@@ -136,10 +137,10 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         if vr.size != pr.size {
             return Err(MapError::LengthMismatch);
         }
-        if !is_page_aligned(vr.base) || !is_page_aligned(pr.base) {
+        if !is_aligned::<B>(vr.base) || !is_aligned::<B>(pr.base) {
             return Err(MapError::Unaligned);
         }
-        if !is_page_aligned(vr.size) || !is_page_aligned(pr.size) {
+        if !is_aligned::<B>(vr.size) || !is_aligned::<B>(pr.size) {
             return Err(MapError::Unaligned);
         }
         // 先做 checked 溢出，保证后续 `ranges_overlap` 里 `base+size` 不绕回。
@@ -257,6 +258,9 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     // -- FakeBackend：记录调用，可在宿主上锁定 Core invariant -------------
+    /// 测试 fixture 的 VM 对齐常量：与 FakeBackend::GRANULE 一致（4 KiB），
+    /// 与分配器 `ALLOC_GRANULE` 无耦合（这正是要验证的解耦）。
+    const VM_PAGE: usize = 4096;
 
     struct FakeBackend {
         mapped: Vec<(VirtualRange, PhysicalRange, MappingPermission)>,
@@ -278,6 +282,7 @@ mod tests {
 
     impl AddressSpaceBackend for FakeBackend {
         type Error = ();
+        const GRANULE: usize = VM_PAGE;
 
         fn map(
             &mut self,
@@ -491,7 +496,7 @@ mod tests {
 
     fn aligned_base() -> impl Strategy<Value = usize> {
         // 上限压小，让序列里容易产生 overlap / 相邻区间
-        (0usize..0x1000).prop_map(|pages| pages * PAGE_SIZE)
+        (0usize..0x1000).prop_map(|pages| pages * VM_PAGE)
     }
 
     /// 序列生成器：随机 map（随机权限 + 随机 backend 失败）与 unmap。
@@ -525,7 +530,7 @@ mod tests {
     }
 
     fn size_of(pages: usize) -> usize {
-        pages * PAGE_SIZE
+        pages * VM_PAGE
     }
 
     /// Invariant A：ledger 内无 VA overlap（相邻允许，重叠禁止）。
@@ -623,7 +628,7 @@ mod tests {
         apply_and_check(
             &mut space,
             OpKind::Map {
-                base: PAGE_SIZE,
+                base: VM_PAGE,
                 pages: 2,
                 perm: rw(),
                 backend_fail: false,
@@ -634,11 +639,24 @@ mod tests {
         apply_and_check(
             &mut space,
             OpKind::Unmap {
-                base: PAGE_SIZE,
+                base: VM_PAGE,
                 pages: 2,
                 backend_fail: false,
             },
         );
         assert_eq!(space.mappings().len(), 0);
+    }
+
+    /// 骨架测试：`arch::nommu::NoMmuAddressSpace` 语义实现后去掉 `#[ignore]`。
+    /// GRANULE=1 时，Core 的 `validate` 必须放行非 4K 对齐区间——
+    /// 这是"Core 不依赖 MMU"的硬证据（对应 roadmap 的 NoMMU 验收点）。
+    #[test]
+    #[ignore = "arch::nommu::NoMmuAddressSpace 语义实现后启用"]
+    fn core_validation_accepts_unaligned_with_granule_one() {
+        use arch::nommu::NoMmuAddressSpace;
+        // TODO: KernelAddressSpace::<NoMmuAddressSpace>::new(...) 后，
+        //       map 一个非 4K 对齐的 { base: 0x1005, size: 0x1000 } 必须 Ok
+        //       （对照：Sv39 backend 下同一输入必须 Err(Unaligned)）。
+        let _ = NoMmuAddressSpace;
     }
 }

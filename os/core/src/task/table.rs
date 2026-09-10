@@ -33,9 +33,10 @@ impl TaskTable {
     /// 唯二创建入口（public）：分配 id + 登记 record。
     pub fn create(&mut self, entry: usize) -> Result<TaskId, TaskError> {
         let id = self.alloc();
-        let memory = memory::alloc_region(memory::PAGE_SIZE).map_err(|_| TaskError::NoMemory)?;
+        let memory =
+            memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| TaskError::NoMemory)?;
         let region = memory.region();
-        let kstack = Kernelstack::new(region.base, memory::PAGE_SIZE);
+        let kstack = Kernelstack::new(region.base, memory::ALLOC_GRANULE);
         let context = CpuImpl::new_context(entry, kstack.base + kstack.size);
         let record = TaskRecord::new(Box::new(context), kstack, memory);
         self.insert(id, record)?;
@@ -129,10 +130,10 @@ mod tests {
         let rec = t.get(id).expect("get after create");
         assert_eq!(rec.state(), TaskState::Created);
         assert!(
-            rec.kstack.base.is_multiple_of(memory::PAGE_SIZE),
+            rec.kstack.base.is_multiple_of(memory::ALLOC_GRANULE),
             "kstack base page-aligned"
         );
-        assert_eq!(rec.kstack.size, memory::PAGE_SIZE);
+        assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
     }
 
     #[test]
@@ -172,7 +173,7 @@ mod tests {
         let mut t = TaskTable::new();
         let id = t.create(ENTRY).unwrap();
         let rec = t.remove(id).expect("remove");
-        assert_eq!(rec.kstack.size, memory::PAGE_SIZE);
+        assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
         assert!(t.is_empty());
         assert_eq!(
             t.remove(id),
@@ -187,7 +188,7 @@ mod tests {
 
         let mut t = TaskTable::new();
         let mut held = Vec::new();
-        while let Ok(lease) = memory::alloc_region(memory::PAGE_SIZE) {
+        while let Ok(lease) = memory::alloc_region(memory::ALLOC_GRANULE) {
             held.push(lease);
         }
         assert!(matches!(t.create(ENTRY), Err(TaskError::NoMemory)));
@@ -201,21 +202,21 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let f1 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
+        let f1 = memory::alloc_region(memory::ALLOC_GRANULE).unwrap();
         let r1 = f1.region();
         let rec1 = TaskRecord::new(
-            Box::new(CpuImpl::new_context(ENTRY, r1.base + memory::PAGE_SIZE)),
-            Kernelstack::new(r1.base, memory::PAGE_SIZE),
+            Box::new(CpuImpl::new_context(ENTRY, r1.base + memory::ALLOC_GRANULE)),
+            Kernelstack::new(r1.base, memory::ALLOC_GRANULE),
             f1,
         );
         let id = TaskId::from_raw(7);
         assert_eq!(t.insert(id, rec1), Ok(()));
 
-        let f2 = memory::alloc_region(memory::PAGE_SIZE).unwrap();
+        let f2 = memory::alloc_region(memory::ALLOC_GRANULE).unwrap();
         let r2 = f2.region();
         let rec2 = TaskRecord::new(
-            Box::new(CpuImpl::new_context(ENTRY, r2.base + memory::PAGE_SIZE)),
-            Kernelstack::new(r2.base, memory::PAGE_SIZE),
+            Box::new(CpuImpl::new_context(ENTRY, r2.base + memory::ALLOC_GRANULE)),
+            Kernelstack::new(r2.base, memory::ALLOC_GRANULE),
             f2,
         );
 

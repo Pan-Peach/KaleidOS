@@ -24,8 +24,12 @@ pub mod address_space;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Backend 的最小物理映射粒度（4 KiB）。
-pub const PAGE_SIZE: usize = 4096;
+/// 物理内存分配粒度（buddy 最小单元 / 区域对齐），当前 4 KiB。
+///
+/// 这只是**分配器/物理内存机制**的粒度，与 VM 翻译粒度无关
+/// （翻译粒度由各 `AddressSpaceBackend` 的 `GRANULE` 声明，见 arch/src/vm.rs）。
+/// NoMMU 目标允许该值随 build/profile 变化，不承诺 4 KiB。
+pub const ALLOC_GRANULE: usize = 4096;
 
 /// MetadataHeap 最大 order（FREE_AREA 槽数；最大块 = 8B << 31 = 16 TiB）。
 pub const HEAP_ORDER: usize = 32;
@@ -35,7 +39,7 @@ pub const HEAP_MIN_ORDER: usize = 12;
 
 /// 对齐到最小物理页。
 pub const fn align_up_page(addr: usize) -> usize {
-    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    (addr + ALLOC_GRANULE - 1) & !(ALLOC_GRANULE - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +109,7 @@ pub fn init(region_start: usize, region_end: usize) -> Result<(), &'static str> 
     // 锁后日志：不持分配器锁打印（打印可能分配/被 panic 中途打断）。
     match &init_result {
         Ok(()) => {
-            let span_pages = (region_end - region_start) / PAGE_SIZE;
+            let span_pages = (region_end - region_start) / ALLOC_GRANULE;
             log!(
                 "memory",
                 "region 0x{:x}-0x{:x} span_pages={}",
@@ -131,7 +135,7 @@ fn order_for_size(size: usize) -> Result<usize, MemoryError> {
         return Err(MemoryError::InvalidSize);
     }
     let mut order = HEAP_MIN_ORDER;
-    let mut capacity = PAGE_SIZE;
+    let mut capacity = ALLOC_GRANULE;
     while capacity < size {
         capacity = capacity.checked_mul(2).ok_or(MemoryError::InvalidSize)?;
         order += 1;
@@ -193,13 +197,13 @@ fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError
 // cross-crate callback contract; allocation diagnostics stay in Core.
 #[allow(clippy::result_unit_err)]
 pub fn vm_page_alloc() -> Result<usize, ()> {
-    let lease = alloc_region(PAGE_SIZE).map_err(|_| ())?;
+    let lease = alloc_region(ALLOC_GRANULE).map_err(|_| ())?;
     let base = lease.region().base;
     // 页表页在 space 销毁前不归还（v1 无回收），因此 forget lease 保活。
     core::mem::forget(lease);
     // SAFETY: base 来自 alloc_region，已页对齐且是 4K 有效物理页，可写。
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(base as *mut u8, 0, ALLOC_GRANULE);
     }
     Ok(base)
 }
@@ -250,14 +254,14 @@ mod tests {
         let _g = test_support::GUARD.lock();
         test_support::ensure_init();
 
-        let lease = alloc_region(PAGE_SIZE).expect("alloc should succeed");
+        let lease = alloc_region(ALLOC_GRANULE).expect("alloc should succeed");
         let region = lease.region();
-        assert_eq!(region.base % PAGE_SIZE, 0);
+        assert_eq!(region.base % ALLOC_GRANULE, 0);
         free_region(lease).expect("free should succeed");
-        let second = alloc_region(PAGE_SIZE).expect("alloc after free should succeed");
+        let second = alloc_region(ALLOC_GRANULE).expect("alloc after free should succeed");
         assert_eq!(region, second.region());
         free_region(second).expect("free second");
-        assert_eq!(region.size, PAGE_SIZE);
+        assert_eq!(region.size, ALLOC_GRANULE);
     }
 
     #[test]
@@ -265,10 +269,10 @@ mod tests {
         let _g = test_support::GUARD.lock();
         test_support::ensure_init();
 
-        let first = alloc_region(PAGE_SIZE).expect("alloc first");
+        let first = alloc_region(ALLOC_GRANULE).expect("alloc first");
         let first_region = first.region();
         free_region(first).expect("free first");
-        let second = alloc_region(PAGE_SIZE).expect("alloc second");
+        let second = alloc_region(ALLOC_GRANULE).expect("alloc second");
         assert_eq!(
             first_region,
             second.region(),
@@ -285,7 +289,7 @@ mod tests {
     fn library_exhausts_cleanly() {
         let mut buf = std::vec![0u8; 1 << 20]; // 1 MiB = 256 帧
         let base = buf.as_mut_ptr() as usize;
-        let start = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start = (base + ALLOC_GRANULE - 1) & !(ALLOC_GRANULE - 1);
         let mut heap = MetadataHeap::<HEAP_ORDER, HEAP_MIN_ORDER>::empty();
         unsafe { heap.try_init(start, 1 << 20).expect("init") };
 

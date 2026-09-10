@@ -85,7 +85,7 @@ pub fn init(
     memory::init(region_start, region_end)?;
 
     // 帧真相验证：可分配一帧并释放（自证 allocator 可用）。
-    let probe = memory::alloc_region(memory::PAGE_SIZE).map_err(|_| "alloc probe failed")?;
+    let probe = memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| "alloc probe failed")?;
     memory::free_region(probe).map_err(|_| "free probe failed")?;
 
     task::init();
