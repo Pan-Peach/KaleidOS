@@ -1,8 +1,9 @@
-//! 长期内核地址空间（buddy 动态根）。
+//! 长期内核地址空间（buddy 动态根）——boot root → runtime root 的交接点。
 //!
 //! `super::bootstrap::init` 建立的临时 root 只活到 `kernel::init()` 完成、
-//! buddy allocator 可用之前；此后由本模块用 `Sv39AddressSpace`（buddy 动态
-//! 页表）建立长期 root，并在 Core 就绪后替换 bootstrap root。
+//! buddy allocator 可用之前；此后本模块用 `Sv39AddressSpace`（buddy 动态
+//! 页表）建立长期 root，`init()` 里完成 build → verify → activate 并在全局
+//! 安装（`main64.rs` 在 `kernel::init()` 后调用一次）。
 //!
 //! 与 bootstrap 的区别只是**实现时机和 backing**，输入是同一个 `KernelLayout`：
 //!
@@ -19,35 +20,41 @@
 //!         Sv39 机制（arch/riscv/mmu）
 //! ```
 //!
-//! # 映射三来源（PA 从哪来）
+//! # 映射四来源（PA 从哪来）
 //!
 //! ```text
-//! layout      → 高半区内核镜像的 VA（段范围 + 权限）→ PA = kernel_pa + (va - KERNEL_VMA)
-//! info RAM    → identity 映射（VA == PA）          → PA 就是 region.base 本身
-//! info 设备   → MMIO 区间（VA == PA，RW-NX）        → PA 就是 device.base 本身
+//! bootstrap 影子 → [KERNEL_VMA, text.va_start) 高半区（含 .bss.stack 高栈，RW）
+//! layout       → 高半区正式段（.text RX / .rodata+.initpkg R / .data+.bss RW）
+//!               → PA = kernel_pa + (va - KERNEL_VMA)
+//! info RAM     → identity 映射（VA == PA，阶段一 RWX：组件池在 buddy identity 页执行）
+//! info 设备    → MMIO 区间（VA == PA，RW-NX，页对齐向外取整）
 //! ```
 //!
-//! # TODO(接线与收紧)
-//! - 接线：`bootstrap_high` 在 `kernel::init()` 之后调 `build → verify → activate`，
-//!   替换 bootstrap root（当前未接线，`#![allow(dead_code)]` 待接线后移除）；
+//! # 遗留 TODO（与实现并存）
 //! - W^X 收紧：identity RAM 目前带 `EXECUTE`（阶段一组件池在 buddy identity 页里
 //!   执行，loader 从那里跑代码，见 roadmap 组件池 RWX 注记）。等 loader 改用
 //!   专用可执行区之后，identity RAM 可降为 RW-NX；
 //! - PTE 权限验证：`AddressSpaceBackend::translate` 只给 PA、不给权限位；要验证
-//!   权限需给 backend 增加只读 accessor（seam，本轮不做）。
+//!   权限需给 backend 增加只读 accessor（seam，本轮不做）；
+//! - usable RAM 边界规范化：RAM 映射这里做内向取整（宁少不越界）；若未来出现
+//!   报告非对齐 RAM 的平台，更正确的落点是在 discovery→MachineInfo 提交时
+//!   规范化 usable 边界，而不是各消费方自己 round。
 //!
 //! Sv39AddressSpace 的机制（map/unmap/translate/权限/失败回滚）已在 arch crate
 //! 的 host 测试覆盖；本模块只做编排。boot crate 是 riscv-only 二进制
 //! （`test = false`），编排逻辑由 QEMU 端到端验证承接。
 
-#![allow(dead_code)]
-
 use arch::riscv::mmu::address_space::Sv39AddressSpace;
 use arch::riscv::mmu::sv39::{PteFlags, VM_PAGE_SIZE};
 use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
 use kernel::machine::{IoSpace, MachineInfo};
+use spin::{Mutex, Once};
 
 use super::layout::{KernelLayout, KERNEL_VMA};
+
+/// 全局长期内核地址空间（`init` 安装；未来驱动/可执行区/直接映射等消费方
+/// 从这里拿 `&mut RuntimeVm` 追加映射）。
+pub static RUNTIME_VM: Once<Mutex<Option<RuntimeVm>>> = Once::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeVmError {
@@ -61,6 +68,8 @@ pub enum RuntimeVmError {
     ActivateFailed,
     /// 布局非法（段越界 / 算术溢出）。
     InvalidLayout,
+    /// `init` 重复调用（长期 root 只安装一次）。
+    AlreadyInstalled,
 }
 
 /// 长期内核地址空间（buddy 动态根）。
@@ -70,6 +79,10 @@ pub struct RuntimeVm {
 
 const fn align_up_page(addr: usize) -> usize {
     (addr + VM_PAGE_SIZE - 1) & !(VM_PAGE_SIZE - 1)
+}
+
+const fn align_down_page(addr: usize) -> usize {
+    addr & !(VM_PAGE_SIZE - 1)
 }
 
 /// layout 的 `PteFlags`（arch 编码）→ 逻辑 `MappingPermission`（backend API）。
@@ -102,7 +115,7 @@ fn section_pa(va_start: usize, kernel_pa: usize) -> Result<usize, RuntimeVmError
 }
 
 impl RuntimeVm {
-    /// 建立长期 root。四个输入覆盖全部 PA 来源（见模块文档）：
+    /// 建立长期 root。四个映射来源覆盖全部 PA 来源（见模块文档）：
     /// 0. 低引导区的高半区影子（`[KERNEL_VMA, text.va_start)`，RW-NX——含
     ///    `.bss.stack` 高栈与 `.bss.early_root`，bootstrap_high 正跑在上面）；
     /// 1. identity RAM（`info.memory_regions`，VA == PA，RWX——阶段一组件池）；
@@ -141,21 +154,32 @@ impl RuntimeVm {
         // 1) identity RAM：VA == PA。bootstrap 曾用 1 GiB 大叶的粗映射，这里
         //    4 KiB 粒度。阶段一带 EXECUTE：组件池在 buddy identity 页里执行
         //    （loader 从那里跑代码）；W^X 收紧见模块文档 TODO。
+        //    对齐：只向内取整（start 向上、end 向下）——绝不把映射扩大到
+        //    机器报告的 RAM 边界之外（边缘页可能混着 reserved/非 RAM）。
         let ram_perm =
             MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE;
         for r in &info.memory_regions[..info.mem_count] {
             if r.size == 0 {
                 continue;
             }
+            let end = r
+                .base
+                .checked_add(r.size)
+                .ok_or(RuntimeVmError::InvalidLayout)?;
+            let start = align_up_page(r.base);
+            let end = align_down_page(end);
+            if end <= start {
+                continue; // 取整后为空（非对齐 RAM 的边缘碎片）
+            }
             space
                 .map(
                     VirtualRange {
-                        base: r.base,
-                        size: r.size,
+                        base: start,
+                        size: end - start,
                     },
                     PhysicalRange {
-                        base: r.base,
-                        size: r.size,
+                        base: start,
+                        size: end - start,
                     },
                     ram_perm,
                 )
@@ -192,7 +216,8 @@ impl RuntimeVm {
         }
 
         // 3) 设备 MMIO：VA == PA，RW-NX（设备寄存器永不执行）。
-        //    FDT 的 reg 区间未必页对齐，映射覆盖它的整页窗口（稍大无害）。
+        //    FDT 的 reg 区间未必页对齐，映射覆盖它的整页窗口（MMU 只能按页，
+        //    向外取整可接受；与 RAM 的内向取整不同——MMIO 页不会混着 RAM）。
         let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
         for d in &info.devices[..info.dev_count] {
             if let IoSpace::Mmio { base, size } = d.space {
@@ -255,4 +280,27 @@ impl RuntimeVm {
             .activate()
             .map_err(|_| RuntimeVmError::ActivateFailed)
     }
+}
+
+/// 建立、验证、激活并安装全局长期 root（`main64.rs` 在 `kernel::init()` 后
+/// 调用一次；重复调用返回 `AlreadyInstalled`）。
+///
+/// 安装顺序：先检查是否已安装 → build → verify → activate → 存入全局。
+/// build 失败时全局槽保持空，调用方（或修复后重试）可以再试。
+pub fn init(
+    layout: &KernelLayout,
+    kernel_pa: usize,
+    info: &MachineInfo,
+) -> Result<(), RuntimeVmError> {
+    let slot = RUNTIME_VM.call_once(|| Mutex::new(None));
+    if slot.lock().is_some() {
+        return Err(RuntimeVmError::AlreadyInstalled);
+    }
+
+    let vm = RuntimeVm::build(layout, kernel_pa, info)?;
+    vm.verify(layout, kernel_pa)?;
+    vm.activate()?;
+
+    *slot.lock() = Some(vm);
+    Ok(())
 }

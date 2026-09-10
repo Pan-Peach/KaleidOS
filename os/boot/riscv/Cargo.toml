@@ -18,6 +18,7 @@ selftest = []
 arch = { path = "../../arch" }
 fdt = { path = "../../../third_party/fdt" }
 kernel = { path = "../../core" }
+spin = { version = "0.12.1", default-features = false, features = ["spin_mutex", "once"] }
 
 [profile.release]
 panic = "abort"        # 裸机没有 unwinding，panic 直接停
