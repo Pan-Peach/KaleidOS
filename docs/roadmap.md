@@ -15,18 +15,29 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
   → loader::load_component（段表/符号表解析、ALLOC 段放置、
      重定位由 `arch/riscv/elf.rs` 的 RiscvRelocator 提供：R_RISCV_CALL/CALL_PLT
      + PCREL_HI20/LO12_I + R_RISCV_32/64；host 测试直接测该实现）
-  → registry（declare → start → Ready 状态机，Failed 吸收态）
+  → registry（declare → resolve → start 状态机：Declared → Resolved → Ready，
+     Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  8 条 kcore_*（console_write_byte / log_line / machine_boot_hart / machine_cpu_count /
-  machine_has_hart / free_page_count / task_count / component_count）
-  —— 组件只能调白名单；未导出符号 → UnresolvedSymbol 整次加载失败
+  10 条 kcore_*，按稳定 ABI 分类：
+    Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
+    Logging：console_write_byte / log_line
+    Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
+    System query：free_page_count / task_count / component_count
+  —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
+Component Interface Registry（os/core/src/component/interface.rs，本轮新增骨架）：
+  InterfaceId / InterfaceVersion / InterfaceKind（Device/Service/Policy）/ BindingId
+  publish / resolve / resolve_by_id / unbind / unbind_provider
+  —— 组件→组件 依赖只走 Interface binding（逻辑 binding + versioned vtable），
+     不建立 flat ELF symbol 全局符号表；provider 重绑后 consumer 无需 ELF reload
+内存粒度定案：ALLOC_GRANULE（物理分配）与 AddressSpaceBackend::GRANULE（VM 映射）解耦
+RISC-V trap 按特权级拆分：trap/supervisor.rs（S-mode 机制）/ trap/machine.rs（M-mode 骨架）
 测试体系（自动化，见 docs/testing.md）：
   make check（fmt/clippy/host 单测/RV64 构建/RV32 check）
   make test-qemu（RV64+RV32 boot smoke + 自动执行 core_test 组件并判定 PASS）
   make test-arch（ArchTest 白盒 selftest：mapping / context switch / illegal instr /
     load fault / store-readonly fault / execute-NX fault，每 case 独立 QEMU，精确 scause 判定）
-  168 个 host 单测（含 proptest 属性测试与 parser 对抗测试）
+  180+ 个 host 单测（含 proptest 属性测试、parser 对抗测试与 Interface Registry 状态测试）
 ```
 
 QEMU 验证输出（真实）：
@@ -62,6 +73,20 @@ P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔
 > 已完成交付：boot_vm 恒等+高半区双映射、high-half 交接、Sv39PageTable/Sv32PageTable
 > 动态后端、KernelAddressSpace（Core ledger + backend contract）、ArchTest 权限/trap/上下文验证。
 > 下方 Phase T/B/C 与阅读计划是当时的执行记录，不再作为未来工作。
+
+### 下一阶段方向（2026-09 架构重构后）
+
+```text
+DeviceTable / MMIO / IRQ     → 第一个 Driver Component
+                             → QEMU RV32 M-mode NoMMU（trap/machine.rs + nommu.rs 骨架就位）
+                             → 真实 MCU
+```
+
+- Interface Registry 已为驱动/服务提供 binding 机制；DeviceRecord 未来含
+  `owner: ComponentId` + `generation`，并支持 `revoke_owner(ComponentId)`
+  （见 component-model.md §3.2）——本轮不实现完整 DeviceTable。
+- 设备发现链（未来方向，本轮不做）：FDT/board description → DeviceRecord →
+  MMIO/IRQ/DMA authority → Driver Component → Device Interface → Service Component。
 
 #### Phase T —— 最小 S-mode trap（0.5-1 天）
 

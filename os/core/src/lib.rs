@@ -90,6 +90,7 @@ pub fn init(
 
     task::init();
     component::registry::init();
+    component::interface::init();
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

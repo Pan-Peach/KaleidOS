@@ -237,6 +237,25 @@ arch/backend 内部。具体映射、撤销和地址空间激活接口随实现�
 > 第一阶段用 Rust trait + direct call；未来可以换成 IPC stub 或 Wasm host call。
 > 因此接口描述**永远不要**绑定 native Rust ABI 细节。
 
+### 两条机制边界（Core ABI ≠ Interface Registry）
+
+```text
+Component → Core          = Core Export ABI（export.rs：kcore_* 白名单，
+                            稳定 C ABI、exact-name resolution、未导出 → UnresolvedSymbol）
+Component → Component     = Interface binding（interface.rs：publish/resolve/unbind，
+                            逻辑 binding + versioned vtable，禁止 flat ELF symbol 互链）
+```
+
+- Core Export ABI 是 **Component → Core 的 mechanism boundary**：只导出
+  共享堆（`kcore_heap_alloc/dealloc`）、输出通道与已提交真相的只读查询；
+  不导出 authority 授予点（物理区域/帧分配、地址空间变更、任务表变更）。
+- Component Interface Registry 是 **Core 的组件依赖真相**：谁提供什么接口、
+  当前绑到谁。两者是独立概念，互不替代。
+- 内存粒度定案：`ALLOC_GRANULE`（物理分配）与 `AddressSpaceBackend::GRANULE`
+  （VM 映射）语义解耦；RISC-V trap 按特权级拆分（`trap/supervisor.rs` =
+  S-mode 机制，`trap/machine.rs` = M-mode 骨架，共享解码在 `trap/mod.rs`），
+  未来 S-mode+MMU 与 M-mode+NoMMU 双 profile 不互相牵制。
+
 ### 授权流（Authority 流）
 
 ```text

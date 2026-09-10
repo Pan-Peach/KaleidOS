@@ -147,6 +147,10 @@ pub fn load(args: &[u8]) {
             return;
         }
     };
+    if let Err(e) = reg.resolve(id) {
+        printk!("load: resolve failed: {e:?}\n");
+        return;
+    }
     if let Err(e) = reg.start(id) {
         printk!("load: start failed: {e:?}\n");
         return;

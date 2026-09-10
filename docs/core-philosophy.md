@@ -190,6 +190,21 @@ Sv39、Sv32、PMP、MPU 都是 backend/mechanism。当前 RISC-V profile 已实�
 Sv32，未来仍可根据机器能力选择 backend；Core API 应使用 AddressSpace、PhysicalRange、
 VirtualRange 和抽象 permission，裸 PA、PTE、VPN、`satp` 只属于 arch 层。
 
+#### 5.5.2 定案：物理分配粒度 ≠ VM 映射粒度
+
+**`memory::ALLOC_GRANULE`（物理分配粒度）与 `AddressSpaceBackend::GRANULE`
+（VM 映射粒度）在语义上彻底解耦**（两者当前数值上都是 4 KiB，但这是巧合，
+不是耦合）：
+
+- `ALLOC_GRANULE`：buddy/区域分配器的最小单元，只属于**物理内存机制**；
+- `GRANULE`：各翻译 backend 自己声明的对齐/步进规则。Core 的
+  `KernelAddressSpace::validate` 用 `B::GRANULE` 做对齐校验，**不引用任何
+  分配器常量**（`os/core/src/memory/address_space.rs` 的 `is_aligned::<B>()`）。
+
+推论：**NoMMU 不存在 VM page 的概念**——恒等 backend 用 `GRANULE = 1`，
+Core 校验自动退化为 no-op，Core 不需要写任何 `#[cfg]`（host 测试
+`core_validation_accepts_unaligned_with_granule_one` 是验收点）。
+
 ## 5.6 组件定义（4 项测试）
 
 一个东西是否算"Component"，用四项测试判定：

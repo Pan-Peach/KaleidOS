@@ -56,8 +56,9 @@ tools/         工具脚本（待建设）
 
 - **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
 - **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
-- **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机）→ monitor `load` 命令
-- **导出白名单**（EXPORT_SYMBOL 教学版，7 条 `kcore_*`）：组件只能调白名单，未导出符号 → 加载失败
+- **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令
+- **导出白名单**（EXPORT_SYMBOL 教学版，10 条 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询）：组件只能调白名单，未导出符号 → 加载失败
+- **Component Interface Registry**（骨架）：组件→组件依赖只走 Interface binding（publish/resolve/unbind，versioned vtable），不建立 flat ELF symbol 全局符号表
 
 实机输出：
 

@@ -42,6 +42,25 @@ provides:  FileSystemService
 > Interface 是语义，传输是绑定策略。第一阶段用 Rust trait + direct call；
 > 未来可换 IPC stub / Wasm host call。接口文档里写"契约"（方法、语义、错误），不写"怎么调用"。
 
+### 2.1 绑定机制定案：Interface Registry（已落地骨架）
+
+```text
+Component → Core          = Core Export ABI（export.rs，ELF undefined symbol 白名单）
+Component → Component     = Interface binding（interface.rs）——禁止 flat ELF symbol 互链
+```
+
+- 已加载组件的 exported ELF symbols **不组成全局符号表**：KaleidOS Component 是
+  replaceable 的，直接 relocation 到 provider 函数地址会让替换非常困难。
+- consumer 拿到的是**逻辑 binding**（`BindingId` + 版本 + opaque `context` 指针，
+  按 `#[repr(C)]` vtable 契约 cast 调用），不是"永不变更的 provider ELF 符号地址"。
+  provider 更换后 consumer 只需 `resolve_by_id` 重新获取，**不需要 ELF reload**。
+- Core 真相：`InterfaceRegistry` 记录 谁提供了什么接口（InterfaceId / version /
+  kind / provider / binding 状态）；publish 要求 provider 存在且 Ready，
+  resolve 时再次校验 provider 存活（组件卸载后 binding 立即不可用）。
+- 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
+  call）不改 binding 数据模型。完整 live binding indirection 与 compatible
+  version range 属下一阶段。
+
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
 **实现决策：ResourceDomain 第一版没有 struct。**
@@ -261,8 +280,9 @@ impl ComponentManager {
 ```
 
 （概念代码；落地时按现有 Registry 状态机接轨。当前 Registry 的同步 start
-直接 `Declared → Ready`，`Starting` 属全量生命周期词汇表但未接线——留给
-ComponentManager 的异步初始化阶段。当前 unload 只删记录、不释放段内存。）
+是 `Declared → Resolved → Ready`：`resolve()` 已落地（Declared → Resolved，
+语义 = requires 全部绑定成功），`Starting` 属全量生命周期词汇表但未接线——
+留给 ComponentManager 的异步初始化阶段。当前 unload 只删记录、不释放段内存。）
 
 ### 4.3 KernelNative 具体是什么
 
@@ -456,7 +476,7 @@ Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destr
 | 状态 | 含义 |
 |---|---|
 | Declared | 系统知道这个组件存在 |
-| Resolved | 所有 requires 都已找到 provider |
+| Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
 | Starting | 正在初始化 |
 | Ready | 可以对外提供 Interface |
 | Quiescing | 停止接受新请求并清理已有状态 |

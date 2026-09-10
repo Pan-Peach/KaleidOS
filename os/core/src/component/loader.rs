@@ -258,6 +258,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_component_to_component_flat_symbol() {
+        // 组件→组件 依赖禁止走 flat ELF symbol namespace（interface.rs 定案）：
+        // 即使符号名存在（core 侧有同名接口），Core 的 flat resolver 也只认
+        // `kcore_*` 白名单，其他未定义符号一律 UnresolvedSymbol。
+        let mut patched = SMOKE_KCOMP.to_vec();
+        let name = b"kcore_console_write_byte";
+        let pos = patched
+            .windows(name.len())
+            .position(|window| window == name)
+            .expect("export name present in strtab");
+        // 把 kcore_ 前缀改成"组件风格"的名字（如 provider 导出的符号）
+        patched[pos..pos + 5].copy_from_slice(b"prov_");
+        assert_eq!(load_component(&patched), Err(LoaderError::UnresolvedSymbol));
+    }
+
+    #[test]
     fn relocation_writes_correct_call_target() {
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();

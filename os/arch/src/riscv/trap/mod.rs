@@ -44,6 +44,11 @@ pub enum Interrupt {
     SupervisorSoft,
     SupervisorTimer,
     SupervisorExternal,
+    // M-mode 中断码（`mcause` 与 `scause` 编码一致）：共享解码器不隐含
+    // S-mode——未来 M-mode profile 直接复用同一套 `from_code`。
+    MachineSoft,
+    MachineTimer,
+    MachineExternal,
     Unknown(usize),
 }
 
@@ -74,8 +79,34 @@ impl Interrupt {
             1 => Self::SupervisorSoft,
             5 => Self::SupervisorTimer,
             9 => Self::SupervisorExternal,
+            3 => Self::MachineSoft,
+            7 => Self::MachineTimer,
+            11 => Self::MachineExternal,
             other => Self::Unknown(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Interrupt, Trap};
+
+    #[test]
+    fn shared_decode_handles_both_privilege_modes() {
+        // S-mode 中断（现有行为不变）
+        assert!(matches!(
+            Trap::Interrupt(Interrupt::from_code(5)),
+            Trap::Interrupt(Interrupt::SupervisorTimer)
+        ));
+        // M-mode 中断（共享解码，不隐含 S-mode）
+        assert!(matches!(
+            Trap::Interrupt(Interrupt::from_code(7)),
+            Trap::Interrupt(Interrupt::MachineTimer)
+        ));
+        assert!(matches!(
+            Trap::Interrupt(Interrupt::from_code(11)),
+            Trap::Interrupt(Interrupt::MachineExternal)
+        ));
     }
 }
 

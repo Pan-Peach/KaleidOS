@@ -380,6 +380,57 @@ mod tests {
         assert_eq!(s.map(mapping(0x2000, 0x1000, rw())), Err(MapError::Overlap));
     }
 
+    // -- backend GRANULE ≠ allocator ALLOC_GRANULE 的解耦证明 ----------------
+
+    /// 8 KiB 粒度 backend：证明 Core 校验跟随 backend 自己的规则，
+    /// 与分配器 `ALLOC_GRANULE`（4 KiB）在语义上无关。
+    struct EightKBackend;
+
+    impl AddressSpaceBackend for EightKBackend {
+        type Error = ();
+        const GRANULE: usize = 0x2000; // 8 KiB，故意 ≠ ALLOC_GRANULE
+
+        fn map(
+            &mut self,
+            _va: VirtualRange,
+            _pa: PhysicalRange,
+            _perm: MappingPermission,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn unmap(&mut self, _va: VirtualRange) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn translate(&self, _va: usize) -> Option<usize> {
+            None
+        }
+
+        fn activate(&self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn vm_alignment_follows_backend_granule_not_alloc_granule() {
+        // 4 KiB 对齐（满足 ALLOC_GRANULE）但非 8 KiB 对齐 → 必须被拒绝：
+        // 证明 Core 用的是 backend GRANULE，不是分配器常量。
+        let mut s = KernelAddressSpace::<EightKBackend>::new(
+            AddressSpaceId::from_raw(1),
+            1,
+            ComponentId::from_raw(1),
+            EightKBackend,
+        );
+        assert_eq!(
+            s.map(mapping(0x1000, 0x1000, rw())),
+            Err(MapError::Unaligned),
+            "4K 对齐但非 backend(8K) 对齐的映射必须被拒绝"
+        );
+        // 8 KiB 对齐 → 放行（同一个 Core 校验函数，仅 backend 不同）。
+        assert!(s.map(mapping(0x2000, 0x2000, rw())).is_ok());
+    }
+
     // -- map / commit ----------------------------------------------------------
 
     #[test]

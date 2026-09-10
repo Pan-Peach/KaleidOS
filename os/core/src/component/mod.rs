@@ -6,6 +6,7 @@
 
 mod elf;
 pub mod export;
+pub mod interface;
 pub mod loader;
 pub mod registry;
 pub mod store;
@@ -33,6 +34,9 @@ impl ComponentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComponentState {
     Declared,
+    /// 所有 required Interfaces 都已成功绑定（见 `component/interface.rs`）。
+    /// 语义：Resolved = 依赖已就位，可以进入初始化。
+    Resolved,
     Starting,
     Ready,
     Failed,

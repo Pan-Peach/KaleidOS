@@ -3,14 +3,16 @@
 //! 现行状态机（实现即契约，见 docs/component-model.md §5 全量生命周期）：
 //!
 //! ```text
-//! Declared --start--> Ready        （start 是同步的：loader 放段完成即可提供接口）
+//! Declared --resolve--> Resolved --start--> Ready
 //!     any state --mark_failed--> Failed   （恢复 = 全新实例）
 //!     any state --unload--> 记录移除       （phase 1 不回收放段内存）
 //! ```
 //!
-//! `ComponentState::Starting` 属于文档声明的全量生命周期词汇表，但当前
-//! 同步 start 不会经过它；若未来 ComponentManager 引入异步初始化，再把
-//! `Declared -> Starting -> Ready` 接上（见 review 记录，不要用测试掩盖漂移）。
+//! `Resolved` = 所有 required Interfaces 都已成功绑定（本轮先把状态与转换落地；
+//! 真实绑定逻辑见 `component/interface.rs`——有 requires 的组件在 resolve 阶段
+//! 逐条 publish/resolve，全部成功才允许进入 Resolved）。`Starting` 属于文档
+//! 声明的全量生命周期词汇表，但当前同步 start 不会经过它；若未来
+//! ComponentManager 引入异步初始化，再把 `Resolved -> Starting -> Ready` 接上。
 //! 非法转换返回 Err（Core 验证后才提交状态，Policy proposes 原则）。
 //! id 单调递增、不回收：组件实例 = 身份——unload 后重载同组件是新实例（新 id），
 //! 失败恢复=全新实例（component-model.md）。
@@ -92,10 +94,21 @@ impl Registry {
         Ok(id)
     }
 
-    /// Declared → Ready（加载链完成，组件可以提供服务）。
-    pub fn start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+    /// Declared → Resolved：所有 required Interfaces 已成功绑定。
+    /// 无 requires 的组件同样经过此步（vacuous truth：零依赖 = 已满足）。
+    pub fn resolve(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         let rec = self.record_mut(id)?;
         if rec.state != ComponentState::Declared {
+            return Err(RegistryError::InvalidTransition);
+        }
+        rec.state = ComponentState::Resolved;
+        Ok(())
+    }
+
+    /// Resolved → Ready（依赖已绑定，组件可以启动）。
+    pub fn start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let rec = self.record_mut(id)?;
+        if rec.state != ComponentState::Resolved {
             return Err(RegistryError::InvalidTransition);
         }
         rec.state = ComponentState::Ready;
@@ -191,17 +204,45 @@ mod tests {
     }
 
     #[test]
-    fn start_transitions_declared_to_ready() {
+    fn resolve_transitions_declared_to_resolved() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
+    }
+
+    #[test]
+    fn start_transitions_resolved_to_ready() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
         reg.start(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
+    }
+
+    #[test]
+    fn start_from_declared_without_resolve_is_invalid() {
+        // Declared --start--> Ready 的硬编码已被拆开：必须先 resolve。
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
+    }
+
+    #[test]
+    fn resolve_twice_is_invalid_transition() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
+        assert_eq!(reg.resolve(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
     }
 
     #[test]
     fn start_twice_is_invalid_transition() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
         reg.start(id).unwrap();
         assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
     }
@@ -211,6 +252,13 @@ mod tests {
         let mut reg = r();
         let ghost = ComponentId::from_raw(99);
         assert_eq!(reg.start(ghost), Err(RegistryError::NotFound));
+    }
+
+    #[test]
+    fn resolve_undeclared_is_not_found() {
+        let mut reg = r();
+        let ghost = ComponentId::from_raw(99);
+        assert_eq!(reg.resolve(ghost), Err(RegistryError::NotFound));
     }
 
     #[test]
@@ -226,6 +274,7 @@ mod tests {
     fn failed_is_reachable_from_any_state() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
         reg.start(id).unwrap();
         reg.mark_failed(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
@@ -283,6 +332,7 @@ mod tests {
     fn failed_transition_keeps_original_state() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
         reg.start(id).unwrap();
         // Ready 再 start：拒绝，且状态保持 Ready
         assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));

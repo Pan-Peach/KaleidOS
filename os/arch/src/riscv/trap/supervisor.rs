@@ -5,7 +5,7 @@
 
 use core::arch::global_asm;
 
-use super::{Interrupt, Scause, Trap, TrapFrame};
+use super::{Scause, Trap, TrapFrame};
 
 #[cfg(target_arch = "riscv32")]
 global_asm!(include_str!("trap32.S"));
