@@ -7,7 +7,7 @@
 //! - 组件侧声明方式：`unsafe extern "C" { #[link_name = "kcore_..."] ... }`，
 //!   loader 重定位时按未 mangled 字节名精确匹配。
 //!
-//! # ABI 分类（v1，稳定）
+//! # ABI 分类（v1 稳定 + v2 增量）
 //!
 //! | 类别 | 符号 | 说明 |
 //! |---|---|---|
@@ -15,6 +15,9 @@
 //! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
+//! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
+//! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
+//! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
 //!
 //! # 明确不导出（authority 授予点 / Core truth 变更点）
 //!
@@ -22,9 +25,12 @@
 //!   Core 内部机制（canonical），组件要内存走 `kcore_heap_alloc`（共享堆）。
 //! - 地址空间：`KernelAddressSpace::map/unmap/activate`——mutation 必须过 Core
 //!   验证与 commit，且需要 `AddressSpaceHandle`（未来类型化授权 API）。
-//! - 任务表：`TaskTable::create` / `set_task_state` / context switch——绕过 Core
-//!   truth 的 mutation 一律不导出；调度走 propose → validate → commit。
-//! - 注册表：`registry::declare/start/unload`——组件生命周期由 Core 掌控。
+//! - 裸任务表：`TaskTable::create` / `set_task_state` / context switch——绕过 Core
+//!   truth 的 mutation 一律不导出；v2 的 `kcore_task_*` 是**带验证的语义入口**
+//!   （requester 校验 + entry 镜像校验 + 状态机），不是 `TaskTable` 的透传。
+//! - 注册表：`registry::declare/start/unload`——组件生命周期由 Core 掌控，
+//!   `kcore_component_load` 是完整语义请求（store → loader → declare → resolve
+//!   → start → call_init）。
 //! - Trace 事件：组件未来只能提交"组件自定义事件"，`TaskSwitch/Grant/Revoke/
 //!   CoreRejected` 等 Core authoritative event 由 Core 自己产生（TODO：trace
 //!   环形缓冲落地后加 `kcore_trace_component_event`，sequence 由 Core 分配）。
@@ -37,10 +43,13 @@
 //! 严格匹配，违反 = UB（与 C `malloc/free` 错配同类）。组件失败后的泄漏在 phase 1
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
+use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
+use crate::component::load::ComponentLoadError;
 use crate::component::registry;
 use crate::machine;
 use crate::memory;
-use crate::task;
+use crate::sched;
+use crate::task::{self, TaskId, TaskState};
 use arch::{Console, ConsoleImpl};
 use core::alloc::GlobalAlloc;
 
@@ -169,10 +178,185 @@ extern "C" fn kcore_component_count() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Category 5：Component lifecycle（v2；语义入口，非裸 registry mutation）
+// ---------------------------------------------------------------------------
+
+/// C ABI `(ptr, len)` → 短切片。长度上限防御野指针/超长输入（组件名受
+/// `MAX_NAME_LEN` 约束）。返回的切片只在调用期间有效。
+fn checked_name(ptr: *const u8, len: usize) -> Option<&'static [u8]> {
+    if ptr.is_null() || len == 0 || len > 256 {
+        return None;
+    }
+    // SAFETY: 调用方保证 (ptr, len) 指向调用期间有效的内存。
+    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+/// `InterfaceKind` 的 ABI 编码（与枚举声明序一致：0=Device 1=Service
+/// 2=Policy；改动枚举声明序 = ABI 破坏，必须同步 bump 文档）。
+fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
+    match kind {
+        0 => Some(InterfaceKind::Device),
+        1 => Some(InterfaceKind::Service),
+        2 => Some(InterfaceKind::Policy),
+        _ => None,
+    }
+}
+
+fn load_error_code(error: ComponentLoadError) -> i32 {
+    match error {
+        ComponentLoadError::StoreNotMounted => -1,
+        ComponentLoadError::NotFound => -2,
+        ComponentLoadError::ReadFailed => -3,
+        ComponentLoadError::Loader(_) => -4,
+        ComponentLoadError::DeclareFailed => -5,
+        ComponentLoadError::ResolveFailed => -6,
+        ComponentLoadError::StartFailed => -7,
+        ComponentLoadError::InitFailed(_) => -8,
+    }
+}
+
+/// 请求 Core 加载并启动组件（store → loader → registry → call_init 全链，
+/// 与 monitor `load` 同源）。返回 ComponentId raw，负数 = 错误码。
+extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
+    let Some(name) = checked_name(name_ptr, name_len) else {
+        return -9;
+    };
+    match crate::component::load::load_and_start(name) {
+        Ok(id) => id.raw() as i32,
+        Err(e) => load_error_code(e),
+    }
+}
+
+/// 发布接口。provider = 当前正在初始化的组件（Core 记录，**不信任组件自报
+/// 身份**）。返回 BindingId raw，负数 = 错误（-1 名字非法 / -2 kind 非法 /
+/// -3 不在组件 init 上下文 / -4 publish 被 Core 拒绝）。
+extern "C" fn kcore_interface_publish(
+    name_ptr: *const u8,
+    name_len: usize,
+    kind: u32,
+    version: u32,
+    context: *mut (),
+) -> i32 {
+    let Some(name) = checked_name(name_ptr, name_len) else {
+        return -1;
+    };
+    let Some(kind) = kind_from_u32(kind) else {
+        return -2;
+    };
+    let Some(provider) = crate::component::load::current_component() else {
+        return -3;
+    };
+    let reg = registry::get_registry().lock();
+    let mut ifs = get_interfaces().lock();
+    match ifs.publish(
+        &reg,
+        provider,
+        name,
+        kind,
+        InterfaceVersion::from_raw(version),
+        context,
+    ) {
+        Ok(binding) => binding.raw() as i32,
+        Err(_) => -4,
+    }
+}
+
+/// 只读查询：`(name, kind, version)` 是否已绑定且 provider 存活（Ready）。
+/// 1 = 可用（可 resolve），0 = 不可用。
+extern "C" fn kcore_interface_available(
+    name_ptr: *const u8,
+    name_len: usize,
+    kind: u32,
+    version: u32,
+) -> i32 {
+    let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind)) else {
+        return 0;
+    };
+    let reg = registry::get_registry().lock();
+    let ifs = get_interfaces().lock();
+    ifs.resolve(&reg, name, kind, InterfaceVersion::from_raw(version))
+        .is_ok() as i32
+}
+
+// ---------------------------------------------------------------------------
+// Category 6：Task control（v2；语义入口，authority 校验在 Core）
+// ---------------------------------------------------------------------------
+
+/// 创建任务。requester = 当前正在初始化的组件；`entry` 必须落在该组件的
+/// 装载镜像内（越界指针一律拒绝）。返回 TaskId raw，负数 = 错误
+/// （-1 不在组件 init 上下文 / -2 Core 拒绝：requester 非 Ready、entry
+/// 越界、内存不足）。
+extern "C" fn kcore_task_create(entry: usize) -> i32 {
+    let Some(requester) = crate::component::load::current_component() else {
+        return -1;
+    };
+    match task::create_task(requester, entry) {
+        Ok(id) => id.raw() as i32,
+        Err(_) => -2,
+    }
+}
+
+/// 启动任务：Created → Runnable（状态机验证在 Core）。0 = 成功，-1 = 失败。
+extern "C" fn kcore_task_start(id: u32) -> i32 {
+    let mut table = task::get_task_table().lock();
+    match table.transition(TaskId::from_raw(id), TaskState::Runnable) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 让出 CPU：Running → Runnable + 调度切换。任务再次被选中时返回 0。
+extern "C" fn kcore_task_yield() -> i32 {
+    match sched::yield_current() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 退出：Running → Exited + 调度切换。**控制权永不回到本任务**——若还有
+/// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
+/// 的上下文）。错误（当前无运行任务等）时返回 -1。
+extern "C" fn kcore_task_exit() -> i32 {
+    match sched::exit_current() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 只读查询任务状态（Core 真相的编码视图）：
+/// 0=Created 1=Runnable 2=Running 3=Blocked 4=Exited；-1 = 不存在。
+extern "C" fn kcore_task_state(id: u32) -> i32 {
+    let table = task::get_task_table().lock();
+    match table.get(TaskId::from_raw(id)) {
+        None => -1,
+        Some(record) => match record.state() {
+            TaskState::Created => 0,
+            TaskState::Runnable => 1,
+            TaskState::Running(_) => 2,
+            TaskState::Blocked => 3,
+            TaskState::Exited => 4,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Category 7：Scheduler（v2）
+// ---------------------------------------------------------------------------
+
+/// 把 CPU 交给调度器：跑完所有 Runnable 任务后返回（锚点上下文）。
+/// 无 Runnable 任务时为 no-op。0 = 完成，-1 = 失败（无 SchedulerPolicy 等）。
+extern "C" fn kcore_sched_run() -> i32 {
+    match sched::run() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 10] = [
+static EXPORTS: [Export; 19] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -217,6 +401,45 @@ static EXPORTS: [Export; 10] = [
         name: b"kcore_component_count",
         address: ExportAddress(kcore_component_count as *const ()),
     },
+    // Category 5：Component lifecycle（v2）
+    Export {
+        name: b"kcore_component_load",
+        address: ExportAddress(kcore_component_load as *const ()),
+    },
+    Export {
+        name: b"kcore_interface_publish",
+        address: ExportAddress(kcore_interface_publish as *const ()),
+    },
+    Export {
+        name: b"kcore_interface_available",
+        address: ExportAddress(kcore_interface_available as *const ()),
+    },
+    // Category 6：Task control（v2）
+    Export {
+        name: b"kcore_task_create",
+        address: ExportAddress(kcore_task_create as *const ()),
+    },
+    Export {
+        name: b"kcore_task_start",
+        address: ExportAddress(kcore_task_start as *const ()),
+    },
+    Export {
+        name: b"kcore_task_yield",
+        address: ExportAddress(kcore_task_yield as *const ()),
+    },
+    Export {
+        name: b"kcore_task_exit",
+        address: ExportAddress(kcore_task_exit as *const ()),
+    },
+    Export {
+        name: b"kcore_task_state",
+        address: ExportAddress(kcore_task_state as *const ()),
+    },
+    // Category 7：Scheduler（v2）
+    Export {
+        name: b"kcore_sched_run",
+        address: ExportAddress(kcore_sched_run as *const ()),
+    },
 ];
 
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
@@ -246,6 +469,15 @@ mod tests {
             &b"kcore_free_page_count"[..],
             &b"kcore_task_count"[..],
             &b"kcore_component_count"[..],
+            &b"kcore_component_load"[..],
+            &b"kcore_interface_publish"[..],
+            &b"kcore_interface_available"[..],
+            &b"kcore_task_create"[..],
+            &b"kcore_task_start"[..],
+            &b"kcore_task_yield"[..],
+            &b"kcore_task_exit"[..],
+            &b"kcore_task_state"[..],
+            &b"kcore_sched_run"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -256,7 +488,9 @@ mod tests {
         assert_eq!(resolve(b"kcore_frame_alloc"), None);
         assert_eq!(resolve(b"kcore_alloc_region"), None);
         assert_eq!(resolve(b"kcore_address_space_map"), None);
-        assert_eq!(resolve(b"kcore_task_create"), None);
+        assert_eq!(resolve(b"kcore_task_table_create"), None);
+        assert_eq!(resolve(b"kcore_registry_declare"), None);
+        assert_eq!(resolve(b"kcore_context_switch"), None);
         assert_eq!(resolve(b"kcore_"), None);
         assert_eq!(resolve(b""), None);
     }

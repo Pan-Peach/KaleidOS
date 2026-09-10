@@ -8,4 +8,12 @@ pub enum TaskError {
     NotFound,
     /// 内存不足。
     NoMemory,
+    /// 状态机非法转换（如 Runnable 再 start、Exited 终态再推进）。
+    InvalidTransition,
+    /// 请求创建任务的组件不存在（requester 未声明）。
+    RequesterNotFound,
+    /// 请求创建任务的组件尚未 Ready（只有 Ready 组件能创建任务）。
+    RequesterNotReady,
+    /// entry 不落在 requester 组件的装载镜像内（越界指针一律拒绝）。
+    EntryOutOfImage,
 }

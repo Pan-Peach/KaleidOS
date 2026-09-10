@@ -47,7 +47,12 @@ pub(crate) struct Section {
 
 impl Section {
     pub(crate) const fn is_alloc_content(self) -> bool {
-        self.ty == SHT_PROGBITS && self.flags & SHF_ALLOC != 0
+        (self.ty == SHT_PROGBITS || self.ty == SHT_NOBITS) && self.flags & SHF_ALLOC != 0
+    }
+
+    /// BSS 段（NOBITS）：无文件数据，放段时零填充。
+    pub(crate) const fn is_nobits(self) -> bool {
+        self.ty == SHT_NOBITS
     }
 }
 

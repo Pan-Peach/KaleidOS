@@ -9,8 +9,10 @@ const R_RISCV_CALL: u32 = 18;
 const R_RISCV_CALL_PLT: u32 = 19;
 const R_RISCV_PCREL_HI20: u32 = 23;
 const R_RISCV_PCREL_LO12_I: u32 = 24;
+const R_RISCV_PCREL_LO12_S: u32 = 25;
 const R_RISCV_HI20: u32 = 26;
 const R_RISCV_LO12_I: u32 = 27;
+const R_RISCV_LO12_S: u32 = 28;
 const R_RISCV_RELAX: u32 = 51;
 
 /// RISC-V relocator state for PCREL_HI20/PCREL_LO12_I pairs.
@@ -149,6 +151,19 @@ impl RelocationBackend for RiscvRelocator {
                 let insn = (imm12 << 20) | (insn & 0x000F_FFFF);
                 Self::write_u32(image, offset, insn)?;
             }
+            R_RISCV_PCREL_LO12_S => {
+                // S-type（load/store）：imm[11:5] → bits 31:25，imm[4:0] → bits 11:7。
+                let v_hi = self
+                    .hi_cache
+                    .iter()
+                    .find(|&(key, _)| *key == (relocation.symbol_section, relocation.symbol_value))
+                    .map(|(_, value)| *value)
+                    .ok_or(RelocationError::Unsupported)?;
+                let imm12 = (v_hi & 0xFFF) as u32;
+                let insn = Self::read_u32(image, offset)?;
+                let insn = ((imm12 & 0xFE0) << 20) | ((imm12 & 0x1F) << 7) | (insn & 0x01FF_F07F);
+                Self::write_u32(image, offset, insn)?;
+            }
             R_RISCV_LO12_I => {
                 let v = s_addr
                     .checked_add(relocation.addend)
@@ -160,6 +175,20 @@ impl RelocationBackend for RiscvRelocator {
                 let imm12 = (v & 0xFFF) as u32;
                 let insn = Self::read_u32(image, offset)?;
                 let insn = (imm12 << 20) | (insn & 0x000F_FFFF);
+                Self::write_u32(image, offset, insn)?;
+            }
+            R_RISCV_LO12_S => {
+                // 绝对地址的 S-type 变体（store，如 `sw`/`sd`）：
+                // 与 LO12_I 同一 HI20 配套，立即数按 S-type 落位。
+                let v = s_addr
+                    .checked_add(relocation.addend)
+                    .ok_or(RelocationError::Unsupported)?;
+                if !(0..(1i64 << 32)).contains(&v) {
+                    return Err(RelocationError::Unsupported);
+                }
+                let imm12 = (v & 0xFFF) as u32;
+                let insn = Self::read_u32(image, offset)?;
+                let insn = ((imm12 & 0xFE0) << 20) | ((imm12 & 0x1F) << 7) | (insn & 0x01FF_F07F);
                 Self::write_u32(image, offset, insn)?;
             }
             R_RISCV_32 => {
@@ -236,6 +265,11 @@ mod tests {
 
     fn i_type_imm12(insn: u32) -> i64 {
         sext(((insn >> 20) & 0xFFF) as i64, 12)
+    }
+
+    /// S-type（load/store）立即数解码：imm[11:5] ← bits 31:25，imm[4:0] ← bits 11:7。
+    fn s_type_imm12(insn: u32) -> i64 {
+        sext((((insn >> 20) & 0xFE0) | ((insn >> 7) & 0x1F)) as i64, 12)
     }
 
     /// 组装一条 AUIPC（rd, imm20）
@@ -406,6 +440,45 @@ mod tests {
         );
     }
 
+    /// S-type 变体（store，如 `sw`/`sd` 的 PCREL 对，静态 mutable 访问会生成它）：
+    /// 与 LO12_I 共用 hi 缓存，但立即数按 S-type 编码落位（imm[11:5]→31:25，
+    /// imm[4:0]→11:7）。
+    #[test]
+    fn pcrel_lo12_s_decodes_to_symbol_address() {
+        // sw(rs2=2, rs1=1, imm=0)：S-type 立即数全 0 的合法编码。
+        let sw_zero = (2u32 << 20) | (1u32 << 15) | (0x2u32 << 12) | 0x23u32;
+        let mut image = [0u8; 8];
+        image[..4].copy_from_slice(&auipc(1, 0).to_le_bytes());
+        image[4..].copy_from_slice(&sw_zero.to_le_bytes());
+        let mut relocator = RiscvRelocator::new();
+        let symbol = BASE + 0x2000_0818; // 低 12 位非零，验证 S-type 落位
+
+        relocator
+            .apply(
+                WordSize::Bits64,
+                &mut image,
+                BASE,
+                rel(0, R_RISCV_PCREL_HI20, 0, 1, 0, 1, 0x10),
+                symbol,
+            )
+            .unwrap();
+        relocator
+            .apply(
+                WordSize::Bits64,
+                &mut image,
+                BASE,
+                rel(4, R_RISCV_PCREL_LO12_S, 0, 1, 4, 1, 0),
+                symbol,
+            )
+            .unwrap();
+
+        let a = u32::from_le_bytes(image[..4].try_into().unwrap());
+        let s = u32::from_le_bytes(image[4..].try_into().unwrap());
+        assert_eq!(s & 0x7F, 0x23, "S 处仍是 store");
+        let target = (BASE as i64) + (auipc_imm20(a) << 12) + s_type_imm12(s);
+        assert_eq!(target, symbol as i64, "PCREL S 对解码 target == 符号地址");
+    }
+
     // -- 绝对地址对（HI20 + LO12_I）-------------------------------------------------
 
     #[test]
@@ -440,6 +513,44 @@ mod tests {
         assert_eq!(l & 0x7F, 0x37, "lui opcode");
         let target = (lui_imm20(l) << 12) + i_type_imm12(i);
         assert_eq!(target, symbol as i64, "LUI+ADDI 解码 target == 符号地址");
+    }
+
+    /// 绝对地址 S-type 对（RV32 medlow 的 `sw`/`sd` 静态 mutable 访问会生成）：
+    /// 与 LO12_I 同一 LUI 配套，立即数按 S-type 落位。
+    #[test]
+    fn hi20_lo12_s_absolute_decodes_to_symbol() {
+        let sw_zero = (2u32 << 20) | (1u32 << 15) | (0x2u32 << 12) | 0x23u32;
+        let mut image = [0u8; 8];
+        image[..4].copy_from_slice(&lui(1, 0).to_le_bytes());
+        image[4..].copy_from_slice(&sw_zero.to_le_bytes());
+        let mut relocator = RiscvRelocator::new();
+        let symbol = 0x1234_5818; // 低 12 位非零，验证落位
+
+        relocator
+            .apply(
+                WordSize::Bits32,
+                &mut image,
+                BASE,
+                rel(0, R_RISCV_HI20, 0, 1, 0, 0, 0),
+                symbol,
+            )
+            .unwrap();
+        relocator
+            .apply(
+                WordSize::Bits32,
+                &mut image,
+                BASE,
+                rel(4, R_RISCV_LO12_S, 0, 1, 4, 0, 0),
+                symbol,
+            )
+            .unwrap();
+
+        let l = u32::from_le_bytes(image[..4].try_into().unwrap());
+        let s = u32::from_le_bytes(image[4..].try_into().unwrap());
+        assert_eq!(l & 0x7F, 0x37, "lui opcode");
+        assert_eq!(s & 0x7F, 0x23, "store opcode");
+        let target = (lui_imm20(l) << 12) + s_type_imm12(s);
+        assert_eq!(target, symbol as i64, "LUI+SW 解码 target == 符号地址");
     }
 
     // -- 数据重定位 ------------------------------------------------------------------

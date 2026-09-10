@@ -25,6 +25,7 @@ pub mod monitor;
 pub mod object;
 #[macro_use]
 pub mod print;
+pub mod sched;
 pub mod task;
 pub mod timer;
 pub mod trace;
@@ -89,6 +90,7 @@ pub fn init(
     memory::free_region(probe).map_err(|_| "free probe failed")?;
 
     task::init();
+    sched::init();
     component::registry::init();
     component::interface::init();
     log!("core", "init OK");

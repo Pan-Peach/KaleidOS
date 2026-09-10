@@ -107,14 +107,19 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let image = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, image_size) };
     for &(index, put) in &seg_place {
         let section = object.section(index)?;
-        let data = object.section_data(index)?;
         let end = put
             .checked_add(section.size)
             .ok_or(LoaderError::UnsupportedFormat)?;
-        image
+        let dst = image
             .get_mut(put..end)
-            .ok_or(LoaderError::UnsupportedFormat)?
-            .copy_from_slice(data);
+            .ok_or(LoaderError::UnsupportedFormat)?;
+        if section.is_nobits() {
+            // BSS：无文件数据，放段 = 零填充（组件的静态 mutable 就住这里）。
+            dst.fill(0);
+        } else {
+            let data = object.section_data(index)?;
+            dst.copy_from_slice(data);
+        }
     }
 
     apply_relocations(&object, base, image, &seg_place, &relocations)?;

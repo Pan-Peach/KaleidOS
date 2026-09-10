@@ -7,6 +7,7 @@
 mod elf;
 pub mod export;
 pub mod interface;
+pub mod load;
 pub mod loader;
 pub mod registry;
 pub mod store;

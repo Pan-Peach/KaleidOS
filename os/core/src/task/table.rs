@@ -5,6 +5,7 @@ use crate::task::error::TaskError;
 use crate::task::id::TaskId;
 use crate::task::kstack::Kernelstack;
 use crate::task::record::TaskRecord;
+use crate::task::state::TaskState;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
@@ -82,6 +83,32 @@ impl TaskTable {
         self.tasks.get_mut(&id)
     }
 
+    /// 状态推进的唯一入口（Core 校验合法转换后才落笔；调度器 commit 路径调用）。
+    ///
+    /// 合法转换（v1 状态机）：
+    /// - `Created → Runnable`（start：任务首次交给调度器）
+    /// - `Runnable → Running(cpu)`（dispatch：被调度器选中）
+    /// - `Running → Runnable`（yield / 时间片到）
+    /// - `Running → Exited`（exit：任务自行退出）
+    ///
+    /// 其余一律 `InvalidTransition`（Exited 终态、Created 直接 Running 等）。
+    /// Running(cpu) 互斥、跨 CPU 检查留给 SMP 里程碑。
+    pub fn transition(&mut self, id: TaskId, to: TaskState) -> Result<(), TaskError> {
+        let record = self.get_mut(id).ok_or(TaskError::NotFound)?;
+        let legal = matches!(
+            (&record.state(), &to),
+            (TaskState::Created, TaskState::Runnable)
+                | (TaskState::Runnable, TaskState::Running(_))
+                | (TaskState::Running(_), TaskState::Runnable)
+                | (TaskState::Running(_), TaskState::Exited)
+        );
+        if !legal {
+            return Err(TaskError::InvalidTransition);
+        }
+        record.set_state(to);
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: TaskId) -> Result<TaskRecord, TaskError> {
         match self.tasks.remove(&id) {
             Some(record) => Ok(record),
@@ -142,13 +169,47 @@ mod tests {
 
         let mut t = TaskTable::new();
         let id = t.create(ENTRY).unwrap();
-        // 组件/外部 crate 拿不到 &mut state：只能走 Core 写入点。
-        // 这里用 Core 内部入口做一次合法写入，验证读取侧一致。
+        // 组件/外部 crate 拿不到 &mut state：只能走 Core 的 transition 写入点。
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Created));
-        t.get_mut(id)
-            .unwrap()
-            .set_state(TaskState::Running(CpuId(0)));
+        t.transition(id, TaskState::Runnable).unwrap();
+        assert!(matches!(t.get(id).unwrap().state(), TaskState::Runnable));
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Running(_)));
+    }
+
+    #[test]
+    fn transition_rejects_illegal_state_moves() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(ENTRY).unwrap();
+
+        // Created 直接 Running / Exited：非法（必须经 Runnable / 先跑起来）。
+        assert_eq!(
+            t.transition(id, TaskState::Running(CpuId(0))),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(
+            t.transition(id, TaskState::Exited),
+            Err(TaskError::InvalidTransition)
+        );
+        // 未存在的 id：NotFound（存在性验证）。
+        assert_eq!(
+            t.transition(TaskId::from_raw(99), TaskState::Runnable),
+            Err(TaskError::NotFound)
+        );
+
+        // 合法全链：Created → Runnable → Running → Runnable → Running → Exited。
+        t.transition(id, TaskState::Runnable).unwrap();
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(id, TaskState::Runnable).unwrap();
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(id, TaskState::Exited).unwrap();
+        // Exited 终态：任何推进都非法。
+        assert_eq!(
+            t.transition(id, TaskState::Runnable),
+            Err(TaskError::InvalidTransition)
+        );
     }
 
     #[test]

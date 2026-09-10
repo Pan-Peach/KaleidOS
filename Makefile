@@ -41,7 +41,7 @@ OUTPUT    := kaleidos-$(ARCH)
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 组件名 → 源码目录；每个组件编译成 ET_REL 对象（= .kcomp）
-KCOMP_COMPONENTS := core_test kcomp_smoke
+KCOMP_COMPONENTS := core_test kcomp_smoke scheduler_rr
 KCOMP_DIRS := $(addprefix os/components/,$(KCOMP_COMPONENTS))
 KPKG_DIR   := /tmp/opencode/kpkg
 

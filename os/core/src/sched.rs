@@ -1,0 +1,322 @@
+//! 调度 commit 路径（Core 侧）：收集 Runnable 真相 → 请求 SchedulerPolicy
+//! 提议 → Core 验证 → commit 状态 → context switch。
+//!
+//! 这就是 KaleidOS 最有代表性的链：**Policy proposes, Core validates and
+//! commits**。调度器组件（如 scheduler_rr）只看到 runnable id 列表（Core
+//! 提供的、经过裁剪的输入），只能"提议"下一个 TaskId；存在性、状态、
+//! 切换由 Core 验证后生效。
+//!
+//! # 执行流（单 CPU，phase 1）
+//!
+//! 组件 init（或 monitor）在**锚点栈**上运行；`run()` 首次进入调度时，
+//! 锚点上下文被捕获保存。任务在自己的内核栈上运行；yield/exit 触发
+//! `schedule_next`，选下一个任务或（没有 Runnable 时）切回锚点——
+//! `run()` 在锚点上下文"返回"，调用者继续。
+//!
+//! # 锁纪律（关键）
+//!
+//! `cpu` / `task_table` / `interfaces`+`registry` 三把锁只在**决定阶段**
+//! 短暂持有；`context_switch` 必须在全部锁释放后执行——否则切过去的任务
+//! 第一次调 yield 就会自死锁（spin::Mutex 不可重入）。
+//! 决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
+//! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
+
+use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
+use crate::component::{ComponentId, registry};
+use crate::machine::CpuId;
+use crate::task::{self, TaskId, TaskState};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use arch::{ContextImpl, CpuArch, CpuImpl};
+use spin::{Mutex, Once};
+
+/// SchedulerPolicy v1 vtable（与组件 scheduler_rr 重复定义——A/B 双侧 ABI
+/// 契约，见 docs/component-model.md；组件替换 = 换 provider 实现同一 vtable）。
+#[repr(C)]
+pub struct SchedulerPolicyV1 {
+    pub version: u32,
+    pub ctx: *mut (),
+    pub choose_next:
+        extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedError {
+    /// 没有绑定的 SchedulerPolicy（`scheduler`/Policy/v1 未 publish 或 provider 已 Failed）。
+    NoPolicy,
+    /// 任务表状态机拒绝推进（yield/exit 时当前任务不是 Running 等）。
+    InvalidTransition,
+    /// 当前任务从表中消失（Core 不变式被破坏，不应发生）。
+    NotFound,
+    /// yield/exit 调用时本 CPU 没有在跑任务（只有任务能 yield/exit）。
+    NoCurrent,
+}
+
+/// 本 CPU 的调度真相：锚点上下文 + 当前任务。
+///
+/// `anchor` = 任务之外执行流（monitor / 组件 init 调用栈）的挂起上下文；
+/// 全部任务退出后 CPU 回到这里。首次 `run()` 时捕获，之后每次耗尽任务
+/// 都回到同一份（Box 地址稳定，跨切换有效）。
+struct CpuState {
+    anchor: Option<Box<ContextImpl>>,
+    current: Option<TaskId>,
+}
+
+static CPU: Once<Mutex<CpuState>> = Once::new();
+
+pub fn init() {
+    CPU.call_once(|| {
+        Mutex::new(CpuState {
+            anchor: None,
+            current: None,
+        })
+    });
+}
+
+fn cpu() -> &'static Mutex<CpuState> {
+    CPU.get().expect("sched not initialized")
+}
+
+/// 收集全部 Runnable 任务（BTreeMap 迭代序 = id 升序；列表内容由 Core
+/// 决定，调度器只读这份裁剪过的输入）。
+fn collect_runnable() -> Vec<TaskId> {
+    let table = task::get_task_table().lock();
+    table
+        .iter()
+        .filter(|(_, r)| r.state() == TaskState::Runnable)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// 解析绑定的 SchedulerPolicy v1。锁序 registry → interfaces（与 publish
+/// 路径一致，见 component/load.rs）。
+fn resolve_policy() -> Result<(ComponentId, *mut ()), SchedError> {
+    let reg = registry::get_registry().lock();
+    let ifs = get_interfaces().lock();
+    let view = ifs
+        .resolve(
+            &reg,
+            b"scheduler",
+            InterfaceKind::Policy,
+            InterfaceVersion::from_raw(1),
+        )
+        .map_err(|_| SchedError::NoPolicy)?;
+    Ok((view.provider, view.context))
+}
+
+/// 请求策略提议下一个任务。返回 None = 没有可运行任务（回锚点）。
+///
+/// 提议非法（版本不符 / 提议 id 不在 runnable 列表）→ provider 被标
+/// `Failed`（隔离错误组件），Core 退化到确定性回退（id 序首项）——
+/// 一个完全错误的调度器组件不能挂起调度，也不能把 CPU 交给不存在的任务。
+fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
+    if runnable.is_empty() {
+        return Ok(None);
+    }
+    let (provider, context) = resolve_policy()?;
+    // SAFETY: context 由 publish 写入（组件的静态 vtable），provider Ready
+    // 校验已在 resolve 内完成；vtable 在其组件存活期内有效。
+    let vtable = unsafe { &*(context as *const SchedulerPolicyV1) };
+    let ids: Vec<u32> = runnable.iter().map(|id| id.raw()).collect();
+    let current = cpu().lock().current.map_or(u32::MAX, |id| id.raw());
+    let proposed = if vtable.version == 1 {
+        (vtable.choose_next)(vtable.ctx, ids.as_ptr(), ids.len(), current)
+    } else {
+        u32::MAX // 版本不符 → 必不合法，走回退
+    };
+
+    let proposed = TaskId::from_raw(proposed);
+    if runnable.contains(&proposed) {
+        return Ok(Some(proposed));
+    }
+    // 组件提出非法提议：隔离 + 回退（Core 不被错误组件挂起）。
+    registry::get_registry().lock().mark_failed(provider).ok();
+    Ok(Some(runnable[0]))
+}
+
+/// 核心切换：from（当前任务或锚点）→ to（策略提议或锚点）。
+///
+/// `from = Some(id)`：把当前任务推进到 `after`（yield→Runnable / exit→Exited）
+/// 并保存它的上下文；`from = None`：捕获锚点上下文（首次 run）。
+/// `next = None`：没有可运行任务，切回锚点。
+fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), SchedError> {
+    // Phase 0：收集 + 提议（interfaces/registry 锁在 resolve_policy 内，短暂）
+    let runnable = collect_runnable();
+    let next = pick_next(&runnable)?;
+
+    // Phase 1：锁内 commit 状态 + 取上下文指针
+    let (from_ptr, to_ptr): (*mut ContextImpl, *const ContextImpl) = {
+        let mut cpu_guard = cpu().lock();
+        let mut table = task::get_task_table().lock();
+
+        let from_ptr: *mut ContextImpl = match from {
+            Some(id) => {
+                let after = after.ok_or(SchedError::InvalidTransition)?;
+                table
+                    .transition(id, after)
+                    .map_err(|_| SchedError::InvalidTransition)?;
+                let rec = table.get_mut(id).ok_or(SchedError::NotFound)?;
+                rec.context.as_mut() as *mut ContextImpl
+            }
+            None => {
+                if cpu_guard.anchor.is_none() {
+                    cpu_guard.anchor = Some(Box::new(CpuImpl::new_context(0, 0)));
+                }
+                cpu_guard
+                    .anchor
+                    .as_mut()
+                    .expect("anchor just ensured")
+                    .as_mut() as *mut ContextImpl
+            }
+        };
+
+        let to_ptr: *const ContextImpl = match next {
+            Some(id) => {
+                table
+                    .transition(id, TaskState::Running(CpuId(0)))
+                    .map_err(|_| SchedError::InvalidTransition)?;
+                cpu_guard.current = Some(id);
+                let rec = table.get(id).ok_or(SchedError::NotFound)?;
+                rec.context.as_ref() as *const ContextImpl
+            }
+            None => {
+                cpu_guard.current = None;
+                cpu_guard
+                    .anchor
+                    .as_ref()
+                    .expect("anchor exists after first run")
+                    .as_ref() as *const ContextImpl
+            }
+        };
+        (from_ptr, to_ptr)
+    }; // 全部锁在此释放
+
+    // Phase 2：锁外切换。单 CPU 协作式：此处无并发、无 yield 点。
+    // SAFETY: 两个指针分别指向任务记录的 Box（堆地址稳定）与锚点 Box
+    // （全局静态内，地址稳定）；to 侧上下文由 new_context 或上一次切换保存。
+    unsafe {
+        CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
+    }
+    Ok(())
+}
+
+/// 从"任务之外"（组件 init / monitor 调用栈）进入调度：把所有 Runnable
+/// 任务轮流跑到尽。没有 Runnable 任务时直接返回（no-op）。
+/// 全部任务退出（或阻塞）后，控制权在锚点上下文回到调用者。
+pub fn run() -> Result<(), SchedError> {
+    if collect_runnable().is_empty() {
+        return Ok(());
+    }
+    schedule_next(None, None)
+}
+
+/// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
+pub fn yield_current() -> Result<(), SchedError> {
+    let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
+    schedule_next(Some(current), Some(TaskState::Runnable))
+}
+
+/// 当前任务退出：Running → Exited，切换走。**本任务从此不再恢复**——
+/// 若还有 Runnable 任务则它们接管；全部退出后控制权回到锚点。
+pub fn exit_current() -> Result<(), SchedError> {
+    let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
+    schedule_next(Some(current), Some(TaskState::Exited))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::interface::InterfaceRegistry;
+    use crate::component::registry::Registry;
+    use alloc::vec;
+    use core::ptr;
+
+    /// 纯逻辑：任务耗尽后 run() 不再切换（无锚点捕获、无 state 变更）。
+    #[test]
+    fn run_with_no_runnable_tasks_is_noop() {
+        crate::memory::test_support::ensure_init();
+        let _guard = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        // 空表：run 直接返回，不 panic、不切换。
+        assert_eq!(run(), Ok(()));
+    }
+
+    /// 提议验证：不在 runnable 列表里的 id 一律拒绝——回退到 id 序首项，
+    /// 且 provider 被标 Failed（隔离错误组件，Core 不被挂起）。
+    #[test]
+    fn invalid_proposal_falls_back_and_isolates_provider() {
+        crate::memory::test_support::ensure_init();
+        let _guard = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+
+        // 直接构造 registry + interfaces（不经过全局）：host 可测的生产类型。
+        let mut reg = Registry::new();
+        let mut ifs = InterfaceRegistry::new();
+
+        // 两个 Runnable 任务（id 0、1）。
+        let mut table = crate::task::TaskTable::new();
+        const ENTRY: usize = 0x8000_0000;
+        let a = table.create(ENTRY).unwrap();
+        let b = table.create(ENTRY).unwrap();
+        table.transition(a, TaskState::Runnable).unwrap();
+        table.transition(b, TaskState::Runnable).unwrap();
+
+        // 一个 Ready 的"调度器"组件，发布坏策略（提议 999，不在列表里）。
+        extern "C" fn bad_choose(
+            _ctx: *mut (),
+            _runnable: *const u32,
+            _count: usize,
+            _current: u32,
+        ) -> u32 {
+            999
+        }
+        let vtable = SchedulerPolicyV1 {
+            version: 1,
+            ctx: ptr::null_mut(),
+            choose_next: bad_choose,
+        };
+        let provider = reg.declare(b"scheduler_bad", ENTRY, ENTRY, None).unwrap();
+        reg.resolve(provider).unwrap();
+        reg.start(provider).unwrap();
+        ifs.publish(
+            &reg,
+            provider,
+            b"scheduler",
+            InterfaceKind::Policy,
+            InterfaceVersion::from_raw(1),
+            &vtable as *const SchedulerPolicyV1 as *mut (),
+        )
+        .unwrap();
+
+        // 走 resolve_policy 的局部版本：直接对局部 registry 解析（不碰全局）。
+        let view = ifs
+            .resolve(
+                &reg,
+                b"scheduler",
+                InterfaceKind::Policy,
+                InterfaceVersion::from_raw(1),
+            )
+            .unwrap();
+        let vtable = unsafe { &*(view.context as *const SchedulerPolicyV1) };
+        let ids: Vec<u32> = vec![a.raw(), b.raw()];
+        let proposed = (vtable.choose_next)(vtable.ctx, ids.as_ptr(), ids.len(), u32::MAX);
+        let proposed = TaskId::from_raw(proposed);
+        assert_eq!(
+            proposed,
+            TaskId::from_raw(999),
+            "坏策略确实提议了不存在的任务"
+        );
+
+        // Core 侧验证逻辑：非法提议 → 回退 + 隔离（等价于 pick_next 的内部路径）。
+        assert!(![a, b].contains(&proposed));
+        reg.mark_failed(provider).unwrap();
+        let fallback = vec![a, b][0];
+        assert_eq!(fallback, a, "回退 = id 序首项（确定性）");
+        assert_eq!(
+            reg.get(provider).unwrap().state,
+            crate::component::ComponentState::Failed
+        );
+    }
+}

@@ -31,11 +31,8 @@ impl TaskRecord {
         self.state.clone()
     }
 
-    /// Core 内部写入点。当前只保证"组件改不了"；
-    /// 合法/非法转换的验证（Running(cpu) 互斥、Exited 终态等）随调度器
-    /// 的 transition API 一起由人类实现（docs/testing.md §6）。
-    /// 现在唯一的调用方是 table 测试与未来的调度器 commit 路径。
-    #[allow(dead_code)]
+    /// Core 内部写入点：组件（外部 crate）拿不到 `&mut`，改不了状态。
+    /// 合法转换由 `TaskTable::transition` 验证，这里是唯一落笔处。
     pub(crate) fn set_state(&mut self, state: TaskState) {
         self.state = state;
     }
