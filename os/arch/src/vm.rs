@@ -43,6 +43,13 @@ pub type PageAlloc = fn() -> Result<usize, ()>;
 /// Core validates & commits around the call. The active architecture backend
 /// supplies the concrete implementation.
 pub trait AddressSpaceBackend {
+    /// 该后端要求映射区间满足的对齐/步进粒度（必须是 2 的幂）。
+    ///
+    /// Core 的地址空间校验用它做对齐检查，**不引用任何分配器常量**：
+    /// Sv39/Sv32 = `VM_PAGE_SIZE`（4 KiB）；NoMMU = 1（恒等，无对齐约束，
+    /// 校验自动退化为 no-op）。这保证 Core 不偷偷依赖"必须有 MMU 页"。
+    const GRANULE: usize;
+
     type Error;
 
     fn map(

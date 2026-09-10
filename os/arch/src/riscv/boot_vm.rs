@@ -9,7 +9,7 @@
 //! high-half alias alive.  A later final-kernel mapping (`KernelAddressSpace`)
 //! will replace this root after memory discovery and allocation are available.
 
-use super::mmu::sv39::{ENTRIES, PAGE_SIZE, PageTable, Pte, PteFlags, vpn};
+use super::mmu::sv39::{ENTRIES, PageTable, Pte, PteFlags, VM_PAGE_SIZE, vpn};
 
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
@@ -117,8 +117,8 @@ pub unsafe fn init(
         return Err(BootVmError::EmptyRam);
     }
 
-    if kernel_pa & (PAGE_SIZE - 1) != 0
-        || linked_kernel_pa & (PAGE_SIZE - 1) != 0
+    if kernel_pa & (VM_PAGE_SIZE - 1) != 0
+        || linked_kernel_pa & (VM_PAGE_SIZE - 1) != 0
         || image_size == 0
     {
         return Err(BootVmError::AddressUnaligned);
@@ -265,7 +265,7 @@ unsafe fn install_identity_alias(
                 unsafe { identity_l0_for(l1, vpn(pa, 1), window_pa, kernel_pa, linked_kernel_pa)? };
             l0[vpn(pa, 0)] = Pte::new_leaf_pa(pa, section.flags);
             pa = pa
-                .checked_add(PAGE_SIZE)
+                .checked_add(VM_PAGE_SIZE)
                 .ok_or(BootVmError::AddressOverflow)?;
         }
     }
@@ -299,10 +299,10 @@ unsafe fn install_kernel_alias(
     // executable in pass 2; the bootstrap shadow only needs data access after
     // the hand-off, and must not create another RWX kernel alias.
     let mapped_size = image_size
-        .checked_add(PAGE_SIZE - 1)
+        .checked_add(VM_PAGE_SIZE - 1)
         .ok_or(BootVmError::AddressOverflow)?
-        & !(PAGE_SIZE - 1);
-    for offset in (0..mapped_size).step_by(PAGE_SIZE) {
+        & !(VM_PAGE_SIZE - 1);
+    for offset in (0..mapped_size).step_by(VM_PAGE_SIZE) {
         let va = KERNEL_VMA
             .checked_add(offset)
             .ok_or(BootVmError::AddressOverflow)?;
@@ -320,7 +320,7 @@ unsafe fn install_kernel_alias(
         if section.va_start >= section.va_end {
             continue;
         }
-        if section.va_start & (PAGE_SIZE - 1) != 0 {
+        if section.va_start & (VM_PAGE_SIZE - 1) != 0 {
             return Err(BootVmError::AddressUnaligned);
         }
 
@@ -333,7 +333,7 @@ unsafe fn install_kernel_alias(
                 .checked_add(offset)
                 .ok_or(BootVmError::AddressOverflow)?;
             l0[vpn(va, 0)] = Pte::new_leaf_pa(pa, section.flags);
-            va += PAGE_SIZE;
+            va += VM_PAGE_SIZE;
         }
     }
 
@@ -378,7 +378,7 @@ unsafe fn identity_l0_for(
     for (index, entry) in table.entries.iter_mut().enumerate() {
         let pa = window_pa
             .checked_add(l1_index * MEGAPAGE_SIZE)
-            .and_then(|pa| pa.checked_add(index * PAGE_SIZE))
+            .and_then(|pa| pa.checked_add(index * VM_PAGE_SIZE))
             .ok_or(BootVmError::AddressOverflow)?;
         *entry = Pte::new_leaf_pa(pa, IDENTITY_FLAGS);
     }
@@ -387,9 +387,9 @@ unsafe fn identity_l0_for(
 
 fn validate_sections(image_size: usize, sections: &[KernelSection]) -> Result<(), BootVmError> {
     let mapped_size = image_size
-        .checked_add(PAGE_SIZE - 1)
+        .checked_add(VM_PAGE_SIZE - 1)
         .ok_or(BootVmError::AddressOverflow)?
-        & !(PAGE_SIZE - 1);
+        & !(VM_PAGE_SIZE - 1);
     let image_end = KERNEL_VMA
         .checked_add(mapped_size)
         .ok_or(BootVmError::AddressOverflow)?;
@@ -400,7 +400,7 @@ fn validate_sections(image_size: usize, sections: &[KernelSection]) -> Result<()
         }
         if section.va_start > section.va_end
             || section.va_start < KERNEL_VMA
-            || section.va_start & (PAGE_SIZE - 1) != 0
+            || section.va_start & (VM_PAGE_SIZE - 1) != 0
             || section.va_end > image_end
         {
             return Err(BootVmError::InvalidKernelSection);

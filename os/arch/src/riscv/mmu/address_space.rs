@@ -37,6 +37,7 @@ impl Sv39AddressSpace {
 #[cfg(target_arch = "riscv64")]
 impl AddressSpaceBackend for Sv39AddressSpace {
     type Error = sv39::MapError;
+    const GRANULE: usize = sv39::VM_PAGE_SIZE;
 
     fn map(
         &mut self,
@@ -90,6 +91,7 @@ impl Sv32AddressSpace {
 #[cfg(target_arch = "riscv32")]
 impl AddressSpaceBackend for Sv32AddressSpace {
     type Error = sv32::MapError;
+    const GRANULE: usize = sv32::VM_PAGE_SIZE;
 
     fn map(
         &mut self,

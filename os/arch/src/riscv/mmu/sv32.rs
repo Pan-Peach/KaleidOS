@@ -8,7 +8,7 @@ use crate::vm::{MappingPermission, PageAlloc, PhysicalRange, VirtualRange};
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
-pub const PAGE_SIZE: usize = 4096;
+pub const VM_PAGE_SIZE: usize = 4096;
 pub const ENTRIES: usize = 1024;
 pub const LEVELS: usize = 2;
 
@@ -111,7 +111,7 @@ pub const fn vpn(va: usize, level: usize) -> usize {
 }
 
 pub const fn is_page_aligned(address: usize) -> bool {
-    address & (PAGE_SIZE - 1) == 0
+    address & (VM_PAGE_SIZE - 1) == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,8 +252,8 @@ impl Sv32PageTable {
                 break Err(MapError::AlreadyMapped);
             }
             *pte = Pte::new_leaf_pa(p, flags);
-            v += PAGE_SIZE;
-            p += PAGE_SIZE;
+            v += VM_PAGE_SIZE;
+            p += VM_PAGE_SIZE;
         };
 
         if result.is_err() {
@@ -278,14 +278,14 @@ impl Sv32PageTable {
             {
                 *pte = Pte::invalid();
             }
-            v += PAGE_SIZE;
+            v += VM_PAGE_SIZE;
         }
         Ok(())
     }
 
     pub fn translate(&self, va: usize) -> Option<usize> {
         let pte = self.find_pte(va)?;
-        pte.is_valid().then(|| pte.pa() | (va & (PAGE_SIZE - 1)))
+        pte.is_valid().then(|| pte.pa() | (va & (VM_PAGE_SIZE - 1)))
     }
 }
 
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn pte_leaf_pa_roundtrip_within_34_bits() {
         // 22 位 PPN → 34 位物理地址空间
-        for pa in [0usize, PAGE_SIZE, 0x8000_0000, 0x3_FFFF_F000] {
+        for pa in [0usize, VM_PAGE_SIZE, 0x8000_0000, 0x3_FFFF_F000] {
             let pte = Pte::new_leaf_pa(pa, PteFlags::R);
             assert!(pte.is_leaf());
             assert_eq!(pte.pa(), pa, "34 位内 leaf PA 必须完整往返");
@@ -442,14 +442,14 @@ mod tests {
         let pa = 0x9000_0000usize;
         assert!(
             table
-                .map_range(vr(va, PAGE_SIZE), pr(pa, PAGE_SIZE), rw())
+                .map_range(vr(va, VM_PAGE_SIZE), pr(pa, VM_PAGE_SIZE), rw())
                 .is_ok()
         );
         assert_eq!(table.translate(va), Some(pa));
         assert_eq!(table.translate(va + 0x500), Some(pa + 0x500));
         assert_eq!(table.translate(va - 1), None);
-        assert_eq!(table.translate(va + PAGE_SIZE), None);
-        assert!(table.unmap_range(vr(va, PAGE_SIZE)).is_ok());
+        assert_eq!(table.translate(va + VM_PAGE_SIZE), None);
+        assert!(table.unmap_range(vr(va, VM_PAGE_SIZE)).is_ok());
         assert_eq!(table.translate(va), None);
     }
 
@@ -461,17 +461,17 @@ mod tests {
         let mut table = table();
         let base = 0x4000_0000usize;
         let pa = 0x8000_0000usize;
-        let size = 3 * PAGE_SIZE;
+        let size = 3 * VM_PAGE_SIZE;
         assert!(table.map_range(vr(base, size), pr(pa, size), rw()).is_ok());
         for i in 0..3 {
             assert_eq!(
-                table.translate(base + i * PAGE_SIZE),
-                Some(pa + i * PAGE_SIZE)
+                table.translate(base + i * VM_PAGE_SIZE),
+                Some(pa + i * VM_PAGE_SIZE)
             );
         }
         assert!(table.unmap_range(vr(base, size)).is_ok());
         for i in 0..3 {
-            assert_eq!(table.translate(base + i * PAGE_SIZE), None);
+            assert_eq!(table.translate(base + i * VM_PAGE_SIZE), None);
         }
     }
 
@@ -486,12 +486,12 @@ mod tests {
         super::super::test_pool::set_fail_after(3);
         let mut table = table();
         let base = 0x0040_0000usize; // 4MiB 边界（vpn1 索引干净）
-        let size = PAGE_SIZE * 1024 * 2 + PAGE_SIZE; // 8 MiB + 4 KiB
+        let size = VM_PAGE_SIZE * 1024 * 2 + VM_PAGE_SIZE; // 8 MiB + 4 KiB
         let result = table.map_range(vr(base, size), pr(0x8000_0000, size), rw());
         assert_eq!(result, Err(MapError::Exhausted));
         for i in 0..2048 {
             assert_eq!(
-                table.translate(base + i * PAGE_SIZE),
+                table.translate(base + i * VM_PAGE_SIZE),
                 None,
                 "leaf {i} 必须回滚"
             );
@@ -514,11 +514,11 @@ mod tests {
         let va = 0x1000usize;
         assert!(
             table
-                .map_range(vr(va, PAGE_SIZE), pr(0x9000_0000, PAGE_SIZE), rw())
+                .map_range(vr(va, VM_PAGE_SIZE), pr(0x9000_0000, VM_PAGE_SIZE), rw())
                 .is_ok()
         );
         assert_eq!(
-            table.map_range(vr(va, PAGE_SIZE), pr(0xA000_0000, PAGE_SIZE), rw()),
+            table.map_range(vr(va, VM_PAGE_SIZE), pr(0xA000_0000, VM_PAGE_SIZE), rw()),
             Err(MapError::AlreadyMapped)
         );
         assert_eq!(table.translate(va), Some(0x9000_0000), "原映射必须保留");
@@ -531,15 +531,15 @@ mod tests {
         super::super::test_pool::init_low();
         let mut table = table();
         assert_eq!(
-            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2000, 2 * PAGE_SIZE), rw()),
+            table.map_range(vr(0x1000, VM_PAGE_SIZE), pr(0x2000, 2 * VM_PAGE_SIZE), rw()),
             Err(MapError::Unaligned)
         );
         assert_eq!(
-            table.map_range(vr(0x1001, PAGE_SIZE), pr(0x2000, PAGE_SIZE), rw()),
+            table.map_range(vr(0x1001, VM_PAGE_SIZE), pr(0x2000, VM_PAGE_SIZE), rw()),
             Err(MapError::Unaligned)
         );
         assert_eq!(
-            table.map_range(vr(0x1000, PAGE_SIZE), pr(0x2001, PAGE_SIZE), rw()),
+            table.map_range(vr(0x1000, VM_PAGE_SIZE), pr(0x2001, VM_PAGE_SIZE), rw()),
             Err(MapError::Unaligned)
         );
         assert_eq!(
@@ -552,8 +552,8 @@ mod tests {
         );
         assert_eq!(
             table.map_range(
-                vr(0x1000, PAGE_SIZE),
-                pr(0x2000, PAGE_SIZE),
+                vr(0x1000, VM_PAGE_SIZE),
+                pr(0x2000, VM_PAGE_SIZE),
                 MappingPermission::empty()
             ),
             Err(MapError::InvalidPermission)
