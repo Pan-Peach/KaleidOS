@@ -141,6 +141,8 @@ pub extern "C" fn on_trap() {
 
     if let Some(next) = next {
         arch::TimerImpl::set_deadline(next);
+    } else {
+        arch::TimerImpl::cancel_deadline();
     }
 }
 

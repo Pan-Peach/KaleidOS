@@ -88,6 +88,8 @@ impl Timer for Fake {
         // host 无定时器硬件：no-op 占位。
     }
 
+    fn cancel_deadline() {}
+
     fn register_timer_handler(_handler: extern "C" fn()) {}
 
     fn enable_timer_interrupt() {}

@@ -98,6 +98,10 @@ impl Timer for Riscv {
         firmware::set_timer(_deadline);
     }
 
+    fn cancel_deadline() {
+        firmware::cancel_timer();
+    }
+
     fn register_timer_handler(handler: extern "C" fn()) {
         trap::register_timer_handler(handler);
     }

@@ -1,4 +1,5 @@
-use arch::{CpuArch, ResetType, SystemReset};
+use arch::{CpuArch, ResetType, SystemReset, Timer};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::global_asm, mem::MaybeUninit};
 
 const STACK_BYTES: usize = 4096;
@@ -35,6 +36,7 @@ static mut SELFTEST_B_RESUMED_SP: usize = 0;
 static mut SELFTEST_A_S: [usize; 12] = [0; 12];
 #[unsafe(no_mangle)]
 static mut SELFTEST_B_S: [usize; 12] = [0; 12];
+static TIMER_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "riscv32")]
 static mut SV32_TEST_TABLE: [u32; 1024] = [0; 1024];
@@ -189,11 +191,43 @@ fn execute_nx_fault() -> ! {
 /// 定时器 ArchTest（C5 骨架位）：N tick 窗口内时钟中断确实触发，且 `sret`
 /// 返回后被打断的现场（寄存器/栈）不破坏。
 ///
-/// TODO(C5)：实现 + 在 `tests/qemu/arch_runner.py` 的 CASES 注册
-/// `("timer", None)`。接线点：`firmware::set_timer`（或 `arch::TimerImpl`）、
-/// `sie.STIE` / `sstatus.SIE` 开闸、ISR 计数；本用例走裸 arch（不依赖 Core）。
+/// 本用例走裸 arch（不依赖 Core）：设置一个 one-shot deadline，等待一次
+/// timer IRQ，由 handler disarm，然后继续等待一个时间窗口确认没有重复 IRQ。
 fn timer() -> ! {
-    todo!("C5: timer arch selftest")
+    const WINDOW: u64 = 10_000;
+
+    TIMER_HANDLER_COUNT.store(0, Ordering::Release);
+    arch::TimerImpl::register_timer_handler(timer_handler);
+    arch::TimerImpl::enable_timer_interrupt();
+
+    let first_deadline = arch::TimerImpl::now().saturating_add(WINDOW);
+    arch::TimerImpl::set_deadline(first_deadline);
+
+    while TIMER_HANDLER_COUNT.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+
+    let quiet_until = arch::TimerImpl::now().saturating_add(WINDOW);
+    while arch::TimerImpl::now() < quiet_until {
+        core::hint::spin_loop();
+    }
+
+    if TIMER_HANDLER_COUNT.load(Ordering::Acquire) != 1 {
+        kernel::log!(
+            "selftest",
+            "timer count={} now={} quiet_until={}",
+            TIMER_HANDLER_COUNT.load(Ordering::Acquire),
+            arch::TimerImpl::now(),
+            quiet_until
+        );
+        fail("timer delivered more than one interrupt");
+    }
+    pass("timer")
+}
+
+extern "C" fn timer_handler() {
+    TIMER_HANDLER_COUNT.fetch_add(1, Ordering::AcqRel);
+    arch::TimerImpl::cancel_deadline();
 }
 
 fn context_switch() -> ! {

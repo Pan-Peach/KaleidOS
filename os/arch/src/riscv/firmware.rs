@@ -113,6 +113,25 @@ pub fn time() -> u64 {
 #[cfg(feature = "supervisor")]
 pub fn set_timer(deadline: u64) {
     sbi_rt::set_timer(deadline);
+    unsafe {
+        core::arch::asm!(
+            "csrs sie, {mask}",
+            mask = in(reg) (1usize << 5),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(feature = "supervisor")]
+pub fn cancel_timer() {
+    sbi_rt::set_timer(u64::MAX);
+    unsafe {
+        core::arch::asm!(
+            "csrc sie, {mask}",
+            mask = in(reg) (1usize << 5),
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 #[cfg(feature = "supervisor")]
@@ -167,6 +186,26 @@ pub fn set_timer(deadline: u64) {
         core::ptr::write_volatile(high, u32::MAX);
         core::ptr::write_volatile(low, deadline as u32);
         core::ptr::write_volatile(high, (deadline >> 32) as u32);
+    }
+
+    unsafe {
+        core::arch::asm!(
+            "csrs mie, {mask}",
+            mask = in(reg) (1usize << 7),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(feature = "machine")]
+pub fn cancel_timer() {
+    set_timer(u64::MAX);
+    unsafe {
+        core::arch::asm!(
+            "csrc mie, {mask}",
+            mask = in(reg) (1usize << 7),
+            options(nostack, preserves_flags),
+        );
     }
 }
 
