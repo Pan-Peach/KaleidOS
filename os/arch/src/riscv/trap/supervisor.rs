@@ -47,7 +47,7 @@ unsafe fn set_trap_vector() {
 pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, stval: usize) {
     let scause = Scause::from_bits(raw_scause);
     let trap = scause.cause();
-    let sepc = unsafe { (*trap_frame).sepc };
+    let sepc = unsafe { (*trap_frame).epc };
 
     match trap {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {

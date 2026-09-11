@@ -11,6 +11,12 @@
 #![no_std]
 extern crate alloc;
 
+#[cfg(all(feature = "supervisor", feature = "machine"))]
+compile_error!("arch features `supervisor` and `machine` are mutually exclusive");
+
+#[cfg(not(any(feature = "supervisor", feature = "machine")))]
+compile_error!("arch requires exactly one privilege-mode feature: `supervisor` or `machine`");
+
 #[cfg(test)]
 extern crate std;
 

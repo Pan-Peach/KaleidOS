@@ -14,8 +14,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {
     pub x: [usize; 32],
-    pub sstatus: usize,
-    pub sepc: usize,
+    pub status: usize,
+    pub epc: usize,
 }
 
 pub enum Trap {
@@ -134,8 +134,15 @@ impl Scause {
     }
 }
 
+#[cfg(all(feature = "machine", not(feature = "supervisor")))]
 pub mod machine;
+#[cfg(all(feature = "supervisor", not(feature = "machine")))]
 pub mod supervisor;
 
-/// S-mode trap 安装入口（当前唯一实现；`cpu.rs` 的 `CpuImpl::init` 调用）。
+#[cfg(all(feature = "machine", not(feature = "supervisor")))]
+pub use machine::init;
+#[cfg(all(feature = "supervisor", not(feature = "machine")))]
 pub use supervisor::init;
+
+#[cfg(all(feature = "machine", feature = "supervisor"))]
+pub fn init() {}

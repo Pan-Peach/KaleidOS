@@ -6,8 +6,18 @@
 
 use super::{console, firmware, trap};
 use crate::{Console, CpuArch, ResetType, SystemReset, Timer};
+use core::arch::asm;
 
 pub struct Riscv;
+
+#[cfg(all(feature = "supervisor", not(feature = "machine")))]
+const IRQ_ENABLE_BIT: usize = 1 << 1;
+
+#[cfg(all(feature = "machine", not(feature = "supervisor")))]
+const IRQ_ENABLE_BIT: usize = 1 << 3;
+
+#[cfg(all(feature = "machine", feature = "supervisor"))]
+const IRQ_ENABLE_BIT: usize = 0;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +53,39 @@ impl CpuArch for Riscv {
     }
 
     fn disable_irq() -> Self::IrqFlags {
-        // TODO(C5): csrr 保存 sstatus.SIE → 清 SIE → 返回旧 sstatus；irq-save 进入。
-        todo!("C5: sstatus.SIE irq-save")
+        let mut old: usize = 0;
+        unsafe {
+            #[cfg(all(feature = "supervisor", not(feature = "machine")))]
+            asm!(
+                "csrrc {old}, sstatus, {sie}",
+                old = out(reg) old,
+                sie = const IRQ_ENABLE_BIT,
+            );
+            #[cfg(all(feature = "machine", not(feature = "supervisor")))]
+            asm!(
+                "csrrc {old}, mstatus, {mie}",
+                old = out(reg) old,
+                mie = const IRQ_ENABLE_BIT,
+            );
+        }
+        old
     }
 
-    fn restore_irq(_flags: Self::IrqFlags) {
-        // TODO(C5): 恢复 sstatus.SIE（仅当保存值为开时置位）；irq-save 退出。
-        todo!("C5: sstatus.SIE irq-restore")
+    fn restore_irq(flags: Self::IrqFlags) {
+        if flags & IRQ_ENABLE_BIT != 0 {
+            unsafe {
+                #[cfg(all(feature = "supervisor", not(feature = "machine")))]
+                asm!(
+                    "csrs sstatus, {mask}",
+                    mask = in(reg) IRQ_ENABLE_BIT,
+                );
+                #[cfg(all(feature = "machine", not(feature = "supervisor")))]
+                asm!(
+                    "csrs mstatus, {mask}",
+                    mask = in(reg) IRQ_ENABLE_BIT,
+                );
+            }
+        }
     }
 }
 
