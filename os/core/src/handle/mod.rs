@@ -9,6 +9,7 @@
 
 mod error;
 mod generic;
+mod table;
 pub mod irq;
 pub mod mmio;
 
@@ -18,3 +19,4 @@ pub use irq::IrqHandle;
 pub use mmio::MmioHandle;
 
 pub(crate) use generic::Slot;
+pub(crate) use table::ResourceTable;

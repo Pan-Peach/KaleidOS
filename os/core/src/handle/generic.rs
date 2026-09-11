@@ -76,4 +76,38 @@ impl<T> Slot<T> {
             object: Some(object),
         }
     }
+
+    pub(crate) const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub(crate) const fn owner(&self) -> ComponentId {
+        self.owner
+    }
+
+    pub(crate) fn object(&self) -> Option<&T> {
+        self.object.as_ref()
+    }
+
+    pub(crate) fn object_mut(&mut self) -> Option<&mut T> {
+        self.object.as_mut()
+    }
+
+    pub(crate) fn is_vacant(&self) -> bool {
+        self.object.is_none()
+    }
+
+    /// 在保留 slot index 和 generation 的前提下重新放入资源。
+    pub(crate) fn activate(&mut self, owner: ComponentId, object: T) {
+        debug_assert!(self.object.is_none());
+        self.owner = owner;
+        self.object = Some(object);
+    }
+
+    /// 撤销当前 authority；重复 revoke 不应再次改变 generation。
+    pub(crate) fn revoke(&mut self) {
+        if self.object.take().is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
 }
