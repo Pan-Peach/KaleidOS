@@ -1,4 +1,4 @@
-use crate::{Console, CpuArch, ResetType, SystemReset, Timer};
+use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
@@ -95,6 +95,19 @@ impl Timer for Fake {
     fn register_timer_handler(_handler: extern "C" fn()) {}
 
     fn enable_timer_interrupt() {}
+}
+
+// host 无中断硬件：控制器全是 no-op，claim 恒 None（永远不会投递外部中断）。
+impl InterruptController for Fake {
+    fn configure(_base: usize) {}
+    fn enable(_line: u32) {}
+    fn disable(_line: u32) {}
+    fn claim() -> Option<u32> {
+        None
+    }
+    fn complete(_line: u32) {}
+    fn register_external_handler(_handler: extern "C" fn()) {}
+    fn enable_external_interrupt() {}
 }
 
 impl Console for Fake {

@@ -99,6 +99,7 @@ pub fn init(
     component::registry::init();
     component::interface::init();
     handle::init();
+    irq::init();
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

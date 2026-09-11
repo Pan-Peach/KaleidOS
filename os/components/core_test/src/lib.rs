@@ -346,6 +346,11 @@ mod runtime {
         let magic_ok = claimed && (unsafe { mmio_read_u32(mmio_handle, 0, &mut magic) } == 0);
         check!("mmio-magic", magic_ok && magic == 0x7472_6976, 10);
 
+        // TODO(C6)：IRQ 链用例——claim 设备中断线（kcore_irq_claim）→ 注册处理函数
+        //   （kcore_irq_register）→ 使能（kcore_irq_enable）→ 外部中断真的到达并
+        //   dispatch 到本组件 handler（失败位 11）。当前 PLIC 机制为骨架
+        //   （arch/riscv/plic.rs 的 claim/enable/complete 是 todo!()），实现后再加。
+
         report.group("summary");
         let all_ok = report.summary() && failed == 0;
         report.verdict(all_ok);

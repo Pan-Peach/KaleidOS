@@ -19,6 +19,8 @@ pub mod context;
 pub mod cpu;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod firmware;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub mod plic;
 
 /// 重定位实现：纯字节/编码逻辑，任何目标可编译（host 也测它本身）。
 pub mod elf;

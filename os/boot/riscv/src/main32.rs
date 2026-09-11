@@ -59,6 +59,26 @@ fn configure_machine_timer(info: &MachineInfo) {
     panic!("machine timer not found in device tree");
 }
 
+/// 把 discovery 找到的中断控制器（PLIC）基址交给 arch 机制（C6 骨架）。
+/// 匹配真实 QEMU 的 `riscv,plic0` 与 fixture/新版的 `sifive,plic-1.0.0`；
+/// 没有中断控制器的机器不阻塞 boot（外部中断不可用）。
+fn configure_interrupt_controller(info: &MachineInfo) {
+    for device in &info.devices[..info.dev_count] {
+        let is_plic = device.compatibles[..device.compat_count as usize]
+            .iter()
+            .any(|c| matches!(c.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"));
+        if !is_plic {
+            continue;
+        }
+        let IoSpace::Mmio { base, .. } = device.space else {
+            continue;
+        };
+        <arch::InterruptImpl as arch::InterruptController>::configure(base);
+        return;
+    }
+    kernel::log!("discovery", "no PLIC found; external IRQ unavailable");
+}
+
 fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
     let tree = unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) }.map_err(|_| ())?;
     let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
@@ -137,6 +157,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 
     #[cfg(feature = "machine")]
     configure_machine_timer(&info);
+
+    configure_interrupt_controller(&info);
 
     let linked_start =
         arch::physical_address_of(linker_addr(core::ptr::addr_of!(__image_load_start)));

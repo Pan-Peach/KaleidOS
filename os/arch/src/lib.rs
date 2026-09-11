@@ -117,6 +117,30 @@ pub trait Timer {
     fn enable_timer_interrupt();
 }
 
+/// 外部中断控制器（PLIC）机制（C6 骨架）。
+///
+/// 与 `Timer`/`Console`/`SystemReset` 同一模式：Core 只依赖本 trait 与
+/// `InterruptImpl`，不感知 PLIC 寄存器布局。`docs/architecture.md` §3 把中断
+/// 控制器的长期定位写成「驱动（由 discovery 发现）」——现阶段先把机制放在
+/// arch（同 CLINT/timer 的处理方式），未来降级为 Driver Component 时 Core 侧
+/// 调用点不变，只换 backend 实现。
+pub trait InterruptController {
+    /// 绑定控制器 MMIO 基址（boot 从 discovery 找到设备后调用一次）。
+    fn configure(base: usize);
+    /// 允许 / 屏蔽一条外部中断线（PLIC enable/disable bit）。
+    fn enable(line: u32);
+    fn disable(line: u32);
+    /// 取一条 pending 外部中断（PLIC claim）；无 pending → `None`。
+    fn claim() -> Option<u32>;
+    /// 通知控制器该中断已处理（PLIC complete）。
+    fn complete(line: u32);
+    /// 注册外部中断回调（trap 分发调用）；Core 在 `irq::init` 时接入。
+    fn register_external_handler(handler: extern "C" fn());
+    /// 打开当前特权级的外部中断使能位（S-mode `sie.SEIE` + `sstatus.SIE`；
+    /// M-mode `mie.MEIE` + `mstatus.MIE`）。
+    fn enable_external_interrupt();
+}
+
 /// 早期 console 服务。它是 boot/firmware 传输能力，不是 CPU ISA 原语。
 pub trait Console {
     fn write_byte(byte: u8);
@@ -158,6 +182,13 @@ pub type TimerImpl = riscv::Riscv;
 
 #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub type TimerImpl = fake::Fake;
+
+/// 当前编译目标的中断控制器 backend（C6 骨架；与 Console/Timer 同模式）。
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+pub type InterruptImpl = riscv::Riscv;
+
+#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+pub type InterruptImpl = fake::Fake;
 
 /// Core 使用的任务上下文类型；Core 不关心具体 ISA 的寄存器布局。
 pub type ContextImpl = <CpuImpl as CpuArch>::Context;

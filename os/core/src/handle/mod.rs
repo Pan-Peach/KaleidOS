@@ -20,10 +20,11 @@ mod table;
 
 /// 初始化所有资源 authority 表（`core::init` 调用一次）。
 ///
-/// 各资源表的全局初始化在这里汇总；IRQ / DMA 表的全局化接入时在此追加。
+/// 各资源表的全局初始化在这里汇总（MMIO / IRQ）；DMA 表接入时在此追加。
+/// 外部中断的**投递回调**注册不在这里——那是 `crate::irq::init` 的职责。
 pub fn init() {
     mmio::init();
-    // TODO(C6): irq::init(); —— IrqTable 全局化后接入
+    irq::init();
 }
 
 pub use error::HandleError;

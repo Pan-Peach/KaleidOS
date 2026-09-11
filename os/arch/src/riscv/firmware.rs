@@ -150,6 +150,25 @@ pub fn enable_timer_interrupt() {
     }
 }
 
+/// 打开 S-mode 外部中断使能（`sie.SEIE` + `sstatus.SIE`，C6 骨架）。
+///
+/// 只开"闸门"：具体哪条线能中断由中断控制器（PLIC）的 enable bit 决定。
+#[cfg(feature = "supervisor")]
+pub fn enable_external_interrupt() {
+    unsafe {
+        core::arch::asm!(
+            "csrs sie, {mask}",
+            mask = in(reg) (1usize << 9),
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "csrs sstatus, {mask}",
+            mask = in(reg) (1usize << 1),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 #[cfg(feature = "machine")]
 pub fn configure_machine_timer(mtimecmp_base: usize) {
     assert!(mtimecmp_base != 0, "machine timer has no mtimecmp address");
@@ -215,6 +234,23 @@ pub fn enable_timer_interrupt() {
         core::arch::asm!(
             "csrs mie, {mask}",
             mask = in(reg) (1usize << 7),
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "csrs mstatus, {mask}",
+            mask = in(reg) (1usize << 3),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// 打开 M-mode 外部中断使能（`mie.MEIE` + `mstatus.MIE`，C6 骨架）。
+#[cfg(feature = "machine")]
+pub fn enable_external_interrupt() {
+    unsafe {
+        core::arch::asm!(
+            "csrs mie, {mask}",
+            mask = in(reg) (1usize << 11),
             options(nostack, preserves_flags),
         );
         core::arch::asm!(

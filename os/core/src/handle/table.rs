@@ -49,6 +49,26 @@ impl<T> ResourceTable<T> {
         slot.object().ok_or(HandleError::Revoked)
     }
 
+    /// `get` 的可变版本：验证规则完全相同（slot/generation/owner/生命周期）。
+    /// 供资源表在授权成立后更新自己的 record（如 IRQ 的投递目标注册）。
+    pub(crate) fn get_mut(
+        &mut self,
+        caller: ComponentId,
+        handle: Handle<T>,
+    ) -> Result<&mut T, HandleError> {
+        let slot = self
+            .slots
+            .get_mut(handle.slot() as usize)
+            .ok_or(HandleError::Invalid)?;
+        if slot.generation() != handle.generation() {
+            return Err(HandleError::Stale);
+        }
+        if slot.owner() != caller {
+            return Err(HandleError::WrongOwner);
+        }
+        slot.object_mut().ok_or(HandleError::Revoked)
+    }
+
     /// 只读遍历 slot（供各资源表的专属检查使用，如 MMIO 的设备独占）。
     pub(crate) fn slots(&self) -> &[Slot<T>] {
         &self.slots

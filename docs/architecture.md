@@ -256,7 +256,7 @@ Component → Component     = Interface binding（interface.rs：publish/resolve
 - Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
   （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
   Core validation 的**语义入口**（组件加载 / 接口发布 / 任务控制 / 资源
-  claim：`kcore_mmio_claim/read`）。**不导出未经 Core validation 的裸
+  claim：`kcore_mmio_claim/read`、`kcore_irq_claim/register/enable`）。**不导出未经 Core validation 的裸
   authority mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动
   仍是 Core 内部提交点——组件只能 request（propose），authorize + grant +
   记录由 Core 完成。
@@ -277,7 +277,7 @@ Component → Component     = Interface binding（interface.rs：publish/resolve
 - `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）：
   用到哪个加哪个，进入 public ABI 后数字不再变更。
 - 各子系统的内部错误（`TaskError` / `HandleError` / `ComponentLoadError` /
-  `SchedError` / `InterfaceError` / `MmioError` ...）保持丰富与类型安全，
+  `SchedError` / `InterfaceError` / `MmioError` / `IrqError` ...）保持丰富与类型安全，
   只在 Core ABI 边界翻译成 `Errno`——映射表集中在 `errno.rs`。
 - 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
 

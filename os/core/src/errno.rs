@@ -18,7 +18,7 @@
 
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
-use crate::handle::{HandleError, mmio};
+use crate::handle::{HandleError, irq, mmio};
 use crate::sched::SchedError;
 use crate::task::TaskError;
 
@@ -150,6 +150,26 @@ impl From<mmio::MmioError> for Errno {
     }
 }
 
+impl From<irq::IrqClaimError> for Errno {
+    fn from(error: irq::IrqClaimError) -> Self {
+        match error {
+            irq::IrqClaimError::DeviceNotFound => Errno::ENODEV,
+            irq::IrqClaimError::DeviceHasNoIrq => Errno::ENODEV,
+            irq::IrqClaimError::LineBusy => Errno::EBUSY,
+            irq::IrqClaimError::Denied => Errno::EPERM,
+        }
+    }
+}
+
+impl From<irq::IrqError> for Errno {
+    fn from(error: irq::IrqError) -> Self {
+        match error {
+            irq::IrqError::Handle(inner) => inner.into(),
+            irq::IrqError::NoDelivery => Errno::EINVAL,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +199,16 @@ mod tests {
             Errno::EKEYREVOKED
         );
         assert_eq!(Errno::from(mmio::MmioError::Unaligned), Errno::EINVAL);
+        assert_eq!(Errno::from(irq::IrqClaimError::LineBusy), Errno::EBUSY);
+        assert_eq!(
+            Errno::from(irq::IrqClaimError::DeviceHasNoIrq),
+            Errno::ENODEV
+        );
+        assert_eq!(
+            Errno::from(irq::IrqError::Handle(HandleError::Stale)),
+            Errno::ESTALE
+        );
+        assert_eq!(Errno::from(irq::IrqError::NoDelivery), Errno::EINVAL);
     }
 
     #[test]

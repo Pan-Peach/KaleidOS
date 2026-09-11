@@ -18,7 +18,7 @@
 //! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
-//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` | 设备认领 + 单次 MMIO 读：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`）；read = 每次调用 Core 重新验证 handle 后才访问硬件。组件拿到的只是 raw handle，**不是地址**；两者均 `0 / -Errno`、值走 out 参数 |
+//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` | 设备认领 + 单次 MMIO 读 + 设备中断线认领/注册/使能：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`、`handle/irq.rs`）；read = 每次调用 Core 重新验证 handle 后才访问硬件。组件拿到的只是 raw handle，**不是地址/中断号**；全部 `0 / -Errno`、值走 out 参数。IRQ 的 register/enable 逻辑为骨架（PLIC 机制待实现） |
 //!
 //! # ABI 错误约定（v3 起）
 //!
@@ -75,7 +75,7 @@
 use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
-use crate::handle::mmio;
+use crate::handle::{irq, mmio};
 use crate::machine;
 use crate::memory;
 use crate::sched;
@@ -431,10 +431,78 @@ extern "C" fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32)
 }
 
 // ---------------------------------------------------------------------------
+// Category 8（续）：IRQ authority（v3 起步；claim → register → enable）
+// ---------------------------------------------------------------------------
+
+/// 认领一台已发现设备的中断线（C6 骨架）。
+///
+/// 语义：compatible 匹配 `MachineInfo.devices` → 取设备的 `irq`（PLIC global
+/// interrupt id）→ Core authorize（phase 1 恒 allow）→ 独占检查（该中断号已归
+/// 其他 owner 则拒绝）→ grant `IrqHandle`。
+/// 成功 = 0，raw handle 写入 `*out_handle`（同 `kcore_mmio_claim` 的编码：
+/// 高 32 位 slot、低 32 位 generation；**不是中断号**）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法 / `EPERM` 无法解析
+/// caller 或 Core 策略拒绝 / `ENODEV` 无匹配设备或设备无中断线 / `EBUSY` 中断线
+/// 已被认领）。**逻辑待手写**（`handle::irq::claim`）。
+extern "C" fn kcore_irq_claim(name_ptr: *const u8, name_len: usize, out_handle: *mut u64) -> i32 {
+    if out_handle.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(compatible) = checked_name(name_ptr, name_len) else {
+        return Errno::EINVAL.code();
+    };
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    match irq::claim(caller, compatible) {
+        Ok(handle) => {
+            // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
+            unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 注册该 IRQ 线的投递目标（组件处理函数 + opaque context，C6 骨架）。
+///
+/// `handler` 是组件提供的 `extern "C" fn(ctx: *mut ())`；`ctx` 原样回传，
+/// Core 不解引用（同 interface vtable `ctx` 的生命周期契约）。delivery 存在
+/// IRQ 表的 slot 里，**随 revoke/release 一起消失**——组件失败/卸载后不会再
+/// 有回调进它的代码。
+/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `EBADF` / `ESTALE` /
+/// `EACCES` 非 owner / `EKEYREVOKED` / `EALREADY`）。**逻辑待手写**。
+extern "C" fn kcore_irq_register(handle: u64, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    let delivery = irq::IrqDelivery::new(handler, ctx);
+    let mut table = irq::get_table().lock();
+    match table.set_delivery(caller, irq::IrqHandle::from_raw(handle), delivery) {
+        Ok(()) => 0,
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 使能该 IRQ 线：Core 验证 handle + delivery 后，才去配置中断控制器
+/// （PLIC enable；C6 骨架）。
+/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / handle 类错误 /
+/// `EINVAL` 尚未注册处理函数）。**逻辑待手写**（`handle::irq::enable`）。
+extern "C" fn kcore_irq_enable(handle: u64) -> i32 {
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    match irq::enable(caller, irq::IrqHandle::from_raw(handle)) {
+        Ok(()) => 0,
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 21] = [
+static EXPORTS: [Export; 24] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -527,6 +595,19 @@ static EXPORTS: [Export; 21] = [
         name: b"kcore_mmio_read_u32",
         address: ExportAddress(kcore_mmio_read_u32 as *const ()),
     },
+    // Category 8（续）：IRQ authority（v3 起步）
+    Export {
+        name: b"kcore_irq_claim",
+        address: ExportAddress(kcore_irq_claim as *const ()),
+    },
+    Export {
+        name: b"kcore_irq_register",
+        address: ExportAddress(kcore_irq_register as *const ()),
+    },
+    Export {
+        name: b"kcore_irq_enable",
+        address: ExportAddress(kcore_irq_enable as *const ()),
+    },
 ];
 
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
@@ -567,6 +648,9 @@ mod tests {
             &b"kcore_sched_run"[..],
             &b"kcore_mmio_claim"[..],
             &b"kcore_mmio_read_u32"[..],
+            &b"kcore_irq_claim"[..],
+            &b"kcore_irq_register"[..],
+            &b"kcore_irq_enable"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -609,6 +693,17 @@ mod tests {
         assert_eq!(read(0, 0, core::ptr::null_mut()), -14);
         // 名字非法 → EINVAL（早于 caller 解析与设备匹配）
         assert_eq!(claim(core::ptr::null(), 0, &mut out), -22);
+
+        // IRQ claim 与 MMIO claim 同形（早期路径可安全断言；register/enable 需
+        // 真实 caller，留给 QEMU CoreTest）。
+        let irq_claim = resolve(b"kcore_irq_claim").unwrap();
+        let irq_claim: extern "C" fn(*const u8, usize, *mut u64) -> i32 =
+            unsafe { core::mem::transmute(irq_claim) };
+        assert_eq!(
+            irq_claim(b"virtio,mmio".as_ptr(), 11, core::ptr::null_mut()),
+            -14
+        );
+        assert_eq!(irq_claim(core::ptr::null(), 0, &mut out), -22);
     }
 
     #[test]

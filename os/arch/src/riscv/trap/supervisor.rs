@@ -53,6 +53,9 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, st
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             super::dispatch_timer();
         }
+        Trap::Interrupt(Interrupt::SupervisorExternal) => {
+            super::dispatch_external();
+        }
         Trap::Interrupt(_) => panic!(
             "unhandled interrupt: scause={:#x}, sepc={:#x}, stval={:#x}",
             raw_scause, sepc, stval

@@ -25,6 +25,22 @@ pub fn dispatch_timer() {
     handler();
 }
 
+/// 外部中断回调（Core 在 `irq::init` 时注册 `crate::irq::on_external`）。
+static EXTERNAL_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_external_handler(handler: extern "C" fn()) {
+    EXTERNAL_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+/// 外部中断分发（`SupervisorExternal`/`MachineExternal` trap 分支调用）。
+/// 具体 claim/dispatch/complete 由注册进来的 Core handler 完成。
+pub fn dispatch_external() {
+    let address = EXTERNAL_HANDLER.load(Ordering::Acquire);
+    assert!(address != 0, "external interrupt handler is not registered");
+    let handler: extern "C" fn() = unsafe { core::mem::transmute(address) };
+    handler();
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {

@@ -45,6 +45,9 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_mcause: usize, mt
         Trap::Interrupt(Interrupt::MachineTimer) => {
             super::dispatch_timer();
         }
+        Trap::Interrupt(Interrupt::MachineExternal) => {
+            super::dispatch_external();
+        }
         Trap::Interrupt(_) => panic!(
             "unhandled interrupt: mcause={:#x}, mepc={:#x}, mtval={:#x}",
             raw_mcause, mepc, mtval
