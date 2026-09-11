@@ -73,7 +73,7 @@ fn configure_interrupt_controller(info: &MachineInfo) {
         let IoSpace::Mmio { base, .. } = device.space else {
             continue;
         };
-        <arch::InterruptImpl as arch::InterruptController>::configure(base);
+        <arch::InterruptImpl as arch::InterruptController>::configure(base, info.boot_hart);
         return;
     }
     kernel::log!("discovery", "no PLIC found; external IRQ unavailable");
@@ -173,8 +173,12 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 
     #[cfg(feature = "selftest")]
     {
-        let _ = (&info, &reserved);
-        crate::selftest::run();
+        // selftest 在**完整初始化之后**运行（RV32 identity 映射下 device MMIO
+        // 本就可达；后挪让两个 profile 语义一致）。
+        if let Err(error) = kernel::init(&info, &reserved) {
+            panic!("core init failed: {}", error);
+        }
+        crate::selftest::run(&info);
     }
 
     #[cfg(not(feature = "selftest"))]

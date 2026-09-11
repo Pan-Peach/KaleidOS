@@ -18,7 +18,7 @@
 //! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
-//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` | 设备认领 + 单次 MMIO 读 + 设备中断线认领/注册/使能：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`、`handle/irq.rs`）；read = 每次调用 Core 重新验证 handle 后才访问硬件。组件拿到的只是 raw handle，**不是地址/中断号**；全部 `0 / -Errno`、值走 out 参数。IRQ 的 register/enable 逻辑为骨架（PLIC 机制待实现） |
+//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` | 设备认领 + 单次 MMIO 读 + 设备中断线认领/注册/使能：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`、`handle/irq.rs`）；read = 每次调用 Core 重新验证 handle 后才访问硬件。组件拿到的只是 raw handle，**不是地址/中断号**；全部 `0 / -Errno`、值走 out 参数 |
 //!
 //! # ABI 错误约定（v3 起）
 //!
@@ -443,7 +443,7 @@ extern "C" fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32)
 /// 高 32 位 slot、低 32 位 generation；**不是中断号**）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法 / `EPERM` 无法解析
 /// caller 或 Core 策略拒绝 / `ENODEV` 无匹配设备或设备无中断线 / `EBUSY` 中断线
-/// 已被认领）。**逻辑待手写**（`handle::irq::claim`）。
+/// 已被认领）。
 extern "C" fn kcore_irq_claim(name_ptr: *const u8, name_len: usize, out_handle: *mut u64) -> i32 {
     if out_handle.is_null() {
         return Errno::EFAULT.code();
@@ -471,7 +471,7 @@ extern "C" fn kcore_irq_claim(name_ptr: *const u8, name_len: usize, out_handle: 
 /// IRQ 表的 slot 里，**随 revoke/release 一起消失**——组件失败/卸载后不会再
 /// 有回调进它的代码。
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `EBADF` / `ESTALE` /
-/// `EACCES` 非 owner / `EKEYREVOKED` / `EALREADY`）。**逻辑待手写**。
+/// `EACCES` 非 owner / `EKEYREVOKED` / `EALREADY`）。
 extern "C" fn kcore_irq_register(handle: u64, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
     let Some(caller) = current_task_requester() else {
         return Errno::EPERM.code();
@@ -487,7 +487,7 @@ extern "C" fn kcore_irq_register(handle: u64, handler: irq::IrqHandler, ctx: *mu
 /// 使能该 IRQ 线：Core 验证 handle + delivery 后，才去配置中断控制器
 /// （PLIC enable；C6 骨架）。
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / handle 类错误 /
-/// `EINVAL` 尚未注册处理函数）。**逻辑待手写**（`handle::irq::enable`）。
+/// `EINVAL` 尚未注册处理函数）。
 extern "C" fn kcore_irq_enable(handle: u64) -> i32 {
     let Some(caller) = current_task_requester() else {
         return Errno::EPERM.code();

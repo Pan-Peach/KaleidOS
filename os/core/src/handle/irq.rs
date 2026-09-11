@@ -13,7 +13,7 @@
 //! 4. 投递：trap 的外部中断分支 → `crate::irq::on_external` → `crate::irq::route`
 //!    查表找到该线的 owner delivery → **锁外**调用。
 //!
-//! # 实现要点（TODO：claim / enable / route 逻辑待手写）
+//! # 实现要点
 //!
 //! - `claim`：遍历 `MachineInfo.devices`，找第一台「compatible 匹配、有 `irq`、
 //!   且该中断号未被认领」的设备。同名设备多台（QEMU 有 8 个 virtio-mmio）时，
@@ -26,9 +26,10 @@
 //!
 //! # 测试指引（host 可验证）
 //!
-//! 表语义（grant/get/revoke/release）与 delivery 注册现在就能 host 测；
-//! `claim` / `enable` 的行为规范用 `#[ignore]` 挂在实现前（与 C6 MMIO 同一做法）。
-//! 真实外部中断 delivery 由 QEMU CoreTest 覆盖（PLIC 机制实现之后）。
+//! 表语义 + delivery 注册 + `claim`/`route` 都能 host 测（`claim` 用例提交一份
+//! `MachineInfo`，与 MMIO 的 claim 用例用 `machine::test_support::GUARD` 互斥）。
+//! 真实的控制器契约（PLIC 寄存器真的被写、外部中断真的到达）由 QEMU CoreTest
+//! 与 ArchTest 覆盖。
 //!
 //! # 明确砍掉（第一版勿提前长出来）
 //!
@@ -37,6 +38,9 @@
 
 use super::{Handle, HandleError, ResourceTable};
 use crate::component::ComponentId;
+use crate::irq::IrqSaveGuard;
+use crate::machine;
+use arch::{InterruptController, InterruptImpl};
 use spin::{Mutex, Once};
 
 /// 一条 IRQ 资源对象：某设备的中断线。
@@ -166,6 +170,16 @@ impl IrqTable {
             .iter()
             .any(|slot| slot.object().is_some_and(|irq| irq.number == number))
     }
+
+    /// 取该中断号已注册的投递目标（`IrqDelivery` 是 Copy）。
+    /// 供中断上下文的 `route` **在锁内取一份拷贝、放锁后再调用**。
+    pub fn delivery_of(&self, number: u32) -> Option<IrqDelivery> {
+        self.table.slots().iter().find_map(|slot| {
+            slot.object()
+                .filter(|irq| irq.number == number)
+                .and_then(|irq| irq.delivery)
+        })
+    }
 }
 
 impl Default for IrqTable {
@@ -191,17 +205,78 @@ pub fn get_table() -> &'static Mutex<IrqTable> {
 /// 认领设备的中断线：request → authorize → grant。
 ///
 /// 找第一台「compatible 匹配、有 `irq`、且该中断号未被任意 owner 认领」的设备；
-/// 同名设备多台时按设备表顺序取用。TODO(C6): 实现。
+/// 同名设备多台时按设备表顺序取用：被占的跳过，只有当**所有**匹配设备的线都不可用
+/// 时才报 `LineBusy` / `DeviceHasNoIrq`。
 pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<IrqHandle, IrqClaimError> {
-    let _ = (caller, compatible);
-    todo!("C6: 认领设备 IRQ 线")
+    let Some(machine) = machine::committed() else {
+        // 机器信息尚未提交（正常组件运行期不可达）
+        return Err(IrqClaimError::DeviceNotFound);
+    };
+    let _guard = IrqSaveGuard::new();
+    let mut table = get_table().lock();
+    let mut saw_match = false;
+    let mut saw_line = false;
+    for (index, device) in machine.devices[..machine.dev_count].iter().enumerate() {
+        // compatible 匹配（任一命中即可）
+        if !device.compatibles[..device.compat_count as usize]
+            .iter()
+            .any(|c| c.as_str().as_bytes() == compatible)
+        {
+            continue;
+        }
+        saw_match = true;
+        // 设备没有中断线（FDT 无 interrupts）→ 试下一台
+        let Some(number) = device.irq else {
+            continue;
+        };
+        saw_line = true;
+        // 这条线已被认领 → 试下一台同名设备（QEMU 上 8 台 virtio 各占一条线）
+        if table.holds_line(number) {
+            continue;
+        }
+        // authorize seam：phase 1 恒 allow（trusted KernelNative）。当前只实现
+        // allocation/ownership，不提供恶意组件隔离；未来 manifest requires /
+        // policy / ExecutionDomain 在这里决定 caller 是否有资格 claim。
+        //
+        // TODO(C6 seam)：可收紧为「caller 必须已持有同一设备的 MmioHandle」
+        // （handle/mod.rs 的「IRQ 从同一 owner 派生」），第一版不强制。
+        return Ok(table.grant(
+            caller,
+            Irq {
+                number,
+                device_index: index as u8,
+                delivery: None,
+            },
+        ));
+    }
+    // 有匹配但都没线 → NoIrq；有线但全被占 → Busy；压根没有匹配 → NotFound
+    Err(if !saw_match {
+        IrqClaimError::DeviceNotFound
+    } else if !saw_line {
+        IrqClaimError::DeviceHasNoIrq
+    } else {
+        IrqClaimError::LineBusy
+    })
 }
 
-/// 打开一条 IRQ 线：Core 验证 handle + delivery 后，才去配置中断控制器。
-/// TODO(C6): 实现。
+/// 打开一条 IRQ 线：Core 先验证 handle + 已注册 delivery，才去配置中断控制器。
+///
+/// 表锁只覆盖验证；PLIC 寄存器与 CPU 使能位在**锁外**写（MMIO 慢，且 trap 可重入）。
 pub fn enable(caller: ComponentId, handle: IrqHandle) -> Result<(), IrqError> {
-    let _ = (caller, handle);
-    todo!("C6: 使能 IRQ 线")
+    let number = {
+        let table = get_table().lock();
+        let irq = table.get(caller, handle).map_err(IrqError::Handle)?;
+        if irq.delivery.is_none() {
+            // 没注册 handler 就开线 = 中断到了没人接（且无法 complete）
+            return Err(IrqError::NoDelivery);
+        }
+        irq.number
+    };
+
+    // 先开控制器上的线，再开 CPU 闸门（顺序反了容易吃到伪中断）
+    InterruptImpl::enable(number);
+    InterruptImpl::enable_external_interrupt();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -300,11 +375,11 @@ mod tests {
     /// 两条线都被占后 → `LineBusy`；无中断线的匹配设备 → `DeviceHasNoIrq`；
     /// 无匹配设备 → `DeviceNotFound`。
     ///
-    /// 注意：`machine::commit` 是全局真相，本用例必须与 `handle::mmio` 的
-    /// claim 用例隔离跑（`cargo test irq -- --ignored` 二者不同时命中）。
+    /// 注意：`machine::COMMITTED` 是进程全局，本用例与 `handle::mmio` 的 claim
+    /// 用例靠 `machine::test_support::GUARD` 串行化（各自 commit 一份 MachineInfo）。
     #[test]
-    #[ignore = "C6：irq::claim 逻辑待手写"]
     fn claim_grants_device_irq_and_is_exclusive() {
+        let _guard = crate::machine::test_support::GUARD.lock();
         use crate::machine::{
             self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
         };

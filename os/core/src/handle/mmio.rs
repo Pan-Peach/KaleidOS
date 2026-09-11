@@ -304,6 +304,7 @@ mod tests {
     /// Busy）；两台都被认领后才 Busy；没有匹配设备才 NotFound。
     #[test]
     fn claim_grants_first_unclaimed_match_and_is_exclusive() {
+        let _guard = crate::machine::test_support::GUARD.lock();
         use crate::machine::{
             self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
         };

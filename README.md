@@ -59,7 +59,7 @@ tools/         工具脚本（待建设）
 - **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令
 - **导出白名单**（EXPORT_SYMBOL 教学版，24 条 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询 + v2 语义入口——组件加载/接口发布/任务控制/调度 + C6 资源 authority 骨架 `kcore_mmio_claim/read_u32` + `kcore_irq_claim/register/enable`，错误码统一 `0/-Errno`）：组件只能调白名单，未导出符号 → 加载失败
 - **Component Interface Registry**（骨架）：组件→组件依赖只走 Interface binding（publish/resolve/unbind，versioned vtable），不建立 flat ELF symbol 全局符号表
-- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy v1）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 11 项自检全 PASS（RV64+RV32）
+- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy v1）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 12 项自检全 PASS（RV64+RV32）
 
 实机输出：
 

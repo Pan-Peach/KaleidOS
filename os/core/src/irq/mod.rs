@@ -74,9 +74,68 @@ pub extern "C" fn on_external() {
 /// 把一条中断号投递给它的 owner 处理函数；返回是否已投递。
 ///
 /// Core 真相：只认 IRQ 表上「live slot + 已注册 delivery」的线——组件被
-/// revoke 后不会再有回调进入它的代码。handler 必须在**锁外**调用（trap 可能
-/// 重入 spin 锁）。TODO(C6): 实现。
+/// revoke 后不会再有回调进入它的代码。**锁内只取一份 `IrqDelivery` 拷贝，
+/// handler 在锁外调用**（trap 可能重入 spin 锁，持锁调用组件代码会自死锁）。
 pub fn route(number: u32) -> bool {
-    let _ = number;
-    todo!("C6: IRQ 投递路由")
+    let delivery = {
+        let table = crate::handle::irq::get_table().lock();
+        table.delivery_of(number)
+    };
+    match delivery {
+        Some(delivery) => {
+            (delivery.handler())(delivery.ctx());
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::ComponentId;
+    use crate::handle::irq::{Irq, IrqDelivery};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn bump(_ctx: *mut ()) {
+        CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 验收：只投递给「live slot + 已注册 delivery」的 owner；revoke 后立刻停止。
+    #[test]
+    fn route_delivers_only_to_live_registered_owner() {
+        crate::handle::irq::init();
+        let owner = ComponentId::from_raw(0xfeed);
+        let handle = crate::handle::irq::get_table().lock().grant(
+            owner,
+            Irq {
+                number: 42,
+                device_index: 0,
+                delivery: None,
+            },
+        );
+
+        // 未注册 delivery：不投递（中断到了也没人接）
+        assert!(!route(42));
+        assert_eq!(CALLS.load(Ordering::Acquire), 0);
+
+        // 注册后可投递
+        crate::handle::irq::get_table()
+            .lock()
+            .set_delivery(owner, handle, IrqDelivery::new(bump, core::ptr::null_mut()))
+            .unwrap();
+        assert!(route(42));
+        assert_eq!(CALLS.load(Ordering::Acquire), 1);
+
+        // 没有 owner 的线：不投递
+        assert!(!route(43));
+        assert_eq!(CALLS.load(Ordering::Acquire), 1);
+
+        // revoke 后立刻停止投递（组件失败/卸载后回调进不去它的代码）
+        crate::handle::irq::get_table().lock().revoke_owner(owner);
+        assert!(!route(42));
+        assert_eq!(CALLS.load(Ordering::Acquire), 1);
+    }
 }

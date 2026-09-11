@@ -6,7 +6,8 @@
 //!   `.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表 /
 //!   **C4 执行链**（组件加载 → 接口发布/绑定 → 任务创建 → RR 调度 →
 //!   上下文切换 → yield/exit → 状态验证）/
-//!   **C6 MMIO 链**（claim 设备 → 经 handle 读真实寄存器，组件不持地址）
+//!   **C6 MMIO 链**（claim 设备 → 经 handle 读真实寄存器）/
+//!   **C6 IRQ 链**（claim 设备中断线 → 注册处理函数 → 使能 → PLIC enable bit 读回）
 //! - 只走导出白名单（`kcore_*`），无 god-mode；不直接触碰 TaskTable /
 //!   Registry / Sv39 / CpuContext —— 那是 Core 的真相
 //! - host 测试只覆盖纯逻辑；真实执行在核内
@@ -75,7 +76,18 @@ mod runtime {
         fn mmio_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_mmio_read_u32"]
         fn mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
+
+        // C6：IRQ authority（status + out / status 形态，0 / -Errno）
+        #[link_name = "kcore_irq_claim"]
+        fn irq_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        #[link_name = "kcore_irq_register"]
+        fn irq_register(handle: u64, handler: extern "C" fn(*mut ()), ctx: *mut ()) -> i32;
+        #[link_name = "kcore_irq_enable"]
+        fn irq_enable(handle: u64) -> i32;
     }
+
+    /// 组件侧 IRQ 处理函数（本用例只验证注册/投递链路，不做设备 ack）。
+    extern "C" fn irq_handler(_ctx: *mut ()) {}
 
     // ABI 编码常量（与 Core export.rs 一致）。
     const KIND_POLICY: u32 = 2;
@@ -346,10 +358,27 @@ mod runtime {
         let magic_ok = claimed && (unsafe { mmio_read_u32(mmio_handle, 0, &mut magic) } == 0);
         check!("mmio-magic", magic_ok && magic == 0x7472_6976, 10);
 
-        // TODO(C6)：IRQ 链用例——claim 设备中断线（kcore_irq_claim）→ 注册处理函数
-        //   （kcore_irq_register）→ 使能（kcore_irq_enable）→ 外部中断真的到达并
-        //   dispatch 到本组件 handler（失败位 11）。当前 PLIC 机制为骨架
-        //   （arch/riscv/plic.rs 的 claim/enable/complete 是 todo!()），实现后再加。
+        // C6 IRQ 链：Core 验证 claim/register/enable 后真的把 PLIC 打开。
+        // 用 PLIC 自己的 MMIO（作为设备 claim 进来）读回 enable bit 作证——
+        // 这一步跨过了「Core 宣布成功」和「硬件真的被写」之间的空隙。
+        // QEMU virt 常量：UART = ns16550a = PLIC line 10；S-mode context = hart*2+1。
+        let mut plic = 0u64;
+        let plic_ok = unsafe { mmio_claim(b"riscv,plic0".as_ptr(), 11, &mut plic) } == 0;
+        let mut irq = 0u64;
+        let irq_claimed = plic_ok && unsafe { irq_claim(b"ns16550a".as_ptr(), 8, &mut irq) } == 0;
+        let irq_registered =
+            irq_claimed && unsafe { irq_register(irq, irq_handler, core::ptr::null_mut()) } == 0;
+        let irq_enabled = irq_registered && unsafe { irq_enable(irq) } == 0;
+
+        let ctx = (unsafe { machine_boot_hart() } as usize) * 2 + 1;
+        let mut enable_word = 0u32;
+        let plic_written = irq_enabled
+            && unsafe { mmio_read_u32(plic, (0x2000 + ctx * 0x80) as u32, &mut enable_word) } == 0;
+        check!(
+            "irq-line-enable",
+            plic_written && (enable_word & (1 << 10)) != 0,
+            11
+        );
 
         report.group("summary");
         let all_ok = report.summary() && failed == 0;

@@ -1,6 +1,7 @@
-use arch::{CpuArch, ResetType, SystemReset, Timer};
+use arch::{CpuArch, InterruptController, ResetType, SystemReset, Timer};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::global_asm, mem::MaybeUninit};
+use kernel::machine::{IoSpace, MachineInfo};
 
 const STACK_BYTES: usize = 4096;
 const UNMAPPED_ADDRESS: usize = 0x4000_0000;
@@ -37,6 +38,10 @@ static mut SELFTEST_A_S: [usize; 12] = [0; 12];
 #[unsafe(no_mangle)]
 static mut SELFTEST_B_S: [usize; 12] = [0; 12];
 static TIMER_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_IRQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_IRQ_LINE: AtomicUsize = AtomicUsize::new(0);
+/// 已发现 UART 的 IER 地址（handler 里要关掉中断源，避免 complete 后立刻重挂）。
+static UART_IER_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "riscv32")]
 static mut SV32_TEST_TABLE: [u32; 1024] = [0; 1024];
@@ -116,7 +121,9 @@ unsafe extern "C" {
     fn selftest_context_b_entry();
 }
 
-pub fn run() -> ! {
+/// 读取用例名并分发。**在完整初始化（core + runtime VM）之后调用**——
+/// device MMIO 已映射，所以外部中断这类用例能真碰硬件。
+pub fn run(info: &MachineInfo) -> ! {
     kernel::log!("selftest", "ready");
     let mut command = [0u8; 64];
     let length = kernel::print::read_line(&mut command);
@@ -129,8 +136,38 @@ pub fn run() -> ! {
         b"store-readonly" => store_readonly_fault(),
         b"execute-nx" => execute_nx_fault(),
         b"timer" => timer(),
+        b"external-irq" => external_irq(info),
         _ => fail("unknown command"),
     }
+}
+
+/// 按 compatible（任一命中）找已发现设备的 MMIO 窗口。
+fn find_mmio(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<(usize, usize)> {
+    info.devices[..info.dev_count].iter().find_map(|device| {
+        let hit = device.compatibles[..device.compat_count as usize]
+            .iter()
+            .any(|c| compatibles.contains(&c.as_str().as_bytes()));
+        if !hit {
+            return None;
+        }
+        match device.space {
+            IoSpace::Mmio { base, size } => Some((base, size)),
+            IoSpace::Pio { .. } => None,
+        }
+    })
+}
+
+/// 按 compatible（任一命中）找设备的 PLIC 中断号。
+fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
+    info.devices[..info.dev_count].iter().find_map(|device| {
+        let hit = device.compatibles[..device.compat_count as usize]
+            .iter()
+            .any(|c| compatibles.contains(&c.as_str().as_bytes()));
+        if !hit {
+            return None;
+        }
+        device.irq
+    })
 }
 
 fn mapping() -> ! {
@@ -228,6 +265,78 @@ fn timer() -> ! {
 extern "C" fn timer_handler() {
     TIMER_HANDLER_COUNT.fetch_add(1, Ordering::AcqRel);
     arch::TimerImpl::cancel_deadline();
+}
+
+/// C6 外部中断 ArchTest：PLIC 真的把一条设备线投递到 S-mode handler。
+///
+/// 触发源用 **UART 的 THRE**（发送保持寄存器空）：打开 `IER.THRE` 后 UART 立刻
+/// 拉高中断线，不需要 runner 注入串口输入。handler 里先关掉 UART 中断源——THRE
+/// 是电平触发，不关的话 claim/complete 之后马上又 pending（中断风暴）。
+///
+/// 本用例直接驱动 PLIC（arch 白盒），不经过 Core 的 `irq::route`；Core 路由由
+/// host 测试与 CoreTest 覆盖。
+fn external_irq(info: &MachineInfo) -> ! {
+    // QEMU virt：PLIC + ns16550a（UART）；UART 的 IER 在 base+1（reg-shift 0）。
+    const UART_IER_OFFSET: usize = 1;
+    const IER_THRE: u8 = 0x02;
+    const WAIT_TICKS: u64 = 10_000_000;
+
+    let (plic_base, _) = find_mmio(
+        info,
+        &[b"riscv,plic0".as_slice(), b"sifive,plic-1.0.0".as_slice()],
+    )
+    .expect("PLIC device not found");
+    let (uart_base, _) = find_mmio(info, &[b"ns16550a".as_slice()]).expect("UART device not found");
+    let uart_line = find_irq(info, &[b"ns16550a".as_slice()]).expect("UART irq not found");
+    let ier = uart_base + UART_IER_OFFSET;
+
+    <arch::InterruptImpl as arch::InterruptController>::configure(plic_base, info.boot_hart);
+    arch::InterruptImpl::register_external_handler(external_irq_handler);
+    arch::InterruptImpl::enable(uart_line);
+
+    EXTERNAL_IRQ_COUNT.store(0, Ordering::Release);
+    EXTERNAL_IRQ_LINE.store(0, Ordering::Release);
+    UART_IER_ADDR.store(ier, Ordering::Release);
+
+    // 打开 UART THRE 中断：THR 空 → UART 立刻断言中断线（无需外部输入）。
+    // SAFETY: ier 是已发现 UART 的寄存器地址（字节宽 IER）。
+    unsafe { core::ptr::write_volatile(ier as *mut u8, IER_THRE) };
+    arch::InterruptImpl::enable_external_interrupt();
+
+    let deadline = arch::TimerImpl::now().saturating_add(WAIT_TICKS);
+    while EXTERNAL_IRQ_COUNT.load(Ordering::Acquire) == 0 && arch::TimerImpl::now() < deadline {
+        core::hint::spin_loop();
+    }
+
+    let count = EXTERNAL_IRQ_COUNT.load(Ordering::Acquire);
+    let line = EXTERNAL_IRQ_LINE.load(Ordering::Acquire);
+    if count != 1 || line != uart_line as usize {
+        kernel::log!(
+            "selftest",
+            "external-irq count={} line={} want_line={}",
+            count,
+            line,
+            uart_line
+        );
+        fail("external IRQ was not delivered exactly once from the UART line");
+    }
+    pass("external-irq")
+}
+
+extern "C" fn external_irq_handler() {
+    // 顺序要紧：**先 claim 再关源**。claim 读走 pending 并置 in-service、才拿得到 id；
+    // 若先关设备（UART 电平触发），pending 随电平撤销，claim 会返回 0。
+    if let Some(line) = arch::InterruptImpl::claim() {
+        EXTERNAL_IRQ_LINE.store(line as usize, Ordering::Release);
+        // 关中断源（THRE 电平触发：不关的话 complete 后立刻又 pending = 风暴）
+        let ier = UART_IER_ADDR.load(Ordering::Acquire);
+        if ier != 0 {
+            // SAFETY: 已发现 UART 的 IER 寄存器（字节宽）。
+            unsafe { core::ptr::write_volatile(ier as *mut u8, 0) };
+        }
+        arch::InterruptImpl::complete(line);
+    }
+    EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
 fn context_switch() -> ! {

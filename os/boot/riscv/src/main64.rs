@@ -81,7 +81,7 @@ fn configure_interrupt_controller(info: &MachineInfo) {
         let IoSpace::Mmio { base, .. } = device.space else {
             continue;
         };
-        <arch::InterruptImpl as arch::InterruptController>::configure(base);
+        <arch::InterruptImpl as arch::InterruptController>::configure(base, info.boot_hart);
         return;
     }
     kernel::log!("discovery", "no PLIC found; external IRQ unavailable");
@@ -327,7 +327,15 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
 
     #[cfg(feature = "selftest")]
     {
-        crate::selftest::run();
+        // selftest 在**完整初始化之后**运行：先起 Core + 长期内核地址空间
+        // （device MMIO 才被映射），才能测 PLIC/UART 这类真实设备契约。
+        if let Err(error) = kernel::init(&context.info, &context.reserved) {
+            panic!("core init failed: {}", error);
+        }
+        let runtime_layout = layout::kernel_layout();
+        runtime::init(&runtime_layout, context.reserved[0].base, &context.info)
+            .expect("Sv39 runtime VM init failed");
+        crate::selftest::run(&context.info);
     }
 
     #[cfg(not(feature = "selftest"))]

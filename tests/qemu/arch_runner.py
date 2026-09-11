@@ -33,6 +33,7 @@ CASES = (
     ("store-readonly", 15),
     ("execute-nx", 12),
     ("timer", None),
+    ("external-irq", None),
 )
 
 

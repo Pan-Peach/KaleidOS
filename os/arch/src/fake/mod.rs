@@ -99,7 +99,7 @@ impl Timer for Fake {
 
 // host 无中断硬件：控制器全是 no-op，claim 恒 None（永远不会投递外部中断）。
 impl InterruptController for Fake {
-    fn configure(_base: usize) {}
+    fn configure(_base: usize, _hart_id: usize) {}
     fn enable(_line: u32) {}
     fn disable(_line: u32) {}
     fn claim() -> Option<u32> {

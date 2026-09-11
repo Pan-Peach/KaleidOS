@@ -125,8 +125,10 @@ pub trait Timer {
 /// arch（同 CLINT/timer 的处理方式），未来降级为 Driver Component 时 Core 侧
 /// 调用点不变，只换 backend 实现。
 pub trait InterruptController {
-    /// 绑定控制器 MMIO 基址（boot 从 discovery 找到设备后调用一次）。
-    fn configure(base: usize);
+    /// 绑定控制器 MMIO 基址与 boot hart（boot 从 discovery 拿到后调用一次）。
+    /// 记录 hart 是因为 S-mode **不能**读 `mhartid`（非法指令），OpenSBI 把
+    /// hartid 通过 `a0` 传入、且不替我们设 `tp`。
+    fn configure(base: usize, hart_id: usize);
     /// 允许 / 屏蔽一条外部中断线（PLIC enable/disable bit）。
     fn enable(line: u32);
     fn disable(line: u32);

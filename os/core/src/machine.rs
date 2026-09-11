@@ -190,3 +190,10 @@ pub fn commit(info: MachineInfo) {
 pub fn committed() -> Option<MachineInfo> {
     *COMMITTED.lock()
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// 串行化「提交全局 MachineInfo」的测试：`COMMITTED` 是进程全局，并行测试
+    /// 各自 commit 一份会互相覆盖。测试很短，用自旋锁串起来即可。
+    pub(crate) static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+}

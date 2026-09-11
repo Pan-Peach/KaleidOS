@@ -31,8 +31,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
     Task control：task_create / task_start / task_yield / task_exit / task_state
     Scheduler：sched_run
     Resource authority（C6 起步）：mmio_claim / mmio_read_u32 / irq_claim / irq_register /
-      irq_enable（认领设备/中断线 → MmioHandle/IrqHandle → Core 每次访问重新验证后才碰硬件；
-      IRQ 的 claim/enable 与 PLIC 机制逻辑待手写）
+      irq_enable（认领设备/中断线 → MmioHandle/IrqHandle → Core 每次访问重新验证后才碰硬件）
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
@@ -68,13 +67,14 @@ P0 地基：
 P1 任务系统打通：
   ✅ C3  context_switch 实机验证（ArchTest：A→B→A 双上下文 s0-s11/sp 保留，RV64+RV32）
   ✅ C4  调度执行链（已完成：scheduler_rr 组件经 Interface 发布 SchedulerPolicy v1；
-         Core propose→validate→commit + 锚点上下文切换；core_test 端到端 11 项自检，RV64+RV32）
+         Core propose→validate→commit + 锚点上下文切换；core_test 端到端 12 项自检，RV64+RV32）
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
          timer/sched seam、ArchTest 位），逻辑待手写
   🚧 C6  MMIO 资源 authority（已落地：claim 设备 → MmioHandle → Core 验证后 read，QEMU
-         端到端 virtio magic 验证）；IRQ authority 骨架已搭（IrqHandle claim/register/
-         enable + trap 外部中断钩子 + PLIC 机制接口 + boot 配置，逻辑待手写）；
+         端到端 virtio magic 验证）；IRQ authority 已落地（claim/register/enable +
+         route + trap 外部中断钩子 + PLIC 寄存器机制 + boot 配置；host 测试 +
+         CoreTest `irq-line-enable` + ArchTest `external-irq`（真设备投递）均有覆盖）；
          后续：驱动模型（virtio 等）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）

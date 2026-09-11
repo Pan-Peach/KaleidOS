@@ -40,7 +40,7 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
 - **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；RISC-V 的纯算法（重定位、Sv32/Sv39 页表编码与 walk）同样 host 测生产实现；
 - **Property Test**：对 Core 的不变式做随机化验证（已引入 proptest，dev-dependency、仅 host profile：AddressSpace 随机序列四不变式 + parser never-panic）；
 - **Model Checking / Concurrency Exploration**：未来用 Kani / Loom 类工具（见 references.md）；
-- **QEMU ArchTest（白盒内核 selftest）**：feature-gated 的 test kernel，直接验证 Arch/HAL 与真实 CPU 的契约——trap/scause、页表权限生效（RO/NX/未映射 fault）、context switch 寄存器保存；每 case 单独 QEMU 进程；
+- **QEMU ArchTest（系统级内核 selftest）**：feature-gated 的 test kernel，跑在**完整 `core::init` + runtime VM 之后**（device MMIO 已映射），直接验证 Arch/HAL 与真实 CPU/设备的契约——trap/scause、页表权限生效（RO/NX/未映射 fault）、context switch 寄存器保存、时钟与**外部中断**实际投递；每 case 单独 QEMU 进程；
 - **QEMU CoreTest**：验证 Core 与 Arch / Machine Discovery 之间的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等），以普通 .kcomp 组件身份运行（无 god-mode）；
 - **Real Hardware**：最终在真机上验证。
 
@@ -57,6 +57,22 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 - IRQ（中断分配、mask、dispatch）
 - handle 生命周期（handle lifetime）：创建、使用、过期
 - 资源回收（resource revocation）：组件停止时 ResourceDomain 完整回收
+
+### C6 IRQ 测试现状（2026-09）
+
+- **Host Test**：`handle::irq` 表语义（grant/get/revoke/release/holds_line/delivery）、
+  `claim`（compatible → 中断线、独占、`DeviceHasNoIrq`/`LineBusy`/`DeviceNotFound`
+  优先级）、`irq::route`（只投递给「live slot + 已注册 delivery」，revoke 后立刻
+  截断）全部 host 覆盖。
+- **QEMU CoreTest**：`irq-line-enable` —— 组件走 `kcore_irq_claim` →
+  `kcore_irq_register` → `kcore_irq_enable`，再把 **PLIC 当设备 claim 进来读回
+  enable bit**，证明「Core 宣布成功」之外硬件真的被写（RV64 + RV32）。
+- **QEMU ArchTest**：ArchTest 已在**完整初始化之后**运行（`core::init` + runtime VM，
+  device MMIO 已映射）。新增 `external-irq` 用例——用 UART 的 **THRE** 中断作触发源
+  （打开 `IER.THRE` 即拉线，无需 runner 注入输入），验证
+  `UART → PLIC → sie.SEIE → trap → dispatch_external → claim/complete` 整条链路；
+  `timer` 用例继续覆盖时钟投递。踩坑记录：**先 claim 再关设备源**——UART 是电平触发，
+  先关 IER 会让 PLIC pending 随电平撤销，claim 会取到 0。
 
 ### 对抗性测试（adversarial tests）—— 重点
 
