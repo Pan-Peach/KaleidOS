@@ -96,8 +96,15 @@ impl Timer for Riscv {
     }
 
     fn set_deadline(_deadline: u64) {
-        // TODO(C5): 委托 `firmware::set_timer(deadline)`（SBI TIME 扩展）。
-        todo!("C5: Timer::set_deadline")
+        firmware::set_timer(_deadline);
+    }
+
+    fn register_timer_handler(handler: extern "C" fn()) {
+        trap::register_timer_handler(handler);
+    }
+
+    fn enable_timer_interrupt() {
+        firmware::enable_timer_interrupt();
     }
 }
 

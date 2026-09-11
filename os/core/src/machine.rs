@@ -155,6 +155,7 @@ impl core::fmt::Debug for DeviceDescriptor {
 #[derive(Clone, Copy)]
 pub struct MachineInfo {
     pub boot_hart: usize,
+    pub timebase_frequency: u64,
     pub cpu_count: usize,
     pub cpu_info: [CpuInfo; 8],
     pub mem_count: usize,
@@ -167,6 +168,7 @@ impl core::fmt::Debug for MachineInfo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MachineInfo")
             .field("boot_hart", &self.boot_hart)
+            .field("timebase_frequency", &self.timebase_frequency)
             .field("cpu_count", &self.cpu_count)
             .field("cpu_info", &&self.cpu_info[..self.cpu_count])
             .field("mem_count", &self.mem_count)

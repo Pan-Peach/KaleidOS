@@ -87,6 +87,10 @@ impl Timer for Fake {
     fn set_deadline(_deadline: u64) {
         // host 无定时器硬件：no-op 占位。
     }
+
+    fn register_timer_handler(_handler: extern "C" fn()) {}
+
+    fn enable_timer_interrupt() {}
 }
 
 impl Console for Fake {

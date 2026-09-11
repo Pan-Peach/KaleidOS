@@ -23,6 +23,7 @@
 
 use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
 use crate::component::{ComponentId, registry};
+use crate::irq::IrqSaveGuard;
 use crate::machine::CpuId;
 use crate::task::{self, TaskId, TaskState};
 use alloc::boxed::Box;
@@ -140,6 +141,7 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
 /// 并保存它的上下文；`from = None`：捕获锚点上下文（首次 run）。
 /// `next = None`：没有可运行任务，切回锚点。
 fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), SchedError> {
+    let guard = IrqSaveGuard::new();
     // Phase 0：收集 + 提议（interfaces/registry 锁在 resolve_policy 内，短暂）
     let runnable = collect_runnable();
     let next = pick_next(&runnable)?;
@@ -196,6 +198,7 @@ fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), S
         (from_ptr, to_ptr)
     }; // 全部锁在此释放
 
+    drop(guard);
     // Phase 2：锁外切换。单 CPU 协作式：此处无并发、无 yield 点。
     // SAFETY: 两个指针分别指向任务记录的 Box（堆地址稳定）与锚点 Box
     // （全局静态内，地址稳定）；to 侧上下文由 new_context 或上一次切换保存。

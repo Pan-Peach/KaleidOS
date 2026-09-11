@@ -110,6 +110,9 @@ pub trait Timer {
     fn now() -> u64;
     /// 编程下一次时钟中断的**绝对** deadline（与 `now` 同一基准）。
     fn set_deadline(deadline: u64);
+    /// 注册时钟中断回调，并打开当前特权级的 timer interrupt。
+    fn register_timer_handler(handler: extern "C" fn());
+    fn enable_timer_interrupt();
 }
 
 /// 早期 console 服务。它是 boot/firmware 传输能力，不是 CPU ISA 原语。

@@ -46,6 +46,27 @@ fn linker_addr(symbol: *const u8) -> usize {
     symbol as usize
 }
 
+#[cfg(feature = "machine")]
+fn configure_machine_timer(info: &MachineInfo) {
+    for device in &info.devices[..info.dev_count] {
+        let kind = device.compatibles[..device.compat_count as usize]
+            .iter()
+            .map(CompatStr::as_str)
+            .find_map(|compatible| match compatible {
+                "riscv,clint0" => Some(0x4000),
+                "riscv,aclint-mtimer" => Some(0),
+                _ => None,
+            });
+        let Some(offset) = kind else { continue };
+        let IoSpace::Mmio { base, .. } = device.space else {
+            continue;
+        };
+        arch::riscv::firmware::configure_machine_timer(base + offset);
+        return;
+    }
+    panic!("machine timer not found in device tree");
+}
+
 fn print_linker_layout() {
     let image_start =
         bootstrap::physical_address_of(linker_addr(core::ptr::addr_of!(__bootstrap_start)));
@@ -177,6 +198,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 
             let info = MachineInfo {
                 boot_hart: hart_id,
+                timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
                 cpu_count,
                 cpu_info,
                 mem_count,
@@ -184,6 +206,9 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 dev_count,
                 devices,
             };
+
+            #[cfg(feature = "machine")]
+            configure_machine_timer(&info);
 
             if mem_count == 0 {
                 panic!("Sv39 early map failed: no RAM region");

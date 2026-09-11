@@ -51,16 +51,7 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, st
 
     match trap {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            // TODO(C5): 时钟中断路径（骨架位）。目标流程：
-            //   trap 分发 → Core 时钟回调（timer::on_trap → sched 抢占 seam）
-            //   → 本函数正常返回 → asm 恢复现场 + sret。
-            // 回调接线方式待定（arch 不依赖 Core：注册式 hook 或 boot 注入均可）。
-            //
-            // 实现前必读（抢占安全）：trap 入口已关中断，但**被打断的上下文
-            // 可能正持有 sched 的锁**——处理器里再取同样的锁会自死锁
-            // （spin 锁不可重入）。先把 sched 关键临界区改为 irq-save
-            // （见 core/src/sched.rs 的 TODO 与 core/src/irq.rs 的决策注记）。
-            todo!("C5: supervisor timer trap path")
+            super::dispatch_timer();
         }
         Trap::Interrupt(_) => panic!(
             "unhandled interrupt: scause={:#x}, sepc={:#x}, stval={:#x}",

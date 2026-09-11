@@ -43,7 +43,7 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_mcause: usize, mt
 
     match trap {
         Trap::Interrupt(Interrupt::MachineTimer) => {
-            todo!("M-mode machine timer trap path")
+            super::dispatch_timer();
         }
         Trap::Interrupt(_) => panic!(
             "unhandled interrupt: mcause={:#x}, mepc={:#x}, mtval={:#x}",

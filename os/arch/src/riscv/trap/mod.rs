@@ -10,6 +10,21 @@
 //! `Interrupt` 与 `Scause`（cause 编码在 S/M 模式一致，只差寄存器名与
 //! 中断位位置的处理方式）。
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_timer_handler(handler: extern "C" fn()) {
+    TIMER_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+pub fn dispatch_timer() {
+    let address = TIMER_HANDLER.load(Ordering::Acquire);
+    assert!(address != 0, "timer interrupt handler is not registered");
+    let handler: extern "C" fn() = unsafe { core::mem::transmute(address) };
+    handler();
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {

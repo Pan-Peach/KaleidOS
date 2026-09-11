@@ -19,3 +19,24 @@
 //!   等真实工作量需要时再上。
 //!
 //! 外部中断（PLIC/驱动 IRQ 分配与 dispatch）属于 C6，本模块暂不承载。
+
+use arch::{CpuArch, CpuImpl};
+
+pub struct IrqSaveGuard {
+    flags: Option<<CpuImpl as CpuArch>::IrqFlags>,
+}
+
+impl IrqSaveGuard {
+    pub fn new() -> Self {
+        let flags = CpuImpl::disable_irq();
+        Self { flags: Some(flags) }
+    }
+}
+
+impl Drop for IrqSaveGuard {
+    fn drop(&mut self) {
+        if let Some(flags) = self.flags.take() {
+            CpuImpl::restore_irq(flags);
+        }
+    }
+}
