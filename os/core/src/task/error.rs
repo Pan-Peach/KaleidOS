@@ -14,6 +14,8 @@ pub enum TaskError {
     RequesterNotFound,
     /// 请求创建任务的组件尚未 Ready（只有 Ready 组件能创建任务）。
     RequesterNotReady,
+    /// 请求者不是任务 owner。
+    WrongOwner,
     /// entry 不落在 requester 组件的装载镜像内（越界指针一律拒绝）。
     EntryOutOfImage,
 }

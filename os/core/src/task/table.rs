@@ -1,5 +1,6 @@
 //! 任务真相存储：Core 唯一的任务清单（id → TaskRecord）。
 
+use crate::component::ComponentId;
 use crate::memory;
 use crate::task::error::TaskError;
 use crate::task::id::TaskId;
@@ -31,15 +32,15 @@ impl TaskTable {
         }
     }
 
-    /// 唯二创建入口（public）：分配 id + 登记 record。
-    pub fn create(&mut self, entry: usize) -> Result<TaskId, TaskError> {
+    /// 唯二创建入口（public）：记录 owner，分配 id + 登记 record。
+    pub fn create(&mut self, owner: ComponentId, entry: usize) -> Result<TaskId, TaskError> {
         let id = self.alloc();
         let memory =
             memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| TaskError::NoMemory)?;
         let region = memory.region();
         let kstack = Kernelstack::new(region.base, memory::ALLOC_GRANULE);
         let context = CpuImpl::new_context(entry, kstack.base + kstack.size);
-        let record = TaskRecord::new(Box::new(context), kstack, memory);
+        let record = TaskRecord::new(owner, Box::new(context), kstack, memory);
         self.insert(id, record)?;
         Ok(id)
     }
@@ -81,6 +82,15 @@ impl TaskTable {
 
     pub fn get_mut(&mut self, id: TaskId) -> Option<&mut TaskRecord> {
         self.tasks.get_mut(&id)
+    }
+
+    /// Core 语义入口：只有任务 owner 才能启动该任务。
+    pub fn start(&mut self, requester: ComponentId, id: TaskId) -> Result<(), TaskError> {
+        let record = self.get(id).ok_or(TaskError::NotFound)?;
+        if record.owner() != requester {
+            return Err(TaskError::WrongOwner);
+        }
+        self.transition(id, TaskState::Runnable)
     }
 
     /// 状态推进的唯一入口（Core 校验合法转换后才落笔；调度器 commit 路径调用）。
@@ -126,6 +136,8 @@ mod tests {
     use alloc::vec::Vec;
 
     const ENTRY: usize = 0x8000_0000;
+    const OWNER: ComponentId = ComponentId::from_raw(1);
+    const OTHER_OWNER: ComponentId = ComponentId::from_raw(2);
 
     fn setup() -> test_support::Guard<'static> {
         test_support::ensure_init();
@@ -149,12 +161,13 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(ENTRY).expect("create");
+        let id = t.create(OWNER, ENTRY).expect("create");
         assert_eq!(id.raw(), 0, "first id is 0");
 
         assert_eq!(t.len(), 1);
         assert!(t.contains(id));
         let rec = t.get(id).expect("get after create");
+        assert_eq!(rec.owner(), OWNER);
         assert_eq!(rec.state(), TaskState::Created);
         assert!(
             rec.kstack.base.is_multiple_of(memory::ALLOC_GRANULE),
@@ -168,7 +181,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY).unwrap();
         // 组件/外部 crate 拿不到 &mut state：只能走 Core 的 transition 写入点。
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Created));
         t.transition(id, TaskState::Runnable).unwrap();
@@ -182,7 +195,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY).unwrap();
 
         // Created 直接 Running / Exited：非法（必须经 Runnable / 先跑起来）。
         assert_eq!(
@@ -219,7 +232,7 @@ mod tests {
         let mut t = TaskTable::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            ids.push(t.create(ENTRY).expect("create").raw());
+            ids.push(t.create(OWNER, ENTRY).expect("create").raw());
         }
         assert_eq!(ids, [0, 1, 2], "sequential unique ids");
 
@@ -232,7 +245,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY).unwrap();
         let rec = t.remove(id).expect("remove");
         assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
         assert!(t.is_empty());
@@ -252,7 +265,7 @@ mod tests {
         while let Ok(lease) = memory::alloc_region(memory::ALLOC_GRANULE) {
             held.push(lease);
         }
-        assert!(matches!(t.create(ENTRY), Err(TaskError::NoMemory)));
+        assert!(matches!(t.create(OWNER, ENTRY), Err(TaskError::NoMemory)));
         assert!(t.is_empty(), "failed create must not register");
 
         drop(held);
@@ -266,6 +279,7 @@ mod tests {
         let f1 = memory::alloc_region(memory::ALLOC_GRANULE).unwrap();
         let r1 = f1.region();
         let rec1 = TaskRecord::new(
+            OWNER,
             Box::new(CpuImpl::new_context(ENTRY, r1.base + memory::ALLOC_GRANULE)),
             Kernelstack::new(r1.base, memory::ALLOC_GRANULE),
             f1,
@@ -276,6 +290,7 @@ mod tests {
         let f2 = memory::alloc_region(memory::ALLOC_GRANULE).unwrap();
         let r2 = f2.region();
         let rec2 = TaskRecord::new(
+            OWNER,
             Box::new(CpuImpl::new_context(ENTRY, r2.base + memory::ALLOC_GRANULE)),
             Kernelstack::new(r2.base, memory::ALLOC_GRANULE),
             f2,
@@ -285,5 +300,19 @@ mod tests {
         assert_eq!(t.len(), 1, "no overwrite");
         let stored = t.get(id).expect("stored");
         assert_eq!(stored.kstack.base, r1.base);
+    }
+
+    #[test]
+    fn start_requires_task_owner() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(OWNER, ENTRY).unwrap();
+
+        assert_eq!(t.start(OTHER_OWNER, id), Err(TaskError::WrongOwner));
+        assert_eq!(t.get(id).unwrap().state(), TaskState::Created);
+
+        assert_eq!(t.start(OWNER, id), Ok(()));
+        assert_eq!(t.get(id).unwrap().state(), TaskState::Runnable);
     }
 }

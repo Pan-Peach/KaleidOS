@@ -282,12 +282,18 @@ extern "C" fn kcore_interface_available(
 // Category 6：Task control（v2；语义入口，authority 校验在 Core）
 // ---------------------------------------------------------------------------
 
-/// 创建任务。requester = 当前正在初始化的组件；`entry` 必须落在该组件的
+/// 解析 Core API caller：运行任务用 TaskRecord.owner；锚点上的组件 init
+/// 用 loader 记录的 call_init 身份。
+fn current_task_requester() -> Option<crate::component::ComponentId> {
+    task::current_owner().or_else(crate::component::load::current_component)
+}
+
+/// 创建任务。requester = 当前 caller；`entry` 必须落在该组件的
 /// 装载镜像内（越界指针一律拒绝）。返回 TaskId raw，负数 = 错误
-/// （-1 不在组件 init 上下文 / -2 Core 拒绝：requester 非 Ready、entry
-/// 越界、内存不足）。
+/// （-1 无法解析 caller / -2 Core 拒绝：requester 非 Ready、entry 越界、
+/// 内存不足）。
 extern "C" fn kcore_task_create(entry: usize) -> i32 {
-    let Some(requester) = crate::component::load::current_component() else {
+    let Some(requester) = current_task_requester() else {
         return -1;
     };
     match task::create_task(requester, entry) {
@@ -296,10 +302,13 @@ extern "C" fn kcore_task_create(entry: usize) -> i32 {
     }
 }
 
-/// 启动任务：Created → Runnable（状态机验证在 Core）。0 = 成功，-1 = 失败。
+/// 启动任务：Core 验证当前 caller 是任务 owner 后才推进 Created → Runnable。
+/// 0 = 成功，-1 = 失败。
 extern "C" fn kcore_task_start(id: u32) -> i32 {
-    let mut table = task::get_task_table().lock();
-    match table.transition(TaskId::from_raw(id), TaskState::Runnable) {
+    let Some(requester) = current_task_requester() else {
+        return -1;
+    };
+    match task::start_task(requester, TaskId::from_raw(id)) {
         Ok(()) => 0,
         Err(_) => -1,
     }

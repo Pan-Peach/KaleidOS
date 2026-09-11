@@ -31,9 +31,10 @@ pub enum ComponentLoadError {
 
 /// 当前正在初始化的组件（call_init 期间由 Core 记录）。
 ///
-/// `kcore_interface_publish` 的 provider、`kcore_task_create` 的 requester
-/// 都从这里解析——组件不需要知道自己/别人的 ComponentId，Core 不信任
-/// 组件自报的身份。嵌套加载（组件 init 里再 load 别的组件）时保存/恢复。
+/// `kcore_interface_publish` 的 provider 以及锚点上 `call_init` 阶段的 task
+/// requester 从这里解析——组件不需要知道自己/别人的 ComponentId，Core 不信任
+/// 组件自报的身份。普通任务的 requester 从 `TaskRecord.owner` 解析。嵌套加载
+///（组件 init 里再 load 别的组件）时保存/恢复。
 static CURRENT: Mutex<Option<ComponentId>> = Mutex::new(None);
 
 /// 取当前正在初始化的组件；不在 call_init 内返回 None。

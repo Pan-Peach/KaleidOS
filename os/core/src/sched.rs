@@ -78,6 +78,13 @@ fn cpu() -> &'static Mutex<CpuState> {
     CPU.get().expect("sched not initialized")
 }
 
+/// 当前 CPU 正在运行的任务。没有进入任务执行流时返回 `None`（锚点上下文）。
+///
+/// 这是 Core 读取执行身份的入口；组件不能通过它修改调度状态。
+pub fn current_task() -> Option<TaskId> {
+    cpu().lock().current
+}
+
 /// 收集全部 Runnable 任务（BTreeMap 迭代序 = id 升序；列表内容由 Core
 /// 决定，调度器只读这份裁剪过的输入）。
 fn collect_runnable() -> Vec<TaskId> {
@@ -280,8 +287,9 @@ mod tests {
         // 两个 Runnable 任务（id 0、1）。
         let mut table = crate::task::TaskTable::new();
         const ENTRY: usize = 0x8000_0000;
-        let a = table.create(ENTRY).unwrap();
-        let b = table.create(ENTRY).unwrap();
+        let owner = ComponentId::from_raw(1);
+        let a = table.create(owner, ENTRY).unwrap();
+        let b = table.create(owner, ENTRY).unwrap();
         table.transition(a, TaskState::Runnable).unwrap();
         table.transition(b, TaskState::Runnable).unwrap();
 

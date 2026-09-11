@@ -1,5 +1,6 @@
 //! 任务记录：Core 真相的载体。
 
+use crate::component::ComponentId;
 use crate::memory::MemoryLease;
 use crate::task::Kernelstack;
 use crate::task::state::TaskState;
@@ -8,6 +9,9 @@ use arch::ContextImpl;
 
 #[derive(Debug, PartialEq)]
 pub struct TaskRecord {
+    /// 创建该任务的组件。任务运行时的 caller identity 从这里解析，
+    /// 不依赖 component loader 的 `call_init` 上下文。
+    owner: ComponentId,
     /// Core-controlled truth：状态只能通过 Core 内部入口改变，组件（外部 crate）
     /// 无法直接赋值。调度器里程碑落地后在此之上加验证式 transition API。
     state: TaskState,
@@ -17,13 +21,24 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
-    pub(crate) fn new(context: Box<ContextImpl>, kstack: Kernelstack, memory: MemoryLease) -> Self {
+    pub(crate) fn new(
+        owner: ComponentId,
+        context: Box<ContextImpl>,
+        kstack: Kernelstack,
+        memory: MemoryLease,
+    ) -> Self {
         Self {
+            owner,
             state: TaskState::Created,
             context,
             kstack,
             memory: Some(memory),
         }
+    }
+
+    /// 只读观察任务归属。owner 是 Core 真相，不能由组件或调度策略修改。
+    pub fn owner(&self) -> ComponentId {
+        self.owner
     }
 
     /// 只读观察状态（monitor / trace / 调度器读侧）。
