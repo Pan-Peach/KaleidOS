@@ -5,7 +5,8 @@
 //! - 自检项（核内，QEMU `load core_test` 时真实执行）：
 //!   `.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表 /
 //!   **C4 执行链**（组件加载 → 接口发布/绑定 → 任务创建 → RR 调度 →
-//!   上下文切换 → yield/exit → 状态验证）
+//!   上下文切换 → yield/exit → 状态验证）/
+//!   **C6 MMIO 链**（claim 设备 → 经 handle 读真实寄存器，组件不持地址）
 //! - 只走导出白名单（`kcore_*`），无 god-mode；不直接触碰 TaskTable /
 //!   Registry / Sv39 / CpuContext —— 那是 Core 的真相
 //! - host 测试只覆盖纯逻辑；真实执行在核内
@@ -68,6 +69,12 @@ mod runtime {
         fn task_state(id: u32) -> i32;
         #[link_name = "kcore_sched_run"]
         fn sched_run() -> i32;
+
+        // C6：资源 authority（status + out 形态，0 / -Errno）
+        #[link_name = "kcore_mmio_claim"]
+        fn mmio_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        #[link_name = "kcore_mmio_read_u32"]
+        fn mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
     }
 
     // ABI 编码常量（与 Core export.rs 一致）。
@@ -323,12 +330,21 @@ mod runtime {
         //   （当前调度是协作式；timer 实现 + sched::on_timer_tick 接线后，
         //   在 scheduling chain 组追加 preempt check）。
 
-        // TODO(C6): MMIO 硬件访问链——claim("virtio,mmio", &mut h) → read_u32(h, 0, &mut v)
-        //   期望 v == 0x74726976（virtio-mmio MagicValue；QEMU 5.2 无条件实例化
-        //   全部 8 个 transport，当前 runner 的 -machine virt 即可，无需 -device）。
-        //   在 handle/mmio.rs 的 claim/read_u32 实现后，再声明
-        //   kcore_mmio_claim / kcore_mmio_read_u32 两个 extern（0/-Errno，值走 out），
-        //   并追加 mmio check。
+        // C6 资源 authority 链：claim 一台 virtio-mmio transport，再经 handle
+        // 读 MagicValue。QEMU 的 8 个 transport 无条件实例化（无需 -device），
+        // offset 0 恒为 0x74726976；组件全程不持有地址。
+        report.group("resource authority");
+        let mut mmio_handle = 0u64;
+        let claimed = unsafe {
+            mmio_claim(
+                b"virtio,mmio".as_ptr(),
+                b"virtio,mmio".len(),
+                &mut mmio_handle,
+            ) == 0
+        };
+        let mut magic = 0u32;
+        let magic_ok = claimed && (unsafe { mmio_read_u32(mmio_handle, 0, &mut magic) } == 0);
+        check!("mmio-magic", magic_ok && magic == 0x7472_6976, 10);
 
         report.group("summary");
         let all_ok = report.summary() && failed == 0;
