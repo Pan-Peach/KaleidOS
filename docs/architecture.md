@@ -253,15 +253,54 @@ Component → Component     = Interface binding（interface.rs：publish/resolve
                             逻辑 binding + versioned vtable，禁止 flat ELF symbol 互链）
 ```
 
-- Core Export ABI 是 **Component → Core 的 mechanism boundary**：只导出
-  共享堆（`kcore_heap_alloc/dealloc`）、输出通道与已提交真相的只读查询；
-  不导出 authority 授予点（物理区域/帧分配、地址空间变更、任务表变更）。
+- Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
+  （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
+  Core validation 的**语义入口**（组件加载 / 接口发布 / 任务控制 / 资源
+  claim：`kcore_mmio_claim/read`）。**不导出未经 Core validation 的裸
+  authority mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动
+  仍是 Core 内部提交点——组件只能 request（propose），authorize + grant +
+  记录由 Core 完成。
 - Component Interface Registry 是 **Core 的组件依赖真相**：谁提供什么接口、
   当前绑到谁。两者是独立概念，互不替代。
 - 内存粒度定案：`ALLOC_GRANULE`（物理分配）与 `AddressSpaceBackend::GRANULE`
   （VM 映射）语义解耦；RISC-V trap 按特权级拆分（`trap/supervisor.rs` =
   S-mode 机制，`trap/machine.rs` = M-mode 骨架，共享解码在 `trap/mod.rs`），
   未来 S-mode+MMU 与 M-mode+NoMMU 双 profile 不互相牵制。
+
+### Core ABI 错误约定（v3 起）
+
+```text
+0          success
+-negative  failure: -Errno
+```
+
+- `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）：
+  用到哪个加哪个，进入 public ABI 后数字不再变更。
+- 各子系统的内部错误（`TaskError` / `HandleError` / `ComponentLoadError` /
+  `SchedError` / `InterfaceError` / `MmioError` ...）保持丰富与类型安全，
+  只在 Core ABI 边界翻译成 `Errno`——映射表集中在 `errno.rs`。
+- 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
+
+**返回值形状**（按"能否失败"分类，无例外）：
+
+| 形状 | 用于 | 例 |
+|---|---|---|
+| `i32 status`（`0` / `-Errno`） | 可失败、无值 | `kcore_task_yield` |
+| `i32 status + out` | 可失败、有值 | `kcore_mmio_read_u32` |
+| 直接返回值 | 不会失败的纯 query（`0` 是普通值，不是哨兵） | `kcore_free_page_count` |
+
+**宽度规则**（kcore ABI 数值类型的唯一口径）：
+
+| 宽度 | 用于 |
+|---|---|
+| `usize` | 仅"语义就是指针宽"的量：地址（`entry`）、`(ptr, len)`、分配器 `size/align` |
+| `u32` | counts / ids（hart / cpu / page / task / component ...） |
+| `i32` | 布尔与编码（`has_hart` / `task_state` / `interface_available`） |
+| `u64` | 不透明句柄，只经 `status + out` 回传 |
+
+KernelNative 下组件与 Core 同 target 编译，宽度天然一致；跨 transport（IPC / Wasm）
+不复用本签名，宽度另行定义。旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容；
+新增"可为空的查询"用 `status + out`，不拿 0 当哨兵（`boot_hart` 的 0 是历史唯一样本）。
 
 ### 授权流（Authority 流）
 

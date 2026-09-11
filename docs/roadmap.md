@@ -22,11 +22,18 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
      Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  10 条 kcore_*，按稳定 ABI 分类：
+  21 条 kcore_*，按稳定 ABI 分类：
     Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
     System query：free_page_count / task_count / component_count
+    Component lifecycle：component_load / interface_publish / interface_available
+    Task control：task_create / task_start / task_yield / task_exit / task_state
+    Scheduler：sched_run
+    Resource authority（C6 起步）：mmio_claim / mmio_read_u32（认领设备 → MmioHandle →
+      Core 每次访问重新验证后才碰硬件；逻辑待手写）
+  错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
+    内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
 Component Interface Registry（os/core/src/component/interface.rs，本轮新增骨架）：
   InterfaceId / InterfaceVersion / InterfaceKind（Device/Service/Policy）/ BindingId
@@ -64,7 +71,8 @@ P1 任务系统打通：
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
          timer/sched seam、ArchTest 位），逻辑待手写
-  C6   IRQ/PLIC + 驱动模型（virtio 等）—— MmioHandle/IrqHandle 实战入口
+  🚧 C6  MMIO 资源 authority 起步（claim 设备 → MmioHandle → Core 验证后 read；
+         骨架已导出，逻辑待手写）；后续：IRQ/PLIC + 驱动模型（virtio 等）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
   C8   MemoryRegion lease + Core 验证的原子 region ownership transfer

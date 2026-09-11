@@ -49,7 +49,8 @@ impl FakeContext {
 
 impl CpuArch for Fake {
     type Context = FakeContext;
-    type IrqFlags = ();
+    // 与 Riscv 同形（usize）；host 无真实中断状态，仅作占位。
+    type IrqFlags = usize;
 
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         // Placeholder for context switch logic
@@ -70,7 +71,8 @@ impl CpuArch for Fake {
     }
 
     fn disable_irq() -> Self::IrqFlags {
-        // host 无真实中断：no-op 占位（C5 骨架；irq-save 语义在真机上由 Riscv 实现）。
+        // host 无真实中断：no-op 占位（irq-save 语义在真机上由 Riscv 实现）。
+        0
     }
 
     fn restore_irq(_flags: Self::IrqFlags) {

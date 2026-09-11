@@ -25,7 +25,7 @@ fn data_ok() -> bool {
 
 /// Validate the machine facts supplied by the Core exports.  The actual hart
 /// membership lookup stays in Core; this pure predicate remains host-testable.
-fn machine_ok(cpu_count: usize, boot_hart_present: bool) -> bool {
+fn machine_ok(cpu_count: u32, boot_hart_present: bool) -> bool {
     cpu_count >= 1 && boot_hart_present
 }
 
@@ -41,15 +41,15 @@ mod runtime {
         #[link_name = "kcore_console_write_byte"]
         fn console_write_byte(byte: u8);
         #[link_name = "kcore_machine_boot_hart"]
-        fn machine_boot_hart() -> usize;
+        fn machine_boot_hart() -> u32;
         #[link_name = "kcore_machine_cpu_count"]
-        fn machine_cpu_count() -> usize;
+        fn machine_cpu_count() -> u32;
         #[link_name = "kcore_machine_has_hart"]
-        fn machine_has_hart(hart_id: usize) -> i32;
+        fn machine_has_hart(hart_id: u32) -> i32;
         #[link_name = "kcore_free_page_count"]
-        fn free_page_count() -> usize;
+        fn free_page_count() -> u32;
         #[link_name = "kcore_component_count"]
-        fn component_count() -> usize;
+        fn component_count() -> u32;
 
         // C4：组件生命周期 / 接口 / 任务 / 调度
         #[link_name = "kcore_component_load"]
@@ -322,6 +322,13 @@ mod runtime {
         // TODO(C5): 抢占链用例——两个"不 yield 的忙循环"任务被时钟强行切出
         //   （当前调度是协作式；timer 实现 + sched::on_timer_tick 接线后，
         //   在 scheduling chain 组追加 preempt check）。
+
+        // TODO(C6): MMIO 硬件访问链——claim("virtio,mmio", &mut h) → read_u32(h, 0, &mut v)
+        //   期望 v == 0x74726976（virtio-mmio MagicValue；QEMU 5.2 无条件实例化
+        //   全部 8 个 transport，当前 runner 的 -machine virt 即可，无需 -device）。
+        //   在 handle/mmio.rs 的 claim/read_u32 实现后，再声明
+        //   kcore_mmio_claim / kcore_mmio_read_u32 两个 extern（0/-Errno，值走 out），
+        //   并追加 mmio check。
 
         report.group("summary");
         let all_ok = report.summary() && failed == 0;

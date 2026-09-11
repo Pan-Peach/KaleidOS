@@ -16,6 +16,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod component;
+pub mod errno;
 pub mod handle;
 pub mod inspector;
 pub mod irq;
@@ -97,6 +98,7 @@ pub fn init(
     timer::init().map_err(|_| "timer init failed")?;
     component::registry::init();
     component::interface::init();
+    handle::init();
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

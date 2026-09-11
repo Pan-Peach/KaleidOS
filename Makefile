@@ -85,8 +85,9 @@ clean:
 #   make test-build   两个架构的交叉构建门禁
 #   make test-qemu-rv64 / test-qemu-rv32   自动 QEMU（boot smoke + 自动 CoreTest）
 #   make test-qemu    两个架构都跑
+#   make bench        host release 性能基线（手动跑，不进 CI）
 #   make check        CI 全量门禁 = fmt + clippy + test-host + test-build
-.PHONY: fmt clippy check test-host test-build test-qemu test-qemu-rv64 test-qemu-rv32 test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+.PHONY: fmt clippy check test-host bench test-build test-qemu test-qemu-rv64 test-qemu-rv32 test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
@@ -103,6 +104,10 @@ clippy:
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU）
 test-host:
 	cargo test --workspace
+
+# 性能基线（host release，手动跑）：ns/call 量级；基线用例见 handle/mmio.rs bench_*
+bench:
+	cargo test --release -p kernel --lib bench -- --ignored --nocapture
 
 # 交叉构建门禁：RV64 链接 + RV32 检查（不运行）
 test-build:

@@ -33,6 +33,12 @@ impl IrqSaveGuard {
     }
 }
 
+impl Default for IrqSaveGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for IrqSaveGuard {
     fn drop(&mut self) {
         if let Some(flags) = self.flags.take() {

@@ -35,11 +35,7 @@ impl<T> ResourceTable<T> {
     }
 
     /// 验证 slot、generation、owner 和资源生命周期后取得资源对象。
-    pub(crate) fn get(
-        &self,
-        caller: ComponentId,
-        handle: Handle<T>,
-    ) -> Result<&T, HandleError> {
+    pub(crate) fn get(&self, caller: ComponentId, handle: Handle<T>) -> Result<&T, HandleError> {
         let slot = self
             .slots
             .get(handle.slot() as usize)
@@ -51,6 +47,11 @@ impl<T> ResourceTable<T> {
             return Err(HandleError::WrongOwner);
         }
         slot.object().ok_or(HandleError::Revoked)
+    }
+
+    /// 只读遍历 slot（供各资源表的专属检查使用，如 MMIO 的设备独占）。
+    pub(crate) fn slots(&self) -> &[Slot<T>] {
+        &self.slots
     }
 
     /// 撤销指定组件拥有的全部 authority。

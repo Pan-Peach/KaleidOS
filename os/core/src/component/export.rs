@@ -7,7 +7,7 @@
 //! - 组件侧声明方式：`unsafe extern "C" { #[link_name = "kcore_..."] ... }`，
 //!   loader 重定位时按未 mangled 字节名精确匹配。
 //!
-//! # ABI 分类（v1 稳定 + v2 增量）
+//! # ABI 分类（v1 稳定 + v2 增量 + v3 资源 authority 起步）
 //!
 //! | 类别 | 符号 | 说明 |
 //! |---|---|---|
@@ -18,8 +18,37 @@
 //! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
+//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` | 设备认领 + 单次 MMIO 读：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`）；read = 每次调用 Core 重新验证 handle 后才访问硬件。组件拿到的只是 raw handle，**不是地址**；两者均 `0 / -Errno`、值走 out 参数 |
 //!
-//! # 明确不导出（authority 授予点 / Core truth 变更点）
+//! # ABI 错误约定（v3 起）
+//!
+//! ```text
+//! 0          success
+//! -negative  failure: -Errno
+//! ```
+//!
+//! `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）；
+//! 各子系统的内部错误（`TaskError` / `HandleError` / `ComponentLoadError` /
+//! `SchedError` / `InterfaceError` / `MmioError`）保持各自为政，只在导出边界
+//! 翻译成 `Errno`。
+//!
+//! **返回值形状**（按"能否失败"分类）：
+//! - 可失败、无值 → `i32 status`（`0` / `-Errno`）；
+//! - 可失败、有值 → `i32 status + out 参数`（值不混进返回值）；
+//! - 不会失败（纯 query）→ 直接返回值，`0` 是普通值不是哨兵。
+//!
+//! **宽度规则**：`usize` 只用于"语义就是指针宽"的量（地址 `entry`、
+//! `(ptr, len)` 长度、分配器 `size/align`）；counts/ids → `u32`（v3 起，v1 的
+//! `usize` 已迁移）；布尔/编码 → `i32`；不透明句柄 → `u64`，只经 `status + out`
+//! 回传。
+//!
+//! 旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容，迁移单独评估。
+//!
+//! # 明确不导出（未经 Core validation 的裸 authority mutation）
+//!
+//! 组件可以 **request** 资源（v3 的 `kcore_mmio_claim` = request → Core
+//! authorize → Core grant），但任何 Core truth 的 mutation 都必须由 Core
+//! 验证后提交并留 trace；裸 mutation 入口一律不导出：
 //!
 //! - 物理内存：`memory::alloc_region` / `free_region` / `vm_page_alloc`——物理帧是
 //!   Core 内部机制（canonical），组件要内存走 `kcore_heap_alloc`（共享堆）。
@@ -44,8 +73,9 @@
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
 use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
-use crate::component::load::ComponentLoadError;
 use crate::component::registry;
+use crate::errno::{Errno, status};
+use crate::handle::mmio;
 use crate::machine;
 use crate::memory;
 use crate::sched;
@@ -91,16 +121,17 @@ extern "C" fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8 {
 }
 
 /// 共享堆释放。契约 = Rust `GlobalAlloc::dealloc`（见模块文档的语义说明）。
+/// 返回 0 / `-Errno`（`EFAULT` 空指针 / `EINVAL` 非法 layout）。
 ///
 /// # Safety
 /// `ptr` 必须来自一次成功的 `kcore_heap_alloc`，且 `(size, align)` 必须与那次
 /// 调用完全一致。违反 = UB。
 extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32 {
     if ptr.is_null() {
-        return -1;
+        return Errno::EFAULT.code();
     }
     let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
-        return -1;
+        return Errno::EINVAL.code();
     };
     // SAFETY: 由调用方保证 ptr/layout 匹配一次成功 alloc（C ABI 契约）。
     unsafe {
@@ -117,9 +148,14 @@ extern "C" fn kcore_console_write_byte(byte: u8) {
     ConsoleImpl::write_byte(byte);
 }
 
+/// 输出一行（`[kcomp] ` 前缀）。返回 0 / `-Errno`（`EFAULT` 空指针 /
+/// `EOVERFLOW` 长度超 `isize::MAX`）。
 extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
-    if (ptr.is_null() && len != 0) || len > isize::MAX as usize {
-        return -1;
+    if ptr.is_null() && len != 0 {
+        return Errno::EFAULT.code();
+    }
+    if len > isize::MAX as usize {
+        return Errno::EOVERFLOW.code();
     }
     const PREFIX: &[u8] = b"[kcomp] ";
     for &b in PREFIX {
@@ -136,45 +172,45 @@ extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Category 3：Machine query（已提交机器真相的只读查询）
+// Category 3：Machine query（已提交机器真相的只读查询；counts/ids → u32）
 // ---------------------------------------------------------------------------
 
-extern "C" fn kcore_machine_boot_hart() -> usize {
-    machine::committed().map_or(0, |m| m.boot_hart)
+extern "C" fn kcore_machine_boot_hart() -> u32 {
+    machine::committed().map_or(0, |m| m.boot_hart as u32)
 }
 
-extern "C" fn kcore_machine_cpu_count() -> usize {
-    machine::committed().map_or(0, |m| m.cpu_count)
+extern "C" fn kcore_machine_cpu_count() -> u32 {
+    machine::committed().map_or(0, |m| m.cpu_count as u32)
 }
 
-extern "C" fn kcore_machine_has_hart(hart_id: usize) -> i32 {
+extern "C" fn kcore_machine_has_hart(hart_id: u32) -> i32 {
     let Some(machine) = machine::committed() else {
         return 0;
     };
     machine.cpu_info[..machine.cpu_count.min(machine.cpu_info.len())]
         .iter()
-        .any(|cpu| cpu.hart_id.raw() == hart_id) as i32
+        .any(|cpu| cpu.hart_id.raw() == hart_id as usize) as i32
 }
 
 // ---------------------------------------------------------------------------
-// Category 4：System query（已提交 Core 真相的只读查询）
+// Category 4：System query（已提交 Core 真相的只读查询；counts → u32）
 // ---------------------------------------------------------------------------
 
-extern "C" fn kcore_free_page_count() -> usize {
+extern "C" fn kcore_free_page_count() -> u32 {
     memory::free_block_counts()
         .iter()
         .enumerate()
         .skip(memory::HEAP_MIN_ORDER)
         .map(|(order, &blocks)| blocks * (1usize << (order - memory::HEAP_MIN_ORDER)))
-        .sum()
+        .sum::<usize>() as u32
 }
 
-extern "C" fn kcore_task_count() -> usize {
-    task::get_task_table().lock().len()
+extern "C" fn kcore_task_count() -> u32 {
+    task::get_task_table().lock().len() as u32
 }
 
-extern "C" fn kcore_component_count() -> usize {
-    registry::get_registry().lock().len()
+extern "C" fn kcore_component_count() -> u32 {
+    registry::get_registry().lock().len() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -202,34 +238,22 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
     }
 }
 
-fn load_error_code(error: ComponentLoadError) -> i32 {
-    match error {
-        ComponentLoadError::StoreNotMounted => -1,
-        ComponentLoadError::NotFound => -2,
-        ComponentLoadError::ReadFailed => -3,
-        ComponentLoadError::Loader(_) => -4,
-        ComponentLoadError::DeclareFailed => -5,
-        ComponentLoadError::ResolveFailed => -6,
-        ComponentLoadError::StartFailed => -7,
-        ComponentLoadError::InitFailed(_) => -8,
-    }
-}
-
 /// 请求 Core 加载并启动组件（store → loader → registry → call_init 全链，
-/// 与 monitor `load` 同源）。返回 ComponentId raw，负数 = 错误码。
+/// 与 monitor `load` 同源）。返回 ComponentId raw（≥ 0）/ `-Errno`
+/// （`EINVAL` 名字非法；其余见 `Errno::from(ComponentLoadError)`）。
 extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
     let Some(name) = checked_name(name_ptr, name_len) else {
-        return -9;
+        return Errno::EINVAL.code();
     };
     match crate::component::load::load_and_start(name) {
         Ok(id) => id.raw() as i32,
-        Err(e) => load_error_code(e),
+        Err(error) => Errno::from(error).code(),
     }
 }
 
 /// 发布接口。provider = 当前正在初始化的组件（Core 记录，**不信任组件自报
-/// 身份**）。返回 BindingId raw，负数 = 错误（-1 名字非法 / -2 kind 非法 /
-/// -3 不在组件 init 上下文 / -4 publish 被 Core 拒绝）。
+/// 身份**）。返回 BindingId raw（≥ 0）/ `-Errno`（`EINVAL` 名字/kind 非法；
+/// `EPERM` 不在组件 init 上下文；其余见 `Errno::from(InterfaceError)`）。
 extern "C" fn kcore_interface_publish(
     name_ptr: *const u8,
     name_len: usize,
@@ -238,13 +262,13 @@ extern "C" fn kcore_interface_publish(
     context: *mut (),
 ) -> i32 {
     let Some(name) = checked_name(name_ptr, name_len) else {
-        return -1;
+        return Errno::EINVAL.code();
     };
     let Some(kind) = kind_from_u32(kind) else {
-        return -2;
+        return Errno::EINVAL.code();
     };
     let Some(provider) = crate::component::load::current_component() else {
-        return -3;
+        return Errno::EPERM.code();
     };
     let reg = registry::get_registry().lock();
     let mut ifs = get_interfaces().lock();
@@ -257,7 +281,7 @@ extern "C" fn kcore_interface_publish(
         context,
     ) {
         Ok(binding) => binding.raw() as i32,
-        Err(_) => -4,
+        Err(error) => Errno::from(error).code(),
     }
 }
 
@@ -289,55 +313,46 @@ fn current_task_requester() -> Option<crate::component::ComponentId> {
 }
 
 /// 创建任务。requester = 当前 caller；`entry` 必须落在该组件的
-/// 装载镜像内（越界指针一律拒绝）。返回 TaskId raw，负数 = 错误
-/// （-1 无法解析 caller / -2 Core 拒绝：requester 非 Ready、entry 越界、
-/// 内存不足）。
+/// 装载镜像内（越界指针一律拒绝）。返回 TaskId raw（≥ 0）/ `-Errno`
+/// （`EPERM` 无法解析 caller；其余见 `Errno::from(TaskError)`）。
 extern "C" fn kcore_task_create(entry: usize) -> i32 {
     let Some(requester) = current_task_requester() else {
-        return -1;
+        return Errno::EPERM.code();
     };
     match task::create_task(requester, entry) {
         Ok(id) => id.raw() as i32,
-        Err(_) => -2,
+        Err(error) => Errno::from(error).code(),
     }
 }
 
 /// 启动任务：Core 验证当前 caller 是任务 owner 后才推进 Created → Runnable。
-/// 0 = 成功，-1 = 失败。
+/// 返回 0 / `-Errno`。
 extern "C" fn kcore_task_start(id: u32) -> i32 {
     let Some(requester) = current_task_requester() else {
-        return -1;
+        return Errno::EPERM.code();
     };
-    match task::start_task(requester, TaskId::from_raw(id)) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+    status(task::start_task(requester, TaskId::from_raw(id)))
 }
 
 /// 让出 CPU：Running → Runnable + 调度切换。任务再次被选中时返回 0。
+/// 返回 0 / `-Errno`。
 extern "C" fn kcore_task_yield() -> i32 {
-    match sched::yield_current() {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+    status(sched::yield_current())
 }
 
 /// 退出：Running → Exited + 调度切换。**控制权永不回到本任务**——若还有
 /// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
-/// 的上下文）。错误（当前无运行任务等）时返回 -1。
+/// 的上下文）。返回 0 / `-Errno`。
 extern "C" fn kcore_task_exit() -> i32 {
-    match sched::exit_current() {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
+    status(sched::exit_current())
 }
 
 /// 只读查询任务状态（Core 真相的编码视图）：
-/// 0=Created 1=Runnable 2=Running 3=Blocked 4=Exited；-1 = 不存在。
+/// 0=Created 1=Runnable 2=Running 3=Blocked 4=Exited；`-ESRCH` = 不存在。
 extern "C" fn kcore_task_state(id: u32) -> i32 {
     let table = task::get_task_table().lock();
     match table.get(TaskId::from_raw(id)) {
-        None => -1,
+        None => Errno::ESRCH.code(),
         Some(record) => match record.state() {
             TaskState::Created => 0,
             TaskState::Runnable => 1,
@@ -353,11 +368,65 @@ extern "C" fn kcore_task_state(id: u32) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// 把 CPU 交给调度器：跑完所有 Runnable 任务后返回（锚点上下文）。
-/// 无 Runnable 任务时为 no-op。0 = 完成，-1 = 失败（无 SchedulerPolicy 等）。
+/// 无 Runnable 任务时为 no-op。返回 0 / `-Errno`（见 `Errno::from(SchedError)`）。
 extern "C" fn kcore_sched_run() -> i32 {
-    match sched::run() {
-        Ok(()) => 0,
-        Err(_) => -1,
+    status(sched::run())
+}
+
+// ---------------------------------------------------------------------------
+// Category 8：Resource authority（v3 起步；request → authorize → grant → access）
+// ---------------------------------------------------------------------------
+
+/// 认领一台已发现设备的 MMIO authority（C6 起步）。
+///
+/// 语义：compatible 匹配 `MachineInfo.devices` → Core authorize（phase 1 恒
+/// allow）→ 独占检查（设备已归其他 owner 则拒绝）→ grant `MmioHandle`。
+/// 成功 = 0，raw handle（`to_raw` 编码：高 32 位 slot、低 32 位 generation；
+/// **不是地址**）写入 `*out_handle`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法 / `EPERM` 无法解析
+/// caller 或 Core 策略拒绝 / `ENODEV` 无匹配设备 / `EBUSY` 匹配设备全被认领）。
+extern "C" fn kcore_mmio_claim(name_ptr: *const u8, name_len: usize, out_handle: *mut u64) -> i32 {
+    if out_handle.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(compatible) = checked_name(name_ptr, name_len) else {
+        return Errno::EINVAL.code();
+    };
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    match mmio::claim(caller, compatible) {
+        Ok(handle) => {
+            // SAFETY: `out_handle` 的可写性由调用方保证（C ABI 契约）；unaligned
+            // 写避免调用方指针未对齐 = UB。
+            unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 单次 32-bit MMIO 读（C6 起步）。每次调用 Core 都重新验证 handle，
+/// 过 bounds/对齐检查后由 Core 访问硬件；组件永远拿不到地址。
+///
+/// 成功 = 0，值写入 `*out_value`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
+/// `EBADF` slot 不存在 / `ESTALE` 过期 / `EACCES` 非 owner /
+/// `EKEYREVOKED` 已 revoke / `EALREADY` 已释放 / `EINVAL` 越界或未对齐）。
+extern "C" fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32 {
+    if out_value.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    match mmio::read_u32(caller, mmio::MmioHandle::from_raw(handle), offset) {
+        Ok(value) => {
+            // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
+            unsafe { core::ptr::write_unaligned(out_value, value) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
     }
 }
 
@@ -365,7 +434,7 @@ extern "C" fn kcore_sched_run() -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 19] = [
+static EXPORTS: [Export; 21] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -449,6 +518,15 @@ static EXPORTS: [Export; 19] = [
         name: b"kcore_sched_run",
         address: ExportAddress(kcore_sched_run as *const ()),
     },
+    // Category 8：Resource authority（v3 起步）
+    Export {
+        name: b"kcore_mmio_claim",
+        address: ExportAddress(kcore_mmio_claim as *const ()),
+    },
+    Export {
+        name: b"kcore_mmio_read_u32",
+        address: ExportAddress(kcore_mmio_read_u32 as *const ()),
+    },
 ];
 
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
@@ -487,6 +565,8 @@ mod tests {
             &b"kcore_task_exit"[..],
             &b"kcore_task_state"[..],
             &b"kcore_sched_run"[..],
+            &b"kcore_mmio_claim"[..],
+            &b"kcore_mmio_read_u32"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -500,6 +580,7 @@ mod tests {
         assert_eq!(resolve(b"kcore_task_table_create"), None);
         assert_eq!(resolve(b"kcore_registry_declare"), None);
         assert_eq!(resolve(b"kcore_context_switch"), None);
+        assert_eq!(resolve(b"kcore_mmio_grant"), None, "设备认领只能走 claim");
         assert_eq!(resolve(b"kcore_"), None);
         assert_eq!(resolve(b""), None);
     }
@@ -508,6 +589,26 @@ mod tests {
     fn names_are_exact_not_prefix() {
         assert!(resolve(b"kcore_log_line2").is_none(), "禁止前缀匹配");
         assert!(resolve(b"x?kcore_log_line").is_none(), "禁止后缀匹配");
+    }
+
+    /// v3 资源 authority API 的错误约定：`0 / -Errno`，值走 out 参数。
+    #[test]
+    fn resource_authority_apis_follow_status_convention() {
+        let claim = resolve(b"kcore_mmio_claim").unwrap();
+        let claim: extern "C" fn(*const u8, usize, *mut u64) -> i32 =
+            unsafe { core::mem::transmute(claim) };
+        let read = resolve(b"kcore_mmio_read_u32").unwrap();
+        let read: extern "C" fn(u64, u32, *mut u32) -> i32 = unsafe { core::mem::transmute(read) };
+
+        let mut out = 0u64;
+        // out 为空 → EFAULT（早于设备/硬件逻辑，host 可安全断言）
+        assert_eq!(
+            claim(b"virtio,mmio".as_ptr(), 11, core::ptr::null_mut()),
+            -14
+        );
+        assert_eq!(read(0, 0, core::ptr::null_mut()), -14);
+        // 名字非法 → EINVAL（早于 caller 解析与设备匹配）
+        assert_eq!(claim(core::ptr::null(), 0, &mut out), -22);
     }
 
     #[test]

@@ -9,12 +9,12 @@ unsafe extern "C" {
     #[link_name = "kcore_console_write_byte"]
     fn console_write_byte(byte: u8);
     #[link_name = "kcore_component_count"]
-    fn component_count() -> usize;
+    fn component_count() -> u32;
     #[link_name = "kcore_free_page_count"]
-    fn free_page_count() -> usize;
+    fn free_page_count() -> u32;
 }
 
-fn hex_digit(d: usize) -> u8 {
+fn hex_digit(d: u32) -> u8 {
     if d < 10 {
         b'0' + d as u8
     } else {
@@ -23,9 +23,9 @@ fn hex_digit(d: usize) -> u8 {
 }
 
 /// 16 进制输出：移位 + 掩码，无除法（避免 div_by_zero panic 分支）、无数组（避免 拷贝/清零 libcall）。
-fn write_hex(v: usize) {
+fn write_hex(v: u32) {
     let mut started = false;
-    let mut shift = usize::BITS as usize - 4;
+    let mut shift = u32::BITS as usize - 4;
     loop {
         let d = (v >> shift) & 0xF;
         if started || d != 0 || shift == 0 {
@@ -41,7 +41,7 @@ fn write_hex(v: usize) {
     }
 }
 
-fn do_smoke() -> usize {
+fn do_smoke() -> u32 {
     unsafe { component_count().wrapping_add(free_page_count()) }
 }
 

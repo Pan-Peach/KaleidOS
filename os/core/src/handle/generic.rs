@@ -34,6 +34,19 @@ impl<T> Handle<T> {
     pub(crate) const fn generation(self) -> u32 {
         self.generation
     }
+
+    /// 跨 ABI 边界的 opaque 编码：高 32 位 slot、低 32 位 generation。
+    ///
+    /// 组件侧只能把它当作不透明值传递（`u64`）；token 可被伪造，authority
+    /// 依然由资源表的 slot/generation/owner 验证决定。
+    pub(crate) const fn to_raw(self) -> u64 {
+        ((self.slot as u64) << 32) | self.generation as u64
+    }
+
+    /// 从 ABI raw 值重建 handle（不做验证；验证在资源表 `get`/`release`）。
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self::new((raw >> 32) as u32, raw as u32)
+    }
 }
 
 impl<T> Copy for Handle<T> {}
@@ -109,5 +122,28 @@ impl<T> Slot<T> {
         if self.object.take().is_some() {
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Handle;
+
+    #[test]
+    fn raw_roundtrip_preserves_slot_and_generation() {
+        let handle = Handle::<u8>::new(3, 7);
+        assert_eq!(handle.to_raw(), (3u64 << 32) | 7);
+        let decoded = Handle::<u8>::from_raw(handle.to_raw());
+        assert_eq!(decoded.slot(), 3);
+        assert_eq!(decoded.generation(), 7);
+    }
+
+    #[test]
+    fn raw_roundtrip_at_u32_limits() {
+        let handle = Handle::<u8>::new(u32::MAX, u32::MAX);
+        assert_eq!(handle.to_raw(), u64::MAX);
+        let decoded = Handle::<u8>::from_raw(u64::MAX);
+        assert_eq!(decoded.slot(), u32::MAX);
+        assert_eq!(decoded.generation(), u32::MAX);
     }
 }
