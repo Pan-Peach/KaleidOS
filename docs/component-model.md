@@ -106,7 +106,7 @@ struct DmaRecord {
 
 > **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA）和受管理的内存区域，用于保护与 revoke。
 >
-> `ComponentId` 是 identity（不是 authority），`handle.rs` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
+> `ComponentId` 是 identity（不是 authority），`handle/` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
 
 ### 3.1 Handle table 可以非常普通
 
@@ -425,7 +425,7 @@ irq/         —— IrqTable，record 带 owner: ComponentId（模块按概念�
 mmio.rs      —— MmioTable，record 带 owner: ComponentId
 dma.rs       —— DmaTable，record 带 owner: ComponentId
 
-handle.rs    —— 类型化 Handle<...> + Slot{generation, owner, object}
+handle/      —— 类型化 Handle<...> + Slot{generation, owner, object}
 ```
 
 ownership 结构：
