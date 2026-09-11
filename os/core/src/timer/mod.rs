@@ -15,30 +15,34 @@
 //!
 //! # 接线点（实现时按序）
 //!
-//! 1. `init`：编程第一个 deadline（`TimerImpl::set_deadline(now + period)`）；
-//! 2. 时钟中断回调注册：把 [`on_trap`] 接到 arch 的 trap 分发
+//! 1. `init`：登记 trap 回调并打开 timer interrupt，不自动产生周期 tick；
+//! 2. `arm_deadline`：为下一个 sleep/timeout/event 编程 one-shot deadline；
+//! 3. 时钟中断回调注册：把 [`on_trap`] 接到 arch 的 trap 分发
 //!    （机制待定——arch 不依赖 Core，注册式 hook 或 boot 注入均可，
 //!    见 `arch::riscv::trap::supervisor::trap_handler` 的 TODO）；
-//! 3. 中断开闸：`sie.STIE` + `sstatus.SIE`（`CpuImpl` 侧原语）；
-//! 4. 抢占：`on_trap` 末尾触发 `crate::sched::on_timer_tick`（模型待定）。
+//! 4. 中断开闸：`sie.STIE` + `sstatus.SIE`（`CpuImpl` 侧原语）；
+//! 5. 可选抢占：仅 `preempt` profile 由 `init_preempt` 使用周期 deadline。
 use arch::Timer;
 use spin::Mutex;
 
 struct TimerState {
     initialized: bool,
     ticks: u64,
-    period: u64,
-    next_deadline: u64,
+    next_deadline: Option<u64>,
+    #[cfg(feature = "preempt")]
+    preempt_period: Option<u64>,
 }
 
 static STATE: Mutex<TimerState> = Mutex::new(TimerState {
     initialized: false,
     ticks: 0,
-    period: 0,
-    next_deadline: 0,
+    next_deadline: None,
+    #[cfg(feature = "preempt")]
+    preempt_period: None,
 });
 
-const TICK_HZ: u64 = 100;
+#[cfg(feature = "preempt")]
+const PREEMPT_HZ: u64 = 100;
 
 /// 时钟机制错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,36 +55,58 @@ pub enum TimerError {
     NotInitialized,
 }
 
-/// 初始化 Core 时钟机制：编程第一个 deadline、登记时钟回调、开中断。
+/// 初始化 one-shot timer 机制：登记时钟回调并打开 timer interrupt。
 ///
-/// TODO(C5)：实现（接线点见模块文档；频率 = timebase Hz，period = 1/frequency）。
-pub fn init(frequency_hz: usize) -> Result<(), TimerError> {
-    let timebase_hz = u64::try_from(frequency_hz).map_err(|_| TimerError::InvalidFrequency)?;
-    if timebase_hz == 0 || timebase_hz < TICK_HZ {
-        return Err(TimerError::InvalidFrequency);
-    }
-    let period = timebase_hz / TICK_HZ;
-    if period == 0 {
-        return Err(TimerError::InvalidFrequency);
-    }
-    let first_deadline = arch::TimerImpl::now()
-        .checked_add(period)
-        .ok_or(TimerError::InvalidFrequency)?;
-
+/// 此函数不会自动编程 deadline；没有事件时，cooperative profile 不会产生
+/// 周期性 timer IRQ。事件机制通过 [`arm_deadline`] 编程下一次到期时间。
+pub fn init() -> Result<(), TimerError> {
     {
         let mut state = STATE.lock();
         if state.initialized {
             return Err(TimerError::AlreadyInitialized);
         }
         state.initialized = true;
-        state.period = period;
-        state.next_deadline = first_deadline;
     }
 
-    arch::TimerImpl::set_deadline(first_deadline);
     arch::TimerImpl::register_timer_handler(on_trap);
     arch::TimerImpl::enable_timer_interrupt();
     Ok(())
+}
+
+/// 编程下一次 one-shot deadline。
+pub fn arm_deadline(deadline: u64) -> Result<(), TimerError> {
+    let _irq_guard = crate::irq::IrqSaveGuard::new();
+    {
+        let mut state = STATE.lock();
+        if !state.initialized {
+            return Err(TimerError::NotInitialized);
+        }
+        state.next_deadline = Some(deadline);
+    }
+    arch::TimerImpl::set_deadline(deadline);
+    Ok(())
+}
+
+#[cfg(feature = "preempt")]
+/// 为抢占 profile 初始化周期性调度 tick。
+pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
+    let timebase_hz = u64::try_from(timebase_hz).map_err(|_| TimerError::InvalidFrequency)?;
+    if timebase_hz < PREEMPT_HZ {
+        return Err(TimerError::InvalidFrequency);
+    }
+    let period = timebase_hz / PREEMPT_HZ;
+    if period == 0 {
+        return Err(TimerError::InvalidFrequency);
+    }
+    let first_deadline = arch::TimerImpl::now()
+        .checked_add(period)
+        .ok_or(TimerError::InvalidFrequency)?;
+    init()?;
+    {
+        let mut state = STATE.lock();
+        state.preempt_period = Some(period);
+    }
+    arm_deadline(first_deadline)
 }
 
 /// 时钟中断入口（trap 分发调用；中断上下文，已关中断）。
@@ -90,6 +116,7 @@ pub fn init(frequency_hz: usize) -> Result<(), TimerError> {
 ///
 /// TODO(C5)：实现；抢占模型（延迟重调度 vs trap 内直接切换）见 sched 侧注记。
 pub extern "C" fn on_trap() {
+    #[cfg(feature = "preempt")]
     let now = arch::TimerImpl::now();
     let next = {
         let mut state = STATE.lock();
@@ -97,13 +124,24 @@ pub extern "C" fn on_trap() {
             return;
         }
         state.ticks += 1;
-        while state.next_deadline <= now {
-            state.next_deadline = state.next_deadline.saturating_add(state.period);
+        #[cfg(feature = "preempt")]
+        if let Some(period) = state.preempt_period {
+            let mut next = state.next_deadline.unwrap_or(now);
+            while next <= now {
+                next = next.saturating_add(period);
+            }
+            state.next_deadline = Some(next);
+        }
+        #[cfg(not(feature = "preempt"))]
+        {
+            state.next_deadline = None;
         }
         state.next_deadline
     };
 
-    arch::TimerImpl::set_deadline(next);
+    if let Some(next) = next {
+        arch::TimerImpl::set_deadline(next);
+    }
 }
 
 /// 已过去的 tick 数（观测/测试用）。

@@ -91,8 +91,7 @@ impl CpuArch for Riscv {
 
 impl Timer for Riscv {
     fn now() -> u64 {
-        // TODO(C5): 委托 `firmware::time()`（rdtime 或 SBI TIME）。
-        todo!("C5: Timer::now")
+        firmware::time()
     }
 
     fn set_deadline(_deadline: u64) {

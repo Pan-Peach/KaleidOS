@@ -9,6 +9,7 @@ build = "build.rs"
 default = ["supervisor"]
 supervisor = ["arch/supervisor"]
 machine = ["arch/machine"]
+preempt = []
 
 [dependencies]
 arch = { path = "../arch", default-features = false }

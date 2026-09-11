@@ -91,7 +91,10 @@ pub fn init(
 
     task::init();
     sched::init();
-    timer::init(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
+    #[cfg(feature = "preempt")]
+    timer::init_preempt(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
+    #[cfg(not(feature = "preempt"))]
+    timer::init().map_err(|_| "timer init failed")?;
     component::registry::init();
     component::interface::init();
     log!("core", "init OK");

@@ -74,34 +74,35 @@ pub fn time() -> u64 {
 
 #[cfg(target_arch = "riscv32")]
 pub fn time() -> u64 {
-    let mut high: u32;
-    let mut low: u32;
-    let mut high_again: u32;
+    loop {
+        let high: u32;
+        let low: u32;
+        let high_again: u32;
 
-    unsafe {
-        core::arch::asm!(
-            "rdtime {high}",
-            high = out(reg) high,
-            options(nostack, preserves_flags),
-        );
+        unsafe {
+            core::arch::asm!(
+                "rdtimeh {high}",
+                high = out(reg) high,
+                options(nostack, preserves_flags),
+            );
 
-        core::arch::asm!(
-            "rdtime {low}",
-            low = out(reg) low,
-            options(nostack, preserves_flags),
-        );
+            core::arch::asm!(
+                "rdtime {low}",
+                low = out(reg) low,
+                options(nostack, preserves_flags),
+            );
 
-        core::arch::asm!(
-            "rdtimeh {high_again}",
-            high_again = out(reg) high_again,
-            options(nostack, preserves_flags),
-        );
+            core::arch::asm!(
+                "rdtimeh {high_again}",
+                high_again = out(reg) high_again,
+                options(nostack, preserves_flags),
+            );
+        }
+
+        if high == high_again {
+            return ((high as u64) << 32) | low as u64;
+        }
     }
-
-    if high == high_again {
-        return ((high as u64) << 32) | (low as u64);
-    }
-    panic!("Inconsistent time values");
 }
 
 /// 编程下一次时钟中断的绝对 deadline（SBI TIME 扩展）。
