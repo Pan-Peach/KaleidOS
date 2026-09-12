@@ -22,7 +22,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
      Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  30 条 kcore_*，按稳定 ABI 分类：
+  33 条 kcore_*，按稳定 ABI 分类：
     Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
@@ -35,6 +35,9 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
       irq_ack（认领设备/中断线 → MmioHandle/IrqHandle；常规访问每次由 Core 重新验证，
       kcore_mmio_lease 可派生一次校验过的 (ptr,len) 供受信 KernelNative 直访；
       IRQ 两态：trap 回调 / 轮询（Core 计数+掩蔽，驱动 poll/ack 后重新放行））
+    DMA authority（C6）：dma_alloc / dma_lease / dma_release（用 caller 已持有的 MmioHandle
+      推导设备身份 → Core 分配物理连续 backing → 派生 (ptr, len, device_addr) + provenance；
+      release/revoke 把 backing 移入 Core 私有 QUARANTINE——无 IOMMU 时设备静默不可证，不立即释放）
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
@@ -74,11 +77,13 @@ P1 任务系统打通：
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
          timer/sched seam、ArchTest 位），逻辑待手写
-  🚧 C6  MMIO 资源 authority（已落地：claim 设备 → MmioHandle → Core 验证后 read，QEMU
-         端到端 virtio magic 验证）；IRQ authority 已落地（claim/register/enable +
-         route + trap 外部中断钩子 + PLIC 寄存器机制 + boot 配置；host 测试 +
-          CoreTest `irq-line-enable` + ArchTest `external-irq`（真设备投递）均有覆盖）；
-          后续：驱动模型（virtio 等，见 `driver-model.md`）
+  🚧 C6  驱动 authority 层（见 `driver-model.md`）：request→authorize→grant→access 走
+         `RequestContext`；MMIO `read/write/release` + `kcore_mmio_lease`（派生 (ptr,len) 直访，
+         受信 KernelNative，撤销协作式）；IRQ 两态（trap 回调 / Polled 计数+掩蔽，驱动
+         poll/ack 重新放行）；DMA `alloc/lease/release`（设备身份从 MmioHandle 推导，backing
+         撤销进 QUARANTINE）；`fail_component` 编排拆除。CoreTest 覆盖 mmio
+         magic/lease/write/release + `irq-line-enable`/polled + dma-ring；ArchTest
+         `external-irq` 真设备投递。后续：第一个 driver component（virtio 等）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
   C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
