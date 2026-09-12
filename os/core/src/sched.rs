@@ -22,7 +22,8 @@
 //! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
 
 use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
-use crate::component::{ComponentId, registry};
+use crate::component::load::ComponentLoadError;
+use crate::component::{ComponentId, containment, registry};
 use crate::irq::IrqSaveGuard;
 use crate::machine::CpuId;
 use crate::task::{self, TaskId, TaskState};
@@ -147,7 +148,19 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
 /// `from = Some(id)`：把当前任务推进到 `after`（yield→Runnable / exit→Exited）
 /// 并保存它的上下文；`from = None`：捕获锚点上下文（首次 run）。
 /// `next = None`：没有可运行任务，切回锚点。
-fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), SchedError> {
+///
+/// `abort` 非空时走**任务 panic 收尾路径**：任务已 commit 为 `Exited`
+/// 后、切换前调用 `fail_component`。顺序刻意如此——`pick_next` 先于
+/// `fail_component`，这样即使 panic 的任务属于当前 scheduler provider，
+/// 后继任务也已在 provider 被解绑前选定，Core 不会被失败组件挂起。
+///
+/// 锁纪律：`context_switch` 前全部锁释放；锁外先 revoke、再按**目标上下文**
+/// 安装逃逸 guard，最后切换。
+fn schedule_next(
+    from: Option<TaskId>,
+    after: Option<TaskState>,
+    abort: Option<(TaskId, ComponentId)>,
+) -> Result<(), SchedError> {
     let guard = IrqSaveGuard::new();
     // Phase 0：收集 + 提议（interfaces/registry 锁在 resolve_policy 内，短暂）
     let runnable = collect_runnable();
@@ -159,7 +172,11 @@ fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), S
     //   持有 cpu/table 锁时，trap 处理器再取同样的锁 = 自死锁）。实现抢占前
     //   本临界区必须 irq-save：CpuImpl::disable_irq() / restore_irq()，
     //   决策注记见 core/src/irq.rs。
-    let (from_ptr, to_ptr): (*mut ContextImpl, *const ContextImpl) = {
+    let (from_ptr, to_ptr, next_owner): (
+        *mut ContextImpl,
+        *const ContextImpl,
+        Option<ComponentId>,
+    ) = {
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
 
@@ -184,35 +201,65 @@ fn schedule_next(from: Option<TaskId>, after: Option<TaskState>) -> Result<(), S
             }
         };
 
-        let to_ptr: *const ContextImpl = match next {
+        let (to_ptr, next_owner): (*const ContextImpl, Option<ComponentId>) = match next {
             Some(id) => {
+                // owner 先取（Copy），再可变借 table 推进状态。
+                let owner = table.get(id).ok_or(SchedError::NotFound)?.owner();
                 table
                     .transition(id, TaskState::Running(CpuId(0)))
                     .map_err(|_| SchedError::InvalidTransition)?;
                 cpu_guard.current = Some(id);
                 let rec = table.get(id).ok_or(SchedError::NotFound)?;
-                rec.context.as_ref() as *const ContextImpl
+                (rec.context.as_ref() as *const ContextImpl, Some(owner))
             }
             None => {
                 cpu_guard.current = None;
-                cpu_guard
-                    .anchor
-                    .as_ref()
-                    .expect("anchor exists after first run")
-                    .as_ref() as *const ContextImpl
+                (
+                    cpu_guard
+                        .anchor
+                        .as_ref()
+                        .expect("anchor exists after first run")
+                        .as_ref() as *const ContextImpl,
+                    None,
+                )
             }
         };
-        (from_ptr, to_ptr)
+        (from_ptr, to_ptr, next_owner)
     }; // 全部锁在此释放
 
     drop(guard);
-    // Phase 2：锁外切换。单 CPU 协作式：此处无并发、无 yield 点。
+
+    // Phase 2：锁外 revoke（仅 abort 路径）+ 按 incoming 安装逃逸 guard + 切换。
+    if let Some((dead, owner)) = abort {
+        crate::component::fail_component(owner, ComponentLoadError::TaskPanicked(dead));
+    }
+    match next {
+        Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
+        None => containment::enter_anchor(),
+    }
+
+    // 单 CPU 协作式：此处无并发、无 yield 点。
     // SAFETY: 两个指针分别指向任务记录的 Box（堆地址稳定）与锚点 Box
     // （全局静态内，地址稳定）；to 侧上下文由 new_context 或上一次切换保存。
     unsafe {
         CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
     }
     Ok(())
+}
+
+/// 任务 panic 收尾：在 Core-owned abort 上下文里把已死任务 commit 为
+/// `Exited`、撤销失败组件的 authority，并重新调度。
+///
+/// 由 [`crate::component::containment`] 的 task-abort trampoline 调用——那里
+/// 是干净的 Core 上下文（不在死任务的栈上、不持任何锁）。本函数**永不返回**
+/// 到 panic 的任务：`schedule_next` 把 abort 上下文保存进死任务的 context
+/// box 后切走，而死任务不会再被调度。若 Core 不变式被破坏（例如任务并非
+/// `Running`）则停机，绝不恢复不可信的上下文。
+pub(crate) fn abort_current_task(task: TaskId, owner: ComponentId) -> ! {
+    let _ = schedule_next(Some(task), Some(TaskState::Exited), Some((task, owner)));
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// 从"任务之外"（组件 init / monitor 调用栈）进入调度：把所有 Runnable
@@ -222,20 +269,20 @@ pub fn run() -> Result<(), SchedError> {
     if collect_runnable().is_empty() {
         return Ok(());
     }
-    schedule_next(None, None)
+    schedule_next(None, None, None)
 }
 
 /// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
 pub fn yield_current() -> Result<(), SchedError> {
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
-    schedule_next(Some(current), Some(TaskState::Runnable))
+    schedule_next(Some(current), Some(TaskState::Runnable), None)
 }
 
 /// 当前任务退出：Running → Exited，切换走。**本任务从此不再恢复**——
 /// 若还有 Runnable 任务则它们接管；全部退出后控制权回到锚点。
 pub fn exit_current() -> Result<(), SchedError> {
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
-    schedule_next(Some(current), Some(TaskState::Exited))
+    schedule_next(Some(current), Some(TaskState::Exited), None)
 }
 
 /// 时钟抢占入口（`timer::on_trap` 调用；中断上下文）。

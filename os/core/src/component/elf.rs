@@ -43,11 +43,16 @@ pub(crate) struct Section {
     pub link: usize,
     pub flags: u64,
     pub info: usize,
+    pub align: usize,
 }
 
 impl Section {
+    pub(crate) const fn is_alloc(self) -> bool {
+        self.flags & SHF_ALLOC != 0
+    }
+
     pub(crate) const fn is_alloc_content(self) -> bool {
-        (self.ty == SHT_PROGBITS || self.ty == SHT_NOBITS) && self.flags & SHF_ALLOC != 0
+        (self.ty == SHT_PROGBITS || self.ty == SHT_NOBITS) && self.is_alloc()
     }
 
     /// BSS 段（NOBITS）：无文件数据，放段时零填充。
@@ -200,6 +205,11 @@ impl<'a> ElfObject<'a> {
                 continue;
             }
             let target = self.section(section.info)?;
+            // 只有落在已加载（SHF_ALLOC）段上的重定位才需要处理；`.debug_*`
+            // 等元数据段的 RELA 直接跳过，不校验也不应用。
+            if !target.is_alloc() {
+                continue;
+            }
             let _ = self.symbol_count(section.link)?;
             if section.size % rela_size != 0 {
                 return Err(ElfError::UnsupportedFormat);
@@ -328,6 +338,7 @@ fn parse_sections(blob: &[u8], header: ElfHeader) -> Result<Vec<Section>, ElfErr
                 size: u32_at(section_header, 20)? as usize,
                 link: u32_at(section_header, 24)? as usize,
                 info: u32_at(section_header, 28)? as usize,
+                align: u32_at(section_header, 32)? as usize,
             },
             ElfClass::Bits64 => Section {
                 ty: u32_at(section_header, 4)?,
@@ -338,6 +349,8 @@ fn parse_sections(blob: &[u8], header: ElfHeader) -> Result<Vec<Section>, ElfErr
                     .map_err(|_| ElfError::UnsupportedFormat)?,
                 link: u32_at(section_header, 40)? as usize,
                 info: u32_at(section_header, 44)? as usize,
+                align: usize::try_from(u64_at(section_header, 48)?)
+                    .map_err(|_| ElfError::UnsupportedFormat)?,
             },
         };
         if section.ty != SHT_NOBITS {
@@ -699,6 +712,21 @@ mod tests {
     }
 
     #[test]
+    fn section_alignment_is_parsed() {
+        // ELF64：.text 的 sh_addralign 位于 shdr +48
+        let mut blob = build_elf64();
+        patch(&mut blob, 64 + 64 + 48, &le64(8));
+        let object = ElfObject::parse(leak(blob)).expect("parse elf64");
+        assert_eq!(object.sections()[1].align, 8);
+
+        // ELF32：.text 的 sh_addralign 位于 shdr +32
+        let mut blob = build_elf32();
+        patch(&mut blob, 52 + 40 + 32, &le32(2));
+        let object = ElfObject::parse(leak(blob)).expect("parse elf32");
+        assert_eq!(object.sections()[1].align, 2);
+    }
+
+    #[test]
     fn real_kcomp_parses_as_elf64() {
         let kcomp = include_bytes!(concat!(env!("OUT_DIR"), "/core_test.kcomp"));
         let object = ElfObject::parse(kcomp).expect("parse real core_test.kcomp");
@@ -843,6 +871,19 @@ mod tests {
         patch(&mut blob, 64 + 256 + 44, &le32(5));
         let object = ElfObject::parse(leak(blob)).expect("parse ok");
         assert_eq!(object.relocations(), Err(ElfError::UnsupportedFormat));
+    }
+
+    #[test]
+    fn relocations_targeting_non_alloc_section_are_skipped() {
+        let mut blob = build_elf64();
+        // 清掉 .text（shndx 1）的 SHF_ALLOC：flags 位于 64 位 shdr +8
+        patch(&mut blob, 64 + 64 + 8, &le64(0));
+        let object = ElfObject::parse(leak(blob)).expect("parse ok");
+        assert!(!object.sections()[1].is_alloc());
+        assert!(
+            object.relocations().expect("relocations parse").is_empty(),
+            "target 非 ALLOC 的 RELA 必须整段跳过"
+        );
     }
 
     #[test]

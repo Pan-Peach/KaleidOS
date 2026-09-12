@@ -28,6 +28,8 @@ ARCH_CONF = {
 CASES = (
     ("mapping", None),
     ("context-switch", None),
+    ("panic-containment", None),
+    ("task-panic", None),
     ("illegal-instruction", 2),
     ("load-fault", 13),
     ("store-readonly", 15),

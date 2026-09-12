@@ -6,7 +6,8 @@
 //! kpkg manifest requires、失败回滚留给真正的 ComponentManager 里程碑。
 
 use crate::component::loader::{self, LoaderError};
-use crate::component::{ComponentId, failure, registry};
+use crate::component::{ComponentId, containment, failure, registry};
+use crate::task::TaskId;
 use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,11 @@ pub enum ComponentLoadError {
     StartFailed,
     /// 组件入口返回非零（`kcomp_init` 失败位图）。
     InitFailed(i32),
+    /// 组件入口 panic 已切回 Core；组件状态由 caller 提交为 Failed。
+    InitPanicked,
+    /// 组件拥有的任务 panic，已由 task-abort 上下文提交为 `Exited`；
+    /// 组件的 authority 由 abort 路径撤销（仅作 reason 语义）。
+    TaskPanicked(TaskId),
 }
 
 /// 当前正在初始化的组件（call_init 期间由 Core 记录）。
@@ -78,13 +84,20 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
     // 入口调用：期间 CURRENT = 本组件（publish / task_create 的身份来源）。
     let previous = *CURRENT.lock();
     *CURRENT.lock() = Some(id);
-    let code = loader::call_init(&comp);
+    let outcome = containment::call_component_init(comp.entry);
     *CURRENT.lock() = previous;
 
-    if code == 0 {
-        Ok(id)
-    } else {
-        failure::fail_component(id, ComponentLoadError::InitFailed(code));
-        Err(ComponentLoadError::InitFailed(code))
+    match outcome {
+        containment::CallOutcome::Returned(0) => Ok(id),
+        containment::CallOutcome::Returned(code) => {
+            let error = ComponentLoadError::InitFailed(code);
+            failure::fail_component(id, error);
+            Err(error)
+        }
+        containment::CallOutcome::Panicked => {
+            let error = ComponentLoadError::InitPanicked;
+            failure::fail_component(id, error);
+            Err(error)
+        }
     }
 }

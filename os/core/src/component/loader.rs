@@ -4,7 +4,7 @@
 //! and linked-address handling live in the selected `arch` backend; this module owns the Core
 //! policy around memory, exports, and component entry points.
 
-use super::elf::{ElfClass, ElfError, ElfObject, Relocation as ElfRelocation};
+use super::elf::{ElfClass, ElfError, ElfObject, Relocation as ElfRelocation, Section};
 use crate::memory;
 use alloc::vec::Vec;
 use arch::ComponentRelocationImpl;
@@ -58,28 +58,10 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     }
 
     let relocations = object.relocations()?;
-    let place_segs: Vec<(usize, usize, usize)> = object
-        .sections()
-        .iter()
-        .enumerate()
-        .filter(|(_, section)| section.is_alloc_content())
-        .map(|(index, section)| (index, section.offset, section.size))
-        .collect();
-    if place_segs.is_empty() {
+    let (image_size, seg_place) = place_alloc_sections(object.sections())?;
+    if seg_place.is_empty() {
         return Err(LoaderError::NoTextSection);
     }
-
-    // 段按序 4 对齐叠加 → (shndx, put_offset)。
-    let mut put = 0usize;
-    let mut seg_place: Vec<(usize, usize)> = Vec::new();
-    for &(index, _, size) in &place_segs {
-        put = put.checked_add(3).ok_or(LoaderError::UnsupportedFormat)? & !3;
-        seg_place.push((index, put));
-        put = put
-            .checked_add(size)
-            .ok_or(LoaderError::UnsupportedFormat)?;
-    }
-    let image_size = put;
 
     let symbol_table = object.symbol_table_index()?;
     let mut entry_offset = None;
@@ -136,10 +118,38 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     })
 }
 
-/// 调用组件入口（insmod 的 init 调用）。返回组件自身的结果码（0 = 成功）。
-pub fn call_init(comp: &LoadedComponent) -> i32 {
-    let init: extern "C" fn() -> i32 = unsafe { core::mem::transmute(comp.entry) };
-    init()
+/// 顶部对齐：只支持 `sh_addralign` ∈ {0,1,2,4,8}（已加载段实测上限 8）；
+/// 更大的值显式失败，绝不静默按更小对齐放置。
+fn align_up(value: usize, align: usize) -> Result<usize, LoaderError> {
+    let mask = match align {
+        0 | 1 => return Ok(value),
+        2 => 1,
+        4 => 3,
+        8 => 7,
+        _ => return Err(LoaderError::UnsupportedFormat),
+    };
+    value
+        .checked_add(mask)
+        .map(|aligned| aligned & !mask)
+        .ok_or(LoaderError::UnsupportedFormat)
+}
+
+/// 依序放置全部 ALLOC 段，每段起点满足自身 `sh_addralign`。
+/// 返回 `(image_size, [(shndx, put_offset)])`。
+fn place_alloc_sections(sections: &[Section]) -> Result<(usize, Vec<(usize, usize)>), LoaderError> {
+    let mut put = 0usize;
+    let mut seg_place = Vec::new();
+    for (index, section) in sections.iter().enumerate() {
+        if !section.is_alloc_content() {
+            continue;
+        }
+        put = align_up(put, section.align)?;
+        seg_place.push((index, put));
+        put = put
+            .checked_add(section.size)
+            .ok_or(LoaderError::UnsupportedFormat)?;
+    }
+    Ok((put, seg_place))
 }
 
 fn apply_relocations(
@@ -177,9 +187,11 @@ fn apply_relocations(
                 .and_then(|address| address.checked_add(symbol_value))
                 .ok_or(LoaderError::UnsupportedFormat)?
         };
+        let target = object.section(relocation.target_section)?;
         let relocation = Relocation {
             target_section: relocation.target_section,
             section_offset: relocation.offset,
+            section_size: target.size,
             image_offset: seg_place
                 .iter()
                 .find(|(index, _)| *index == relocation.target_section)
@@ -301,5 +313,70 @@ mod tests {
         let expected =
             crate::component::export::resolve(b"kcore_console_write_byte").unwrap() as i64;
         assert_eq!(target, expected, "重定位写入的目标必须等于 resolve 地址");
+    }
+
+    // -- 段放置对齐 ---------------------------------------------------------
+
+    const PROGBITS: u32 = 1;
+    const ALLOC: u64 = 0x2;
+
+    fn alloc_section(size: usize, align: usize) -> Section {
+        Section {
+            ty: PROGBITS,
+            offset: 0,
+            size,
+            link: 0,
+            flags: ALLOC,
+            info: 0,
+            align,
+        }
+    }
+
+    #[test]
+    fn align_up_supports_1_2_4_8_and_rejects_larger() {
+        assert_eq!(align_up(0, 1), Ok(0));
+        assert_eq!(align_up(3, 1), Ok(3));
+        assert_eq!(align_up(3, 2), Ok(4));
+        assert_eq!(align_up(3, 4), Ok(4));
+        assert_eq!(align_up(3, 8), Ok(8));
+        assert_eq!(align_up(8, 8), Ok(8));
+        assert_eq!(align_up(9, 8), Ok(16));
+        assert_eq!(align_up(0, 0), Ok(0), "align 0 等同不对齐");
+        assert_eq!(align_up(0, 16), Err(LoaderError::UnsupportedFormat));
+        assert_eq!(align_up(0, 3), Err(LoaderError::UnsupportedFormat));
+    }
+
+    #[test]
+    fn alloc_sections_are_placed_at_their_sh_addralign() {
+        let sections = [
+            alloc_section(3, 1),
+            alloc_section(5, 8),
+            alloc_section(2, 4),
+            alloc_section(1, 2),
+        ];
+        let (image_size, place) = place_alloc_sections(&sections).expect("place sections");
+        assert_eq!(place[0], (0, 0));
+        assert_eq!(place[1], (1, 8), "align 8：3 字节后顶到 8");
+        assert_eq!(place[2], (2, 16), "align 4：8+5=13 顶到 16");
+        assert_eq!(place[3], (3, 18), "align 2：16+2=18 已对齐");
+        assert_eq!(image_size, 19);
+        for (index, offset) in place {
+            assert_eq!(
+                offset % sections[index].align,
+                0,
+                "shndx {index} 起点必须满足自身 sh_addralign"
+            );
+        }
+    }
+
+    #[test]
+    fn non_alloc_sections_are_not_placed() {
+        let mut metadata = alloc_section(4, 8);
+        metadata.flags = 0; // PROGBITS 但非 ALLOC（如 .comment）
+        let sections = [metadata, alloc_section(4, 4)];
+        let (image_size, place) = place_alloc_sections(&sections).expect("place sections");
+        assert_eq!(place.len(), 1);
+        assert_eq!(place[0], (1, 0));
+        assert_eq!(image_size, 4);
     }
 }

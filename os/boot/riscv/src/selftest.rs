@@ -131,6 +131,8 @@ pub fn run(info: &MachineInfo) -> ! {
     match &command[..length] {
         b"mapping" => mapping(),
         b"context-switch" => context_switch(),
+        b"panic-containment" => panic_containment(),
+        b"task-panic" => task_panic(),
         b"illegal-instruction" => illegal_instruction(),
         b"load-fault" => load_fault(),
         b"store-readonly" => store_readonly_fault(),
@@ -138,6 +140,99 @@ pub fn run(info: &MachineInfo) -> ! {
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
         _ => fail("unknown command"),
+    }
+}
+
+fn panic_containment() -> ! {
+    match kernel::component::containment::call_on_isolated_stack(panic_containment_entry) {
+        kernel::component::containment::CallOutcome::Panicked => pass("panic-containment"),
+        kernel::component::containment::CallOutcome::Returned(_) => {
+            fail("component panic returned unexpectedly")
+        }
+    }
+}
+
+extern "C" fn panic_containment_entry() -> i32 {
+    panic!("component panic test");
+}
+
+/// Task-boundary containment ArchTest.
+///
+/// Loads a real scheduler policy provider plus a separate victim component from
+/// the embedded archive, then creates two component-owned tasks directly in the
+/// Core table (white-box: task entries live in the boot image, so the
+/// image-range check in `task::create_task` is intentionally bypassed).  One
+/// task panics; the scheduler's ambient escape guard must redirect it to the
+/// Core abort trampoline, which kills the task, fails the victim component, and
+/// reschedules so the normal task still completes and Core survives.
+fn task_panic() -> ! {
+    // A Ready scheduler policy provider (publishes "scheduler" v1 on init).
+    if kernel::component::load::load_and_start(b"scheduler_rr").is_err() {
+        fail("task-panic: scheduler_rr load failed");
+    }
+    // A separate Ready victim, so failing it does not remove the scheduler.
+    let victim = match kernel::component::load::load_and_start(b"kcomp_smoke") {
+        Ok(id) => id,
+        Err(_) => fail("task-panic: kcomp_smoke load failed"),
+    };
+
+    let (panicking, normal) = {
+        let mut table = kernel::task::get_task_table().lock();
+        let Ok(panicking) = table.create(victim, task_panic_entry as *const () as usize) else {
+            fail("task-panic: panic task create failed");
+        };
+        let Ok(normal) = table.create(victim, task_normal_entry as *const () as usize) else {
+            fail("task-panic: normal task create failed");
+        };
+        if table
+            .transition(panicking, kernel::task::TaskState::Runnable)
+            .is_err()
+            || table
+                .transition(normal, kernel::task::TaskState::Runnable)
+                .is_err()
+        {
+            fail("task-panic: task start failed");
+        }
+        (panicking, normal)
+    };
+
+    // Drive the real scheduler on the anchor.  The panicking task escapes into
+    // the Core abort trampoline; the normal task runs and exits normally.
+    if kernel::sched::run().is_err() {
+        fail("task-panic: scheduler run failed");
+    }
+
+    let (panicking_state, normal_state) = {
+        let table = kernel::task::get_task_table().lock();
+        (
+            table.get(panicking).map(|record| record.state()),
+            table.get(normal).map(|record| record.state()),
+        )
+    };
+    let victim_failed = kernel::component::registry::get_registry()
+        .lock()
+        .get(victim)
+        .map(|record| record.state)
+        == Some(kernel::component::ComponentState::Failed);
+
+    let contained = panicking_state == Some(kernel::task::TaskState::Exited)
+        && normal_state == Some(kernel::task::TaskState::Exited)
+        && victim_failed;
+    if contained {
+        pass("task-panic")
+    } else {
+        fail("task-panic: panic was not contained")
+    }
+}
+
+extern "C" fn task_panic_entry() -> ! {
+    panic!("component task panic");
+}
+
+extern "C" fn task_normal_entry() -> ! {
+    let _ = kernel::sched::exit_current();
+    loop {
+        core::hint::spin_loop();
     }
 }
 

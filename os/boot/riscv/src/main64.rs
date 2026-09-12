@@ -335,6 +335,12 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         let runtime_layout = layout::kernel_layout();
         runtime::init(&runtime_layout, context.reserved[0].base, &context.info)
             .expect("Sv39 runtime VM init failed");
+        // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
+        let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
+        let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
+        let pkg =
+            unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
+        kernel::component::store::init(pkg);
         crate::selftest::run(&context.info);
     }
 
@@ -457,6 +463,24 @@ impl core::fmt::Write for DirectWriter {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    // 组件 panic：先打印一行诊断（直接 SBI 字节输出，绕过 printk 锁、无分配、
+    // 无锁），再逃逸到 Core 保存的上下文。诊断信息（message/location）只有
+    // boot panic handler 拿得到，所以打印必须在这里。
+    if let Some(escape) = kernel::component::containment::active_escape() {
+        let mut writer = DirectWriter;
+        let message = _info.message();
+        let _ = kernel::component::containment::write_escape_line(
+            &mut writer,
+            escape,
+            _info.location(),
+            Some(&message),
+        );
+    }
+    if kernel::component::panic_escape() {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     // 绕过 print（panic 时其锁可能已损坏），直接 SBI 紧急输出。
     let mut writer = DirectWriter;
     let _ = core::fmt::write(&mut writer, format_args!("\nPANIC: {}\n", _info));

@@ -4,6 +4,7 @@
 //! 具体设备 shutdown 顺序由组件/驱动决定，不由 ResourceDomain 写死。
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
+pub mod containment;
 mod elf;
 pub mod export;
 pub mod failure;
@@ -13,6 +14,7 @@ pub mod loader;
 pub mod registry;
 pub mod store;
 
+pub use containment::panic_escape;
 pub use failure::fail_component;
 
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。

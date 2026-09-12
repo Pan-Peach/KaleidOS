@@ -15,6 +15,9 @@ pub struct Relocation {
     pub target_section: usize,
     /// Offset within the target object section.
     pub section_offset: usize,
+    /// Size in bytes of the target object section; relocation writes must
+    /// stay inside `[section_offset, section_offset + section_size)`.
+    pub section_size: usize,
     /// Offset within the placed component image.
     pub image_offset: usize,
     pub kind: u32,

@@ -127,6 +127,8 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::ResolveFailed => Errno::ENOENT,
             ComponentLoadError::StartFailed => Errno::EIO,
             ComponentLoadError::InitFailed(_) => Errno::EIO,
+            ComponentLoadError::InitPanicked => Errno::EIO,
+            ComponentLoadError::TaskPanicked(_) => Errno::EIO,
         }
     }
 }

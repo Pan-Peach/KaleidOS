@@ -92,6 +92,7 @@ pub fn init(
 
     task::init();
     sched::init();
+    component::containment::init();
     #[cfg(feature = "preempt")]
     timer::init_preempt(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
     #[cfg(not(feature = "preempt"))]

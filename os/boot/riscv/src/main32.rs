@@ -178,6 +178,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         if let Err(error) = kernel::init(&info, &reserved) {
             panic!("core init failed: {}", error);
         }
+        // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
+        let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
+        let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
+        kernel::component::store::init(pkg);
         crate::selftest::run(&info);
     }
 
@@ -264,6 +268,23 @@ impl core::fmt::Write for DirectWriter {
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // 组件 panic：先打印一行诊断（直接 SBI 字节输出，绕过 printk 锁、无分配、
+    // 无锁），再逃逸到 Core 保存的上下文。
+    if let Some(escape) = kernel::component::containment::active_escape() {
+        let mut writer = DirectWriter;
+        let message = info.message();
+        let _ = kernel::component::containment::write_escape_line(
+            &mut writer,
+            escape,
+            info.location(),
+            Some(&message),
+        );
+    }
+    if kernel::component::panic_escape() {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     let mut writer = DirectWriter;
     let _ = core::fmt::write(&mut writer, format_args!("\nPANIC: {}\n", info));
     loop {
