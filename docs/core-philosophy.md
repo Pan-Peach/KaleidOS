@@ -3,6 +3,16 @@
 本文档解释 KaleidOS 最重要的设计原则：**什么状态属于 Core、什么属于 Component，以及为什么**。
 这是整个仓库最不可违背的部分 —— 代码可以重写，哲学不要漂移。
 
+## 0. 总原则：少即是多
+
+KaleidOS 的目标不是构造一个"功能完整的内核"，而是构造一个**足够小、足够稳定、能够支撑多种系统形态的 Core**。
+
+> Core 做得越少，KaleidOS 能形成的系统形态越多。
+
+因此判断某项能力是否应该进入 Core 时，默认答案应当是：**如果它可以安全、清晰地外置，就不应该放进 Core。** Core 不应该因为"传统内核一般这么做"而拥有某项功能，也不应该为了方便某一个部署形态，把策略永久固化在最底层。
+
+KaleidOS 的适应性来自：**稳定且极小的机制 + 可替换的上层策略与组件。** Core 的价值不是"什么都能做"，而是提供那些**无法再向外推的最小机制和边界**。
+
 ## 1. 一句话原则
 
 > Core 保存真实且不可撒谎的系统状态，并拥有**为保存这份真相、推进 Core 自身资源/生命周期操作所必需的机制**；Component 实现可替换的算法、策略、协议和高级 OS 语义。
@@ -24,6 +34,12 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 > 策略可以提议任何事，但只有 Core 验证通过后，真实资源才会被改动。
 >
 > 注意：这条只适用于**可替换的策略组件**（如调度器）。物理帧分配是 Core 内部机制，不是"提议"的策略 —— 见 §3 分配示例。
+
+更完整地说，Core 的职责是系统中的 **authority / resource / isolation / lifetime arbiter**：它回答"谁拥有这个资源、谁可以访问、当前 authority 是否仍有效、资源如何被授予/转移/撤销、一个 execution domain 能看见哪些内存、IRQ / DMA / MMIO 的硬件边界如何建立、一个组件死亡后哪些资源必须失效、一个任务如何被切换、一个 fault 应该终止哪个 execution domain"。
+
+而 Core **不决定**：用什么调度策略；网络栈 / 文件系统如何设计；驱动用什么框架；服务如何组合；POSIX 如何实现；某个组件采用什么内部数据结构；某个系统必须采用宏内核、微内核还是用户态服务形态。
+
+> **Core provides mechanism, not policy.** 以调度为例：Core 提供 context switch / task state / timer / runnable mechanism / primitive scheduling hooks；RR / priority / EDF / 自定义策略都属于 Scheduler 组件（见 §3 与 `component-model.md`）。
 
 ## 2. 状态归属：谁存什么
 
@@ -111,6 +127,24 @@ Core 的分配器：
 ### 工程含义
 
 
+## 3.5 不是微内核，也不是宏内核：信任等级决定边界
+
+KaleidOS 不追求某种纯粹的内核教条，也不再要求"Core 中绝不能出现任何看起来像宏内核的东西"。真正应该坚持的是：**不同信任等级使用不同边界。**
+
+如果一个组件已经被完全信任，强迫它经过昂贵的 capability / syscall / copy / validation 路径，并不会让系统更"纯洁"，反而会破坏 KaleidOS 的适应性。因此允许至少三种执行 / 信任域：
+
+| 域 | 特权级 | 地址空间 | 信任模型 |
+|---|---|---|---|
+| KernelNative | S | 共享内核 AS | 完全受信任；同特权级直接 native call，零切换成本 |
+| IsolatedNative | S | 私有 AS | 半信任；native 性能 + 条件性故障隔离（可选实验，非里程碑） |
+| U-mode（SandboxedNative） | U | 私有 AS | 不信任；syscall 边界，硬件强制隔离 |
+
+**部署形态本身就是安全策略的一部分**：不信任它，就不要部署成 KernelNative。Core 不应该靠"所有组件都经过同样重的安全机制"来解决信任问题。KernelNative 的安全边界不是"防御恶意组件"，而是 API 边界、ownership、lifetime、authority bookkeeping 与可撤销资源身份——它仍可能通过裸指针、非法内存写、UB 破坏整个 Core。
+
+**同一语义、不同传输**：allocate / map / irq / log / interface-call 这些语义可以复用，但传输方式必须分离——KernelNative 用窄 `extern "C"` ABI，IsolatedNative 走受控边界，U-mode 用独立的 syscall wire ABI。不要因为三个域最终都做"同一件事"，就强行让它们共享同一个底层 ABI。
+
+（执行域与 Handle→Lease 细节见 `driver-model.md`；AddressSpace 注册表见 `component-model.md`。）
+
 ## 4. Authority ≠ Interface
 
 不要把所有东西都叫 capability。两个概念必须分开：
@@ -126,6 +160,19 @@ TaskHandle  TimerHandle AddressSpaceHandle
 
 **硬性要求**：驱动永远不应该拿到裸物理地址、裸 IRQ 号、裸 DMA 指针或任意 MMIO 指针。
 它应该拿到 `MmioHandle`、`IrqHandle`、`DmaHandle` —— 通过 handle 间接访问，Core 在中间校验。
+
+#### Handle 的真正意义：control plane，不是内存屏障
+
+即使 KernelNative 可以接触裸地址，Handle 仍然有存在价值，但必须明确：**Handle 在 KernelNative 中不是内存安全屏障。** 如果一个受信组件已经拿到裸 MMIO pointer，撤销 handle 并不能神奇地让已泄漏的裸 pointer 停止工作。
+
+Handle 的意义在 **control plane**：resource identity / ownership / authority / generation / lifetime / revocation / accounting / cleanup。它表达的是"你现在被授予了对这个资源的 authority"，而不是"CPU 从物理上绝不允许你绕过我"。因此 KernelNative 可以有这样的分层：
+
+```text
+control plane:  handle / authority
+fast path:      经 Core 校验一次后派生的 native pointer / mapping（typed Lease）
+```
+
+Handle 负责：谁拥有设备；资源是否仍有效；teardown 时撤销谁；generation 防止 stale handle；restart 后旧 authority 失效；由 Core 统一管理资源生命周期。（`smoltcp` 式的直觉：handle 是稳定的身份与管理引用，而不是对象本身。）
 
 ### Interface —— "你能提供什么"
 
@@ -152,11 +199,18 @@ BlockDevice（Interface）
 
 ## 5. 什么应该进 Core（判断标准）
 
-新增任何东西进 Core 之前，问三个问题：
+新增任何东西进 Core 之前，问这组问题：
 
 1. **它是不是真相？**（对象存在性 / 状态 / 所有权 / 生命周期 —— 是）
-2. **一个错误的 Component 能否通过它破坏全局不变式？**（能 → 考虑收回 Core；不能 → 留在组件层）
-3. **它是不是"基础功能"？**（是 → 警惕！"基础功能"恰恰容易误入 Core。Core 收的是 authority，不是功能）
+2. **它是否必须拥有系统级 authority 才能正确工作？**
+3. **把它做成 component / library，会不会破坏安全边界？**
+4. **它是 mechanism，还是 policy？**
+5. **不同 KaleidOS 部署是否可能希望替换它？**
+6. **它是否只服务某一个具体系统形态？**
+7. **它进入 Core 后，会不会迫使其它 domain 也接受这个设计？**
+8. **它能否通过一个更小的 primitive 暴露给上层？** 是不是因为"Linux / 传统 OS 都这么做"才想放进来？
+
+如果最后的答案是"它只是方便放 Core"，那通常就不应该放。特别警惕"它是不是基础功能？"——"基础功能"恰恰最容易误入 Core：**Core 收的是 authority，不是功能**。
 
 核心判据（litmus test）：
 
@@ -214,9 +268,45 @@ Core 校验自动退化为 no-op，Core 不需要写任何 `#[cfg]`（host 测�
 3. **它能否真正 stop / unload？**（有明确的停止/卸载路径）
 4. **它的状态是否 loss-tolerant / 可重建？**（丢失后能重建到 safe usable state）
 
-> 组件失败 = **逻辑死亡、物理驻留**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例（逻辑重启）。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain（Wasm / 地址空间）里程碑。目标上暂无 panic recovery（panic=abort），phase 1 用 Result 传播错误。
+> 组件失败 = **逻辑死亡、物理驻留**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例（逻辑重启）。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain（Wasm / 地址空间）里程碑。panic 契约见 §5.8：phase 1 已实现 init 边界与任务边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，非 unwinding）；但这**不等于** fault isolation。
+
+## 5.7 最小性不是代码高尔夫
+
+"Core 越小越好"不是"代码越少越好"的代码高尔夫。真正含义是：**Core 只保留那些必须拥有全局 authority 才能正确完成的机制。** 典型的 Core 内容：
+
+```text
+resource authority        handle lifecycle          memory ownership
+address-space primitive   task / context primitive  interrupt primitive
+timer primitive           component loader          component lifecycle
+interface registry primitive   fault routing        machine capability
+```
+
+可以独立选择策略的东西，尽量外置（见 §0）。不塞进 Core 的典型：某个调度算法、文件系统格式、网络协议栈、设备协议、POSIX 语义、ELF loader、Wasm runtime。
+
+## 5.8 失败与 panic 的诚实契约
+
+Phase 1 中，KernelNative component 的**普通失败**与**panic**必须区分：
+
+- **普通失败**（可恢复的 component failure）：`Result` / status code / `kcomp_init() != 0`；
+- **意外 panic**：不要假装拥有不存在的恢复能力。如果组件仍然直接跑在 Core 栈上（`Core stack → kcomp_init() → panic`），`panic=abort` 不可能凭空形成 component recovery boundary。
+
+因此诚实的契约是：**expected failure → return error；unexpected panic → 默认 fatal。** 若要"panic → 杀掉 instance → Core 继续"，组件必须先拥有一个**可独立丢弃的 execution context**（独立 task / 独立 stack / component trampoline / instance identity），panic handler 再进入 Core 的 abort 路径。
+
+Phase 1 **已实现** init 边界与任务边界的协作式 containment：组件跑在 Core 拥有的独立栈上，panic 时先打印诊断、再 stack-switch 回 Core 上下文，由 Core 把该 task / instance 标记失败并重新调度（逻辑死亡；不 unwind）。**但必须明确：panic recovery ≠ fault isolation。** KernelNative 组件仍可能写坏 Core 内存、产生 UB、持有裸 pointer、在持锁状态死亡、破坏共享数据结构——因此 KernelNative 的 panic recovery 是 **cooperative failure containment**，不是对抗性隔离；真正的 memory fault containment 交给 `IsolatedNative` / U-mode。
+
+失败 teardown 也必须以**资源生命周期**为核心（而非 `free(stack)` 就结束），并且 `CPU isolation ≠ DMA isolation`——细节见 `component-model.md` §3.3 与 `driver-model.md`。
 
 ## 6. 由哲学推导出的工程约束
 
+- **默认外置**：新能力默认不进 Core；只有"无法安全外置的 authority 机制"才进（§0 / §5）。
+- **显式 authority**：涉及 authority 的 Core 操作都显式接收 `RequestContext`（谁在请求 / 属于哪个 instance / 哪个 domain / 什么 rights），不偷偷读 `current_task()` 或全局 caller（见 `driver-model.md`）。
+- **能力退化可见**：MMU / IOMMU / 特权级等平台能力差异必须显式可见，不能伪装（见 `architecture.md`）。
+- **契约不绑 ABI / 传输**：Interface 与 Handle 和"怎么调用"解耦；组件边界使用稳定 C ABI，Rust ABI 永不成为组件 ABI（见 `architecture.md`）。
+- **组件间只走 Interface registry**：禁止 flat ELF symbol 互链，组件间交互经 typed interface + explicit authority（见 `component-model.md` §2.1）。
+- **失败可推理**：普通失败用 Result；panic 走协作式 containment；teardown 按资源生命周期回收（§5.8）。
 
 ## 7. 哲学来源（详见 references.md）
+
+## 8. 最核心的一句话
+
+> **KaleidOS 要统一的不是"系统长什么样"，而是 authority、resource identity、lifetime、execution primitives、isolation primitives、component lifecycle、explicit interfaces。** 它提供一个足够小的权力与资源核心，使不同信任模型、执行模型、策略与服务能在同一套基础机制之上自由组合——**少即是多。**

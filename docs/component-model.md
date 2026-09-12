@@ -2,7 +2,7 @@
 
 ## 1. Component 是什么
 
-Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而是一个完整的可管理单元：
+Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而是 **lifecycle 与 authority 的同一单位（unit of lifecycle AND authority）**：一个组件实例代表它的 code、execution、authority、resources、interfaces、lifetime 与 failure state。因此它是一个完整的可管理单元：
 
 - 消费（requires）和提供（provides）Interface；
 - 拥有 ResourceDomain（Core 维护的资源集合）；
@@ -10,6 +10,8 @@ Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而�
 - 可以依赖其他 Component；
 - 可以包含子 Component（Composite，见 §7）；
 - 可以被替换 / 重启 / 恢复。
+
+一个实例因此可以拥有：tasks、stacks、handles、memory mappings、irq bindings、DMA leases、interfaces、device ownership；失败时 Core 能按实例（per-instance）拆除它们（见 §3.3 与 §4.9）。
 
 **组件 ≠ crate**：第一阶段里，一个只有几十行的小模块就是普通 Rust module，不需要为架构图强行建 crate。组件是概念边界，crate 是实现选择。
 
@@ -60,6 +62,48 @@ Component → Component     = Interface binding（interface.rs）——禁止 fl
 - 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
   call）不改 binding 数据模型。完整 live binding indirection 与 compatible
   version range 属下一阶段。
+
+### 2.2 `.kcomp` = 链接后的组件程序（目标：step 2-3）
+
+`.kcomp` 不是 rustc 的 `.o`，而是**链接后的组件程序（linked component program）**。运行时动态加载保持不变，但构建管线是：
+
+```text
+component wrapper
+  + third-party crates
+  + Component SDK / CRT
+  + reachable Rust support
+      → staticlib / archive
+      → selective extraction   （只抽真正可达的成员）
+      → section GC             （丢弃未引用 section）
+      → strip                  （去符号 / 元数据）
+      → partial link
+      → .kcomp
+```
+
+`.kcomp` 内部的符号边界是契约：
+
+| | 内容 |
+|---|---|
+| DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_init` |
+| UNDEFINED | 只允许显式放行的 `kcore_*` imports（对齐 §2.1 的 export 白名单） |
+
+- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_write`、`kcore_irq_*`、`kcore_map_*` ...）。
+- **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
+- **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
+
+> 现状（step 1）：组件仍由 `rustc --emit=obj` 产出裸对象；裸 `.o` 无法携带 third-party `no_std` 依赖，这正是 step 2-3 要换成上述管线的原因。（组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
+
+### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
+
+Core heap 是共享的（§3），但组件不裸调 Core 导出，中间有 SDK adapter 层：
+
+```text
+GlobalAlloc   → component allocator adapter → kcore_heap_alloc / kcore_heap_dealloc → Core heap
+log crate     → component-local logger      → kcore_log_write                        → final sink
+panic handler → component panic adapter     → kcore_log_write + 边界提交失败（见 §5）  → —
+```
+
+> 这不是"每个组件自带一个堆"：每个组件有自己的 adapter（满足 Rust 类型/宏契约），但**底层资源仍由 Core 统一管理**。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
@@ -208,6 +252,28 @@ revoke_component_resources(id) —— 收回 authority-backed resources（handle
 
 > 强制隔离回收的是 **authority-backed 资源（handle）**。堆内存的清理走正常 Drop 路径；完整的内存回收属于 ExecutionDomain 的职责（见 §4）——phase 1 的 KernelNative 组件不承诺内存回收。
 
+#### Teardown 是资源生命周期问题，不是 "free(stack) + done"
+
+正确的拆除顺序以**资源生命周期**为中心：
+
+```text
+stop new work
+  → quiesce / reset / detach device
+  → mask IRQ
+  → resolve outstanding interrupt claims
+  → stop tasks
+  → remove interfaces
+  → unmap memory
+  → wait / quarantine outstanding DMA
+  → release resources
+  → revoke handles
+  → mark Failed / Destroyed
+```
+
+> 两条硬原则：
+> 1. **任何仍可能被 CPU 或设备访问的物理内存，都不得重新分配**（否则就是 UAF / 数据破坏）。
+> 2. **CPU 隔离 ≠ DMA 隔离**：即使 CPU 侧已停止访问、任务已停，设备 DMA 仍可能写入该内存——必须先 quiesce / wait / quarantine outstanding DMA，才能回收。
+
 **意义**：restart、replace、fault recovery 全部建立在"Core 最终能收回 ResourceDomain"这一保证上。
 
 ## 4. ExecutionDomain —— 这里才真的有 enum
@@ -246,6 +312,7 @@ pub enum ExecutionKind {
     IsolatedNative,   // 可选实验（S + 私有 AS），非里程碑
     // future: SandboxedNative  —— U + 私有 AS，未来的硬件强制边界
 }
+```
 
 真正 runtime：
 
@@ -285,6 +352,10 @@ impl ComponentManager {
 是 `Declared → Resolved → Ready`：`resolve()` 已落地（Declared → Resolved，
 语义 = requires 全部绑定成功），`Starting` 属全量生命周期词汇表但未接线——
 留给 ComponentManager 的异步初始化阶段。当前 unload 只删记录、不释放段内存。）
+
+> **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
+>
+> 规则：不要因为有了组件模型就把一切都组件化。Component 对应真正具备 lifecycle / identity / authority / execution / service-role 的实体（见 §1）。
 
 ### 4.3 KernelNative 具体是什么
 
@@ -491,7 +562,20 @@ Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destr
 | Destroyed | 生命周期结束 |
 | Failed | 运行过程中失败（可触发恢复流程） |
 
-> **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。目标上暂无 panic recovery（panic=abort），phase 1 用 Result 传播错误。
+> **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
+
+### 5.1 失败谱系：Result 失败 vs panic（不虚构不存在的 recovery）
+
+| 类别 | 表达 | 语义 |
+|---|---|---|
+| 普通失败 | `Result` / status code / `kcomp_init() != 0` | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
+| 意外 panic | `panic!`（`panic=abort`） | 进程级 abort，不能凭空转成组件 recovery boundary |
+
+> `panic=abort` 下，Core 栈上的普通 panic 不可能"魔法般"变成组件 recovery boundary。
+
+**当前（phase 1）已有 init 边界 + task 边界的协作式 containment**：组件跑在 Core-owned 独立栈上；panic 时 Core 打印诊断，然后 stack-switch 回 Core 上下文，把该 task / instance 提交为 Failed（逻辑死亡，**不做 Rust unwinding**；内存回收仍 deferred）。
+
+**panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存、制造 UB、持有裸指针、带锁死亡。真正的 memory-fault containment 是 IsolatedNative / U-mode 的职责（见 §4.4 与 `driver-model.md`）。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 

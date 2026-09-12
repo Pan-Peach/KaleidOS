@@ -20,9 +20,13 @@
 - mapping / lease 提供 **scoped fast path**：稳态访问不经过 Core。
 - 撤销完成 ≠ generation 变了；必须在"用户与设备静默、相关翻译失效"之后才算完成。
 
-### 1.1 关于裸地址与裸指针
+### 1.1 关于裸地址、裸指针与 Handle 的真实含义
 
 组件不能通过知道一个裸地址来获得 authority；裸指针只允许存在于 Core 派生并持有 provenance 的 typed Lease 实现内部。
+
+**Handle 属于控制面（control plane），不是快路面（fast path）**：它承载资源身份 / 所有权 / authority / generation / 生命周期 / 撤销 / 记账 / 清理。快路面是**经 Core 校验一次的原生指针 / 映射**。
+
+在 KernelNative，**Handle 不是内存安全屏障**：若受信组件已持有裸 MMIO 指针，撤销 handle 并不能魔法般阻止那个已泄漏的指针继续生效。Handle 表达的是"Core 授予你对这个资源有 authority"，**不是**"CPU 在物理上禁止你绕过我"。硬件层面的阻止只属于 SandboxedNative（见 §2、§3）。
 
 ### 1.2 关于数据面
 
@@ -48,11 +52,21 @@ Core 与组件共享**一个 Core heap**，不做 per-component 内存记账；�
 - **SandboxedNative 才是未来的强制边界**：U 模式 + 私有 AS + Handle 校验，由硬件完成强制。
 - **Wasm 更远**，只作为 Component 的执行后端之一。
 
+**部署形态本身就是安全策略，不是 Core 的统一强制。** 若不信任一个组件，就不要把它部署成 KernelNative。三个信任 / 执行域对应三种代价：
+
+| 域 | 信任假设 | 代价 | 隔离机制 |
+|---|---|---|---|
+| KernelNative | 受信 | 最快 | 无（逻辑 authority） |
+| IsolatedNative(S) | 半受信 | 原生性能 | CPU 故障隔离 |
+| SandboxedNative(U) | 不可信 | syscall / 切换开销 | 硬件强制（Handle + MMU + 特权级） |
+
+Core 不应通过"把每个组件都塞进同一套重型安全机制"来解决信任问题——**部署形态的选择权（与责任）在系统组合者**。
+
 > 执行域只决定"在哪里跑、谁来强制"；契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核 / 微内核 / 混合形态。
 
 ## 3. Handle → Lease（authority vs execution capability）
 
-**Handle = authority；Lease = execution capability。**
+**Handle = authority；Lease = execution capability。** 更准确地说：**Handle 在控制面**（身份 / 所有权 / authority / generation / 生命周期 / 撤销 / 记账 / 清理），**Lease 是快路面**（经 Core 校验一次的原生指针 / 映射）。Handle 不承诺"CPU 物理禁止绕过"（见 §1.1）。
 
 ```text
 MmioHandle（authority）
@@ -215,6 +229,16 @@ kcore_irq_release(...)
 
 ### 6.3 未来 syscall 线格式（SandboxedNative / Wasm 方向）
 
+**三个域不得因为"做同一件事"就共用同一个底层 ABI。** 语义（allocate / map / irq / log / interface-call）可以复用，**transport 必须分开**：
+
+| 域 | transport | 形态 |
+|---|---|---|
+| KernelNative | 直接调用 | narrow `extern "C"` C ABI（见 §6.2） |
+| IsolatedNative | 受控边界 | 私有 AS 边界 + 受控入口 |
+| SandboxedNative(U) | syscall | 自有稳定 wire ABI |
+
+**不要**把 KernelNative 的 Rust/C 接口原样搬到 U-mode 复用——上方 `a7/a0..a5` 线格式就是 U-mode 专属的稳定 ABI。
+
 ```text
 a7 = op
 a0..a5 = args
@@ -293,6 +317,7 @@ alloc → device_addr → KernelNative 用 lease 指针
 - **不 fork `rcore-os/virtio-drivers`**：在 **virtio 驱动组件内部**实现其 `Hal`（组件内 `compat/virtio.rs` 模块），用 `MmioLease` + `DmaLease` + IRQ 轮询事件接入。
 - **IsolatedNative(S) 不做**；未来要真正隔离时把驱动搬进 SandboxedNative(U)——主要换 transport / loader，不重写驱动逻辑。
 - **第三方 crate 兼容性实测结论**：`virtio-drivers 0.13.0` 的**类型 / 解码面**能直接编进 no_std rv64/rv32 的 `.kcomp`（不需要 alloc，ET_REL 只剩 `kcore_*` UND）；但 `MmioTransport` 需要一个裸的 `NonNull<VirtIOHeader>` 基址、`Hal` 需要 DMA 与地址翻译——这两件正是 `MmioLease` / `DmaLease` 要补的 Core 能力。**真正的 virtio 驱动组件要等 step 1–3。**
+- **无共享 Rust runtime**：每个 `.kcomp` **私有携带自己的 Rust 支撑**。不建立共享 Rust runtime 符号袋，不提供共享 alloc / 共享 fmt 供组件链接；组件可链接的外部符号只有 Core 白名单 `kcore_*`（见 §4：第三方库的兼容适配作为该驱动组件内部模块）。
 
 ### 9.1 驱动组件如何挂载（就是组件间依赖）
 
@@ -324,9 +349,20 @@ runtime:
 
 ## 11. 已知限制
 
+- **CPU 隔离 ≠ DMA 隔离**：即使组件拥有私有地址空间，若设备具 bus-master DMA 且平台无 IOMMU，**页表拦不住设备**。因此不得以"我们有独立地址空间"为由宣称"完整安全隔离"——那只是 CPU 侧隔离。设备侧隔离要么靠 IOMMU（阶段 5），要么明文接受不做。
 - **无 IOMMU**：DMA 只能做偶然故障隔离，无法阻止恶意 / 失控设备越界。
 - **KernelNative 撤销是协作式**：Core 能撤销 authority，但不能回收正在死循环的受信代码。
 - **协作调度下，非协作 / 死循环域无法被夺回控制**；完整夺回依赖 timer 抢占 / 特权级强制（阶段 5）。
+
+**能力诚实（capability honesty）**：KaleidOS 必须按轴显式描述平台能力，**不得用"可适配"掩盖硬件限制**。每个平台至少声明：
+
+| 轴 | 取值 |
+|---|---|
+| CPU 内存隔离 | yes / no |
+| DMA 隔离 | yes / no |
+| 特权隔离 | yes / no |
+
+执行域承诺的强制程度必须**落在平台真实能力之内**（例如无 IOMMU 时，SandboxedNative 的承诺只覆盖 CPU 侧，不含设备侧）。
 
 ## 12. 待定 / 开放问题
 

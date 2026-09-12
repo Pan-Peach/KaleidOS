@@ -196,6 +196,20 @@ Core 面向 `MemoryDomain`、region、ownership 和 permission；它不应该知
 等 protection backend。NoMMU 不是一种特殊的页表，也不承诺具备 page fault、
 COW 或任意虚拟地址空间等 MMU 语义。
 
+**MMU / NoMMU 是平台能力，不是哲学分叉。** Core 不因平台能力缺失而拒绝平台，而是
+允许能力降级，并把差异统一到 `AddressSpaceManager` / `MappingSource` 抽象
+（map / unmap / domain / protection），backend 可以是 RV64+Sv39、RV32+Sv32 或 NoMMU。
+能力差异必须显式可见、绝不假装：
+
+| 平台能力 | 可承诺的隔离 |
+|---|---|
+| MMU + IOMMU | 强隔离（CPU + DMA 均受控） |
+| MMU，无 IOMMU | CPU 隔离；DMA 受限（需信任或额外约束） |
+| NoMMU | 基于信任的 native domain，无硬件强制 |
+
+每一处能力差异都必须在 Profile / 机器描述中显式呈现，而不是在 Core 里用同一套假设
+抹平（差异如何暴露给驱动见 `driver-model.md`）。
+
 当前 RISC-V 已提供 RV64/Sv39 与 RV32/Sv32 backend，但它们只是 address-translation
 实现，不是 KaleidOS 的内存模型。Core 公共路径使用 typed handle、virtual region、
 permission 等抽象；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
@@ -243,6 +257,12 @@ arch/backend 内部。具体映射、撤销和地址空间激活接口随实现�
 > **Interface 是语义，传输（transport）是绑定策略。**
 > 第一阶段用 Rust trait + direct call；未来可以换成 IPC stub 或 Wasm host call。
 > 因此接口描述**永远不要**绑定 native Rust ABI 细节。
+
+**Rust ABI 不得成为 Component ABI。** 边界处禁止出现：Rust mangled symbol、
+Rust trait-object ABI、`fmt::Arguments`、`PanicInfo`、allocator 内部结构、
+Rust enum layout、编译器私有 runtime 结构。KernelNative 边界使用窄而稳定的
+C ABI：`extern "C"`、定宽整数、pointer + length、显式 status code、opaque handle、
+versioned struct（Core Export ABI 即此形状）；U-mode 另行定义自己的 syscall wire ABI。
 
 ### 两条机制边界（Core ABI ≠ Interface Registry）
 
@@ -328,7 +348,42 @@ Component
 - **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative` / `Wasm`）。`ComponentRecord` 只记轻量 `execution_kind`，真正的 runtime（`LoadedComponent` + `ExecutionDomain`）放 `ComponentRuntime`，由 `ComponentManager` 串起来（见 component-model.md §4）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
   - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / Handle→Lease / 撤销不变式见 `driver-model.md`。
 
-> 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"。契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核、微内核或混合形态。
+**三个组件信任域（Trust Domain）与 ABI 分离：**
+
+| 域 | 特权级 | 地址空间 | 信任假设 | 边界 ABI |
+|---|---|---|---|---|
+| KernelNative | S-mode | 共享内核 AS | 完全可信 | 窄稳定 `extern "C"` C ABI |
+| IsolatedNative | S-mode | 私有 AS | 半可信 | 受控边界 |
+| SandboxedNative | U-mode | 私有 AS | 不可信 | syscall wire 格式 |
+
+- 同一语义操作（allocate / map / irq / log / interface-call）在三个域中是同一件事，
+  但 **transport / ABI 必须分离**：不能因为"做的是同一件事"就强推同一套底层 ABI；
+- 因此 KaleidOS **既不"必须是微内核"、也不"必须是宏内核"**：不同信任级使用不同边界，
+  同一组件图按需组合成宏内核、微内核或混合形态。
+
+**部署形态本身就是安全策略，Core 不统一强制。** 若不信任一个组件，就不要把它部署成
+`KernelNative`——而不是让 Core 把每个组件都塞进同等重量的机制。信任问题首先由"选择
+哪种执行域"回答，Core 不为统一性牺牲部署自由度。
+
+**AddressSpace 不是普通驱动 capability。** 驱动不应取得任意 `AddressSpaceHandle`
+后到处映射；它只能请求"把这个资源映射进请求者自己的域"。目标地址空间由
+`RequestContext` / execution domain 推导，`AddressSpaceHandle` 保留给 Core /
+domain-manager / lifecycle-manager（driver 视角见 `driver-model.md`）：
+
+```text
+driver   request: map(resource)
+           │
+           ▼
+Core     解析调用者的 execution domain（推导目标 AS）
+           │
+           ▼
+Core     验证 authority（资源属于该域？权限足够？）
+           │
+           ▼
+Core     映射进调用者自己的 domain（记录 ownership / trace）
+```
+
+> 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"：契约（Interface + Handle）与执行域解耦，才能在同一组件图上自由选择信任边界。
 
 ## 7. OS Profile
 
