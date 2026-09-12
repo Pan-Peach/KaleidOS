@@ -50,7 +50,7 @@
 
 **借鉴什么**：
 - **typed authority**：设备和执行域授权有明确类型，不能把一种 handle 当成另一种资源使用；内存映射采用 Core 管理的 region/address-space 语义，不把每个 frame 暴露成组件 authority；
-- **不可伪造**：capability 只能由内核创建和传递，用户无法构造 —— 我们要求"驱动永远拿不到裸物理地址/裸 IRQ 号/裸指针"就是这个原则；
+- **不可伪造**：capability 只能由内核创建和传递，用户无法构造 —— 我们要求"驱动不能靠知道裸物理地址 / 裸 IRQ 号 / 裸地址获得 authority；裸指针只存在于 Core 派生并持有 provenance 的 typed Lease 内部"就是这个原则；
 - 内核对象（kernel object）作为资源存在性/所有权记录在核心 —— 我们的 `Handle / Authority` + 内核对象表。
 
 **怎么映射**：

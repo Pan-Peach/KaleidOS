@@ -325,7 +325,8 @@ Component
 ```
 
 - **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是设备/执行域 authority 和受管理的内存区域，**不是**逐帧 handle、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的资源），owner 字段直接落在各资源表（irq/mmio/dma/timer）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
-- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `Wasm`）。`ComponentRecord` 只记轻量 `execution_kind`，真正的 runtime（`LoadedComponent` + `ExecutionDomain`）放 `ComponentRuntime`，由 `ComponentManager` 串起来（见 component-model.md §4）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
+- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative` / `Wasm`）。`ComponentRecord` 只记轻量 `execution_kind`，真正的 runtime（`LoadedComponent` + `ExecutionDomain`）放 `ComponentRuntime`，由 `ComponentManager` 串起来（见 component-model.md §4）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
+  - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / Handle→Lease / 撤销不变式见 `driver-model.md`。
 
 > 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"。契约（Interface + Handle）与执行域解耦，同一个组件图才能配置成宏内核、微内核或混合形态。
 
@@ -386,6 +387,7 @@ Scheduler（Component）         Core
 
 - `core-philosophy.md`：为什么这样设计（判断标准与取舍）；
 - `component-model.md`：组件的完整模型（生命周期、关系、替换）；
+- `driver-model.md`：驱动 / Handle→Lease / 执行域 / 撤销不变式的设计契约；
 - `testing.md`：如何保证 Core 可信；
 - `roadmap.md`：按里程碑怎么一步步长出来；
 - `references.md`：每个参考系统借鉴什么、怎么用。

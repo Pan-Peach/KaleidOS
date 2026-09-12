@@ -22,7 +22,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
      Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  24 条 kcore_*，按稳定 ABI 分类：
+  30 条 kcore_*，按稳定 ABI 分类：
     Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
@@ -30,8 +30,11 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
     Component lifecycle：component_load / interface_publish / interface_available
     Task control：task_create / task_start / task_yield / task_exit / task_state
     Scheduler：sched_run
-    Resource authority（C6 起步）：mmio_claim / mmio_read_u32 / irq_claim / irq_register /
-      irq_enable（认领设备/中断线 → MmioHandle/IrqHandle → Core 每次访问重新验证后才碰硬件）
+    Resource authority（C6）：mmio_claim / mmio_read_u32 / mmio_write_u32 / mmio_release /
+      mmio_lease / irq_claim / irq_register / irq_enable / irq_register_polled / irq_poll /
+      irq_ack（认领设备/中断线 → MmioHandle/IrqHandle；常规访问每次由 Core 重新验证，
+      kcore_mmio_lease 可派生一次校验过的 (ptr,len) 供受信 KernelNative 直访；
+      IRQ 两态：trap 回调 / 轮询（Core 计数+掩蔽，驱动 poll/ack 后重新放行））
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
@@ -74,14 +77,15 @@ P2 中断/驱动雏形：
   🚧 C6  MMIO 资源 authority（已落地：claim 设备 → MmioHandle → Core 验证后 read，QEMU
          端到端 virtio magic 验证）；IRQ authority 已落地（claim/register/enable +
          route + trap 外部中断钩子 + PLIC 寄存器机制 + boot 配置；host 测试 +
-         CoreTest `irq-line-enable` + ArchTest `external-irq`（真设备投递）均有覆盖）；
-         后续：驱动模型（virtio 等）
+          CoreTest `irq-line-enable` + ArchTest `external-irq`（真设备投递）均有覆盖）；
+          后续：驱动模型（virtio 等，见 `driver-model.md`）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
   C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
   C9   任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
 P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
-  C10 Core AddressSpaceManager + 每域 Sv39 根 + ASID + U-mode（见 §10 性能模型）
+  C10 Core AddressSpaceManager + 私有 AS（IsolatedNative=S 可选实验、非里程碑；
+     SandboxedNative=U 未来强制边界）（见 §10 与 driver-model.md；D2=A）
 ```
 
 ### 下一个里程碑：M0.5 —— Sv39（✅ 已完成，2026-09；本节保留作历史规划）
@@ -331,6 +335,8 @@ Power On
 
 ## 10. 执行域性能模型与卸载协议（2026-08 Oracle 咨询结论）
 
+> 驱动 / Handle→Lease / 执行域与撤销不变式的最终契约见 `driver-model.md`；本节保留性能数量级与卸载协议的原始结论。
+
 ### 10.1 执行域切换成本（数量级；GHz 级硬件 + 热缓存）
 
 | 操作 | 真硬件 | 主要成本 |
@@ -347,8 +353,14 @@ Power On
 **对当前阶段的意义**：现在**零切换成本**（call_init 是普通调用；未来每组件任务共享 satp，
 切换只花寄存器+栈）。"切页表"只在**隔离执行域**发生——按触发器推迟（C10）。
 
-**正确形态（若做）**：每域一个 Sv39 根 + **ASID**（切换免 flush）+ 组件 U-mode
-（低于 Core 特权；**同特权 S-mode 换页表不是恶意代码边界**）。
+**执行域定位（D2=A，见 `driver-model.md`）**：**KernelNative 是常态、长期模式**——同特权级、
+零切换、逻辑 authority（受信代码，未强制部分靠自觉），不追求硬件隔离。私有地址空间只在
+执行域实验 / 隔离时引入：
+
+- **IsolatedNative（可选实验，非里程碑）**：S-mode + 私有 AS（每域 Sv39 根 + **ASID** 免 flush）；
+  只提供条件性故障隔离（协作与偶然 bug，**对恶意无效**），**同特权 S-mode 换页表不构成恶意代码边界**；
+- **SandboxedNative（未来）**：U-mode + 私有 AS，才是对抗隔离的**硬件强制边界**
+  （Handle + MMU + 特权级；组件 U-mode 低于 Core 特权）。
 
 **否决项**：单内核页表 + 子集权限（RISC-V 无 MPK、PTE 不按键区分组件；PMP 是 M-mode 专属
 且窄——都不是正解）。

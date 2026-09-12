@@ -220,7 +220,8 @@ revoke_component_resources(id) —— 收回 authority-backed resources（handle
 ```rust
 pub enum ExecutionDomain {
     KernelNative,
-  IsolatedNative(AddressSpaceId),
+    IsolatedNative(AddressSpaceId),   // 可选实验（S + 私有 AS），非里程碑
+    // future: SandboxedNative(AddressSpaceId)  —— U + 私有 AS，未来的硬件强制边界
     // future: Wasm(WasmInstance)
 }
 ```
@@ -242,7 +243,8 @@ pub struct ComponentRecord {
 #[derive(Clone, Copy, Debug)]
 pub enum ExecutionKind {
     KernelNative,
-  IsolatedNative,
+    IsolatedNative,   // 可选实验（S + 私有 AS），非里程碑
+    // future: SandboxedNative  —— U + 私有 AS，未来的硬件强制边界
 }
 
 真正 runtime：
@@ -292,10 +294,15 @@ impl ComponentManager {
 let ret = loader::call_init(&runtime.image);
 ```
 
-### 4.4 IsolatedNative 的 AddressSpace（未来 C10）
+### 4.4 私有 AddressSpace 与执行域（未来 C10）
 
 M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间在需要
-U-mode、故障隔离或可执行回收时才引入，由 Core 的 AddressSpaceManager 统一管理。
+**私有地址空间**时才引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），
+由 Core 的 AddressSpaceManager 统一管理。
+
+> **D2=A**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；
+> `IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；
+> `SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。详见 `driver-model.md`。
 
 ```text
 Core AddressSpaceTable
