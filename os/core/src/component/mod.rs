@@ -6,11 +6,14 @@
 
 mod elf;
 pub mod export;
+pub mod failure;
 pub mod interface;
 pub mod load;
 pub mod loader;
 pub mod registry;
 pub mod store;
+
+pub use failure::fail_component;
 
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
 /// 由 Core 分配；组件的 ResourceDomain 以 ComponentId 为键记录。

@@ -67,6 +67,16 @@ impl MemoryLease {
     pub(crate) const fn region(&self) -> PhysicalRange {
         self.region
     }
+
+    /// 区域物理基址（DMA 等 Core 内部派生路径用；不对组件暴露）。
+    pub(crate) const fn base(&self) -> usize {
+        self.region.base
+    }
+
+    /// 区域实际容量（buddy order 的块大小，≥ 请求尺寸）。
+    pub(crate) const fn size(&self) -> usize {
+        self.region.size
+    }
 }
 
 impl Drop for MemoryLease {

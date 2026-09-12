@@ -22,6 +22,7 @@
 //! - **preempt_count**（Linux 式）：计数 > 0 时延迟抢占；更通用、规模更大，
 //!   等真实工作量需要时再上。
 
+use crate::handle::irq::{IrqDelivery, IrqHandler};
 use arch::{CpuArch, CpuImpl, InterruptController, InterruptImpl};
 
 /// irq-save 临界区 guard：进入时保存并关中断，退出时恢复。
@@ -61,32 +62,64 @@ pub fn init() {
 
 /// 外部中断入口（trap 分发调用；中断上下文，已关中断）。
 ///
-/// 循环从中断控制器取一条 pending 中断 → [`route`] 投递给该线的 owner →
-/// `complete`。一次 trap 可能对应多条 pending（PLIC 共享一个 mip 位），
-/// 必须循环到 claim 返回 `None`。
+/// 循环从中断控制器取一条 pending 中断 → [`route`] 取得投递处置 →
+/// 按处置执行（回调 inline / Polled 计数+掩蔽）→ `complete`。一次 trap 可能
+/// 对应多条 pending（PLIC 共享一个 mip 位），必须循环到 claim 返回 `None`。
 pub extern "C" fn on_external() {
     while let Some(line) = InterruptImpl::claim() {
-        route(line);
+        match route(line) {
+            // Callback：锁内已取拷贝，这里在锁外直接调用（trap 可重入，
+            // 持锁调用组件代码会自死锁）。
+            RouteOutcome::Callback { handler, ctx } => handler(ctx),
+            // Polled：Core 计数；首个事件要求在锁外掩蔽该线，防止电平触发源
+            // 在协作调度下反复打断。驱动任务随后 poll/ack 才重新放行。
+            RouteOutcome::Polled => {
+                let mask = {
+                    let mut table = crate::handle::irq::get_table().lock();
+                    table.note_polled_event(line)
+                };
+                if let Some(number) = mask {
+                    InterruptImpl::disable(number);
+                }
+            }
+            RouteOutcome::None => {}
+        }
         InterruptImpl::complete(line);
     }
 }
 
-/// 把一条中断号投递给它的 owner 处理函数；返回是否已投递。
+/// [`route`] 的处置结果：锁内只读一份 Core 真相，实际动作在锁外执行。
+pub enum RouteOutcome {
+    /// 受信回调：在 trap 上下文锁外调用组件 handler。
+    Callback { handler: IrqHandler, ctx: *mut () },
+    /// 轮询投递：顶半部计数并（首事件）掩蔽该线。
+    Polled,
+    /// 该线无 owner / 未注册 delivery：什么都不做（仍 `complete`）。
+    None,
+}
+
+/// 把一条中断号路由成处置结果。
 ///
 /// Core 真相：只认 IRQ 表上「live slot + 已注册 delivery」的线——组件被
 /// revoke 后不会再有回调进入它的代码。**锁内只取一份 `IrqDelivery` 拷贝，
-/// handler 在锁外调用**（trap 可能重入 spin 锁，持锁调用组件代码会自死锁）。
-pub fn route(number: u32) -> bool {
+/// 实际投递动作（回调 / 控制器写）在锁外执行**（trap 可能重入 spin 锁）。
+pub fn route(number: u32) -> RouteOutcome {
     let delivery = {
         let table = crate::handle::irq::get_table().lock();
         table.delivery_of(number)
     };
     match delivery {
-        Some(delivery) => {
-            (delivery.handler())(delivery.ctx());
-            true
+        Some(IrqDelivery::Callback { handler, ctx }) => {
+            // SAFETY: `handler` 只由 `IrqDelivery::new` 从真实 `IrqHandler`
+            // 写入（phase 1 信任 KernelNative 函数地址，同 schedule policy vtable）。
+            let handler = unsafe { core::mem::transmute::<usize, IrqHandler>(handler) };
+            RouteOutcome::Callback {
+                handler,
+                ctx: ctx as *mut (),
+            }
         }
-        None => false,
+        Some(IrqDelivery::Polled) => RouteOutcome::Polled,
+        None => RouteOutcome::None,
     }
 }
 
@@ -103,39 +136,58 @@ mod tests {
         CALLS.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// 验收：只投递给「live slot + 已注册 delivery」的 owner；revoke 后立刻停止。
+    /// 验收：只对「live slot + 已注册 delivery」的线给出投递处置；revoke 后立刻停止。
     #[test]
-    fn route_delivers_only_to_live_registered_owner() {
+    fn route_yields_delivery_only_for_live_registered_owner() {
         crate::handle::irq::init();
         let owner = ComponentId::from_raw(0xfeed);
-        let handle = crate::handle::irq::get_table().lock().grant(
-            owner,
-            Irq {
-                number: 42,
-                device_index: 0,
-                delivery: None,
-            },
-        );
+        let handle = crate::handle::irq::get_table()
+            .lock()
+            .grant(owner, Irq::new(42, 0));
 
-        // 未注册 delivery：不投递（中断到了也没人接）
-        assert!(!route(42));
+        // 未注册 delivery：无处置（中断到了也没人接）
+        assert!(matches!(route(42), RouteOutcome::None));
         assert_eq!(CALLS.load(Ordering::Acquire), 0);
 
-        // 注册后可投递
+        // 注册后得到 Callback 处置；on_external 会在锁外调用它
         crate::handle::irq::get_table()
             .lock()
             .set_delivery(owner, handle, IrqDelivery::new(bump, core::ptr::null_mut()))
             .unwrap();
-        assert!(route(42));
+        match route(42) {
+            RouteOutcome::Callback { handler, ctx } => handler(ctx),
+            _ => panic!("expected Callback disposition"),
+        }
         assert_eq!(CALLS.load(Ordering::Acquire), 1);
 
-        // 没有 owner 的线：不投递
-        assert!(!route(43));
+        // 没有 owner 的线：无处置
+        assert!(matches!(route(43), RouteOutcome::None));
         assert_eq!(CALLS.load(Ordering::Acquire), 1);
 
         // revoke 后立刻停止投递（组件失败/卸载后回调进不去它的代码）
         crate::handle::irq::get_table().lock().revoke_owner(owner);
-        assert!(!route(42));
+        assert!(matches!(route(42), RouteOutcome::None));
         assert_eq!(CALLS.load(Ordering::Acquire), 1);
+    }
+
+    /// 验收：Polled 线路由出 `RouteOutcome::Polled`（不产生回调）。
+    #[test]
+    fn route_yields_polled_for_polled_delivery() {
+        crate::handle::irq::init();
+        let owner = ComponentId::from_raw(0xfeed);
+        let handle = crate::handle::irq::get_table()
+            .lock()
+            .grant(owner, Irq::new(7, 0));
+        crate::handle::irq::get_table()
+            .lock()
+            .set_polled(owner, handle)
+            .unwrap();
+
+        assert!(matches!(route(7), RouteOutcome::Polled));
+        // 顶半部处置：首事件计数并返回要掩蔽的中断号
+        let number = crate::handle::irq::get_table().lock().note_polled_event(7);
+        assert_eq!(number, Some(7));
+
+        crate::handle::irq::get_table().lock().revoke_owner(owner);
     }
 }

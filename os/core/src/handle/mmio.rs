@@ -7,9 +7,10 @@
 //!    authorize seam（phase 1 恒 allow），然后 grant 出 `MmioHandle`。
 //!    独占锚在**设备**（`device_index`）上：将来同一设备的 IRQ 也只能授予
 //!    同一个 owner——不存在"MMIO 给 A、IRQ 给 B"的拆分。
-//! 2. [`read_u32`]：组件每次访问都把 handle 交回 Core；Core 先验证
+//! 2. [`read_u32`] / [`write_u32`]：组件每次访问都把 handle 交回 Core；Core 先验证
 //!    slot/generation/owner/生命周期，再做 bounds/对齐检查，最后才碰硬件。
 //!    组件永远不持有地址（raw handle 只是 slot+generation 编码）。
+//! 3. [`release`]：组件主动交回 authority（validate 后由资源表回收）。
 //!
 //! # 实现要点
 //!
@@ -34,10 +35,9 @@
 //!
 //! # 明确砍掉（第一版勿提前长出来）
 //!
-//! width 1/2/4/8、`write`、`release` ABI 出口、DMA/IRQ 派生、activation
-//! seam、SDK、按设备授权策略。
+//! width 1/2/4/8、DMA/IRQ 派生、activation seam、SDK、按设备授权策略。
 
-use super::{Handle, HandleError, ResourceTable};
+use super::{Handle, HandleError, MmioLease, RequestContext, ResourceTable};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine::{self, IoSpace};
@@ -143,7 +143,7 @@ pub fn get_table() -> &'static Mutex<MmioTable> {
 ///
 /// 找第一台「compatible 匹配且未被任意 owner 认领」的 MMIO 设备；
 /// 同名设备有多台时按设备表顺序取用，全部被认领才 `DeviceBusy`。
-pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<MmioHandle, MmioClaimError> {
+pub fn claim(ctx: &RequestContext, compatible: &[u8]) -> Result<MmioHandle, MmioClaimError> {
     let Some(machine) = machine::committed() else {
         // 机器信息尚未提交（正常组件运行期不可达）
         return Err(MmioClaimError::DeviceNotFound);
@@ -174,7 +174,7 @@ pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<MmioHandle, MmioC
         //
         // 授出：所有权记在表上，返回凭证（handle 只含 slot/generation，不含地址）
         return Ok(table.grant(
-            caller,
+            ctx.component,
             MmioRegion {
                 base,
                 size,
@@ -190,14 +190,46 @@ pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<MmioHandle, MmioC
     })
 }
 
+/// 从已持有的 `MmioHandle` 推导设备身份（`device_index`）。
+///
+/// 供 **DMA 授权**用：DMA 不接受组件自报的设备号，必须先在 Core 里持有该设备的
+/// MMIO authority。Core 校验 slot/generation/owner/生命周期后返回 region 记录的
+/// `device_index`；校验失败返回 [`MmioError::Handle`]。
+pub(crate) fn device_index_for(ctx: &RequestContext, handle: MmioHandle) -> Result<u8, MmioError> {
+    let _guard = IrqSaveGuard::new();
+    let table = get_table().lock();
+    let region = table
+        .get(ctx.component, handle)
+        .map_err(MmioError::Handle)?;
+    Ok(region.device_index)
+}
+
+/// 派生 [`MmioLease`]：KernelNative 直接 MMIO 快路径。
+///
+/// Core 只在这里校验一次 handle（slot/generation/owner/生命周期），成功则
+/// 返回携带 `region.base` 指针、`region.size` 长度与 `source = handle`
+/// （provenance）的 lease。受信 KernelNative 驱动据此直接 volatile 访问，
+/// 稳态不再 per-access 进 Core。**撤销是协作式的**：在 revoke/release 之前
+/// 已经派生出去的裸指针不会被追回（见 `lease` 模块文档）。
+pub fn derive_lease(ctx: &RequestContext, handle: MmioHandle) -> Result<MmioLease, MmioError> {
+    let _guard = IrqSaveGuard::new();
+    let table = get_table().lock();
+    let region = table
+        .get(ctx.component, handle)
+        .map_err(MmioError::Handle)?;
+    Ok(MmioLease::new(region.base as *mut u8, region.size, handle))
+}
+
 /// 单次 32-bit MMIO 读：每次调用重新验证 handle（slot/generation/owner/
 /// 生命周期），过 bounds/对齐检查后由 Core 访问硬件。
-pub fn read_u32(caller: ComponentId, handle: MmioHandle, offset: u32) -> Result<u32, MmioError> {
+pub fn read_u32(ctx: &RequestContext, handle: MmioHandle, offset: u32) -> Result<u32, MmioError> {
     let _guard = IrqSaveGuard::new();
 
     let addr = {
         let table = get_table().lock();
-        let region = table.get(caller, handle).map_err(MmioError::Handle)?;
+        let region = table
+            .get(ctx.component, handle)
+            .map_err(MmioError::Handle)?;
         let offset = offset as usize;
         if offset
             .checked_add(4)
@@ -214,17 +246,67 @@ pub fn read_u32(caller: ComponentId, handle: MmioHandle, offset: u32) -> Result<
     Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
 }
 
+/// 单次 32-bit MMIO 写：每次调用重新验证 handle（slot/generation/owner/
+/// 生命周期），过 bounds/对齐检查后由 Core 访问硬件。
+pub fn write_u32(
+    ctx: &RequestContext,
+    handle: MmioHandle,
+    offset: u32,
+    value: u32,
+) -> Result<(), MmioError> {
+    let _guard = IrqSaveGuard::new();
+
+    let addr = {
+        let table = get_table().lock();
+        let region = table
+            .get(ctx.component, handle)
+            .map_err(MmioError::Handle)?;
+        let offset = offset as usize;
+        if offset
+            .checked_add(4)
+            .filter(|&end| end <= region.size)
+            .is_none()
+        {
+            return Err(MmioError::OutOfBounds);
+        }
+        if !offset.is_multiple_of(4) {
+            return Err(MmioError::Unaligned);
+        }
+        region.base + offset
+    };
+    // SAFETY: category 6 (alignment) and 10 (bounds) are established by the
+    // checks above; `base` is the Core-authoritative MMIO region base.
+    unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+    Ok(())
+}
+
+/// 主动释放 MMIO authority；资源表负责 slot/generation/owner/lifecycle 验证。
+pub fn release(ctx: &RequestContext, handle: MmioHandle) -> Result<(), MmioError> {
+    let _guard = IrqSaveGuard::new();
+    get_table()
+        .lock()
+        .release(ctx.component, handle)
+        .map_err(MmioError::Handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MmioClaimError, MmioError, MmioRegion, MmioTable};
     use crate::component::ComponentId;
-    use crate::handle::HandleError;
+    use crate::handle::{HandleError, RequestContext};
 
     fn region(device_index: u8) -> MmioRegion {
         MmioRegion {
             base: 0x1000_0000 + device_index as usize * 0x1000,
             size: 0x1000,
             device_index,
+        }
+    }
+
+    fn context(component: ComponentId) -> RequestContext {
+        RequestContext {
+            component,
+            task: None,
         }
     }
 
@@ -373,7 +455,7 @@ mod tests {
         let owner = ComponentId::from_raw(7);
 
         // 第一台 virtio（devices[0]）
-        let first = super::claim(owner, b"virtio,mmio").unwrap();
+        let first = super::claim(&context(owner), b"virtio,mmio").unwrap();
         {
             // 表锁作用域内用完即释放：后面再 claim 会重新 lock 同一把锁。
             let table = super::get_table().lock();
@@ -384,7 +466,7 @@ mod tests {
         }
 
         // 第二台 virtio（devices[2]）仍未被认领 → 必须拿到它，而不是 Busy
-        let second = super::claim(owner, b"virtio,mmio").unwrap();
+        let second = super::claim(&context(owner), b"virtio,mmio").unwrap();
         assert_ne!(first, second);
         {
             let table = super::get_table().lock();
@@ -396,11 +478,11 @@ mod tests {
 
         // 两台都被认领 → Busy
         assert_eq!(
-            super::claim(owner, b"virtio,mmio"),
+            super::claim(&context(owner), b"virtio,mmio"),
             Err(MmioClaimError::DeviceBusy)
         );
         assert_eq!(
-            super::claim(owner, b"nope,device"),
+            super::claim(&context(owner), b"nope,device"),
             Err(MmioClaimError::DeviceNotFound)
         );
     }
@@ -423,24 +505,178 @@ mod tests {
             },
         );
 
-        assert_eq!(super::read_u32(owner, handle, 0), Ok(0x7472_6976));
-        assert_eq!(super::read_u32(owner, handle, 4), Ok(0));
+        assert_eq!(super::read_u32(&context(owner), handle, 0), Ok(0x7472_6976));
+        assert_eq!(super::read_u32(&context(owner), handle, 4), Ok(0));
 
         // 对抗：wrong owner / 越界 / 非对齐 / revoke 后 stale
         assert_eq!(
-            super::read_u32(other, handle, 0),
+            super::read_u32(&context(other), handle, 0),
             Err(MmioError::Handle(HandleError::WrongOwner))
         );
         assert_eq!(
-            super::read_u32(owner, handle, 16),
+            super::read_u32(&context(owner), handle, 16),
             Err(MmioError::OutOfBounds)
         );
-        assert_eq!(super::read_u32(owner, handle, 2), Err(MmioError::Unaligned));
+        assert_eq!(
+            super::read_u32(&context(owner), handle, 2),
+            Err(MmioError::Unaligned)
+        );
 
         super::get_table().lock().revoke_owner(owner);
         assert_eq!(
-            super::read_u32(owner, handle, 0),
+            super::read_u32(&context(owner), handle, 0),
             Err(MmioError::Handle(HandleError::Stale))
+        );
+    }
+
+    #[test]
+    fn write_u32_round_trips_and_rejects_invalid_access() {
+        super::init();
+        let mut buf = [0u32; 4];
+        let owner = ComponentId::from_raw(13);
+        let other = ComponentId::from_raw(14);
+        let owner_ctx = RequestContext {
+            component: owner,
+            task: None,
+        };
+        let other_ctx = RequestContext {
+            component: other,
+            task: None,
+        };
+        let handle = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base: buf.as_mut_ptr() as usize,
+                size: core::mem::size_of_val(&buf),
+                device_index: 0,
+            },
+        );
+
+        assert_eq!(super::write_u32(&owner_ctx, handle, 0, 0x7472_6976), Ok(()));
+        assert_eq!(super::read_u32(&owner_ctx, handle, 0), Ok(0x7472_6976));
+        assert_eq!(
+            super::write_u32(&other_ctx, handle, 0, 0),
+            Err(MmioError::Handle(HandleError::WrongOwner))
+        );
+        assert_eq!(
+            super::write_u32(&owner_ctx, handle, 16, 0),
+            Err(MmioError::OutOfBounds)
+        );
+        assert_eq!(
+            super::write_u32(&owner_ctx, handle, 2, 0),
+            Err(MmioError::Unaligned)
+        );
+
+        assert_eq!(super::release(&owner_ctx, handle), Ok(()));
+        assert_eq!(
+            super::write_u32(&owner_ctx, handle, 0, 0),
+            Err(MmioError::Handle(HandleError::Stale))
+        );
+        assert_eq!(
+            super::release(&owner_ctx, handle),
+            Err(MmioError::Handle(HandleError::Stale))
+        );
+    }
+
+    #[test]
+    fn write_u32_rejects_stale_handle_after_owner_revoke() {
+        super::init();
+        let mut buf = [0u32; 1];
+        let owner = ComponentId::from_raw(15);
+        let ctx = context(owner);
+        let handle = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base: buf.as_mut_ptr() as usize,
+                size: core::mem::size_of_val(&buf),
+                device_index: 0,
+            },
+        );
+
+        super::get_table().lock().revoke_owner(owner);
+
+        assert_eq!(
+            super::write_u32(&ctx, handle, 0, 0),
+            Err(MmioError::Handle(HandleError::Stale))
+        );
+    }
+
+    // ---- MmioLease 派生（KernelNative 直接 MMIO 快路径）----
+
+    /// Core 一次性校验后派生 lease：指针 / 长度 / source 都来自已 grant 的 region。
+    #[test]
+    fn derive_lease_carries_region_ptr_len_and_source() {
+        super::init();
+        let mut buf = [0u32; 4];
+        let owner = ComponentId::from_raw(21);
+        let handle = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base: buf.as_mut_ptr() as usize,
+                size: core::mem::size_of_val(&buf),
+                device_index: 200,
+            },
+        );
+
+        let lease = super::derive_lease(&context(owner), handle).unwrap();
+
+        assert_eq!(lease.as_ptr(), buf.as_mut_ptr().cast::<u8>());
+        assert_eq!(lease.len(), core::mem::size_of_val(&buf));
+        assert_eq!(lease.source(), handle);
+        assert!(!lease.is_empty());
+
+        // 归还全局表，避免污染 `claim` 的设备独占检查。
+        super::get_table().lock().revoke_owner(owner);
+    }
+
+    /// 对抗：wrong owner / release 后 / revoke_owner 后一律拒绝，不产出 lease。
+    ///
+    /// 注意：这里只验证 **尚未派生** 时不放行。至于在 `release`/`revoke_owner`
+    /// **之前**已经派生出去的裸指针，Core 不会追回——KernelNative 撤销是协作
+    /// 式的，没有硬件 fault 可测（见 `lease` 模块文档与 `docs/driver-model.md` §3）。
+    #[test]
+    fn derive_lease_rejects_invalid_handle() {
+        super::init();
+        let mut buf = [0u32; 4];
+        let owner = ComponentId::from_raw(22);
+        let other = ComponentId::from_raw(23);
+        let base = buf.as_mut_ptr() as usize;
+        let size = core::mem::size_of_val(&buf);
+        let released = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base,
+                size,
+                device_index: 201,
+            },
+        );
+        let revoked = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base,
+                size,
+                device_index: 202,
+            },
+        );
+
+        // wrong owner
+        assert_eq!(
+            super::derive_lease(&context(other), released).unwrap_err(),
+            MmioError::Handle(HandleError::WrongOwner)
+        );
+
+        // release 后 stale
+        assert!(super::get_table().lock().release(owner, released).is_ok());
+        assert_eq!(
+            super::derive_lease(&context(owner), released).unwrap_err(),
+            MmioError::Handle(HandleError::Stale)
+        );
+
+        // revoke_owner 后 stale
+        super::get_table().lock().revoke_owner(owner);
+        assert_eq!(
+            super::derive_lease(&context(owner), revoked).unwrap_err(),
+            MmioError::Handle(HandleError::Stale)
         );
     }
 
@@ -474,13 +710,13 @@ mod tests {
         // 热身：避免首次缓存/分支预测冷启动污染数字
         let mut warm = 0u32;
         for _ in 0..10_000 {
-            warm = warm.wrapping_add(super::read_u32(owner, handle, 0).unwrap());
+            warm = warm.wrapping_add(super::read_u32(&context(owner), handle, 0).unwrap());
         }
 
         let t0 = std::time::Instant::now();
         let mut acc = 0u32;
         for _ in 0..N {
-            acc = acc.wrapping_add(super::read_u32(owner, handle, 0).unwrap());
+            acc = acc.wrapping_add(super::read_u32(&context(owner), handle, 0).unwrap());
         }
         let mediated = t0.elapsed();
 

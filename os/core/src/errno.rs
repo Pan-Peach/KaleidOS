@@ -18,7 +18,7 @@
 
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
-use crate::handle::{HandleError, irq, mmio};
+use crate::handle::{HandleError, dma, irq, mmio};
 use crate::sched::SchedError;
 use crate::task::TaskError;
 
@@ -150,6 +150,17 @@ impl From<mmio::MmioError> for Errno {
     }
 }
 
+impl From<dma::DmaError> for Errno {
+    fn from(error: dma::DmaError) -> Self {
+        match error {
+            dma::DmaError::Handle(inner) => inner.into(),
+            dma::DmaError::Mmio(inner) => inner.into(),
+            dma::DmaError::InvalidSize => Errno::EINVAL,
+            dma::DmaError::Exhausted => Errno::ENOMEM,
+        }
+    }
+}
+
 impl From<irq::IrqClaimError> for Errno {
     fn from(error: irq::IrqClaimError) -> Self {
         match error {
@@ -166,6 +177,7 @@ impl From<irq::IrqError> for Errno {
         match error {
             irq::IrqError::Handle(inner) => inner.into(),
             irq::IrqError::NoDelivery => Errno::EINVAL,
+            irq::IrqError::NotPolled => Errno::EINVAL,
         }
     }
 }
@@ -209,6 +221,17 @@ mod tests {
             Errno::ESTALE
         );
         assert_eq!(Errno::from(irq::IrqError::NoDelivery), Errno::EINVAL);
+        assert_eq!(Errno::from(irq::IrqError::NotPolled), Errno::EINVAL);
+        assert_eq!(
+            Errno::from(dma::DmaError::Handle(HandleError::Stale)),
+            Errno::ESTALE
+        );
+        assert_eq!(
+            Errno::from(dma::DmaError::Mmio(mmio::MmioError::Unaligned)),
+            Errno::EINVAL
+        );
+        assert_eq!(Errno::from(dma::DmaError::InvalidSize), Errno::EINVAL);
+        assert_eq!(Errno::from(dma::DmaError::Exhausted), Errno::ENOMEM);
     }
 
     #[test]

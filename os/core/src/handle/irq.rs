@@ -11,7 +11,12 @@
 //!    组件失败/卸载后不会再有回调进它的代码。
 //! 3. [`enable`]：Core 验证 handle + delivery 后，才去配置中断控制器（PLIC enable）。
 //! 4. 投递：trap 的外部中断分支 → `crate::irq::on_external` → `crate::irq::route`
-//!    查表找到该线的 owner delivery → **锁外**调用。
+//!    查表找到该线的 owner delivery：
+//!    - `Callback`：**锁外**调用组件 handler（受信 KernelNative）；
+//!    - `Polled`：顶半部只计数并掩蔽该线（[`IrqTable::note_polled_event`]），
+//!      驱动任务随后 [`IrqTable::poll`] 读计数、处理设备、[`IrqTable::ack`]。
+//! 5. [`IrqTable::set_polled`]：owner 把该线切成轮询投递（不装回调）。回调路径
+//!    与 Polled 路径互斥（`delivery` 是 `Option<IrqDelivery>`）。
 //!
 //! # 实现要点
 //!
@@ -33,8 +38,9 @@
 //!
 //! # 明确砍掉（第一版勿提前长出来）
 //!
-//! mask（disable ABI 出口）、release ABI 出口、优先级/触发方式配置、共享中断线、
-//! per-line 统计、SMP affinity、把 PLIC 从 arch 降级为 Driver Component。
+//! 独立 mask ABI 出口（Polled 掩蔽完全在 Core 内部完成）、release ABI 出口、
+//! 优先级/触发方式配置、共享中断线、per-line 统计、SMP affinity、把 PLIC 从
+//! arch 降级为 Driver Component。
 
 use super::{Handle, HandleError, ResourceTable};
 use crate::component::ComponentId;
@@ -52,6 +58,23 @@ pub struct Irq {
     pub device_index: u8,
     /// 投递目标：组件注册的处理函数 + opaque context（`None` = 尚未注册）。
     pub delivery: Option<IrqDelivery>,
+    /// `Polled` 线累计的事件数（Core 真相，顶半部锁内自增）。
+    pub events: u64,
+    /// `Polled` 线是否已被 Core 掩蔽：首个事件置位，`ack` 清除。
+    pub masked: bool,
+}
+
+impl Irq {
+    /// 新建一条尚未注册投递的 IRQ 资源对象。
+    pub const fn new(number: u32, device_index: u8) -> Self {
+        Self {
+            number,
+            device_index,
+            delivery: None,
+            events: 0,
+            masked: false,
+        }
+    }
 }
 
 /// Core 授予组件的 IRQ authority。
@@ -65,33 +88,26 @@ pub type IrqHandler = extern "C" fn(ctx: *mut ());
 
 /// 一条 IRQ 的投递目标。
 ///
-/// 函数地址与 context 以 `usize` 保存（同 arch 的 `TIMER_HANDLER: AtomicUsize`），
-/// 这样全局表不必把裸指针放进 `Send` 容器；Core 只在真正投递时还原函数指针。
+/// - `Callback`：trap 上下文直接调用组件处理函数（仅受信 KernelNative）；
+///   函数地址与 context 以 `usize` 保存（同 arch 的 `TIMER_HANDLER: AtomicUsize`），
+///   这样全局表不必把裸指针放进 `Send` 容器。
+/// - `Polled`：不装回调——顶半部只计数并掩蔽该线，owner 任务轮询 `poll` 后
+///   `ack`（见模块文档）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IrqDelivery {
-    pub handler: usize,
-    pub ctx: usize,
+pub enum IrqDelivery {
+    /// 受信 KernelNative 回调：`handler(ctx)` 在 trap 上下文锁外调用。
+    Callback { handler: usize, ctx: usize },
+    /// 轮询投递：Core 计数 + 掩蔽，组件任务 `poll`/`ack`。
+    Polled,
 }
 
 impl IrqDelivery {
-    /// 从 ABI 收到的函数指针 + context 构造。
+    /// 从 ABI 收到的函数指针 + context 构造 `Callback` 投递。
     pub fn new(handler: IrqHandler, ctx: *mut ()) -> Self {
-        Self {
+        Self::Callback {
             handler: handler as usize,
             ctx: ctx as usize,
         }
-    }
-
-    /// 还原成可调用形式。
-    pub fn handler(self) -> IrqHandler {
-        // SAFETY: `handler` 只由 `new` 从真实 `IrqHandler` 写入（phase 1
-        // 信任 KernelNative 函数地址，同 schedule policy vtable）。
-        unsafe { core::mem::transmute::<usize, IrqHandler>(self.handler) }
-    }
-
-    /// 还原 opaque context。
-    pub fn ctx(self) -> *mut () {
-        self.ctx as *mut ()
     }
 }
 
@@ -116,6 +132,8 @@ pub enum IrqError {
     Handle(HandleError),
     /// 尚未注册处理函数就试图使能该线。
     NoDelivery,
+    /// 该线不是 `Polled` 投递（对 `Callback` / 未注册的线做 `poll`/`ack`）。
+    NotPolled,
 }
 
 /// IRQ 资源真相表。
@@ -154,10 +172,88 @@ impl IrqTable {
         Ok(())
     }
 
+    /// 把该线切成轮询投递（`delivery = Some(Polled)`，不装回调）。
+    /// Core 验证 handle 成立后才写入。
+    pub fn set_polled(&mut self, caller: ComponentId, handle: IrqHandle) -> Result<(), IrqError> {
+        let irq = self
+            .table
+            .get_mut(caller, handle)
+            .map_err(IrqError::Handle)?;
+        irq.delivery = Some(IrqDelivery::Polled);
+        Ok(())
+    }
+
+    /// 读取 `Polled` 线累计的事件数（不清零——驱动按 delta 判断新事件）。
+    /// 非 `Polled` 线 → [`IrqError::NotPolled`]。
+    pub fn poll(&self, caller: ComponentId, handle: IrqHandle) -> Result<u64, IrqError> {
+        let irq = self.table.get(caller, handle).map_err(IrqError::Handle)?;
+        match irq.delivery {
+            Some(IrqDelivery::Polled) => Ok(irq.events),
+            _ => Err(IrqError::NotPolled),
+        }
+    }
+
+    /// 确认 `Polled` 事件：清除 `masked` 并返回中断号，供调用方在**锁外**
+    /// `InterruptImpl::enable(number)` 重新放行该线。非 `Polled` → `NotPolled`。
+    ///
+    /// 返回中断号而不是在锁内 `enable`：trap 可重入、MMIO 慢，控制器写必须
+    /// 放锁后做（同 `complete`）。
+    pub fn ack(&mut self, caller: ComponentId, handle: IrqHandle) -> Result<u32, IrqError> {
+        let irq = self
+            .table
+            .get_mut(caller, handle)
+            .map_err(IrqError::Handle)?;
+        match irq.delivery {
+            Some(IrqDelivery::Polled) => {
+                irq.masked = false;
+                Ok(irq.number)
+            }
+            _ => Err(IrqError::NotPolled),
+        }
+    }
+
+    /// 顶半部事件计数（Core 内部，调用方持表锁）：仅对 `Polled` 线生效。
+    ///
+    /// `events += 1`；若尚未 `masked`，置 `masked = true` 并返回 `Some(number)`
+    /// ——调用方据此在**锁外** `InterruptImpl::disable(number)`，把电平触发源
+    /// 在协作调度下提前掩蔽（防止风暴）。已掩蔽则只计数、返回 `None`。
+    /// 非 `Polled` / 未知线 → `None`。
+    pub fn note_polled_event(&mut self, number: u32) -> Option<u32> {
+        for slot in self.table.slots_mut() {
+            if !slot.object().is_some_and(|irq| irq.number == number) {
+                continue;
+            }
+            // 上面已确认 object 存在。
+            let irq = slot.object_mut().expect("occupied slot checked above");
+            return match irq.delivery {
+                Some(IrqDelivery::Polled) => {
+                    irq.events = irq.events.wrapping_add(1);
+                    if irq.masked {
+                        None
+                    } else {
+                        irq.masked = true;
+                        Some(number)
+                    }
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// 撤销 owner 全部 IRQ authority。
+    ///
+    /// 若被撤销的是已 `masked` 的 `Polled` 线，**保持控制器上的 disable 状态**
+    /// （不做任何 arch `enable`）——该线已无 owner，重新放行只会投递到无人认领
+    /// 的线；下一次合法 claim/`enable` 会重新配置它。
     pub fn revoke_owner(&mut self, owner: ComponentId) {
         self.table.revoke_owner(owner)
     }
 
+    /// 组件主动释放一条 IRQ authority。
+    ///
+    /// 同 `revoke_owner`：已 `masked` 的 `Polled` 线释放后**保持 disabled**
+    /// （Core 不代 owner 回调 arch `enable`）。
     pub fn release(&mut self, caller: ComponentId, handle: IrqHandle) -> Result<(), HandleError> {
         self.table.release(caller, handle)
     }
@@ -240,14 +336,7 @@ pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<IrqHandle, IrqCla
         //
         // TODO(C6 seam)：可收紧为「caller 必须已持有同一设备的 MmioHandle」
         // （handle/mod.rs 的「IRQ 从同一 owner 派生」），第一版不强制。
-        return Ok(table.grant(
-            caller,
-            Irq {
-                number,
-                device_index: index as u8,
-                delivery: None,
-            },
-        ));
+        return Ok(table.grant(caller, Irq::new(number, index as u8)));
     }
     // 有匹配但都没线 → NoIrq；有线但全被占 → Busy；压根没有匹配 → NotFound
     Err(if !saw_match {
@@ -286,11 +375,7 @@ mod tests {
     use crate::handle::HandleError;
 
     fn irq(number: u32, device_index: u8) -> Irq {
-        Irq {
-            number,
-            device_index,
-            delivery: None,
-        }
+        Irq::new(number, device_index)
     }
 
     extern "C" fn dummy_handler(_ctx: *mut ()) {}
@@ -502,5 +587,130 @@ mod tests {
         // revoke 后 delivery 随 slot 一起消失（不会再有回调进组件的代码）
         table.revoke_owner(owner);
         assert!(matches!(table.get(owner, handle), Err(HandleError::Stale)));
+    }
+
+    // ---- Polled 投递（C6 增量：Core 计数 + 掩蔽，驱动 poll/ack）----
+
+    /// 验收：首事件计数 + 置 masked 并返回 `Some(number)`；已掩蔽只计数。
+    #[test]
+    fn note_polled_event_counts_and_masks_once() {
+        let owner = ComponentId::from_raw(1);
+        let mut table = IrqTable::new();
+        let handle = table.grant(owner, irq(8, 0));
+
+        table.set_polled(owner, handle).unwrap();
+        {
+            let got = table.get(owner, handle).unwrap();
+            assert_eq!(got.delivery, Some(IrqDelivery::Polled));
+            assert_eq!(got.events, 0);
+            assert!(!got.masked);
+        }
+
+        // 首个事件：计数 + 置 masked，并返回中断号让顶半部在锁外 disable
+        assert_eq!(table.note_polled_event(8), Some(8));
+        {
+            let got = table.get(owner, handle).unwrap();
+            assert_eq!(got.events, 1);
+            assert!(got.masked);
+        }
+
+        // 已 masked：继续计数，但不重复要求掩蔽
+        assert_eq!(table.note_polled_event(8), None);
+        {
+            let got = table.get(owner, handle).unwrap();
+            assert_eq!(got.events, 2);
+            assert!(got.masked);
+        }
+
+        // 未知线 / 非 Polled 线：不动
+        assert_eq!(table.note_polled_event(99), None);
+    }
+
+    /// 验收：`poll` 读累计计数，不清零。
+    #[test]
+    fn poll_reads_event_count_without_resetting() {
+        let owner = ComponentId::from_raw(1);
+        let mut table = IrqTable::new();
+        let handle = table.grant(owner, irq(8, 0));
+        table.set_polled(owner, handle).unwrap();
+
+        assert_eq!(table.poll(owner, handle), Ok(0));
+        table.note_polled_event(8);
+        table.note_polled_event(8);
+        assert_eq!(table.poll(owner, handle), Ok(2));
+        // poll 是只读：计数保留
+        assert_eq!(table.poll(owner, handle), Ok(2));
+    }
+
+    /// 验收：`ack` 清 `masked`、返回中断号（供锁外 re-enable），并可再次掩蔽。
+    #[test]
+    fn ack_clears_mask_and_returns_reenable_number() {
+        let owner = ComponentId::from_raw(1);
+        let mut table = IrqTable::new();
+        let handle = table.grant(owner, irq(8, 0));
+        table.set_polled(owner, handle).unwrap();
+
+        assert_eq!(table.note_polled_event(8), Some(8));
+        assert!(table.get(owner, handle).unwrap().masked);
+
+        assert_eq!(table.ack(owner, handle), Ok(8));
+        {
+            let got = table.get(owner, handle).unwrap();
+            assert!(!got.masked);
+            // 计数保留（驱动用 delta 判断）
+            assert_eq!(got.events, 1);
+        }
+
+        // ack 后可再次掩蔽下一条事件
+        assert_eq!(table.note_polled_event(8), Some(8));
+        assert!(table.get(owner, handle).unwrap().masked);
+    }
+
+    /// 验收：`poll`/`ack` 拒绝非 Polled 线；wrong owner / stale handle 被拒。
+    #[test]
+    fn poll_and_ack_reject_non_polled_wrong_owner_and_stale() {
+        let owner = ComponentId::from_raw(1);
+        let other = ComponentId::from_raw(2);
+        let mut table = IrqTable::new();
+
+        // Callback 线：poll/ack 都拒绝
+        let callback = table.grant(owner, irq(8, 0));
+        table
+            .set_delivery(
+                owner,
+                callback,
+                IrqDelivery::new(dummy_handler, core::ptr::null_mut()),
+            )
+            .unwrap();
+        assert_eq!(table.poll(owner, callback), Err(IrqError::NotPolled));
+        assert_eq!(table.ack(owner, callback), Err(IrqError::NotPolled));
+
+        // 未注册 delivery 的线也拒绝
+        let bare = table.grant(owner, irq(9, 1));
+        assert_eq!(table.poll(owner, bare), Err(IrqError::NotPolled));
+        assert_eq!(table.ack(owner, bare), Err(IrqError::NotPolled));
+
+        // wrong owner：handle 校验先于 delivery 检查
+        let polled = table.grant(owner, irq(10, 2));
+        table.set_polled(owner, polled).unwrap();
+        assert_eq!(
+            table.poll(other, polled),
+            Err(IrqError::Handle(HandleError::WrongOwner))
+        );
+        assert_eq!(
+            table.ack(other, polled),
+            Err(IrqError::Handle(HandleError::WrongOwner))
+        );
+
+        // stale：revoke 后
+        table.revoke_owner(owner);
+        assert_eq!(
+            table.poll(owner, polled),
+            Err(IrqError::Handle(HandleError::Stale))
+        );
+        assert_eq!(
+            table.ack(owner, polled),
+            Err(IrqError::Handle(HandleError::Stale))
+        );
     }
 }

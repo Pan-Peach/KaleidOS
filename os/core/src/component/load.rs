@@ -6,7 +6,7 @@
 //! kpkg manifest requires、失败回滚留给真正的 ComponentManager 里程碑。
 
 use crate::component::loader::{self, LoaderError};
-use crate::component::{ComponentId, registry};
+use crate::component::{ComponentId, failure, registry};
 use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
     if code == 0 {
         Ok(id)
     } else {
-        registry::get_registry().lock().mark_failed(id).ok();
+        failure::fail_component(id, ComponentLoadError::InitFailed(code));
         Err(ComponentLoadError::InitFailed(code))
     }
 }

@@ -74,6 +74,12 @@ impl<T> ResourceTable<T> {
         &self.slots
     }
 
+    /// 可变遍历 slot（供 Core 内部按非 handle 锚点更新的操作使用，如 IRQ 顶半部
+    /// 按中断号累计 Polled 事件）。
+    pub(crate) fn slots_mut(&mut self) -> &mut [Slot<T>] {
+        &mut self.slots
+    }
+
     /// 撤销指定组件拥有的全部 authority。
     pub(crate) fn revoke_owner(&mut self, owner: ComponentId) {
         for slot in self.slots.iter_mut() {
