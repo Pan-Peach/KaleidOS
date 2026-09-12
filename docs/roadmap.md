@@ -22,7 +22,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
      Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
-  33 条 kcore_*，按稳定 ABI 分类：
+  一组 kcore_*，按稳定 ABI 分类：
     Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
@@ -73,7 +73,7 @@ P0 地基：
 P1 任务系统打通：
   ✅ C3  context_switch 实机验证（ArchTest：A→B→A 双上下文 s0-s11/sp 保留，RV64+RV32）
   ✅ C4  调度执行链（已完成：scheduler_rr 组件经 Interface 发布 SchedulerPolicy v1；
-         Core propose→validate→commit + 锚点上下文切换；core_test 端到端 12 项自检，RV64+RV32）
+         Core propose→validate→commit + 锚点上下文切换；core_test 端到端自检，RV64+RV32）
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
          timer/sched seam、ArchTest 位），逻辑待手写
@@ -320,7 +320,7 @@ Device Interface（如 BlockDevice / UART 设备）
 - **热替换**：在 Phase-1 替换模型（quiesce → stop → unbind → reset → replace → bind → start）基础上，向无感替换演进；
 - **验证工具链**：Kani / Loom / Miri / Verus 逐步引入；
 - **确定性测试**：Test Scheduler / Hunt Mode（CHESS 思路）；
-- **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、panic recovery —— 均推迟到显式未来里程碑；phase 1 只做 authority-backed 资源 revoke，不承诺共享堆字节回收。
+- **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、完整 panic recovery（内存回收 / 真隔离）—— 均推迟到显式未来里程碑；phase 1 已实现 init / task 边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，见 `component-model.md` §5.1），但只做 authority-backed 资源 revoke，不承诺共享堆字节回收。
 
 ## 9. 长期愿景
 
@@ -379,8 +379,10 @@ Power On
 | ELF `.fini_array` / 全局 dtor | 加载器不会自动获得该语义 |
 | Linux module unload | 正确参照：阻新用户 → refcount → module_exit → 清状态 → 释放内存 |
 
-**组件失效模型**：panic 恢复的正确姿势 = **边界隔离**（trap → Core 标记 Failed → 杀任务/
-隔离上下文），**不是** Rust stack unwinding（跨组件边界展开不安全）。正常回收由组件
+**组件失效模型**：panic 恢复的正确姿势 = **边界隔离**（组件跑在 Core 拥有的独立栈上；
+panic 时先打印诊断、再 stack-switch 回 Core 上下文 → Core 标记 Failed → 停止该 task /
+instance），**不是** Rust stack unwinding（跨组件边界展开不安全）。phase 1 已实现
+init / task 边界的协作式 containment（见 `component-model.md` §5.1）；正常回收由组件
 自己做（`kcomp_exit` 显式清理 / 组件内部 RAII drop）——参考 Theseus 的
 "组件失败 → 状态 Failed → 重启"模型。
 

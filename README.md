@@ -8,6 +8,7 @@
 
 ## 核心哲学
 
+- **少即是多：Core 做得越少，形态越多。** 默认外置——能安全、清晰外置的能力就不进 Core；Core 只提供稳定极小的 mechanism，策略与语义在上层可替换。不同信任等级使用不同边界（KernelNative / IsolatedNative / U-mode），**部署形态本身就是安全策略**；Core 提供 mechanism，不拥有 policy。
 - **Core owns truth. Components own policy and semantics.** Core 保存真实且不可撒谎的系统状态，并拥有为保存这份真相、推进 Core 自身资源/生命周期操作所必需的机制；Component 实现可替换的算法、策略与语义。
 - **Policy proposes, Core validates and commits.** 策略/调度器只能"提议"，由 Core 验证存在性、状态、所有权后才生效；物理帧分配本身是 Core 内部机制（canonical，不热卸载），不是"提议"的策略。
 - **Authority ≠ Interface。** 驱动拿类型化 Handle（`MmioHandle`/`IrqHandle`/`DmaHandle`...）获得 authority，不能靠知道裸地址/裸 IRQ 获得 authority（裸指针只存在于 Core 派生并持有 provenance 的 typed Lease 内部）；Interface 是语义，传输是绑定策略。
@@ -57,9 +58,10 @@ tools/         工具脚本（待建设）
 - **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
 - **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
 - **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令
-- **导出白名单**（EXPORT_SYMBOL 教学版，33 条 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询 + v2 语义入口——组件加载/接口发布/任务控制/调度 + C6 资源 authority `kcore_mmio_claim/read_u32/write_u32/release/lease` + `kcore_irq_claim/register/enable/register_polled/poll/ack` + DMA authority `kcore_dma_alloc/lease/release`，错误码统一 `0/-Errno`）：组件只能调白名单，未导出符号 → 加载失败
+- **导出白名单**（EXPORT_SYMBOL 教学版，一组 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询 + v2 语义入口——组件加载/接口发布/任务控制/调度 + C6 资源 authority `kcore_mmio_claim/read_u32/write_u32/release/lease` + `kcore_irq_claim/register/enable/register_polled/poll/ack` + DMA authority `kcore_dma_alloc/lease/release`，错误码统一 `0/-Errno`）：组件只能调白名单，未导出符号 → 加载失败
 - **Component Interface Registry**（骨架）：组件→组件依赖只走 Interface binding（publish/resolve/unbind，versioned vtable），不建立 flat ELF symbol 全局符号表
-- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy v1）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 12 项自检全 PASS（RV64+RV32）
+- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy v1）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 端到端自检全 PASS（RV64+RV32）
+- **组件 panic containment**（init + task 边界，协作式）：组件跑在 Core 拥有的独立栈上；panic 时先用直接 SBI 打印诊断（`[panic] component=<id> task=<id> at <loc>: <msg>`）再 stack-switch 回 Core 上下文，标记该 instance Failed 后重新调度。`panic=abort` 不变、无 unwinding，不承诺内存回收（containment ≠ fault isolation）。ArchTest `panic-containment` / `task-panic`（RV64+RV32）
 
 实机输出：
 
