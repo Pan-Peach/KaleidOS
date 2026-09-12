@@ -6,8 +6,11 @@
 //!   `.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表 /
 //!   **C4 执行链**（组件加载 → 接口发布/绑定 → 任务创建 → RR 调度 →
 //!   上下文切换 → yield/exit → 状态验证）/
-//!   **C6 MMIO 链**（claim 设备 → 经 handle 读真实寄存器）/
-//!   **C6 IRQ 链**（claim 设备中断线 → 注册处理函数 → 使能 → PLIC enable bit 读回）
+//!   **C6 MMIO 链**（claim 设备 → 经 handle 读真实寄存器 → lease 派生裸指针 →
+//!   write/read 回写 → release 后 handle 即失效）/
+//!   **C6 IRQ 链**（claim 设备中断线 → 注册处理函数 → 使能 → PLIC enable bit 读回 →
+//!   polled 轮询投递 → poll/ack 闭环）/
+//!   **C6 DMA 链**（用 MMIO handle 推导设备 → alloc → lease 写读回 → release → stale）
 //! - 只走导出白名单（`kcore_*`），无 god-mode；不直接触碰 TaskTable /
 //!   Registry / Sv39 / CpuContext —— 那是 Core 的真相
 //! - host 测试只覆盖纯逻辑；真实执行在核内
@@ -76,6 +79,12 @@ mod runtime {
         fn mmio_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_mmio_read_u32"]
         fn mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
+        #[link_name = "kcore_mmio_write_u32"]
+        fn mmio_write_u32(handle: u64, offset: u32, value: u32) -> i32;
+        #[link_name = "kcore_mmio_release"]
+        fn mmio_release(handle: u64) -> i32;
+        #[link_name = "kcore_mmio_lease"]
+        fn mmio_lease(handle: u64, out_ptr: *mut usize, out_len: *mut usize) -> i32;
 
         // C6：IRQ authority（status + out / status 形态，0 / -Errno）
         #[link_name = "kcore_irq_claim"]
@@ -84,6 +93,25 @@ mod runtime {
         fn irq_register(handle: u64, handler: extern "C" fn(*mut ()), ctx: *mut ()) -> i32;
         #[link_name = "kcore_irq_enable"]
         fn irq_enable(handle: u64) -> i32;
+        #[link_name = "kcore_irq_register_polled"]
+        fn irq_register_polled(handle: u64) -> i32;
+        #[link_name = "kcore_irq_poll"]
+        fn irq_poll(handle: u64, out_count: *mut u64) -> i32;
+        #[link_name = "kcore_irq_ack"]
+        fn irq_ack(handle: u64) -> i32;
+
+        // C6：DMA authority（alloc → lease → release，0 / -Errno）
+        #[link_name = "kcore_dma_alloc"]
+        fn dma_alloc(mmio_handle: u64, size: usize, direction: i32, out_handle: *mut u64) -> i32;
+        #[link_name = "kcore_dma_lease"]
+        fn dma_lease(
+            handle: u64,
+            out_ptr: *mut usize,
+            out_len: *mut usize,
+            out_device_addr: *mut u64,
+        ) -> i32;
+        #[link_name = "kcore_dma_release"]
+        fn dma_release(handle: u64) -> i32;
     }
 
     /// 组件侧 IRQ 处理函数（本用例只验证注册/投递链路，不做设备 ack）。
@@ -379,6 +407,67 @@ mod runtime {
             plic_written && (enable_word & (1 << 10)) != 0,
             11
         );
+
+        // C6 MMIO lease：对已 claim 的 virtio transport 一次性派生 (ptr, len)，
+        // 只读一个 u32（MagicValue）作证，不改设备状态。len 必须 = 映射长度。
+        let mut lease_ptr = 0usize;
+        let mut lease_len = 0usize;
+        let leased = unsafe { mmio_lease(mmio_handle, &mut lease_ptr, &mut lease_len) } == 0;
+        let lease_magic =
+            leased && unsafe { core::ptr::read_volatile(lease_ptr as *const u32) } == 0x7472_6976;
+        check!(
+            "mmio-lease",
+            leased && lease_len == 0x1000 && lease_magic,
+            12
+        );
+
+        // C6 MMIO 写：PLIC priority 寄存器是 RW，source id 1 未使用，只碰它的
+        // priority（offset 4 = 4*id），不 enable 该线；回读后还原为 0。
+        let wrote = unsafe { mmio_write_u32(plic, 4, 3) } == 0;
+        let mut priority = 0u32;
+        let priority_read = wrote && (unsafe { mmio_read_u32(plic, 4, &mut priority) } == 0);
+        check!("mmio-write-readback", priority_read && priority == 3, 13);
+        let _ = unsafe { mmio_write_u32(plic, 4, 0) };
+
+        // C6 MMIO release：显式撤销 authority 后同一 handle 立即失效（stale）。
+        // 这是本次最后一次引用 mmio_handle。
+        let released = unsafe { mmio_release(mmio_handle) } == 0;
+        let mut stale_magic = 0u32;
+        let stale_read = unsafe { mmio_read_u32(mmio_handle, 0, &mut stale_magic) };
+        check!("mmio-release", released && stale_read != 0, 14);
+
+        // C6 IRQ polled 链：把已 enable 的线切成轮询投递，读计数（run 中无 UART
+        // 中断 = 0），再 ack 闭环。不 enable 该线、不碰 UART IER/THR。
+        let polled = irq_enabled && unsafe { irq_register_polled(irq) } == 0;
+        let mut poll_count = 0u64;
+        let poll_read = polled && (unsafe { irq_poll(irq, &mut poll_count) } == 0);
+        let poll_acked = poll_read && (unsafe { irq_ack(irq) } == 0);
+        check!("irq-polled", poll_read && poll_count == 0 && poll_acked, 15);
+
+        // C6 DMA 链：用仍持有的 plic MmioHandle 推导设备身份，alloc → lease
+        // backing → 写读回 0xDEADBEEF → release → 后续 lease stale（进 quarantine）。
+        let mut dma = 0u64;
+        let dma_ok = unsafe { dma_alloc(plic, 8192, 2, &mut dma) } == 0;
+        let mut dma_ptr = 0usize;
+        let mut dma_len = 0usize;
+        let mut dma_devaddr = 0u64;
+        let dma_leased = dma_ok
+            && (unsafe { dma_lease(dma, &mut dma_ptr, &mut dma_len, &mut dma_devaddr) } == 0);
+        let dma_roundtrip = dma_leased
+            && dma_ptr != 0
+            && dma_len >= 8192
+            && dma_devaddr != 0
+            && unsafe {
+                core::ptr::write_volatile(dma_ptr as *mut u32, 0xDEAD_BEEF);
+                core::ptr::read_volatile(dma_ptr as *const u32) == 0xDEAD_BEEF
+            };
+        let dma_released = dma_roundtrip && (unsafe { dma_release(dma) } == 0);
+        let mut stale_ptr = 0usize;
+        let mut stale_len = 0usize;
+        let mut stale_addr = 0u64;
+        let dma_stale =
+            unsafe { dma_lease(dma, &mut stale_ptr, &mut stale_len, &mut stale_addr) } != 0;
+        check!("dma-ring", dma_roundtrip && dma_released && dma_stale, 16);
 
         report.group("summary");
         let all_ok = report.summary() && failed == 0;
