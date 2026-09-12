@@ -87,11 +87,16 @@ component wrapper
 | DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_init` |
 | UNDEFINED | 只允许显式放行的 `kcore_*` imports（对齐 §2.1 的 export 白名单） |
 
-- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_write`、`kcore_irq_*`、`kcore_map_*` ...）。
+- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_line`、`kcore_irq_*`、`kcore_mmio_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
 - **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
 - **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
 
-> 现状（step 1）：组件仍由 `rustc --emit=obj` 产出裸对象；裸 `.o` 无法携带 third-party `no_std` 依赖，这正是 step 2-3 要换成上述管线的原因。（组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
+> 现状（step 2）：上述管线已落地——组件编成 `staticlib`（SDK / 依赖随镜像私有携带），
+> 再由 `tools/build-kcomp.sh` 做 partial link + section GC + strip，产出 ET_REL `.kcomp`。
+> Makefile 与 `os/core/build.rs` 共用这一脚本，两条构建路径不再分叉；脚本在输出前校验
+> 「ET_REL + `kcomp_init` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
+> 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
+> （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
 
@@ -99,11 +104,17 @@ Core heap 是共享的（§3），但组件不裸调 Core 导出，中间有 SDK
 
 ```text
 GlobalAlloc   → component allocator adapter → kcore_heap_alloc / kcore_heap_dealloc → Core heap
-log crate     → component-local logger      → kcore_log_write                        → final sink
-panic handler → component panic adapter     → kcore_log_write + 边界提交失败（见 §5）  → —
+log crate     → component-local logger      → kcore_log_line                         → final sink
+panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸，见 §5） → —
 ```
 
 > 这不是"每个组件自带一个堆"：每个组件有自己的 adapter（满足 Rust 类型/宏契约），但**底层资源仍由 Core 统一管理**。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带。
+
+> 现状（step 2）：`os/components/kcomp-sdk` 是这一层的落地——它是 `kcore_*` 导出白名单的
+> 单一来源，提供 `kcomp_init!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
+> `#[panic_handler]`（打印诊断后调 `kcore_panic_escape` 协作式逃逸），以及 feature `alloc`
+> 下的 `#[global_allocator]`（接 Core 共享堆，无 per-component 堆）。SDK 是普通 library，
+> 编译进每个 `.kcomp`，不是可加载组件、也不是 shared runtime。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 

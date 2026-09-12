@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "kcomp-sdk"
+version = "0.1.0"
+
+[[package]]
 name = "kcomp_smoke"
 version = "0.1.0"
+dependencies = [
+ "kcomp-sdk",
+]

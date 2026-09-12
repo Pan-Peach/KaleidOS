@@ -17,6 +17,7 @@
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
 //! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
+//! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
 //! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_mmio_write_u32` `kcore_mmio_release` `kcore_mmio_lease` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` `kcore_irq_register_polled` `kcore_irq_poll` `kcore_irq_ack` | 设备认领 + 单次 MMIO 读写/释放 + 设备中断线认领/注册/使能：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`、`handle/irq.rs`）；常规访问 = 每次调用 Core 重新验证 handle 后才访问硬件。IRQ 投递两态：`register` = trap 上下文回调；`register_polled` + `poll`/`ack` = 轮询（Core 计数并掩蔽，驱动任务读完计数后 `ack` 由 Core 重新放行）。常规访问组件拿到的只是 raw handle，**不是地址/中断号**；`kcore_mmio_lease` 额外派生 Core 校验过一次的 `(ptr, len)` + provenance（受信 KernelNative 直接访问，撤销为协作式，见 `handle/lease.rs`）。全部 `0 / -Errno`、值走 out 参数 |
 //! | DMA authority（v3 起步） | `kcore_dma_alloc` `kcore_dma_lease` `kcore_dma_release` | `alloc` = 用 caller **已持有的 `MmioHandle`** 推导设备身份（绝不接受自报设备号）→ Core 分配物理连续 backing → grant `DmaHandle`；`lease` = Core 校验后派生 backing `(ptr, len)` + **设备可见地址**（v1 identity：== 物理基址，无 IOMMU）+ provenance；`release` = backing lease 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `handle/dma.rs`。全部 `0 / -Errno`、值走 out 参数 |
@@ -362,6 +363,26 @@ extern "C" fn kcore_task_state(id: u32) -> i32 {
             TaskState::Exited => 4,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Category 6（续）：Panic containment（v2；协作式 escape）
+// ---------------------------------------------------------------------------
+
+/// 组件 panic 协作式逃逸。组件 SDK 的 panic adapter 打印诊断后调用此入口，
+/// 把控制权交还 Core（在活动 containment 边界内会标记该 instance Failed 并切回
+/// Core 上下文，见 `component/containment.rs`）。
+///
+/// 语义：活动边界存在时触发 escape，**本函数永不返回**（控制权切回 Core，与 boot
+/// `#[panic_handler]` 直接调 `containment::panic_escape()` 等价，只是组件只能经
+/// 白名单符号调用）；无活动边界时返回 `-EPERM`（当前执行不在任何组件边界内，
+/// 没有可逃逸的目标）。
+extern "C" fn kcore_panic_escape() -> i32 {
+    // `panic_escape()` 只在无活动边界时返回（`false`）；有活动边界时它会切换回
+    // Core 而不会到达这里。因此任何返回都意味着"未发生逃逸"——报告 `-EPERM`
+    // 而不假装成功（`true` 在健康上下文后端下不可达）。
+    let _escaped = crate::component::containment::panic_escape();
+    Errno::EPERM.code()
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +735,7 @@ extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 33] = [
+static EXPORTS: [Export; 34] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -792,6 +813,11 @@ static EXPORTS: [Export; 33] = [
     Export {
         name: b"kcore_task_state",
         address: ExportAddress(kcore_task_state as *const ()),
+    },
+    // Category 6（续）：Panic containment（v2）
+    Export {
+        name: b"kcore_panic_escape",
+        address: ExportAddress(kcore_panic_escape as *const ()),
     },
     // Category 7：Scheduler（v2）
     Export {
@@ -894,6 +920,7 @@ mod tests {
             &b"kcore_task_yield"[..],
             &b"kcore_task_exit"[..],
             &b"kcore_task_state"[..],
+            &b"kcore_panic_escape"[..],
             &b"kcore_sched_run"[..],
             &b"kcore_mmio_claim"[..],
             &b"kcore_mmio_read_u32"[..],
@@ -931,6 +958,20 @@ mod tests {
     fn names_are_exact_not_prefix() {
         assert!(resolve(b"kcore_log_line2").is_none(), "禁止前缀匹配");
         assert!(resolve(b"x?kcore_log_line").is_none(), "禁止后缀匹配");
+    }
+
+    /// `kcore_panic_escape`：host 无活动 containment 边界时安全地返回 `-EPERM`
+    /// （不触发 context switch）。活动边界下永不返回，只能由 QEMU/ArchTest 验证。
+    #[test]
+    fn panic_escape_without_boundary_returns_eperm() {
+        // 其它测试会短暂安装 task guard；仅在确认无活动边界时断言，避免把并行
+        // 测试的 guard 当成真实边界而触发一次 context switch。
+        if crate::component::containment::active_escape().is_some() {
+            return;
+        }
+        let escape = resolve(b"kcore_panic_escape").expect("panic escape export registered");
+        let escape: extern "C" fn() -> i32 = unsafe { core::mem::transmute(escape) };
+        assert_eq!(escape(), Errno::EPERM.code());
     }
 
     /// v3 资源 authority API 的错误约定：`0 / -Errno`，值走 out 参数。

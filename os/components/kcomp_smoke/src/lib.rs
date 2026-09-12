@@ -1,18 +1,12 @@
-//! kcomp_smoke —— 第二个 .kcomp 组件（升级版）：
-//! 通过导出表（白名单）调用内核函数，验证重定位链路（UNDEF 符号表解析 + 组件内符号）。
+//! kcomp_smoke —— SDK 参考组件（step 2 C）。
+//!
+//! 通过 Component SDK 调用 `kcore_*` 白名单（不再自己写 extern / console helper），
+//! 验证链接后的 `.kcomp` 重定位链路（UNDEF 只解析白名单符号），并保持与迁移前
+//! 相同的可观测行为：输出 `[smoke] hex=<n>\n!`（`n` = 组件数 + 空闲页数）。
 
 #![no_std]
 
-// 白名单 API 声明：未 mangled 精确名 + C ABI（与内核 `export.rs` 一一对应）。
-// 签名错 = UB（声明即契约），loader 只按名字解析，不校验签名。
-unsafe extern "C" {
-    #[link_name = "kcore_console_write_byte"]
-    fn console_write_byte(byte: u8);
-    #[link_name = "kcore_component_count"]
-    fn component_count() -> u32;
-    #[link_name = "kcore_free_page_count"]
-    fn free_page_count() -> u32;
-}
+use kcomp_sdk::abi;
 
 fn hex_digit(d: u32) -> u8 {
     if d < 10 {
@@ -29,9 +23,7 @@ fn write_hex(v: u32) {
     loop {
         let d = (v >> shift) & 0xF;
         if started || d != 0 || shift == 0 {
-            unsafe {
-                console_write_byte(hex_digit(d));
-            }
+            kcomp_sdk::console_write_byte(hex_digit(d));
             started = true;
         }
         if shift == 0 {
@@ -42,21 +34,19 @@ fn write_hex(v: u32) {
 }
 
 fn do_smoke() -> u32 {
-    unsafe { component_count().wrapping_add(free_page_count()) }
+    // SAFETY: 两个只读查询导出无参数、无所有权语义。
+    let components = unsafe { abi::kcore_component_count() };
+    let free_pages = unsafe { abi::kcore_free_page_count() };
+    components.wrapping_add(free_pages)
 }
 
-/// 组件入口：加载器在放段 + 重定位之后调用。
-/// 返回约定（Linux insmod 风格）：0 = 加载成功；非 0 = 加载失败。
-#[unsafe(no_mangle)]
-pub extern "C" fn kcomp_init() -> i32 {
+kcomp_sdk::kcomp_init!({
     let n = do_smoke();
-    unsafe {
-        for &c in "[smoke] hex=".as_bytes() {
-            console_write_byte(c);
-        }
-        write_hex(n);
-        console_write_byte(b'\n');
-        console_write_byte(b'!');
+    for &c in "[smoke] hex=".as_bytes() {
+        kcomp_sdk::console_write_byte(c);
     }
+    write_hex(n);
+    kcomp_sdk::console_write_byte(b'\n');
+    kcomp_sdk::console_write_byte(b'!');
     0
-}
+});

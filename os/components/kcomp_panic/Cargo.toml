@@ -1,12 +1,12 @@
 [package]
-name = "kcomp_min"
+name = "kcomp_panic"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
+# 独立编译单元（同 kcomp_smoke / kcomp_min）。
 [workspace]
 
-# host 测试 fixture：同样走链接管线（SDK panic adapter 随镜像携带）。
 [lib]
 crate-type = ["staticlib"]
 

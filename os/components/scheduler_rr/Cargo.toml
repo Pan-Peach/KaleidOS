@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# .kcomp 走链接管线（staticlib）；kcomp-sdk 仅提供组件私有 panic adapter。
+[lib]
+crate-type = ["staticlib"]
+
 [dependencies]
+kcomp-sdk = { path = "../kcomp-sdk" }

@@ -25,17 +25,21 @@ ARCH_CONF = {
     "rv32": {"qemu": "qemu-system-riscv32", "mem": "1G"},
 }
 
+# (case name, expected scause, required serial substring)
 CASES = (
-    ("mapping", None),
-    ("context-switch", None),
-    ("panic-containment", None),
-    ("task-panic", None),
-    ("illegal-instruction", 2),
-    ("load-fault", 13),
-    ("store-readonly", 15),
-    ("execute-nx", 12),
-    ("timer", None),
-    ("external-irq", None),
+    ("mapping", None, None),
+    ("context-switch", None, None),
+    ("panic-containment", None, None),
+    ("task-panic", None, None),
+    # step 2 D: a real .kcomp panics via its own SDK panic adapter; Core must
+    # survive and the adapter's diagnostic line must reach the serial console.
+    ("panic-component", None, "[kcomp] panic"),
+    ("illegal-instruction", 2, None),
+    ("load-fault", 13, None),
+    ("store-readonly", 15, None),
+    ("execute-nx", 12, None),
+    ("timer", None, None),
+    ("external-irq", None, None),
 )
 
 
@@ -125,7 +129,9 @@ def log_path(arch: str, name: str) -> str:
     return os.path.join(LOGS_DIR, f"{arch}-archtest-{name}-{stamp}.log")
 
 
-def run_case(arch: str, name: str, expected_scause: int | None) -> None:
+def run_case(
+    arch: str, name: str, expected_scause: int | None, required_text: str | None
+) -> None:
     """Boot a fresh QEMU process and judge exactly one architectural test."""
     conf = ARCH_CONF[arch]
     kernel = os.path.join(REPO, f"kaleidos-{arch}-selftest")
@@ -151,6 +157,8 @@ def run_case(arch: str, name: str, expected_scause: int | None) -> None:
         proc.stdin.flush()
         if expected_scause is None:
             output = wait_for_non_faulting_pass(proc, output, name)
+            if required_text is not None and required_text not in output:
+                raise RunFailure(f"missing required serial text {required_text!r}")
             print(f"[arch-{arch}] {name}: PASS")
         else:
             output = wait_for_fault(proc, output, expected_scause)
@@ -185,9 +193,9 @@ def main() -> int:
 
     os.makedirs(LOGS_DIR, exist_ok=True)
     failures = 0
-    for name, expected_scause in CASES:
+    for name, expected_scause, required_text in CASES:
         try:
-            run_case(arch, name, expected_scause)
+            run_case(arch, name, expected_scause, required_text)
         except RunFailure:
             failures += 1
 

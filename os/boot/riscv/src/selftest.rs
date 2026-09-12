@@ -133,6 +133,7 @@ pub fn run(info: &MachineInfo) -> ! {
         b"context-switch" => context_switch(),
         b"panic-containment" => panic_containment(),
         b"task-panic" => task_panic(),
+        b"panic-component" => panic_component(),
         b"illegal-instruction" => illegal_instruction(),
         b"load-fault" => load_fault(),
         b"store-readonly" => store_readonly_fault(),
@@ -227,6 +228,34 @@ fn task_panic() -> ! {
 
 extern "C" fn task_panic_entry() -> ! {
     panic!("component task panic");
+}
+
+/// step 2 D：**真实 `.kcomp`** 的 panic containment。
+///
+/// 从内嵌 kpkg 加载 `kcomp_panic`。它的 `kcomp_init` 刻意 `panic!`，进入的是
+/// **组件镜像自己的** SDK panic adapter（不是 boot panic handler）；adapter 经
+/// `kcore_log_line` 打印诊断后调 `kcore_panic_escape`，逃逸回 Core 的 init
+/// containment 边界。这里断言：Core 存活、该 instance 被提交为 Failed；诊断行
+/// 由 `arch_runner.py` 在串口输出上断言。
+fn panic_component() -> ! {
+    use kernel::component::load::ComponentLoadError;
+    match kernel::component::load::load_and_start(b"kcomp_panic") {
+        Err(ComponentLoadError::InitPanicked) => {}
+        Ok(_) => fail("panic-component: component did not panic"),
+        Err(_) => fail("panic-component: unexpected load error"),
+    }
+    let failed = kernel::component::registry::get_registry()
+        .lock()
+        .iter()
+        .any(|record| {
+            record.name.as_slice() == b"kcomp_panic"
+                && record.state == kernel::component::ComponentState::Failed
+        });
+    if failed {
+        pass("panic-component")
+    } else {
+        fail("panic-component: instance not marked Failed")
+    }
 }
 
 extern "C" fn task_normal_entry() -> ! {

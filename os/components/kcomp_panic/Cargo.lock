@@ -7,7 +7,7 @@ name = "kcomp-sdk"
 version = "0.1.0"
 
 [[package]]
-name = "kcomp_min"
+name = "kcomp_panic"
 version = "0.1.0"
 dependencies = [
  "kcomp-sdk",

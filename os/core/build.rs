@@ -16,6 +16,20 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let target_dir = out.join("component-target");
 
+    // 组件 → .kcomp 的单一构建管线（与 Makefile 共用 tools/build-kcomp.sh）：
+    // staticlib → rust-lld -r --gc-sections -u kcomp_init → strip。host 测试
+    // fixture（<name>.kcomp / init.kpkg / smoke_min.kcomp）保持不变。
+    let script = repo.join("tools/build-kcomp.sh");
+    println!("cargo:rerun-if-changed={}", script.display());
+    let sdk_dir = repo.join("os/components/kcomp-sdk");
+    for changed in [
+        sdk_dir.join("Cargo.toml"),
+        sdk_dir.join("src/lib.rs"),
+        repo.join("tools/build-kcomp.sh"),
+    ] {
+        println!("cargo:rerun-if-changed={}", changed.display());
+    }
+
     let components = ["core_test", "kcomp_smoke", "kcomp_min"];
     let mut objects = Vec::new();
     for name in components {
@@ -28,12 +42,16 @@ fn main() {
             "cargo:rerun-if-changed={}",
             component_dir.join("src/lib.rs").display()
         );
-        run_component_build(&component_dir, &target_dir, target);
-        let object = find_object(&target_dir, name, target)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
         let destination = out.join(format!("{name}.kcomp"));
-        fs::copy(object, &destination).unwrap();
-        objects.push((name, fs::read(destination).unwrap()));
+        run_kcomp_build(
+            &script,
+            &component_dir,
+            name,
+            target,
+            &destination,
+            &target_dir,
+        );
+        objects.push((name, fs::read(&destination).unwrap()));
     }
 
     write_newc(
@@ -46,48 +64,36 @@ fn main() {
     fs::copy(out.join("kcomp_min.kcomp"), out.join("smoke_min.kcomp")).unwrap();
 }
 
-fn run_component_build(component_dir: &Path, target_dir: &Path, target: &str) {
-    let status = Command::new("cargo")
-        .current_dir(component_dir)
+/// 调用共享构建脚本（与 Makefile 同一条管线），失败即 panic。
+fn run_kcomp_build(
+    script: &Path,
+    component_dir: &Path,
+    name: &str,
+    target: &str,
+    destination: &Path,
+    target_dir: &Path,
+) {
+    let status = Command::new(script)
         .args([
-            "rustc",
-            "--release",
-            "--target",
+            component_dir.to_str().unwrap(),
+            name,
             target,
-            "--target-dir",
+            destination.to_str().unwrap(),
             target_dir.to_str().unwrap(),
-            "--",
-            "--emit=obj",
         ])
         .status()
         .unwrap_or_else(|error| {
             panic!(
-                "failed to run cargo for {}: {error}",
+                "failed to run {} for {}: {error}",
+                script.display(),
                 component_dir.display()
             )
         });
     assert!(
         status.success(),
-        "cargo failed for {}",
+        "kcomp build failed for {}",
         component_dir.display()
     );
-}
-
-fn find_object(target_dir: &Path, name: &str, target: &str) -> Result<PathBuf, String> {
-    let deps = target_dir.join(target).join("release").join("deps");
-    let entries =
-        fs::read_dir(&deps).map_err(|error| format!("read {}: {error}", deps.display()))?;
-    for entry in entries {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if path.extension().is_some_and(|extension| extension == "o")
-            && path
-                .file_name()
-                .is_some_and(|file| file.to_string_lossy().starts_with(&format!("{name}-")))
-        {
-            return Ok(path);
-        }
-    }
-    Err(format!("object not found in {}", deps.display()))
 }
 
 fn write_newc(path: &Path, files: &[(&str, Vec<u8>)]) {

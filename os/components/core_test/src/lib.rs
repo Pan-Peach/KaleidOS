@@ -17,6 +17,10 @@
 
 #![no_std]
 
+// 组件私有 panic adapter（kcomp-sdk）：只提供裸机 #[panic_handler] + 链接期
+// Rust support，符号未被引用时被 --gc-sections 丢弃。
+use kcomp_sdk as _;
+
 #[cfg(test)]
 extern crate std;
 

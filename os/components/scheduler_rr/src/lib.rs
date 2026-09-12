@@ -12,6 +12,10 @@
 
 #![no_std]
 
+// 组件私有 panic adapter（kcomp-sdk）：只提供裸机 #[panic_handler]；本组件的
+// 白名单 ABI 声明保留在此（未被引用的符号由 GC 丢弃）。
+use kcomp_sdk as _;
+
 #[cfg(test)]
 extern crate std;
 

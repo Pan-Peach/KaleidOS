@@ -40,21 +40,19 @@ OUTPUT    := kaleidos-$(ARCH)
 .PHONY: kernel qemu clean init.kpkg
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
-# 组件名 → 源码目录；每个组件编译成 ET_REL 对象（= .kcomp）
-KCOMP_COMPONENTS := core_test kcomp_smoke scheduler_rr
-KCOMP_DIRS := $(addprefix os/components/,$(KCOMP_COMPONENTS))
+# 每个组件经共享管线 tools/build-kcomp.sh 构建成**链接后的** .kcomp（ET_REL 组件程序）：
+# staticlib → rust-lld -r --gc-sections -u kcomp_init → strip → 白名单/重定位契约校验。
+KCOMP_COMPONENTS := core_test kcomp_smoke scheduler_rr kcomp_panic
 KPKG_DIR   := /tmp/opencode/kpkg
+KPKG_BUILD := /tmp/opencode/kpkg-build
 
-# 构建所有组件对象（ET_REL）→ 统一打包 init.kpkg（cpio newc + manifest）
+# 构建所有组件 .kcomp → 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
-	@for d in $(KCOMP_DIRS); do \
-		( cd $$d && RUSTFLAGS="$(REMAP_RUSTFLAGS)" cargo rustc --release --target $(TARGET) -- --emit=obj ); \
-	done
-	@mkdir -p $(KPKG_DIR)
-	@for d in $(KCOMP_DIRS); do \
-		name=$$(basename $$d); \
-		obj=$$(find $$d/target/$(TARGET)/release/deps target/$(TARGET)/release/deps -maxdepth 1 -name "$$name-*.o" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
-		cp $$obj $(KPKG_DIR)/$$name.kcomp; \
+	@set -e; mkdir -p $(KPKG_DIR); \
+	for name in $(KCOMP_COMPONENTS); do \
+		RUSTFLAGS="$(REMAP_RUSTFLAGS)" tools/build-kcomp.sh \
+			$(CURDIR)/os/components/$$name $$name $(TARGET) \
+			$(KPKG_DIR)/$$name.kcomp $(KPKG_BUILD); \
 	done
 	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest
 	@mkdir -p $(CURDIR)/tools/qemu
@@ -92,14 +90,19 @@ clean:
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
 
-# 代码格式化（rustfmt）
+# 代码格式化（rustfmt）；kcomp-sdk 是独立 workspace（root exclude），单独 fmt。
 fmt:
 	cargo fmt $(OUR_CRATES)
+	cd os/components/kcomp-sdk && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
+# core_test / scheduler_rr 的 lib 是 staticlib（最终产物，需裸机 panic handler），
+# host 无法完成其静态链接，因此对它们按真实目标 $(TARGET) 做 clippy。
 clippy:
-	cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr
+	cargo clippy -p core_test -p scheduler_rr --target $(TARGET)
+	cd os/components/kcomp-sdk && cargo clippy --all-targets
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU）
 test-host:
@@ -147,7 +150,10 @@ test-arch: test-arch-rv64 test-arch-rv32
 # 依赖 $(INITPKG_O)：boot 链接需要 .initpkg 对象存在
 check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
+	cd os/components/kcomp-sdk && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
+	cargo clippy -p core_test -p scheduler_rr --target $(TARGET) -- -D warnings
+	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	$(MAKE) test-host
 	$(MAKE) test-build
