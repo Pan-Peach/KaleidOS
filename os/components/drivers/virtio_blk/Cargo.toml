@@ -1,0 +1,14 @@
+[package]
+name = "kcomp_virtio_blk"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk" }
+virtio-drivers = { version = "0.13.0", default-features = false }

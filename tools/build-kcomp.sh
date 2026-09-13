@@ -10,27 +10,35 @@
 #     → .kcomp（ET_REL；UNDEF 只允许白名单 kcore_*；kcomp_init DEFINED）
 #
 # 用法：
-#   tools/build-kcomp.sh <component-dir> <name> <target> <output> [<target-dir>]
+#   tools/build-kcomp.sh <component-dir> <target> <output> [<target-dir>]
 #
 #   component-dir  含 Cargo.toml 的组件目录（manifest 需声明 crate-type=["staticlib"]）
-#   name           cargo 包名（决定 lib<name>.a；`-` 会映射为 `_`）
 #   target         rust target triple（riscv64gc-... / riscv32imac-...）
 #   output         输出的 .kcomp 路径
 #   target-dir     cargo 产物目录（默认 <component-dir>/target）
+#
+# 包名从 component-dir/Cargo.toml 读取（目录名可与包名不同，如 drivers/virtio_blk
+# 的包名是 kcomp_virtio_blk）——避免构建脚本与 cargo 包名强耦合。
 
 set -euo pipefail
 
-if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
-    echo "usage: $0 <component-dir> <name> <target> <output> [<target-dir>]" >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    echo "usage: $0 <component-dir> <target> <output> [<target-dir>]" >&2
     exit 2
 fi
 
 component_dir=$1
-name=$2
-target=$3
-output=$4
-target_dir=${5:-"$component_dir/target"}
-lib_name=${name//-/_}
+target=$2
+output=$3
+target_dir=${4:-"$component_dir/target"}
+
+# 包名（Cargo.toml [package] 的第一个 name）= staticlib 文件名 lib<pkg>.a。
+pkg=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' "$component_dir/Cargo.toml" | head -1)
+if [ -z "$pkg" ]; then
+    echo "build-kcomp: cannot read package name from $component_dir/Cargo.toml" >&2
+    exit 1
+fi
+lib_name=${pkg//-/_}
 
 cargo_bin=${CARGO:-cargo}
 rustc_bin=${RUSTC:-rustc}

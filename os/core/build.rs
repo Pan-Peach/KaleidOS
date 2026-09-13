@@ -43,14 +43,7 @@ fn main() {
             component_dir.join("src/lib.rs").display()
         );
         let destination = out.join(format!("{name}.kcomp"));
-        run_kcomp_build(
-            &script,
-            &component_dir,
-            name,
-            target,
-            &destination,
-            &target_dir,
-        );
+        run_kcomp_build(&script, &component_dir, target, &destination, &target_dir);
         objects.push((name, fs::read(&destination).unwrap()));
     }
 
@@ -68,7 +61,6 @@ fn main() {
 fn run_kcomp_build(
     script: &Path,
     component_dir: &Path,
-    name: &str,
     target: &str,
     destination: &Path,
     target_dir: &Path,
@@ -76,7 +68,6 @@ fn run_kcomp_build(
     let status = Command::new(script)
         .args([
             component_dir.to_str().unwrap(),
-            name,
             target,
             destination.to_str().unwrap(),
             target_dir.to_str().unwrap(),

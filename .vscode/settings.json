@@ -1,7 +1,8 @@
 {
   "rust-analyzer.linkedProjects": [
     "Cargo.toml",
-    "os/boot/riscv/Cargo.toml"
+    "os/boot/riscv/Cargo.toml",
+    "os/components/drivers/virtio_blk/Cargo.toml"
   ],
   // 裸机 #![no_std] bin 无 test crate；默认 allTargets=true 会让 rust-analyzer
   // 尝试检查 test target 并报 "can't find crate for 'test'"（编辑器误报）。

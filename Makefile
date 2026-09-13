@@ -42,22 +42,25 @@ OUTPUT    := kaleidos-$(ARCH)
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 每个组件经共享管线 tools/build-kcomp.sh 构建成**链接后的** .kcomp（ET_REL 组件程序）：
 # staticlib → rust-lld -r --gc-sections -u kcomp_init → strip → 白名单/重定位契约校验。
-KCOMP_COMPONENTS := core_test kcomp_smoke scheduler_rr kcomp_panic
-KPKG_DIR   := /tmp/opencode/kpkg
-KPKG_BUILD := /tmp/opencode/kpkg-build
+# 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
+KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk
+# 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
+KPKG_DIR   := $(CURDIR)/build/kpkg
+KPKG_BUILD := $(CURDIR)/build/kpkg-build
 
 # 构建所有组件 .kcomp → 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
-	@set -e; mkdir -p $(KPKG_DIR); \
-	for name in $(KCOMP_COMPONENTS); do \
+	@rm -rf $(KPKG_DIR)
+	@mkdir -p $(KPKG_DIR) $(KPKG_BUILD) $(CURDIR)/tools/qemu
+	@for src in $(KCOMP_SRCS); do \
+		n=$$(basename $$src); \
 		RUSTFLAGS="$(REMAP_RUSTFLAGS)" tools/build-kcomp.sh \
-			$(CURDIR)/os/components/$$name $$name $(TARGET) \
-			$(KPKG_DIR)/$$name.kcomp $(KPKG_BUILD); \
+			$(CURDIR)/os/components/$$src $(TARGET) \
+			$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD) || exit 1; \
+		echo $$n >> $(KPKG_DIR)/manifest; \
 	done
-	@echo "$(KCOMP_COMPONENTS)" | tr ' ' '\n' > $(KPKG_DIR)/manifest
-	@mkdir -p $(CURDIR)/tools/qemu
 	cd $(KPKG_DIR) && find . -type f | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
-	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_COMPONENTS))"
+	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS))"
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 kernel: init.kpkg
@@ -75,6 +78,7 @@ qemu: kernel
 clean:
 	rm -f $(OUTPUT)
 	rm -f tools/qemu/init.kpkg
+	rm -rf $(CURDIR)/build
 	cd $(BOOT_DIR) && cargo clean --release
 
 # —— 质量工具链（fmt / clippy / check / 测试通道）——
@@ -107,6 +111,7 @@ clippy:
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU）
 test-host:
 	cargo test --workspace
+	cd os/components/kcomp-sdk && cargo test
 
 # 性能基线（host release，手动跑）：ns/call 量级；基线用例见 handle/mmio.rs bench_*
 bench:
