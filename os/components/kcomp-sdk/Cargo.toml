@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 # 组件 SDK / CRT：随 .kcomp 私有携带（编译进组件镜像），不是可加载组件本身，
-# 因此不加入 KCOMP_COMPONENTS。独立 workspace：root 侧用 exclude 隔离，
+# 因此不加入 Makefile 的组件列表（KCOMP_SRCS）。独立 workspace：root 侧用 exclude 隔离，
 # 既让 root 成员（core_test / scheduler_rr）能 path 依赖，又让 standalone
 # 组件（kcomp_smoke / kcomp_min / kcomp_panic）能 path 依赖。
 [workspace]

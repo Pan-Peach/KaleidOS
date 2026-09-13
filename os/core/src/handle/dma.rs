@@ -52,6 +52,22 @@ pub enum DmaDirection {
     Bidirectional,
 }
 
+impl DmaDirection {
+    /// ABI 编码（`kcore_dma_alloc` 的 `direction` 参数）。
+    ///
+    /// **这是 Component ABI 的一部分**：`0 = ToDevice` / `1 = FromDevice` /
+    /// `2 = Bidirectional`（见 `docs/driver-model.md` §6.2）。`kcomp-sdk` 镜像同一
+    /// 组值；改动必须同步 `component/export.rs::dma_direction_from_i32`、本函数与
+    /// SDK 的 `DmaDirection`（两侧各有锚定测试钉住 0/1/2）。
+    pub const fn as_i32(self) -> i32 {
+        match self {
+            DmaDirection::ToDevice => 0,
+            DmaDirection::FromDevice => 1,
+            DmaDirection::Bidirectional => 2,
+        }
+    }
+}
+
 /// 一个 DMA 资源对象：一段 Core 拥有的物理连续内存。
 ///
 /// `device_index` 从 caller 已持有的 `MmioHandle` 推导（不是组件自报）；

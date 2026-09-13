@@ -960,6 +960,21 @@ mod tests {
         assert!(resolve(b"x?kcore_log_line").is_none(), "禁止后缀匹配");
     }
 
+    /// DMA 方向 ABI 编码锚定（`docs/driver-model.md` §6.2）：`as_i32` 与解码
+    /// `dma_direction_from_i32` 必须互为逆，且值固定为 0/1/2；`kcomp-sdk` 的镜像
+    /// 枚举同值（SDK 侧有对应测试 `dma_direction_encoding_is_stable`）。
+    #[test]
+    fn dma_direction_encoding_is_stable() {
+        use crate::handle::dma::DmaDirection::{Bidirectional, FromDevice, ToDevice};
+        assert_eq!(ToDevice.as_i32(), 0);
+        assert_eq!(FromDevice.as_i32(), 1);
+        assert_eq!(Bidirectional.as_i32(), 2);
+        for direction in [ToDevice, FromDevice, Bidirectional] {
+            assert_eq!(dma_direction_from_i32(direction.as_i32()), Some(direction));
+        }
+        assert_eq!(dma_direction_from_i32(3), None, "越界编码必须被拒绝");
+    }
+
     /// `kcore_panic_escape`：host 无活动 containment 边界时安全地返回 `-EPERM`
     /// （不触发 context switch）。活动边界下永不返回，只能由 QEMU/ArchTest 验证。
     #[test]

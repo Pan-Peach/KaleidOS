@@ -24,6 +24,10 @@
 
 #![no_std]
 
+// host 测试用（`cargo test`）；裸机目标不编入。
+#[cfg(test)]
+extern crate std;
+
 /// `kcore_*` 导出 ABI（EXPORT_SYMBOL 教学版）。
 ///
 /// 声明即契约：名字必须与 Core `component/export.rs` 的白名单逐字节一致，签名
@@ -146,6 +150,37 @@ pub mod abi {
         pub fn kcore_irq_poll(handle: u64, out_count: *mut u64) -> i32;
         #[link_name = "kcore_irq_ack"]
         pub fn kcore_irq_ack(handle: u64) -> i32;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DMA 方向：ABI 编码的类型化镜像
+// ---------------------------------------------------------------------------
+
+/// DMA 传输方向。**这是 Component ABI 的一部分**：编码 `0/1/2`，与 Core
+/// `handle/dma.rs::DmaDirection::as_i32` 及 `kcore_dma_alloc` 的 `direction`
+/// 参数一致（见 `docs/driver-model.md` §6.2）。
+///
+/// Core 与 SDK 各自持有一份声明（组件不能依赖 `os/core`——那会把 Core 的 Rust
+/// 类型与代码带进 `.kcomp`，违反"不建 shared runtime / 组件只经 `kcore_*` 交互"）；
+/// 两侧各有锚定测试把值钉死在 0/1/2，防止漂移。设备库的枚举（如
+/// `virtio_drivers::BufferDirection`）到本枚举的映射写在**驱动组件**里（纯类型
+/// 匹配，不出现数字）。
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaDirection {
+    /// 内存 → 设备。
+    ToDevice = 0,
+    /// 设备 → 内存。
+    FromDevice = 1,
+    /// 双向。
+    Bidirectional = 2,
+}
+
+impl DmaDirection {
+    /// ABI 编码（`#[repr(i32)]`，恒等于判别值）。
+    pub const fn as_i32(self) -> i32 {
+        self as i32
     }
 }
 
@@ -292,4 +327,18 @@ mod global_alloc {
 
     #[global_allocator]
     static CORE_HEAP: CoreHeap = CoreHeap;
+}
+
+#[cfg(test)]
+mod tests {
+    //! host 锚定测试：钉住 ABI 编码（`docs/driver-model.md` §6.2）。
+    //! Core 侧有对应测试 `component::export::tests::dma_direction_encoding_is_stable`。
+
+    #[test]
+    fn dma_direction_encoding_is_stable() {
+        use super::DmaDirection::{Bidirectional, FromDevice, ToDevice};
+        assert_eq!(ToDevice.as_i32(), 0);
+        assert_eq!(FromDevice.as_i32(), 1);
+        assert_eq!(Bidirectional.as_i32(), 2);
+    }
 }
