@@ -374,6 +374,8 @@ runtime:
 - `DmaRegion.direction` 的枚举形状 —— **已决**：`DmaDirection { ToDevice, FromDevice, Bidirectional }`（ABI 编码 0/1/2）。同时定案：设备可见地址 v1 identity（== 物理基址，无 IOMMU），经 `DmaLease` 暴露给受信 KernelNative；DMA 撤销为协作式 + quarantine（设备静默前不 free，见 §5 / §7）；
 - `kcore_irq_poll` 的精确签名与返回值形状（单事件 / 计数 / 批量）——**已决**：采用「计数」，配套 `kcore_irq_register_polled` / `kcore_irq_ack`，见 §13；
 - `RequestContext.task` 是否可为空（非任务上下文的 IRQ/设备路径）；
+- **`kcore_mmio_claim` 的设备选择（接口灵活性）**：当前只做"第一台 compatible 匹配且未被认领"（`handle/mmio.rs::claim`）。QEMU 上 `virtio,mmio` 有 8 台同 compatible 设备，组件无法**精确选择**目标；prober 识别出"块设备是第 k 台"后，driver 仍只能重扫、或靠"握住被拒 handle 再释放"推顺序。候选方案：`claim(compatible, selector)`（匹配序号，discovery 顺序稳定）或增加**只读枚举**（列候选、不授权）。约束：读 virtio-mmio `DeviceID` 本身就需要 MMIO 访问（claim + lease），探测无法完全无副作用。**同一根问题也在 `kcore_irq_claim`**：它同样按 compatible 取第一台未认领，不保证与 driver 认领的 MMIO 是**同一台设备**（多设备时 IRQ 可能错配）；候选方案是让它收 `MmioHandle`，由它推出同台设备的 `device_index` / irq。
+- **组件间 authority 转移（handle transfer）**：让 prober 把自己已认领的 `MmioHandle` 直接交给 driver，需要 Core 支持**跨组件所有权转移**；更根本的缺口是**组件寻址**——组件彼此拿不到 `ComponentId`（Core 不允许自报身份），Interface Registry 的 binding 也不是可寻址 id。属"完整 capability 系统"，语义未定（move / copy、能否降权、能否再传递、撤销如何传播）。当前 §9.1 的"设备驱动自己向 Core claim"正是为绕开它而选；待出现真实 broker 场景（如 FS server 把块设备能力转交给另一个 server）再定。
 - 阶段 5 中 timer 控制、H·PMP、IOMMU 的具体接口。
 
 ## 13. 已决
