@@ -56,6 +56,11 @@ const COMMANDS: &[Command] = &[
         run: cmds::components,
     },
     Command {
+        name: "catalog",
+        help: "list components found in the store (loadable); [loaded] marks loaded ones",
+        run: cmds::catalog,
+    },
+    Command {
         name: "shutdown",
         help: "shutdown the system",
         run: cmds::shutdown,

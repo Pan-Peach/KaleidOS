@@ -139,6 +139,39 @@ pub fn components(_line: &[u8]) {
     }
 }
 
+/// `catalog`：列出仓库里**已找到**（可 `load`）的组件，并标注是否已加载。
+///
+/// 与 `components`（只列已加载）互补：这是"内核找到了哪些组件"的清单。
+pub fn catalog(_line: &[u8]) {
+    let Some(store) = crate::component::store::get_component_store() else {
+        printk!("catalog: component store not mounted\n");
+        return;
+    };
+    let entries = match store.list() {
+        Ok(entries) => entries,
+        Err(error) => {
+            printk!("catalog: list failed: {error:?}\n");
+            return;
+        }
+    };
+    let reg = crate::component::registry::get_registry().lock();
+    let mut count = 0usize;
+    for entry in &entries {
+        let Some(stem) = entry.name.strip_suffix(b".kcomp") else {
+            continue;
+        };
+        let loaded = reg.iter().any(|record| record.name.as_slice() == stem);
+        printk!(
+            "  {} ({} bytes){}\n",
+            String::from_utf8_lossy(stem),
+            entry.len,
+            if loaded { " [loaded]" } else { "" }
+        );
+        count += 1;
+    }
+    printk!("catalog: {count} available (load <name>)\n");
+}
+
 pub fn shutdown(_line: &[u8]) {
     ResetImpl::system_reset(ResetType::Shutdown);
 }
