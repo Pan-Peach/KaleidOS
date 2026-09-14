@@ -46,6 +46,18 @@
 //!
 //! 旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容，迁移单独评估。
 //!
+//! # 身份解析与 Failed 门禁
+//!
+//! - **principal = 最内层当前活动的 Core-managed 执行边界**
+//!   （`containment::active_escape`）：组件任务 → task owner；`kcomp_init`
+//!   （含**嵌套加载**）→ 被初始化的组件；嵌套 init 返回/panic 后恢复上一层边界。
+//!   所有 authority / task / interface 入口统一走 `RequestContext::ambient()` /
+//!   `ambient_init()`，不再各自偏好当前任务 owner。
+//! - **Failed 实例门禁**：获取 authority / 创建 work 的入口
+//!   （`kcore_mmio_claim`、`kcore_irq_claim`、`kcore_dma_alloc`、`kcore_task_create`、
+//!   `kcore_interface_publish`）在 caller/provider 已 `Failed` 时返回 `-EPERM`；
+//!   `release` / `revoke` 及已持有 handle 的操作**不受此门禁限制**，teardown 仍可用。
+//!
 //! # 明确不导出（未经 Core validation 的裸 authority mutation）
 //!
 //! 组件可以 **request** 资源（v3+ 的 `kcore_device_nth` + `kcore_mmio_claim` = discover + request → Core
@@ -262,8 +274,10 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
 ///
 /// `kcomp_init` 返回 0 后 Core 原子提交该组件的 pending interfaces；ABI 冲突的
 /// replacement 在提交时被拒绝。因此本函数返回 `0` 只表示"已记录 pending"。
-/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在组件 init 上下文；
-/// 其余见 `Errno::from(InterfaceError)`）。
+/// provider 由最内层活动 init 边界解析（嵌套加载 = 被初始化的组件），不信任组件
+/// 自报身份；`Failed` provider → `-EPERM`。
+/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在组件 init 上下文或
+/// provider 已 `Failed`；其余见 `Errno::from(InterfaceError)`）。
 extern "C" fn kcore_interface_publish(
     name_ptr: *const u8,
     name_len: usize,
@@ -278,9 +292,12 @@ extern "C" fn kcore_interface_publish(
     let Some(kind) = kind_from_u32(kind) else {
         return Errno::EINVAL.code();
     };
-    let Some(provider) = crate::component::load::current_component() else {
+    let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
         return Errno::EPERM.code();
     };
+    if let Some(denied) = deny_if_failed(provider) {
+        return denied;
+    }
     let reg = registry::get_registry().lock();
     let mut ifs = get_interfaces().lock();
     match ifs.stage_publish(
@@ -399,10 +416,19 @@ extern "C" fn kcore_interface_refresh(
 // Category 6：Task control（v2；语义入口，authority 校验在 Core）
 // ---------------------------------------------------------------------------
 
-/// 解析 Core API caller：运行任务用 TaskRecord.owner；锚点上的组件 init
-/// 用 loader 记录的 call_init 身份。
+/// 解析 Core API caller：身份统一走 [`RequestContext::ambient`]——最内层活动执行
+/// 边界优先（组件任务 → task owner；`kcomp_init`，含嵌套加载 → 被初始化组件）。
 fn current_task_requester() -> Option<crate::component::ComponentId> {
-    task::current_owner().or_else(crate::component::load::current_component)
+    RequestContext::ambient().map(|ctx| ctx.component)
+}
+
+/// Core 真相门禁：拒绝来自 `Failed` 实例的「获取 authority / 创建 work」请求。
+///
+/// 失败实例逻辑死亡，可 teardown（`release` / `revoke`、释放已持有 handle），
+/// 但不得获取新 authority 或创建新 work。返回 `-EPERM`（Core 策略拒绝，与
+/// 「无法解析 caller」同一 errno）。**只有** acquiring/creating 入口调用本函数。
+fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
+    crate::component::is_failed(component).then_some(Errno::EPERM.code())
 }
 
 /// 创建任务。requester = 当前 caller；`entry` 必须落在该组件的
@@ -412,6 +438,9 @@ extern "C" fn kcore_task_create(entry: usize) -> i32 {
     let Some(requester) = current_task_requester() else {
         return Errno::EPERM.code();
     };
+    if let Some(denied) = deny_if_failed(requester) {
+        return denied;
+    }
     match task::create_task(requester, entry) {
         Ok(id) => id.raw() as i32,
         Err(error) => Errno::from(error).code(),
@@ -533,8 +562,9 @@ extern "C" fn kcore_device_nth(
 ///
 /// 成功 = 0，raw handle（`to_raw` 编码：高 32 位 slot、低 32 位 generation；
 /// **不是地址**）写入 `*out_handle`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 Core 策略拒绝 /
-/// `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO / `EBUSY` 设备已被认领或已 quarantine）。
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller、caller 已
+/// `Failed`、或 Core 策略拒绝 / `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO /
+/// `EBUSY` 设备已被认领或已 quarantine）。
 extern "C" fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32 {
     if out_handle.is_null() {
         return Errno::EFAULT.code();
@@ -542,6 +572,9 @@ extern "C" fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32 {
     let Some(ctx) = RequestContext::ambient() else {
         return Errno::EPERM.code();
     };
+    if let Some(denied) = deny_if_failed(ctx.component) {
+        return denied;
+    }
     match mmio::claim_device(&ctx, machine::DeviceId::from_raw(device_id)) {
         Ok(handle) => {
             // SAFETY: `out_handle` 的可写性由调用方保证（C ABI 契约）；unaligned
@@ -650,8 +683,9 @@ fn dma_direction_from_i32(direction: i32) -> Option<dma::DmaDirection> {
 /// backing → grant `DmaHandle`。组件只拿到 raw handle，拿不到地址。
 /// 成功 = 0，raw handle 写入 `*out_handle`（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` direction 非法或尺寸非法 /
-/// `EPERM` 无法解析 caller / `ENODEV` 无匹配设备 / `EBUSY` 设备已被认领 /
-/// `ENOMEM` 物理内存耗尽 / handle 类错误同 `kcore_mmio_read_u32`）。
+/// `EPERM` 无法解析 caller 或 caller 已 `Failed` / `ENODEV` 无匹配设备 /
+/// `EBUSY` 设备已被认领 / `ENOMEM` 物理内存耗尽 / handle 类错误同
+/// `kcore_mmio_read_u32`）。
 extern "C" fn kcore_dma_alloc(
     mmio_handle: u64,
     size: usize,
@@ -667,6 +701,9 @@ extern "C" fn kcore_dma_alloc(
     let Some(ctx) = RequestContext::ambient() else {
         return Errno::EPERM.code();
     };
+    if let Some(denied) = deny_if_failed(ctx.component) {
+        return denied;
+    }
     match dma::alloc(
         &ctx,
         mmio::MmioHandle::from_raw(mmio_handle),
@@ -742,9 +779,9 @@ extern "C" fn kcore_dma_release(handle: u64) -> i32 {
 ///
 /// 成功 = 0，raw handle 写入 `*out_handle`（同 `kcore_mmio_claim` 的编码：
 /// 高 32 位 slot、低 32 位 generation；**不是中断号**）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
-/// `EBADF`/`ESTALE`/`EACCES`/`EKEYREVOKED` MMIO handle 无效 / `ENODEV` 设备无
-/// 中断线 / `EBUSY` 中断线已被认领）。
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
+/// `Failed` / `EBADF`/`ESTALE`/`EACCES`/`EKEYREVOKED` MMIO handle 无效 /
+/// `ENODEV` 设备无中断线 / `EBUSY` 中断线已被认领）。
 extern "C" fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32 {
     if out_handle.is_null() {
         return Errno::EFAULT.code();
@@ -752,6 +789,9 @@ extern "C" fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32 {
     let Some(ctx) = RequestContext::ambient() else {
         return Errno::EPERM.code();
     };
+    if let Some(denied) = deny_if_failed(ctx.component) {
+        return denied;
+    }
     match irq::claim_derived(ctx.component, mmio::MmioHandle::from_raw(mmio_handle)) {
         Ok(handle) => {
             // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
@@ -1221,6 +1261,62 @@ mod tests {
         // DMA release 同形：host 无 caller → EPERM（不是 panic）
         let _dma_release: extern "C" fn(u64) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_dma_release").unwrap()) };
+    }
+
+    /// Failed 实例门禁：获取 authority / 创建 work 的入口一律 `-EPERM`，但已持有
+    /// handle 的 `release` 仍可用（teardown 不被门禁挡住）。
+    #[test]
+    fn failed_component_is_denied_new_authority_but_may_release() {
+        use crate::component::{containment, registry};
+
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::handle::init();
+        let _boundary = containment::test_boundary_lock();
+
+        // Given：一个被标记 Failed 的组件。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"gate_failed_demo", 0x1000, 0x2000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.mark_failed(id).unwrap();
+            id
+        };
+
+        // When / Then：身份解析到该 Failed 组件（init 边界）；acquiring 入口
+        // 全部 `-EPERM`，但 release 一个已持有的 handle 仍然成功。
+        containment::with_test_init_boundary(Some(id), || {
+            let mut out = 0u64;
+            assert_eq!(kcore_mmio_claim(0, &mut out), Errno::EPERM.code());
+            assert_eq!(kcore_irq_claim(0, &mut out), Errno::EPERM.code());
+            assert_eq!(kcore_dma_alloc(0, 4096, 0, &mut out), Errno::EPERM.code());
+            assert_eq!(kcore_task_create(0x1000), Errno::EPERM.code());
+            assert_eq!(
+                kcore_interface_publish(
+                    b"svc".as_ptr(),
+                    3,
+                    1,
+                    0xAB,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                ),
+                Errno::EPERM.code()
+            );
+
+            let granted = mmio::get_table().lock().grant(
+                id,
+                mmio::MmioRegion {
+                    base: 0,
+                    size: 0x1000,
+                    device_index: 240,
+                },
+            );
+            assert_eq!(kcore_mmio_release(granted.to_raw()), 0);
+        });
     }
 
     /// 接口 ABI（exact fingerprint）：bind/refresh 的早期错误约定

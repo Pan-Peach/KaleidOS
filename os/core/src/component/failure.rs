@@ -9,12 +9,13 @@
 //!
 //! # 明确 DEFERRED（本增量不做）
 //!
-//! - **拒绝来自 Failed 组件的新操作**：当前 Failed 组件再次调用 authority 入口时，
-//!   已 revoke 的 handle 会因 generation 前进而 `Stale`；但「组件状态即拒绝」的
-//!   统一 state check 尚未加进各 authority 操作（那需要入口统一收 `RequestContext`
-//!   并查 registry），本增量不动。
-//! - **停止组件的任务**：`stop_component_tasks` 需要 task-stop API（当前 Core 只有
-//!   yield/exit，没有 Core 侧强制停止），本增量不动。
+//! - **强制停止失败组件的任务**：Core 已从 runnable 候选与 commit 路径剔除
+//!   `Failed` 组件拥有的任务（`sched.rs`），但不会**强制停止**正在跑的任务——
+//!   那需要 task-stop API（当前只有 yield/exit），本增量不做；任务在下次
+//!   yield/exit 时自然退出。
+//! - **Quiescing / Stopped 与 `kcomp_stop`**：本增量只把 `Failed` 接入
+//!   acquiring / work 门禁（`component::is_failed` / `component::may_run`，入口见
+//!   `export.rs`）；优雅 quiesce / drain / 实例退役留给后续增量。
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
 
 use crate::component::load::ComponentLoadError;

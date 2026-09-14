@@ -134,6 +134,25 @@ impl Registry {
         Ok(())
     }
 
+    /// `id` 是否为 `Failed`（逻辑死亡）实例。
+    ///
+    /// Core 真相门禁：失败实例不得获取新 authority 或创建新 work，但仍需
+    /// teardown（`release` / `revoke`、释放已持有的 handle）。（未来的
+    /// `Quiescing` / `Stopped` 落地后并入本判定。）
+    pub fn is_failed(&self, id: ComponentId) -> bool {
+        self.get(id)
+            .is_some_and(|r| r.state == ComponentState::Failed)
+    }
+
+    /// 该组件拥有的任务是否允许运行。
+    ///
+    /// 只有活着的实例（`Starting` = `kcomp_init` 执行期、`Ready`）可以运行任务；
+    /// `Failed` 实例的任务必须从 runnable 候选中剔除，并在 commit 前再次验证。
+    pub fn may_run(&self, id: ComponentId) -> bool {
+        self.get(id)
+            .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))
+    }
+
     /// 卸载：移除记录（第一版不回收放段内存）。
     pub fn unload(&mut self, id: ComponentId) -> Result<ComponentRecord, RegistryError> {
         let pos = self
@@ -357,6 +376,43 @@ mod tests {
         assert_eq!(
             reg.mark_failed(ComponentId::from_raw(99)),
             Err(RegistryError::NotFound)
+        );
+    }
+
+    #[test]
+    fn is_failed_only_reports_failed_instances() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        assert!(!reg.is_failed(id));
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        assert!(!reg.is_failed(id));
+        reg.finish_start(id).unwrap();
+        assert!(!reg.is_failed(id));
+        reg.mark_failed(id).unwrap();
+        assert!(reg.is_failed(id));
+        assert!(
+            !reg.is_failed(ComponentId::from_raw(99)),
+            "unknown is not Failed"
+        );
+    }
+
+    #[test]
+    fn may_run_only_for_live_instances() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        assert!(!reg.may_run(id), "Declared does not run work");
+        reg.resolve(id).unwrap();
+        assert!(!reg.may_run(id), "Resolved does not run work");
+        reg.begin_start(id).unwrap();
+        assert!(reg.may_run(id), "Starting (kcomp_init) may create/run work");
+        reg.finish_start(id).unwrap();
+        assert!(reg.may_run(id), "Ready runs work");
+        reg.mark_failed(id).unwrap();
+        assert!(!reg.may_run(id), "Failed must not run work");
+        assert!(
+            !reg.may_run(ComponentId::from_raw(99)),
+            "unknown must not run"
         );
     }
 

@@ -38,7 +38,7 @@ use spin::{Mutex, Once};
 /// `api` 指向本 struct；`ctx`（provider opaque state）由 Core 从 binding 单独取出
 /// 后原样传入 `choose_next`，**不再放在 vtable 内**。
 #[repr(C)]
-pub struct SchedulerPolicyV1 {
+pub struct SchedulerPolicyApi {
     pub choose_next:
         extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
 }
@@ -53,7 +53,7 @@ pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_484
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedError {
-    /// 没有绑定的 SchedulerPolicy（`scheduler`/Policy/v1 未 publish 或 provider 已 Failed）。
+    /// 没有绑定的 SchedulerPolicy（`scheduler`/Policy 未 publish 或 provider 已 Failed）。
     NoPolicy,
     /// 任务表状态机拒绝推进（yield/exit 时当前任务不是 Running 等）。
     InvalidTransition,
@@ -95,15 +95,37 @@ pub fn current_task() -> Option<TaskId> {
     cpu().lock().current
 }
 
-/// 收集全部 Runnable 任务（BTreeMap 迭代序 = id 升序；列表内容由 Core
-/// 决定，调度器只读这份裁剪过的输入）。
+/// 收集全部 Runnable 且 **owner 仍是活实例**的任务（BTreeMap 迭代序 = id 升序；
+/// 列表内容由 Core 决定，调度器只读这份裁剪过的输入）。
+///
+/// 组件失败 = 逻辑死亡：`Failed` 组件的任务必须从候选中剔除，否则调度器会把 CPU
+/// 交给一个已经死掉的实例。两把锁**先后分开**取（先 task 表快照 owner、再 registry
+/// 判定），不做嵌套，避免与 create_task（registry → task_table）的锁序冲突。
 fn collect_runnable() -> Vec<TaskId> {
-    let table = task::get_task_table().lock();
-    table
-        .iter()
-        .filter(|(_, r)| r.state() == TaskState::Runnable)
-        .map(|(id, _)| *id)
+    let candidates: Vec<(TaskId, ComponentId)> = {
+        let table = task::get_task_table().lock();
+        table
+            .iter()
+            .filter(|(_, r)| r.state() == TaskState::Runnable)
+            .map(|(id, r)| (*id, r.owner()))
+            .collect()
+    };
+    let reg = registry::get_registry().lock();
+    candidates
+        .into_iter()
+        .filter(|(_, owner)| reg.may_run(*owner))
+        .map(|(id, _)| id)
         .collect()
+}
+
+/// Commit-time 门禁：任务 owner 此刻是否仍允许运行。
+///
+/// `collect_runnable` 只过滤一次候选；在真正把 CPU 交给某个任务前，Core 用同一条
+/// 真相（`Registry::may_run`）再验证一次——`pick_next` 可能隔离了一个失败组件，
+/// 而它恰好是候选任务的 owner。owner 已死 → 绝不 commit。
+fn owner_still_runnable(id: TaskId) -> bool {
+    let owner = task::get_task_table().lock().get(id).map(|r| r.owner());
+    owner.is_some_and(crate::component::may_run)
 }
 
 /// 解析绑定的 SchedulerPolicy。锁序 registry → interfaces（与 publish
@@ -124,7 +146,7 @@ fn resolve_policy() -> Result<(ComponentId, *const (), *mut ()), SchedError> {
 
 /// 请求策略提议下一个任务。返回 None = 没有可运行任务（回锚点）。
 ///
-/// 提议非法（版本不符 / 提议 id 不在 runnable 列表）→ provider 被标
+/// 提议非法（契约不符 / 提议 id 不在 runnable 列表）→ provider 被标
 /// `Failed`（隔离错误组件），Core 退化到确定性回退（id 序首项）——
 /// 一个完全错误的调度器组件不能挂起调度，也不能把 CPU 交给不存在的任务。
 fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
@@ -134,7 +156,7 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
     let (provider, api, ctx) = resolve_policy()?;
     // SAFETY: api 由 provider 的 staged publish 写入（组件的静态 function table），
     // provider Ready 与 exact ABI 校验已在 bind 内完成；table 在其组件存活期内有效。
-    let vtable = unsafe { &*(api as *const SchedulerPolicyV1) };
+    let vtable = unsafe { &*(api as *const SchedulerPolicyApi) };
     let ids: Vec<u32> = runnable.iter().map(|id| id.raw()).collect();
     let current = cpu().lock().current.map_or(u32::MAX, |id| id.raw());
     let proposed = (vtable.choose_next)(ctx, ids.as_ptr(), ids.len(), current);
@@ -159,6 +181,10 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
 /// `fail_component`，这样即使 panic 的任务属于当前 scheduler provider，
 /// 后继任务也已在 provider 被解绑前选定，Core 不会被失败组件挂起。
 ///
+/// Failed 门禁发生在**候选收集**与 **commit 之前**（Phase 0）：已经 `Failed` 的
+/// owner 的任务既不进候选、也过不了 commit-time 复验。abort 交接是唯一例外——
+/// 后继任务在 owner 死亡前就已完成 commit，Core 靠它保持存活。
+///
 /// 锁纪律：`context_switch` 前全部锁释放；锁外先 revoke、再按**目标上下文**
 /// 安装逃逸 guard，最后切换。
 fn schedule_next(
@@ -169,7 +195,16 @@ fn schedule_next(
     let guard = IrqSaveGuard::new();
     // Phase 0：收集 + 提议（interfaces/registry 锁在 resolve_policy 内，短暂）
     let runnable = collect_runnable();
-    let next = pick_next(&runnable)?;
+    let mut next = pick_next(&runnable)?;
+
+    // Commit-time 门禁：候选过滤只发生一次；真正 commit 前再核对一次 owner 真相
+    //（`pick_next` 可能隔离了一个失败的调度器 provider，而它恰好是候选的 owner）。
+    // owner 已死 → 回锚点，绝不把 CPU 交给已死实例的任务。
+    if let Some(id) = next
+        && !owner_still_runnable(id)
+    {
+        next = None;
+    }
 
     // Phase 1：锁内 commit 状态 + 取上下文指针
     //
@@ -312,15 +347,67 @@ mod tests {
     use alloc::vec;
     use core::ptr;
 
+    /// 串行化触碰进程全局 task table / registry 的调度测试。
+    static SCHED_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     /// 纯逻辑：任务耗尽后 run() 不再切换（无锚点捕获、无 state 变更）。
     #[test]
     fn run_with_no_runnable_tasks_is_noop() {
+        let _sched = SCHED_TEST_LOCK.lock();
         crate::memory::test_support::ensure_init();
         let _guard = crate::memory::test_support::GUARD.lock();
         crate::task::init();
         init();
+        crate::component::registry::init();
         // 空表：run 直接返回，不 panic、不切换。
         assert_eq!(run(), Ok(()));
+    }
+
+    /// `Failed` 组件拥有的 Runnable 任务既不进入候选，也不通过 commit 门禁；
+    /// `run()` 安全返回 no-op（不挂起、不误调度）。
+    #[test]
+    fn failed_component_tasks_are_not_scheduled() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+
+        // Given：一个 Ready 组件 + 一个 Runnable 任务（直接进全局 task 表）。
+        let owner = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"sched_failed_owner", 0x8000_0000, 0x8000_0000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, 0x8000_0000)
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Runnable)
+            .unwrap();
+
+        // 活实例：候选包含它，commit 门禁放行。
+        assert!(collect_runnable().contains(&task));
+        assert!(owner_still_runnable(task));
+
+        // When：组件失败。
+        registry::get_registry().lock().mark_failed(owner).unwrap();
+
+        // Then：候选剔除、commit 门禁拒绝、run() no-op。
+        assert!(!collect_runnable().contains(&task));
+        assert!(!owner_still_runnable(task));
+        assert_eq!(run(), Ok(()));
+
+        // 清理：移除任务，避免污染其它调度测试。
+        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
     }
 
     /// 提议验证：不在 runnable 列表里的 id 一律拒绝——回退到 id 序首项，
@@ -354,7 +441,7 @@ mod tests {
         ) -> u32 {
             999
         }
-        let vtable = SchedulerPolicyV1 {
+        let vtable = SchedulerPolicyApi {
             choose_next: bad_choose,
         };
         let provider = reg.declare(b"scheduler_bad", ENTRY, ENTRY, None).unwrap();
@@ -366,7 +453,7 @@ mod tests {
             b"scheduler",
             InterfaceKind::Policy,
             SCHEDULER_POLICY_ABI,
-            &vtable as *const SchedulerPolicyV1 as *const (),
+            &vtable as *const SchedulerPolicyApi as *const (),
             ptr::null_mut(),
         )
         .unwrap();
@@ -382,7 +469,7 @@ mod tests {
                 SCHEDULER_POLICY_ABI,
             )
             .unwrap();
-        let vtable = unsafe { &*(view.api as *const SchedulerPolicyV1) };
+        let vtable = unsafe { &*(view.api as *const SchedulerPolicyApi) };
         let ids: Vec<u32> = vec![a.raw(), b.raw()];
         let proposed = (vtable.choose_next)(view.ctx, ids.as_ptr(), ids.len(), u32::MAX);
         let proposed = TaskId::from_raw(proposed);

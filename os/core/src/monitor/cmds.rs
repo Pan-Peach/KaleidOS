@@ -116,6 +116,14 @@ pub fn load(args: &[u8]) {
                 .get(id)
                 .map_or(0, |r| r.entry);
             printk!("load {}: OK (id={}, entry={:#x})\n", name, id.raw(), entry);
+            // 组件可能在 `kcomp_init` 期间创建了任务（例如 driver_prober 的
+            // post-init dispatch 任务）。init 期间 publish 是 staged：消费者必须等
+            // provider `Ready`，所以这类任务只能在 load 提交之后运行。Monitor 是
+            // 交互态下唯一的调度锚点，这里在加载成功后把 CPU 交给调度器；没有
+            // Runnable 任务时 `sched::run()` 是 no-op（现有加载路径不受影响）。
+            if let Err(error) = crate::sched::run() {
+                printk!("load {name}: post-load scheduling failed: {error:?}\n");
+            }
         }
         Err(ComponentLoadError::DeclareFailed) => {
             printk!("load {name}: already loaded\n");

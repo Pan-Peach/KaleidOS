@@ -398,6 +398,59 @@ fn halt() -> ! {
     }
 }
 
+// —— Test-only boundary scaffolding ——
+//
+// These helpers let host tests exercise the process-global boundary stack
+// without a context switch, and serialize the tests that mutate it.
+
+/// Serializes tests that mutate the process-global active boundary.
+#[cfg(test)]
+static TEST_BOUNDARY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Acquires the test-only active-boundary lock.
+#[cfg(test)]
+pub(crate) fn test_boundary_lock() -> spin::MutexGuard<'static, ()> {
+    TEST_BOUNDARY_LOCK.lock()
+}
+
+/// Runs `f` with an init escape boundary installed over the current one,
+/// without a context switch.  Mirrors the guard push/pop in
+/// [`call_on_isolated_stack`], so host tests can exercise the boundary nesting
+/// that principal resolution depends on.
+#[cfg(test)]
+pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnOnce() -> R) -> R {
+    let mut from_context = CpuImpl::new_context(0, 0);
+    let mut to_context = CpuImpl::new_context(0, 0);
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::Init { owner },
+        from_context: &mut from_context,
+        to_context: &mut to_context,
+        entry: None,
+        returned: 0,
+        state: GuardState::new(None),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
+}
+
+/// Marks the active escape as panicked, as the boot panic handler does before
+/// escaping.  Lets host tests assert that popping a panicked guard still
+/// restores the previous boundary.
+#[cfg(test)]
+pub(crate) fn test_mark_active_panicked() {
+    if let Some(guard_ptr) = active_guard() {
+        // SAFETY: [Category 2 — Data races] single active CPU / test boundary
+        // lock; the record is live and only this test mutates it.
+        unsafe { (*guard_ptr).state.mark_panicked() };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +527,8 @@ mod tests {
 
     #[test]
     fn task_region_switches_replace_and_anchor_restores() {
-        // Given: no ambient escape (anchor context).
+        // Given: no ambient escape (anchor context); serialize boundary mutation.
+        let _boundary = test_boundary_lock();
         enter_anchor();
         assert!(active_escape().is_none());
 

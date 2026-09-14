@@ -28,19 +28,6 @@ pub fn get_task_table() -> &'static spin::Mutex<TaskTable> {
     TASK_TABLE.get().expect("task table not initialized")
 }
 
-/// 解析当前运行任务所属的组件。
-///
-/// 普通任务执行时，身份来自调度器记录的当前 `TaskId` 及其
-/// `TaskRecord.owner`；锚点上下文没有任务 owner，应由调用方按场景使用
-/// `component::load::current_component()` 读取 `call_init` 身份。
-pub fn current_owner() -> Option<ComponentId> {
-    let task = crate::sched::current_task()?;
-    get_task_table()
-        .lock()
-        .get(task)
-        .map(|record| record.owner())
-}
-
 /// Core 语义入口：创建任务（组件只能经 export ABI `kcore_task_create` 到达）。
 ///
 /// 验证（Core validates，组件只有提议权）：
@@ -53,8 +40,8 @@ pub fn current_owner() -> Option<ComponentId> {
 /// + 初始上下文（`Created` 态，经 `transition(Created→Runnable)` 后进入调度）。
 ///
 /// # Seam
-/// 锚点上的 `call_init` 身份由 `component::load::current_component()` 提供；
-/// 普通任务身份由 `current_owner()` 从当前 TaskRecord 提供。真正的
+/// caller 身份统一由 `handle::RequestContext::ambient()` 解析（最内层活动执行
+/// 边界优先：组件任务 → task owner；`kcomp_init` → 被初始化组件）。真正的
 /// per-execution-domain 凭证（TaskHandle 化）留给未来 ExecutionDomain 里程碑。
 pub fn create_task(requester: ComponentId, entry: usize) -> Result<TaskId, TaskError> {
     let registry = crate::component::registry::get_registry().lock();

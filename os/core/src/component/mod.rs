@@ -17,6 +17,19 @@ pub mod store;
 pub use containment::panic_escape;
 pub use failure::fail_component;
 
+/// Core 真相门禁：`id` 是否为 `Failed`（逻辑死亡）实例。
+///
+/// 失败实例不得获取新 authority 或创建新 work；`release` / `revoke` 等 teardown
+/// 操作不受此门禁限制。
+pub fn is_failed(id: ComponentId) -> bool {
+    registry::get_registry().lock().is_failed(id)
+}
+
+/// Core 真相门禁：`id` 拥有的任务是否允许运行（活实例 = `Starting` / `Ready`）。
+pub fn may_run(id: ComponentId) -> bool {
+    registry::get_registry().lock().may_run(id)
+}
+
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
 /// 由 Core 分配；组件的 ResourceDomain 以 ComponentId 为键记录。
 /// 可被猜测/构造/传递，但真正的操作权限来自 Core 授予的组件凭证（token），
