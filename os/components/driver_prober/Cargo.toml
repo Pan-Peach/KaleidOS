@@ -1,0 +1,14 @@
+[package]
+name = "driver_prober"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立编译单元（同 drivers/virtio_blk / kcomp_panic）。
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../kcomp-sdk" }

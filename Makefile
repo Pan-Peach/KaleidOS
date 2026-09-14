@@ -1,12 +1,14 @@
 # KaleidOS 构建入口（Linux Kbuild 风格：根 Makefile 驱动，tools/ 放辅助脚本）
 #
 # 用法：
-#   make kernel            # 构建 kaleidos-rv64（os/boot/riscv + core 链接）
-#   make kernel ARCH=rv32  # 构建 RV32/Sv32 profile
+#   make kernel                     # 构建 kaleidos-rv64（默认 MMU/Sv39）
+#   make kernel ARCH=rv32           # 构建 RV32/Sv32 profile
+#   make kernel ARCH=rv32 VM=nommu  # 构建 RV32 NoMMU profile
 #   make qemu              # 在 QEMU 上运行（Ctrl-A X 退出）
 #   make clean
 
 ARCH      ?= rv64
+VM        ?= mmu
 # Rust embeds source locations in panic messages.  Keep them independent of
 # the checkout path while retaining the boot crate's linker script when
 # RUSTFLAGS from the environment overrides Cargo's target-specific flags.
@@ -29,6 +31,17 @@ QEMU      := qemu-system-riscv32
 # >1 GiB 的 RAM 会让 FDT 区间在 32 位 usize 下回绕（boot 无法初始化帧区）。
 QEMU_MEM  := 1G
 endif
+
+ifeq ($(VM),mmu)
+VM_FEATURE := vm-mmu
+else ifeq ($(VM),nommu)
+VM_FEATURE := vm-nommu
+else
+$(error VM must be mmu or nommu, got '$(VM)')
+endif
+
+BOOT_FEATURES := supervisor,$(VM_FEATURE)
+
 BOOT_DIR  ?= os/boot/$(ARCH)
 TARGET    ?= riscv64gc-unknown-none-elf
 LINKER    ?= linker.ld
@@ -43,7 +56,7 @@ OUTPUT    := kaleidos-$(ARCH)
 # 每个组件经共享管线 tools/build-kcomp.sh 构建成**链接后的** .kcomp（ET_REL 组件程序）：
 # staticlib → rust-lld -r --gc-sections -u kcomp_init → strip → 白名单/重定位契约校验。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
-KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk
+KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR   := $(CURDIR)/build/kpkg
 KPKG_BUILD := $(CURDIR)/build/kpkg-build
@@ -64,7 +77,7 @@ init.kpkg:
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 kernel: init.kpkg
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --target $(TARGET) --release
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(BOOT_FEATURES) --target $(TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (with embedded init.kpkg)"
 
@@ -87,9 +100,10 @@ clean:
 #   make test-build   两个架构的交叉构建门禁
 #   make test-qemu-rv64 / test-qemu-rv32   自动 QEMU（boot smoke + 自动 CoreTest）
 #   make test-qemu    两个架构都跑
+#   make test-driver-prober  driver_prober 组件端到端（positive / no-device / extra-device）
 #   make bench        host release 性能基线（手动跑，不进 CI）
 #   make check        CI 全量门禁 = fmt + clippy + test-host + test-build
-.PHONY: fmt clippy check test-host bench test-build test-qemu test-qemu-rv64 test-qemu-rv32 test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+.PHONY: fmt clippy check test-host bench test-build test-qemu test-qemu-rv64 test-qemu-rv32 test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
@@ -98,6 +112,7 @@ OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test
 fmt:
 	cargo fmt $(OUR_CRATES)
 	cd os/components/kcomp-sdk && cargo fmt
+	cd os/components/driver_prober && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
@@ -107,11 +122,13 @@ clippy:
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr
 	cargo clippy -p core_test -p scheduler_rr --target $(TARGET)
 	cd os/components/kcomp-sdk && cargo clippy --all-targets
+	cd os/components/driver_prober && cargo clippy --target $(TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU）
 test-host:
 	cargo test --workspace
 	cd os/components/kcomp-sdk && cargo test
+	cd os/components/driver_prober && cargo test
 
 # 性能基线（host release，手动跑）：ns/call 量级；基线用例见 handle/mmio.rs bench_*
 bench:
@@ -119,8 +136,8 @@ bench:
 
 # 交叉构建门禁：RV64 链接 + RV32 检查（不运行）
 test-build:
-	cd os/boot/riscv && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build
-	cd os/boot/riscv && cargo check --target riscv32imac-unknown-none-elf
+	cd os/boot/riscv && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(BOOT_FEATURES)
+	cd os/boot/riscv && cargo check --no-default-features --features $(BOOT_FEATURES) --target riscv32imac-unknown-none-elf
 
 # 自动 QEMU：构建 + 启动 + 自动执行 core_test + 判定 PASS（输出进日志）。
 # 每个架构用子 make 传 ARCH：ifeq 在解析期就固定 TARGET/BOOT_DIR，
@@ -136,6 +153,23 @@ test-qemu-one: kernel
 
 test-qemu: test-qemu-rv64 test-qemu-rv32
 
+# driver_prober 端到端：加载 scheduler_rr → driver_prober，prober 自动 load
+# virtio_blk；runner 内跑三个场景：
+#   positive     挂 1 MiB virtio-blk 盘（MBR 签名 0xaa55 @ 510）→ 读到 sector 0；
+#   no-device    不挂盘 → prober 仍加载候选，驱动无支持设备但干净进入 Ready；
+#   extra-device 挂两块同类盘 → 首次 attach 生效，不产生第二个实例。
+# 每个架构用子 make 传 ARCH（同 test-qemu-one 的理由）。
+test-driver-prober-rv64:
+	$(MAKE) ARCH=rv64 test-driver-prober-one
+
+test-driver-prober-rv32:
+	$(MAKE) ARCH=rv32 test-driver-prober-one
+
+test-driver-prober-one: kernel
+	@python3 tests/qemu/driver_prober_runner.py $(ARCH)
+
+test-driver-prober: test-driver-prober-rv64 test-driver-prober-rv32
+
 # White-box architectural selftests use a separate feature-gated image.  Keep
 # the normal `kernel` target feature-free so `make qemu` still enters Monitor.
 test-arch-rv64:
@@ -145,7 +179,7 @@ test-arch-rv32:
 	$(MAKE) ARCH=rv32 test-arch-one
 
 test-arch-one: init.kpkg
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --features selftest --target $(TARGET) --release
+	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(BOOT_FEATURES),selftest --target $(TARGET) --release
 	cp $(KERNEL) $(OUTPUT)-selftest
 	@python3 tests/qemu/arch_runner.py $(ARCH)
 
@@ -156,9 +190,11 @@ test-arch: test-arch-rv64 test-arch-rv32
 check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
 	cd os/components/kcomp-sdk && cargo fmt -- --check
+	cd os/components/driver_prober && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
 	cargo clippy -p core_test -p scheduler_rr --target $(TARGET) -- -D warnings
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
+	cd os/components/driver_prober && cargo clippy --target $(TARGET) -- -D warnings
 	$(MAKE) test-host
 	$(MAKE) test-build
