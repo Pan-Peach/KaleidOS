@@ -211,16 +211,30 @@ failure::fail_component
 ### 6.2 KernelNative ABI v4 增量
 
 ```text
+kcore_device_nth(compatible, len, ordinal, out_device_id)   # 纯发现：列候选，不授权
+kcore_mmio_claim(device_id, out_handle)                  # 认领确切设备（root authority）
 kcore_mmio_read(handle, offset, width, out)
 kcore_mmio_write(handle, offset, width, value)
-kcore_mmio_release(handle)
+kcore_mmio_release(handle)              # 有 live IRQ/DMA 子 authority 时 -EBUSY
 kcore_mmio_lease(handle, out_ptr, out_len)
-kcore_dma_alloc(mmio_handle, size, direction, out_handle)
+kcore_dma_alloc(mmio_handle, size, direction, out_handle)  # 设备身份从 MmioHandle 推导
 kcore_dma_lease(handle, out_ptr, out_len, out_device_addr)
 kcore_dma_release(handle)
-kcore_irq_poll(...)
-kcore_irq_release(...)
+kcore_irq_claim(mmio_handle, out_handle)   # 从 MmioHandle 派生同台设备的 IRQ
+kcore_irq_register / enable / register_polled / poll / ack
+kcore_irq_release(handle)                     # 真正关断投递 + 控制器线
 ```
+
+**设备身份 / 认领链（identity → root → derived）**：`DeviceId`（`u32`，`MachineInfo.devices`
+中的记录身份）**不是 Handle、不可撤销、无权限**；`kcore_device_nth` 是纯枚举（不分配、
+不触碰设备、包含已认领设备，order 跨 claim/release 稳定；`ordinal >= 匹配数` → `-ENOENT`
+是唯一终止信号）。`kcore_mmio_claim` 用 `DeviceId` 认领**确切设备**（不再"第一台
+compatible 匹配"），独占锚在 `device_index` 上；`kcore_irq_claim` / `kcore_dma_alloc`
+都从调用方已持有的 `MmioHandle` 派生 `device_index`——不存在"MMIO 给 A、IRQ 给 B"的
+跨设备错配。**签名直接替换**：`kcore_mmio_claim` / `kcore_irq_claim` 沿用原名、签名变更，
+本阶段不提供 ABI 兼容（所有内置组件一同重编；loader 只按名字解析、不校验签名，故不保证
+陈旧 `.kcomp` 可加载）。错误码：无 MMIO（PIO）设备 → `-ENOTSUP`；设备无 IRQ → `-ENODEV`；
+已认领 → `-EBUSY`；无效/stale/wrong-owner 的 MMIO handle → `-EBADF`/`-ESTALE`/`-EACCES`。
 
 - `width ∈ {1, 2, 4, 8}`；`direction ∈ {0=ToDevice, 1=FromDevice, 2=Bidirectional}`；错误沿用 v3 约定（`0` 成功 / `-Errno`）。
 - **`kcore_mmio_lease` 进入直接 ABI**：Core 校验 handle 后一次性派生 `(ptr, len)` + provenance（`source` handle），受信 KernelNative 驱动据此直接访问。
@@ -374,8 +388,14 @@ runtime:
 - `DmaRegion.direction` 的枚举形状 —— **已决**：`DmaDirection { ToDevice, FromDevice, Bidirectional }`（ABI 编码 0/1/2）。同时定案：设备可见地址 v1 identity（== 物理基址，无 IOMMU），经 `DmaLease` 暴露给受信 KernelNative；DMA 撤销为协作式 + quarantine（设备静默前不 free，见 §5 / §7）；
 - `kcore_irq_poll` 的精确签名与返回值形状（单事件 / 计数 / 批量）——**已决**：采用「计数」，配套 `kcore_irq_register_polled` / `kcore_irq_ack`，见 §13；
 - `RequestContext.task` 是否可为空（非任务上下文的 IRQ/设备路径）；
-- **`kcore_mmio_claim` 的设备选择（接口灵活性）**：当前只做"第一台 compatible 匹配且未被认领"（`handle/mmio.rs::claim`）。QEMU 上 `virtio,mmio` 有 8 台同 compatible 设备，组件无法**精确选择**目标；prober 识别出"块设备是第 k 台"后，driver 仍只能重扫、或靠"握住被拒 handle 再释放"推顺序。候选方案：`claim(compatible, selector)`（匹配序号，discovery 顺序稳定）或增加**只读枚举**（列候选、不授权）。约束：读 virtio-mmio `DeviceID` 本身就需要 MMIO 访问（claim + lease），探测无法完全无副作用。**同一根问题也在 `kcore_irq_claim`**：它同样按 compatible 取第一台未认领，不保证与 driver 认领的 MMIO 是**同一台设备**（多设备时 IRQ 可能错配）；候选方案是让它收 `MmioHandle`，由它推出同台设备的 `device_index` / irq。
-- **组件间 authority 转移（handle transfer）**：让 prober 把自己已认领的 `MmioHandle` 直接交给 driver，需要 Core 支持**跨组件所有权转移**；更根本的缺口是**组件寻址**——组件彼此拿不到 `ComponentId`（Core 不允许自报身份），Interface Registry 的 binding 也不是可寻址 id。属"完整 capability 系统"，语义未定（move / copy、能否降权、能否再传递、撤销如何传播）。当前 §9.1 的"设备驱动自己向 Core claim"正是为绕开它而选；待出现真实 broker 场景（如 FS server 把块设备能力转交给另一个 server）再定。
+- **设备选择（Q1）—— 已决**：原先 `kcore_mmio_claim` 只做"第一台 compatible 匹配且未被认领"，QEMU 上 `virtio,mmio` 有 8 台同 compatible 设备，组件无法**精确选择**；`kcore_irq_claim` 也独立按 compatible 匹配，可能与 driver 认领的 MMIO **不是同一台设备**。定案采用"**纯枚举 + 精确认领 + 从 root 派生**"：
+  - `kcore_device_nth(compatible, len, ordinal, out_device_id)` 纯发现（不分配、不触碰设备、包含已认领设备、order 稳定；`ordinal >= 匹配数` → `-ENOENT` 是唯一终止信号），产出 `DeviceId`（identity，非 Handle）；
+  - `kcore_mmio_claim(device_id, out_handle)` 认领**那台确切设备**，独占锚在 `device_index`；
+  - `kcore_irq_claim(mmio_handle, out_handle)` 与 `kcore_dma_alloc(mmio_handle, ...)` 都从调用方已持有的 MMIO root 派生 `device_index` / irq，**不再**独立匹配 compatible；
+  - `kcore_mmio_release` 在仍有 live IRQ/DMA 子 authority 时 `-EBUSY`（root 生命周期）；`kcore_irq_release` 真正关断投递与控制器线；
+  - 失败 containment：`fail_component` 把失败组件占用的每个 `device_index` 标进 Core 的 quarantine（phase 1 保持到 reboot；优雅 `release` 不标记）。
+  读 virtio-mmio `DeviceID` 本身仍需 MMIO 访问（claim + lease）：探测是"**独占 claim → 识别 → 释放 → 下一个 ordinal**"，不做无副作用的只读探测 claim（generic MMIO 读可能清状态 / 弹 FIFO，Core 不学协议语义）。组件级 **prober** 是后续增量，不属于本轮。
+- **组件间 authority 转移（handle transfer，Q2）—— 仍然刻意 deferred**：让 prober 把自己已认领的 `MmioHandle` 直接交给 driver，需要 Core 支持**跨组件所有权转移**；更根本的缺口是**组件寻址**——组件彼此拿不到 `ComponentId`（Core 不允许自报身份），Interface Registry 的 binding 也不是可寻址 id。属"完整 capability 系统"，语义未定（move / copy、能否降权、能否再传递、撤销如何传播）。**本轮只解决设备选择（Q1）**：prober 释放后把选中的 `DeviceId` 作为**选择数据**（不是 authority）经一个小型 selection-query 接口交给 driver，driver 在**自己的执行上下文**里 claim 同一 `DeviceId`——这不是 handle transfer（`RequestContext::ambient()` 从执行任务/init 上下文推导身份，prober 调 driver vtable 不会转移 authority）。当前 §9.1 的"设备驱动自己向 Core claim"继续有效；待出现真实 broker 场景（如 FS server 把块设备能力转交给另一个 server）再定 Q2。
 - 阶段 5 中 timer 控制、H·PMP、IOMMU 的具体接口。
 
 ## 13. 已决

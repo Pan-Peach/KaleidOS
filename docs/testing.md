@@ -61,12 +61,19 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 ### C6 IRQ 测试现状（2026-09）
 
 - **Host Test**：`handle::irq` 表语义（grant/get/revoke/release/holds_line/delivery）、
-  `claim`（compatible → 中断线、独占、`DeviceHasNoIrq`/`LineBusy`/`DeviceNotFound`
-  优先级）、`irq::route`（只投递给「live slot + 已注册 delivery」，revoke 后立刻
-  截断）全部 host 覆盖。
-- **QEMU CoreTest**：`irq-line-enable` —— 组件走 `kcore_irq_claim` →
-  `kcore_irq_register` → `kcore_irq_enable`，再把 **PLIC 当设备 claim 进来读回
-  enable bit**，证明「Core 宣布成功」之外硬件真的被写（RV64 + RV32）。
+  `claim_derived`（从 `MmioHandle` 推导同台设备的 IRQ、独占、`DeviceHasNoIrq`/
+  `LineBusy`/`MmioHandle(WrongOwner|Stale)` 优先级）、`release`（撤销并清子标记）、
+  `irq::route`（只投递给「live slot + 已注册 delivery」，revoke 后立刻截断）全部
+  host 覆盖；`machine::nth_compatible` 纯枚举（ordinal/`NoSuchOrdinal`、一条描述符
+  命中多个 compatible 只计一次、`NoMachineInfo`）与 `handle::mmio::claim_device`
+  精确认领（越界/`NotMmio`/`DeviceBusy`/release 后新 handle + 旧 token stale）、
+  child-aware `mmio::release`（live IRQ/DMA 子项 → `HasChildren`）、失败 quarantine
+  （`fail_component` 后设备 `-EBUSY`）同样 host 覆盖。
+- **QEMU CoreTest**：`irq-line-enable` —— 组件先 `kcore_mmio_claim` 认领 UART
+  的 MMIO root，再 `kcore_irq_claim(uart_mmio_handle, ...)` 派生**同台设备**的
+  中断线 → `kcore_irq_register` → `kcore_irq_enable`，再把 **PLIC 当设备 claim 进来
+  读回 enable bit**，证明「Core 宣布成功」之外硬件真的被写（RV64 + RV32）；`irq-release`
+  再用 `kcore_irq_release` 真正关断该线。
 - **QEMU ArchTest**：ArchTest 已在**完整初始化之后**运行（`core::init` + runtime VM，
   device MMIO 已映射）。新增 `external-irq` 用例——用 UART 的 **THRE** 中断作触发源
   （打开 `IER.THRE` 即拉线，无需 runner 注入输入），验证

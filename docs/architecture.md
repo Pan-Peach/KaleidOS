@@ -277,7 +277,7 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 - Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
   （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
   Core validation 的**语义入口**（组件加载 / 接口发布 / 任务控制 / 资源
-  claim：`kcore_mmio_claim/read`、`kcore_irq_claim/register/enable`）。**不导出未经 Core validation 的裸
+  claim：`kcore_device_nth` + `kcore_mmio_claim/read`、`kcore_irq_claim/register/enable/release`）。**不导出未经 Core validation 的裸
   authority mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动
   仍是 Core 内部提交点——组件只能 request（propose），authorize + grant +
   记录由 Core 完成。
