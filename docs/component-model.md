@@ -565,23 +565,30 @@ DMA table  ─ owner=A ─┘
 所有组件共享统一生命周期（但**不共享**业务接口）：
 
 ```text
-Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destroyed
-                                ↘
-                                Failed（运行中失败，任何阶段都可能进入）
+Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 ```
 
 | 状态 | 含义 |
 |---|---|
 | Declared | 系统知道这个组件存在 |
 | Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
-| Starting | 正在初始化 |
+| Starting | 正在初始化（执行 `kcomp_init`） |
 | Ready | 可以对外提供 Interface |
-| Quiescing | 停止接受新请求并清理已有状态 |
-| Stopped | 已停止 |
-| Destroyed | 生命周期结束 |
-| Failed | 运行过程中失败（可触发恢复流程） |
+| Stopping | **shape-only stub**：正在停止（未来在此执行 `kcomp_exit` 并 quiesce/drain；当前无任何转换进入） |
+| Stopped | **shape-only stub**：已停止（当前无任何转换进入） |
+| Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
 
+> **`kcomp_exit`（Linux `module_exit` 类比）已定义为组件 ABI 的对称退出入口**
+> （`#[unsafe(no_mangle)] pub extern "C" fn kcomp_exit() -> i32`）：Core loader 会
+> **可选解析**该符号并记录为 seam（`LoadedComponent::exit` /
+> `ComponentRecord::exit`），但本阶段**从不调用**它；`Stopping` / `Stopped` 也只是
+> `ComponentState` 里的 shape-only 变体。优雅停止（调用 `kcomp_exit` + quiesce/drain
+> + authority 回收 + 实例退役 + 重新探测）留待后续增量。
+>
 > **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
+
+> 意外退出 / abort 当前统一由 `Failed` 覆盖（组件 panic containment 路径）。未来
+> 独立 abort/exit 通知的 hook 点见 `ComponentState::Failed` 的 `TODO(unexpected-exit)`。
 
 ### 5.1 失败谱系：Result 失败 vs panic（不虚构不存在的 recovery）
 

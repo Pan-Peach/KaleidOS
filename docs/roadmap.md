@@ -282,7 +282,7 @@ provides / requires / bind / start / stop
 ```
 
 - 组件注册是**静态的**（代码里声明，不做动态 ELF / Wasm）；
-- 生命周期状态机（Declared → Resolved → Starting → Ready → Quiescing → Stopped → Destroyed）落地；
+- 生命周期状态机（Declared → Resolved → Starting → Ready → Stopping → Stopped → Destroyed）落地；
 - Ownership Tree 与 Dependency DAG 两套关系分开维护。
 
 **验收标准**：一个配置好的 minimal profile 能按声明完成 bind → start → stop → destroy 全流程，authority-backed 资源（handle）被 revoke。

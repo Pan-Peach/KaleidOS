@@ -39,7 +39,17 @@ impl From<ElfError> for LoaderError {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadedComponent {
     pub base: usize,
+    /// 加载入口（`kcomp_init`，Linux `module_init` 类比）地址。
     pub entry: usize,
+    /// 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）地址。
+    ///
+    /// 组件**可以**导出该 C ABI 符号（`extern "C" fn() -> i32`）；Core 解析它
+    /// 并记录为 seam，但**本轮从不调用**。
+    ///
+    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径会调用它——
+    /// 那时它配合 `ComponentState::Stopping` / `Stopped` 使用。当前没有任何
+    /// 调用点；这是与 `handle/generic.rs` 相同的"保留形状、暂不使用"先例。
+    pub exit: Option<usize>,
     pub text_size: usize,
     pub(crate) memory: Option<memory::MemoryLease>,
 }
@@ -51,6 +61,10 @@ impl LoadedComponent {
 }
 
 /// 解析 ET_REL、放置 ALLOC 段、应用当前 ABI 重定位并定位入口。
+///
+/// 加载入口 `kcomp_init` 必须存在；退出入口 `kcomp_exit`（Linux `module_exit`
+/// 类比）**可选**——存在则解析其地址存入 [`LoadedComponent::exit`]，不存在则为
+/// `None`。Core 只解析、从不调用退出入口。
 pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let object = ElfObject::parse(blob)?;
     if object.machine() != ComponentRelocationImpl::ELF_MACHINE {
@@ -64,25 +78,10 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     }
 
     let symbol_table = object.symbol_table_index()?;
-    let mut entry_offset = None;
-    for index in 0..object.symbol_count(symbol_table)? {
-        let symbol = object.symbol(symbol_table, index)?;
-        if symbol.kind != 2 {
-            continue;
-        }
-        if object.symbol_name(symbol_table, symbol)? == b"kcomp_init" {
-            let value =
-                usize::try_from(symbol.value).map_err(|_| LoaderError::UnsupportedFormat)?;
-            entry_offset = Some((symbol.shndx, value));
-            break;
-        }
-    }
-    let (entry_section, entry_section_offset) = entry_offset.ok_or(LoaderError::NoEntrySymbol)?;
-    let entry_image_offset = seg_place
-        .iter()
-        .find(|(index, _)| *index == entry_section)
-        .map(|(_, offset)| *offset)
+    let entry_offset = function_symbol_offset(&object, symbol_table, b"kcomp_init")?
         .ok_or(LoaderError::NoEntrySymbol)?;
+    // 可选退出入口：镜像里没有该符号是正常情况（不是每个组件都需要 exit）。
+    let exit_offset = function_symbol_offset(&object, symbol_table, b"kcomp_exit")?;
 
     let image_memory = memory::alloc_region(image_size).map_err(|_| LoaderError::OutOfMemory)?;
     let base = image_memory.region().base;
@@ -106,16 +105,55 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
 
     apply_relocations(&object, base, image, &seg_place, &relocations)?;
 
-    let entry = base
-        .checked_add(entry_image_offset)
-        .and_then(|offset| offset.checked_add(entry_section_offset))
-        .ok_or(LoaderError::UnsupportedFormat)?;
+    let entry = resolve_function_address(&seg_place, base, entry_offset)?;
+    let exit = match exit_offset {
+        Some(offset) => Some(resolve_function_address(&seg_place, base, offset)?),
+        None => None,
+    };
     Ok(LoadedComponent {
         base,
         entry,
+        exit,
         text_size: image_size,
         memory: Some(image_memory),
     })
+}
+
+/// 在符号表里查找名为 `name` 的 `STT_FUNC`（ELF kind == 2）符号，返回
+/// `(shndx, st_value)`；不存在返回 `None`。`kcomp_init` 必需，`kcomp_exit` 可选。
+fn function_symbol_offset(
+    object: &ElfObject<'_>,
+    symbol_table: usize,
+    name: &[u8],
+) -> Result<Option<(usize, usize)>, LoaderError> {
+    for index in 0..object.symbol_count(symbol_table)? {
+        let symbol = object.symbol(symbol_table, index)?;
+        if symbol.kind != 2 {
+            continue;
+        }
+        if object.symbol_name(symbol_table, symbol)? == name {
+            let value =
+                usize::try_from(symbol.value).map_err(|_| LoaderError::UnsupportedFormat)?;
+            return Ok(Some((symbol.shndx, value)));
+        }
+    }
+    Ok(None)
+}
+
+/// `(shndx, st_value)` → 加载后的绝对地址（段放置偏移 + base）。
+fn resolve_function_address(
+    seg_place: &[(usize, usize)],
+    base: usize,
+    (section, value): (usize, usize),
+) -> Result<usize, LoaderError> {
+    let image_offset = seg_place
+        .iter()
+        .find(|(index, _)| *index == section)
+        .map(|(_, offset)| *offset)
+        .ok_or(LoaderError::NoEntrySymbol)?;
+    base.checked_add(image_offset)
+        .and_then(|address| address.checked_add(value))
+        .ok_or(LoaderError::UnsupportedFormat)
 }
 
 /// 顶部对齐：只支持 `sh_addralign` ∈ {0,1,2,4,8}（已加载段实测上限 8）；
@@ -260,6 +298,34 @@ mod tests {
         let comp = load_component(SMOKE_KCOMP).expect("load smoke.kcomp");
         assert!(comp.entry >= comp.base);
         assert!(comp.text_size > 0);
+    }
+
+    #[test]
+    fn records_optional_exit_entry_when_symbol_present() {
+        // Given：kcomp_smoke 定义 kcomp_exit（module_exit 类比）。
+        let _g = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        // When：加载组件。
+        let comp = load_component(SMOKE_KCOMP).expect("load smoke.kcomp");
+
+        // Then：exit seam 记录到非 None 的入口地址，且与 kcomp_init 不同。
+        let exit = comp.exit.expect("kcomp_smoke exports kcomp_exit");
+        assert!(exit >= comp.base, "kcomp_exit 必须位于放置段映射内");
+        assert_ne!(exit, comp.entry, "exit 与 init 是两个不同入口");
+    }
+
+    #[test]
+    fn exit_entry_is_none_when_symbol_absent() {
+        // Given：core_test 未导出 kcomp_exit。
+        let _g = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        // When：加载组件。
+        let comp = load_component(CORETEST_KCOMP).expect("load core_test.kcomp");
+
+        // Then：可选 exit seam 保持 None（组件不导出 exit 是正常情况）。
+        assert_eq!(comp.exit, None);
     }
 
     #[test]

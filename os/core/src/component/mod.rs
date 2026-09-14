@@ -58,6 +58,29 @@ pub enum ComponentState {
     Resolved,
     Starting,
     Ready,
+    /// 正在停止：**shape-only stub**——本增量没有任何路径进入此状态，
+    /// `Stopping → Stopped` 的转换也尚未接线。
+    ///
+    /// 预期（future）语义：组件退出入口 `kcomp_exit`（Linux `module_exit` 类比）
+    /// 执行期，publish/claim 等新 work 被拒绝，已有状态逐步清理（quiesce/drain）。
+    ///
+    /// TODO(component-exit): ComponentManager 的 stop 路径落地后
+    /// （`Ready → Stopping → Stopped`），由它调用 `ComponentRecord.exit`。
+    Stopping,
+    /// 已停止：**shape-only stub**——本增量没有任何路径进入此状态。
+    ///
+    /// 预期（future）语义：`kcomp_exit` 已返回、实例的 authority 与接口已回收，
+    /// 之后可退休该实例（释放名字槽、分配新 `ComponentId`）并重新探测。
+    Stopped,
+    /// 运行过程中失败（逻辑死亡，可触发恢复流程）。
+    ///
+    /// 意外退出 / abort **当前统一由 `Failed` 覆盖**（组件 panic containment
+    /// 路径提交 `Failed`）。
+    ///
+    /// TODO(unexpected-exit): 失败实例的状态提交点（`containment` 的
+    /// task-abort trampoline → `sched::abort_current_task` → `fail_component`）
+    /// 就是未来"独立 abort/exit 通知"的 hook 点；届时可区分普通失败与组件
+    /// 主动退出。
     Failed,
 }
 

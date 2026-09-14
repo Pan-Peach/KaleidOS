@@ -13,9 +13,12 @@
 //!   `Failed` 组件拥有的任务（`sched.rs`），但不会**强制停止**正在跑的任务——
 //!   那需要 task-stop API（当前只有 yield/exit），本增量不做；任务在下次
 //!   yield/exit 时自然退出。
-//! - **Quiescing / Stopped 与 `kcomp_stop`**：本增量只把 `Failed` 接入
+//! - **Stopping / Stopped 与 `kcomp_exit`**：本增量只把 `Failed` 接入
 //!   acquiring / work 门禁（`component::is_failed` / `component::may_run`，入口见
-//!   `export.rs`）；优雅 quiesce / drain / 实例退役留给后续增量。
+//!   `export.rs`）；`kcomp_exit` 只被 loader 可选解析为 seam（从不调用），优雅
+//!   quiesce / drain / 实例退役留给后续增量。
+//!   TODO(unexpected-exit): 本文件是失败实例状态提交的汇合点——未来"独立
+//!   abort/exit 通知"（区分普通失败与组件主动退出）会从这里分流。
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
 
 use crate::component::load::ComponentLoadError;

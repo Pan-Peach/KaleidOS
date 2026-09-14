@@ -83,6 +83,13 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
         let id = reg
             .declare(name, comp.entry, comp.base, comp.take_memory())
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
+        // 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）：只记录 seam。
+        //
+        // TODO(component-exit): 未来 ComponentManager 的 stop 路径会读取
+        //   `ComponentRecord.exit` 并调用它（`Ready → Stopping → Stopped`）。
+        //   当前**从未调用**——`kcomp_exit` 的定义/解析只是完成生命周期形状。
+        reg.record_exit(id, comp.exit)
+            .map_err(|_| ComponentLoadError::DeclareFailed)?;
         reg.resolve(id)
             .map_err(|_| ComponentLoadError::ResolveFailed)?;
         // Resolved → Starting：`kcomp_init` 执行期间 publish 只记录 pending。

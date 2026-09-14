@@ -5,9 +5,11 @@
 #
 #   component wrapper + third-party/SDK deps
 #     → staticlib（私有携带所有依赖）
-#     → rust-lld -r --gc-sections -u kcomp_init（partial link + 段 GC + 保留入口）
+#     → rust-lld -r --gc-sections -u kcomp_init（+ 定义了 kcomp_exit 时一并 -u）
+#       （partial link + 段 GC + 保留入口）
 #     → llvm-objcopy --strip-debug（去调试/元数据）
-#     → .kcomp（ET_REL；UNDEF 只允许白名单 kcore_*；kcomp_init DEFINED）
+#     → .kcomp（ET_REL；UNDEF 只允许白名单 kcore_*；kcomp_init DEFINED，
+#               kcomp_exit 可选 DEFINED）
 #
 # 用法：
 #   tools/build-kcomp.sh <component-dir> <target> <output> [<target-dir>]
@@ -60,6 +62,11 @@ fi
 
 # 2) partial link：只抽可达成员、GC 未引用段、-u 钉住加载入口。
 #    --no-relax 避免 R_RISCV_ALIGN（loader 不支持；relax 在本步骤无收益）。
+#
+#    组件可以**可选**导出退出入口 kcomp_exit（Linux module_exit 类比）。它在
+#    staticlib 里是独立 archive member，若不显式 -u 就会被归档抽取/GC 丢掉；
+#    只有定义时才钉住——未定义该符号的组件保持 UNDEF 白名单干净（loader 按
+#    可选解析，见 os/core/src/component/loader.rs）。
 sysroot=$("$rustc_bin" --print sysroot)
 host=$("$rustc_bin" -vV | sed -n 's/^host: //p')
 lld="$sysroot/lib/rustlib/$host/bin/rust-lld"
@@ -71,7 +78,12 @@ fi
 tmp=$(mktemp "${TMPDIR:-/tmp}/kcomp.XXXXXX.o")
 trap 'rm -f "$tmp"' EXIT
 
-"$lld" -flavor gnu -r --gc-sections --no-relax -u kcomp_init -o "$tmp" "$lib"
+force=(-u kcomp_init)
+if "$readelf" -s "$lib" | awk '$4=="FUNC" && $8=="kcomp_exit" && $7!="UND" {found=1} END{exit !found}'; then
+    force+=(-u kcomp_exit)
+fi
+
+"$lld" -flavor gnu -r --gc-sections --no-relax "${force[@]}" -o "$tmp" "$lib"
 
 # 3) strip：去调试段 + LTO bitcode（loader 不需要，且体积巨大）。
 mkdir -p "$(dirname "$output")"

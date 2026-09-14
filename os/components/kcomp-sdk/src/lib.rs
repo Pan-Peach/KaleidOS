@@ -621,6 +621,22 @@ macro_rules! kcomp_init {
     };
 }
 
+// 可选退出入口 `kcomp_exit`（Linux module_exit 风格）。
+//
+// 组件**可以**手写与 `kcomp_init!` 对称的 C ABI 退出入口：
+//
+//     #[unsafe(no_mangle)]
+//     pub extern "C" fn kcomp_exit() -> i32 { 0 }
+//
+// 本阶段只完成生命周期**形状**：Core loader 会可选地解析该符号并存为 seam
+// （`os/core/src/component/loader.rs::LoadedComponent::exit`、
+// `component::registry::ComponentRecord::exit`），但**从不调用**它——未来的
+// ComponentManager stop 路径才会真正驱动（`Ready → Stopping → Stopped`，见
+// `component::ComponentState`）。不导出该符号是正常情况（`exit == None`）。
+//
+// 返回码约定（future，与 `kcomp_init` 对称）：`0` = 干净退出，非 0 = 失败
+// 位图；当前未驱动，Core 侧无处理语义。
+
 // ---------------------------------------------------------------------------
 // panic adapter（组件私有；见 crate 文档）
 // ---------------------------------------------------------------------------

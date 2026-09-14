@@ -32,6 +32,16 @@ pub struct ComponentRecord {
     pub state: ComponentState,
     pub entry: usize,
     pub base: usize,
+    /// 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）地址；仅当组件
+    /// 导出该符号时存在。
+    ///
+    /// **本轮是 seam only：Core 记录但从不调用**——与 `handle/generic.rs`
+    /// 保留未使用形状的先例一致。
+    ///
+    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径会调用它并推进
+    /// `Stopping → Stopped`；当前没有任何路径读它。
+    #[allow(dead_code)]
+    pub exit: Option<usize>,
     #[allow(dead_code)]
     pub(crate) memory: Option<MemoryLease>,
 }
@@ -88,9 +98,23 @@ impl Registry {
             state: ComponentState::Declared,
             entry,
             base,
+            exit: None,
             memory,
         });
         Ok(id)
+    }
+
+    /// 记录组件的可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）。
+    ///
+    /// 与 `declare` 分开：只有 load 路径有真实值，registry 单测只关心状态机，
+    /// 不必让每个调用点都携带 `exit`。**Core 本轮只存不调用**（seam only）。
+    pub fn record_exit(
+        &mut self,
+        id: ComponentId,
+        exit: Option<usize>,
+    ) -> Result<(), RegistryError> {
+        self.record_mut(id)?.exit = exit;
+        Ok(())
     }
 
     /// Declared → Resolved：所有 required Interfaces 已成功绑定。
@@ -137,8 +161,8 @@ impl Registry {
     /// `id` 是否为 `Failed`（逻辑死亡）实例。
     ///
     /// Core 真相门禁：失败实例不得获取新 authority 或创建新 work，但仍需
-    /// teardown（`release` / `revoke`、释放已持有的 handle）。（未来的
-    /// `Quiescing` / `Stopped` 落地后并入本判定。）
+    /// teardown（`release` / `revoke`、释放已持有的 handle）。（`Stopping` /
+    /// `Stopped` 落地后并入本判定：它们同样不是可运行状态。）
     pub fn is_failed(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| r.state == ComponentState::Failed)
@@ -147,7 +171,9 @@ impl Registry {
     /// 该组件拥有的任务是否允许运行。
     ///
     /// 只有活着的实例（`Starting` = `kcomp_init` 执行期、`Ready`）可以运行任务；
-    /// `Failed` 实例的任务必须从 runnable 候选中剔除，并在 commit 前再次验证。
+    /// `Failed`、`Stopping`、`Stopped` 实例的任务必须从 runnable 候选中剔除，并在
+    /// commit 前再次验证（`Stopping` / `Stopped` 当前是 shape-only stub，没有任何
+    /// 转换进入它们，但门禁语义已经正确）。
     pub fn may_run(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))
@@ -413,6 +439,46 @@ mod tests {
         assert!(
             !reg.may_run(ComponentId::from_raw(99)),
             "unknown must not run"
+        );
+    }
+
+    #[test]
+    fn may_run_excludes_stopping_stopped_and_failed() {
+        // Given：一个 Ready 组件（唯一可运行任务的活状态）。
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        assert!(reg.may_run(id), "Ready runs work");
+
+        // When / Then：Stopping / Stopped 是 shape-only stub（本增量没有任何
+        // 转换进入它们），直接写入状态以钉死门禁语义——只有活实例可运行任务。
+        reg.record_mut(id).unwrap().state = ComponentState::Stopping;
+        assert!(!reg.may_run(id), "Stopping must not run work");
+        reg.record_mut(id).unwrap().state = ComponentState::Stopped;
+        assert!(!reg.may_run(id), "Stopped must not run work");
+        reg.record_mut(id).unwrap().state = ComponentState::Failed;
+        assert!(!reg.may_run(id), "Failed must not run work");
+    }
+
+    #[test]
+    fn record_exit_stores_seam_and_declare_defaults_to_none() {
+        // Given：一个新声明的组件。
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+
+        // Then：exit seam 默认 None（组件不导出 kcomp_exit）。
+        assert_eq!(reg.get(id).unwrap().exit, None);
+
+        // When：loader 记录一个可选退出入口。
+        reg.record_exit(id, Some(0x3000)).unwrap();
+
+        // Then：记录可见；未知 id 被拒绝。
+        assert_eq!(reg.get(id).unwrap().exit, Some(0x3000));
+        assert_eq!(
+            reg.record_exit(ComponentId::from_raw(99), Some(1)),
+            Err(RegistryError::NotFound)
         );
     }
 
