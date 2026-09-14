@@ -79,8 +79,15 @@ mod runtime {
         fn sched_run() -> i32;
 
         // C6：资源 authority（status + out 形态，0 / -Errno）
+        #[link_name = "kcore_device_nth"]
+        fn device_nth(
+            compatible: *const u8,
+            len: usize,
+            ordinal: u32,
+            out_device_id: *mut u32,
+        ) -> i32;
         #[link_name = "kcore_mmio_claim"]
-        fn mmio_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        fn mmio_claim(device_id: u32, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_mmio_read_u32"]
         fn mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
         #[link_name = "kcore_mmio_write_u32"]
@@ -92,7 +99,7 @@ mod runtime {
 
         // C6：IRQ authority（status + out / status 形态，0 / -Errno）
         #[link_name = "kcore_irq_claim"]
-        fn irq_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        fn irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_irq_register"]
         fn irq_register(handle: u64, handler: extern "C" fn(*mut ()), ctx: *mut ()) -> i32;
         #[link_name = "kcore_irq_enable"]
@@ -103,6 +110,8 @@ mod runtime {
         fn irq_poll(handle: u64, out_count: *mut u64) -> i32;
         #[link_name = "kcore_irq_ack"]
         fn irq_ack(handle: u64) -> i32;
+        #[link_name = "kcore_irq_release"]
+        fn irq_release(handle: u64) -> i32;
 
         // C6：DMA authority（alloc → lease → release，0 / -Errno）
         #[link_name = "kcore_dma_alloc"]
@@ -391,33 +400,43 @@ mod runtime {
         // 读 MagicValue。QEMU 的 8 个 transport 无条件实例化（无需 -device），
         // offset 0 恒为 0x74726976；组件全程不持有地址。
         report.group("resource authority");
+        // 纯枚举出第一台 virtio-mmio，再认领**确切的** DeviceId（不再"第一台匹配"）。
+        let mut virtio_device = 0u32;
+        let enumerated =
+            unsafe { device_nth(b"virtio,mmio".as_ptr(), 11, 0, &mut virtio_device) } == 0;
         let mut mmio_handle = 0u64;
-        let claimed = unsafe {
-            mmio_claim(
-                b"virtio,mmio".as_ptr(),
-                b"virtio,mmio".len(),
-                &mut mmio_handle,
-            ) == 0
-        };
+        let claimed = enumerated && unsafe { mmio_claim(virtio_device, &mut mmio_handle) } == 0;
         let mut magic = 0u32;
         let magic_ok = claimed && (unsafe { mmio_read_u32(mmio_handle, 0, &mut magic) } == 0);
         check!("mmio-magic", magic_ok && magic == 0x7472_6976, 10);
 
-        // C6 IRQ 链：Core 验证 claim/register/enable 后真的把 PLIC 打开。
-        // 用 PLIC 自己的 MMIO（作为设备 claim 进来）读回 enable bit 作证——
-        // 这一步跨过了「Core 宣布成功」和「硬件真的被写」之间的空隙。
-        // QEMU virt 常量：UART = ns16550a = PLIC line 10；S-mode context = hart*2+1。
-        let mut plic = 0u64;
-        let plic_ok = unsafe { mmio_claim(b"riscv,plic0".as_ptr(), 11, &mut plic) } == 0;
+        // C6 IRQ 链：先从 UART 的 MMIO root 派生**同台设备**的中断线（不再独立匹配
+        // compatible），再 Core 验证 register/enable 后真的把 PLIC 打开。用 PLIC
+        // 自己的 MMIO 读回 enable bit 作证——跨过「Core 宣布成功」和「硬件真的被
+        // 写」之间的空隙。QEMU virt 常量：UART = ns16550a = PLIC line 10；
+        // S-mode context = hart*2+1。
+        let mut uart_device = 0u32;
+        let uart_enumerated =
+            unsafe { device_nth(b"ns16550a".as_ptr(), 8, 0, &mut uart_device) } == 0;
+        let mut uart = 0u64;
+        let uart_ok = uart_enumerated && unsafe { mmio_claim(uart_device, &mut uart) } == 0;
         let mut irq = 0u64;
-        let irq_claimed = plic_ok && unsafe { irq_claim(b"ns16550a".as_ptr(), 8, &mut irq) } == 0;
+        let irq_claimed = uart_ok && unsafe { irq_claim(uart, &mut irq) } == 0;
         let irq_registered =
             irq_claimed && unsafe { irq_register(irq, irq_handler, core::ptr::null_mut()) } == 0;
         let irq_enabled = irq_registered && unsafe { irq_enable(irq) } == 0;
 
+        // PLIC 用来读回 enable bit（IRQ 证据）并为 DMA 提供设备身份。
+        let mut plic_device = 0u32;
+        let plic_enumerated =
+            unsafe { device_nth(b"riscv,plic0".as_ptr(), 11, 0, &mut plic_device) } == 0;
+        let mut plic = 0u64;
+        let plic_ok = plic_enumerated && unsafe { mmio_claim(plic_device, &mut plic) } == 0;
+
         let ctx = (unsafe { machine_boot_hart() } as usize) * 2 + 1;
         let mut enable_word = 0u32;
         let plic_written = irq_enabled
+            && plic_ok
             && unsafe { mmio_read_u32(plic, (0x2000 + ctx * 0x80) as u32, &mut enable_word) } == 0;
         check!(
             "irq-line-enable",
@@ -460,6 +479,13 @@ mod runtime {
         let poll_read = polled && (unsafe { irq_poll(irq, &mut poll_count) } == 0);
         let poll_acked = poll_read && (unsafe { irq_ack(irq) } == 0);
         check!("irq-polled", poll_read && poll_count == 0 && poll_acked, 15);
+
+        // C6 IRQ release：真正撤销该线 authority（revoke slot + 关断控制器线）后
+        // 同一 handle 立即失效。
+        let irq_released = poll_acked && (unsafe { irq_release(irq) } == 0);
+        let mut released_count = 0u64;
+        let stale_poll = unsafe { irq_poll(irq, &mut released_count) } != 0;
+        check!("irq-release", irq_released && stale_poll, 17);
 
         // C6 DMA 链：用仍持有的 plic MmioHandle 推导设备身份，alloc → lease
         // backing → 写读回 0xDEADBEEF → release → 后续 lease stale（进 quarantine）。

@@ -107,11 +107,53 @@ unsafe impl Hal for CoreHal {
 }
 
 kcomp_sdk::kcomp_init!({
+    // 设备发现 + 精确认领：纯枚举列出候选（不授权）→ 认领确切 DeviceId →
+    // 读 VirtIO MMIO DeviceID（offset 0x008，2 = block）→ 不是块设备就释放、
+    // 试下一个 ordinal。Core 不学 VirtIO 语义，读设备头只在驱动里。
+    //
+    // TODO(prober): 这个逐 ordinal 探测循环属于未来的组件级 prober（总线/协议
+    // aware 的组件，不是 Core）。届时 prober 只把选中的 DeviceId 作为"选择数据"
+    // 交给本驱动，本驱动仍在自己上下文里 claim 同一 DeviceId（见
+    // docs/driver-model.md §9.1 / §12 Q1）。当前先内联最小实现以验证 ABI。
+    const VIRTIO_MMIO_DEVICE_ID_OFFSET: u32 = 0x008;
+    const VIRTIO_ID_BLOCK: u32 = 2;
+
+    let mut ordinal = 0u32;
     let mut mmio = 0u64;
-    let rc = unsafe { abi::kcore_mmio_claim(b"virtio,mmio".as_ptr(), 11, &mut mmio) };
-    if rc != 0 {
-        kcomp_sdk::klog!("claim mmio failed: {}", rc);
-        return rc;
+    loop {
+        let mut device_id = 0u32;
+        let rc = unsafe {
+            abi::kcore_device_nth(b"virtio,mmio".as_ptr(), 11, ordinal, &mut device_id)
+        };
+        if rc != 0 {
+            kcomp_sdk::klog!("no virtio block device found (device_nth: {})", rc);
+            return rc;
+        }
+
+        let rc = unsafe { abi::kcore_mmio_claim(device_id, &mut mmio) };
+        if rc != 0 {
+            // 该 transport 已被别的 owner 认领：跳过，试下一台。
+            kcomp_sdk::klog!("claim device_id={} failed: {}; trying next", device_id, rc);
+            ordinal += 1;
+            continue;
+        }
+
+        let mut virtio_device_id = 0u32;
+        let rc = unsafe {
+            abi::kcore_mmio_read_u32(mmio, VIRTIO_MMIO_DEVICE_ID_OFFSET, &mut virtio_device_id)
+        };
+        if rc != 0 {
+            kcomp_sdk::klog!("read DeviceID failed: {}", rc);
+            let _ = unsafe { abi::kcore_mmio_release(mmio) };
+            return rc;
+        }
+        if virtio_device_id == VIRTIO_ID_BLOCK {
+            break;
+        }
+
+        // 空 transport（DeviceID=0）或其他类型：释放这一台，继续探测。
+        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        ordinal += 1;
     }
     unsafe { *MMIO_HANDLE.0.get() = mmio; }
 

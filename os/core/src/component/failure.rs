@@ -21,15 +21,21 @@ use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, interface, registry};
 use crate::handle::{dma, irq, mmio};
 
-/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 撤销 MMIO → 撤销 IRQ →
-/// 撤销 DMA → 解绑它作为 provider 的所有接口并丢弃其 pending publications。
+/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → quarantine + 撤销 MMIO →
+/// 撤销 IRQ → 撤销 DMA → 解绑它作为 provider 的所有接口并丢弃其 pending publications。
+///
+/// **设备 quarantine**：revoke MMIO authority 不等于设备可被下一个驱动安全复用
+/// （设备可能仍被硬件引用 / 未静默）。因此撤销前先把失败组件占用的每个
+/// `device_index` 标进 Core 的失败 quarantine——之后普通认领返回 `-EBUSY`，直到
+/// reboot（phase 1 不建 reset/recovery 框架）。组件**优雅、协作式 quiesce** 后的
+/// `release` 不进入 quarantine，设备仍可复用。
 ///
 /// `reason` 记录失败原因；Registry 当前只存状态、不存 reason，参数保留为调用方
 /// 语义 / 未来 trace seam。锁纪律：各操作各自取锁、互不嵌套，可安全调用。
 pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
     let _ = reason;
     registry::get_registry().lock().mark_failed(id).ok();
-    mmio::get_table().lock().revoke_owner(id);
+    mmio::get_table().lock().quarantine_owner(id);
     irq::get_table().lock().revoke_owner(id);
     // DMA authority：failed 组件的 backing lease 进 QUARANTINE（不 free）。
     // （`dma::revoke_owner` 早已存在，此前未接在失败路径上。）
@@ -74,6 +80,46 @@ mod tests {
         interface::init();
         crate::handle::init();
 
+        // Given：提交一份包含 device 24 的机器信息（之后用它验证 quarantine 认领）。
+        // device_index 24 是本用例专用，避开其它测试的索引。
+        {
+            use crate::machine::{
+                self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo,
+                MemoryRegion,
+            };
+            let mut devices = [DeviceDescriptor::empty(); 26];
+            devices[24] = DeviceDescriptor {
+                space: IoSpace::Mmio {
+                    base: 0x1000_0000,
+                    size: 0x1000,
+                },
+                irq: Some(8),
+                compatibles: [
+                    CompatStr::from_bytes(b"fail,mmio"),
+                    CompatStr::empty(),
+                    CompatStr::empty(),
+                    CompatStr::empty(),
+                ],
+                compat_count: 1,
+            };
+            machine::commit(MachineInfo {
+                boot_hart: 0,
+                timebase_frequency: 10_000_000,
+                cpu_count: 1,
+                cpu_info: [CpuInfo {
+                    boot_cpu: true,
+                    hart_id: CpuId::from_raw(0),
+                }; 8],
+                mem_count: 1,
+                memory_regions: [MemoryRegion {
+                    base: 0x8000_0000,
+                    size: 0x1000_0000,
+                }; 16],
+                dev_count: 25,
+                devices,
+            });
+        }
+
         // Given：Starting 组件 + 三个 authority + 一个已提交接口。
         let id = {
             let mut reg = registry::get_registry().lock();
@@ -87,10 +133,10 @@ mod tests {
             MmioRegion {
                 base: 0x1000_0000,
                 size: 0x1000,
-                device_index: 0,
+                device_index: 24,
             },
         );
-        let irq_handle = irq::get_table().lock().grant(id, Irq::new(8, 0));
+        let irq_handle = irq::get_table().lock().grant(id, Irq::new(8, 24));
         // DMA authority：设备身份从 caller 已持有的 MmioHandle 推导。
         let dma_ctx = RequestContext {
             component: id,
@@ -155,5 +201,23 @@ mod tests {
             registry::get_registry().lock().get(id).unwrap().state,
             ComponentState::Failed
         );
+
+        // Then：失败设备被 quarantine——revoke 后既无 live claim，普通认领也返回
+        // Busy（直到 reboot）。优雅 release 才会重新可认领。
+        assert!(mmio::get_table().lock().is_quarantined(24));
+        assert!(!mmio::get_table().lock().holds_device(24));
+        let claimant = ComponentId::from_raw(999);
+        let claim_ctx = RequestContext {
+            component: claimant,
+            task: None,
+        };
+        assert_eq!(
+            mmio::claim_device(&claim_ctx, crate::machine::DeviceId::from_raw(24)),
+            Err(mmio::MmioClaimError::DeviceBusy),
+            "失败设备 quarantine 后普通认领必须 -EBUSY"
+        );
+
+        // 清理：进程全局 quarantine 标记不能在用例间残留。
+        mmio::get_table().lock().clear_quarantine();
     }
 }

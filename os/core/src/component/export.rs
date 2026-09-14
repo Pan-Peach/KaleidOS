@@ -19,7 +19,7 @@
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
-//! | Resource authority（v3 起步） | `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_mmio_write_u32` `kcore_mmio_release` `kcore_mmio_lease` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` `kcore_irq_register_polled` `kcore_irq_poll` `kcore_irq_ack` | 设备认领 + 单次 MMIO 读写/释放 + 设备中断线认领/注册/使能：claim = request → Core authorize → grant（authorize phase 1 恒 allow，见 `handle/mmio.rs`、`handle/irq.rs`）；常规访问 = 每次调用 Core 重新验证 handle 后才访问硬件。IRQ 投递两态：`register` = trap 上下文回调；`register_polled` + `poll`/`ack` = 轮询（Core 计数并掩蔽，驱动任务读完计数后 `ack` 由 Core 重新放行）。常规访问组件拿到的只是 raw handle，**不是地址/中断号**；`kcore_mmio_lease` 额外派生 Core 校验过一次的 `(ptr, len)` + provenance（受信 KernelNative 直接访问，撤销为协作式，见 `handle/lease.rs`）。全部 `0 / -Errno`、值走 out 参数 |
+//! | Resource authority（v3 起步） | `kcore_device_nth` `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_mmio_write_u32` `kcore_mmio_release` `kcore_mmio_lease` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` `kcore_irq_register_polled` `kcore_irq_poll` `kcore_irq_ack` `kcore_irq_release` | 设备身份/认领链（identity → root → derived）：`device_nth` = 纯发现（列候选，不授权，`DeviceId` 是 identity 不是 handle）；`mmio_claim` = 用 `DeviceId` 认领**确切设备**（不是"第一台匹配"）→ Core authorize → grant；`irq_claim` = 从 caller 已持有的 `MmioHandle` 派生**同一台设备**的中断线（`irq=None` → `-ENODEV`）；`dma_alloc` 同样从 `MmioHandle` 推导设备身份。`mmio_release` 在仍有 live IRQ/DMA 子 authority 时拒绝（`-EBUSY`）；`irq_release` 真的关断投递（撤销 slot + 关断控制器线）。IRQ 投递两态：`register` = trap 上下文回调；`register_polled` + `poll`/`ack` = 轮询（Core 计数并掩蔽，驱动任务读完计数后 `ack` 由 Core 重新放行）。常规访问组件拿到的只是 raw handle，**不是地址/中断号**；`kcore_mmio_lease` 额外派生 Core 校验过一次的 `(ptr, len)` + provenance（受信 KernelNative 直接访问，撤销为协作式，见 `handle/lease.rs`）。全部 `0 / -Errno`、值走 out 参数 |
 //! | DMA authority（v3 起步） | `kcore_dma_alloc` `kcore_dma_lease` `kcore_dma_release` | `alloc` = 用 caller **已持有的 `MmioHandle`** 推导设备身份（绝不接受自报设备号）→ Core 分配物理连续 backing → grant `DmaHandle`；`lease` = Core 校验后派生 backing `(ptr, len)` + **设备可见地址**（v1 identity：== 物理基址，无 IOMMU）+ provenance；`release` = backing lease 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `handle/dma.rs`。全部 `0 / -Errno`、值走 out 参数 |
 //!
 //! # ABI 错误约定（v3 起）
@@ -48,7 +48,7 @@
 //!
 //! # 明确不导出（未经 Core validation 的裸 authority mutation）
 //!
-//! 组件可以 **request** 资源（v3 的 `kcore_mmio_claim` = request → Core
+//! 组件可以 **request** 资源（v3+ 的 `kcore_device_nth` + `kcore_mmio_claim` = discover + request → Core
 //! authorize → Core grant），但任何 Core truth 的 mutation 都必须由 Core
 //! 验证后提交并留 trace；裸 mutation 入口一律不导出：
 //!
@@ -490,25 +490,59 @@ extern "C" fn kcore_sched_run() -> i32 {
 // Category 8：Resource authority（v3 起步；request → authorize → grant → access）
 // ---------------------------------------------------------------------------
 
-/// 认领一台已发现设备的 MMIO authority（C6 起步）。
+/// 纯设备发现：按 compatible 取第 `ordinal` 个匹配描述符。
 ///
-/// 语义：compatible 匹配 `MachineInfo.devices` → Core authorize（phase 1 恒
-/// allow）→ 独占检查（设备已归其他 owner 则拒绝）→ grant `MmioHandle`。
+/// **不分配、不预留、不触碰任何设备寄存器、不读取 claim 状态**；枚举包含已认领
+/// 设备，顺序只取决于已提交的 `MachineInfo`（跨 claim/release 稳定）。一条描述符
+/// 匹配任意 compatible 串只计一次。
+///
+/// 成功 = 0，`DeviceId`（纯身份，**不是 handle、不可撤销、无权限**；`u32`）写入
+/// `*out_device_id`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` compatible 非法 /
+/// `ENODEV` 机器信息尚未提交 / `ENOENT` `ordinal` 超出匹配数——**唯一终止信号**）。
+extern "C" fn kcore_device_nth(
+    compatible_ptr: *const u8,
+    compatible_len: usize,
+    ordinal: u32,
+    out_device_id: *mut u32,
+) -> i32 {
+    if out_device_id.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(compatible) = checked_name(compatible_ptr, compatible_len) else {
+        return Errno::EINVAL.code();
+    };
+    match machine::nth_compatible(compatible, ordinal) {
+        Ok(device) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe { core::ptr::write_unaligned(out_device_id, device.raw()) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 认领**一台确切设备**的 MMIO root authority（v2）。
+///
+/// 语义：`device_id`（发现阶段得到）→ Core 解析到设备记录 → authorize（phase 1 恒
+/// allow）→ 独占检查（该 `device_index` 已被认领或处于失败 quarantine 则拒绝）→
+/// grant `MmioHandle`。独占锚在**设备**上：同一设备的 IRQ / DMA 只能从这个 root 派生。
+///
+/// 链接名沿用原名，签名直接替换（收 `device_id` 而非 compatible）；本阶段不提供
+/// ABI 兼容，所有内置组件一同重编，不保证陈旧 `.kcomp` 可加载。
+///
 /// 成功 = 0，raw handle（`to_raw` 编码：高 32 位 slot、低 32 位 generation；
 /// **不是地址**）写入 `*out_handle`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法 / `EPERM` 无法解析
-/// caller 或 Core 策略拒绝 / `ENODEV` 无匹配设备 / `EBUSY` 匹配设备全被认领）。
-extern "C" fn kcore_mmio_claim(name_ptr: *const u8, name_len: usize, out_handle: *mut u64) -> i32 {
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 Core 策略拒绝 /
+/// `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO / `EBUSY` 设备已被认领或已 quarantine）。
+extern "C" fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32 {
     if out_handle.is_null() {
         return Errno::EFAULT.code();
     }
-    let Some(compatible) = checked_name(name_ptr, name_len) else {
-        return Errno::EINVAL.code();
-    };
     let Some(ctx) = RequestContext::ambient() else {
         return Errno::EPERM.code();
     };
-    match mmio::claim(&ctx, compatible) {
+    match mmio::claim_device(&ctx, machine::DeviceId::from_raw(device_id)) {
         Ok(handle) => {
             // SAFETY: `out_handle` 的可写性由调用方保证（C ABI 契约）；unaligned
             // 写避免调用方指针未对齐 = UB。
@@ -697,27 +731,28 @@ extern "C" fn kcore_dma_release(handle: u64) -> i32 {
 // Category 8（续）：IRQ authority（v3 起步；claim → register → enable）
 // ---------------------------------------------------------------------------
 
-/// 认领一台已发现设备的中断线（C6 骨架）。
+/// 从 caller **已持有的 MMIO root** 派生同一台设备的中断线（v2）。
 ///
-/// 语义：compatible 匹配 `MachineInfo.devices` → 取设备的 `irq`（PLIC global
-/// interrupt id）→ Core authorize（phase 1 恒 allow）→ 独占检查（该中断号已归
-/// 其他 owner 则拒绝）→ grant `IrqHandle`。
+/// 语义：Core 校验 `mmio_handle`（slot/generation/owner/生命周期）→ 推出该设备的
+/// `device_index` → 取设备记录的 `irq`（PLIC global interrupt id）→ authorize
+/// （phase 1 恒 allow）→ 独占检查（该中断号已被认领则拒绝）→ grant `IrqHandle`。
+/// IRQ **不再**按 compatible 独立匹配，因此不可能与 MMIO 认领到不同设备。
+///
+/// 链接名沿用原名，签名直接替换（由 `(compatible)` 变为 `(mmio_handle)`）。
+///
 /// 成功 = 0，raw handle 写入 `*out_handle`（同 `kcore_mmio_claim` 的编码：
 /// 高 32 位 slot、低 32 位 generation；**不是中断号**）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法 / `EPERM` 无法解析
-/// caller 或 Core 策略拒绝 / `ENODEV` 无匹配设备或设备无中断线 / `EBUSY` 中断线
-/// 已被认领）。
-extern "C" fn kcore_irq_claim(name_ptr: *const u8, name_len: usize, out_handle: *mut u64) -> i32 {
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
+/// `EBADF`/`ESTALE`/`EACCES`/`EKEYREVOKED` MMIO handle 无效 / `ENODEV` 设备无
+/// 中断线 / `EBUSY` 中断线已被认领）。
+extern "C" fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32 {
     if out_handle.is_null() {
         return Errno::EFAULT.code();
     }
-    let Some(compatible) = checked_name(name_ptr, name_len) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(caller) = current_task_requester() else {
+    let Some(ctx) = RequestContext::ambient() else {
         return Errno::EPERM.code();
     };
-    match irq::claim(caller, compatible) {
+    match irq::claim_derived(ctx.component, mmio::MmioHandle::from_raw(mmio_handle)) {
         Ok(handle) => {
             // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
             unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
@@ -725,6 +760,16 @@ extern "C" fn kcore_irq_claim(name_ptr: *const u8, name_len: usize, out_handle: 
         }
         Err(error) => Errno::from(error).code(),
     }
+}
+
+/// 主动释放一条 IRQ authority：**真的关断投递**（撤销 slot + 关断控制器线）。
+///
+/// 返回 0 / `-Errno`（`EPERM` 无法解析 caller / handle 类错误同 MMIO）。
+extern "C" fn kcore_irq_release(handle: u64) -> i32 {
+    let Some(caller) = current_task_requester() else {
+        return Errno::EPERM.code();
+    };
+    status(irq::release(caller, irq::IrqHandle::from_raw(handle)))
 }
 
 /// 注册该 IRQ 线的投递目标（组件处理函数 + opaque context，C6 骨架）。
@@ -826,7 +871,7 @@ extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 36] = [
+static EXPORTS: [Export; 38] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -925,6 +970,10 @@ static EXPORTS: [Export; 36] = [
     },
     // Category 8：Resource authority（v3 起步）
     Export {
+        name: b"kcore_device_nth",
+        address: ExportAddress(kcore_device_nth as *const ()),
+    },
+    Export {
         name: b"kcore_mmio_claim",
         address: ExportAddress(kcore_mmio_claim as *const ()),
     },
@@ -982,6 +1031,10 @@ static EXPORTS: [Export; 36] = [
         name: b"kcore_irq_ack",
         address: ExportAddress(kcore_irq_ack as *const ()),
     },
+    Export {
+        name: b"kcore_irq_release",
+        address: ExportAddress(kcore_irq_release as *const ()),
+    },
 ];
 
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
@@ -1023,6 +1076,7 @@ mod tests {
             &b"kcore_task_state"[..],
             &b"kcore_panic_escape"[..],
             &b"kcore_sched_run"[..],
+            &b"kcore_device_nth"[..],
             &b"kcore_mmio_claim"[..],
             &b"kcore_mmio_read_u32"[..],
             &b"kcore_mmio_write_u32"[..],
@@ -1037,6 +1091,7 @@ mod tests {
             &b"kcore_irq_register_polled"[..],
             &b"kcore_irq_poll"[..],
             &b"kcore_irq_ack"[..],
+            &b"kcore_irq_release"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -1093,9 +1148,19 @@ mod tests {
     /// v3 资源 authority API 的错误约定：`0 / -Errno`，值走 out 参数。
     #[test]
     fn resource_authority_apis_follow_status_convention() {
+        // `kcore_device_nth`：null out → EFAULT；compatible 非法 → EINVAL。
+        let device_nth = resolve(b"kcore_device_nth").unwrap();
+        let device_nth: extern "C" fn(*const u8, usize, u32, *mut u32) -> i32 =
+            unsafe { core::mem::transmute(device_nth) };
+        let mut device_id = 0u32;
+        assert_eq!(
+            device_nth(b"virtio,mmio".as_ptr(), 11, 0, core::ptr::null_mut()),
+            -14
+        );
+        assert_eq!(device_nth(core::ptr::null(), 0, 0, &mut device_id), -22);
+
         let claim = resolve(b"kcore_mmio_claim").unwrap();
-        let claim: extern "C" fn(*const u8, usize, *mut u64) -> i32 =
-            unsafe { core::mem::transmute(claim) };
+        let claim: extern "C" fn(u32, *mut u64) -> i32 = unsafe { core::mem::transmute(claim) };
         let read = resolve(b"kcore_mmio_read_u32").unwrap();
         let read: extern "C" fn(u64, u32, *mut u32) -> i32 = unsafe { core::mem::transmute(read) };
         let _write: extern "C" fn(u64, u32, u32) -> i32 =
@@ -1105,10 +1170,7 @@ mod tests {
 
         let mut out = 0u64;
         // out 为空 → EFAULT（早于设备/硬件逻辑，host 可安全断言）
-        assert_eq!(
-            claim(b"virtio,mmio".as_ptr(), 11, core::ptr::null_mut()),
-            -14
-        );
+        assert_eq!(claim(0, core::ptr::null_mut()), -14);
         assert_eq!(read(0, 0, core::ptr::null_mut()), -14);
 
         // mmio lease：两个 out 任一为空 → EFAULT（早于 handle/caller 解析）
@@ -1118,19 +1180,15 @@ mod tests {
         assert_eq!(lease(0, core::ptr::null_mut(), &mut lease_len), -14);
         assert_eq!(lease(0, &mut lease_ptr, core::ptr::null_mut()), -14);
 
-        // 名字非法 → EINVAL（早于 caller 解析与设备匹配）
-        assert_eq!(claim(core::ptr::null(), 0, &mut out), -22);
-
-        // IRQ claim 与 MMIO claim 同形（早期路径可安全断言；register/enable 需
-        // 真实 caller，留给 QEMU CoreTest）。
+        // IRQ claim：从 MMIO handle 派生；out 为空 → EFAULT（早于 caller 解析）。
         let irq_claim = resolve(b"kcore_irq_claim").unwrap();
-        let irq_claim: extern "C" fn(*const u8, usize, *mut u64) -> i32 =
+        let irq_claim: extern "C" fn(u64, *mut u64) -> i32 =
             unsafe { core::mem::transmute(irq_claim) };
-        assert_eq!(
-            irq_claim(b"virtio,mmio".as_ptr(), 11, core::ptr::null_mut()),
-            -14
-        );
-        assert_eq!(irq_claim(core::ptr::null(), 0, &mut out), -22);
+        assert_eq!(irq_claim(0, core::ptr::null_mut()), -14);
+
+        // IRQ release：host 无 caller → EPERM（不是 panic）。
+        let _irq_release: extern "C" fn(u64) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_irq_release").unwrap()) };
 
         // IRQ poll：out 为空 → EFAULT（早于 handle/caller 解析）
         let irq_poll: extern "C" fn(u64, *mut u64) -> i32 =

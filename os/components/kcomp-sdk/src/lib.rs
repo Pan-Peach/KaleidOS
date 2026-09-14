@@ -122,9 +122,16 @@ pub mod abi {
         #[link_name = "kcore_sched_run"]
         pub fn kcore_sched_run() -> i32;
 
-        // -- Resource authority: MMIO --
+        // -- Resource authority: device discovery / MMIO --
+        #[link_name = "kcore_device_nth"]
+        pub fn kcore_device_nth(
+            compatible: *const u8,
+            len: usize,
+            ordinal: u32,
+            out_device_id: *mut u32,
+        ) -> i32;
         #[link_name = "kcore_mmio_claim"]
-        pub fn kcore_mmio_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        pub fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_mmio_read_u32"]
         pub fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
         #[link_name = "kcore_mmio_write_u32"]
@@ -154,7 +161,7 @@ pub mod abi {
 
         // -- Resource authority: IRQ --
         #[link_name = "kcore_irq_claim"]
-        pub fn kcore_irq_claim(name: *const u8, len: usize, out_handle: *mut u64) -> i32;
+        pub fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32;
         #[link_name = "kcore_irq_register"]
         pub fn kcore_irq_register(handle: u64, handler: IrqHandler, ctx: *mut ()) -> i32;
         #[link_name = "kcore_irq_enable"]
@@ -165,6 +172,8 @@ pub mod abi {
         pub fn kcore_irq_poll(handle: u64, out_count: *mut u64) -> i32;
         #[link_name = "kcore_irq_ack"]
         pub fn kcore_irq_ack(handle: u64) -> i32;
+        #[link_name = "kcore_irq_release"]
+        pub fn kcore_irq_release(handle: u64) -> i32;
     }
 }
 

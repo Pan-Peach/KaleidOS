@@ -1,23 +1,43 @@
-//! MMIO authority 表 + 设备认领 / 单次访问（C6 起步）。
+//! MMIO authority 表 + 精确设备认领 / 单次访问（C6 起步）。
 //!
-//! # 主线：request → authorize → grant → access
+//! # 模型：identity → root authority → derived authority
 //!
-//! 1. [`claim`]：组件用 compatible 字符串认领**设备**（不是认领一段地址）。
-//!    查 `MachineInfo.devices` 找匹配、检查设备未被其他 owner 认领、过
-//!    authorize seam（phase 1 恒 allow），然后 grant 出 `MmioHandle`。
-//!    独占锚在**设备**（`device_index`）上：将来同一设备的 IRQ 也只能授予
-//!    同一个 owner——不存在"MMIO 给 A、IRQ 给 B"的拆分。
-//! 2. [`read_u32`] / [`write_u32`]：组件每次访问都把 handle 交回 Core；Core 先验证
+//! ```text
+//! DeviceId（身份，可复制，无权限）
+//!   │  claim_device：Core 解析到设备记录 + 独占检查 + authorize
+//!   ▼
+//! MmioHandle（独占 root authority，锚在 device_index 上）
+//!   │  claim_derived（IRQ）/ dma::alloc（DMA）从同一 handle 推导
+//!   ▼
+//! IrqHandle / DmaHandle（derived authority）
+//! ```
+//!
+//! # 主线：discover → claim → access → release
+//!
+//! 1. **发现**（[`crate::machine::nth_compatible`]，不含 authority）：组件按
+//!    compatible 纯枚举得到 `DeviceId`；枚举不分配、不触碰设备、包含已认领设备。
+//! 2. [`claim_device`]：用 `DeviceId` 认领**那台确切设备**（不是"第一台匹配"）。
+//!    Core 解析到设备记录、检查未被认领、过 authorize seam（phase 1 恒 allow），
+//!    再 grant 出 `MmioHandle`。独占锚在**设备**（`device_index`）上：同一设备的
+//!    IRQ / DMA 只能从同一个 root handle 派生——不存在"MMIO 给 A、IRQ 给 B"的拆分。
+//! 3. [`read_u32`] / [`write_u32`]：每次访问都把 handle 交回 Core；Core 先验证
 //!    slot/generation/owner/生命周期，再做 bounds/对齐检查，最后才碰硬件。
-//!    组件永远不持有地址（raw handle 只是 slot+generation 编码）。
-//! 3. [`release`]：组件主动交回 authority（validate 后由资源表回收）。
+//! 4. [`release`]：主动交回 root authority。**root 生命周期**：只要同一
+//!    `device_index` 上还有 live 的 IRQ / DMA 子 authority，就拒绝（`-EBUSY`）——
+//!    优雅拆机顺序是「静默设备 → 释放 IRQ/DMA → 停 MMIO lease → 释放 MMIO root」。
+//!
+//! # 加锁纪律（root 派生必须与 release / failure 串行）
+//!
+//! **MMIO 表锁是最外层**：`mmio::release` 在持 MMIO 锁期间扫 IRQ/DMA 子表；
+//! `irq::claim_derived` 在持 MMIO 锁期间 grant IRQ。`dma::alloc` 同样先在 MMIO
+//! 锁下推导 `device_index`，因此「读设备身份」与「扫子 authority」互斥：要么派生
+//! 先完成（release 会看到子项 → Busy），要么 release 先完成（派生看到 Stale）。
 //!
 //! # 实现要点
 //!
-//! - `claim`：遍历 `MachineInfo.devices`，找第一台「compatible 匹配且未被
-//!   认领」的 MMIO 设备：匹配 → `holds_device` 独占检查 → `grant`。
-//!   同名设备可能有多台（如 QEMU 有 8 个 virtio-mmio transport）：被占的跳过，
-//!   **全部**匹配设备都被认领才 `DeviceBusy`；一台都没有才 `DeviceNotFound`。
+//! - `claim_device`：`DeviceId` 越界 / 未提交机器信息 → `DeviceNotFound`；
+//!   PIO 设备 → `NotMmio`；`device_index` 已被认领**或已被 quarantine 标记** →
+//!   `DeviceBusy`。
 //! - `read_u32`：`IrqSaveGuard` + 表锁 → `get(caller, handle)` → bounds
 //!   `offset + 4 <= size`（checked_add）→ 对齐 `offset % 4 == 0`（非对齐
 //!   volatile 读会在 S-mode fault）→ 拷出 `base` → **放锁** →
@@ -35,12 +55,26 @@
 //!
 //! # 明确砍掉（第一版勿提前长出来）
 //!
-//! width 1/2/4/8、DMA/IRQ 派生、activation seam、SDK、按设备授权策略。
+//! width 1/2/4/8、activation seam、SDK、按设备授权策略、只读探测 claim
+//! （generic MMIO 读可能清状态 / 弹 FIFO，Core 不学协议语义）。
+//!
+//! # TODO（deferred，勿在本轮实现）
+//!
+//! - **组件级 prober**：属于总线/协议 aware 的**组件**（不是 Core），负责兼容性
+//!   排序、match table / precedence、把选中的 `DeviceId` 作为选择数据交给驱动
+//!   （见 `docs/driver-model.md` §12 Q1）；Core 只提供 discovery + 精确认领。
+//! - **多实例组件加载**：`ComponentRegistry` 目前按组件名唯一，一个 `virtio_blk`
+//!   代码还无法对应多台设备（同 §12）。
+//! - **热插拔 / 设备 reset / recovery**：失败 quarantine 保持到 reboot；不做
+//!   reset/recovery 框架。
+//! - **多窗口 / 非 MMIO root authority**：一个设备当前只有一个 `IoSpace`。
+//! - **跨组件 handle transfer（Q2）**：`MmioHandle` 不可移交给另一个组件（组件
+//!   寻址 / capability 语义未定，见 §12 Q2）。
 
-use super::{Handle, HandleError, MmioLease, RequestContext, ResourceTable};
+use super::{Handle, HandleError, MmioLease, RequestContext, ResourceTable, dma, irq};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
-use crate::machine::{self, IoSpace};
+use crate::machine::{self, DeviceId, IoSpace};
 use spin::{Mutex, Once};
 
 /// 一个 MMIO 资源对象：某设备的寄存器窗口。
@@ -60,16 +94,17 @@ pub type MmioHandle = Handle<MmioRegion>;
 /// 认领失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmioClaimError {
-    /// 已发现设备中没有 compatible 匹配项（机器信息尚未提交时同样返回此值；
-    /// 正常组件运行期不可达）。
+    /// `DeviceId` 不存在（越界），或机器信息尚未提交（正常组件运行期不可达）。
     DeviceNotFound,
-    /// 匹配的设备全部已被组件认领（一台设备最多一个 owner）。
+    /// 该设备不是 MMIO（PIO 空间；本阶段不支持）。
+    NotMmio,
+    /// 该设备已被认领（一台设备最多一个 owner），或已被失败 quarantine 标记。
     DeviceBusy,
     /// Core 策略拒绝（phase 1 恒 allow；留给未来 manifest/policy/ExecutionDomain）。
     Denied,
 }
 
-/// 单次访问失败。
+/// 单次访问 / 释放失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmioError {
     /// handle 验证失败（slot/generation/owner/生命周期）。
@@ -78,17 +113,25 @@ pub enum MmioError {
     OutOfBounds,
     /// offset 未按 4 字节对齐（非对齐 volatile 读会在 S-mode fault）。
     Unaligned,
+    /// 释放 root 时该设备仍有 live 的 IRQ / DMA 子 authority（`-EBUSY`）。
+    HasChildren,
 }
 
 /// MMIO 资源真相表。
 pub struct MmioTable {
     table: ResourceTable<MmioRegion>,
+    /// Core 拥有的失败 quarantine 标记，按 `device_index` 索引。
+    ///
+    /// 设备数量上限 26（`MachineInfo.devices` 定长），但 `device_index` 是 u8，
+    /// 用 256 项定长表避免任何换算。组件失败后该设备保持不可认领直到 reboot。
+    quarantine: [bool; 256],
 }
 
 impl MmioTable {
     pub const fn new() -> Self {
         Self {
             table: ResourceTable::new(),
+            quarantine: [false; 256],
         }
     }
 
@@ -105,17 +148,70 @@ impl MmioTable {
         self.table.revoke_owner(owner)
     }
 
+    /// 该设备是否处于失败 quarantine（Core 拥有的不可用标记）。
+    ///
+    /// 组件失败 = 逻辑死亡、物理驻留：revoke authority ≠ 设备可被下一个驱动安全
+    /// 复用（设备可能仍被硬件引用 / 未静默）。phase 1 标记后保持到 reboot。优雅、
+    /// 协作式 quiesce 的 [`release`] 不进入 quarantine，设备仍可复用。
+    pub fn is_quarantined(&self, device_index: u8) -> bool {
+        self.quarantine[device_index as usize]
+    }
+
+    /// 撤销 owner 的全部 MMIO authority，并把其占用的每个 `device_index` 标记为
+    /// quarantine（失败路径专用）。先记标记、再 revoke。
+    pub fn quarantine_owner(&mut self, owner: ComponentId) {
+        for slot in self.table.slots_mut() {
+            if slot.owner() != owner {
+                continue;
+            }
+            if let Some(region) = slot.object() {
+                self.quarantine[region.device_index as usize] = true;
+            }
+            slot.revoke();
+        }
+    }
+
     pub fn release(&mut self, caller: ComponentId, handle: MmioHandle) -> Result<(), HandleError> {
         self.table.release(caller, handle)
     }
 
     /// 该设备（`device_index`）是否已被任意 live slot 认领。
-    /// 独占锚在设备上：同一台设备最多一个 owner（将来 IRQ 也从同一 owner 派生）。
+    /// 独占锚在设备上：同一台设备最多一个 owner（同一 root 派生 IRQ / DMA）。
     pub fn holds_device(&self, device_index: u8) -> bool {
         self.table.slots().iter().any(|slot| {
             slot.object()
                 .is_some_and(|region| region.device_index == device_index)
         })
+    }
+
+    /// 独占检查 + grant 的原子核心（调用方已完成 `DeviceId` → 设备记录的解析）。
+    ///
+    /// 检查与 grant 在同一表锁内完成，因此两个竞争调用者一个成功、一个
+    /// `DeviceBusy`；quarantine 与 live claim 对普通认领同样返回 `DeviceBusy`。
+    fn claim_checked(
+        &mut self,
+        owner: ComponentId,
+        base: usize,
+        size: usize,
+        device_index: u8,
+    ) -> Result<MmioHandle, MmioClaimError> {
+        if self.is_quarantined(device_index) || self.holds_device(device_index) {
+            return Err(MmioClaimError::DeviceBusy);
+        }
+        Ok(self.grant(
+            owner,
+            MmioRegion {
+                base,
+                size,
+                device_index,
+            },
+        ))
+    }
+
+    /// 清空失败 quarantine（**仅测试**：进程全局表不能在用例间回退）。
+    #[cfg(test)]
+    pub(crate) fn clear_quarantine(&mut self) {
+        self.quarantine = [false; 256];
     }
 }
 
@@ -139,69 +235,39 @@ pub fn get_table() -> &'static Mutex<MmioTable> {
     TABLE.get().expect("mmio table not initialized")
 }
 
-/// 认领设备：request → authorize → grant。
+/// 认领**一台确切设备**的 MMIO root authority：resolve → authorize → grant。
 ///
-/// 找第一台「compatible 匹配且未被任意 owner 认领」的 MMIO 设备；
-/// 同名设备有多台时按设备表顺序取用，全部被认领才 `DeviceBusy`。
-pub fn claim(ctx: &RequestContext, compatible: &[u8]) -> Result<MmioHandle, MmioClaimError> {
+/// `device` 由发现阶段（[`crate::machine::nth_compatible`]）给出；Core 把它解析
+/// 回设备记录。`DeviceId` 本身不授予任何东西——真正的 authority 只在这里，经
+/// 独占检查 + authorize seam 后 grant。
+///
+/// - `device` 越界 / 机器信息未提交 → `DeviceNotFound`；
+/// - 设备是 PIO 空间 → `NotMmio`；
+/// - `device_index` 已被认领**或已被 quarantine** → `DeviceBusy`（独占锚在设备上）。
+///
+/// 独占检查与 grant 在**同一把表锁**内完成：两个竞争调用者一个成功、一个 Busy。
+pub fn claim_device(ctx: &RequestContext, device: DeviceId) -> Result<MmioHandle, MmioClaimError> {
     let Some(machine) = machine::committed() else {
         // 机器信息尚未提交（正常组件运行期不可达）
         return Err(MmioClaimError::DeviceNotFound);
     };
-    let _guard = IrqSaveGuard::new();
-    let mut table = get_table().lock();
-    let mut saw_match = false;
-    for (index, device) in machine.devices[..machine.dev_count].iter().enumerate() {
-        // compatible 匹配（任一命中即可）
-        if !device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| c.as_str().as_bytes() == compatible)
-        {
-            continue;
-        }
-        // 只看 MMIO 空间（PIO 设备本阶段不认领）
-        let IoSpace::Mmio { base, size } = device.space else {
-            continue;
-        };
-        saw_match = true;
-        // 已被认领 → 试下一台同名设备（QEMU 上 virtio 有 8 台 transport）
-        if table.holds_device(index as u8) {
-            continue;
-        }
-        // authorize seam：phase 1 恒 allow（trusted KernelNative）。当前只实现
-        // allocation/ownership，不提供恶意组件隔离；未来 manifest requires /
-        // policy / ExecutionDomain 在这里决定 caller 是否有资格 claim。
-        //
-        // 授出：所有权记在表上，返回凭证（handle 只含 slot/generation，不含地址）
-        return Ok(table.grant(
-            ctx.component,
-            MmioRegion {
-                base,
-                size,
-                device_index: index as u8,
-            },
-        ));
-    }
-    // 有匹配但全被认领 → Busy；压根没有匹配设备 → NotFound
-    Err(if saw_match {
-        MmioClaimError::DeviceBusy
-    } else {
-        MmioClaimError::DeviceNotFound
-    })
-}
+    let Some(descriptor) = machine.devices[..machine.dev_count].get(device.raw() as usize) else {
+        return Err(MmioClaimError::DeviceNotFound);
+    };
+    // 只看 MMIO 空间（PIO 设备本阶段不认领）。
+    let IoSpace::Mmio { base, size } = descriptor.space else {
+        return Err(MmioClaimError::NotMmio);
+    };
+    // `claim_device` 只接受已提交设备表内的 ID，因此 index 必落在 u8 内。
+    let device_index = u8::try_from(device.raw()).expect("device index within u8");
 
-/// 从已持有的 `MmioHandle` 推导设备身份（`device_index`）。
-///
-/// 供 **DMA 授权**用：DMA 不接受组件自报的设备号，必须先在 Core 里持有该设备的
-/// MMIO authority。Core 校验 slot/generation/owner/生命周期后返回 region 记录的
-/// `device_index`；校验失败返回 [`MmioError::Handle`]。
-pub(crate) fn device_index_for(ctx: &RequestContext, handle: MmioHandle) -> Result<u8, MmioError> {
     let _guard = IrqSaveGuard::new();
-    let table = get_table().lock();
-    let region = table
-        .get(ctx.component, handle)
-        .map_err(MmioError::Handle)?;
-    Ok(region.device_index)
+    // authorize seam：phase 1 恒 allow（trusted KernelNative）。当前只实现
+    // allocation/ownership，不提供恶意组件隔离；未来 manifest requires /
+    // policy / ExecutionDomain 在这里决定 caller 是否有资格 claim。
+    get_table()
+        .lock()
+        .claim_checked(ctx.component, base, size, device_index)
 }
 
 /// 派生 [`MmioLease`]：KernelNative 直接 MMIO 快路径。
@@ -280,11 +346,25 @@ pub fn write_u32(
     Ok(())
 }
 
-/// 主动释放 MMIO authority；资源表负责 slot/generation/owner/lifecycle 验证。
+/// 主动释放 MMIO root authority。
+///
+/// **root 生命周期**：只要同一 `device_index` 上还有 live 的 IRQ / DMA 子
+/// authority，就返回 [`MmioError::HasChildren`]（`-EBUSY`）——必须先释放子项。
+/// 扫描在 MMIO 表锁内进行（MMIO 锁是最外层，见模块文档的加锁纪律），因此与
+/// IRQ/DMA 派生互斥：不允许"先检查无子项、随后子项才被 grant"的窗口。
+///
+/// 优雅拆机顺序：静默设备 → 释放 IRQ/DMA → 停 MMIO lease → 释放 MMIO root。
 pub fn release(ctx: &RequestContext, handle: MmioHandle) -> Result<(), MmioError> {
     let _guard = IrqSaveGuard::new();
-    get_table()
-        .lock()
+    let mut table = get_table().lock();
+    let device_index = table
+        .get(ctx.component, handle)
+        .map_err(MmioError::Handle)?
+        .device_index;
+    if irq::has_line_for_device(device_index) || dma::has_region_for_device(device_index) {
+        return Err(MmioError::HasChildren);
+    }
+    table
         .release(ctx.component, handle)
         .map_err(MmioError::Handle)
 }
@@ -294,6 +374,7 @@ mod tests {
     use super::{MmioClaimError, MmioError, MmioRegion, MmioTable};
     use crate::component::ComponentId;
     use crate::handle::{HandleError, RequestContext};
+    use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
 
     fn region(device_index: u8) -> MmioRegion {
         MmioRegion {
@@ -379,62 +460,36 @@ mod tests {
         assert_eq!(got.size, 0x1000);
     }
 
-    // ---- C6 行为规范（验收：claim 设备认领 / read_u32 访问）----
+    // ---- 设备发现 + 精确认领（identity → root authority）----
 
-    /// 验收：claim 取「第一台未认领的匹配设备」。
-    /// 两台同名 virtio：第一次拿 devices[0]，第二次必须拿 devices[2]（而不是
-    /// Busy）；两台都被认领后才 Busy；没有匹配设备才 NotFound。
-    #[test]
-    fn claim_grants_first_unclaimed_match_and_is_exclusive() {
-        let _guard = crate::machine::test_support::GUARD.lock();
-        use crate::machine::{
-            self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
-        };
+    /// MMIO 设备描述符（单 compatible）。
+    fn mmio_device(compatible: &[u8], base: usize, irq: Option<u32>) -> DeviceDescriptor {
+        let mut device = DeviceDescriptor::empty();
+        device.space = IoSpace::Mmio { base, size: 0x1000 };
+        device.irq = irq;
+        device.compatibles[0] = CompatStr::from_bytes(compatible);
+        device.compat_count = 1;
+        device
+    }
 
-        super::init();
+    /// 提交一份测试设备表。设备下标刻意选在 IRQ/DMA 表测试不用的 20+ 区间，
+    /// 避免进程全局表之间通过 `device_index` 相互干扰。
+    fn commit_test_machine() {
+        use crate::machine::{self, CpuId, CpuInfo, MachineInfo, MemoryRegion};
         let mut devices = [DeviceDescriptor::empty(); 26];
-        devices[0] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_8000,
-                size: 0x1000,
-            },
-            irq: Some(8),
-            compatibles: [
-                CompatStr::from_bytes(b"virtio,mmio"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
+        devices[20] = mmio_device(b"virtio,mmio", 0x1000_8000, Some(8));
+        devices[21] = mmio_device(b"ns16550a", 0x1000_0000, Some(10));
+        devices[22] = {
+            let mut pio = DeviceDescriptor::empty();
+            pio.space = IoSpace::Pio {
+                base: 0x3f8,
+                size: 8,
+            };
+            pio.compatibles[0] = CompatStr::from_bytes(b"pio,thing");
+            pio.compat_count = 1;
+            pio
         };
-        devices[1] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_0000,
-                size: 0x100,
-            },
-            irq: Some(10),
-            compatibles: [
-                CompatStr::from_bytes(b"ns16550a"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
-        };
-        devices[2] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_7000,
-                size: 0x1000,
-            },
-            irq: Some(9),
-            compatibles: [
-                CompatStr::from_bytes(b"virtio,mmio"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
-        };
+        devices[23] = mmio_device(b"virtio,mmio", 0x1000_7000, Some(9));
         machine::commit(MachineInfo {
             boot_hart: 0,
             timebase_frequency: 10_000_000,
@@ -448,49 +503,189 @@ mod tests {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
             }; 16],
-            dev_count: 3,
+            dev_count: 24,
             devices,
         });
+    }
 
-        let owner = ComponentId::from_raw(7);
+    /// 验收：claim 认领**确切的** DeviceId，不认领"第一台匹配"。
+    /// 换台设备后仍可认领；PIO → NotMmio；越界 → NotFound；重复 → Busy。
+    #[test]
+    fn claim_device_selects_exact_device_and_is_exclusive() {
+        use crate::machine::DeviceId;
+        let _guard = crate::machine::test_support::GUARD.lock();
+        crate::handle::init();
+        commit_test_machine();
 
-        // 第一台 virtio（devices[0]）
-        let first = super::claim(&context(owner), b"virtio,mmio").unwrap();
+        let owner = ComponentId::from_raw(71);
+        let ctx = context(owner);
+
+        let first_id = crate::machine::nth_compatible(b"virtio,mmio", 0).unwrap();
+        let second_id = crate::machine::nth_compatible(b"virtio,mmio", 1).unwrap();
+        assert_eq!(first_id, DeviceId::from_raw(20));
+        assert_eq!(second_id, DeviceId::from_raw(23));
+
+        let first = super::claim_device(&ctx, first_id).unwrap();
         {
             // 表锁作用域内用完即释放：后面再 claim 会重新 lock 同一把锁。
             let table = super::get_table().lock();
             let region = table.get(owner, first).unwrap();
             assert_eq!(region.base, 0x1000_8000);
             assert_eq!(region.size, 0x1000);
-            assert_eq!(region.device_index, 0);
+            assert_eq!(region.device_index, 20);
         }
 
-        // 第二台 virtio（devices[2]）仍未被认领 → 必须拿到它，而不是 Busy
-        let second = super::claim(&context(owner), b"virtio,mmio").unwrap();
-        assert_ne!(first, second);
-        {
-            let table = super::get_table().lock();
-            let region = table.get(owner, second).unwrap();
-            assert_eq!(region.base, 0x1000_7000);
-            assert_eq!(region.size, 0x1000);
-            assert_eq!(region.device_index, 2);
-        }
-
-        // 两台都被认领 → Busy
+        // 同一台设备（包括同一 owner）再认领 → Busy。
         assert_eq!(
-            super::claim(&context(owner), b"virtio,mmio"),
+            super::claim_device(&ctx, first_id),
+            Err(MmioClaimError::DeviceBusy)
+        );
+
+        // 另一台 virtio 仍可认领，拿到不同 handle。
+        let second = super::claim_device(&ctx, second_id).unwrap();
+        assert_ne!(first, second);
+
+        // PIO 设备 → NotMmio。
+        assert_eq!(
+            super::claim_device(&ctx, DeviceId::from_raw(22)),
+            Err(MmioClaimError::NotMmio)
+        );
+        // 不存在 / 越界 → NotFound。
+        assert_eq!(
+            super::claim_device(&ctx, DeviceId::from_raw(99)),
+            Err(MmioClaimError::DeviceNotFound)
+        );
+
+        super::get_table().lock().revoke_owner(owner);
+    }
+
+    /// 验收：释放后旧 token stale，重新认领得到**新的** handle（新 generation）。
+    #[test]
+    fn claim_after_release_returns_new_handle_and_stales_old() {
+        use crate::machine::DeviceId;
+        let _guard = crate::machine::test_support::GUARD.lock();
+        crate::handle::init();
+        commit_test_machine();
+
+        let owner = ComponentId::from_raw(72);
+        let ctx = context(owner);
+        let id = DeviceId::from_raw(20);
+
+        let first = super::claim_device(&ctx, id).unwrap();
+        assert_eq!(super::release(&ctx, first), Ok(()));
+        assert!(matches!(
+            super::get_table().lock().get(owner, first),
+            Err(HandleError::Stale)
+        ));
+
+        let second = super::claim_device(&ctx, id).unwrap();
+        assert_ne!(first, second);
+        assert!(super::get_table().lock().get(owner, second).is_ok());
+        super::get_table().lock().revoke_owner(owner);
+    }
+
+    /// 验收：枚举包含已认领设备，且顺序跨 claim/release 稳定。
+    #[test]
+    fn enumeration_includes_claimed_devices_and_is_stable_across_claim_release() {
+        use crate::machine::DeviceId;
+        let _guard = crate::machine::test_support::GUARD.lock();
+        crate::handle::init();
+        commit_test_machine();
+
+        let owner = ComponentId::from_raw(73);
+        let ctx = context(owner);
+        let before: [DeviceId; 2] = [
+            crate::machine::nth_compatible(b"virtio,mmio", 0).unwrap(),
+            crate::machine::nth_compatible(b"virtio,mmio", 1).unwrap(),
+        ];
+
+        let first = super::claim_device(&ctx, before[0]).unwrap();
+        // 认领之后枚举仍然列出它（顺序 / 身份不变）。
+        assert_eq!(
+            crate::machine::nth_compatible(b"virtio,mmio", 0),
+            Ok(before[0])
+        );
+        assert_eq!(
+            crate::machine::nth_compatible(b"virtio,mmio", 1),
+            Ok(before[1])
+        );
+
+        assert_eq!(super::release(&ctx, first), Ok(()));
+        // 释放之后同样不变。
+        assert_eq!(
+            crate::machine::nth_compatible(b"virtio,mmio", 0),
+            Ok(before[0])
+        );
+        assert_eq!(
+            crate::machine::nth_compatible(b"virtio,mmio", 1),
+            Ok(before[1])
+        );
+    }
+
+    /// 验收：失败 quarantine 标记按 device_index 挡住普通认领；优雅 release 不标记。
+    #[test]
+    fn quarantine_owner_marks_device_and_blocks_reclaim() {
+        let owner = ComponentId::from_raw(80);
+        let other = ComponentId::from_raw(81);
+        let mut table = MmioTable::new();
+        let handle = table.grant(owner, region(5));
+        assert!(!table.is_quarantined(5));
+        assert!(table.get(owner, handle).is_ok());
+
+        table.quarantine_owner(owner);
+
+        assert!(table.is_quarantined(5), "失败后设备必须被标记");
+        assert!(matches!(table.get(owner, handle), Err(HandleError::Stale)));
+        // 同一 owner 或其他 owner 的普通认领都被 quarantine 挡住。
+        assert_eq!(
+            table.claim_checked(owner, 0x1000_5000, 0x1000, 5),
             Err(MmioClaimError::DeviceBusy)
         );
         assert_eq!(
-            super::claim(&context(owner), b"nope,device"),
-            Err(MmioClaimError::DeviceNotFound)
+            table.claim_checked(other, 0x1000_5000, 0x1000, 5),
+            Err(MmioClaimError::DeviceBusy)
         );
+        // 别的设备不受影响。
+        assert!(table.claim_checked(other, 0x1000_6000, 0x1000, 6).is_ok());
+    }
+
+    /// 验收：普通 release 可回收（不 quarantine），设备仍可再次认领。
+    #[test]
+    fn graceful_release_does_not_quarantine_device() {
+        let owner = ComponentId::from_raw(82);
+        let mut table = MmioTable::new();
+        let handle = table.grant(owner, region(7));
+        assert_eq!(table.release(owner, handle), Ok(()));
+        assert!(!table.is_quarantined(7));
+        assert!(table.claim_checked(owner, 0x1000_7000, 0x1000, 7).is_ok());
+    }
+
+    // ---- root 生命周期：有 live IRQ 子项时拒绝释放 ----
+
+    /// 验收：同一 `device_index` 上仍有 live IRQ 子 authority 时，release 拒绝
+    /// （`-EBUSY`）；子项释放后 root 才能释放。
+    #[test]
+    fn release_refuses_while_irq_child_is_live() {
+        use crate::handle::irq::{self, Irq};
+        let _guard = crate::machine::test_support::GUARD.lock();
+        crate::handle::init();
+
+        let owner = ComponentId::from_raw(83);
+        let ctx = context(owner);
+        let mmio = super::get_table().lock().grant(owner, region(18));
+        let irq_handle = irq::get_table().lock().grant(owner, Irq::new(218, 18));
+
+        assert_eq!(super::release(&ctx, mmio), Err(MmioError::HasChildren));
+
+        // 释放子项后 root 可释放。
+        assert_eq!(irq::get_table().lock().release(owner, irq_handle), Ok(()));
+        assert_eq!(super::release(&ctx, mmio), Ok(()));
     }
 
     /// host 缓冲当 MMIO 靶子：validation → bounds → 对齐 → volatile read 全路径。
     #[test]
     fn read_u32_validates_then_reads_through_handle() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 4];
         buf[0] = 0x7472_6976; // host 缓冲区模拟设备寄存器（virtio magic）
         let owner = ComponentId::from_raw(11);
@@ -531,7 +726,7 @@ mod tests {
 
     #[test]
     fn write_u32_round_trips_and_rejects_invalid_access() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 4];
         let owner = ComponentId::from_raw(13);
         let other = ComponentId::from_raw(14);
@@ -548,7 +743,8 @@ mod tests {
             MmioRegion {
                 base: buf.as_mut_ptr() as usize,
                 size: core::mem::size_of_val(&buf),
-                device_index: 0,
+                // 选一个 IRQ/DMA 测试不用的 device_index：free `release` 会扫子表。
+                device_index: 19,
             },
         );
 
@@ -580,7 +776,7 @@ mod tests {
 
     #[test]
     fn write_u32_rejects_stale_handle_after_owner_revoke() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 1];
         let owner = ComponentId::from_raw(15);
         let ctx = context(owner);
@@ -606,7 +802,7 @@ mod tests {
     /// Core 一次性校验后派生 lease：指针 / 长度 / source 都来自已 grant 的 region。
     #[test]
     fn derive_lease_carries_region_ptr_len_and_source() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 4];
         let owner = ComponentId::from_raw(21);
         let handle = super::get_table().lock().grant(
@@ -636,7 +832,7 @@ mod tests {
     /// 式的，没有硬件 fault 可测（见 `lease` 模块文档与 `docs/driver-model.md` §3）。
     #[test]
     fn derive_lease_rejects_invalid_handle() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 4];
         let owner = ComponentId::from_raw(22);
         let other = ComponentId::from_raw(23);
@@ -692,7 +888,7 @@ mod tests {
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
     fn bench_read_u32_baseline() {
-        super::init();
+        crate::handle::init();
         let mut buf = [0u32; 4];
         buf[0] = 0x7472_6976;
         let owner = ComponentId::from_raw(99);

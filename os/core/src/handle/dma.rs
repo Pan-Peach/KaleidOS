@@ -3,7 +3,7 @@
 //! # 主线：request → authorize → grant → derive → use → quarantine → revoke
 //!
 //! 1. [`alloc`]：caller 必须**已经持有目标设备的 `MmioHandle`**；`device_index`
-//!    由 Core 从该 handle 的 MMIO 表记录推导（`mmio::device_index_for`），
+//!    由 Core 在 MMIO 表锁下从该 handle 的 MMIO 表记录推导（MMIO 锁是最外层），
 //!    **绝不接受组件自报的设备号**。Core 再分配一段物理连续区域
 //!    （`memory::alloc_region`），把区域真相记进 `DmaRegion`，grant 出 `DmaHandle`。
 //! 2. [`derive_lease`]：Core 一次性校验 handle 后派生 [`DmaLease`]——携带
@@ -148,6 +148,15 @@ impl DmaTable {
             slot.revoke();
         }
     }
+
+    /// 该设备（`device_index`）上是否还有 live DMA authority。
+    /// 供 MMIO root 释放前的子项扫描（root 生命周期）。
+    pub fn has_region_for_device(&self, device_index: u8) -> bool {
+        self.table.slots().iter().any(|slot| {
+            slot.object()
+                .is_some_and(|region| region.device_index == device_index)
+        })
+    }
 }
 
 impl Default for DmaTable {
@@ -188,19 +197,28 @@ pub fn get_table() -> &'static Mutex<DmaTable> {
 
 /// 分配一段物理连续 DMA 区域并 grant `DmaHandle`。
 ///
-/// `device_index` 由 `mmio` 从 caller 自己持有的 `MmioHandle` 推导（Core 真相），
-/// 组件无法伪造设备身份；随后 `memory::alloc_region` 分配 backing。分配在
-/// `IrqSaveGuard` 下进行（同 MMIO claim 路径），不跨 volatile 访问持锁。
+/// `device_index` 由 Core 从 caller **已持有的 `MmioHandle`** 推导（Core 真相），
+/// 组件无法伪造设备身份；随后 `memory::alloc_region` 分配 backing。
+///
+/// 加锁：**MMIO 表锁是最外层**（MMIO → DMA → heap），持锁贯穿「推导设备身份 +
+/// DMA grant」。这样与 [`mmio::release`] 的子项扫描互斥：root 不可能在 DMA
+/// authority 授予后才释放（要么本函数先完成 → release 看到 DMA 子项 → Busy；
+/// 要么 release 先完成 → 这里的 `get` 看到 Stale）。分配在 `IrqSaveGuard` 下进行，
+/// 不跨 volatile 访问持锁。
 pub fn alloc(
     ctx: &RequestContext,
     mmio: mmio::MmioHandle,
     size: usize,
     dir: DmaDirection,
 ) -> Result<DmaHandle, DmaError> {
-    // device_index 只能来自 caller 已持有的 MMIO authority。
-    let device_index = mmio::device_index_for(ctx, mmio).map_err(DmaError::Mmio)?;
-
     let _guard = IrqSaveGuard::new();
+    let mmio_table = mmio::get_table().lock();
+    // device_index 只能来自 caller 已持有的 MMIO authority。
+    let device_index = mmio_table
+        .get(ctx.component, mmio)
+        .map_err(|error| DmaError::Mmio(MmioError::Handle(error)))?
+        .device_index;
+
     let lease = memory::alloc_region(size).map_err(|error| match error {
         MemoryError::Exhausted => DmaError::Exhausted,
         MemoryError::InvalidSize => DmaError::InvalidSize,
@@ -255,6 +273,12 @@ pub fn release(ctx: &RequestContext, h: DmaHandle) -> Result<(), DmaError> {
 pub fn revoke_owner(owner: ComponentId) {
     let _guard = IrqSaveGuard::new();
     get_table().lock().revoke_owner(owner);
+}
+
+/// 该 `device_index` 上是否还有 live DMA authority（供 `mmio::release` 的 root
+/// 生命周期检查）。
+pub fn has_region_for_device(device_index: u8) -> bool {
+    get_table().lock().has_region_for_device(device_index)
 }
 
 #[cfg(test)]
@@ -454,5 +478,29 @@ mod tests {
             derive_lease(&ctx, h1).unwrap_err(),
             DmaError::Handle(HandleError::Stale)
         );
+    }
+
+    /// 验收：同一设备有 live DMA 子项时 MMIO root 拒绝释放（`-EBUSY`）；
+    /// 释放 DMA 子项后 root 才能释放。
+    #[test]
+    fn mmio_release_refuses_while_dma_child_is_live() {
+        let _heap = test_support::GUARD.lock();
+        let _machine = crate::machine::test_support::GUARD.lock();
+        test_support::ensure_init();
+        crate::handle::init();
+
+        let owner = ComponentId::from_raw(48);
+        let ctx = context(owner);
+        // device_index 17：本用例专用，避开其它测试的索引。
+        let mmio = grant_mmio(owner, 17);
+        let dma_handle = alloc(&ctx, mmio, 4096, DmaDirection::ToDevice).expect("alloc");
+
+        assert_eq!(
+            crate::handle::mmio::release(&ctx, mmio),
+            Err(MmioError::HasChildren)
+        );
+
+        assert_eq!(release(&ctx, dma_handle), Ok(()));
+        assert_eq!(crate::handle::mmio::release(&ctx, mmio), Ok(()));
     }
 }

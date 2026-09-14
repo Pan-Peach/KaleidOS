@@ -1,11 +1,14 @@
 //! IRQ authority 表 + 外部中断投递（C6 骨架）。
 //!
-//! # 主线：request → authorize → grant → register → enable → dispatch
+//! # 主线：derive → authorize → grant → register → enable → dispatch → release
 //!
-//! 1. [`claim`]：组件用 compatible 字符串认领**设备的 IRQ 线**（不是认领一个
-//!    裸中断号）。查 `MachineInfo.devices` 找匹配、取设备的 `irq`（PLIC global
-//!    interrupt id）、过 authorize seam（phase 1 恒 allow），授予 `IrqHandle`。
-//!    独占锚在**中断号**上：一条线最多一个 owner（重复认领 = duplicate claim）。
+//! 1. [`claim_derived`]：组件**从自己已持有的 `MmioHandle`** 派生设备的 IRQ 线
+//!    （不是用 compatible 独立匹配，也不是认领一个裸中断号）。Core 校验 MMIO
+//!    root（slot/generation/owner/生命周期）→ 取 `region.device_index` → 查
+//!    `MachineInfo.devices[device_index].irq`（PLIC global interrupt id）→ 过
+//!    authorize seam（phase 1 恒 allow）→ 授予 `IrqHandle`。设备 `irq == None`
+//!    → `DeviceHasNoIrq`（`-ENODEV`）。独占锚在**中断号**上：一条线最多一个
+//!    owner（重复认领 = duplicate claim）。
 //! 2. [`IrqTable::set_delivery`]：owner 注册处理函数（`extern "C" fn(ctx)` +
 //!    opaque ctx）。delivery 存在 slot 里，**随 revoke/release 一起消失**——
 //!    组件失败/卸载后不会再有回调进它的代码。
@@ -17,32 +20,32 @@
 //!      驱动任务随后 [`IrqTable::poll`] 读计数、处理设备、[`IrqTable::ack`]。
 //! 5. [`IrqTable::set_polled`]：owner 把该线切成轮询投递（不装回调）。回调路径
 //!    与 Polled 路径互斥（`delivery` 是 `Option<IrqDelivery>`）。
+//! 6. [`release`]：**真的关断投递**——先 revoke slot（此后 `route` 不再投递给
+//!    已死 owner，in-flight 处置也只会得到 `None`），再在锁外
+//!    `InterruptImpl::disable(number)` 关掉控制器上的那条线。
 //!
 //! # 实现要点
 //!
-//! - `claim`：遍历 `MachineInfo.devices`，找第一台「compatible 匹配、有 `irq`、
-//!   且该中断号未被认领」的设备。同名设备多台（QEMU 有 8 个 virtio-mmio）时，
-//!   被占的跳过；有匹配但都不可用才 `LineBusy` / `DeviceHasNoIrq`；一台都没有
-//!   才 `DeviceNotFound`。
-//! - `device_index` 与 MMIO 表锚在同一台设备上：同一设备的 MMIO 与 IRQ 应归同一
-//!   owner（见 `handle/mod.rs` 的「IRQ 从同一 owner 派生」）。**跨表校验**（claim
-//!   要求 caller 已持有该设备的 `MmioHandle`）是明确的 TODO seam，第一版不实现。
+//! - `claim_derived` 在 **MMIO 表锁内**完成派生与 IRQ grant（MMIO 锁是最外层，
+//!   见 `handle/mmio.rs` 的加锁纪律），因此与 `mmio::release` 的子项扫描互斥：
+//!   要么 IRQ 先授予（release 看到子项 → Busy），要么 root 先释放（派生 Stale）。
+//! - `device_index` 与 MMIO 表锚在同一台设备上：同一设备的 MMIO root 与 IRQ 归
+//!   同一 owner——不再存在"MMIO 给 A、IRQ 给 B"的跨设备错配。
 //! - 投递必须在**锁外**调用组件 handler：trap 可能重入，spin 锁不可重入。
 //!
 //! # 测试指引（host 可验证）
 //!
-//! 表语义 + delivery 注册 + `claim`/`route` 都能 host 测（`claim` 用例提交一份
-//! `MachineInfo`，与 MMIO 的 claim 用例用 `machine::test_support::GUARD` 互斥）。
-//! 真实的控制器契约（PLIC 寄存器真的被写、外部中断真的到达）由 QEMU CoreTest
-//! 与 ArchTest 覆盖。
+//! 表语义 + delivery 注册 + `claim_derived`/`release`/`route` 都能 host 测
+//! （`claim_derived` 用例提交一份 `MachineInfo` 并先 grant 一个 `MmioHandle`，
+//! 与 MMIO 的 claim 用例用 `machine::test_support::GUARD` 互斥）。真实的控制器
+//! 契约（PLIC 寄存器真的被写、外部中断真的到达）由 QEMU CoreTest 与 ArchTest 覆盖。
 //!
 //! # 明确砍掉（第一版勿提前长出来）
 //!
-//! 独立 mask ABI 出口（Polled 掩蔽完全在 Core 内部完成）、release ABI 出口、
 //! 优先级/触发方式配置、共享中断线、per-line 统计、SMP affinity、把 PLIC 从
-//! arch 降级为 Driver Component。
+//! arch 降级为 Driver Component。**不保留 compatible-based 的 IRQ 认领旁路**。
 
-use super::{Handle, HandleError, ResourceTable};
+use super::{Handle, HandleError, ResourceTable, mmio};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine;
@@ -114,13 +117,15 @@ impl IrqDelivery {
 /// 认领失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqClaimError {
-    /// 已发现设备中没有 compatible 匹配项（机器信息尚未提交时同样返回此值；
-    /// 正常组件运行期不可达）。
+    /// 机器信息尚未提交，或派生出的 `device_index` 不在已发现设备表内（正常
+    /// 组件运行期不可达）。
     DeviceNotFound,
-    /// 匹配设备没有中断线（FDT 无 `interrupts` / `irq == None`）。
+    /// 设备没有中断线（FDT 无 `interrupts` / `irq == None`）。
     DeviceHasNoIrq,
-    /// 匹配设备的中断线已被认领（一条线最多一个 owner；duplicate claim）。
+    /// 该中断线已被认领（一条线最多一个 owner；duplicate claim）。
     LineBusy,
+    /// 用于派生的 `MmioHandle` 无效（slot/generation/owner/生命周期）。
+    MmioHandle(HandleError),
     /// Core 策略拒绝（phase 1 恒 allow；留给未来 manifest/policy/ExecutionDomain）。
     Denied,
 }
@@ -267,6 +272,15 @@ impl IrqTable {
             .any(|slot| slot.object().is_some_and(|irq| irq.number == number))
     }
 
+    /// 该设备（`device_index`）上是否还有 live IRQ authority。
+    /// 供 MMIO root 释放前的子项扫描（root 生命周期）。
+    pub fn has_line_for_device(&self, device_index: u8) -> bool {
+        self.table.slots().iter().any(|slot| {
+            slot.object()
+                .is_some_and(|irq| irq.device_index == device_index)
+        })
+    }
+
     /// 取该中断号已注册的投递目标（`IrqDelivery` 是 Copy）。
     /// 供中断上下文的 `route` **在锁内取一份拷贝、放锁后再调用**。
     pub fn delivery_of(&self, number: u32) -> Option<IrqDelivery> {
@@ -298,54 +312,74 @@ pub fn get_table() -> &'static Mutex<IrqTable> {
     TABLE.get().expect("irq table not initialized")
 }
 
-/// 认领设备的中断线：request → authorize → grant。
+/// 从 caller **已持有的 `MmioHandle`** 派生设备的中断线：derive → authorize → grant。
 ///
-/// 找第一台「compatible 匹配、有 `irq`、且该中断号未被任意 owner 认领」的设备；
-/// 同名设备多台时按设备表顺序取用：被占的跳过，只有当**所有**匹配设备的线都不可用
-/// 时才报 `LineBusy` / `DeviceHasNoIrq`。
-pub fn claim(caller: ComponentId, compatible: &[u8]) -> Result<IrqHandle, IrqClaimError> {
+/// IRQ **不再**按 compatible 独立匹配——设备身份（`device_index`）由 Core 从
+/// 调用方的 MMIO root 推导，因此不会出现"MMIO 认领 A、IRQ 认领 B"的跨设备错配。
+///
+/// - `mmio_handle` 无效（slot/generation/owner/生命周期）→ `MmioHandle(..)`
+///   （导出层翻译成 `-EBADF`/`-ESTALE`/`-EACCES`/`-EKEYREVOKED`）；
+/// - 设备 `irq == None` → `DeviceHasNoIrq`（`-ENODEV`）；
+/// - 该中断线已被认领 → `LineBusy`（`-EBUSY`）。
+///
+/// 加锁：**MMIO 表锁在最外层**（MMIO → IRQ），与 `mmio::release` 的子项扫描互斥
+/// （见 `handle/mmio.rs` 的加锁纪律），使派生与 root 释放串行化。
+pub fn claim_derived(
+    caller: ComponentId,
+    mmio_handle: mmio::MmioHandle,
+) -> Result<IrqHandle, IrqClaimError> {
+    let _guard = IrqSaveGuard::new();
+    // 先派生设备身份：验证 caller 确实持有该 MMIO root。
+    let mmio_table = mmio::get_table().lock();
+    let device_index = mmio_table
+        .get(caller, mmio_handle)
+        .map_err(IrqClaimError::MmioHandle)?
+        .device_index;
+
     let Some(machine) = machine::committed() else {
-        // 机器信息尚未提交（正常组件运行期不可达）
         return Err(IrqClaimError::DeviceNotFound);
     };
-    let _guard = IrqSaveGuard::new();
+    let Some(device) = machine.devices[..machine.dev_count].get(device_index as usize) else {
+        return Err(IrqClaimError::DeviceNotFound);
+    };
+    // 设备没有中断线（FDT 无 interrupts）。
+    let Some(number) = device.irq else {
+        return Err(IrqClaimError::DeviceHasNoIrq);
+    };
+
+    // authorize seam：phase 1 恒 allow（trusted KernelNative）。当前只实现
+    // allocation/ownership，不提供恶意组件隔离；未来 manifest requires /
+    // policy / ExecutionDomain 在这里决定 caller 是否有资格 claim。
     let mut table = get_table().lock();
-    let mut saw_match = false;
-    let mut saw_line = false;
-    for (index, device) in machine.devices[..machine.dev_count].iter().enumerate() {
-        // compatible 匹配（任一命中即可）
-        if !device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| c.as_str().as_bytes() == compatible)
-        {
-            continue;
-        }
-        saw_match = true;
-        // 设备没有中断线（FDT 无 interrupts）→ 试下一台
-        let Some(number) = device.irq else {
-            continue;
-        };
-        saw_line = true;
-        // 这条线已被认领 → 试下一台同名设备（QEMU 上 8 台 virtio 各占一条线）
-        if table.holds_line(number) {
-            continue;
-        }
-        // authorize seam：phase 1 恒 allow（trusted KernelNative）。当前只实现
-        // allocation/ownership，不提供恶意组件隔离；未来 manifest requires /
-        // policy / ExecutionDomain 在这里决定 caller 是否有资格 claim。
-        //
-        // TODO(C6 seam)：可收紧为「caller 必须已持有同一设备的 MmioHandle」
-        // （handle/mod.rs 的「IRQ 从同一 owner 派生」），第一版不强制。
-        return Ok(table.grant(caller, Irq::new(number, index as u8)));
+    if table.holds_line(number) {
+        return Err(IrqClaimError::LineBusy);
     }
-    // 有匹配但都没线 → NoIrq；有线但全被占 → Busy；压根没有匹配 → NotFound
-    Err(if !saw_match {
-        IrqClaimError::DeviceNotFound
-    } else if !saw_line {
-        IrqClaimError::DeviceHasNoIrq
-    } else {
-        IrqClaimError::LineBusy
-    })
+    Ok(table.grant(caller, Irq::new(number, device_index)))
+}
+
+/// 主动释放一条 IRQ authority：**真的关断投递**。
+///
+/// 顺序：先 revoke slot（此后 [`crate::irq::route`] 不再把该线投递给已死 owner，
+/// in-flight 处置退化为 `None`），再在锁外 `InterruptImpl::disable(number)` 关掉
+/// 控制器上的线。`IrqSaveGuard` 期间本地不会重入 trap，故不存在"revoke 后本 CPU
+/// 又投递一次"的窗口；跨 hart 的 in-flight 处置也因 slot 已撤销而无处投递。
+pub fn release(caller: ComponentId, handle: IrqHandle) -> Result<(), IrqError> {
+    let _guard = IrqSaveGuard::new();
+    let number = {
+        let mut table = get_table().lock();
+        let number = table.get(caller, handle).map_err(IrqError::Handle)?.number;
+        table.release(caller, handle).map_err(IrqError::Handle)?;
+        number
+    };
+    // 锁外关线：trap 可重入、控制器写慢（同 `enable` / `ack` 的纪律）。
+    InterruptImpl::disable(number);
+    Ok(())
+}
+
+/// 该 `device_index` 上是否还有 live 的 IRQ authority（供 `mmio::release`
+/// 的 root 生命周期检查）。
+pub fn has_line_for_device(device_index: u8) -> bool {
+    get_table().lock().has_line_for_device(device_index)
 }
 
 /// 打开一条 IRQ 线：Core 先验证 handle + 已注册 delivery，才去配置中断控制器。
@@ -453,67 +487,26 @@ mod tests {
         assert!(!table.holds_line(11));
     }
 
-    // ---- C6 行为规范（验收：claim 设备中断线 / delivery 注册）----
+    // ---- 派生 IRQ（从 MMIO root 推导同一台设备）----
 
-    /// 验收：claim 取「设备的中断线」并独占锚在中断号上。
-    /// virtio 两台（irq=8/9）：第一次 8（devices[0]），第二次 9（devices[2]）；
-    /// 两条线都被占后 → `LineBusy`；无中断线的匹配设备 → `DeviceHasNoIrq`；
-    /// 无匹配设备 → `DeviceNotFound`。
-    ///
-    /// 注意：`machine::COMMITTED` 是进程全局，本用例与 `handle::mmio` 的 claim
-    /// 用例靠 `machine::test_support::GUARD` 串行化（各自 commit 一份 MachineInfo）。
-    #[test]
-    fn claim_grants_device_irq_and_is_exclusive() {
-        let _guard = crate::machine::test_support::GUARD.lock();
+    /// 提交一份测试设备表（下标刻意选在其它测试不用的 20+ 区间）。
+    fn commit_test_machine() {
         use crate::machine::{
             self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
         };
-
-        super::init();
         let mut devices = [DeviceDescriptor::empty(); 26];
-        devices[0] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_8000,
-                size: 0x1000,
-            },
-            irq: Some(8),
-            compatibles: [
-                CompatStr::from_bytes(b"virtio,mmio"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
+        let mmio = |compatible: &[u8], base: usize, irq: Option<u32>| {
+            let mut d = DeviceDescriptor::empty();
+            d.space = IoSpace::Mmio { base, size: 0x1000 };
+            d.irq = irq;
+            d.compatibles[0] = CompatStr::from_bytes(compatible);
+            d.compat_count = 1;
+            d
         };
-        // 有匹配 compatible 但没有中断线
-        devices[1] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_0000,
-                size: 0x100,
-            },
-            irq: None,
-            compatibles: [
-                CompatStr::from_bytes(b"ns16550a"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
-        };
-        devices[2] = DeviceDescriptor {
-            space: IoSpace::Mmio {
-                base: 0x1000_7000,
-                size: 0x1000,
-            },
-            irq: Some(9),
-            compatibles: [
-                CompatStr::from_bytes(b"virtio,mmio"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
-        };
+        devices[20] = mmio(b"virtio,mmio", 0x1000_8000, Some(8));
+        devices[21] = mmio(b"ns16550a", 0x1000_0000, Some(10));
+        devices[22] = mmio(b"no-irq,mmio", 0x1000_6000, None);
+        devices[23] = mmio(b"virtio,mmio", 0x1000_7000, Some(9));
         machine::commit(MachineInfo {
             boot_hart: 0,
             timebase_frequency: 10_000_000,
@@ -527,41 +520,103 @@ mod tests {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
             }; 16],
-            dev_count: 3,
+            dev_count: 24,
             devices,
         });
+    }
 
-        let owner = ComponentId::from_raw(7);
+    /// 验收：IRQ 从 caller 的 MMIO root 派生**同一台设备**（device_index 一致），
+    /// 独占锚在中断号上；无 IRQ 设备 / wrong-owner / stale handle 各自映射。
+    #[test]
+    fn claim_derived_binds_irq_to_the_mmio_device_and_is_exclusive() {
+        use crate::handle::mmio::{self, MmioRegion};
+        let _guard = crate::machine::test_support::GUARD.lock();
+        crate::handle::init();
+        commit_test_machine();
 
-        let first = super::claim(owner, b"virtio,mmio").unwrap();
+        let owner = ComponentId::from_raw(74);
+        let other = ComponentId::from_raw(75);
+        let region = |device_index: u8, base: usize| MmioRegion {
+            base,
+            size: 0x1000,
+            device_index,
+        };
+
+        let virtio = mmio::get_table()
+            .lock()
+            .grant(owner, region(20, 0x1000_8000));
+        let irq_handle = super::claim_derived(owner, virtio).unwrap();
         {
             let table = super::get_table().lock();
-            let got = table.get(owner, first).unwrap();
-            assert_eq!(got.number, 8);
-            assert_eq!(got.device_index, 0);
+            let got = table.get(owner, irq_handle).unwrap();
+            assert_eq!(got.number, 8, "IRQ number 来自同一设备记录");
+            assert_eq!(got.device_index, 20, "IRQ 与 MMIO root 同一 device_index");
         }
-
-        // 第一条线已被占 → 拿第二台（devices[2] 的 9），而不是 Busy
-        let second = super::claim(owner, b"virtio,mmio").unwrap();
-        assert_ne!(first, second);
-        {
-            let table = super::get_table().lock();
-            let got = table.get(owner, second).unwrap();
-            assert_eq!(got.number, 9);
-            assert_eq!(got.device_index, 2);
-        }
-
+        // 同一条线再认领 → LineBusy（即使还是同一 root）。
         assert_eq!(
-            super::claim(owner, b"virtio,mmio"),
+            super::claim_derived(owner, virtio),
             Err(IrqClaimError::LineBusy)
         );
+
+        // 另一台 virtio（device 23 / line 9）可派生。
+        let virtio2 = mmio::get_table()
+            .lock()
+            .grant(other, region(23, 0x1000_7000));
+        let irq2 = super::claim_derived(other, virtio2).unwrap();
+        {
+            let table = super::get_table().lock();
+            let got = table.get(other, irq2).unwrap();
+            assert_eq!(got.number, 9);
+            assert_eq!(got.device_index, 23);
+        }
+
+        // 无中断线设备 → DeviceHasNoIrq。
+        let no_irq = mmio::get_table()
+            .lock()
+            .grant(owner, region(22, 0x1000_6000));
         assert_eq!(
-            super::claim(owner, b"ns16550a"),
+            super::claim_derived(owner, no_irq),
             Err(IrqClaimError::DeviceHasNoIrq)
         );
+
+        // 借用别的 owner 的 MMIO handle → MmioHandle(WrongOwner)。
         assert_eq!(
-            super::claim(owner, b"nope,device"),
-            Err(IrqClaimError::DeviceNotFound)
+            super::claim_derived(other, virtio),
+            Err(IrqClaimError::MmioHandle(HandleError::WrongOwner))
+        );
+
+        // root 撤销后派生 → MmioHandle(Stale)。
+        mmio::get_table().lock().revoke_owner(owner);
+        assert_eq!(
+            super::claim_derived(owner, virtio),
+            Err(IrqClaimError::MmioHandle(HandleError::Stale))
+        );
+
+        // 清理。
+        mmio::get_table().lock().revoke_owner(other);
+        super::get_table().lock().revoke_owner(owner);
+        super::get_table().lock().revoke_owner(other);
+    }
+
+    /// 验收：`release` 真的撤销 authority（slot stale），并清掉同设备的子标记。
+    #[test]
+    fn release_revokes_handle_and_clears_device_child() {
+        crate::handle::init();
+        let owner = ComponentId::from_raw(76);
+        let handle = super::get_table().lock().grant(owner, irq(219, 19));
+        super::get_table().lock().set_polled(owner, handle).unwrap();
+        assert!(super::has_line_for_device(19));
+
+        assert_eq!(super::release(owner, handle), Ok(()));
+        assert!(matches!(
+            super::get_table().lock().get(owner, handle),
+            Err(HandleError::Stale)
+        ));
+        assert!(!super::has_line_for_device(19));
+        // 重复释放 → Stale。
+        assert_eq!(
+            super::release(owner, handle),
+            Err(IrqError::Handle(HandleError::Stale))
         );
     }
 

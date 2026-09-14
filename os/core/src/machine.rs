@@ -122,6 +122,82 @@ impl DeviceDescriptor {
             compat_count: 0,
         }
     }
+
+    /// 该描述符是否声明了 `compatible`（任一串命中即计一次）。
+    /// 纯谓词：不看可用性 / claim 状态，也不触碰设备。
+    pub fn matches(&self, compatible: &[u8]) -> bool {
+        self.compatibles[..self.compat_count as usize]
+            .iter()
+            .any(|c| c.as_str().as_bytes() == compatible)
+    }
+}
+
+/// 设备身份（identity，**不是 authority**）：命名 `MachineInfo.devices` 中的一条记录。
+///
+/// - 可自由复制、比较、透传；Core 把它解析回那条设备记录。
+/// - **不是** Handle、不可撤销、不携带权限；零可以是合法值。
+/// - 表示形式是实现细节：消费者**不得**把它解释成地址、IRQ 号、过滤后的序号，
+///   或跨启动持久的身份。它只在一个已提交 `MachineInfo` 的生命周期内有意义。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeviceId(u32);
+
+impl DeviceId {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// 纯设备发现失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceLookupError {
+    /// 机器信息尚未提交（正常组件运行期不可达）。
+    NoMachineInfo,
+    /// `ordinal` 超出匹配数量（包括完全没有匹配）——枚举的**唯一**终止信号。
+    NoSuchOrdinal,
+}
+
+/// 纯设备发现：按 compatible 取第 `ordinal` 个匹配描述符（zero-based）。
+///
+/// - **不分配、不预留、不触碰任何设备寄存器、不读取 claim 状态**；
+/// - 一条描述符匹配**任意** compatible 串即计一次；
+/// - 枚举**包含已认领设备**，且顺序只取决于已提交的 `MachineInfo`——因此跨
+///   claim/release 稳定；
+/// - `ordinal >= 匹配数` → [`DeviceLookupError::NoSuchOrdinal`]。
+///
+/// 身份不是权限：调用方只能拿这个 ID 去 [`crate::handle::mmio::claim_device`]
+/// 请求该**确切设备**的 authority；ID 本身不授予任何东西。
+pub fn nth_compatible(compatible: &[u8], ordinal: u32) -> Result<DeviceId, DeviceLookupError> {
+    nth_compatible_in(committed().as_ref(), compatible, ordinal)
+}
+
+/// [`nth_compatible`] 的纯逻辑核心：把已提交快照显式传入，让 `NoMachineInfo`
+/// 路径可以确定性 host 测试（进程全局 `COMMITTED` 无法在测试间回退）。
+fn nth_compatible_in(
+    info: Option<&MachineInfo>,
+    compatible: &[u8],
+    ordinal: u32,
+) -> Result<DeviceId, DeviceLookupError> {
+    let Some(info) = info else {
+        return Err(DeviceLookupError::NoMachineInfo);
+    };
+    let mut seen = 0u32;
+    for (index, device) in info.devices[..info.dev_count.min(info.devices.len())]
+        .iter()
+        .enumerate()
+    {
+        if !device.matches(compatible) {
+            continue;
+        }
+        if seen == ordinal {
+            return Ok(DeviceId(index as u32));
+        }
+        seen += 1;
+    }
+    Err(DeviceLookupError::NoSuchOrdinal)
 }
 
 impl core::fmt::Debug for DeviceDescriptor {
@@ -196,4 +272,109 @@ pub(crate) mod test_support {
     /// 串行化「提交全局 MachineInfo」的测试：`COMMITTED` 是进程全局，并行测试
     /// 各自 commit 一份会互相覆盖。测试很短，用自旋锁串起来即可。
     pub(crate) static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(compatibles: &[&[u8]], irq: Option<u32>) -> DeviceDescriptor {
+        let mut d = DeviceDescriptor::empty();
+        for (slot, c) in d.compatibles.iter_mut().zip(compatibles) {
+            *slot = CompatStr::from_bytes(c);
+        }
+        d.compat_count = compatibles.len() as u8;
+        d.irq = irq;
+        d
+    }
+
+    fn info(devices: [DeviceDescriptor; 26], dev_count: usize) -> MachineInfo {
+        MachineInfo {
+            boot_hart: 0,
+            timebase_frequency: 10_000_000,
+            cpu_count: 1,
+            cpu_info: [CpuInfo {
+                boot_cpu: true,
+                hart_id: CpuId::from_raw(0),
+            }; 8],
+            mem_count: 1,
+            memory_regions: [MemoryRegion {
+                base: 0x8000_0000,
+                size: 0x1000_0000,
+            }; 16],
+            dev_count,
+            devices,
+        }
+    }
+
+    /// 枚举纯逻辑：ordinal 是 zero-based 匹配序号，越界（含无匹配）→ NoSuchOrdinal；
+    /// 一条描述符命中多个 compatible 只计一次；顺序就是设备表顺序（与 claim 无关）。
+    #[test]
+    fn nth_compatible_counts_once_per_descriptor_and_terminates_with_no_such_ordinal() {
+        let mut devices = [DeviceDescriptor::empty(); 26];
+        // devices[0] 同时声明两个 compatible —— 匹配任一个都只算一台设备。
+        devices[0] = device(
+            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
+            Some(1),
+        );
+        devices[1] = device(&[b"ns16550a".as_slice()], Some(10));
+        devices[2] = device(&[b"virtio,mmio".as_slice()], Some(2));
+        let info = info(devices, 3);
+
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"virtio,mmio", 0),
+            Ok(DeviceId(0))
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"virtio,mmio", 1),
+            Ok(DeviceId(2))
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"virtio,mmio", 2),
+            Err(DeviceLookupError::NoSuchOrdinal)
+        );
+        // 另一个 compatible 命中同一描述符，仍只是 ordinal 0。
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"legacy,mmio", 0),
+            Ok(DeviceId(0))
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"legacy,mmio", 1),
+            Err(DeviceLookupError::NoSuchOrdinal)
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"ns16550a", 0),
+            Ok(DeviceId(1))
+        );
+        // 完全无匹配 → 同样是 NoSuchOrdinal（枚举的唯一终止信号）。
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"nope,device", 0),
+            Err(DeviceLookupError::NoSuchOrdinal)
+        );
+        // 只看 dev_count 个，尾部空描述符不参与。
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"virtio,mmio", 2),
+            Err(DeviceLookupError::NoSuchOrdinal)
+        );
+    }
+
+    /// 机器信息未提交 → NoMachineInfo（导出层翻译成 `-ENODEV`）。
+    #[test]
+    fn nth_compatible_without_machine_info_is_unavailable() {
+        assert_eq!(
+            nth_compatible_in(None, b"virtio,mmio", 0),
+            Err(DeviceLookupError::NoMachineInfo)
+        );
+    }
+
+    /// DeviceId 是身份：可复制 / 可比较，零合法。
+    #[test]
+    fn device_id_is_a_copyable_identity_including_zero() {
+        let zero = DeviceId::from_raw(0);
+        assert_eq!(zero.raw(), 0);
+        assert_eq!(zero, DeviceId::from_raw(0));
+        assert_ne!(zero, DeviceId::from_raw(1));
+        let copy = zero;
+        assert_eq!(copy, zero);
+    }
 }

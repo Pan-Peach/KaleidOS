@@ -19,6 +19,7 @@
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
 use crate::handle::{HandleError, dma, irq, mmio};
+use crate::machine;
 use crate::sched::SchedError;
 use crate::task::TaskError;
 
@@ -134,10 +135,20 @@ impl From<ComponentLoadError> for Errno {
     }
 }
 
+impl From<machine::DeviceLookupError> for Errno {
+    fn from(error: machine::DeviceLookupError) -> Self {
+        match error {
+            machine::DeviceLookupError::NoMachineInfo => Errno::ENODEV,
+            machine::DeviceLookupError::NoSuchOrdinal => Errno::ENOENT,
+        }
+    }
+}
+
 impl From<mmio::MmioClaimError> for Errno {
     fn from(error: mmio::MmioClaimError) -> Self {
         match error {
             mmio::MmioClaimError::DeviceNotFound => Errno::ENODEV,
+            mmio::MmioClaimError::NotMmio => Errno::ENOTSUP,
             mmio::MmioClaimError::DeviceBusy => Errno::EBUSY,
             mmio::MmioClaimError::Denied => Errno::EPERM,
         }
@@ -149,6 +160,7 @@ impl From<mmio::MmioError> for Errno {
         match error {
             mmio::MmioError::Handle(inner) => inner.into(),
             mmio::MmioError::OutOfBounds | mmio::MmioError::Unaligned => Errno::EINVAL,
+            mmio::MmioError::HasChildren => Errno::EBUSY,
         }
     }
 }
@@ -170,6 +182,7 @@ impl From<irq::IrqClaimError> for Errno {
             irq::IrqClaimError::DeviceNotFound => Errno::ENODEV,
             irq::IrqClaimError::DeviceHasNoIrq => Errno::ENODEV,
             irq::IrqClaimError::LineBusy => Errno::EBUSY,
+            irq::IrqClaimError::MmioHandle(inner) => inner.into(),
             irq::IrqClaimError::Denied => Errno::EPERM,
         }
     }
@@ -209,15 +222,29 @@ mod tests {
         assert_eq!(Errno::from(InterfaceError::ProviderNotReady), Errno::EAGAIN);
         assert_eq!(Errno::from(ComponentLoadError::NotFound), Errno::ENOENT);
         assert_eq!(Errno::from(mmio::MmioClaimError::DeviceBusy), Errno::EBUSY);
+        assert_eq!(Errno::from(mmio::MmioClaimError::NotMmio), Errno::ENOTSUP);
         assert_eq!(
             Errno::from(mmio::MmioError::Handle(HandleError::Revoked)),
             Errno::EKEYREVOKED
         );
         assert_eq!(Errno::from(mmio::MmioError::Unaligned), Errno::EINVAL);
+        assert_eq!(Errno::from(mmio::MmioError::HasChildren), Errno::EBUSY);
+        assert_eq!(
+            Errno::from(machine::DeviceLookupError::NoMachineInfo),
+            Errno::ENODEV
+        );
+        assert_eq!(
+            Errno::from(machine::DeviceLookupError::NoSuchOrdinal),
+            Errno::ENOENT
+        );
         assert_eq!(Errno::from(irq::IrqClaimError::LineBusy), Errno::EBUSY);
         assert_eq!(
             Errno::from(irq::IrqClaimError::DeviceHasNoIrq),
             Errno::ENODEV
+        );
+        assert_eq!(
+            Errno::from(irq::IrqClaimError::MmioHandle(HandleError::WrongOwner)),
+            Errno::EACCES
         );
         assert_eq!(
             Errno::from(irq::IrqError::Handle(HandleError::Stale)),
