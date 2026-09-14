@@ -98,6 +98,11 @@ pub trait CpuArch {
     fn disable_irq() -> Self::IrqFlags;
     /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）。
     fn restore_irq(flags: Self::IrqFlags);
+    /// 等待下一次中断（RISC-V `wfi`；host fake = no-op）。
+    ///
+    /// **调用者负责保证有中断会到来**（例如先 arm 一个 one-shot timer）——
+    /// 没有使能的中断源时 `wfi` 可能永久睡眠。
+    fn wait_for_interrupt();
 }
 
 /// 时钟 / 单次定时器服务（firmware/platform 能力，不是 ISA 原语）。

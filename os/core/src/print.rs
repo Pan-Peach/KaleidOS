@@ -13,7 +13,8 @@
 //! **注意**：panic 路径不走本模块 —— panic 可能发生在锁/堆损坏时，
 //! 由 bootstrap 的静态紧急 console 直连输出（见 bootstrap console.rs）。
 
-use arch::{Console, ConsoleImpl};
+use crate::monitor::editor::{LineEditor, Outcome, Screen};
+use arch::{Console, ConsoleImpl, CpuArch, Timer, TimerImpl};
 use core::fmt::{self, Write};
 
 /// 无前缀输出（core 内部各模块的自描述日志用）。
@@ -32,39 +33,79 @@ pub fn log(tag: &str, args: fmt::Arguments<'_>) {
 }
 
 /// 打印任意字节序列（不经格式化，monitor 回显/原始输出用）。
+///
+/// 逐字节原样写 Console backend：未知命令回显必须是**精确字节**，
+/// 不做 UTF-8 校验/替换。
 pub fn print_bytes(bytes: &[u8]) {
-    let mut sink = Sink;
-    let _ = sink.write_str(core::str::from_utf8(bytes).unwrap_or("(?non-utf8)"));
+    for &byte in bytes {
+        ConsoleImpl::write_byte(byte);
+    }
+}
+
+/// 屏幕 sink：把行编辑器的输出原样接到 Console backend。
+pub(crate) struct ConsoleScreen;
+
+impl Screen for ConsoleScreen {
+    fn put(&mut self, bytes: &[u8]) {
+        print_bytes(bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Monitor 输入：read_line（轮询 Console::getc，直到 \n 或缓冲区满）
+// Monitor 输入：read_line（行编辑器 + 轮询 Console::getc）
 // ---------------------------------------------------------------------------
 
-/// 读一行（最长 `max-1` 字节，留 NUL 终止）。回车(\n)结束；退格(0x08/0x7f)删字符。
-/// 返回行字节数；空行（仅回车）返回 0。
+/// 读一行（编辑器无提示符、无补全）。返回提交的字节数；空行 / Ctrl-C /
+/// Ctrl-D 返回 0。
+///
+/// 保留本函数给 boot selftest（单次调用、64 字节缓冲）——monitor 主循环
+/// 另有带提示符/补全的接线。
 pub fn read_line(buf: &mut [u8]) -> usize {
-    let mut n = 0;
+    let mut editor = LineEditor::new();
+    let mut screen = ConsoleScreen;
     loop {
-        let Some(ch) = ConsoleImpl::getc() else {
-            continue;
-        };
-        match ch {
-            b'\n' | b'\r' => return n,
-            0x08 | 0x7f => {
-                if n > 0 {
-                    n -= 1;
-                    print(format_args!("\u{8} \u{8}"));
+        match ConsoleImpl::getc() {
+            Some(byte) => match editor.feed("", byte, &[], &mut screen) {
+                Outcome::Pending => {}
+                Outcome::Submitted => {
+                    let line = editor.line();
+                    let len = line.len().min(buf.len());
+                    buf[..len].copy_from_slice(&line[..len]);
+                    return len;
                 }
-            }
-            _ if n < buf.len() - 1 => {
-                buf[n] = ch;
-                n += 1;
-                print(format_args!("{}", ch as char));
-            }
-            _ => {}
+                Outcome::Cancelled | Outcome::Eof => return 0,
+            },
+            None => idle_wait(),
         }
     }
+}
+
+/// 空闲等待：短 one-shot timer + WFI（唤醒后回到 getc 轮询）。
+///
+/// `Console::getc()` 是轮询式 SBI 调用（未使能 UART RX 中断），单独 `wfi`
+/// 没有任何东西能唤醒——所以先 arm 一个 ~10ms 的 one-shot deadline，让
+/// timer IRQ 把 WFI 叫醒。arm 失败（timer 未初始化，如 selftest 早于
+/// `core::init`）退回自旋，**绝不挂死**。
+pub(crate) fn idle_wait() {
+    let now = TimerImpl::now();
+    let deadline = now.saturating_add(idle_period());
+    if crate::timer::arm_deadline(deadline).is_ok() {
+        arch::CpuImpl::wait_for_interrupt();
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
+/// ~10ms 的 idle 周期：优先用已提交 MachineInfo 的 timebase 频率换算，
+/// 缺省用安全常量（10ms @ 10MHz，QEMU virt 的 timebase）。
+fn idle_period() -> u64 {
+    const TARGET_MS: u64 = 10;
+    const FALLBACK_TICKS: u64 = 100_000;
+    let Some(info) = crate::machine::committed() else {
+        return FALLBACK_TICKS;
+    };
+    let period = info.timebase_frequency / (1000 / TARGET_MS);
+    if period == 0 { FALLBACK_TICKS } else { period }
 }
 
 // ---------------------------------------------------------------------------

@@ -78,6 +78,10 @@ impl CpuArch for Fake {
     fn restore_irq(_flags: Self::IrqFlags) {
         // host 无真实中断：no-op 占位。
     }
+
+    fn wait_for_interrupt() {
+        // host 无中断/时钟硬件：no-op（真机语义见 Riscv 实现）。
+    }
 }
 
 impl Timer for Fake {

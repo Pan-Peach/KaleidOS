@@ -87,6 +87,12 @@ impl CpuArch for Riscv {
             }
         }
     }
+
+    fn wait_for_interrupt() {
+        unsafe {
+            asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+    }
 }
 
 impl Timer for Riscv {

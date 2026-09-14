@@ -6,16 +6,23 @@
 //! - 只读观察系统状态（machine/memory），不提供 god-mode 修改；
 //! - 不因拥有 console 而获得 authority（Oracle 审查结论）。
 //!
-//! 主循环：`core> _` 提示符 → 读行 → token 解析 → 命令表分发 → 循环。
+//! 主循环：`core> _` 提示符 → 轮询取字节 → 行编辑（历史/Tab 补全）→
+//! token 解析 → 命令表分发 → 循环。空闲时走 `print::idle_wait()`（短
+//! one-shot timer + WFI，不忙等烧 CPU）。
 //! 输入/输出都走 arch crate 的 Console backend，无注入层。
 
-use crate::{print, printk};
+use crate::monitor::editor::{LineEditor, Outcome, Screen};
+use crate::print::{self, ConsoleScreen};
+use crate::printk;
+use arch::Console;
 
 mod cmds;
+pub mod editor;
 
 pub use cmds::mount;
 
-const LINE_BUF: usize = 64;
+/// 交互提示符（重绘时重新输出；`LINE_MAX` 与其匹配 80 列预算）。
+const PROMPT: &str = "core> ";
 
 /// 命令表：名称 + 执行函数（返回是否已执行；为未来多值参数预留 args）。
 struct Command {
@@ -57,7 +64,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "catalog",
-        help: "list components found in the store (loadable); [loaded] marks loaded ones",
+        help: "list loadable components in store",
         run: cmds::catalog,
     },
     Command {
@@ -99,25 +106,48 @@ fn resolve_command(line: &[u8]) -> Resolved<'_> {
 }
 
 /// 进入 Monitor 主循环（永不返回）。
+///
+/// 行编辑状态常驻（历史/Tab 补全跨命令保持）；空闲等待 = 短 timer + WFI，
+/// 永不挂死（见 `print::idle_wait`）。
 pub fn run() -> ! {
     printk!("KaleidOS Core Monitor\n");
     printk!("type 'help' for commands\n");
 
-    let mut buf = [0u8; LINE_BUF];
+    let mut editor = LineEditor::new();
+    let mut screen = ConsoleScreen;
+    // 补全候选 = 命令名（从 COMMANDS 派生，避免两份表漂移）。
+    let mut names = [""; COMMANDS.len()];
+    for (slot, cmd) in names.iter_mut().zip(COMMANDS) {
+        *slot = cmd.name;
+    }
+
     loop {
-        printk!("core> ");
-        let n = print::read_line(&mut buf);
-        if n == 0 {
-            continue;
-        }
-        let line = &buf[..n];
-        printk!("\n");
-        match resolve_command(line) {
-            Resolved::Known(cmd, args) => (cmd.run)(args),
-            Resolved::Unknown(first) => {
-                printk!("unknown command '");
-                print::print_bytes(first);
-                printk!("' (try 'help')\n");
+        screen.put(PROMPT.as_bytes());
+        loop {
+            match arch::ConsoleImpl::getc() {
+                Some(byte) => match editor.feed(PROMPT, byte, &names, &mut screen) {
+                    Outcome::Pending => {}
+                    Outcome::Submitted => {
+                        let line = editor.line();
+                        // 空行 / 纯空白：静默重来（旧 read_line 对空行也是直接继续），
+                        // 不能报 unknown command ''。
+                        if !line.trim_ascii().is_empty() {
+                            match resolve_command(line) {
+                                Resolved::Known(cmd, args) => (cmd.run)(args),
+                                Resolved::Unknown(first) => {
+                                    printk!("unknown command '");
+                                    print::print_bytes(first);
+                                    printk!("' (try 'help')\n");
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Outcome::Cancelled => break,
+                    // Ctrl-D 空行：Monitor 不退出（run 永不返回），忽略。
+                    Outcome::Eof => {}
+                },
+                None => print::idle_wait(),
             }
         }
     }
