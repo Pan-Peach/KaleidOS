@@ -34,6 +34,9 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 ## 目录
 
 ```
+Kconfig        构建配置顶层入口；`.config`（gitignored）是配置唯一真相，configs/*_defconfig 是具名 profile（见 docs/kconfig.md）
+configs/       具名 profile（defconfig）：qemu_rv64 / qemu_rv32 / qemu_rv32_nommu
+scripts/       Kconfig 胶水脚本：kconfig/configure.py（创建/归一化 .config）+ kconfig/genmk.py（生成 Make 片段）
 os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
   boot/            成品镜像层（bin，按目标架构分目录）：riscv/ ——
                    RV64/Sv39 与 RV32/Sv32 profile 共用 RISC-V family，
@@ -43,10 +46,10 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
   arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
   components/      组件 crates（策略 / 服务 / 测试）：scheduler_rr/ core_test/ logger/ …
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
-third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）——workspace exclude，clippy 不检索
+third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）——workspace exclude，clippy 不检索
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
-tools/         工具脚本（待建设）
+tools/         构建辅助脚本（build-kcomp.sh 等）
 ```
 
 > **Cargo 依赖图 ≠ Component 图。** 组件运行时的加载/组合由 Component Manager 决定（未来：.kcomp + cpio + manifest，Linux insmod/depmod/initramfs 模式）——不写在 Cargo.toml 里。
@@ -71,7 +74,7 @@ core> load kcomp_smoke
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认构建 RV64，也可用 `make kernel ARCH=rv32` 构建 RV32（QEMU 内存 rv32=1G，见 Makefile）。
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认 profile 为 RV64；切换架构 / VM 走 Kconfig：`make qemu_rv32_defconfig` 或 `make qemu_rv32_nommu_defconfig`，再 `make qemu`（见 `docs/kconfig.md`）。
 
 ## 构建
 
@@ -82,9 +85,19 @@ git submodule update --init --recursive
 cargo check
 ```
 
-QEMU 运行：`make qemu`（默认 RV64），或 `make qemu ARCH=rv32`。
-VM profile：默认 `VM=mmu`（RV64→Sv39、RV32→Sv32）；RV32 NoMMU 可用
-`make kernel ARCH=rv32 VM=nommu` 构建。
+配置走 Linux Kconfig 风格：`.config` 是唯一配置真相，先选 profile 再构建（详见 `docs/kconfig.md`）：
+
+```sh
+make qemu_rv64_defconfig        # RV64 / supervisor / MMU（默认 profile）
+make qemu_rv32_defconfig        # RV32 / supervisor / MMU
+make qemu_rv32_nommu_defconfig  # RV32 / supervisor / NoMMU
+make qemu                       # 构建并在 QEMU 中运行（Ctrl-A X 退出）
+
+make menuconfig                 # 交互式编辑 .config
+make olddefconfig               # 用新默认值刷新 .config
+```
+
+主工作流：`make <board>_defconfig && make qemu`。
 
 ## 文档
 
@@ -94,6 +107,7 @@ VM profile：默认 `VM=mmu`（RV64→Sv39、RV32→Sv32）；RV32 NoMMU 可用
 | `docs/core-philosophy.md` | 核心哲学与判断标准 |
 | `docs/component-model.md` | 组件模型（生命周期 / ResourceDomain / 依赖图） |
 | `docs/driver-model.md` | 驱动与执行域模型（Handle→Lease / MMIO·IRQ·DMA / 撤销不变式） |
+| `docs/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
 | `docs/testing.md` | 测试策略（host test / CoreTest / trace） |
 | `docs/roadmap.md` | 路线图（M0–M4 与后续方向） |
 | `docs/references.md` | 参考资料与借鉴方向 |
