@@ -76,15 +76,30 @@ pub mod abi {
             name: *const u8,
             len: usize,
             kind: u32,
-            version: u32,
-            context: *mut (),
+            abi: u64,
+            api: *const (),
+            ctx: *mut (),
         ) -> i32;
         #[link_name = "kcore_interface_available"]
-        pub fn kcore_interface_available(
+        pub fn kcore_interface_available(name: *const u8, len: usize, kind: u32, abi: u64) -> i32;
+        #[link_name = "kcore_interface_bind"]
+        pub fn kcore_interface_bind(
             name: *const u8,
             len: usize,
             kind: u32,
-            version: u32,
+            abi: u64,
+            out_binding: *mut u64,
+            out_api: *mut usize,
+            out_ctx: *mut usize,
+            out_generation: *mut u64,
+        ) -> i32;
+        #[link_name = "kcore_interface_refresh"]
+        pub fn kcore_interface_refresh(
+            binding: u64,
+            abi: u64,
+            out_api: *mut usize,
+            out_ctx: *mut usize,
+            out_generation: *mut u64,
         ) -> i32;
 
         // -- Task control --
@@ -150,6 +165,163 @@ pub mod abi {
         pub fn kcore_irq_poll(handle: u64, out_count: *mut u64) -> i32;
         #[link_name = "kcore_irq_ack"]
         pub fn kcore_irq_ack(handle: u64) -> i32;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interface binding：Core `kcore_interface_*` 之上的薄安全 wrapper
+// ---------------------------------------------------------------------------
+
+/// Component → Component Service binding 的薄 SDK 层。
+///
+/// 这一层只做三件事：把 ABI 编码（kind / fingerprint）变成类型、把 `0/-errno`
+/// 变成 `Result`、把裸指针收窄成 [`binding::ServiceBinding`]。**不定义任何具体
+/// Service**（`FsService` / `BlockService` / `NetService` 等属于组件侧 contract），
+/// 也不做字符串函数查找 / 反射 / 动态类型——KernelNative phase 1 就是 typed
+/// `#[repr(C)]` function table + direct call。
+///
+/// TODO(service-handle): 未来可在本层之上加 `ServiceHandle<S>`（编译期绑定
+/// contract 类型并封装 refresh 快照），当前只提供 raw wrapper，避免过度抽象。
+pub mod binding {
+    use crate::abi;
+
+    /// Exact ABI fingerprint（`#[repr(transparent)] u64`，**无版本兼容语义**）。
+    /// 与 Core `component::interface::InterfaceAbi` 镜像。
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct InterfaceAbi(u64);
+
+    impl InterfaceAbi {
+        pub const fn from_raw(raw: u64) -> Self {
+            Self(raw)
+        }
+
+        pub const fn raw(self) -> u64 {
+            self.0
+        }
+    }
+
+    /// Interface 领域分类（ABI 编码 0/1/2，与 Core `InterfaceKind` 一致）。
+    #[repr(u32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum InterfaceKind {
+        Device = 0,
+        Service = 1,
+        Policy = 2,
+    }
+
+    impl InterfaceKind {
+        /// ABI 编码（`#[repr(u32)]`，恒等于判别值）。
+        pub const fn as_u32(self) -> u32 {
+            self as u32
+        }
+    }
+
+    /// 逻辑 binding 的当前快照（Core 交付 `api` / `ctx` / `generation`）。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ServiceBinding {
+        /// 稳定逻辑 binding 身份；provider replacement 不改变它。
+        pub binding: u64,
+        /// provider `#[repr(C)]` function table 指针（opaque）。
+        pub api: usize,
+        /// provider opaque state/context。
+        pub ctx: usize,
+        /// provider commit 计数。
+        pub generation: u64,
+    }
+
+    /// SchedulerPolicy 的 exact ABI fingerprint。
+    ///
+    /// TODO(service-abi): 具体 Service contract 的 fingerprint 应在本模块统一定义；
+    /// 当前为占位值，必须与 Core `sched::SCHEDULER_POLICY_ABI` 完全一致
+    /// （A/B 双侧手工锚定，两侧各有锚定测试钉死数值）。
+    pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_4845_4455_4C52);
+
+    /// 发布接口（**只在 `kcomp_init` 期间有效**）：Core 记录 pending，
+    /// `kcomp_init` 返回 0 后原子提交。返回 `Ok(())` = 已记录 pending。
+    ///
+    /// # Safety
+    /// `api` 必须指向 `'static` 的 `#[repr(C)]` function table，`ctx` 必须是
+    /// provider 存活期内有效的 opaque state；Core 只存指针、不解引用。
+    pub unsafe fn publish(
+        name: &[u8],
+        kind: InterfaceKind,
+        abi: InterfaceAbi,
+        api: *const (),
+        ctx: *mut (),
+    ) -> Result<(), i32> {
+        // SAFETY: 调用方保证 api/ctx 契约（见函数 Safety）。
+        let status = unsafe {
+            abi::kcore_interface_publish(
+                name.as_ptr(),
+                name.len(),
+                kind.as_u32(),
+                abi.raw(),
+                api,
+                ctx,
+            )
+        };
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+
+    /// consumer 按名 bind：Core exact-compare ABI + 验证 provider 后返回当前快照。
+    pub fn bind(
+        name: &[u8],
+        kind: InterfaceKind,
+        abi: InterfaceAbi,
+    ) -> Result<ServiceBinding, i32> {
+        let (mut binding, mut api, mut ctx, mut generation) = (0u64, 0usize, 0usize, 0u64);
+        // SAFETY: (name_ptr, len) 与四个 out 在本帧内有效；Core 写入 out。
+        let status = unsafe {
+            abi::kcore_interface_bind(
+                name.as_ptr(),
+                name.len(),
+                kind.as_u32(),
+                abi.raw(),
+                &mut binding,
+                &mut api,
+                &mut ctx,
+                &mut generation,
+            )
+        };
+        if status == 0 {
+            Ok(ServiceBinding {
+                binding,
+                api,
+                ctx,
+                generation,
+            })
+        } else {
+            Err(status)
+        }
+    }
+
+    /// consumer 用已有 binding id refresh：Core exact-compare ABI + 重新验证
+    /// provider 后返回最新快照（provider replacement 后无需 ELF reload）。
+    pub fn refresh(binding: u64, abi: InterfaceAbi) -> Result<ServiceBinding, i32> {
+        let (mut api, mut ctx, mut generation) = (0usize, 0usize, 0u64);
+        // SAFETY: 三个 out 在本帧内有效；Core 写入 out。
+        let status = unsafe {
+            abi::kcore_interface_refresh(binding, abi.raw(), &mut api, &mut ctx, &mut generation)
+        };
+        if status == 0 {
+            Ok(ServiceBinding {
+                binding,
+                api,
+                ctx,
+                generation,
+            })
+        } else {
+            Err(status)
+        }
+    }
+
+    /// 只读查询 `(name, kind, abi)` 是否已绑定且 provider 存活。
+    pub fn available(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> bool {
+        // SAFETY: (name_ptr, len) 在本帧内有效；Core 只读。
+        unsafe {
+            abi::kcore_interface_available(name.as_ptr(), name.len(), kind.as_u32(), abi.raw()) == 1
+        }
     }
 }
 
@@ -340,5 +512,24 @@ mod tests {
         assert_eq!(ToDevice.as_i32(), 0);
         assert_eq!(FromDevice.as_i32(), 1);
         assert_eq!(Bidirectional.as_i32(), 2);
+    }
+
+    /// InterfaceKind ABI 编码锚定（与 Core `export.rs::kind_from_u32` 一致）。
+    #[test]
+    fn interface_kind_encoding_is_stable() {
+        use super::binding::InterfaceKind::{Device, Policy, Service};
+        assert_eq!(Device.as_u32(), 0);
+        assert_eq!(Service.as_u32(), 1);
+        assert_eq!(Policy.as_u32(), 2);
+    }
+
+    /// SchedulerPolicy ABI fingerprint 锚定：与 Core `sched::SCHEDULER_POLICY_ABI`
+    /// 必须是同一数值（A/B 双侧手工锚定）。
+    #[test]
+    fn scheduler_policy_abi_is_anchored() {
+        assert_eq!(
+            super::binding::SCHEDULER_POLICY_ABI.raw(),
+            0x5343_4845_4455_4C52
+        );
     }
 }

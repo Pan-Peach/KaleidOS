@@ -167,7 +167,8 @@ extern "C" fn panic_containment_entry() -> i32 {
 /// Core abort trampoline, which kills the task, fails the victim component, and
 /// reschedules so the normal task still completes and Core survives.
 fn task_panic() -> ! {
-    // A Ready scheduler policy provider (publishes "scheduler" v1 on init).
+    // A Ready scheduler policy provider (publishes "scheduler" with the exact
+    // ABI fingerprint on init).
     if kernel::component::load::load_and_start(b"scheduler_rr").is_err() {
         fail("task-panic: scheduler_rr load failed");
     }

@@ -1,10 +1,12 @@
 //! 组件加载语义入口（ComponentManager 教学版占位）：仓库读取 → loader 放段 →
-//! registry 声明 → resolve → start（Ready）→ 调用入口（call_init）。
+//! registry 声明 → resolve → begin_start（Starting）→ 调用入口（call_init）→
+//! 成功则原子提交 pending interfaces 并 finish_start（Ready）。
 //!
 //! `monitor load <name>` 与组件 ABI `kcore_component_load` 都是这里的**薄 caller**——
 //! 加载流程本身属于 Core（monitor 不是 ComponentManager）。完整依赖解析、
 //! kpkg manifest requires、失败回滚留给真正的 ComponentManager 里程碑。
 
+use crate::component::interface::{self, InterfaceError};
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, containment, failure, registry};
 use crate::task::TaskId;
@@ -24,12 +26,15 @@ pub enum ComponentLoadError {
     DeclareFailed,
     /// resolve 失败（require 未满足；v1 无 requires，不应发生）。
     ResolveFailed,
-    /// 状态机拒绝 start（Declared 直接 start 等）。
+    /// 状态机拒绝 begin_start/finish_start。
     StartFailed,
     /// 组件入口返回非零（`kcomp_init` 失败位图）。
     InitFailed(i32),
     /// 组件入口 panic 已切回 Core；组件状态由 caller 提交为 Failed。
     InitPanicked,
+    /// `kcomp_init` 返回 0，但 pending interfaces 提交冲突（ABI mismatch /
+    /// kind mismatch）——组件被提交为 Failed，旧 binding 不受影响。
+    InterfaceCommitFailed(InterfaceError),
     /// 组件拥有的任务 panic，已由 task-abort 上下文提交为 `Exited`；
     /// 组件的 authority 由 abort 路径撤销（仅作 reason 语义）。
     TaskPanicked(TaskId),
@@ -50,8 +55,11 @@ pub fn current_component() -> Option<ComponentId> {
 
 /// 加载并启动组件：完整生命周期链，返回组件 id。
 ///
-/// 锁纪律：registry 锁只覆盖 declare/resolve/start；`call_init` 在**无锁**
-/// 状态下调用（组件 init 可能再 load 别的组件、publish 接口、创建任务，
+/// 生命周期：`Declared → resolve → Resolved → begin_start → Starting →
+/// call_init → { failure → Failed | success → commit pending interfaces → Ready }`。
+///
+/// 锁纪律：registry 锁只覆盖 declare/resolve/begin_start/finish_start；`call_init`
+/// 在**无锁**状态下调用（组件 init 可能再 load 别的组件、publish 接口、创建任务，
 /// 都各自拿锁——不能有任何锁跨 call_init 持有）。
 pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
     let store = crate::component::store::get_component_store()
@@ -77,7 +85,9 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
         reg.resolve(id)
             .map_err(|_| ComponentLoadError::ResolveFailed)?;
-        reg.start(id).map_err(|_| ComponentLoadError::StartFailed)?;
+        // Resolved → Starting：`kcomp_init` 执行期间 publish 只记录 pending。
+        reg.begin_start(id)
+            .map_err(|_| ComponentLoadError::StartFailed)?;
         id
     };
 
@@ -88,7 +98,32 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
     *CURRENT.lock() = previous;
 
     match outcome {
-        containment::CallOutcome::Returned(0) => Ok(id),
+        containment::CallOutcome::Returned(0) => {
+            // init 成功：原子提交 pending interfaces，成功才进入 Ready。
+            let committed = {
+                let reg = registry::get_registry().lock();
+                let mut ifs = interface::get_interfaces().lock();
+                ifs.commit_pending(&reg, id)
+            };
+            match committed {
+                Ok(()) => {
+                    let ready = registry::get_registry().lock().finish_start(id).is_ok();
+                    if ready {
+                        Ok(id)
+                    } else {
+                        // Starting → Ready 失败是 Core 不变式破坏（不应发生）。
+                        let error = ComponentLoadError::StartFailed;
+                        failure::fail_component(id, error);
+                        Err(error)
+                    }
+                }
+                Err(interface_error) => {
+                    let error = ComponentLoadError::InterfaceCommitFailed(interface_error);
+                    failure::fail_component(id, error);
+                    Err(error)
+                }
+            }
+        }
         containment::CallOutcome::Returned(code) => {
             let error = ComponentLoadError::InitFailed(code);
             failure::fail_component(id, error);

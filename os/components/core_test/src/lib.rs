@@ -64,7 +64,7 @@ mod runtime {
         #[link_name = "kcore_component_load"]
         fn component_load(name: *const u8, len: usize) -> i32;
         #[link_name = "kcore_interface_available"]
-        fn interface_available(name: *const u8, len: usize, kind: u32, version: u32) -> i32;
+        fn interface_available(name: *const u8, len: usize, kind: u32, abi: u64) -> i32;
         #[link_name = "kcore_task_create"]
         fn task_create(entry: usize) -> i32;
         #[link_name = "kcore_task_start"]
@@ -124,6 +124,9 @@ mod runtime {
     // ABI 编码常量（与 Core export.rs 一致）。
     const KIND_POLICY: u32 = 2;
     const STATE_EXITED: i32 = 4;
+    /// SchedulerPolicy 的 exact ABI fingerprint（SDK 统一定义；与 Core
+    /// `sched::SCHEDULER_POLICY_ABI` 一致）。
+    const SCHEDULER_POLICY_ABI: u64 = kcomp_sdk::binding::SCHEDULER_POLICY_ABI.raw();
 
     // ---- 输出样式（ANSI SGR；终端解释颜色，日志里是可剥离的控制字节）----
     //
@@ -344,7 +347,12 @@ mod runtime {
 
         // 调度器接口已绑定且 provider 存活（发布发生在 scheduler_rr 的 init）。
         let bound = unsafe {
-            interface_available(b"scheduler".as_ptr(), b"scheduler".len(), KIND_POLICY, 1) == 1
+            interface_available(
+                b"scheduler".as_ptr(),
+                b"scheduler".len(),
+                KIND_POLICY,
+                SCHEDULER_POLICY_ABI,
+            ) == 1
         };
         check!("scheduler-bind", bound, 6);
 
@@ -366,7 +374,12 @@ mod runtime {
 
         // scheduler_rr 仍 Ready（resolve 会做 provider 存活二次校验）。
         let rr_ready = unsafe {
-            interface_available(b"scheduler".as_ptr(), b"scheduler".len(), KIND_POLICY, 1) == 1
+            interface_available(
+                b"scheduler".as_ptr(),
+                b"scheduler".len(),
+                KIND_POLICY,
+                SCHEDULER_POLICY_ABI,
+            ) == 1
         };
         check!("scheduler-rr", rr_ready && rr_id >= 0, 9);
 

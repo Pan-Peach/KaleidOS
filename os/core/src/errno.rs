@@ -108,7 +108,7 @@ impl From<InterfaceError> for Errno {
             InterfaceError::ProviderNotReady => Errno::EAGAIN,
             InterfaceError::UnknownInterface => Errno::ENOENT,
             InterfaceError::KindMismatch => Errno::EINVAL,
-            InterfaceError::VersionMismatch => Errno::EINVAL,
+            InterfaceError::AbiMismatch => Errno::EINVAL,
             InterfaceError::Unbound => Errno::ENOENT,
             InterfaceError::BindingNotFound => Errno::ENOENT,
             InterfaceError::IdExhausted => Errno::EOVERFLOW,
@@ -128,6 +128,7 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::StartFailed => Errno::EIO,
             ComponentLoadError::InitFailed(_) => Errno::EIO,
             ComponentLoadError::InitPanicked => Errno::EIO,
+            ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
         }
     }

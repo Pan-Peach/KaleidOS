@@ -3,17 +3,16 @@
 //! 现行状态机（实现即契约，见 docs/component-model.md §5 全量生命周期）：
 //!
 //! ```text
-//! Declared --resolve--> Resolved --start--> Ready
+//! Declared --resolve--> Resolved --begin_start--> Starting --finish_start--> Ready
 //!     any state --mark_failed--> Failed   （恢复 = 全新实例）
 //!     any state --unload--> 记录移除       （phase 1 不回收放段内存）
 //! ```
 //!
-//! `Resolved` = 所有 required Interfaces 都已成功绑定（本轮先把状态与转换落地；
-//! 真实绑定逻辑见 `component/interface.rs`——有 requires 的组件在 resolve 阶段
-//! 逐条 publish/resolve，全部成功才允许进入 Resolved）。`Starting` 属于文档
-//! 声明的全量生命周期词汇表，但当前同步 start 不会经过它；若未来
-//! ComponentManager 引入异步初始化，再把 `Resolved -> Starting -> Ready` 接上。
-//! 非法转换返回 Err（Core 验证后才提交状态，Policy proposes 原则）。
+//! `Resolved` = 所有 required Interfaces 都已找到 provider。`Starting` =
+//! 正在执行 `kcomp_init()`（此期间 `kcore_interface_publish` 只记录 pending，
+//! 不修改 active binding）。`finish_start` 由 Core 在 `kcomp_init()` 返回 0 且
+//! pending interfaces 原子提交后调用（见 `component/interface.rs`）。非法转换
+//! 返回 Err（Core 验证后才提交状态，Policy proposes 原则）。
 //! id 单调递增、不回收：组件实例 = 身份——unload 后重载同组件是新实例（新 id），
 //! 失败恢复=全新实例（component-model.md）。
 
@@ -105,10 +104,23 @@ impl Registry {
         Ok(())
     }
 
-    /// Resolved → Ready（依赖已绑定，组件可以启动）。
-    pub fn start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+    /// Resolved → Starting：开始执行 `kcomp_init()`。
+    /// `Starting` 期间组件可以 publish 接口（记录为 pending）与创建任务；
+    /// 只有 `finish_start`（或失败路径）能离开该状态。
+    pub fn begin_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         let rec = self.record_mut(id)?;
         if rec.state != ComponentState::Resolved {
+            return Err(RegistryError::InvalidTransition);
+        }
+        rec.state = ComponentState::Starting;
+        Ok(())
+    }
+
+    /// Starting → Ready：`kcomp_init()` 返回 0 且 pending interfaces 已提交，
+    /// 组件可以对外提供 Interface。
+    pub fn finish_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let rec = self.record_mut(id)?;
+        if rec.state != ComponentState::Starting {
             return Err(RegistryError::InvalidTransition);
         }
         rec.state = ComponentState::Ready;
@@ -212,20 +224,39 @@ mod tests {
     }
 
     #[test]
-    fn start_transitions_resolved_to_ready() {
+    fn begin_start_transitions_resolved_to_starting() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.resolve(id).unwrap();
-        reg.start(id).unwrap();
+        reg.begin_start(id).unwrap();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
+    }
+
+    #[test]
+    fn finish_start_transitions_starting_to_ready() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
     }
 
     #[test]
-    fn start_from_declared_without_resolve_is_invalid() {
-        // Declared --start--> Ready 的硬编码已被拆开：必须先 resolve。
+    fn finish_start_without_begin_start_is_invalid() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
-        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        reg.resolve(id).unwrap();
+        assert_eq!(reg.finish_start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
+    }
+
+    #[test]
+    fn begin_start_from_declared_without_resolve_is_invalid() {
+        // Declared --begin_start--> Starting 的硬编码已被拆开：必须先 resolve。
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
     }
 
@@ -239,19 +270,20 @@ mod tests {
     }
 
     #[test]
-    fn start_twice_is_invalid_transition() {
+    fn begin_start_twice_is_invalid_transition() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.resolve(id).unwrap();
-        reg.start(id).unwrap();
-        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        reg.begin_start(id).unwrap();
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
     }
 
     #[test]
-    fn start_undeclared_is_not_found() {
+    fn begin_start_undeclared_is_not_found() {
         let mut reg = r();
         let ghost = ComponentId::from_raw(99);
-        assert_eq!(reg.start(ghost), Err(RegistryError::NotFound));
+        assert_eq!(reg.begin_start(ghost), Err(RegistryError::NotFound));
     }
 
     #[test]
@@ -275,7 +307,7 @@ mod tests {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.resolve(id).unwrap();
-        reg.start(id).unwrap();
+        reg.begin_start(id).unwrap();
         reg.mark_failed(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
     }
@@ -333,18 +365,19 @@ mod tests {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.resolve(id).unwrap();
-        reg.start(id).unwrap();
-        // Ready 再 start：拒绝，且状态保持 Ready
-        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        // Ready 再 begin_start：拒绝，且状态保持 Ready
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
     }
 
     #[test]
-    fn start_after_failed_is_invalid_and_keeps_failed() {
+    fn begin_start_after_failed_is_invalid_and_keeps_failed() {
         let mut reg = r();
         let id = reg.declare(b"x", 1, 2, None).unwrap();
         reg.mark_failed(id).unwrap();
-        assert_eq!(reg.start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
     }
 

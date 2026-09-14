@@ -21,7 +21,7 @@
 //! 决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
 //! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
 
-use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
+use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, containment, registry};
 use crate::irq::IrqSaveGuard;
@@ -32,15 +32,24 @@ use alloc::vec::Vec;
 use arch::{ContextImpl, CpuArch, CpuImpl};
 use spin::{Mutex, Once};
 
-/// SchedulerPolicy v1 vtable（与组件 scheduler_rr 重复定义——A/B 双侧 ABI
-/// 契约，见 docs/component-model.md；组件替换 = 换 provider 实现同一 vtable）。
+/// SchedulerPolicy 的 function table（与组件 scheduler_rr 重复定义——A/B 双侧
+/// ABI 契约，见 docs/component-model.md；组件替换 = 换 provider 实现同一 layout）。
+///
+/// `api` 指向本 struct；`ctx`（provider opaque state）由 Core 从 binding 单独取出
+/// 后原样传入 `choose_next`，**不再放在 vtable 内**。
 #[repr(C)]
 pub struct SchedulerPolicyV1 {
-    pub version: u32,
-    pub ctx: *mut (),
     pub choose_next:
         extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
 }
+
+/// SchedulerPolicy 的 exact ABI fingerprint。provider 与 consumer 必须使用完全
+/// 相同的值（不一致 → `bind` 拒绝）。
+///
+/// TODO(service-abi): 未来由 `kcomp-sdk` 统一定义具体 Service contract 的
+/// fingerprint；当前为占位值。组件侧镜像定义见
+/// `kcomp-sdk::binding::SCHEDULER_POLICY_ABI`（A/B 双侧手工锚定）。
+pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_4845_4455_4C52);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedError {
@@ -97,20 +106,20 @@ fn collect_runnable() -> Vec<TaskId> {
         .collect()
 }
 
-/// 解析绑定的 SchedulerPolicy v1。锁序 registry → interfaces（与 publish
-/// 路径一致，见 component/load.rs）。
-fn resolve_policy() -> Result<(ComponentId, *mut ()), SchedError> {
+/// 解析绑定的 SchedulerPolicy。锁序 registry → interfaces（与 publish
+/// 路径一致，见 component/load.rs）。返回 provider + `api`/`ctx`（Core 不解引用）。
+fn resolve_policy() -> Result<(ComponentId, *const (), *mut ()), SchedError> {
     let reg = registry::get_registry().lock();
     let ifs = get_interfaces().lock();
     let view = ifs
-        .resolve(
+        .bind(
             &reg,
             b"scheduler",
             InterfaceKind::Policy,
-            InterfaceVersion::from_raw(1),
+            SCHEDULER_POLICY_ABI,
         )
         .map_err(|_| SchedError::NoPolicy)?;
-    Ok((view.provider, view.context))
+    Ok((view.provider, view.api, view.ctx))
 }
 
 /// 请求策略提议下一个任务。返回 None = 没有可运行任务（回锚点）。
@@ -122,17 +131,13 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
     if runnable.is_empty() {
         return Ok(None);
     }
-    let (provider, context) = resolve_policy()?;
-    // SAFETY: context 由 publish 写入（组件的静态 vtable），provider Ready
-    // 校验已在 resolve 内完成；vtable 在其组件存活期内有效。
-    let vtable = unsafe { &*(context as *const SchedulerPolicyV1) };
+    let (provider, api, ctx) = resolve_policy()?;
+    // SAFETY: api 由 provider 的 staged publish 写入（组件的静态 function table），
+    // provider Ready 与 exact ABI 校验已在 bind 内完成；table 在其组件存活期内有效。
+    let vtable = unsafe { &*(api as *const SchedulerPolicyV1) };
     let ids: Vec<u32> = runnable.iter().map(|id| id.raw()).collect();
     let current = cpu().lock().current.map_or(u32::MAX, |id| id.raw());
-    let proposed = if vtable.version == 1 {
-        (vtable.choose_next)(vtable.ctx, ids.as_ptr(), ids.len(), current)
-    } else {
-        u32::MAX // 版本不符 → 必不合法，走回退
-    };
+    let proposed = (vtable.choose_next)(ctx, ids.as_ptr(), ids.len(), current);
 
     let proposed = TaskId::from_raw(proposed);
     if runnable.contains(&proposed) {
@@ -350,35 +355,36 @@ mod tests {
             999
         }
         let vtable = SchedulerPolicyV1 {
-            version: 1,
-            ctx: ptr::null_mut(),
             choose_next: bad_choose,
         };
         let provider = reg.declare(b"scheduler_bad", ENTRY, ENTRY, None).unwrap();
         reg.resolve(provider).unwrap();
-        reg.start(provider).unwrap();
-        ifs.publish(
+        reg.begin_start(provider).unwrap();
+        ifs.stage_publish(
             &reg,
             provider,
             b"scheduler",
             InterfaceKind::Policy,
-            InterfaceVersion::from_raw(1),
-            &vtable as *const SchedulerPolicyV1 as *mut (),
+            SCHEDULER_POLICY_ABI,
+            &vtable as *const SchedulerPolicyV1 as *const (),
+            ptr::null_mut(),
         )
         .unwrap();
+        ifs.commit_pending(&reg, provider).unwrap();
+        reg.finish_start(provider).unwrap();
 
         // 走 resolve_policy 的局部版本：直接对局部 registry 解析（不碰全局）。
         let view = ifs
-            .resolve(
+            .bind(
                 &reg,
                 b"scheduler",
                 InterfaceKind::Policy,
-                InterfaceVersion::from_raw(1),
+                SCHEDULER_POLICY_ABI,
             )
             .unwrap();
-        let vtable = unsafe { &*(view.context as *const SchedulerPolicyV1) };
+        let vtable = unsafe { &*(view.api as *const SchedulerPolicyV1) };
         let ids: Vec<u32> = vec![a.raw(), b.raw()];
-        let proposed = (vtable.choose_next)(vtable.ctx, ids.as_ptr(), ids.len(), u32::MAX);
+        let proposed = (vtable.choose_next)(view.ctx, ids.as_ptr(), ids.len(), u32::MAX);
         let proposed = TaskId::from_raw(proposed);
         assert_eq!(
             proposed,

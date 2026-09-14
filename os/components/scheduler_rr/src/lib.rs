@@ -5,15 +5,15 @@
 //! 提议下一个 TaskId。**提议**是否被采纳由 Core 验证后决定——本组件永远
 //! 拿不到任务表、状态或任何 Core truth 的写权限。
 //!
-//! 接口发布：`kcomp_init` 里 `kcore_interface_publish("scheduler", Policy, v1,
-//! &VTABLE)`；provider 身份由 Core 从 call_init 上下文解析（组件不自报 id）。
-//! 消费方（Core 调度 commit 路径）按名字 resolve，替换本组件 = 换 provider，
-//! consumer 无需重编译。
+//! 接口发布：`kcomp_init` 里经 `kcomp_sdk::binding::publish("scheduler", Policy,
+//! SCHEDULER_POLICY_ABI, &VTABLE, ctx)`；provider 身份由 Core 从 call_init 上下文
+//! 解析（组件不自报 id）。发布是 **staged**：init 期间 Core 只记 pending，init
+//! 返回 0 后才提交。消费方按名字 bind 并 exact-compare ABI fingerprint；替换本
+//! 组件 = 换 provider，consumer 无需重编译。
 
 #![no_std]
 
-// 组件私有 panic adapter（kcomp-sdk）：只提供裸机 #[panic_handler]；本组件的
-// 白名单 ABI 声明保留在此（未被引用的符号由 GC 丢弃）。
+// 组件私有 panic adapter（kcomp-sdk）：提供裸机 #[panic_handler] 与 binding wrapper。
 use kcomp_sdk as _;
 
 #[cfg(test)]
@@ -21,17 +21,16 @@ extern crate std;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// SchedulerPolicy v1 vtable（与 Core `sched::SchedulerPolicyV1` 布局一致——
-/// A/B 双侧 ABI 契约；改动 = 破坏性变更，双侧同步 bump）。
+/// SchedulerPolicy function table（与 Core `sched::SchedulerPolicyV1` 布局一致——
+/// A/B 双侧 ABI 契约；改动 = 破坏性变更，双侧同步）。`ctx` 由 Core 从 binding
+/// 单独持有并回传，不在 table 内。
 #[repr(C)]
 pub struct SchedulerPolicyV1 {
-    pub version: u32,
-    pub ctx: *mut (),
     pub choose_next:
         extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
 }
 
-// vtable 是只读契约，指针只被 Core 读取（provider 存活期内有效）。
+// function table 是只读契约，指针只被 Core 读取（provider 存活期内有效）。
 unsafe impl Sync for SchedulerPolicyV1 {}
 
 /// RR cursor：指向 runnable 列表中的下一个槽位（跨调用保持，轮转推进）。
@@ -55,50 +54,31 @@ extern "C" fn rr_choose_next(
     unsafe { *runnable.add(slot) }
 }
 
-/// 发布的 vtable（发布后由 Core 保存 context 指针）。
+/// 发布的 function table（发布后由 Core 保存 api 指针 + ctx）。
 static VTABLE: SchedulerPolicyV1 = SchedulerPolicyV1 {
-    version: 1,
-    ctx: core::ptr::null_mut(),
     choose_next: rr_choose_next,
 };
 
-// 白名单 ABI（与 kernel `export.rs` 一一对应；C ABI 声明即契约）。
-unsafe extern "C" {
-    #[link_name = "kcore_interface_publish"]
-    fn interface_publish(
-        name: *const u8,
-        len: usize,
-        kind: u32,
-        version: u32,
-        context: *mut (),
-    ) -> i32;
-    #[link_name = "kcore_log_line"]
-    fn log_line(ptr: *const u8, len: usize) -> i32;
-}
-
-/// InterfaceKind 的 ABI 编码（与 Core 一致）：2 = Policy。
-const KIND_POLICY: u32 = 2;
-
-/// 组件入口（Linux module_init 约定）：发布 SchedulerPolicy v1。
+/// 组件入口（Linux module_init 约定）：发布 SchedulerPolicy。
 /// 0 = 成功；非 0 = 发布失败（provider 状态/接口名冲突等由 Core 拒绝）。
 #[unsafe(no_mangle)]
 pub extern "C" fn kcomp_init() -> i32 {
-    let binding = unsafe {
-        interface_publish(
-            b"scheduler".as_ptr(),
-            b"scheduler".len(),
-            KIND_POLICY,
-            1,
-            &VTABLE as *const SchedulerPolicyV1 as *mut (),
+    use kcomp_sdk::binding;
+    // SAFETY: `VTABLE` 是 'static 的 #[repr(C)] function table；ctx 为 null
+    // （RR 策略状态在组件静态 CURSOR 内，function table 无需 opaque state）。
+    let published = unsafe {
+        binding::publish(
+            b"scheduler",
+            binding::InterfaceKind::Policy,
+            binding::SCHEDULER_POLICY_ABI,
+            &VTABLE as *const SchedulerPolicyV1 as *const (),
+            core::ptr::null_mut(),
         )
     };
-    if binding < 0 {
+    if published.is_err() {
         return -1;
     }
-    const MSG: &[u8] = b"scheduler_rr: policy published";
-    unsafe {
-        log_line(MSG.as_ptr(), MSG.len());
-    }
+    kcomp_sdk::klog!("scheduler_rr: policy published");
     0
 }
 

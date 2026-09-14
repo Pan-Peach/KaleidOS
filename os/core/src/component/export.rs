@@ -15,7 +15,7 @@
 //! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
-//! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份） |
+//! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份）。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_init` 期间只记录 pending（staged），init 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
@@ -74,7 +74,7 @@
 //! 严格匹配，违反 = UB（与 C `malloc/free` 错配同类）。组件失败后的泄漏在 phase 1
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
-use crate::component::interface::{InterfaceKind, InterfaceVersion, get_interfaces};
+use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
 use crate::handle::{RequestContext, dma, irq, mmio};
@@ -253,15 +253,24 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
     }
 }
 
-/// 发布接口。provider = 当前正在初始化的组件（Core 记录，**不信任组件自报
-/// 身份**）。返回 BindingId raw（≥ 0）/ `-Errno`（`EINVAL` 名字/kind 非法；
-/// `EPERM` 不在组件 init 上下文；其余见 `Errno::from(InterfaceError)`）。
+/// 发布接口（**staged**：`kcomp_init` 期间只记录 pending，不修改 active binding）。
+/// provider = 当前正在初始化的组件（Core 记录，**不信任组件自报身份**）。
+///
+/// `abi` 是 exact ABI fingerprint（`u64`，无版本兼容语义）：provider 与 consumer
+/// 必须由完全相同的 Service ABI contract 编译。`api` 指向 provider 的 `#[repr(C)]`
+/// function table，`ctx` 是 provider opaque state；Core 只存指针、永不解引用。
+///
+/// `kcomp_init` 返回 0 后 Core 原子提交该组件的 pending interfaces；ABI 冲突的
+/// replacement 在提交时被拒绝。因此本函数返回 `0` 只表示"已记录 pending"。
+/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在组件 init 上下文；
+/// 其余见 `Errno::from(InterfaceError)`）。
 extern "C" fn kcore_interface_publish(
     name_ptr: *const u8,
     name_len: usize,
     kind: u32,
-    version: u32,
-    context: *mut (),
+    abi: u64,
+    api: *const (),
+    ctx: *mut (),
 ) -> i32 {
     let Some(name) = checked_name(name_ptr, name_len) else {
         return Errno::EINVAL.code();
@@ -274,34 +283,116 @@ extern "C" fn kcore_interface_publish(
     };
     let reg = registry::get_registry().lock();
     let mut ifs = get_interfaces().lock();
-    match ifs.publish(
+    match ifs.stage_publish(
         &reg,
         provider,
         name,
         kind,
-        InterfaceVersion::from_raw(version),
-        context,
+        InterfaceAbi::from_raw(abi),
+        api,
+        ctx,
     ) {
-        Ok(binding) => binding.raw() as i32,
+        Ok(()) => 0,
         Err(error) => Errno::from(error).code(),
     }
 }
 
-/// 只读查询：`(name, kind, version)` 是否已绑定且 provider 存活（Ready）。
-/// 1 = 可用（可 resolve），0 = 不可用。
+/// 只读查询：`(name, kind, abi)` 是否已绑定且 provider 存活（Ready）。
+/// 1 = 可用（可 bind），0 = 不可用。
 extern "C" fn kcore_interface_available(
     name_ptr: *const u8,
     name_len: usize,
     kind: u32,
-    version: u32,
+    abi: u64,
 ) -> i32 {
     let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind)) else {
         return 0;
     };
     let reg = registry::get_registry().lock();
     let ifs = get_interfaces().lock();
-    ifs.resolve(&reg, name, kind, InterfaceVersion::from_raw(version))
+    ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi))
         .is_ok() as i32
+}
+
+/// consumer 按名 bind：Core 查找接口 → exact-compare ABI fingerprint → 验证当前
+/// provider 存在且 Ready → 返回稳定 `BindingId` + 当前 `api/ctx/generation`。
+///
+/// 成功 = 0，`*out_binding`（`u64`）、`*out_api` / `*out_ctx`（指针宽 `usize`）、
+/// `*out_generation`（`u64`）写入（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` 任一 out 为空 / `EINVAL` 名字/kind 非法 /
+/// `ENOENT` 接口未知·Unbound / ABI mismatch 等见 `Errno::from(InterfaceError)`）。
+#[allow(clippy::too_many_arguments)]
+extern "C" fn kcore_interface_bind(
+    name_ptr: *const u8,
+    name_len: usize,
+    kind: u32,
+    abi: u64,
+    out_binding: *mut u64,
+    out_api: *mut usize,
+    out_ctx: *mut usize,
+    out_generation: *mut u64,
+) -> i32 {
+    if out_binding.is_null() || out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind)) else {
+        return Errno::EINVAL.code();
+    };
+    let reg = registry::get_registry().lock();
+    let ifs = get_interfaces().lock();
+    match ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi)) {
+        Ok(view) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe {
+                core::ptr::write_unaligned(out_binding, view.id.raw() as u64);
+                core::ptr::write_unaligned(out_api, view.api as usize);
+                core::ptr::write_unaligned(out_ctx, view.ctx as usize);
+                core::ptr::write_unaligned(out_generation, view.generation);
+            }
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// consumer 用已有 `BindingId` refresh：exact-compare 期望 ABI → 重新验证 provider →
+/// 返回最新 `api/ctx/generation`（provider 替换后无需 ELF reload）。
+///
+/// 成功 = 0，三个 out 写入（调用方保证可写，任意对齐）；失败 = `-Errno`
+/// （`EFAULT` 任一 out 为空 / ABI mismatch / Unbound / BindingNotFound）。
+extern "C" fn kcore_interface_refresh(
+    binding: u64,
+    abi: u64,
+    out_api: *mut usize,
+    out_ctx: *mut usize,
+    out_generation: *mut u64,
+) -> i32 {
+    if out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
+        return Errno::EFAULT.code();
+    }
+    // `binding` 是 u64 ABI 宽度；BindingId 是 u32。超范围直接拒绝（不得截断后
+    // 命中一个无关的槽）。
+    let Ok(binding) = u32::try_from(binding) else {
+        return Errno::ENOENT.code();
+    };
+    let reg = registry::get_registry().lock();
+    let ifs = get_interfaces().lock();
+    match ifs.refresh(
+        &reg,
+        crate::component::interface::BindingId::from_raw(binding),
+        InterfaceAbi::from_raw(abi),
+    ) {
+        Ok(view) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe {
+                core::ptr::write_unaligned(out_api, view.api as usize);
+                core::ptr::write_unaligned(out_ctx, view.ctx as usize);
+                core::ptr::write_unaligned(out_generation, view.generation);
+            }
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +826,7 @@ extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 34] = [
+static EXPORTS: [Export; 36] = [
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -792,6 +883,14 @@ static EXPORTS: [Export; 34] = [
     Export {
         name: b"kcore_interface_available",
         address: ExportAddress(kcore_interface_available as *const ()),
+    },
+    Export {
+        name: b"kcore_interface_bind",
+        address: ExportAddress(kcore_interface_bind as *const ()),
+    },
+    Export {
+        name: b"kcore_interface_refresh",
+        address: ExportAddress(kcore_interface_refresh as *const ()),
     },
     // Category 6：Task control（v2）
     Export {
@@ -915,6 +1014,8 @@ mod tests {
             &b"kcore_component_load"[..],
             &b"kcore_interface_publish"[..],
             &b"kcore_interface_available"[..],
+            &b"kcore_interface_bind"[..],
+            &b"kcore_interface_refresh"[..],
             &b"kcore_task_create"[..],
             &b"kcore_task_start"[..],
             &b"kcore_task_yield"[..],
@@ -1062,6 +1163,107 @@ mod tests {
         // DMA release 同形：host 无 caller → EPERM（不是 panic）
         let _dma_release: extern "C" fn(u64) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_dma_release").unwrap()) };
+    }
+
+    /// 接口 ABI（exact fingerprint）：bind/refresh 的早期错误约定
+    /// （`EFAULT` out 为空 / `EINVAL` 名字非法），host 可在不触碰 registry 前断言。
+    #[test]
+    fn interface_bind_and_refresh_reject_null_outputs() {
+        let bind = resolve(b"kcore_interface_bind").unwrap();
+        let bind: extern "C" fn(
+            *const u8,
+            usize,
+            u32,
+            u64,
+            *mut u64,
+            *mut usize,
+            *mut usize,
+            *mut u64,
+        ) -> i32 = unsafe { core::mem::transmute(bind) };
+        let (mut b, mut api, mut ctx, mut generation) = (0u64, 0usize, 0usize, 0u64);
+        // 任一 out 为空 → EFAULT（早于 registry 解析）
+        assert_eq!(
+            bind(
+                b"x".as_ptr(),
+                1,
+                1,
+                0,
+                core::ptr::null_mut(),
+                &mut api,
+                &mut ctx,
+                &mut generation
+            ),
+            -14
+        );
+        assert_eq!(
+            bind(
+                b"x".as_ptr(),
+                1,
+                1,
+                0,
+                &mut b,
+                core::ptr::null_mut(),
+                &mut ctx,
+                &mut generation
+            ),
+            -14
+        );
+        assert_eq!(
+            bind(
+                b"x".as_ptr(),
+                1,
+                1,
+                0,
+                &mut b,
+                &mut api,
+                core::ptr::null_mut(),
+                &mut generation
+            ),
+            -14
+        );
+        assert_eq!(
+            bind(
+                b"x".as_ptr(),
+                1,
+                1,
+                0,
+                &mut b,
+                &mut api,
+                &mut ctx,
+                core::ptr::null_mut()
+            ),
+            -14
+        );
+        // 名字非法 → EINVAL（早于 registry 解析）
+        assert_eq!(
+            bind(
+                core::ptr::null(),
+                0,
+                1,
+                0,
+                &mut b,
+                &mut api,
+                &mut ctx,
+                &mut generation
+            ),
+            -22
+        );
+
+        let refresh = resolve(b"kcore_interface_refresh").unwrap();
+        let refresh: extern "C" fn(u64, u64, *mut usize, *mut usize, *mut u64) -> i32 =
+            unsafe { core::mem::transmute(refresh) };
+        assert_eq!(
+            refresh(0, 0, core::ptr::null_mut(), &mut ctx, &mut generation),
+            -14
+        );
+        assert_eq!(
+            refresh(0, 0, &mut api, core::ptr::null_mut(), &mut generation),
+            -14
+        );
+        assert_eq!(
+            refresh(0, 0, &mut api, &mut ctx, core::ptr::null_mut()),
+            -14
+        );
     }
 
     #[test]

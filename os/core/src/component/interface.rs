@@ -3,43 +3,65 @@
 //! # 规则（本轮定案）
 //!
 //! ```text
-//! Component → Core    = Core Export ABI（component/export.rs，ELF undefined symbol）
-//! Component → Component = Interface binding（本模块）——禁止 flat ELF symbol 互链
+//! Component → Core       = Core Export ABI（component/export.rs，ELF undefined symbol）
+//! Component → Component  = Interface binding（本模块）——禁止 flat ELF symbol 互链
 //! ```
 //!
-//! 组件替换的成立条件：consumer 拿的是**逻辑 binding**（`BindingView`），不是
-//! "永不变更的 provider ELF 符号地址"。provider 换成新实现时，consumer 只需
-//! 重新 `resolve_by_id` 拿新 `context`，**不需要 ELF reload**。
+//! 组件替换的成立条件：consumer 拿的是**逻辑 binding**（`BindingId` + 当前
+//! `api/ctx/generation`），不是"永不变更的 provider ELF 符号地址"。provider
+//! 换成新实现时，consumer 只需 `refresh` 拿新 `api/ctx`，**不需要 ELF reload**。
 //!
 //! # 数据模型
 //!
 //! - `InterfaceId`：Core 分配的接口身份（每个唯一接口名一条记录）。
 //! - `BindingId`：一次 publish 产生的绑定槽；unbind/rebind **不失效**——
 //!   unbind 只清 provider，槽位保留（consumer 持有的 id 继续有效）。
-//! - `InterfaceKind`：Device / Service / Policy（复用文档 §2 的分类）。
+//! - `InterfaceAbi`：**exact ABI fingerprint**（`#[repr(transparent)] u64`）。
+//!   它没有"版本兼容"语义，只回答一个问题：provider 与 consumer 是否由完全
+//!   相同的 Service ABI contract 编译？不一致必须拒绝 binding/replacement。
+//!   **绝不允许把布局不同的 function table 交给 consumer。**
 //! - provider state：`provider: Option<ComponentId>`（None ⇔ Unbound）。
-//! - `context: *mut ()`：provider 提供的 opaque 函数表/上下文。阶段一
-//!   KernelNative 用 versioned function table（`#[repr(C)]` vtable，见下方示例）；
-//!   未来可换 IPC stub / Wasm host call —— **binding 不含传输假设**。
+//! - `api: *const ()`：provider 提供的 `#[repr(C)]` function table（opaque）。
+//! - `ctx: *mut ()`：provider opaque state/context（opaque）。
+//! - `generation: u64`：每次成功 commit 新 provider 时前进一次。
+//!
+//! **Core 永远不解引用 `api` / `ctx`**：function table 的内容由 provider 与
+//! consumer 共享的 SDK contract 决定，Core 只存取指针。
 //!
 //! # 阶段一调用方式（KernelNative，direct call）
 //!
 //! ```rust
 //! #[repr(C)]
-//! struct SampleServiceV1 {
-//!     abi_version: u32,
-//!     ctx: *mut (),
-//!     do_thing: extern "C" fn(*mut (), u32) -> u32,
+//! struct SampleService {
+//!     do_thing: extern "C" fn(ctx: *mut (), u32) -> u32,
 //! }
-//! // consumer: let view = interfaces.resolve(&reg, b"sample", Kind::Service, Ver(1))?;
-//! //           let vtable = unsafe { &*(view.context.cast::<SampleServiceV1>()) };
+//! // consumer: let view = interfaces.bind(&reg, b"sample", Kind::Service, ABI)?;
+//! //           let vtable = unsafe { &*(view.api.cast::<SampleService>()) };
+//! //           (vtable.do_thing)(view.ctx, 5);
 //! ```
 //!
-//! # 下一阶段（seam）
+//! # Staged publish（`Declared → Resolved → Starting → Ready`）
 //!
-//! - compatible range（major/minor 版本区间）替代 exact match；
-//! - 组件失败/卸载时 Core 自动 `unbind_provider`（本轮提供原语，接线留给
-//!   ComponentManager）；
+//! `kcomp_init()` 执行期间调用 publish **不会立即修改 active binding**：它记录为
+//! 该组件的 pending publication。Core 在 `kcomp_init()` 返回 0 后**原子提交**
+//! 该组件的 pending interfaces（见 [`InterfaceRegistry::commit_pending`]）：
+//!
+//! - interface 不存在 → 新建 binding（generation = 1）；
+//! - 已存在且 ABI fingerprint 相同 → 保留原 `BindingId`，替换 provider/api/ctx，
+//!   `generation += 1`（hot replacement 的全部范围）；
+//! - 已存在但 ABI fingerprint 不同 → **拒绝 replacement**（当前阶段）。
+//!
+//! init 失败或 panic：丢弃该组件全部 pending，旧 active provider **完全不受影响**
+//! （见 [`InterfaceRegistry::discard_pending`] / `failure::fail_component`）。
+//!
+//! # 下一阶段（seam / TODO）
+//!
+//! - ABI fingerprint 的**具体定义**（类型布局 → 稳定 u64）未来在 `kcomp-sdk`
+//!   统一生成；Core 不做 ABI hash / proc macro，只保留 u64 机制。
+//! - compatible range（major/minor 版本区间）替代 exact match：本轮不做。
+//! - 组件失败/卸载时 Core 自动 unbind（本轮提供原语并已接线 fail_component）。
+//! - dependency graph / requires manifest / ABI-changing coordinated update /
+//!   automatic consumer reload / multi-version ABI：全部 deferred（仅此文件保留 seam）。
 //! - 传输升级（IPC / Wasm host call）不改 binding 数据模型。
 
 use alloc::vec::Vec;
@@ -56,16 +78,24 @@ pub enum InterfaceKind {
     Policy,
 }
 
-/// 接口版本（阶段一 exact match；compatible range 留下一阶段）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InterfaceVersion(u32);
+/// Exact ABI fingerprint（`#[repr(transparent)]`，无版本兼容语义）。
+///
+/// 只回答："provider 与 consumer 是否由**完全相同**的 Service ABI contract
+/// 编译？" 不一致 → `InterfaceError::AbiMismatch` → 拒绝 binding/replacement。
+///
+/// TODO(service-abi): 具体 Service contract 的 fingerprint 未来在 `kcomp-sdk`
+/// 统一定义（例如由 contract 布局经稳定哈希生成）；当前阶段 Core 只提供 u64
+/// 机制与 seam，不实现 ABI hash 生成器或 proc macro。
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterfaceAbi(u64);
 
-impl InterfaceVersion {
-    pub const fn from_raw(raw: u32) -> Self {
+impl InterfaceAbi {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub const fn raw(self) -> u32 {
+    pub const fn raw(self) -> u64 {
         self.0
     }
 }
@@ -98,27 +128,34 @@ impl BindingId {
     }
 }
 
-/// 一次 resolve 返回的逻辑 binding 视图（Copy，无借用）。
-/// consumer 把 `context` cast 成自己声明的 vtable 布局。
+/// 一次 `bind` / `refresh` 返回的逻辑 binding 视图（Copy，无借用）。
+/// consumer 把 `api` cast 成自己声明的 `#[repr(C)]` function table，并把
+/// `ctx` 作为 opaque state 传入。
 #[derive(Debug, Clone, Copy)]
 pub struct BindingView {
     pub id: BindingId,
     pub interface: InterfaceId,
-    pub version: InterfaceVersion,
+    pub abi: InterfaceAbi,
     pub provider: ComponentId,
-    /// opaque provider 函数表/上下文指针；消费方按接口契约 cast。
-    /// 该指针的生命周期：provider Ready 期间有效；unbind/组件失败后必须
-    /// 视为悬垂——consumer 应通过 `resolve_by_id` 重新获取。
-    pub context: *mut (),
+    /// provider 的 `#[repr(C)]` function table 指针；消费方按接口契约 cast。
+    /// 生命周期：provider Ready 期间有效；unbind/组件失败后必须视为悬垂——
+    /// consumer 应通过 `refresh` 重新获取。
+    pub api: *const (),
+    /// provider opaque state/context；由 consumer 原样传给 function table。
+    pub ctx: *mut (),
+    /// provider commit 计数（每次成功替换 +1）。
+    pub generation: u64,
 }
 
 impl PartialEq for BindingView {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && self.interface == other.interface
-            && self.version == other.version
+            && self.abi == other.abi
             && self.provider == other.provider
-            && core::ptr::eq(self.context, other.context)
+            && core::ptr::eq(self.api, other.api)
+            && core::ptr::eq(self.ctx, other.ctx)
+            && self.generation == other.generation
     }
 }
 
@@ -126,19 +163,19 @@ impl PartialEq for BindingView {
 pub enum InterfaceError {
     /// publish：provider 不在组件注册表。
     ProviderNotFound,
-    /// publish：provider 未进入 Ready（只能由已就绪组件提供接口）。
+    /// publish：provider 不在可初始化状态（`Starting` / `Ready` 之外）。
     ProviderNotReady,
-    /// resolve：接口名未知。
+    /// bind：接口名未知。
     UnknownInterface,
-    /// resolve：同接口名已用不同 kind 发布（一个名字一个 kind）。
+    /// bind / commit：同接口名已用不同 kind 发布（一个名字一个 kind）。
     KindMismatch,
-    /// resolve：版本不匹配（阶段一 exact match）。
-    VersionMismatch,
-    /// resolve：绑定槽存在但 provider 已 unbind。
+    /// bind / refresh / commit：ABI fingerprint 不一致（exact match 失败）。
+    AbiMismatch,
+    /// bind：绑定槽存在但 provider 已 unbind。
     Unbound,
-    /// resolve_by_id：无效槽 id。
+    /// refresh：无效槽 id。
     BindingNotFound,
-    /// InterfaceId 空间耗尽（u32 单调递增）。
+    /// InterfaceId / BindingId 空间耗尽（u32 单调递增）。
     IdExhausted,
 }
 
@@ -149,25 +186,40 @@ struct InterfaceRecord {
     kind: InterfaceKind,
 }
 
-/// 一个绑定槽：interface + 当前 provider/版本/上下文。
+/// 一个绑定槽：interface + 当前 provider / ABI / function table / context / generation。
 /// `provider == None` ⇔ Unbound（槽保留，供重绑，binding id 不失效）。
 struct BindingRecord {
     interface_id: InterfaceId,
-    version: InterfaceVersion,
+    abi: InterfaceAbi,
     provider: Option<ComponentId>,
-    context: *mut (),
+    api: *const (),
+    ctx: *mut (),
+    generation: u64,
 }
 
-// `context` 是 opaque provider 句柄：Registry 只存取、永不解引用。
+/// `kcomp_init` 期间记录的一次待提交发布（staged publish）。
+struct PendingPublication {
+    component: ComponentId,
+    name: Vec<u8>,
+    kind: InterfaceKind,
+    abi: InterfaceAbi,
+    api: *const (),
+    ctx: *mut (),
+}
+
+// `api` / `ctx` 是 opaque provider 指针：Registry 只存取、永不解引用。
 // Send/Sync 安全（与 export.rs 的 ExportAddress 同一理由；跨线程使用由
 // 外层 Mutex 串行化）。
 unsafe impl Send for BindingRecord {}
 unsafe impl Sync for BindingRecord {}
+unsafe impl Send for PendingPublication {}
+unsafe impl Sync for PendingPublication {}
 
 /// 组件→组件 依赖的 Core 真相：谁提供了什么接口、当前绑到谁。
 pub struct InterfaceRegistry {
     interfaces: Vec<InterfaceRecord>,
     bindings: Vec<BindingRecord>,
+    pending: Vec<PendingPublication>,
     next_interface_id: u32,
 }
 
@@ -176,36 +228,111 @@ impl InterfaceRegistry {
         Self {
             interfaces: Vec::new(),
             bindings: Vec::new(),
+            pending: Vec::new(),
             next_interface_id: 1,
         }
     }
 
-    /// 发布/提供接口。Core 校验：provider 必须存在且处于 Ready。
-    /// 同接口名再次 publish = 重绑（新 provider/版本/上下文），
-    /// 已有 binding 槽复用 → consumer 的 `BindingId` 不变（无需 reload）。
-    pub fn publish(
+    /// **Staged publish**：记录一条 pending publication，不修改 active binding。
+    ///
+    /// 由 `kcore_interface_publish` 在 `kcomp_init()` 执行期间调用（provider 此时
+    /// 处于 `Starting`）。Core 校验 provider 存在且处于可初始化状态，但**不**
+    /// 在此刻提交——提交由 [`Self::commit_pending`] 在 init 成功后完成。
+    ///
+    /// 返回 `Ok(())` 只表示"已记录 pending"；真正的接口身份/ABI 冲突在 commit
+    /// 阶段统一判定（原子语义）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_publish(
         &mut self,
         components: &Registry,
         provider: ComponentId,
         name: &[u8],
         kind: InterfaceKind,
-        version: InterfaceVersion,
-        context: *mut (),
-    ) -> Result<BindingId, InterfaceError> {
+        abi: InterfaceAbi,
+        api: *const (),
+        ctx: *mut (),
+    ) -> Result<(), InterfaceError> {
         let rec = components
             .get(provider)
             .ok_or(InterfaceError::ProviderNotFound)?;
-        if rec.state != ComponentState::Ready {
+        // `Starting` = 正在 call_init；`Ready` 允许未来 monitor 驱动的重发布。
+        if !matches!(rec.state, ComponentState::Starting | ComponentState::Ready) {
             return Err(InterfaceError::ProviderNotReady);
         }
+        self.pending.push(PendingPublication {
+            component: provider,
+            name: name.to_vec(),
+            kind,
+            abi,
+            api,
+            ctx,
+        });
+        Ok(())
+    }
 
-        let interface_id = match self.interfaces.iter().find(|r| r.name == name) {
-            Some(record) => {
-                if record.kind != kind {
+    /// 提交某组件的全部 pending publications（`kcomp_init()` 返回 0 后由 Core 调用）。
+    ///
+    /// **原子语义**：先整体校验该组件的 pending（kind / ABI 冲突），任一失败则
+    /// 丢弃该组件全部 pending 并返回 `Err`——旧 active binding 完全不受影响；
+    /// 校验通过后一次性应用（hot replacement 规则见模块文档）。
+    pub fn commit_pending(
+        &mut self,
+        components: &Registry,
+        component: ComponentId,
+    ) -> Result<(), InterfaceError> {
+        // 仅取出该组件的 pending（其它组件的 pending 原样保留）。
+        let mut staging = Vec::new();
+        self.pending.retain(|p| {
+            if p.component == component {
+                staging.push(PendingPublication {
+                    component: p.component,
+                    name: p.name.clone(),
+                    kind: p.kind,
+                    abi: p.abi,
+                    api: p.api,
+                    ctx: p.ctx,
+                });
+                false
+            } else {
+                true
+            }
+        });
+
+        if components.get(component).is_none() {
+            return Err(InterfaceError::ProviderNotFound);
+        }
+
+        // 校验阶段：任一冲突 → 全部丢弃（staging 随作用域结束被 drop）。
+        for p in &staging {
+            if let Some(iface) = self.interfaces.iter().find(|r| r.name == p.name) {
+                if iface.kind != p.kind {
                     return Err(InterfaceError::KindMismatch);
                 }
-                record.id
+                if let Some(binding) = self.bindings.iter().find(|b| b.interface_id == iface.id)
+                    && binding.abi != p.abi
+                {
+                    return Err(InterfaceError::AbiMismatch);
+                }
             }
+        }
+
+        // 应用阶段：接口已存在且 ABI 相同 → 保留 BindingId、generation += 1。
+        for p in staging {
+            self.apply_publish(p)?;
+        }
+        Ok(())
+    }
+
+    /// 丢弃某组件的全部 pending publications（init 失败 / panic 路径）。
+    /// 旧 active binding 完全不受影响。
+    pub fn discard_pending(&mut self, component: ComponentId) {
+        self.pending.retain(|p| p.component != component);
+    }
+
+    /// 应用一条已校验的 pending publication。
+    fn apply_publish(&mut self, p: PendingPublication) -> Result<(), InterfaceError> {
+        let interface_id = match self.interfaces.iter().find(|r| r.name == p.name) {
+            Some(record) => record.id,
             None => {
                 let id = InterfaceId::from_raw(self.next_interface_id);
                 self.next_interface_id = self
@@ -214,49 +341,49 @@ impl InterfaceRegistry {
                     .ok_or(InterfaceError::IdExhausted)?;
                 self.interfaces.push(InterfaceRecord {
                     id,
-                    name: name.to_vec(),
-                    kind,
+                    name: p.name,
+                    kind: p.kind,
                 });
                 id
             }
         };
 
-        // 复用已有绑定槽（重绑），否则新建。
-        let index = self
+        match self
             .bindings
             .iter()
-            .position(|b| b.interface_id == interface_id);
-        let binding_id = match index {
+            .position(|b| b.interface_id == interface_id)
+        {
             Some(i) => {
-                self.bindings[i].provider = Some(provider);
-                self.bindings[i].version = version;
-                self.bindings[i].context = context;
-                BindingId::from_raw(u32::try_from(i).map_err(|_| InterfaceError::IdExhausted)?)
+                // 同 ABI replacement：保留 BindingId（槽位），推进 generation。
+                let binding = &mut self.bindings[i];
+                binding.abi = p.abi;
+                binding.provider = Some(p.component);
+                binding.api = p.api;
+                binding.ctx = p.ctx;
+                binding.generation = binding.generation.wrapping_add(1);
             }
             None => {
-                let id = BindingId::from_raw(
-                    u32::try_from(self.bindings.len()).map_err(|_| InterfaceError::IdExhausted)?,
-                );
                 self.bindings.push(BindingRecord {
                     interface_id,
-                    version,
-                    provider: Some(provider),
-                    context,
+                    abi: p.abi,
+                    provider: Some(p.component),
+                    api: p.api,
+                    ctx: p.ctx,
+                    generation: 1,
                 });
-                id
             }
-        };
-        Ok(binding_id)
+        }
+        Ok(())
     }
 
-    /// 按名解析 + 获取逻辑 binding。Core 再次验证 provider 仍存活
-    /// （存在且 Ready）——组件卸载后 binding 立即不可用，不留给 consumer 悬垂调用。
-    pub fn resolve(
+    /// consumer 按名 bind：查找接口 → exact-compare ABI fingerprint → 验证当前
+    /// provider 存活（存在且 Ready）→ 返回稳定 `BindingId` + 当前 `api/ctx/generation`。
+    pub fn bind(
         &self,
         components: &Registry,
         name: &[u8],
         kind: InterfaceKind,
-        version: InterfaceVersion,
+        abi: InterfaceAbi,
     ) -> Result<BindingView, InterfaceError> {
         let interface = self
             .interfaces
@@ -271,28 +398,37 @@ impl InterfaceRegistry {
             .iter()
             .position(|b| b.interface_id == interface.id)
             .ok_or(InterfaceError::Unbound)?;
-        if self.bindings[index].version != version {
-            return Err(InterfaceError::VersionMismatch);
+        if self.bindings[index].abi != abi {
+            return Err(InterfaceError::AbiMismatch);
         }
         self.view_of(components, index)
     }
 
-    /// 按槽 id 重新获取 binding（provider 替换后 consumer 无需 ELF reload）。
-    /// 版本由消费方从返回视图自行校验兼容性。
-    pub fn resolve_by_id(
+    /// consumer 用已有 `BindingId` refresh：exact-compare 期望 ABI → 重新验证
+    /// provider → 返回最新 `api/ctx/generation`（provider 替换后无需 ELF reload）。
+    pub fn refresh(
         &self,
         components: &Registry,
         id: BindingId,
+        abi: InterfaceAbi,
     ) -> Result<BindingView, InterfaceError> {
-        if id.raw() as usize >= self.bindings.len() {
-            return Err(InterfaceError::BindingNotFound);
+        let index = id.raw() as usize;
+        let binding = self
+            .bindings
+            .get(index)
+            .ok_or(InterfaceError::BindingNotFound)?;
+        if binding.abi != abi {
+            return Err(InterfaceError::AbiMismatch);
         }
-        self.view_of(components, id.raw() as usize)
+        self.view_of(components, index)
     }
 
     /// 生成视图，并做 provider 存活二次校验（Core 验证后才交付）。
     fn view_of(&self, components: &Registry, index: usize) -> Result<BindingView, InterfaceError> {
-        let binding = &self.bindings[index];
+        let binding = self
+            .bindings
+            .get(index)
+            .ok_or(InterfaceError::BindingNotFound)?;
         let provider = binding.provider.ok_or(InterfaceError::Unbound)?;
         // 存活二次校验：provider 必须仍在组件注册表且处于 Ready。
         // （组件卸载/失败后，binding 立即不可用，不留给 consumer 悬垂调用。）
@@ -310,9 +446,11 @@ impl InterfaceRegistry {
         Ok(BindingView {
             id: BindingId::from_raw(u32::try_from(index).map_err(|_| InterfaceError::IdExhausted)?),
             interface: interface.id,
-            version: binding.version,
+            abi: binding.abi,
             provider,
-            context: binding.context,
+            api: binding.api,
+            ctx: binding.ctx,
+            generation: binding.generation,
         })
     }
 
@@ -324,17 +462,18 @@ impl InterfaceRegistry {
             .get_mut(id.raw() as usize)
             .ok_or(InterfaceError::BindingNotFound)?;
         binding.provider = None;
-        binding.context = core::ptr::null_mut();
+        binding.api = core::ptr::null();
+        binding.ctx = core::ptr::null_mut();
         Ok(())
     }
 
-    /// 解除某 provider 的全部绑定（组件失败/卸载时由 Core 调用；接线留给
-    /// ComponentManager，本轮提供原语）。
+    /// 解除某 provider 的全部绑定（组件失败/卸载时由 Core 调用）。
     pub fn unbind_provider(&mut self, provider: ComponentId) {
         for binding in &mut self.bindings {
             if binding.provider == Some(provider) {
                 binding.provider = None;
-                binding.context = core::ptr::null_mut();
+                binding.api = core::ptr::null();
+                binding.ctx = core::ptr::null_mut();
             }
         }
     }
@@ -375,13 +514,53 @@ mod tests {
     use super::*;
     use crate::component::registry::Registry;
 
-    const V1: InterfaceVersion = InterfaceVersion::from_raw(1);
-    const V2: InterfaceVersion = InterfaceVersion::from_raw(2);
+    const ABI_A: InterfaceAbi = InterfaceAbi::from_raw(0xAAAA_0001);
+    const ABI_B: InterfaceAbi = InterfaceAbi::from_raw(0xBBBB_0002);
 
-    /// 测试用 context：真实局部地址（区分 provider 即可，生命周期限测试函数内）。
+    /// 测试用 dummy `#[repr(C)]` function table（不实现任何真实 Service）。
+    /// `api` 指向这块 table（不是函数本身）；`ctx` 单独由 Core 交付。
+    #[repr(C)]
+    struct SampleService {
+        do_thing: extern "C" fn(ctx: *mut (), input: u32) -> u32,
+    }
+
+    unsafe impl Sync for SampleService {}
+
+    static SAMPLE_TABLE: SampleService = SampleService {
+        do_thing: sample_impl,
+    };
+
+    extern "C" fn sample_impl(ctx: *mut (), input: u32) -> u32 {
+        // provider 侧实现：ctx 指向一个计数器
+        let counter = unsafe { &mut *(ctx as *mut u32) };
+        *counter = counter.wrapping_add(input);
+        *counter
+    }
+
+    /// 真实局部地址（区分 provider 即可，生命周期限测试函数内）。
     fn ctx(n: u32) -> *mut () {
         let mut slot = n;
         &mut slot as *mut u32 as *mut ()
+    }
+
+    fn api() -> *const () {
+        &SAMPLE_TABLE as *const SampleService as *const ()
+    }
+
+    /// 发布一个接口并提交（provider 已 Ready），返回当前 BindingId。
+    fn publish_ready(
+        reg: &Registry,
+        ifs: &mut InterfaceRegistry,
+        provider: ComponentId,
+        name: &[u8],
+        kind: InterfaceKind,
+        abi: InterfaceAbi,
+        ctx: *mut (),
+    ) -> BindingId {
+        ifs.stage_publish(reg, provider, name, kind, abi, api(), ctx)
+            .unwrap();
+        ifs.commit_pending(reg, provider).unwrap();
+        ifs.bind(reg, name, kind, abi).unwrap().id
     }
 
     /// 构造注册表并声明两个 Ready 组件（provider_a / provider_b / consumer）。
@@ -391,43 +570,57 @@ mod tests {
         for name in [&b"provider_a"[..], &b"provider_b"[..], &b"consumer"[..]] {
             let id = reg.declare(name, 1, 2, None).unwrap();
             reg.resolve(id).unwrap();
-            reg.start(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
             ids.push(id);
         }
         (reg, ids)
     }
 
-    // -- 1. provider publish -----------------------------------------------
+    // -- 1. staged publish + commit ----------------------------------------
 
     #[test]
-    fn publish_and_resolve_roundtrip() {
+    fn staged_publish_does_not_touch_active_binding_until_commit() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        let ctx = 0x1234usize as *mut ();
-        let binding = interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx)
+        let mut ifs = InterfaceRegistry::new();
+        ifs.stage_publish(
+            &reg,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            api(),
+            ctx(1),
+        )
+        .unwrap();
+        // 尚未 commit：接口不可见（不会交出半成品 vtable）。
+        assert_eq!(
+            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_A),
+            Err(InterfaceError::UnknownInterface)
+        );
+        assert_eq!(ifs.binding_count(), 0);
+        ifs.commit_pending(&reg, ids[0]).unwrap();
+        let view = ifs
+            .bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
             .unwrap();
-
-        let view = interfaces
-            .resolve(&reg, b"sample", InterfaceKind::Service, V1)
-            .unwrap();
-        assert_eq!(view.id, binding);
         assert_eq!(view.provider, ids[0]);
-        assert_eq!(view.version, V1);
-        assert_eq!(view.context, ctx);
+        assert_eq!(view.api, api());
+        assert_eq!(view.ctx, ctx(1));
+        assert_eq!(view.generation, 1, "首次 commit = generation 1");
     }
 
     #[test]
-    fn publish_rejects_unknown_provider() {
+    fn stage_publish_rejects_unknown_provider() {
         let (reg, _ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
+        let mut ifs = InterfaceRegistry::new();
         assert_eq!(
-            interfaces.publish(
+            ifs.stage_publish(
                 &reg,
                 ComponentId::from_raw(99),
                 b"sample",
                 InterfaceKind::Service,
-                V1,
+                ABI_A,
+                core::ptr::null(),
                 core::ptr::null_mut(),
             ),
             Err(InterfaceError::ProviderNotFound)
@@ -435,18 +628,19 @@ mod tests {
     }
 
     #[test]
-    fn publish_rejects_non_ready_provider() {
+    fn stage_publish_rejects_non_starting_provider() {
         let mut reg = Registry::new();
         let declared = reg.declare(b"not_ready", 1, 2, None).unwrap();
-        // 不 resolve/start：保持 Declared
-        let mut interfaces = InterfaceRegistry::new();
+        // 不 resolve/begin_start：保持 Declared
+        let mut ifs = InterfaceRegistry::new();
         assert_eq!(
-            interfaces.publish(
+            ifs.stage_publish(
                 &reg,
                 declared,
                 b"sample",
                 InterfaceKind::Service,
-                V1,
+                ABI_A,
+                core::ptr::null(),
                 core::ptr::null_mut(),
             ),
             Err(InterfaceError::ProviderNotReady)
@@ -454,68 +648,119 @@ mod tests {
     }
 
     #[test]
-    fn same_name_different_kind_is_rejected() {
+    fn same_name_different_kind_is_rejected_at_commit() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx(1))
-            .unwrap();
+        let mut ifs = InterfaceRegistry::new();
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        // provider_b 以不同 kind 发布同名接口 → commit 拒绝。
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"sample",
+            InterfaceKind::Device,
+            ABI_A,
+            api(),
+            ctx(2),
+        )
+        .unwrap();
         assert_eq!(
-            interfaces.publish(&reg, ids[0], b"sample", InterfaceKind::Device, V1, ctx(2)),
+            ifs.commit_pending(&reg, ids[1]),
             Err(InterfaceError::KindMismatch)
         );
     }
 
-    // -- 2. consumer resolve + 3. version mismatch --------------------------
+    // -- 2. consumer bind + ABI mismatch -----------------------------------
 
     #[test]
-    fn resolve_unknown_interface_is_rejected() {
+    fn bind_unknown_interface_is_rejected() {
         let (reg, _ids) = ready_world();
-        let interfaces = InterfaceRegistry::new();
+        let ifs = InterfaceRegistry::new();
         assert_eq!(
-            interfaces.resolve(&reg, b"nope", InterfaceKind::Service, V1),
+            ifs.bind(&reg, b"nope", InterfaceKind::Service, ABI_A),
             Err(InterfaceError::UnknownInterface)
         );
     }
 
     #[test]
-    fn resolve_version_mismatch_is_rejected() {
+    fn bind_abi_mismatch_is_rejected() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx(1))
-            .unwrap();
+        let mut ifs = InterfaceRegistry::new();
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
         assert_eq!(
-            interfaces.resolve(&reg, b"sample", InterfaceKind::Service, V2),
-            Err(InterfaceError::VersionMismatch)
+            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_B),
+            Err(InterfaceError::AbiMismatch)
         );
     }
 
-    // -- 4. unbind 后 binding 不可用 ---------------------------------------
+    #[test]
+    fn bind_returns_current_api_ctx_and_generation() {
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        let view = ifs
+            .bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
+            .unwrap();
+        assert_eq!(view.id, binding);
+        assert_eq!(view.api, api());
+        assert_eq!(view.ctx, ctx(1));
+        assert_eq!(view.generation, 1);
+    }
+
+    // -- 3. unbind 后 binding 不可用 ---------------------------------------
 
     #[test]
     fn unbind_makes_binding_unavailable() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        let binding = interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx(1))
-            .unwrap();
-        interfaces.unbind(binding).unwrap();
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        ifs.unbind(binding).unwrap();
         assert_eq!(
-            interfaces.resolve(&reg, b"sample", InterfaceKind::Service, V1),
+            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_A),
             Err(InterfaceError::Unbound)
         );
         assert_eq!(
-            interfaces.resolve_by_id(&reg, binding),
+            ifs.refresh(&reg, binding, ABI_A),
             Err(InterfaceError::Unbound)
         );
     }
 
     #[test]
     fn unbind_unknown_binding_is_not_found() {
-        let mut interfaces = InterfaceRegistry::new();
+        let mut ifs = InterfaceRegistry::new();
         assert_eq!(
-            interfaces.unbind(BindingId::from_raw(7)),
+            ifs.unbind(BindingId::from_raw(7)),
             Err(InterfaceError::BindingNotFound)
         );
     }
@@ -523,125 +768,280 @@ mod tests {
     #[test]
     fn unbind_provider_revokes_all_its_bindings() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        interfaces
-            .publish(&reg, ids[0], b"svc_a", InterfaceKind::Service, V1, ctx(1))
-            .unwrap();
-        interfaces
-            .publish(&reg, ids[0], b"svc_b", InterfaceKind::Service, V1, ctx(2))
-            .unwrap();
-        interfaces.unbind_provider(ids[0]);
-        assert_eq!(interfaces.binding_count(), 2, "槽保留");
+        let mut ifs = InterfaceRegistry::new();
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"svc_a",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"svc_b",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(2),
+        );
+        ifs.unbind_provider(ids[0]);
+        assert_eq!(ifs.binding_count(), 2, "槽保留");
         assert_eq!(
-            interfaces.resolve(&reg, b"svc_a", InterfaceKind::Service, V1),
+            ifs.bind(&reg, b"svc_a", InterfaceKind::Service, ABI_A),
             Err(InterfaceError::Unbound)
         );
         assert_eq!(
-            interfaces.resolve(&reg, b"svc_b", InterfaceKind::Service, V1),
+            ifs.bind(&reg, b"svc_b", InterfaceKind::Service, ABI_A),
             Err(InterfaceError::Unbound)
         );
         // 其他 provider 的绑定不受影响
-        interfaces
-            .publish(&reg, ids[1], b"svc_a", InterfaceKind::Service, V1, ctx(3))
-            .unwrap();
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"svc_a",
+            InterfaceKind::Service,
+            ABI_A,
+            api(),
+            ctx(3),
+        )
+        .unwrap();
+        ifs.commit_pending(&reg, ids[1]).unwrap();
         assert!(
-            interfaces
-                .resolve(&reg, b"svc_a", InterfaceKind::Service, V1)
+            ifs.bind(&reg, b"svc_a", InterfaceKind::Service, ABI_A)
                 .is_ok()
         );
     }
 
-    // -- 5. 重绑新 provider：consumer 不需要 ELF reload ----------------------
+    // -- 4. hot replacement：同 ABI 保留 BindingId + generation 前进 ----------
 
     #[test]
-    fn rebind_new_provider_keeps_consumer_binding_id() {
+    fn same_abi_replacement_keeps_binding_id_and_advances_generation() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        let binding = interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx(1))
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        let first = ifs
+            .bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
             .unwrap();
+        assert_eq!(first.generation, 1);
 
-        // provider_a 卸载 → Core 解绑
-        interfaces.unbind(binding).unwrap();
+        // provider_a 卸载 → Core 解绑；provider_b 以同 ABI 重发布。
+        ifs.unbind_provider(ids[0]);
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            api(),
+            ctx(2),
+        )
+        .unwrap();
+        ifs.commit_pending(&reg, ids[1]).unwrap();
 
-        // provider_b 重绑同一接口（新版本、新上下文）
-        let rebound = interfaces
-            .publish(&reg, ids[1], b"sample", InterfaceKind::Service, V2, ctx(2))
-            .unwrap();
-        assert_eq!(rebound, binding, "槽复用：consumer 持有的 id 不变");
-
-        // consumer 用旧 id 重新获取 → 拿到新 provider 的上下文（无 ELF reload）
-        let view = interfaces.resolve_by_id(&reg, binding).unwrap();
+        // consumer 用旧 id refresh → 拿到新 provider 的 api/ctx，BindingId 不变。
+        let view = ifs.refresh(&reg, binding, ABI_A).unwrap();
+        assert_eq!(view.id, binding, "槽复用：consumer 持有的 id 不变");
         assert_eq!(view.provider, ids[1]);
-        assert_eq!(view.version, V2);
-        assert_eq!(view.context, ctx(2));
-    }
-
-    // -- 6. 极小 vtable 接口：逻辑 binding 全链路 ---------------------------
-
-    /// 测试用极小接口（示例性 vtable 布局，`#[repr(C)]`，versioned）。
-    #[repr(C)]
-    struct SampleServiceV1 {
-        abi_version: u32,
-        ctx: *mut (),
-        do_thing: extern "C" fn(*mut (), u32) -> u32,
-    }
-
-    extern "C" fn sample_impl(ctx: *mut (), input: u32) -> u32 {
-        // provider 侧实现：ctx 指向一个计数器
-        let counter = unsafe { &mut *(ctx as *mut u32) };
-        *counter = counter.wrapping_add(input);
-        *counter
+        assert_eq!(view.ctx, ctx(2));
+        assert_eq!(view.generation, 2, "replacement 后 generation 前进");
     }
 
     #[test]
-    fn consumer_calls_through_logical_binding_vtable() {
+    fn abi_mismatch_replacement_is_rejected_and_old_binding_survives() {
         let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        let mut counter = 10u32;
-        let vtable = SampleServiceV1 {
-            abi_version: 1,
-            ctx: &mut counter as *mut u32 as *mut (),
-            do_thing: sample_impl,
-        };
-        let binding = interfaces
-            .publish(
-                &reg,
-                ids[0],
-                b"sample",
-                InterfaceKind::Service,
-                V1,
-                (&vtable as *const SampleServiceV1).cast_mut().cast(),
-            )
-            .unwrap();
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
 
-        let view = interfaces
-            .resolve(&reg, b"sample", InterfaceKind::Service, V1)
+        // provider_b 用不同 ABI 尝试替换 → commit 拒绝，旧 binding 原样。
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_B,
+            api(),
+            ctx(2),
+        )
+        .unwrap();
+        assert_eq!(
+            ifs.commit_pending(&reg, ids[1]),
+            Err(InterfaceError::AbiMismatch)
+        );
+
+        let view = ifs.refresh(&reg, binding, ABI_A).unwrap();
+        assert_eq!(view.provider, ids[0], "旧 provider 不受影响");
+        assert_eq!(view.ctx, ctx(1), "旧 ctx 不受影响");
+        assert_eq!(view.generation, 1, "generation 不前进");
+    }
+
+    #[test]
+    fn refresh_abi_mismatch_is_rejected() {
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        assert_eq!(
+            ifs.refresh(&reg, binding, ABI_B),
+            Err(InterfaceError::AbiMismatch)
+        );
+    }
+
+    // -- 5. provider failure / init failure 隔离 ----------------------------
+
+    #[test]
+    fn discard_pending_leaves_old_binding_uncontaminated() {
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+
+        // provider_b init 中途失败：pending 被丢弃，旧 active binding 完全不受影响。
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            api(),
+            ctx(2),
+        )
+        .unwrap();
+        ifs.discard_pending(ids[1]);
+
+        let view = ifs.refresh(&reg, binding, ABI_A).unwrap();
+        assert_eq!(view.provider, ids[0]);
+        assert_eq!(view.ctx, ctx(1));
+        assert_eq!(view.generation, 1);
+    }
+
+    #[test]
+    fn commit_conflict_discards_all_pending_for_component() {
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+
+        // 同一组件两条 pending：一条合法新接口、一条 ABI 冲突 → 全部丢弃。
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"brand_new",
+            InterfaceKind::Service,
+            ABI_A,
+            api(),
+            ctx(2),
+        )
+        .unwrap();
+        ifs.stage_publish(
+            &reg,
+            ids[1],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_B,
+            api(),
+            ctx(3),
+        )
+        .unwrap();
+        assert_eq!(
+            ifs.commit_pending(&reg, ids[1]),
+            Err(InterfaceError::AbiMismatch)
+        );
+        // 合法的那条也被原子丢弃：新接口不存在。
+        assert_eq!(
+            ifs.bind(&reg, b"brand_new", InterfaceKind::Service, ABI_A),
+            Err(InterfaceError::UnknownInterface)
+        );
+    }
+
+    #[test]
+    fn provider_liveness_revalidated_on_bind() {
+        let (mut reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            ctx(1),
+        );
+        // provider 被卸载（从组件注册表移除）→ bind 必须拒绝
+        reg.unload(ids[0]).unwrap();
+        assert_eq!(
+            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_A),
+            Err(InterfaceError::ProviderNotFound)
+        );
+    }
+
+    // -- 6. 极小 function table：逻辑 binding 全链路 ------------------------
+
+    #[test]
+    fn consumer_calls_through_logical_binding_function_table() {
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        let mut counter = 10u32;
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            ids[0],
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            &mut counter as *mut u32 as *mut (),
+        );
+
+        let view = ifs
+            .bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
             .unwrap();
         assert_eq!(view.id, binding);
-        // consumer 把 opaque context cast 回自己声明的 vtable 布局并调用
-        let got = unsafe { &*(view.context.cast::<SampleServiceV1>()) };
-        assert_eq!(got.abi_version, 1);
-        let result = (got.do_thing)(got.ctx, 5);
+        // consumer 把 opaque api cast 回自己声明的 function table 布局并调用。
+        let vtable = unsafe { &*(view.api.cast::<SampleService>()) };
+        let result = (vtable.do_thing)(view.ctx, 5);
         assert_eq!(
             result, 15,
             "direct call 通过逻辑 binding 抵达 provider 实现"
         );
-    }
-
-    #[test]
-    fn provider_liveness_revalidated_on_resolve() {
-        let (reg, ids) = ready_world();
-        let mut interfaces = InterfaceRegistry::new();
-        interfaces
-            .publish(&reg, ids[0], b"sample", InterfaceKind::Service, V1, ctx(1))
-            .unwrap();
-        // provider 被卸载（从组件注册表移除）→ resolve 必须拒绝
-        let mut reg = reg;
-        reg.unload(ids[0]).unwrap();
-        assert_eq!(
-            interfaces.resolve(&reg, b"sample", InterfaceKind::Service, V1),
-            Err(InterfaceError::ProviderNotFound)
-        );
+        assert_eq!(view.generation, 1);
     }
 }

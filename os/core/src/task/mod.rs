@@ -44,7 +44,8 @@ pub fn current_owner() -> Option<ComponentId> {
 /// Core 语义入口：创建任务（组件只能经 export ABI `kcore_task_create` 到达）。
 ///
 /// 验证（Core validates，组件只有提议权）：
-/// 1. `requester` 必须存在且处于 `Ready` —— 只有活着的组件能创建任务；
+/// 1. `requester` 必须存在且处于 `Ready`（运行中）或 `Starting`（`kcomp_init`
+///    执行期间，组件可以创建自己的任务）——只有活着的组件能创建任务；
 /// 2. `entry` 必须落在该组件的**装载镜像内**（`[base, base+size)`）——
 ///    组件不能把执行权指到任意内核地址，也不能指到别的组件的镜像。
 ///
@@ -60,7 +61,10 @@ pub fn create_task(requester: ComponentId, entry: usize) -> Result<TaskId, TaskE
     let record = registry
         .get(requester)
         .ok_or(TaskError::RequesterNotFound)?;
-    if record.state != ComponentState::Ready {
+    if !matches!(
+        record.state,
+        ComponentState::Starting | ComponentState::Ready
+    ) {
         return Err(TaskError::RequesterNotReady);
     }
     let Some(lease) = &record.memory else {
