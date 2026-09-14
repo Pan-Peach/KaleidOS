@@ -371,7 +371,12 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
                     let list = store.list();
                     match list {
                         Ok(entries) => {
-                            kernel::log!("store", "embedded kpkg: {} components", entries.len())
+                            // 只数组件：cpio 归档里还有 manifest 等元数据条目。
+                            let components = entries
+                                .iter()
+                                .filter(|entry| entry.name.ends_with(b".kcomp"))
+                                .count();
+                            kernel::log!("store", "embedded kpkg: {} components", components)
                         }
                         Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
                     }

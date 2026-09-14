@@ -2,7 +2,6 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use kcomp_sdk::{DmaDirection, abi};
 use virtio_drivers::{
@@ -11,7 +10,11 @@ use virtio_drivers::{
     transport::mmio::{MmioTransport, VirtIOHeader},
 };
 
-static MMIO_HANDLE: AtomicU64 = AtomicU64::new(0);
+// MMIO handle：驱动单任务运行（IRQ 走 polled），且 rv32 目标没有 64-bit
+// 原子（AtomicU64 在 riscv32imac 不存在）——用 UnsafeCell 存 u64，无新依赖。
+struct MmioHandle(UnsafeCell<u64>);
+unsafe impl Sync for MmioHandle {}
+static MMIO_HANDLE: MmioHandle = MmioHandle(UnsafeCell::new(0));
 
 // paddr -> DmaHandle. 驱动单任务运行，IRQ走polled，无需锁
 // 若将来有并发，再换成细粒度锁
@@ -61,7 +64,7 @@ unsafe impl Hal for CoreHal {
         let mut handle = 0u64;
         let rc = unsafe {
             abi::kcore_dma_alloc(
-                MMIO_HANDLE.load(Ordering::Relaxed),
+                *MMIO_HANDLE.0.get(),
                 size,
                 dir_enc(direction).as_i32(),
                 &mut handle,
@@ -110,7 +113,7 @@ kcomp_sdk::kcomp_init!({
         kcomp_sdk::klog!("claim mmio failed: {}", rc);
         return rc;
     }
-    MMIO_HANDLE.store(mmio, Ordering::Relaxed);
+    unsafe { *MMIO_HANDLE.0.get() = mmio; }
 
     // lease MMIO
     let (mut base, mut region) = (0usize, 0usize);

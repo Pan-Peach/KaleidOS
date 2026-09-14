@@ -55,7 +55,7 @@ tools/         工具脚本（待建设）
 
 **架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（2026-09，全部 QEMU 端到端验证，RV64 + RV32 双 profile）：
 
-- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/frame/tasks/load/components/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
+- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/tasks/load/components/catalog/shutdown/reboot`；行编辑支持光标移动/退格/Ctrl-U·K·W、8 条历史 ↑/↓、Tab 命令补全；空闲时不忙等——arm ~10ms one-shot timer 后 `wfi`，由时钟中断唤醒）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
 - **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
 - **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令
 - **导出白名单**（EXPORT_SYMBOL 教学版，一组 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询 + v2 语义入口——组件加载/接口发布/任务控制/调度 + C6 资源 authority `kcore_mmio_claim/read_u32/write_u32/release/lease` + `kcore_irq_claim/register/enable/register_polled/poll/ack` + DMA authority `kcore_dma_alloc/lease/release`，错误码统一 `0/-Errno`）：组件只能调白名单，未导出符号 → 加载失败

@@ -194,6 +194,21 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 let pkg =
                     unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
                 kernel::component::store::init(pkg);
+                if let Some(store) = kernel::component::store::get_component_store() {
+                    match store.list() {
+                        Ok(entries) => {
+                            // 只数组件：cpio 归档里还有 manifest 等元数据条目。
+                            let components = entries
+                                .iter()
+                                .filter(|entry| entry.name.ends_with(b".kcomp"))
+                                .count();
+                            kernel::log!("store", "embedded kpkg: {} components", components)
+                        }
+                        Err(error) => kernel::log!("store", "kpkg parse error: {:?}", error),
+                    }
+                } else {
+                    kernel::log!("store", "store: not initialized");
+                }
                 kernel::monitor::run();
             }
             Err(error) => panic!("core init failed: {}", error),

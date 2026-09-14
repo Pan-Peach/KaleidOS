@@ -3,6 +3,7 @@
 //! 全部只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
 
+use crate::component::load::ComponentLoadError;
 use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
@@ -31,7 +32,8 @@ pub fn machine(_line: &[u8]) {
     printk!("cpus: {}\n", info.cpu_count);
     for i in 0..info.cpu_count {
         let c = &info.cpu_info[i];
-        printk!("  hart{} boot={}\n", c.hart_id, c.boot_cpu);
+        // raw()：CpuId 的 Display 是 "CPU0"；这里要裸 hart 号（hart0）。
+        printk!("  hart{} boot={}\n", c.hart_id.raw(), c.boot_cpu);
     }
     printk!("memory regions: {}\n", info.mem_count);
     for i in 0..info.mem_count {
@@ -106,20 +108,22 @@ pub fn load(args: &[u8]) {
         printk!("usage: load <name>\n");
         return;
     }
-    match crate::component::load::load_and_start(name) {
+    let name = String::from_utf8_lossy(name);
+    match crate::component::load::load_and_start(name.as_bytes()) {
         Ok(id) => {
             let entry = crate::component::registry::get_registry()
                 .lock()
                 .get(id)
                 .map_or(0, |r| r.entry);
-            printk!(
-                "load {}: OK (id={}, entry={:#x})\n",
-                String::from_utf8_lossy(name),
-                id.raw(),
-                entry
-            );
+            printk!("load {}: OK (id={}, entry={:#x})\n", name, id.raw(), entry);
         }
-        Err(e) => printk!("load {}: {e:?}\n", String::from_utf8_lossy(name)),
+        Err(ComponentLoadError::DeclareFailed) => {
+            printk!("load {name}: already loaded\n");
+        }
+        Err(ComponentLoadError::NotFound) => {
+            printk!("load {name}: no such component\n");
+        }
+        Err(error) => printk!("load {name}: {error:?}\n"),
     }
 }
 
