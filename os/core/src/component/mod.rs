@@ -84,9 +84,43 @@ pub enum ComponentState {
     Failed,
 }
 
+impl ComponentState {
+    /// 合法生命周期转换的**唯一真相**（Core owns truth）。
+    ///
+    /// 非法转换返回 `false`；`Registry` 的唯一转换入口据此拒绝并保持原状态，
+    /// 各转换方法不再各自硬编码 `state != X`。转移表：
+    ///
+    /// ```text
+    /// Declared  → Resolved
+    /// Resolved  → Starting
+    /// Starting  → Ready
+    /// Ready     → Stopping
+    /// Stopping  → Stopped
+    /// 任意状态  → Failed          （逻辑死亡；含 Failed → Failed 幂等）
+    /// ```
+    ///
+    /// `Ready → Stopping → Stopped` 已在此声明为规则，但当前**没有任何生产路径
+    /// 驱动它们**（stop orchestration 仍 deferred；`Registry::begin_stop` /
+    /// `finish_stop` 是仅声明未接线的入口）。`Failed` 目标从任意状态均合法，
+    /// 保持 `mark_failed` 的既有语义（可重复标记、保持 `Failed`）。
+    pub const fn can_transition(self, to: Self) -> bool {
+        if matches!(to, Self::Failed) {
+            return true;
+        }
+        matches!(
+            (self, to),
+            (Self::Declared, Self::Resolved)
+                | (Self::Resolved, Self::Starting)
+                | (Self::Starting, Self::Ready)
+                | (Self::Ready, Self::Stopping)
+                | (Self::Stopping, Self::Stopped)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ComponentId;
+    use super::{ComponentId, ComponentState};
 
     #[test]
     fn ids_with_same_raw_are_equal() {
@@ -101,5 +135,51 @@ mod tests {
     #[test]
     fn raw_roundtrip() {
         assert_eq!(ComponentId::from_raw(17).raw(), 17);
+    }
+
+    #[test]
+    fn can_transition_matches_lifecycle_matrix() {
+        use ComponentState::{Declared, Failed, Ready, Resolved, Starting, Stopped, Stopping};
+
+        const STATES: [ComponentState; 7] = [
+            Declared, Resolved, Starting, Ready, Stopping, Stopped, Failed,
+        ];
+        // 唯一合法的非 Failed 边；`Failed` 目标对任意状态都合法（见实现文档）。
+        const LEGAL: [(ComponentState, ComponentState); 5] = [
+            (Declared, Resolved),
+            (Resolved, Starting),
+            (Starting, Ready),
+            (Ready, Stopping),
+            (Stopping, Stopped),
+        ];
+
+        for from in STATES {
+            for to in STATES {
+                let expected = LEGAL.contains(&(from, to)) || to == Failed;
+                assert_eq!(
+                    from.can_transition(to),
+                    expected,
+                    "{from:?} -> {to:?} legality"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_is_reachable_from_every_state_and_idempotent() {
+        for from in [
+            ComponentState::Declared,
+            ComponentState::Resolved,
+            ComponentState::Starting,
+            ComponentState::Ready,
+            ComponentState::Stopping,
+            ComponentState::Stopped,
+            ComponentState::Failed,
+        ] {
+            assert!(
+                from.can_transition(ComponentState::Failed),
+                "{from:?} -> Failed must be legal"
+            );
+        }
     }
 }

@@ -4,15 +4,20 @@
 //!
 //! ```text
 //! Declared --resolve--> Resolved --begin_start--> Starting --finish_start--> Ready
+//!     Ready --begin_stop--> Stopping --finish_stop--> Stopped   （stop 路径仅声明，未接线）
 //!     any state --mark_failed--> Failed   （恢复 = 全新实例）
 //!     any state --unload--> 记录移除       （phase 1 不回收放段内存）
 //! ```
 //!
+//! **合法转换的唯一真相是 [`ComponentState::can_transition`]**（Core owns truth）：
+//! 本模块所有转换方法都经私有 `transition` 收口，只做存在性检查 + 规则校验 + 提交，
+//! 不再各自硬编码 `state != X`。非法转换返回 Err（Core 验证后才提交状态，
+//! Policy proposes 原则）。
+//!
 //! `Resolved` = 所有 required Interfaces 都已找到 provider。`Starting` =
 //! 正在执行 `kcomp_init()`（此期间 `kcore_interface_publish` 只记录 pending，
 //! 不修改 active binding）。`finish_start` 由 Core 在 `kcomp_init()` 返回 0 且
-//! pending interfaces 原子提交后调用（见 `component/interface.rs`）。非法转换
-//! 返回 Err（Core 验证后才提交状态，Policy proposes 原则）。
+//! pending interfaces 原子提交后调用（见 `component/interface.rs`）。
 //! id 单调递增、不回收：组件实例 = 身份——unload 后重载同组件是新实例（新 id），
 //! 失败恢复=全新实例（component-model.md）。
 
@@ -120,41 +125,59 @@ impl Registry {
     /// Declared → Resolved：所有 required Interfaces 已成功绑定。
     /// 无 requires 的组件同样经过此步（vacuous truth：零依赖 = 已满足）。
     pub fn resolve(&mut self, id: ComponentId) -> Result<(), RegistryError> {
-        let rec = self.record_mut(id)?;
-        if rec.state != ComponentState::Declared {
-            return Err(RegistryError::InvalidTransition);
-        }
-        rec.state = ComponentState::Resolved;
-        Ok(())
+        self.transition(id, ComponentState::Resolved)
     }
 
     /// Resolved → Starting：开始执行 `kcomp_init()`。
     /// `Starting` 期间组件可以 publish 接口（记录为 pending）与创建任务；
     /// 只有 `finish_start`（或失败路径）能离开该状态。
     pub fn begin_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
-        let rec = self.record_mut(id)?;
-        if rec.state != ComponentState::Resolved {
-            return Err(RegistryError::InvalidTransition);
-        }
-        rec.state = ComponentState::Starting;
-        Ok(())
+        self.transition(id, ComponentState::Starting)
     }
 
     /// Starting → Ready：`kcomp_init()` 返回 0 且 pending interfaces 已提交，
     /// 组件可以对外提供 Interface。
     pub fn finish_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
-        let rec = self.record_mut(id)?;
-        if rec.state != ComponentState::Starting {
-            return Err(RegistryError::InvalidTransition);
-        }
-        rec.state = ComponentState::Ready;
-        Ok(())
+        self.transition(id, ComponentState::Ready)
+    }
+
+    /// Ready → Stopping：开始优雅停止。
+    ///
+    /// **仅声明转换，无生产调用方。** 合法边由 [`ComponentState::can_transition`]
+    /// 唯一定义；stop orchestration（调用 `kcomp_exit`、quiesce/drain、authority
+    /// 回收）尚未接线。
+    ///
+    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径驱动本方法，
+    /// 随后 `finish_stop`；当前停在声明层。
+    pub fn begin_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        self.transition(id, ComponentState::Stopping)
+    }
+
+    /// Stopping → Stopped：停止完成。
+    ///
+    /// **仅声明转换，无生产调用方**（见 [`Self::begin_stop`] 的
+    /// `TODO(component-exit)`）。
+    ///
+    /// TODO(component-exit): 未来 stop 路径在 `kcomp_exit` 返回、authority 回收后
+    /// 调用本方法；当前停在声明层。
+    pub fn finish_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        self.transition(id, ComponentState::Stopped)
     }
 
     /// 任意状态 → Failed（组件运行失败，Core 标记；恢复 = 全新实例）。
     pub fn mark_failed(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        self.transition(id, ComponentState::Failed)
+    }
+
+    /// 生命周期转换的**唯一收口**：存在性检查（NotFound）→ 规则校验
+    /// （[`ComponentState::can_transition`]）→ 提交。所有转换方法都经此，
+    /// 合法转换表只存在于一处。
+    fn transition(&mut self, id: ComponentId, to: ComponentState) -> Result<(), RegistryError> {
         let rec = self.record_mut(id)?;
-        rec.state = ComponentState::Failed;
+        if !rec.state.can_transition(to) {
+            return Err(RegistryError::InvalidTransition);
+        }
+        rec.state = to;
         Ok(())
     }
 
@@ -172,8 +195,8 @@ impl Registry {
     ///
     /// 只有活着的实例（`Starting` = `kcomp_init` 执行期、`Ready`）可以运行任务；
     /// `Failed`、`Stopping`、`Stopped` 实例的任务必须从 runnable 候选中剔除，并在
-    /// commit 前再次验证（`Stopping` / `Stopped` 当前是 shape-only stub，没有任何
-    /// 转换进入它们，但门禁语义已经正确）。
+    /// commit 前再次验证（`Stopping` / `Stopped` 的转换已由规则表声明，但当前没有
+    /// 生产路径驱动它们——stop orchestration deferred；门禁语义已经正确）。
     pub fn may_run(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))
@@ -239,6 +262,15 @@ mod tests {
 
     fn r() -> Registry {
         Registry::new()
+    }
+
+    /// 驱一个组件走完 init 路径到 `Ready`（stop 路径唯一合法的起点）。
+    fn ready(reg: &mut Registry) -> ComponentId {
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        id
     }
 
     #[test]
@@ -446,20 +478,69 @@ mod tests {
     fn may_run_excludes_stopping_stopped_and_failed() {
         // Given：一个 Ready 组件（唯一可运行任务的活状态）。
         let mut reg = r();
-        let id = reg.declare(b"x", 1, 2, None).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        reg.finish_start(id).unwrap();
+        let id = ready(&mut reg);
         assert!(reg.may_run(id), "Ready runs work");
 
-        // When / Then：Stopping / Stopped 是 shape-only stub（本增量没有任何
-        // 转换进入它们），直接写入状态以钉死门禁语义——只有活实例可运行任务。
-        reg.record_mut(id).unwrap().state = ComponentState::Stopping;
+        // When / Then：stop 路径上的状态（经规则表驱动）同样不得运行任务。
+        reg.begin_stop(id).unwrap();
         assert!(!reg.may_run(id), "Stopping must not run work");
-        reg.record_mut(id).unwrap().state = ComponentState::Stopped;
+        reg.finish_stop(id).unwrap();
         assert!(!reg.may_run(id), "Stopped must not run work");
-        reg.record_mut(id).unwrap().state = ComponentState::Failed;
+        reg.mark_failed(id).unwrap();
         assert!(!reg.may_run(id), "Failed must not run work");
+    }
+
+    #[test]
+    fn begin_stop_and_finish_stop_drive_ready_to_stopped() {
+        // Given：一个 Ready 组件。
+        let mut reg = r();
+        let id = ready(&mut reg);
+
+        // When / Then：Ready → Stopping → Stopped 由规则表放行。
+        reg.begin_stop(id).unwrap();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopping);
+        reg.finish_stop(id).unwrap();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopped);
+    }
+
+    #[test]
+    fn begin_stop_is_only_legal_from_ready() {
+        let mut reg = r();
+        let id = reg.declare(b"x", 1, 2, None).unwrap();
+        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
+        reg.resolve(id).unwrap();
+        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
+        reg.begin_start(id).unwrap();
+        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
+    }
+
+    #[test]
+    fn finish_stop_without_begin_stop_is_invalid() {
+        let mut reg = r();
+        let id = ready(&mut reg);
+        assert_eq!(reg.finish_stop(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
+    }
+
+    #[test]
+    fn stopping_may_transition_to_failed() {
+        let mut reg = r();
+        let id = ready(&mut reg);
+        reg.begin_stop(id).unwrap();
+        reg.mark_failed(id).unwrap();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
+    }
+
+    #[test]
+    fn stopped_cannot_restart() {
+        let mut reg = r();
+        let id = ready(&mut reg);
+        reg.begin_stop(id).unwrap();
+        reg.finish_stop(id).unwrap();
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopped);
     }
 
     #[test]
