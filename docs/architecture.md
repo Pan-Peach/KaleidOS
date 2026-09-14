@@ -262,15 +262,16 @@ arch/backend 内部。具体映射、撤销和地址空间激活接口随实现�
 Rust trait-object ABI、`fmt::Arguments`、`PanicInfo`、allocator 内部结构、
 Rust enum layout、编译器私有 runtime 结构。KernelNative 边界使用窄而稳定的
 C ABI：`extern "C"`、定宽整数、pointer + length、显式 status code、opaque handle、
-versioned struct（Core Export ABI 即此形状）；U-mode 另行定义自己的 syscall wire ABI。
+explicit-layout struct（Core Export ABI 即此形状）；U-mode 另行定义自己的 syscall wire ABI。
 
 ### 两条机制边界（Core ABI ≠ Interface Registry）
 
 ```text
 Component → Core          = Core Export ABI（export.rs：kcore_* 白名单，
                             稳定 C ABI、exact-name resolution、未导出 → UnresolvedSymbol）
-Component → Component     = Interface binding（interface.rs：publish/resolve/unbind，
-                            逻辑 binding + versioned vtable，禁止 flat ELF symbol 互链）
+Component → Component     = Interface binding（interface.rs：publish/bind/refresh/unbind，
+                            逻辑 binding + exact ABI fingerprint + typed #[repr(C)] function table，
+                            禁止 flat ELF symbol 互链）
 ```
 
 - Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆

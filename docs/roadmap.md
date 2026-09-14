@@ -18,7 +18,8 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
   → loader::load_component（段表/符号表解析、ALLOC 段放置、
      重定位由 `arch/riscv/elf.rs` 的 RiscvRelocator 提供：R_RISCV_CALL/CALL_PLT
      + PCREL_HI20/LO12_I + R_RISCV_32/64；host 测试直接测该实现）
-  → registry（declare → resolve → start 状态机：Declared → Resolved → Ready，
+  → registry（declare → resolve → begin_start → finish_start 状态机：
+     Declared → Resolved → Starting → Ready；Starting = kcomp_init 执行期，
      Resolved = requires 全部绑定；Failed 吸收态）
   → monitor `load <name>` → call_init（kcomp_init）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
@@ -27,7 +28,8 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
     System query：free_page_count / task_count / component_count
-    Component lifecycle：component_load / interface_publish / interface_available
+    Component lifecycle：component_load / interface_publish / interface_available /
+      interface_bind / interface_refresh
     Task control：task_create / task_start / task_yield / task_exit / task_state
     Scheduler：sched_run
     Resource authority（C6）：mmio_claim / mmio_read_u32 / mmio_write_u32 / mmio_release /
@@ -41,11 +43,15 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
-Component Interface Registry（os/core/src/component/interface.rs，本轮新增骨架）：
-  InterfaceId / InterfaceVersion / InterfaceKind（Device/Service/Policy）/ BindingId
-  publish / resolve / resolve_by_id / unbind / unbind_provider
-  —— 组件→组件 依赖只走 Interface binding（逻辑 binding + versioned vtable），
-     不建立 flat ELF symbol 全局符号表；provider 重绑后 consumer 无需 ELF reload
+Component Interface Registry（os/core/src/component/interface.rs）：
+  InterfaceId / InterfaceAbi（exact fingerprint，无版本语义）/ InterfaceKind
+  （Device/Service/Policy）/ BindingId / BindingRecord{api, ctx, generation}
+  staged publish（commit_pending / discard_pending）/ bind / refresh / unbind /
+  unbind_provider
+  —— 组件→组件 依赖只走 Interface binding（逻辑 binding + typed #[repr(C)]
+     function table）；publish 在 kcomp_init 期间只记 pending，init 成功后原子
+     提交；同 ABI replacement 保留 BindingId、generation++；不建立 flat ELF
+     symbol 全局符号表；provider 替换后 consumer 只需 refresh，无需 ELF reload
 内存粒度定案：ALLOC_GRANULE（物理分配）与 AddressSpaceBackend::GRANULE（VM 映射）解耦
 RISC-V trap 按特权级拆分：trap/supervisor.rs（S-mode 机制）/ trap/machine.rs（M-mode 骨架）
 测试体系（自动化，见 docs/testing.md）：

@@ -53,15 +53,21 @@ Component → Component     = Interface binding（interface.rs）——禁止 fl
 
 - 已加载组件的 exported ELF symbols **不组成全局符号表**：KaleidOS Component 是
   replaceable 的，直接 relocation 到 provider 函数地址会让替换非常困难。
-- consumer 拿到的是**逻辑 binding**（`BindingId` + 版本 + opaque `context` 指针，
-  按 `#[repr(C)]` vtable 契约 cast 调用），不是"永不变更的 provider ELF 符号地址"。
-  provider 更换后 consumer 只需 `resolve_by_id` 重新获取，**不需要 ELF reload**。
-- Core 真相：`InterfaceRegistry` 记录 谁提供了什么接口（InterfaceId / version /
-  kind / provider / binding 状态）；publish 要求 provider 存在且 Ready，
-  resolve 时再次校验 provider 存活（组件卸载后 binding 立即不可用）。
+- consumer 拿到的是**逻辑 binding**（`BindingId` + 当前 `api`/`ctx`/`generation`，
+  其中 `api` 指向 provider 的 `#[repr(C)]` function table，`ctx` 是 provider opaque
+  state），不是"永不变更的 provider ELF 符号地址"。provider 更换后 consumer 只需
+  `refresh` 重新获取，**不需要 ELF reload**。
+- **exact ABI fingerprint（`InterfaceAbi`，`#[repr(transparent)] u64`）取代
+  version**：它没有版本兼容语义，只回答"provider 与 consumer 是否由完全相同的
+  Service ABI contract 编译"。不一致必须拒绝 binding/replacement，绝不能把布局
+  不同的 function table 交给 consumer。自动 ABI hash 生成器 / compatible range /
+  ABI-changing coordinated update 属下一阶段（只留 seam）。
+- Core 真相：`InterfaceRegistry` 记录 谁提供了什么接口（InterfaceId / abi /
+  kind / provider / api / ctx / generation）；`publish` 在 `kcomp_init()` 期间
+  只记录 pending（**staged**），init 成功后 Core 原子提交；consumer `bind` /
+  `refresh` 时 Core 再次校验 provider 存活（组件卸载/失败后 binding 立即不可用）。
 - 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
-  call）不改 binding 数据模型。完整 live binding indirection 与 compatible
-  version range 属下一阶段。
+  call）不改 binding 数据模型。
 
 ### 2.2 `.kcomp` = 链接后的组件程序（目标：step 2-3）
 
@@ -359,10 +365,12 @@ impl ComponentManager {
 }
 ```
 
-（概念代码；落地时按现有 Registry 状态机接轨。当前 Registry 的同步 start
-是 `Declared → Resolved → Ready`：`resolve()` 已落地（Declared → Resolved，
-语义 = requires 全部绑定成功），`Starting` 属全量生命周期词汇表但未接线——
-留给 ComponentManager 的异步初始化阶段。当前 unload 只删记录、不释放段内存。）
+（概念代码；落地时按现有 Registry 状态机接轨。当前 load 链是
+`Declared → resolve → Resolved → begin_start → Starting → call kcomp_init →
+{ failure → Failed | success → 提交 pending interfaces → finish_start → Ready }`：
+`resolve()` 已落地（语义 = requires 全部绑定成功）；`Starting` 已接线为
+`kcomp_init()` 执行期（此期间 `kcore_interface_publish` 只记录 pending，不修改
+active binding）。当前 unload 只删记录、不释放段内存。）
 
 > **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
 >
