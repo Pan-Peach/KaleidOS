@@ -13,8 +13,8 @@
 //!        arch::riscv::mmu   （Sv39 机制本身）
 //! ```
 //!
-//! 整个模块是 RV64-only（`main.rs` 按 target_arch 门控；RV32 走 Sv32 identity，
-//! 不经此处）。
+//! 整个模块是 RV64 + `vm-mmu` only（`main.rs` 按 target_arch/profile 门控；
+//! RV32 走 entry32 的 Sv32 identity 或 NoMMU flat identity，不经此处）。
 
 pub mod bootstrap;
 pub mod layout;

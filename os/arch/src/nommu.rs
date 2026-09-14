@@ -1,4 +1,4 @@
-//! NoMMU 恒等翻译 backend（**骨架**：结构/契约就位，语义实现由人类完成）。
+//! NoMMU 恒等翻译 backend。
 //!
 //! 这是 `AddressSpaceBackend`（arch/src/vm.rs）在无 MMU 目标上的诚实实现：
 //! 没有页表、没有 page fault、没有 satp、VA≈PA。不伪装成 Sv32。
@@ -11,14 +11,6 @@
 //! - map 是 identity 一致性校验（VA 区间必须与 PA 区间重合），translate 恒等，
 //!   activate 无 satp 可写（no-op）。
 //!
-//! TODO(实现)：
-//! 1. `map`：校验 `va == pa && va.size == pa.size`，不做任何硬件操作；
-//! 2. `unmap`：恒等下无 TLB 可刷，no-op（或按未来 profile 记 ledger）；
-//! 3. `translate`：恒等返回 `va`；
-//! 4. `activate`：no-op。
-//!
-//! 实现后启用 `tests` 里的 `#[ignore]` 骨架测试。
-
 use crate::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
 
 /// NoMMU backend 的错误：恒等约束失败（VA 与 PA 不重合）。
@@ -38,49 +30,78 @@ impl AddressSpaceBackend for NoMmuAddressSpace {
 
     fn map(
         &mut self,
-        _va: VirtualRange,
-        _pa: PhysicalRange,
+        va: VirtualRange,
+        pa: PhysicalRange,
         _perm: MappingPermission,
     ) -> Result<(), NoMmuError> {
-        todo!("NoMmuAddressSpace::map —— identity 一致性校验后 no-op")
+        if va.base != pa.base || va.size != pa.size {
+            return Err(NoMmuError::IdentityMismatch);
+        }
+
+        Ok(())
     }
 
     fn unmap(&mut self, _va: VirtualRange) -> Result<(), NoMmuError> {
-        todo!("NoMmuAddressSpace::unmap —— no-op")
+        Ok(())
     }
 
-    fn translate(&self, _va: usize) -> Option<usize> {
-        todo!("NoMmuAddressSpace::translate —— 恒等返回 va")
+    fn translate(&self, va: usize) -> Option<usize> {
+        Some(va)
     }
 
     fn activate(&self) -> Result<(), NoMmuError> {
-        todo!("NoMmuAddressSpace::activate —— 无 satp，no-op")
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! 骨架测试：语义实现后逐个去掉 `#[ignore]` 即可验收
     //! （"Core 不依赖 MMU"的跨 crate 验收在 kernel 侧：
     //! `address_space::tests::core_validation_accepts_unaligned_with_granule_one`）。
 
+    use crate::vm::AddressSpaceBackend;
+
     #[test]
-    #[ignore = "NoMmuAddressSpace 语义实现后启用"]
     fn identity_map_translate_roundtrip() {
-        let _space = super::NoMmuAddressSpace;
+        let mut space = super::NoMmuAddressSpace;
         let va = super::VirtualRange {
             base: 0x2000_0000,
             size: 0x1000,
         };
-        // TODO: map(va, va, READ|WRITE) → Ok；translate(va.base) == Some(va.base)；
-        //       unmap(va) 后 translate == None。
-        let _ = va;
+        assert_eq!(
+            space.map(
+                va,
+                super::PhysicalRange {
+                    base: va.base,
+                    size: va.size,
+                },
+                super::MappingPermission::READ | super::MappingPermission::WRITE,
+            ),
+            Ok(())
+        );
+        assert_eq!(space.translate(va.base + 7), Some(va.base + 7));
+        assert_eq!(space.unmap(va), Ok(()));
+        // NoMMU has no mapping ledger in the backend; Core owns that truth.
+        assert_eq!(space.translate(va.base + 7), Some(va.base + 7));
     }
 
     #[test]
-    #[ignore = "NoMmuAddressSpace 语义实现后启用"]
     fn identity_mismatch_is_rejected() {
-        let _space = super::NoMmuAddressSpace;
-        // TODO: map(va = 0x2000, pa = 0x3000) → Err(NoMmuError::IdentityMismatch)。
+        let mut space = super::NoMmuAddressSpace;
+        let va = super::VirtualRange {
+            base: 0x2000,
+            size: 0x1000,
+        };
+        assert_eq!(
+            space.map(
+                va,
+                super::PhysicalRange {
+                    base: 0x3000,
+                    size: va.size,
+                },
+                super::MappingPermission::READ,
+            ),
+            Err(super::NoMmuError::IdentityMismatch)
+        );
     }
 }

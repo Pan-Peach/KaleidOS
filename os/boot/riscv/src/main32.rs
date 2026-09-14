@@ -1,9 +1,8 @@
 //! RV32 bare bootstrap for the QEMU/OpenSBI-style hand-off.
 //!
-//! This profile keeps the image in an identity-mapped Sv32 view.  It exercises
-//! the RV32 CPU/firmware path without assuming that every RV32 machine has the
-//! same high-half layout; the reusable address-space backend remains below
-//! `arch::riscv::mmu`.
+//! This profile keeps the image in an identity view.  `vm-mmu` enters a coarse
+//! Sv32 mapping before Rust; `vm-nommu` leaves translation disabled.  Both
+//! paths avoid assuming a high-half layout.
 
 use arch::CpuArch;
 use core::arch::global_asm;
@@ -17,7 +16,11 @@ use kernel::machine::{
 #[path = "console.rs"]
 mod console;
 
+#[cfg(feature = "vm-mmu")]
 global_asm!(include_str!("entry32.S"));
+
+#[cfg(feature = "vm-nommu")]
+global_asm!(include_str!("entry32-nommu.S"));
 
 unsafe extern "C" {
     static __image_load_start: u8;

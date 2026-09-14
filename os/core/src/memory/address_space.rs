@@ -698,16 +698,44 @@ mod tests {
         assert_eq!(space.mappings().len(), 0);
     }
 
-    /// 骨架测试：`arch::nommu::NoMmuAddressSpace` 语义实现后去掉 `#[ignore]`。
     /// GRANULE=1 时，Core 的 `validate` 必须放行非 4K 对齐区间——
     /// 这是"Core 不依赖 MMU"的硬证据（对应 roadmap 的 NoMMU 验收点）。
+    #[cfg(feature = "vm-nommu")]
     #[test]
-    #[ignore = "arch::nommu::NoMmuAddressSpace 语义实现后启用"]
     fn core_validation_accepts_unaligned_with_granule_one() {
         use arch::nommu::NoMmuAddressSpace;
-        // TODO: KernelAddressSpace::<NoMmuAddressSpace>::new(...) 后，
-        //       map 一个非 4K 对齐的 { base: 0x1005, size: 0x1000 } 必须 Ok
-        //       （对照：Sv39 backend 下同一输入必须 Err(Unaligned)）。
-        let _ = NoMmuAddressSpace;
+
+        let mut space = KernelAddressSpace::new(
+            AddressSpaceId::from_raw(1),
+            1,
+            ComponentId::from_raw(1),
+            NoMmuAddressSpace,
+        );
+        let range = VirtualRange {
+            base: 0x1005,
+            size: 0x1000,
+        };
+        assert_eq!(
+            space.map(Mapping {
+                virtual_range: range,
+                physical_range: PhysicalRange {
+                    base: 0x1005,
+                    size: 0x1000,
+                },
+                permission: rw(),
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            space.mappings(),
+            &[Mapping {
+                virtual_range: range,
+                physical_range: PhysicalRange {
+                    base: 0x1005,
+                    size: 0x1000,
+                },
+                permission: rw(),
+            }]
+        );
     }
 }

@@ -17,13 +17,34 @@ compile_error!("arch features `supervisor` and `machine` are mutually exclusive"
 #[cfg(not(any(feature = "supervisor", feature = "machine")))]
 compile_error!("arch requires exactly one privilege-mode feature: `supervisor` or `machine`");
 
+#[cfg(all(feature = "vm-mmu", feature = "vm-nommu"))]
+compile_error!("arch VM features `vm-mmu` and `vm-nommu` are mutually exclusive");
+
+#[cfg(not(any(feature = "vm-mmu", feature = "vm-nommu")))]
+compile_error!("arch requires exactly one VM feature: `vm-mmu` or `vm-nommu`");
+
 #[cfg(test)]
 extern crate std;
 
 pub mod component;
+#[cfg(feature = "vm-nommu")]
 pub mod nommu;
 pub mod store;
 pub mod vm;
+
+/// 当前构建 profile 的地址空间 backend。
+///
+/// VM profile 先决定 MMU / NoMMU；只有 MMU profile 才继续由 RISC-V XLEN
+/// 选择 Sv39 或 Sv32。host 上的 MMU 页表算法测试不需要这个运行时 alias，
+/// 因为真实的 `AddressSpace` wrapper 只在 RISC-V target 提供。
+#[cfg(feature = "vm-nommu")]
+pub type AddressSpaceImpl = nommu::NoMmuAddressSpace;
+
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
+pub type AddressSpaceImpl = riscv::mmu::address_space::Sv39AddressSpace;
+
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
+pub type AddressSpaceImpl = riscv::mmu::address_space::Sv32AddressSpace;
 
 #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
 pub mod fake;

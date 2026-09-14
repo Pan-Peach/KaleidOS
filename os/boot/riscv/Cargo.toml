@@ -12,9 +12,11 @@ path = "src/main.rs"
 test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --tests
 
 [features]
-default = ["supervisor"]
+default = ["supervisor", "vm-mmu"]
 supervisor = ["arch/supervisor", "kernel/supervisor"]
 machine = ["arch/machine", "kernel/machine"]
+vm-mmu = ["arch/vm-mmu", "kernel/vm-mmu"]
+vm-nommu = ["arch/vm-nommu", "kernel/vm-nommu"]
 preempt = ["kernel/preempt"]
 selftest = []
 

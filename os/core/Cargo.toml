@@ -6,9 +6,11 @@ publish = false
 build = "build.rs"
 
 [features]
-default = ["supervisor"]
+default = ["supervisor", "vm-mmu"]
 supervisor = ["arch/supervisor"]
 machine = ["arch/machine"]
+vm-mmu = ["arch/vm-mmu"]
+vm-nommu = ["arch/vm-nommu"]
 preempt = []
 
 [dependencies]

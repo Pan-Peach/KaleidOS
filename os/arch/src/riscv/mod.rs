@@ -27,10 +27,13 @@ pub mod elf;
 
 /// 地址翻译 backend：纯逻辑 + identity 指针解引用。
 /// host 上仅在 cfg(test) 的 64 位目标编译（sv39/sv32 host 测试）。
-#[cfg(any(
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-    all(test, target_pointer_width = "64")
+#[cfg(all(
+    feature = "vm-mmu",
+    any(
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        all(test, target_pointer_width = "64")
+    )
 ))]
 pub mod mmu;
 

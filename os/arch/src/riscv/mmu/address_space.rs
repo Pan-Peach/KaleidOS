@@ -5,18 +5,18 @@
 
 use crate::vm::{AddressSpaceBackend, MappingPermission, PageAlloc, PhysicalRange, VirtualRange};
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 use super::sv32::{self, MapError, Sv32PageTable};
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 use super::sv39::{self, MapError, Sv39PageTable};
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 pub struct Sv39AddressSpace {
     asid: u16,
     table: Sv39PageTable,
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 impl Sv39AddressSpace {
     pub fn new(alloc: PageAlloc, asid: u16) -> Result<Self, MapError> {
         Ok(Self {
@@ -34,7 +34,7 @@ impl Sv39AddressSpace {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 impl AddressSpaceBackend for Sv39AddressSpace {
     type Error = sv39::MapError;
     const GRANULE: usize = sv39::VM_PAGE_SIZE;
@@ -64,13 +64,13 @@ impl AddressSpaceBackend for Sv39AddressSpace {
     }
 }
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 pub struct Sv32AddressSpace {
     asid: u16,
     table: Sv32PageTable,
 }
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 impl Sv32AddressSpace {
     pub fn new(alloc: PageAlloc, asid: u16) -> Result<Self, MapError> {
         Ok(Self {
@@ -88,7 +88,7 @@ impl Sv32AddressSpace {
     }
 }
 
-#[cfg(target_arch = "riscv32")]
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 impl AddressSpaceBackend for Sv32AddressSpace {
     type Error = sv32::MapError;
     const GRANULE: usize = sv32::VM_PAGE_SIZE;

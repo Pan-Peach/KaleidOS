@@ -5,9 +5,12 @@ edition = "2024"
 publish = false
 
 [features]
-default = ["supervisor"]
+default = ["supervisor", "vm-mmu"]
 supervisor = []
 machine = []
+
+vm-mmu = []
+vm-nommu = []
 
 [dependencies]
 bitflags = { version = "2", default-features = false }
