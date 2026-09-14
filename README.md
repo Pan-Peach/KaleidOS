@@ -60,7 +60,7 @@ tools/         工具脚本（待建设）
 - **组件加载链**（Linux insmod 教学版）：`.kcomp`（ELF32/ELF64 ET_REL，no_std Rust）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令
 - **导出白名单**（EXPORT_SYMBOL 教学版，一组 `kcore_*`：共享堆 alloc/dealloc + 输出 + 机器/系统只读查询 + v2 语义入口——组件加载/接口发布/任务控制/调度 + C6 资源 authority `kcore_device_nth`（纯发现）/`kcore_mmio_claim/read_u32/write_u32/release/lease` + `kcore_irq_claim/register/enable/register_polled/poll/ack/release` + DMA authority `kcore_dma_alloc/lease/release`，错误码统一 `0/-Errno`）：组件只能调白名单，未导出符号 → 加载失败
 - **Component Interface Registry**（骨架）：组件→组件依赖只走 Interface binding（staged publish / bind / refresh / unbind，exact ABI fingerprint + typed `#[repr(C)]` function table），不建立 flat ELF symbol 全局符号表
-- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy v1）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 端到端自检全 PASS（RV64+RV32）
+- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 端到端自检全 PASS（RV64+RV32）
 - **组件 panic containment**（init + task 边界，协作式）：组件跑在 Core 拥有的独立栈上；panic 时先用直接 SBI 打印诊断（`[panic] component=<id> task=<id> at <loc>: <msg>`）再 stack-switch 回 Core 上下文，标记该 instance Failed 后重新调度。`panic=abort` 不变、无 unwinding，不承诺内存回收（containment ≠ fault isolation）。ArchTest `panic-containment` / `task-panic`（RV64+RV32）
 
 实机输出：
@@ -83,6 +83,8 @@ cargo check
 ```
 
 QEMU 运行：`make qemu`（默认 RV64），或 `make qemu ARCH=rv32`。
+VM profile：默认 `VM=mmu`（RV64→Sv39、RV32→Sv32）；RV32 NoMMU 可用
+`make kernel ARCH=rv32 VM=nommu` 构建。
 
 ## 文档
 

@@ -1,4 +1,4 @@
-//! RR（轮转）调度器组件 —— SchedulerPolicy v1 的参考实现（M2/C4）。
+//! RR（轮转）调度器组件 —— SchedulerPolicy 的参考实现（M2/C4）。
 //!
 //! 策略只保存一个 RR cursor（runqueue 真相由 Core 每次调用时传入，本组件
 //! 不持有）。`choose_next` 只做一件事：在 Core 给的 runnable 列表里轮流
@@ -21,17 +21,17 @@ extern crate std;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// SchedulerPolicy function table（与 Core `sched::SchedulerPolicyV1` 布局一致——
+/// SchedulerPolicy function table（与 Core `sched::SchedulerPolicyApi` 布局一致——
 /// A/B 双侧 ABI 契约；改动 = 破坏性变更，双侧同步）。`ctx` 由 Core 从 binding
 /// 单独持有并回传，不在 table 内。
 #[repr(C)]
-pub struct SchedulerPolicyV1 {
+pub struct SchedulerPolicyApi {
     pub choose_next:
         extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
 }
 
 // function table 是只读契约，指针只被 Core 读取（provider 存活期内有效）。
-unsafe impl Sync for SchedulerPolicyV1 {}
+unsafe impl Sync for SchedulerPolicyApi {}
 
 /// RR cursor：指向 runnable 列表中的下一个槽位（跨调用保持，轮转推进）。
 static CURSOR: AtomicU32 = AtomicU32::new(0);
@@ -55,7 +55,7 @@ extern "C" fn rr_choose_next(
 }
 
 /// 发布的 function table（发布后由 Core 保存 api 指针 + ctx）。
-static VTABLE: SchedulerPolicyV1 = SchedulerPolicyV1 {
+static VTABLE: SchedulerPolicyApi = SchedulerPolicyApi {
     choose_next: rr_choose_next,
 };
 
@@ -71,7 +71,7 @@ pub extern "C" fn kcomp_init() -> i32 {
             b"scheduler",
             binding::InterfaceKind::Policy,
             binding::SCHEDULER_POLICY_ABI,
-            &VTABLE as *const SchedulerPolicyV1 as *const (),
+            &VTABLE as *const SchedulerPolicyApi as *const (),
             core::ptr::null_mut(),
         )
     };

@@ -78,7 +78,7 @@ P0 地基：
   ✅ C2  启动地址去硬编码（已完成：内存布局由 FDT/链接脚本符号决定，不写死 QEMU 布局）
 P1 任务系统打通：
   ✅ C3  context_switch 实机验证（ArchTest：A→B→A 双上下文 s0-s11/sp 保留，RV64+RV32）
-  ✅ C4  调度执行链（已完成：scheduler_rr 组件经 Interface 发布 SchedulerPolicy v1；
+  ✅ C4  调度执行链（已完成：scheduler_rr 组件经 Interface 发布 SchedulerPolicy；
          Core propose→validate→commit + 锚点上下文切换；core_test 端到端自检，RV64+RV32）
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
