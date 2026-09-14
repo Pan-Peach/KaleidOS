@@ -1,0 +1,30 @@
+# KaleidOS Core options.
+#
+# Core-level build switches that change the Core's own behaviour or the boot
+# image.  Component selection does NOT belong here -- see os/components/Kconfig.
+
+menu "Core options"
+
+config PREEMPT
+	bool "Preemptive scheduling"
+	default n
+	help
+	  Let the scheduler preempt a running task on a timer interrupt instead
+	  of switching only cooperatively at explicit yield points.  Off by
+	  default: cooperative round-robin is the current baseline.
+
+endmenu
+
+menu "Debugging / Testing"
+
+config SELFTEST
+	bool "Build the ArchTest selftest image"
+	default n
+	depends on VM_MMU
+	help
+	  Swap the boot entrypoint so the image runs the architectural selftests
+	  (ArchTest) instead of entering the interactive Core Monitor.  Requires
+	  the MMU profile: the selftests exercise page tables and do not build
+	  against NoMMU.
+
+endmenu

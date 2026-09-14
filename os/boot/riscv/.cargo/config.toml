@@ -1,5 +1,7 @@
-[build]
-target = "riscv64gc-unknown-none-elf"
+# NOTE: no `[build] target` default.  The build target is part of the Kconfig
+# profile and is always passed explicitly (`--target $(KCFG_TARGET)`) by the
+# Makefile, so a stray `cargo build` here cannot silently pick an architecture.
+# Only the per-target linker scripts below are kept.
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [

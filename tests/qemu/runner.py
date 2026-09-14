@@ -3,7 +3,8 @@
 
 Usage:  python3 tests/qemu/runner.py <rv64|rv32>
 
-Drives a QEMU boot of `kaleidos-<arch>` (built by `make kernel ARCH=<arch>`):
+Drives a QEMU boot of `kaleidos-<arch>`.  Select a profile first, e.g.
+`make qemu_<arch>_defconfig`, then `make kernel`:
 
 1. boot smoke  —— wait for the arch boot marker, then the Core Monitor banner;
 2. auto CoreTest —— type `load core_test`, require every `[core-test] ... PASS`
@@ -117,7 +118,8 @@ def main() -> int:
 
     kernel = os.path.join(REPO, conf["kernel"])
     if not os.path.exists(kernel):
-        print(f"FAIL: kernel {kernel} not found (run `make kernel ARCH={arch}`)")
+        print(f"FAIL: kernel {kernel} not found "
+              f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
         return 1
 
     os.makedirs(LOGS_DIR, exist_ok=True)

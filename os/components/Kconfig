@@ -1,0 +1,8 @@
+# KaleidOS component selection.
+#
+# Component selection lives here in a later phase.  No symbols yet.
+#
+# Phase 1 does not migrate component selection out of the build: the .kcomp
+# list still lives in the Makefile until the loader + manifest pipeline lands.
+# When that milestone arrives, per-component `config` symbols belong here --
+# the Core must not own the component graph.

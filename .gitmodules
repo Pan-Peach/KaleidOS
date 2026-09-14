@@ -5,3 +5,6 @@
 	path = third_party/buddy_system_allocator
 	url = https://github.com/Mango-Iced-Americano/buddy_system_allocator.git
 	branch = feat/metadata-heap
+[submodule "third_party/Kconfiglib"]
+	path = third_party/Kconfiglib
+	url = https://github.com/zephyrproject-rtos/Kconfiglib

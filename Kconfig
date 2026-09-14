@@ -1,0 +1,5 @@
+mainmenu "KaleidOS Configuration"
+
+source "os/arch/Kconfig"
+source "os/core/Kconfig"
+source "os/components/Kconfig"

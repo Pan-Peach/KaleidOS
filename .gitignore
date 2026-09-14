@@ -1,6 +1,9 @@
 /target/
 **/target/
 /build/
+# Kconfig working state: `.config` and its generated fragment are build
+# artifacts.  The committed profiles are configs/*_defconfig (see docs/kconfig.md).
+.config*
 kaleidos-*
 .omo/
 .codegraph/
@@ -8,3 +11,10 @@ kaleidos-*
 /tests/fixtures/kpkg/*.kcomp
 /tests/fixtures/kpkg/*.kpkg
 tests/qemu/logs/
+
+# Python bytecode caches (Kconfig glue + QEMU runners).
+__pycache__/
+*.pyc
+
+# `make savedefconfig` default output.
+defconfig.out

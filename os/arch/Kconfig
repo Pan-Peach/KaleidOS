@@ -1,0 +1,77 @@
+# KaleidOS architecture selection.
+#
+# Semantic and system-level only: this file selects the target profile, the
+# privilege mode and the virtual-memory model.  Crate-internal details (e.g.
+# Rust feature names such as `supervisor` / `vm-mmu`) do NOT belong here --
+# they live in scripts/kconfig/genmk.py, the single source of truth for the
+# config -> build mapping.
+#
+# NOTE: there is deliberately no VM_SV32 / VM_SV39 symbol.  Nothing consumes
+# them, and the arch crate derives the page-table format (Sv32 on RV32, Sv39
+# on RV64) from the target triple.  Defining them here would create a second
+# source of truth for one fact.
+
+menu "Architecture"
+
+choice
+	prompt "Target architecture"
+	default ARCH_RISCV64
+
+config ARCH_RISCV32
+	bool "RISC-V 32-bit (RV32)"
+
+config ARCH_RISCV64
+	bool "RISC-V 64-bit (RV64)"
+
+endchoice
+
+endmenu
+
+menu "Privilege mode"
+
+choice
+	prompt "Privilege mode"
+	default PRIVILEGE_SUPERVISOR
+
+config PRIVILEGE_SUPERVISOR
+	bool "Supervisor (S-mode)"
+	help
+	  Run the kernel in S-mode, entered through the OpenSBI firmware
+	  hand-off.  This is the supported and boot-verified path.
+
+config PRIVILEGE_MACHINE
+	bool "Machine (M-mode)"
+	help
+	  Boot and run the kernel directly in M-mode instead of delegating to
+	  S-mode.  This path is COMPILE-verified only today: it builds, but
+	  there is no launch target (no M-mode boot harness / OpenSBI hand-off
+	  is wired up), so it has never been boot-verified.  No defconfig
+	  selects it.  Prefer "Supervisor" unless you are actively working on
+	  the M-mode bring-up.
+
+endchoice
+
+comment "M-mode is compile-verified only, not boot-verified, and is selected by no defconfig"
+
+endmenu
+
+menu "Virtual memory model"
+
+choice
+	prompt "Virtual memory model"
+	default VM_MMU
+
+config VM_MMU
+	bool "MMU (Sv32 on RV32, Sv39 on RV64; page tables)"
+
+config VM_NOMMU
+	bool "NoMMU (VA == PA, no page tables)"
+	depends on ARCH_RISCV32
+
+endchoice
+
+# VM_NOMMU depends on ARCH_RISCV32 on purpose: the RV64 boot layout hard-errors
+# ("RV64 boot layout requires `vm-mmu`; NoMMU boot is RV32-only"), so RV64 +
+# NoMMU must be unrepresentable rather than silently rejected at compile time.
+
+endmenu

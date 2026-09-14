@@ -3,7 +3,8 @@
 
 Usage:  python3 tests/qemu/driver_prober_runner.py <rv64|rv32>
 
-Boots `kaleidos-<arch>` (built by `make kernel ARCH=<arch>`) and drives the Core
+Boots `kaleidos-<arch>` (select a profile, e.g. `make qemu_<arch>_defconfig`, then
+`make kernel`) and drives the Core
 Monitor with `load scheduler_rr` → `load driver_prober`.  The prober does a coarse
 compatible match and auto-loads `virtio_blk`; the driver claims in its OWN init
 context and does the fine protocol match.  Three scenarios:
@@ -203,7 +204,9 @@ def run_case(arch, case):
     conf = ARCH_CONF[arch]
     kernel = os.path.join(REPO, conf["kernel"])
     if not os.path.exists(kernel):
-        raise RunFailure(f"kernel {kernel} not found (run `make kernel ARCH={arch}`)")
+        raise RunFailure(
+            f"kernel {kernel} not found "
+            f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
 
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(BUILD_DIR, exist_ok=True)

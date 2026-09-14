@@ -1,0 +1,2 @@
+# KaleidOS fragment: enable the ArchTest selftest entrypoint
+CONFIG_SELFTEST=y

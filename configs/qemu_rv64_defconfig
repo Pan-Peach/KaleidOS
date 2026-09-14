@@ -1,0 +1,4 @@
+# KaleidOS defconfig: QEMU virt, RV64, supervisor, MMU
+CONFIG_ARCH_RISCV64=y
+CONFIG_PRIVILEGE_SUPERVISOR=y
+CONFIG_VM_MMU=y
