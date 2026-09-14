@@ -24,7 +24,8 @@ fn main() {
     let sdk_dir = repo.join("os/components/kcomp-sdk");
     for changed in [
         sdk_dir.join("Cargo.toml"),
-        sdk_dir.join("src/lib.rs"),
+        // SDK 已拆成多模块：跟踪整个 src/ 目录，任一源文件变化都触发重建。
+        sdk_dir.join("src"),
         repo.join("tools/build-kcomp.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", changed.display());
