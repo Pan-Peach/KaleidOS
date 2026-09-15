@@ -240,6 +240,11 @@ compatible 匹配"），独占锚在 `device_index` 上；`kcore_irq_claim` / `k
 - **`kcore_mmio_lease` 进入直接 ABI**：Core 校验 handle 后一次性派生 `(ptr, len)` + provenance（`source` handle），受信 KernelNative 驱动据此直接访问。
 - **`kcore_dma_alloc` / `kcore_dma_lease` 进入直接 ABI**：`dma_alloc` 用调用方**已持有的 `MmioHandle`** 推导设备身份、由 Core 分配物理连续 backing（**不接受自报设备号**）；`dma_lease` 派生 `(ptr, len, device_addr)`——**设备可见地址由 Core 在 DMA 授权时给出，经 typed lease 暴露给 KernelNative**（v1 identity：== 物理基址，无 IOMMU），组件不能自行指定物理/设备地址；`map` 仍不进直接 ABI，映射由 Core 提交。
 - **DMA 撤销**：`kcore_dma_release` 只 revoke authority，backing 内存进 Core 私有 quarantine（**不 free**）；权威回收需设备静默，本版 deferred（见 §7 / §11）。
+- **DMA 授权模型（已决，刻意如此）**：**不建模**“设备是不是 DMA master”（FDT 无可靠来源 ——
+  真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标 `dma-coherent`），`dma_alloc` 的授权证明 =
+  caller 已持有该设备的 `MmioHandle`，本阶段按**协作式信任**处理。**未决问题**：组件目前可以
+  自己 claim 中断控制器（PLIC）——“认领一台设备 = 拿到它的全部语义”这个 capability 边界
+  还没有人回答；记录见 `docs/testing.md` §3 / `docs/component-model.md` §3。
 
 ### 6.3 未来 syscall 线格式（SandboxedNative / Wasm 方向）
 

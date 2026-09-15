@@ -47,7 +47,7 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
   components/      组件 crates（策略 / 服务 / 测试）：scheduler_rr/ core_test/ logger/ …
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）——workspace exclude，clippy 不检索
-tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，供 discovery host test）
+tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，QEMU virt 真实 DTB 转储；供未来 parser 测试与人工对照）
 docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
 tools/         构建辅助脚本（build-kcomp.sh 等）
 ```

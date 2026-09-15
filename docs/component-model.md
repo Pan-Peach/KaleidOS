@@ -169,6 +169,13 @@ struct DmaRecord {
 >
 > `ComponentId` 是 identity（不是 authority），`handle/` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
 
+> **DMA 授权模型（已决，刻意如此）**：`dma_alloc` 的授权证明 = caller 已持有该设备的
+> `MmioHandle`（Core 从 handle 推导设备身份，不接受组件自报）。**不建模**“设备是不是
+> DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标
+> `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim
+> 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个 capability 边界
+> 还没有人回答；记录见 `docs/testing.md` §3。
+
 ### 3.1 Handle table 可以非常普通
 
 ```rust
