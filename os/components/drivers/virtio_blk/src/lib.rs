@@ -1,4 +1,4 @@
-//! virtio_blk —— VirtIO-MMIO 块设备驱动组件。
+//! virtio_blk —— VirtIO-MMIO 块设备驱动组件（持久单设备，提供 `block.device`）。
 //!
 //! # 设备选择：协议无关 prober（coarse match）+ 驱动自己的 fine match
 //!
@@ -14,67 +14,140 @@
 //! prober 只交**分配数据**（`DeviceId`/`attempt`，不是 authority）；authority 仍由
 //! 本驱动在**自己的 init 上下文**里向 Core claim，协议身份也由本驱动读设备头确认。
 //! 若直接 `load virtio_blk` 而没有 prober，bind 失败并打印清晰错误（见 `kcomp_init`）。
+//! 没有支持的设备**不是失败**：init 返回 0、不 attach（干净的 no-device）。
 //!
-//! # 本次迁移对 virtio_blk 的改动（逐条，便于 review）
+//! # 持久化：init 保留设备并 publish，exit 线性拆除
 //!
-//! 1. 绑定契约：旧 prober 选择接口 → `DriverProber`/`next_assignment`；
-//! 2. 单台选择 → `next_assignment` 循环（`-ENOENT` = 耗尽），逐台 claim；
-//! 3. 协议不匹配时 `release` + `report_attempt(NoMatch)` 后试下一台；
-//! 4. 分配耗尽（无支持的设备）时 init **返回 0**（`Ready`，但不 attach 设备）；
-//! 5. `ASSIGN_MATCH` / claim 失败 / 读失败均 `report_attempt`；claim 失败不中止；
-//! 6. transport / capacity / sector-0 读取**路径不变**；末尾仍 `release` MMIO
-//!    （沿用既有 smoke 行为：不在 init 里保留一个 persistent `Bound` 设备）。
+//! fine match 通过后本驱动**不释放** claim：设备本体存进 `BLK`，init 末尾
+//! `BLOCK_SERVICE.publish()`（staged：Core 在 `kcomp_init` 返回 0 后提交），
+//! 上层 Service 经 `block.device` bind 消费。停止（monitor `unload`）由
+//! `kcomp_exit` 线性拆除：reset 设备 → drop 设备（释放队列 DMA）→ DMA 兜底 →
+//! release MMIO（**最后**：Core 在还有 live DMA/IRQ 子 authority 时返回 `-EBUSY`）。
+//!
+//! # 状态与锁序（不变量）
+//!
+//! ```text
+//! MMIO_HANDLE  AtomicUsize                    Core 的 MMIO handle（无锁单字）
+//! BLK          Mutex<Option<VirtIOBlk<...>>>  设备本体；provider 唯一的锁
+//! DMA_MAP      Mutex<[(u64, u64); SLOTS]>     paddr → DmaHandle
+//! ```
+//!
+//! **锁序恒为 `BLK → DMA_MAP`，永不反向。** `VirtIOBlk::drop` 会经
+//! `CoreHal::dma_dealloc` 去 `DMA_MAP.take`，所以 exit 里 drop 必须在 `BLK`
+//! 锁内执行，顺序天然是 BLK → DMA_MAP。`MMIO_HANDLE` 刻意用原子而不是锁：
+//! `CoreHal` 的 DMA 回调会在 `BLK` 锁内被调用（`dma_dealloc` 就是），Hal 侧
+//! 不能再引入第二条锁 / 第二种锁序（`dma_alloc` 还要读它拿设备身份）。
 
 #![no_std]
 
-use core::cell::UnsafeCell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kcomp_sdk::binding::{ASSIGN_MATCH, ASSIGN_NO_MATCH, DriverProber, ServiceBinding};
+use kcomp_sdk::block::{BlockDeviceProvider, BlockDeviceService};
 use kcomp_sdk::{DmaDirection, abi};
+use spin::Mutex;
 use virtio_drivers::{
     BufferDirection, Hal, PAGE_SIZE, PhysAddr,
     device::blk::VirtIOBlk,
     transport::mmio::{MmioTransport, VirtIOHeader},
 };
 
-// MMIO handle：驱动单任务运行（IRQ 走 polled），且 rv32 目标没有 64-bit
-// 原子（AtomicU64 在 riscv32imac 不存在）——用 UnsafeCell 存 u64，无新依赖。
-struct MmioHandle(UnsafeCell<u64>);
-unsafe impl Sync for MmioHandle {}
-static MMIO_HANDLE: MmioHandle = MmioHandle(UnsafeCell::new(0));
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
 
-// paddr -> DmaHandle. 驱动单任务运行，IRQ走polled，无需锁
-// 若将来有并发，再换成细粒度锁
+// 组件不能依赖 os/core 的 errno 模块：本地按数值镜像（与 os/core/src/errno.rs 一致）。
+const ENOENT: i32 = -2; // next_assignment 耗尽：没有更多分配
+const EIO: i32 = -5; // virtio 传输失败
+const ENODEV: i32 = -19; // 未 attach 就收到读写
+
+// virtio-mmio 寄存器 offset（4 字节访问）。
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: u32 = 0x008;
+const VIRTIO_MMIO_STATUS_OFFSET: u32 = 0x070;
+
+const VIRTIO_ID_BLOCK: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// 状态（全在 statics）
+// ---------------------------------------------------------------------------
+
+/// MMIO handle（Core 的 opaque u64）。无锁单字：`CoreHal` 的 DMA 回调在 `BLK`
+/// 锁内被调用，不能再取互斥锁；`AtomicU64` 在 riscv32imac 上不存在，所以用
+/// `AtomicUsize`（rv64 = 8 字节；rv32 = 4 字节，只装得下低半 —— 本驱动单 claim、
+/// slot=0 的场景够用）。
+static MMIO_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+/// paddr → DmaHandle 映射；`paddr == 0` = 空槽。
 const SLOTS: usize = 16;
-struct DmaMap(UnsafeCell<[(u64, u64); SLOTS]>); // (paddr, handle)
-unsafe impl Sync for DmaMap {}
-static DMA_MAP: DmaMap = DmaMap(UnsafeCell::new([(0, 0); SLOTS]));
+static DMA_MAP: Mutex<[(u64, u64); SLOTS]> = Mutex::new([(0, 0); SLOTS]);
 
-impl DmaMap {
-    fn insert(&self, paddr: u64, handle: u64) {
-        let slots = unsafe { &mut *self.0.get() };
-        for slot in slots.iter_mut() {
-            if slot.0 == 0 {
-                *slot = (paddr, handle);
-                return;
-            }
+/// 设备本体；`None` = 未 attach。provider 方法只取这一把锁。
+///
+/// `MmioTransport<'static>` 的论证见 `kcomp_init` 里构造处的注释。
+static BLK: Mutex<Option<VirtIOBlk<CoreHal, MmioTransport<'static>>>> = Mutex::new(None);
+
+fn dma_insert(paddr: u64, handle: u64) {
+    let mut slots = DMA_MAP.lock();
+    for slot in slots.iter_mut() {
+        if slot.0 == 0 {
+            *slot = (paddr, handle);
+            return;
         }
-        panic!("DMA map full");
+    }
+    panic!("virtio_blk: DMA_MAP full");
+}
+
+fn dma_take(paddr: u64) -> Option<u64> {
+    let mut slots = DMA_MAP.lock();
+    for slot in slots.iter_mut() {
+        if slot.0 == paddr {
+            let handle = slot.1;
+            *slot = (0, 0);
+            return Some(handle);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// provider：零大小标记；状态全在 statics
+// ---------------------------------------------------------------------------
+//
+// `BlockDeviceService<P>` 只是 provider 与生成的 `#[repr(C)]` table 的配对，
+// **不是状态容器**：`P` 保持零大小，读写经 `BLK`。入参校验（null / len == 0 /
+// 非 512 倍数 → `-EINVAL`）由 SDK adapter 统一完成，provider 不重复校验。
+
+struct VirtioBlkProvider;
+
+impl BlockDeviceProvider for VirtioBlkProvider {
+    fn capacity_sectors(&self) -> u64 {
+        BLK.lock().as_ref().map_or(0, |blk| blk.capacity())
     }
 
-    fn take(&self, paddr: u64) -> Option<u64> {
-        let slots = unsafe { &mut *self.0.get() };
-        for slot in slots.iter_mut() {
-            if slot.0 == paddr {
-                let handle = slot.1;
-                *slot = (0, 0);
-                return Some(handle);
-            }
+    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), i32> {
+        match BLK.lock().as_mut() {
+            Some(blk) => blk.read_blocks(lba as usize, buf).map_err(|_| EIO),
+            None => Err(ENODEV),
         }
-        None
+    }
+
+    fn write(&self, lba: u64, buf: &[u8]) -> Result<(), i32> {
+        match BLK.lock().as_mut() {
+            Some(blk) => blk.write_blocks(lba as usize, buf).map_err(|_| EIO),
+            None => Err(ENODEV),
+        }
     }
 }
+
+/// publish 只在 init 末尾、且真的 attach 了设备时调用（staged：Core 在
+/// `kcomp_init` 返回 0 后提交）。
+static BLOCK_SERVICE: BlockDeviceService<VirtioBlkProvider> =
+    BlockDeviceService::new(VirtioBlkProvider);
+
+// ---------------------------------------------------------------------------
+// CoreHal：virtio-drivers 的 DMA/MMIO 回调 → `kcore_*` 白名单
+// ---------------------------------------------------------------------------
 
 struct CoreHal;
 
@@ -90,39 +163,40 @@ unsafe impl Hal for CoreHal {
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         let size = pages * PAGE_SIZE;
         let mut handle = 0u64;
+        // MMIO_HANDLE 是无锁原子：Hal 回调可能在 BLK 锁内运行（见模块文档）。
         let rc = unsafe {
             abi::kcore_dma_alloc(
-                *MMIO_HANDLE.0.get(),
+                MMIO_HANDLE.load(Ordering::SeqCst) as u64,
                 size,
                 dir_enc(direction).as_i32(),
                 &mut handle,
             )
         };
         if rc != 0 {
-            return (0, NonNull::dangling()); // 失败返回 (0, dangling)
+            return (0, NonNull::dangling()); // virtio 约定：paddr == 0 = 分配失败
         }
         let (mut ptr, mut len, mut dev) = (0usize, 0usize, 0u64);
         let rc = unsafe { abi::kcore_dma_lease(handle, &mut ptr, &mut len, &mut dev) };
         if rc != 0 {
+            // lease 失败：立刻归还刚拿到的 handle，不留悬空 authority。
+            let _ = unsafe { abi::kcore_dma_release(handle) };
             return (0, NonNull::dangling());
         }
 
         // virtio 要求 DMA 清零；Core 的 dma_alloc 不清零。
         unsafe { core::ptr::write_bytes(ptr as *mut u8, 0, len) };
-        DMA_MAP.insert(dev, handle);
-        (dev, NonNull::new(ptr as *mut u8).unwrap()) // dev==pa==va 暂时没有 iommu
+        dma_insert(dev, handle);
+        (dev, NonNull::new(ptr as *mut u8).unwrap()) // v1 无 IOMMU：dev == pa == va
     }
 
     unsafe fn dma_dealloc(paddr: PhysAddr, _vaddr: NonNull<u8>, _pages: usize) -> i32 {
-        match DMA_MAP.take(paddr) {
+        match dma_take(paddr) {
             Some(handle) => unsafe { abi::kcore_dma_release(handle) },
-            None => {
-                panic!("dma_dealloc: paddr not found");
-            }
+            None => panic!("virtio_blk: dma_dealloc: paddr not in DMA_MAP"),
         }
     }
 
-    // MMIO走MmioTransport， 此函数只有 PCI transport才会调用，暂时不实现
+    // MMIO 走 MmioTransport；本函数只有 PCI transport 才会调用。
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
         NonNull::new(paddr as *mut u8).unwrap()
     }
@@ -133,6 +207,10 @@ unsafe impl Hal for CoreHal {
 
     unsafe fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {}
 }
+
+// ---------------------------------------------------------------------------
+// 入口 / 退出
+// ---------------------------------------------------------------------------
 
 kcomp_sdk::kcomp_init!({
     // 设备选择由**协议无关**的 driver_prober 负责：它只做 compatible 级 coarse
@@ -152,11 +230,7 @@ kcomp_sdk::kcomp_init!({
         }
     };
 
-    const ENOENT: i32 = -2;
-    const VIRTIO_MMIO_DEVICE_ID_OFFSET: u32 = 0x008;
-    const VIRTIO_ID_BLOCK: u32 = 2;
     const DRIVER_NAME: &[u8] = b"virtio_blk";
-    let mut attached = false;
 
     // prober-owned cursor：逐台取候选设备；`-ENOENT` = 没有更多分配。
     loop {
@@ -213,39 +287,45 @@ kcomp_sdk::kcomp_init!({
             continue;
         }
 
-        // 接受：保留 claim，报告 Match，走既有 transport / capacity / sector-0 路径。
+        // 接受：保留 claim，报告 Match。
         let _ = (prober.api().report_attempt)(prober.ctx(), attempt, ASSIGN_MATCH, 0);
-        unsafe {
-            *MMIO_HANDLE.0.get() = mmio;
-        }
 
-        // lease MMIO
+        // MMIO_HANDLE 必须先于任何 dma_alloc 发布：CoreHal 用它给 DMA 认设备身份。
+        MMIO_HANDLE.store(mmio as usize, Ordering::SeqCst);
+
+        // lease MMIO：Core 校验过一次的 (ptr, len)（受信 KernelNative 直接访问）。
         let (mut base, mut region) = (0usize, 0usize);
         let rc = unsafe { abi::kcore_mmio_lease(mmio, &mut base, &mut region) };
         if rc != 0 {
-            kcomp_sdk::klog!("lease mmio failed: {}", rc);
+            kcomp_sdk::klog!("virtio_blk: lease mmio failed (rc={})", rc);
             return rc;
         }
 
-        // transport
         let header = NonNull::new(base as *mut VirtIOHeader).unwrap();
-        let transport = match unsafe { MmioTransport::new(header, region) } {
-            Ok(t) => t,
-            Err(e) => {
-                kcomp_sdk::klog!("MmioTransport::new failed: {:?}", e);
+        // SAFETY: `MmioTransport::new` 的 `'a` 是调用点自由选择的生命周期参数，
+        // 这里显式选 `'static`：本组件实例在存活期间一直持有该 MMIO claim，
+        // 且唯一持有 transport 的 `BLK` 在 exit 里先于 `kcore_mmio_release` 清空
+        // （失败路径组件不再被调用，Core 兜底 revoke + quarantine），所以没有
+        // 任何代码能在 lease 失效后碰到这块映射。
+        let transport: MmioTransport<'static> = match unsafe { MmioTransport::new(header, region) }
+        {
+            Ok(transport) => transport,
+            Err(error) => {
+                kcomp_sdk::klog!("virtio_blk: MmioTransport::new failed: {:?}", error);
                 return -1;
             }
         };
+
         let mut blk = match VirtIOBlk::<CoreHal, _>::new(transport) {
-            Ok(b) => b,
-            Err(e) => {
-                kcomp_sdk::klog!("VirtIOBlk::new failed: {:?}", e);
+            Ok(blk) => blk,
+            Err(error) => {
+                kcomp_sdk::klog!("virtio_blk: VirtIOBlk::new failed: {:?}", error);
                 return -1;
             }
         };
         kcomp_sdk::klog!("virtio_blk capacity: {} sectors", blk.capacity());
 
-        // 读 sector 0
+        // 健康检查：读 sector 0，确认设备真的能完成一次传输。
         let mut buf = [0u8; 512];
         if blk.read_blocks(0, &mut buf).is_err() {
             kcomp_sdk::klog!("read sector 0 failed");
@@ -253,27 +333,62 @@ kcomp_sdk::kcomp_init!({
         }
         let sig = u16::from_le_bytes([buf[510], buf[511]]);
         kcomp_sdk::klog!("mbr sig={:04x}", sig);
-
-        // exit：沿用既有 smoke 行为，init 末尾释放 MMIO（不保留 persistent Bound 设备）。
-        drop(blk);
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
         if sig != 0xAA55 {
             kcomp_sdk::klog!("virtio_blk test failed");
             return -1;
         }
+
+        // 保留设备：不 drop、不 release MMIO；状态进 static，随实例存活。
+        *BLK.lock() = Some(blk);
+
+        // staged publish：Core 在 `kcomp_init` 返回 0 后提交；失败 = init 失败。
+        if let Err(rc) = BLOCK_SERVICE.publish() {
+            kcomp_sdk::klog!("virtio_blk: publish block.device failed (rc={})", rc);
+            return rc;
+        }
         kcomp_sdk::klog!("virtio_blk test passed");
-        attached = true;
         break;
     }
 
-    if !attached {
+    if BLK.lock().is_none() {
         // 没有支持的设备**不是失败**：组件仍进入 Ready（干净的 no-device）。
         kcomp_sdk::klog!("virtio_blk: no supported block device; init ok, no device attached");
     }
     0
 });
 
-// TODO(component-exit): virtio_blk 持有 MMIO/DMA authority（attached 时），退出
-// 钩子应像 kcomp_smoke 那样显式 release（停 DMA 顺序由驱动决定）；当前 no-op，
-// 停止时由 Core 兜底 revoke + quarantine（见 docs/component-model.md §5.2）。
-kcomp_sdk::kcomp_exit!(0);
+kcomp_sdk::kcomp_exit!({
+    let mmio = MMIO_HANDLE.load(Ordering::SeqCst) as u64;
+
+    // 线性拆除（顺序即不变量，见模块文档）：
+    //
+    // 1) 复位设备：写 virtio-mmio DeviceStatus（0x070，4 字节）= 0。
+    //    MMIO 此刻仍在 claim 内。
+    if mmio != 0 {
+        let _ = unsafe { abi::kcore_mmio_write_u32(mmio, VIRTIO_MMIO_STATUS_OFFSET, 0) };
+    }
+
+    // 2) 释放设备本体：`VirtIOBlk::drop` 的 dma_dealloc 在 BLK 锁内跑，
+    //    锁序 BLK → DMA_MAP 保持不变（drop 是语句末尾才发生）。
+    drop(BLK.lock().take());
+
+    // 3) DMA 兜底：正常路径第 2 步已清空；这里扫掉异常路径残留的槽位。
+    for slot in DMA_MAP.lock().iter_mut() {
+        if slot.0 != 0 {
+            let _ = unsafe { abi::kcore_dma_release(slot.1) };
+            *slot = (0, 0);
+        }
+    }
+
+    // 4) MMIO 最后释放：Core 在还有 live DMA/IRQ 子 authority 时拒绝（-EBUSY）。
+    if mmio != 0 {
+        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+    }
+
+    // 5) 归零：之后再进入任何路径都不应看到这个 handle。
+    MMIO_HANDLE.store(0, Ordering::SeqCst);
+
+    // 6) 证据行（QEMU gate 靠它证明退出钩子真的执行了）。
+    kcomp_sdk::klog!("[virtio_blk] exit");
+    0
+});
