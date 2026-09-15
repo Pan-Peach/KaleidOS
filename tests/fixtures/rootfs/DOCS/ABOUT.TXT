@@ -1,0 +1,1 @@
+KaleidOS test fixture: a tiny FAT volume for the virtio_blk block driver.

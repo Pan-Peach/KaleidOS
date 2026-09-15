@@ -40,8 +40,9 @@ GENMK     := python3 scripts/kconfig/genmk.py --kconfig $(KCONFIG_TOP)
 KCONFIG_MK := $(KCONFIG_CONFIG).mk
 
 # Goals that must NOT create or parse a configuration: host-only tools, and
-# `clean` (which has to work on a fresh checkout where no .config exists yet).
-CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig
+# `clean` / `rootfs` (both have to work on a fresh checkout where no .config
+# exists yet — the FAT image is built by mkfs.vfat/mtools, not by Kconfig).
+CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig rootfs
 
 # Goals that CREATE a configuration: they must not generate/parse one, and they
 # cannot be combined with build goals in a single invocation.
@@ -117,6 +118,7 @@ help:
 	@echo "KaleidOS — build"
 	@echo "  make kernel                      build kaleidos-\$$(KCFG_ARCH)"
 	@echo "  make qemu                        build + run in QEMU"
+	@echo "  make rootfs                      build the small FAT image attached to make qemu"
 	@echo "  make check | test-host | test-build | test-kconfig | test-qemu | test-arch | test-driver-prober"
 
 # Materialise a configuration on first use.
@@ -128,7 +130,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 	@$(GENMK) --config $(KCONFIG_CONFIG) --mk $@
 
 # ————————————————————————— build —————————————————————————
-.PHONY: kernel qemu clean distclean init.kpkg
+.PHONY: kernel qemu rootfs clean distclean init.kpkg
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 每个组件经共享管线 tools/build-kcomp.sh 构建成**链接后的** .kcomp（ET_REL 组件程序）：
@@ -163,12 +165,35 @@ kernel: init.kpkg
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
+# —— 交互运行默认挂载的小 FAT 盘（块设备驱动有真实设备可读）——
+# 文本源在 tests/fixtures/rootfs/（mtools 按目录树原样拷进镜像根），成品进
+# build/（已 gitignore，不提交二进制）。`--invariant` 让镜像字节可复现。
+# 仅在源文件较新时重建：先写 .tmp 再改名，mkfs/mcopy 中途失败不会留下
+# "比源新" 的坏镜像挡住下一次重试（幂等、便宜）。
+ROOTFS_DIR  := tests/fixtures/rootfs
+ROOTFS_MB   := 8
+ROOTFS      := $(CURDIR)/build/rootfs.fat
+ROOTFS_SRCS := $(shell find $(ROOTFS_DIR) -type f)
+
+rootfs: $(ROOTFS)
+
+$(ROOTFS): $(ROOTFS_SRCS)
+	@mkdir -p $(@D)
+	dd if=/dev/zero of=$@.tmp bs=1M count=$(ROOTFS_MB) status=none
+	mkfs.vfat --invariant -n KALEIDOS $@.tmp
+	mcopy -s -i $@.tmp $(ROOTFS_DIR)/* ::
+	mv -f $@.tmp $@
+
 # 调试看输出（串口打印 + Ctrl-A X 退出 QEMU）
 # -smp 2: 2 核（boot hart 由 OpenSBI 选择）；内存按 profile（rv64=4G，rv32=1G，
 # 32 位地址空间放不下 4 GiB RAM，见 configs/ 与 genmk.py 的 KCFG_QEMU_MEM）。
-qemu: kernel
+# 默认挂上 ROOTFS（virtio-blk）：第 0 扇区是 FAT 引导记录（510=0x55, 511=0xAA），
+# virtio_blk 因此有真实设备可读；自动化测试不用它（test-* 各自起 QEMU）。
+qemu: kernel rootfs
 	$(KCFG_QEMU) -machine virt -smp 2 -m $(KCFG_QEMU_MEM) -bios default \
-		-kernel $(OUTPUT) -nographic
+		-kernel $(OUTPUT) -nographic \
+		-drive file=$(ROOTFS),if=none,format=raw,id=rootfs \
+		-device virtio-blk-device,drive=rootfs
 
 clean:
 	rm -f kaleidos-*
