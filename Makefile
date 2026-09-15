@@ -37,29 +37,11 @@ KCONFIGLIB     ?= third_party/Kconfiglib
 CONFIGURE := python3 scripts/kconfig/configure.py --kconfig $(KCONFIG_TOP)
 GENMK     := python3 scripts/kconfig/genmk.py --kconfig $(KCONFIG_TOP)
 
-# Deprecated compatibility entry points ARCH= / VM=.  They are recognised ONLY
-# when given on the command line (environment ARCH/VM are ignored), and they
-# never carry build truth: they are translated into a PRIVATE resolved config
-# and then validated by scripts/kconfig/configure.py, so an unsatisfiable
-# request (e.g. RV64 + NoMMU) fails loudly instead of building something else.
-LEGACY_ARCH := $(if $(filter command line,$(origin ARCH)),$(ARCH),)
-LEGACY_VM   := $(if $(filter command line,$(origin VM)),$(VM),)
-
-ifneq ($(strip $(LEGACY_ARCH)$(LEGACY_VM)),)
-KCONFIG_CONFIG   := build/configs/legacy/.config
-LEGACY_REQUEST   := build/configs/legacy/.request
-LEGACY_BASE_ARGS := $(if $(wildcard .config),--base .config,--defconfig configs/qemu_rv64_defconfig)
-LEGACY_SETS      := \
-	$(if $(LEGACY_ARCH),--set CONFIG_ARCH_RISCV$(if $(filter rv32,$(LEGACY_ARCH)),32,64)=y) \
-	$(if $(LEGACY_VM),--set CONFIG_VM_$(if $(filter nommu,$(LEGACY_VM)),NOMMU,MMU)=y)
-endif
-
-# Derived AFTER the legacy block so it tracks the final KCONFIG_CONFIG.
 KCONFIG_MK := $(KCONFIG_CONFIG).mk
 
 # Goals that must NOT create or parse a configuration: host-only tools, and
 # `clean` (which has to work on a fresh checkout where no .config exists yet).
-CONFIG_FREE_GOALS := clean distclean help fmt test-host bench
+CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig
 
 # Goals that CREATE a configuration: they must not generate/parse one, and they
 # cannot be combined with build goals in a single invocation.
@@ -74,10 +56,15 @@ endif
 
 # Build invocations pull in the generated configuration fragment.  It lives next
 # to its own .config, so switching profiles can never reuse a stale fragment.
-ifeq ($(filter $(CONFIG_FREE_GOALS),$(MAKECMDGOALS)),)
-ifeq ($(filter $(CONFIG_ONLY_GOALS),$(MAKECMDGOALS)),)
+#
+# MAKECMDGOALS is global to the whole invocation, so the exemption is only valid
+# when *every* goal is config-free / config-only: otherwise `make clean kernel`
+# or `make fmt check` would strip KCFG_* from its build goal (the same class of
+# bug the config-only guard above rejects in the other direction).  `make` with
+# no goal builds kernel, so that counts as a build goal too.
+KCFG_GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),kernel)
+ifneq ($(strip $(filter-out $(CONFIG_FREE_GOALS) $(CONFIG_ONLY_GOALS),$(KCFG_GOALS))),)
 include $(KCONFIG_MK)
-endif
 endif
 
 # Explicit default goal: the generated-fragment rule above must not become it.
@@ -130,29 +117,12 @@ help:
 	@echo "KaleidOS — build"
 	@echo "  make kernel                      build kaleidos-\$$(KCFG_ARCH)"
 	@echo "  make qemu                        build + run in QEMU"
-	@echo "  make check | test-host | test-build | test-qemu | test-arch | test-driver-prober"
+	@echo "  make check | test-host | test-build | test-kconfig | test-qemu | test-arch | test-driver-prober"
 
 # Materialise a configuration on first use.
-ifeq ($(strip $(LEGACY_ARCH)$(LEGACY_VM)),)
 $(KCONFIG_CONFIG):
 	@echo "no $(KCONFIG_CONFIG) yet; creating it from configs/qemu_rv64_defconfig"
 	@$(CONFIGURE) --defconfig configs/qemu_rv64_defconfig --out $@
-else
-# The private config is re-resolved (and re-validated) exactly when the legacy
-# request changes, tracked by a stamp file.  The stamp recipe runs every time
-# (FORCE) but only touches the file on a real change: were it to rewrite $@ each
-# time, the config would count as changed on every restart and GNU make would
-# re-exec forever.
-$(LEGACY_REQUEST): FORCE
-	@mkdir -p $(dir $@)
-	@printf 'ARCH=%s VM=%s\n' '$(LEGACY_ARCH)' '$(LEGACY_VM)' > $@.tmp
-	@cmp -s $@.tmp $@ || mv $@.tmp $@
-	@rm -f $@.tmp
-
-$(KCONFIG_CONFIG): $(LEGACY_REQUEST) $(if $(wildcard .config),.config,)
-	@echo "warning: ARCH=/VM= are deprecated; prefer 'make <board>_defconfig' then 'make qemu'" >&2
-	@$(CONFIGURE) $(LEGACY_BASE_ARGS) $(LEGACY_SETS) --out $@
-endif
 
 $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 	@$(GENMK) --config $(KCONFIG_CONFIG) --mk $@
@@ -185,11 +155,11 @@ init.kpkg:
 	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS))"
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
-# KALEIDOS_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 经 genmk.py 解析成
-# KCFG_TRACE_CAPACITY；这不是 Cargo feature，由 os/core/build.rs 校验后写入
-# OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/kconfig.md）。
+# CONFIG_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 由生成的片段镜像成
+# CONFIG_TRACE_CAPACITY；这不是 Cargo feature，作为环境变量传给 os/core/build.rs
+# 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/kconfig.md）。
 kernel: init.kpkg
-	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
@@ -218,8 +188,9 @@ distclean: clean
 #   make test-qemu    两个架构都跑
 #   make test-driver-prober  driver_prober 组件端到端（positive / no-device / extra-device）
 #   make bench        host release 性能基线（手动跑，不进 CI）
-#   make check        CI 全量门禁 = fmt + clippy + test-host + test-build
-.PHONY: fmt clippy check test-host bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+#   make test-kconfig Kconfig / Makefile 胶水契约测试（host-only，快速）
+#   make check        CI 全量门禁 = fmt + clippy + test-kconfig + test-host + test-build
+.PHONY: fmt clippy check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
@@ -249,6 +220,10 @@ test-host:
 	cd os/components/driver_prober && cargo test
 	cd os/components/kbench && cargo test
 
+# Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
+test-kconfig:
+	python3 tests/kconfig/test_glue.py
+
 # 性能基线（host release，手动跑）：统一走 kernel::bench harness（见 os/core/src/bench）。
 # - trace 关掉：CONFIG_TRACE 的探针正好落在被测路径上，开着会污染数字
 #   （顺带也就验证了"关掉即零成本"）。
@@ -263,10 +238,10 @@ bench:
 
 # 交叉构建门禁：每个 profile 用一份私有 .config（互不污染，也不动用户的 .config）。
 boot-build:
-	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 boot-check:
-	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 test-build-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
@@ -289,7 +264,7 @@ test-qemu-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-qemu-one
 
 test-qemu-one: kernel
-	@python3 tests/qemu/runner.py $(KCFG_ARCH)
+	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
 test-qemu: test-qemu-rv64 test-qemu-rv32
 
@@ -307,7 +282,7 @@ test-driver-prober-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-driver-prober-one
 
 test-driver-prober-one: kernel
-	@python3 tests/qemu/driver_prober_runner.py $(KCFG_ARCH)
+	@python3 tests/qemu/driver_prober_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
 test-driver-prober: test-driver-prober-rv64 test-driver-prober-rv32
 
@@ -325,7 +300,7 @@ test-arch-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv32/.config test-arch-one
 
 test-arch-one: kernel
-	@python3 tests/qemu/arch_runner.py $(KCFG_ARCH)
+	@python3 tests/qemu/arch_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
 test-arch: test-arch-rv64 test-arch-rv32
 
@@ -341,6 +316,7 @@ check: init.kpkg
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	$(MAKE) test-kconfig
 	$(MAKE) test-host
 	$(MAKE) test-build
 

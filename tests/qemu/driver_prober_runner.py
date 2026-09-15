@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """KaleidOS driver_prober end-to-end runner (host tooling, stdlib only).
 
-Usage:  python3 tests/qemu/driver_prober_runner.py <rv64|rv32>
+Usage:  python3 tests/qemu/driver_prober_runner.py --arch <rv64|rv32> --kernel <path>
 
-Boots `kaleidos-<arch>` (select a profile, e.g. `make qemu_<arch>_defconfig`, then
-`make kernel`) and drives the Core
+Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT)) and
+drives the Core
 Monitor with `load scheduler_rr` → `load driver_prober`.  The prober does a coarse
 compatible match and auto-loads `virtio_blk`; the driver claims in its OWN init
 context and does the fine protocol match.  Three scenarios:
@@ -24,6 +24,7 @@ Raw serial output → tests/qemu/logs/<arch>-driver-prober-<case>-<stamp>.log.
 Exit 0 = all cases PASS, non-zero = FAIL.
 """
 
+import argparse
 import datetime
 import os
 import re
@@ -41,13 +42,11 @@ MBR_SIG_OFFSET = 510
 ARCH_CONF = {
     "rv64": {
         "qemu": "qemu-system-riscv64",
-        "kernel": "kaleidos-rv64",
         "mem": "4G",
         "boot_ok": "[core] BOOT CORE OK",
     },
     "rv32": {
         "qemu": "qemu-system-riscv32",
-        "kernel": "kaleidos-rv32",
         "mem": "1G",  # 32 位地址空间放不下 4 GiB RAM（见 Makefile）
         "boot_ok": "[bootstrap] RV32 CORE OK",
     },
@@ -200,14 +199,8 @@ def drive_case(proc, sink, case):
     wait_for(proc, sink, ["load virtio_blk: already loaded"], "second load")
 
 
-def run_case(arch, case):
+def run_case(arch, kernel, case):
     conf = ARCH_CONF[arch]
-    kernel = os.path.join(REPO, conf["kernel"])
-    if not os.path.exists(kernel):
-        raise RunFailure(
-            f"kernel {kernel} not found "
-            f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
-
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(BUILD_DIR, exist_ok=True)
     disks = []
@@ -252,14 +245,28 @@ def run_case(arch, case):
     return True, f"[driver-prober-{arch}] {case}: PASS (log: {log_path})"
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run the driver_prober end-to-end scenarios in QEMU.")
+    parser.add_argument("--arch", required=True, choices=sorted(ARCH_CONF),
+                        help="profile arch: selects the QEMU binary and boot marker")
+    parser.add_argument("--kernel", required=True, metavar="PATH",
+                        help="boot artifact to test (the Makefile passes $(OUTPUT))")
+    return parser.parse_args()
+
+
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in ARCH_CONF:
-        print(__doc__)
-        return 2
-    arch = sys.argv[1]
+    args = parse_args()
+    arch = args.arch
+    # 产物身份由调用方显式给出（Makefile 传 $(OUTPUT)），不按 arch 猜镜像名。
+    kernel = args.kernel if os.path.isabs(args.kernel) else os.path.join(REPO, args.kernel)
+    if not os.path.exists(kernel):
+        print(f"FAIL: kernel {kernel} not found "
+              f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
+        return 1
     passed = True
     for case in CASES:
-        ok, message = run_case(arch, case)
+        ok, message = run_case(arch, kernel, case)
         print(message)
         passed = passed and ok
     print(f"[driver-prober-{arch}] ALL {'PASS' if passed else 'FAIL'}")

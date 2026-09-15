@@ -36,7 +36,7 @@ use arch::{Timer, TimerImpl};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // 目标端 ring 容量（records）由 Kconfig `TRACE_CAPACITY` 决定：
-// Makefile（genmk.py → KCFG_TRACE_CAPACITY）→ 环境变量 → build.rs 校验 →
+// Makefile（genmk.py 生成的 CONFIG_TRACE_CAPACITY）→ 环境变量 → build.rs 校验 →
 // OUT_DIR 常量。build.rs 不重新解释 `.config`；裸机构建缺值 / 越界直接报错，
 // host 构建（cargo test / clippy）有显式默认。这里只消费生成常量。
 include!(concat!(env!("OUT_DIR"), "/trace_capacity.rs"));
@@ -258,6 +258,11 @@ std::thread_local! {
     static RING: core::cell::RefCell<TraceRing> =
         const { core::cell::RefCell::new(TraceRing::new()) };
 }
+
+// ⚠️ **host 测试不覆盖生产的锁 / 并发语义**：这个 thread_local 替身换掉了全局
+// `Mutex<TraceRing>`（也没有 `IrqSaveGuard`），所以 `cargo test` 的通过结果**不能**
+// 当作 SMP / 中断重入行为的证据；那部分由 QEMU / 真机与未来的并发探索工具承担
+// （见 docs/testing.md §4 的 trace 说明）。
 
 /// 独占 ring（读侧 / 管理路径）。
 ///

@@ -5,7 +5,7 @@
 //! **不读 `.config`**，也不重新实现 Kconfig 的默认 / `range` 语义（这里的
 //! 范围只是防御性再校验，Kconfig 仍是唯一真相，见 docs/kconfig.md）。
 //!
-//! 值由 Makefile 从 `genmk.py` 生成的 `KCFG_TRACE_CAPACITY` 传入；映射只在
+//! 值由 Makefile 从生成的片段里的 `CONFIG_TRACE_CAPACITY` 传入；映射只在
 //! genmk.py 一处。
 
 /// `TRACE_CAPACITY` 的 host 构建显式默认（与 Kconfig `default` 一致）。

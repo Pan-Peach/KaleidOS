@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""KaleidOS architectural selftest runner (host tooling, stdlib only).
 
-"""Run the feature-gated RISC-V architectural selftests in QEMU.
+Usage:  python3 tests/qemu/arch_runner.py --arch <rv64|rv32> --kernel <path>
 
-Usage: python3 tests/qemu/arch_runner.py <rv64|rv32>
+Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT),
+i.e. `kaleidos-<arch>-selftest` under the selftest profile) and drives the
+feature-gated RISC-V architectural selftests: every case boots a fresh QEMU
+process and must reach its serial-output contract (PASS marker, or PANIC plus
+the expected scause), with firmware shutdown exiting QEMU.
+
+Raw serial output → tests/qemu/logs/<arch>-archtest-<case>-<stamp>.log.
+Exit 0 = all cases PASS, non-zero = FAIL.
 """
 
+from __future__ import annotations
+
+import argparse
 import datetime
 import os
 import re
@@ -130,11 +140,14 @@ def log_path(arch: str, name: str) -> str:
 
 
 def run_case(
-    arch: str, name: str, expected_scause: int | None, required_text: str | None
+    arch: str,
+    kernel: str,
+    name: str,
+    expected_scause: int | None,
+    required_text: str | None,
 ) -> None:
     """Boot a fresh QEMU process and judge exactly one architectural test."""
     conf = ARCH_CONF[arch]
-    kernel = os.path.join(REPO, f"kaleidos-{arch}-selftest")
     command = [
         conf["qemu"],
         "-machine", "virt",
@@ -180,13 +193,22 @@ def run_case(
         print(f"[arch-{arch}] log: {path}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Boot one KaleidOS selftest artifact and judge every ArchTest case.")
+    parser.add_argument("--arch", required=True, choices=sorted(ARCH_CONF),
+                        help="profile arch: selects the QEMU binary")
+    parser.add_argument("--kernel", required=True, metavar="PATH",
+                        help="boot artifact to test (the Makefile passes $(OUTPUT))")
+    return parser.parse_args()
+
+
 def main() -> int:
     """Run all cases for one RISC-V architecture and return a shell verdict."""
-    if len(sys.argv) != 2 or sys.argv[1] not in ARCH_CONF:
-        print(__doc__)
-        return 2
-    arch = sys.argv[1]
-    kernel = os.path.join(REPO, f"kaleidos-{arch}-selftest")
+    args = parse_args()
+    arch = args.arch
+    # 产物身份由调用方显式给出（Makefile 传 $(OUTPUT)），不再按 arch 猜镜像名。
+    kernel = args.kernel if os.path.isabs(args.kernel) else os.path.join(REPO, args.kernel)
     if not os.path.exists(kernel):
         print(f"FAIL: selftest kernel {kernel} not found")
         return 1
@@ -195,7 +217,7 @@ def main() -> int:
     failures = 0
     for name, expected_scause, required_text in CASES:
         try:
-            run_case(arch, name, expected_scause, required_text)
+            run_case(arch, kernel, name, expected_scause, required_text)
         except RunFailure:
             failures += 1
 

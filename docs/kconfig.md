@@ -22,7 +22,7 @@ configs/*_defconfig ────────────────────
         cargo --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 ```
 
-- **创建 / 归一化**（`scripts/kconfig/configure.py`）：从 `configs/*_defconfig`、fragment、`--set` 解析出一份完整、归一化的 `.config`。显式请求的值如果在 Kconfig 解析后活不下来（`depends on` 不满足、symbol 不可见、名字拼错），脚本直接报错退出，**不写一份会撒谎的 config**。
+- **创建 / 归一化**（`scripts/kconfig/configure.py`）：从 `configs/*_defconfig`、fragment、`--set` 解析出一份完整、归一化的 `.config`。显式请求的值（无论来自 `--set`、defconfig 还是 fragment）如果在 Kconfig 解析后活不下来（`depends on` 不满足、symbol 不可见、名字拼错），脚本直接报错退出，**不写一份会撒谎的 config**。
 - **消费**（`scripts/kconfig/genmk.py`）：把 `.config` 翻译成 Make 片段 `$(KCONFIG_CONFIG).mk`。这是**唯一**存放「config → build 映射」的地方。
 
 `Makefile` 只 `include` 生成的片段，消费里面的 `KCFG_*`，从不自己推导。
@@ -40,8 +40,7 @@ Kconfig 前端复用 `third_party/Kconfiglib`（git submodule，pin 到具体 co
 | `KCFG_QEMU_MEM` | QEMU 内存（`1G` / `4G`） |
 | `KCFG_BOOT_FEATURES` | 传给 boot crate 的 Cargo features（如 `supervisor,vm-mmu`） |
 | `KCFG_SELFTEST` | `y` / `n`，决定产物名与 selftest 入口 |
-| `KCFG_TRACE_CAPACITY` | 解析后的 trace ring 容量（`CONFIG_TRACE_CAPACITY`），由 Makefile 作为环境变量传给 `os/core/build.rs` |
-| `CONFIG_<symbol>` | 每个 bool / int symbol 都按解析后的值镜像一份 |
+| `CONFIG_<symbol>` | 每个 bool / int symbol 都按解析后的值镜像一份（符号自己的名字，一个数字不造第二个名字；Makefile 把 `CONFIG_TRACE_CAPACITY` 作为环境变量转发给 `os/core/build.rs`） |
 
 所有变量都以 `override` 写出：命令行上误加的 `make KCFG_...=...` 无法制造第二个真相，解析后的 config 永远获胜。构建命令形如：
 
@@ -49,7 +48,7 @@ Kconfig 前端复用 `third_party/Kconfiglib`（git submodule，pin 到具体 co
 cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 ```
 
-`--no-default-features` 是硬性约定：managed kernel build 永远显式声明 profile（见 §6）。
+`--no-default-features` 是硬性约定：managed kernel build 永远显式声明 profile（见 §5）。
 
 ## 2. 命令
 
@@ -70,7 +69,9 @@ make qemu_rv64_defconfig && make qemu   # 主工作流：先选 profile，再构
 make menuconfig && make qemu            # 第二条：交互调参后直接构建运行
 ```
 
-`menuconfig` / `olddefconfig` / `savedefconfig` / `syncconfig` / `defconfig` / `%_defconfig` 是 **config-only goals**：不能和 build goals 写进同一条 `make` 命令（Makefile 会直接报错），它们本身也不解析已有 config。`clean` / `distclean` / `help` / `fmt` / `test-host` / `bench` 是 config-free goals，`make clean` 在没有 `.config` 的全新 checkout 上也能跑。
+`menuconfig` / `olddefconfig` / `savedefconfig` / `syncconfig` / `defconfig` / `%_defconfig` 是 **config-only goals**：不能和 build goals 写进同一条 `make` 命令（Makefile 会直接报错），它们本身也不解析已有 config。`clean` / `distclean` / `help` / `fmt` / `test-host` / `bench` / `test-kconfig` 是 config-free goals，`make clean` 在没有 `.config` 的全新 checkout 上也能跑。豁免只对**整条命令**成立：只有所有 goal 都 config-free / config-only 时才跳过 include，所以 `make clean kernel`、`make fmt check` 里的 build goal 仍会拿到 `KCFG_*`。
+
+`ARCH=` / `VM=` 之类的 make 变量不参与配置：profile 只由 `.config` 决定（选 profile = `make <board>_defconfig`），没有兼容层会把它们翻译成配置。`make test-kconfig` 跑本层的胶水契约测试（host-only，也是 `make check` 的一步）。
 
 ## 3. 符号（phase 1）
 
@@ -82,7 +83,7 @@ make menuconfig && make qemu            # 第二条：交互调参后直接构�
 | `PREEMPT` | bool | n | 抢占式调度；当前基线是协作式 RR |
 | `SELFTEST` | bool | n | 构建 ArchTest 镜像；`depends on VM_MMU`，位于 "Debugging / Testing" |
 | `TRACE` | bool | y | 结构化 Core trace（`trace::emit`）。关掉即内联空操作、热路径零成本；**跑 benchmark 时应当关掉** |
-| `TRACE_CAPACITY` | int | 1024 | trace ring 容量（records，`range 64 8192`）；经 `KCFG_TRACE_CAPACITY` → `os/core/build.rs` 校验 → OUT_DIR 常量，不是 Cargo feature |
+| `TRACE_CAPACITY` | int | 1024 | trace ring 容量（records，`range 64 8192`）；Makefile 把 `CONFIG_TRACE_CAPACITY` 交给 `os/core/build.rs` 校验 → OUT_DIR 常量，不是 Cargo feature |
 
 `os/components/Kconfig` 目前是空的扩展点：组件选择留到 loader + manifest 里程碑，Phase 1 不迁移（组件列表仍在 Makefile 的 `KCOMP_SRCS`）。
 
@@ -105,7 +106,7 @@ Kconfig 本身让不可能的组合不可表达：
 
 ### 4.4 只有 `make` 拥有 config → build 映射
 
-映射只存在于 `genmk.py` 的一张注释表里（`ARCH_MAP` + 特权 / VM feature 表 + `KCFG_BOOT_FEATURES` 组装 + 整数运输 `KCFG_TRACE_CAPACITY`）。Makefile、Cargo、`.cargo/config.toml` 都不各自决定 profile。判断标准：**一个事实只有一处真相**。
+映射只存在于 `genmk.py` 的一张注释表里（`ARCH_MAP` + 特权 / VM feature 表 + `KCFG_BOOT_FEATURES` 组装）。bool / int 以 `CONFIG_<symbol>` 镜像输出——那就是 Kconfig 里符号自己的名字，Makefile 只把 `CONFIG_TRACE_CAPACITY` 转发给 build.rs，不再为同一个数字造第二个名字。Makefile、Cargo、`.cargo/config.toml` 都不各自决定 profile。判断标准：**一个事实只有一处真相**。
 
 ### 4.5 fragment 路径是按 config 派生的
 
@@ -113,16 +114,7 @@ Kconfig 本身让不可能的组合不可表达：
 
 `.config` / `.config.mk` / `.config.old`（以及整个 `build/`）都在 `.gitignore` 里；只有 `configs/*_defconfig` 提交进仓库。`make distclean` 连配置一起清掉，`make clean` 不动 `.config`（它是用户数据）。
 
-## 5. 已弃用的兼容入口 `ARCH=` / `VM=`
-
-命令行的 `ARCH=rv32` / `VM=nommu` 仍然能用，但会打印弃用警告。它们**不携带 build truth**：会被翻译成 `build/configs/legacy/` 下一份私有 resolved config，再由 `configure.py` 校验。
-
-- 只在**命令行**给出时生效；环境变量 `ARCH` / `VM` 被忽略。
-- 不可满足的请求（如 `make ARCH=rv64 VM=nommu qemu`）会**显式失败**，而不是悄悄构建成别的东西。
-
-新代码一律用 `make <board>_defconfig`。
-
-## 6. 不要在这里配置
+## 5. 不要在这里配置
 
 以下层**不得**决定系统 profile，否则同一事实会出现第二个真相：
 
@@ -133,19 +125,20 @@ Kconfig 本身让不可能的组合不可表达：
 
 Phase 1 **不迁移**：组件 / 驱动选择、调度器、PMP/MPU、平台发现、其余调试开关。
 
-## 7. 如何新增一个 config symbol
+## 6. 如何新增一个 config symbol
 
 1. 加到正确的 `Kconfig`：架构 / 特权级 / VM 级别的东西放 `os/arch/Kconfig`，Core 构建开关放 `os/core/Kconfig`，组件选择（将来）放 `os/components/Kconfig`。优先用 `choice` / `depends on` / `default ... if` 表达约束，而不是事后用 Rust `compile_error!` 兜底；避免 `select`。
 2. 如果这个 symbol 要改变构建，把它加进 `scripts/kconfig/genmk.py` 的映射表（**唯一**存放 config → build 的地方），例如往 `KCFG_BOOT_FEATURES` 追加一个 feature。
 3. 如果它改变**构建契约**（target triple、linker、QEMU 二进制、内存），扩展 `genmk.py` 里的 `ARCH_MAP`。
 4. 如果某个 profile 默认要打开它，加到对应的 `configs/*_defconfig`。
 5. 如果某个 Rust crate 编译期需要它，让它成为一个 Cargo feature，由 Makefile 通过生成的 `KCFG_*` 传入；**不要让 crate 自己决定**。
-   **bool 之外的取值（int 等）不拆成"每个值一个 Cargo feature"**：Makefile 把解析后的 `KCFG_*` 作为**环境变量**传给 `os/core/build.rs`，build.rs 校验后写入 `OUT_DIR` 常量（见 `TRACE_CAPACITY`）。build.rs **不读 `.config`**；裸机构建缺值 / 越界直接报错，host 构建（`cargo test` / `clippy`）用显式默认。
+   **bool 之外的取值（int 等）不拆成"每个值一个 Cargo feature"**：Makefile 把镜像出的 `CONFIG_<symbol>` 作为**环境变量**传给 `os/core/build.rs`，build.rs 校验后写入 `OUT_DIR` 常量（见 `TRACE_CAPACITY`）。build.rs **不读 `.config`**；裸机构建缺值 / 越界直接报错，host 构建（`cargo test` / `clippy`）用显式默认。
 6. 命名禁止版本后缀（`V1`、`_v2`）：契约变了就原地替换，不做兼容别名。
 
-## 8. 验证（验收标准）
+## 7. 验证（验收标准）
 
 - `make <board>_defconfig && make qemu` 对三个 profile 都能跑通：`qemu_rv64`、`qemu_rv32`、`qemu_rv32_nommu`；
 - MMU / NoMMU 与 supervisor / machine 由构造互斥（choice + `depends on`），不可能同时选中；
 - `make test-qemu`、`make test-arch`、`make test-driver-prober`、`make check`、`make test-host`、`make test-build` 在两个架构上都通过；
+- `make test-kconfig`（`make check` 的一步）覆盖本层胶水契约：不能存活的显式请求报错（`--set` / defconfig / fragment）、有效 fragment 栈不被误拒、混合 goal 的 include 粒度、config-free goal 不在全新 checkout 上创建 `.config`；
 - `make clean` 在没有 `.config` 的全新 checkout 上也能工作。

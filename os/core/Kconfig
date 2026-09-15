@@ -39,9 +39,10 @@ config TRACE_CAPACITY
 	  still sizes the image when tracing is compiled out.
 
 	  The value travels to the Core crate as one resolved number (not a Cargo
-	  feature): genmk.py emits KCFG_TRACE_CAPACITY, the Makefile passes it to
-	  os/core/build.rs, and build.rs validates it before writing the Rust
-	  constant.  1024 records cover a full boot plus one core_test round.
+	  feature): genmk.py mirrors it as CONFIG_TRACE_CAPACITY, the Makefile
+	  passes that to os/core/build.rs, and build.rs validates it before writing
+	  the Rust constant.  1024 records cover a full boot plus one core_test
+	  round.
 
 config SELFTEST
 	bool "Build the ArchTest selftest image"

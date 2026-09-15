@@ -67,15 +67,6 @@ def is_y(kconf, name):
     return sym is not None and sym.str_value == "y"
 
 
-def int_value(kconf, name):
-    """Resolved decimal value of an int symbol.  `name` carries the CONFIG_ prefix."""
-    sym = kconf.syms.get(name[len("CONFIG_"):] if name.startswith("CONFIG_")
-                         else name)
-    if sym is None or sym.type != kconfiglib.INT:
-        sys.exit("error: expected int symbol {}".format(name))
-    return sym.str_value
-
-
 def exactly_one(kconf, mapping, what):
     """Return the single selected key, or exit with a clear message."""
     chosen = [key for key in mapping if is_y(kconf, key)]
@@ -108,12 +99,11 @@ def variables(kconf):
         ("KCFG_QEMU_MEM", qemu_mem),
         ("KCFG_BOOT_FEATURES", ",".join(features)),
         ("KCFG_SELFTEST", "y" if is_y(kconf, "CONFIG_SELFTEST") else "n"),
-        # Resolved integer handed to os/core/build.rs (validated there).  The
-        # value is not a Cargo feature: one build variable, one source of truth.
-        ("KCFG_TRACE_CAPACITY", int_value(kconf, "CONFIG_TRACE_CAPACITY")),
     ]
     # Mirror every BOOL as CONFIG_<name>=y/n and every INT as its resolved
-    # decimal value, so a resolved number can reach build.rs unchanged.
+    # decimal value: 这是 Kconfig 符号自己的名字，Makefile 直接消费（例如把
+    # CONFIG_TRACE_CAPACITY 作为环境变量转发给 os/core/build.rs）。不再为同一个
+    # 数字造第二个名字。
     for sym in kconf.unique_defined_syms:
         if sym.type in (kconfiglib.BOOL, kconfiglib.INT):
             lines.append(("CONFIG_" + sym.name, sym.str_value))

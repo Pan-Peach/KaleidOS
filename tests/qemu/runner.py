@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """KaleidOS automated QEMU test runner (host tooling, stdlib only).
 
-Usage:  python3 tests/qemu/runner.py <rv64|rv32>
+Usage:  python3 tests/qemu/runner.py --arch <rv64|rv32> --kernel <path>
 
-Drives a QEMU boot of `kaleidos-<arch>`.  Select a profile first, e.g.
+Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT),
+e.g. `kaleidos-rv64`), so the runner never has to guess which image belongs to
+the selected profile.  Select a profile first, e.g.
 `make qemu_<arch>_defconfig`, then `make kernel`:
 
 1. boot smoke  —— wait for the arch boot marker, then the Core Monitor banner;
@@ -22,6 +24,7 @@ Exit code 0 = PASS, non-zero = FAIL. Markers below were captured empirically
 from current develop (do not guess markers from old docs).
 """
 
+import argparse
 import datetime
 import os
 import re
@@ -36,14 +39,12 @@ LOGS_DIR = os.path.join(REPO, "tests", "qemu", "logs")
 ARCH_CONF = {
     "rv64": {
         "qemu": "qemu-system-riscv64",
-        "kernel": "kaleidos-rv64",
         "mem": "4G",
         # 启动完成 marker（实测 main64.rs / core::init 输出）
         "boot_ok": "[core] BOOT CORE OK",
     },
     "rv32": {
         "qemu": "qemu-system-riscv32",
-        "kernel": "kaleidos-rv32",
         "mem": "1G",  # 32 位地址空间放不下 4 GiB RAM（见 Makefile）
         "boot_ok": "[bootstrap] RV32 CORE OK",
     },
@@ -69,6 +70,16 @@ SHUTDOWN_TIMEOUT_S = 10
 
 class RunFailure(Exception):
     pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Boot one KaleidOS artifact in QEMU and run CoreTest.")
+    parser.add_argument("--arch", required=True, choices=sorted(ARCH_CONF),
+                        help="profile arch: selects the QEMU binary and boot marker")
+    parser.add_argument("--kernel", required=True, metavar="PATH",
+                        help="boot artifact to test (the Makefile passes $(OUTPUT))")
+    return parser.parse_args()
 
 
 def collect(proc, deadline_s, expected, forbid=()):
@@ -110,25 +121,16 @@ def send(proc, data: str):
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in ARCH_CONF:
-        print(__doc__)
-        return 2
-    arch = sys.argv[1]
+    args = parse_args()
+    arch = args.arch
     conf = ARCH_CONF[arch]
 
-    kernel = os.path.join(REPO, conf["kernel"])
+    # 产物身份由调用方显式给出（Makefile 传 $(OUTPUT)），不再用 mtime 猜镜像；
+    # 未来若要做更强身份校验，可在产物里内嵌 config hash / init.kpkg hash（TODO）。
+    kernel = args.kernel if os.path.isabs(args.kernel) else os.path.join(REPO, args.kernel)
     if not os.path.exists(kernel):
         print(f"FAIL: kernel {kernel} not found "
               f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
-        return 1
-
-    # 陈旧镜像守卫：`make kernel` 跟随 `.config`，而本 runner 按 arch 只 boot
-    # `kaleidos-<arch>`。两者对不上时（例如 `.config` 是 rv32，而归此处 boot rv64）
-    # 会**静默地测试一个旧镜像** —— 已经踩过一次坑，所以这里直接硬失败。
-    package = os.path.join(REPO, "tools", "qemu", "init.kpkg")
-    if os.path.exists(package) and os.path.getmtime(kernel) < os.path.getmtime(package):
-        print(f"FAIL: {conf['kernel']} is older than tools/qemu/init.kpkg (stale image): "
-              f"run `make qemu_{arch}_defconfig && make kernel`")
         return 1
 
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -147,6 +149,9 @@ def main() -> int:
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
+    # collect() 可能在第一次赋值之前就抛 RunFailure（例如启动即 PANIC），而下面的
+    # 失败处理会写 `output`——必须先初始化，否则失败路径自己 UnboundLocalError。
+    output = ""
     summary = []
 
     try:
