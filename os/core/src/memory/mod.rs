@@ -319,4 +319,31 @@ mod tests {
             Err(buddy_system_allocator::AllocError::NoMemory)
         ));
     }
+
+    /// 性能基线：按 order 分档测 alloc/free 往返（`make bench`）。
+    ///
+    /// 分档而不是只报一个数：buddy 的成本随 order 变化（分裂/合并的层数），
+    /// 混成一个数字就看不出来了。以后再加 fragmentation 基准。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_alloc_free_by_order() {
+        let _heap = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        crate::bench::report_environment();
+        for (name, order) in [
+            ("alloc_free.order0", 0u32),
+            ("alloc_free.order1", 1),
+            ("alloc_free.order2", 2),
+            ("alloc_free.order3", 3),
+        ] {
+            let size = ALLOC_GRANULE << order;
+            let mut bench = crate::bench::Bench::new(name);
+            bench.run(100, || {
+                let lease = alloc_region(size).expect("alloc");
+                free_region(lease).expect("free");
+            });
+            bench.finish().report();
+        }
+    }
 }

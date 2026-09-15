@@ -46,3 +46,31 @@ pub use mmio::MmioHandle;
 
 pub(crate) use generic::Slot;
 pub(crate) use table::ResourceTable;
+
+/// 资源种类：authority 事件的类型化标签（trace / 记账用）。
+///
+/// 只描述"哪一类 authority"，不携带地址、设备号或 IRQ 线 —— 那些是各资源表
+/// 内部的真相。与具体 Handle 类型一一对应（`Mmio`→`MmioHandle`，…）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    Mmio,
+    Irq,
+    Dma,
+}
+
+/// 跨 ABI 的 opaque handle 编码（见 `Handle::to_raw`：`slot << 32 | generation`）。
+///
+/// 只保证"可传递、可比较、可记录"；它**不是** authority —— 数字可被伪造，
+/// 真正的权限永远来自资源表对 slot/generation/owner/生命周期的验证。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawHandle(u64);
+
+impl RawHandle {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}

@@ -68,6 +68,11 @@ const COMMANDS: &[Command] = &[
         run: cmds::catalog,
     },
     Command {
+        name: "trace",
+        help: "trace status / toggle event kinds",
+        run: cmds::trace,
+    },
+    Command {
         name: "shutdown",
         help: "shutdown the system",
         run: cmds::shutdown,
@@ -237,5 +242,34 @@ mod tests {
     fn empty_input_is_unknown_empty() {
         let r = resolve_command(b"");
         assert!(matches!(r, Resolved::Unknown(_)));
+    }
+
+    #[test]
+    fn trace_command_resolves_with_arguments() {
+        let r = resolve_command(b"trace irq off");
+        assert_eq!(name(&r), "trace");
+        assert_eq!(args(&r), b"irq off");
+    }
+
+    /// `trace` 是 Core 管理路径：类别开关真的落到运行时掩码上。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn trace_command_toggles_category_mask() {
+        let _trace = crate::trace::test_support::GUARD.lock();
+        crate::trace::reset_for_test();
+
+        cmds::trace(b"irq off");
+        let mask = crate::trace::enabled_mask() as u32;
+        assert_eq!(mask & crate::trace::MASK_IRQ, 0, "irq 类别必须被关闭");
+        assert_ne!(mask & crate::trace::MASK_TASK, 0, "其他类别不受影响");
+
+        // 未知类别 / 缺动作不得改变掩码。
+        cmds::trace(b"nope off");
+        cmds::trace(b"irq");
+        assert_eq!(crate::trace::enabled_mask() as u32, mask);
+
+        cmds::trace(b"all on");
+        assert_eq!(crate::trace::enabled_mask(), crate::trace::ENABLED_MASK_ALL);
+        crate::trace::reset_for_test();
     }
 }

@@ -45,7 +45,7 @@
 //! 优先级/触发方式配置、共享中断线、per-line 统计、SMP affinity、把 PLIC 从
 //! arch 降级为 Driver Component。**不保留 compatible-based 的 IRQ 认领旁路**。
 
-use super::{Handle, HandleError, ResourceTable, mmio};
+use super::{Handle, HandleError, ResourceKind, ResourceTable, mmio};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine;
@@ -149,7 +149,7 @@ pub struct IrqTable {
 impl IrqTable {
     pub const fn new() -> Self {
         Self {
-            table: ResourceTable::new(),
+            table: ResourceTable::new(ResourceKind::Irq),
         }
     }
 
@@ -281,13 +281,16 @@ impl IrqTable {
         })
     }
 
-    /// 取该中断号已注册的投递目标（`IrqDelivery` 是 Copy）。
-    /// 供中断上下文的 `route` **在锁内取一份拷贝、放锁后再调用**。
-    pub fn delivery_of(&self, number: u32) -> Option<IrqDelivery> {
+    /// 取该中断号的 (owner, 已注册投递目标)：**一次锁内取齐**。
+    /// 供中断上下文的 `route` 取一份拷贝、放锁后再动作（trap 可重入）。
+    ///
+    /// owner 是 Core truth：trace 需要知道这次投递落在哪个组件；投递存在
+    /// （`Some`）意味着该线有 live owner，因此二者在同一次查询里返回，避免
+    /// 两次独立查找可能出现的不一致。
+    pub fn route_of(&self, number: u32) -> Option<(ComponentId, Option<IrqDelivery>)> {
         self.table.slots().iter().find_map(|slot| {
-            slot.object()
-                .filter(|irq| irq.number == number)
-                .and_then(|irq| irq.delivery)
+            let irq = slot.object()?;
+            (irq.number == number).then_some((slot.owner(), irq.delivery))
         })
     }
 }

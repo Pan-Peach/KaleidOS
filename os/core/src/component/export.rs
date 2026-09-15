@@ -186,11 +186,80 @@ extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Category 0：Trace（只读观察面）
+// ---------------------------------------------------------------------------
+
+/// 读一条 trace 记录（组件用它断言事件序列 / 调试；**只读**，无 god-mode）。
+///
+/// 语义：把 `seq >= since` 的**第一条**记录写入调用者提供的 `out`，并通过
+/// `out_next` 返回下一次应传的 `since`（= 本次记录 `seq` + 1）。没有更多记录时
+/// 返回 `ENOENT` —— **不返回 0**，否则无法区分"读到了一条"与"读完了"。
+///
+/// 实现为 O(1)：直接在 ring 元数据上定位并拷贝一条（锁内无遍历、无回调、无分配），
+/// 命中后立即返回。`since` 若已被逐出保留区，返回的是当前最旧存活记录——
+/// reader 的缺口 = `record.seq - since`。
+///
+/// 不分配、不回调、不暴露 Core 内部指针：`out` / `out_next` 都是调用者自己的内存。
+/// 记录形态是 `#[repr(C)]` 的稳定编码（见 `trace::abi`），不是 Rust enum layout。
+extern "C" fn kcore_trace_read(
+    since: u64,
+    out: *mut crate::trace::TraceRecordAbi,
+    out_next: *mut u64,
+) -> i32 {
+    if out.is_null() || out_next.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(record) = crate::trace::ring::read_one(since) else {
+        return Errno::ENOENT.code();
+    };
+    let abi = crate::trace::TraceRecordAbi::from(&record);
+    // SAFETY: 两个指针在上面已校验非空；它们是调用者提供的可写内存。
+    unsafe {
+        out.write(abi);
+        out_next.write(record.seq.saturating_add(1));
+    }
+    0
+}
+
+/// 读 Trace 子系统状态（只读观察面）：容量 / 最旧 seq / 下一 seq / 逐出总数 /
+/// 已使能事件掩码。值走调用者提供的 `out`。
+///
+/// 成功 = 0；失败 = `-Errno`（`EFAULT` 空指针）。
+///
+/// **损失语义**：`overwritten_total` 是"因 ring 满被逐出保留区"的记录总数，
+/// 不是"某个 reader 漏掉的条数"——reader 的真实缺口是
+/// `record.seq - since`（见 [`kcore_trace_read`]）。被事件使能掩码过滤的事件
+/// 不记录、也不消耗 `seq`，不算丢失。
+extern "C" fn kcore_trace_stats(out: *mut crate::trace::TraceStatsAbi) -> i32 {
+    if out.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let stats = crate::trace::stats();
+    let abi = crate::trace::TraceStatsAbi::from(&stats);
+    // SAFETY: out 在上面已校验非空；它是调用者提供的可写内存。
+    unsafe { out.write(abi) };
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Category 3：Machine query（已提交机器真相的只读查询；counts/ids → u32）
 // ---------------------------------------------------------------------------
 
 extern "C" fn kcore_machine_boot_hart() -> u32 {
     machine::committed().map_or(0, |m| m.boot_hart as u32)
+}
+
+/// 单调时钟（`rdtime` 的原始 tick）——组件侧计时用，无 authority 语义。
+///
+/// 频率见 [`kcore_timebase_hz`]。注意真机上 timebase 常是 10 MHz（1 tick =
+/// 100 ns），测很短的操作要么**累积多次再除**，要么等 cycle 源（`rdcycle`）。
+extern "C" fn kcore_now() -> u64 {
+    <arch::TimerImpl as arch::Timer>::now()
+}
+
+/// 时钟频率（Hz）：把 [`kcore_now`] 的 tick 换算成时间需要它。
+extern "C" fn kcore_timebase_hz() -> u64 {
+    machine::committed().map_or(0, |m| m.timebase_frequency)
 }
 
 extern "C" fn kcore_machine_cpu_count() -> u32 {
@@ -911,7 +980,24 @@ extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 38] = [
+static EXPORTS: [Export; 42] = [
+    // Category 0：Trace / 时钟（只读观察面）
+    Export {
+        name: b"kcore_trace_read",
+        address: ExportAddress(kcore_trace_read as *const ()),
+    },
+    Export {
+        name: b"kcore_trace_stats",
+        address: ExportAddress(kcore_trace_stats as *const ()),
+    },
+    Export {
+        name: b"kcore_now",
+        address: ExportAddress(kcore_now as *const ()),
+    },
+    Export {
+        name: b"kcore_timebase_hz",
+        address: ExportAddress(kcore_timebase_hz as *const ()),
+    },
     // Category 1：Runtime / shared heap
     Export {
         name: b"kcore_heap_alloc",
@@ -1094,6 +1180,8 @@ mod tests {
     fn resolves_all_entries() {
         use alloc::string::String;
         for name in [
+            &b"kcore_trace_read"[..],
+            &b"kcore_trace_stats"[..],
             &b"kcore_heap_alloc"[..],
             &b"kcore_heap_dealloc"[..],
             &b"kcore_console_write_byte"[..],
@@ -1449,5 +1537,86 @@ mod tests {
         // size=0 与非法 align（非 2 的幂）必须返回 null，不得 panic/UB。
         assert!(alloc(0, 8).is_null());
         assert!(alloc(16, 3).is_null());
+    }
+
+    /// `kcore_trace_read`：一次只读一条、`out_next` 作续读游标、读空返回
+    /// `ENOENT`、空指针返回 `EFAULT`。走的是**真实导出函数**，不是复刻逻辑。
+    ///
+    /// 只在 `CONFIG_TRACE=y` 时有意义：trace 编译掉后没有可读的事件。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn trace_read_export_returns_one_record_and_a_cursor() {
+        let _serial = crate::trace::test_support::GUARD.lock();
+        crate::trace::reset_for_test();
+        crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq: 7 });
+        crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq: 7 });
+
+        let mut record = crate::trace::TraceRecordAbi {
+            seq: 0,
+            timestamp: 0,
+            kind: 0,
+            flags: 0,
+            a: 0,
+            b: 0,
+            c: 0,
+        };
+        let mut next = 0u64;
+
+        // 第一条：IrqEnter，游标推进到 seq + 1。
+        assert_eq!(kcore_trace_read(0, &mut record, &mut next), 0);
+        assert_eq!(record.kind, crate::trace::abi::KIND_IRQ_ENTER);
+        assert_eq!(record.a, 7, "IrqEnter 的 irq 走 payload a");
+        assert_eq!(next, record.seq + 1);
+
+        // 用游标续读第二条。
+        assert_eq!(kcore_trace_read(next, &mut record, &mut next), 0);
+        assert_eq!(record.kind, crate::trace::abi::KIND_IRQ_ACK);
+
+        // 读完必须返回 ENOENT —— 不能返回 0，否则无法区分"读到"与"读完"。
+        assert_eq!(
+            kcore_trace_read(next, &mut record, &mut next),
+            Errno::ENOENT.code()
+        );
+
+        // 空指针 → EFAULT（两个 out 参数都要校验）。
+        assert_eq!(
+            kcore_trace_read(0, core::ptr::null_mut(), &mut next),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(
+            kcore_trace_read(0, &mut record, core::ptr::null_mut()),
+            Errno::EFAULT.code()
+        );
+    }
+
+    /// `kcore_trace_stats`：字段显式编码、空指针 `EFAULT`，走真实导出函数。
+    ///
+    /// 只在 `CONFIG_TRACE=y` 时有意义：trace 编译掉后 ring 恒空（`enabled_mask == 0`）。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn trace_stats_export_reports_ring_state() {
+        let _serial = crate::trace::test_support::GUARD.lock();
+        crate::trace::reset_for_test();
+        crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq: 7 });
+        crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq: 7 });
+
+        let mut out = crate::trace::TraceStatsAbi {
+            capacity: 0,
+            oldest_seq: 0,
+            next_seq: 0,
+            overwritten_total: 0,
+            enabled_mask: 0,
+        };
+        assert_eq!(kcore_trace_stats(&mut out), 0);
+        assert_eq!(out.capacity, crate::trace::capacity() as u64);
+        assert_eq!(out.oldest_seq, 1);
+        assert_eq!(out.next_seq, 3);
+        assert_eq!(out.overwritten_total, 0);
+        assert_eq!(out.enabled_mask, crate::trace::ENABLED_MASK_ALL);
+
+        assert_eq!(
+            kcore_trace_stats(core::ptr::null_mut()),
+            Errno::EFAULT.code()
+        );
     }
 }

@@ -1,6 +1,8 @@
-//! Core Monitor 命令实现（machine / memory / help）。
+//! Core Monitor 命令实现（machine / memory / help / trace …）。
 //!
-//! 全部只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
+//! 查询命令只读：查询 core 状态并打印，不修改任何状态（无 god-mode）。
+//! 管理命令（load / trace / shutdown…）走 Core 已有的语义入口；trace 掩码是
+//! Core 管理路径的一部分（组件没有全局 trace-control authority，只能读）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
 
 use crate::component::load::ComponentLoadError;
@@ -182,6 +184,97 @@ pub fn catalog(_line: &[u8]) {
         count += 1;
     }
     printk!("catalog: {count} available (load <name>)\n");
+}
+
+/// Monitor 的事件类别：名字 → 使能位并集（位定义见 `trace::ring`）。
+struct TraceCategory {
+    name: &'static str,
+    mask: u32,
+}
+
+const TRACE_CATEGORIES: &[TraceCategory] = &[
+    TraceCategory {
+        name: "task",
+        mask: crate::trace::MASK_TASK,
+    },
+    TraceCategory {
+        name: "policy",
+        mask: crate::trace::MASK_POLICY,
+    },
+    TraceCategory {
+        name: "component",
+        mask: crate::trace::MASK_COMPONENT,
+    },
+    TraceCategory {
+        name: "resource",
+        mask: crate::trace::MASK_RESOURCE,
+    },
+    TraceCategory {
+        name: "interface",
+        mask: crate::trace::MASK_INTERFACE,
+    },
+    TraceCategory {
+        name: "irq",
+        mask: crate::trace::MASK_IRQ,
+    },
+];
+
+/// `trace [<category|all> on|off]`：查看 / 开关运行时事件使能掩码。
+///
+/// 掩码是 Core 管理路径的一部分：组件没有全局 trace-control authority，
+/// 只能经 `kcore_trace_stats` **读**。被关闭的事件不记录、不消耗 `seq`。
+pub fn trace(line: &[u8]) {
+    if !cfg!(feature = "trace") {
+        printk!("trace: not compiled in (CONFIG_TRACE=n)\n");
+        return;
+    }
+    if line.trim_ascii().is_empty() {
+        trace_status();
+        return;
+    }
+    let mut tokens = line.trim_ascii().split(|&b| b.is_ascii_whitespace());
+    let name = tokens.next().unwrap_or(b"");
+    let mask = if name == b"all" {
+        crate::trace::ENABLED_MASK_ALL as u32
+    } else if let Some(category) = TRACE_CATEGORIES.iter().find(|c| c.name.as_bytes() == name) {
+        category.mask
+    } else {
+        printk!("trace: unknown category (try 'trace')\n");
+        return;
+    };
+    let current = crate::trace::enabled_mask() as u32;
+    let next = match tokens.next() {
+        Some(b"on") => current | mask,
+        Some(b"off") => current & !mask,
+        _ => {
+            printk!("usage: trace <all|task|policy|component|resource|interface|irq> on|off\n");
+            return;
+        }
+    };
+    crate::trace::set_enabled_mask(next);
+    trace_status();
+}
+
+/// `trace` 无参数：打印采集状态 + 各事件类别的 on/off。
+fn trace_status() {
+    let stats = crate::trace::stats();
+    printk!(
+        "trace: capacity={} next_seq={} oldest_seq={} overwritten={} mask={:#06x}\n",
+        crate::trace::capacity(),
+        stats.next_seq,
+        stats.oldest_seq,
+        stats.overwritten_total,
+        stats.enabled_mask
+    );
+    let mask = crate::trace::enabled_mask() as u32;
+    for category in TRACE_CATEGORIES {
+        let state = if mask & category.mask == 0 {
+            "off"
+        } else {
+            "on"
+        };
+        printk!("  {:<10} {}\n", category.name, state);
+    }
 }
 
 pub fn shutdown(_line: &[u8]) {

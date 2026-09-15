@@ -315,4 +315,37 @@ mod tests {
         assert_eq!(t.start(OWNER, id), Ok(()));
         assert_eq!(t.get(id).unwrap().state(), TaskState::Runnable);
     }
+
+    /// 性能基线（`make bench`）：**task 数量增长时的趋势**。
+    ///
+    /// 先证明 O(N) 是不是真问题，再决定加不加索引（与 handle scaling 同一模式）。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_task_scaling() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        crate::bench::report_environment();
+        const SIZES: [(usize, &str); 3] = [
+            (1, "task.lookup.n1"),
+            (32, "task.lookup.n32"),
+            (256, "task.lookup.n256"),
+        ];
+        for (count, name) in SIZES {
+            let mut table = TaskTable::new();
+            let mut ids = alloc::vec::Vec::new();
+            for _ in 0..count {
+                let id = table.create(OWNER, 0x8000_0000).unwrap();
+                table.transition(id, TaskState::Runnable).unwrap();
+                ids.push(id);
+            }
+            let probe = ids[count / 2];
+            let mut bench = crate::bench::Bench::new(name);
+            bench.run(100, || table.get(probe).is_some());
+            bench.finish().report();
+            for id in ids {
+                table.remove(id).unwrap();
+            }
+        }
+    }
 }

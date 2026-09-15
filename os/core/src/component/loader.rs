@@ -445,4 +445,56 @@ mod tests {
         assert_eq!(place[0], (1, 0));
         assert_eq!(image_size, 4);
     }
+
+    /// 性能基线（`make bench`）：**component loader 分阶段成本**。
+    ///
+    /// 不要只报一个 "load = 3ms"：解析 / 重定位 / 放置·拷贝 / 入口解析各自多少？
+    /// - `elf_parse` / `relocations` 不分配组件镜像，可以高频跑；
+    /// - `load_component` 每次都会 `alloc_region`（放置段镜像），必须把 lease
+    ///   还回去，否则会耗尽测试堆 —— 因此它的数字里**含一次 region 释放**。
+    ///
+    /// 还缺 `kcomp_init` 执行与 `registry.declare/resolve`（要全局 registry），
+    /// 与 target 侧一起做（见 docs/benchmark.md §6）。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_component_load_phases() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        crate::bench::report_environment();
+
+        // 解析：ET_REL header + section table，不碰 VM。
+        crate::bench::run("loader.elf_parse", 1_000, || {
+            ElfObject::parse(CORETEST_KCOMP).unwrap()
+        })
+        .report();
+
+        // 只收集重定位表（不做放置/写回）。
+        let object = ElfObject::parse(CORETEST_KCOMP).expect("parse");
+        crate::bench::run("loader.relocations", 1_000, || {
+            object.relocations().unwrap()
+        })
+        .report();
+
+        // 完整加载：parse + place + alloc + copy + relocate + 解析 entry/exit。
+        let mut minimal = crate::bench::Bench::new("loader.load_component.min");
+        minimal.run(100, || {
+            let mut comp = load_component(SMOKE_MIN_KCOMP).unwrap();
+            if let Some(lease) = comp.take_memory() {
+                crate::memory::free_region(lease).unwrap();
+            }
+            comp.entry
+        });
+        minimal.finish().report();
+
+        let mut full = crate::bench::Bench::new("loader.load_component.core_test");
+        full.run(100, || {
+            let mut comp = load_component(CORETEST_KCOMP).unwrap();
+            if let Some(lease) = comp.take_memory() {
+                crate::memory::free_region(lease).unwrap();
+            }
+            comp.text_size
+        });
+        full.finish().report();
+    }
 }

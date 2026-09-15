@@ -738,4 +738,36 @@ mod tests {
             }]
         );
     }
+
+    /// 性能基线（`make bench`）：**Core 语义 ledger 成本** vs **完整路径成本**。
+    ///
+    /// `validate` 是私有的，只有 crate 内的 benchmark 能单独测到它 —— 这正是
+    /// "先测 ledger、再测 backend" 的前提。真实页表 backend 的成本必须用 arch
+    /// 后端在目标端测（见 docs/benchmark.md §6）。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_address_space_paths() {
+        let mut space = space(FakeBackend::new());
+        let probe = mapping(0x1000, VM_PAGE, rw());
+
+        crate::bench::report_environment();
+
+        // 纯验证：只读 ledger，不改变任何状态。
+        crate::bench::run("address_space.validate", 1_000, || {
+            space.validate(&probe).is_ok()
+        })
+        .report();
+
+        // 完整路径：validate + backend.map + ledger.commit，再 unmap 回来
+        // （否则 ledger 会无限增长，测出来的是内存压力而不是 map 成本）。
+        let va = VirtualRange {
+            base: 0x2000,
+            size: VM_PAGE,
+        };
+        crate::bench::run("address_space.map_unmap", 1_000, || {
+            space.map(mapping(0x2000, VM_PAGE, rw())).unwrap();
+            space.unmap(&va).unwrap()
+        })
+        .report();
+    }
 }

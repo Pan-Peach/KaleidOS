@@ -165,7 +165,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # staticlib → rust-lld -r --gc-sections -u kcomp_init → strip → 白名单/重定位契约校验。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober
+KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR   := $(CURDIR)/build/kpkg
 KPKG_BUILD := $(CURDIR)/build/kpkg-build
@@ -185,8 +185,11 @@ init.kpkg:
 	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS))"
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
+# KALEIDOS_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 经 genmk.py 解析成
+# KCFG_TRACE_CAPACITY；这不是 Cargo feature，由 os/core/build.rs 校验后写入
+# OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/kconfig.md）。
 kernel: init.kpkg
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
@@ -226,6 +229,7 @@ fmt:
 	cargo fmt $(OUR_CRATES)
 	cd os/components/kcomp-sdk && cargo fmt
 	cd os/components/driver_prober && cargo fmt
+	cd os/components/kbench && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
@@ -236,23 +240,33 @@ clippy:
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET)
 	cd os/components/kcomp-sdk && cargo clippy --all-targets
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU，不读 .config）
 test-host:
 	cargo test --workspace
 	cd os/components/kcomp-sdk && cargo test
 	cd os/components/driver_prober && cargo test
+	cd os/components/kbench && cargo test
 
-# 性能基线（host release，手动跑）：ns/call 量级；基线用例见 handle/mmio.rs bench_*
+# 性能基线（host release，手动跑）：统一走 kernel::bench harness（见 os/core/src/bench）。
+# - trace 关掉：CONFIG_TRACE 的探针正好落在被测路径上，开着会污染数字
+#   （顺带也就验证了"关掉即零成本"）。
+# - 带上 git commit：BENCH-ENV 行才能把数字和代码版本对上。
+# - `--test-threads=1`：bench 必须串行跑，否则多个 primitive 的 stdout 会交错，
+#   报告就不再是机器可解析的（而且并行本身也会互相污染计时）。
 bench:
-	cargo test --release -p kernel --lib bench -- --ignored --nocapture
+	KALEIDOS_GIT_COMMIT="$$(git rev-parse --short=12 HEAD)" \
+		cargo test --release -p kernel --lib \
+			--no-default-features --features supervisor,vm-mmu \
+			bench -- --ignored --nocapture --test-threads=1
 
 # 交叉构建门禁：每个 profile 用一份私有 .config（互不污染，也不动用户的 .config）。
 boot-build:
-	cd $(BOOT_DIR) && RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 boot-check:
-	cd $(BOOT_DIR) && cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && KALEIDOS_TRACE_CAPACITY="$(KCFG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 test-build-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
@@ -320,11 +334,13 @@ check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
 	cd os/components/kcomp-sdk && cargo fmt -- --check
 	cd os/components/driver_prober && cargo fmt -- --check
+	cd os/components/kbench && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	$(MAKE) test-host
 	$(MAKE) test-build
 

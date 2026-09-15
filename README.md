@@ -109,5 +109,6 @@ make olddefconfig               # 用新默认值刷新 .config
 | `docs/driver-model.md` | 驱动与执行域模型（Handle→Lease / MMIO·IRQ·DMA / 撤销不变式） |
 | `docs/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
 | `docs/testing.md` | 测试策略（host test / CoreTest / trace） |
+| `docs/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
 | `docs/roadmap.md` | 路线图（M0–M4 与后续方向） |
 | `docs/references.md` | 参考资料与借鉴方向 |

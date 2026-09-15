@@ -401,7 +401,14 @@ impl InterfaceRegistry {
         if self.bindings[index].abi != abi {
             return Err(InterfaceError::AbiMismatch);
         }
-        self.view_of(components, index)
+        let view = self.view_of(components, index)?;
+        // Trace：一次成功的 bind 解析（Core 不记录 consumer 边，见 TraceEvent 文档）。
+        crate::trace::emit(crate::trace::TraceEvent::InterfaceBind {
+            consumer: None,
+            provider: view.provider,
+            interface: view.interface,
+        });
+        Ok(view)
     }
 
     /// consumer 用已有 `BindingId` refresh：exact-compare 期望 ABI → 重新验证
@@ -420,7 +427,14 @@ impl InterfaceRegistry {
         if binding.abi != abi {
             return Err(InterfaceError::AbiMismatch);
         }
-        self.view_of(components, index)
+        let view = self.view_of(components, index)?;
+        // Trace：刷新会暴露 provider 是否被替换（generation）。首次 bind 是 1，
+        // 同 ABI 热替换后每次 +1。
+        crate::trace::emit(crate::trace::TraceEvent::InterfaceRefresh {
+            binding: view.id,
+            generation: view.generation,
+        });
+        Ok(view)
     }
 
     /// 生成视图，并做 provider 存活二次校验（Core 验证后才交付）。
@@ -575,6 +589,118 @@ mod tests {
             ids.push(id);
         }
         (reg, ids)
+    }
+
+    /// 性能基线（`make bench`）：**interface 调用开销** —— 直接 Rust 调用 vs
+    /// 经 `#[repr(C)]` function table 调用 vs 经 Registry 解析后的表调用。
+    ///
+    /// 刻意分开报：hot path（`direct_call` / `table_call`，同一个函数，区别只在
+    /// 是否过表）与 control path（`bind` / `refresh` / `publish`，一次性），
+    /// 混成一个数字就没有意义了。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_interface_call_paths() {
+        static mut COUNTER: u32 = 0;
+        let stable_ctx = core::ptr::addr_of_mut!(COUNTER) as *mut ();
+
+        let (reg, ids) = ready_world();
+        let mut ifs = InterfaceRegistry::new();
+        let provider = ids[0];
+        let binding = publish_ready(
+            &reg,
+            &mut ifs,
+            provider,
+            b"sample",
+            InterfaceKind::Service,
+            ABI_A,
+            stable_ctx,
+        );
+        let view = ifs
+            .bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
+            .unwrap();
+        // SAFETY: `api` 由 Core 在 bind 时交付，指向 SAMPLE_TABLE（本测试内有效）。
+        let table = unsafe { &*(view.api as *const SampleService) };
+
+        crate::bench::report_environment();
+
+        crate::bench::run("interface.direct_call", 10_000, || {
+            sample_impl(stable_ctx, 1)
+        })
+        .report();
+
+        crate::bench::run("interface.table_call", 10_000, || {
+            (table.do_thing)(stable_ctx, 1)
+        })
+        .report();
+
+        let mut bind = crate::bench::Bench::new("interface.bind");
+        bind.run(1_000, || {
+            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_A)
+                .unwrap()
+        });
+        bind.finish().report();
+
+        let mut refresh = crate::bench::Bench::new("interface.refresh");
+        refresh.run(1_000, || ifs.refresh(&reg, binding, ABI_A).unwrap());
+        refresh.finish().report();
+
+        let mut publish = crate::bench::Bench::new("interface.publish");
+        publish.run(100, || {
+            ifs.stage_publish(
+                &reg,
+                provider,
+                b"sample",
+                InterfaceKind::Service,
+                ABI_A,
+                api(),
+                stable_ctx,
+            )
+            .unwrap();
+            ifs.commit_pending(&reg, provider).unwrap()
+        });
+        publish.finish().report();
+    }
+
+    /// 性能基线（`make bench`）：Interface Registry 的**规模趋势**。
+    ///
+    /// 查找是线性扫描（`Vec`），所以测 N = 1/8/32/128 个接口时 `bind` 第一个
+    /// （最坏情况）的成本。**先证明它是不是真问题，再决定要不要加索引**。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_registry_bind_scaling() {
+        static mut COUNTER: u32 = 0;
+        let stable_ctx = core::ptr::addr_of_mut!(COUNTER) as *mut ();
+
+        crate::bench::report_environment();
+        const SCALING: [(usize, &str); 4] = [
+            (1, "registry.bind.n1"),
+            (8, "registry.bind.n8"),
+            (32, "registry.bind.n32"),
+            (128, "registry.bind.n128"),
+        ];
+        for (count, name) in SCALING {
+            let (reg, ids) = ready_world();
+            let mut ifs = InterfaceRegistry::new();
+            let provider = ids[0];
+            for index in 0..count {
+                let iface = alloc::format!("iface{index}").into_bytes();
+                publish_ready(
+                    &reg,
+                    &mut ifs,
+                    provider,
+                    &iface,
+                    InterfaceKind::Service,
+                    ABI_A,
+                    stable_ctx,
+                );
+            }
+            let mut bench = crate::bench::Bench::new(name);
+            bench.run(100, || {
+                ifs.bind(&reg, b"iface0", InterfaceKind::Service, ABI_A)
+                    .unwrap()
+            });
+            bench.finish().report();
+        }
     }
 
     // -- 1. staged publish + commit ----------------------------------------

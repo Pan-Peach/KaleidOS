@@ -71,7 +71,10 @@
 //! - **跨组件 handle transfer（Q2）**：`MmioHandle` 不可移交给另一个组件（组件
 //!   寻址 / capability 语义未定，见 §12 Q2）。
 
-use super::{Handle, HandleError, MmioLease, RequestContext, ResourceTable, dma, irq};
+use super::{
+    Handle, HandleError, MmioLease, RawHandle, RequestContext, ResourceKind, ResourceTable, dma,
+    irq,
+};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine::{self, DeviceId, IoSpace};
@@ -130,7 +133,7 @@ pub struct MmioTable {
 impl MmioTable {
     pub const fn new() -> Self {
         Self {
-            table: ResourceTable::new(),
+            table: ResourceTable::new(ResourceKind::Mmio),
             quarantine: [false; 256],
         }
     }
@@ -160,14 +163,23 @@ impl MmioTable {
     /// 撤销 owner 的全部 MMIO authority，并把其占用的每个 `device_index` 标记为
     /// quarantine（失败路径专用）。先记标记、再 revoke。
     pub fn quarantine_owner(&mut self, owner: ComponentId) {
-        for slot in self.table.slots_mut() {
-            if slot.owner() != owner {
+        for (index, slot) in self.table.slots_mut().iter_mut().enumerate() {
+            if slot.owner() != owner || slot.is_vacant() {
                 continue;
             }
             if let Some(region) = slot.object() {
                 self.quarantine[region.device_index as usize] = true;
             }
+            let handle = Handle::<MmioRegion>::new(
+                u32::try_from(index).expect("resource slot index exhausted"),
+                slot.generation(),
+            );
             slot.revoke();
+            crate::trace::emit(crate::trace::TraceEvent::ResourceRevoke {
+                component: owner,
+                kind: ResourceKind::Mmio,
+                handle: RawHandle::from_raw(handle.to_raw()),
+            });
         }
     }
 
@@ -876,18 +888,18 @@ mod tests {
         );
     }
 
-    /// 性能基线（`#[ignore]`，不进 `make check`）：单次 `read_u32` 全路径 vs 裸 volatile。
-    ///
-    /// 用法：`make bench`，或
-    /// `cargo test --release -p kernel --lib -- bench -- --ignored --nocapture`。
+    /// 性能基线（`#[ignore]`，不进 `make check`）：`make bench` 手动跑。
     ///
     /// 读法：看**同一台机器上的相对变化**——改 read_u32 / 表锁 / 验证路径后重跑对比。
     /// 绝对值不代表目标机：host 的 irq-guard 是 no-op（真机多 ~2 条 CSR 指令），
-    /// host 原子操作比 RV64 本地原子贵；而真实 MMIO 访问本身的成本远在此之上
-    /// （QEMU 设备模型 ~µs 级，真机总线往返 ~几十~几百 ns）。
+    /// host 原子操作比 RV64 本地原子贵；而真实 MMIO 访问成本远在此之上
+    /// （QEMU 设备模型 ~µs，真机总线往返 ~几十~几百 ns）。
+    ///
+    /// 刻意把 **hot path**（每次访问都付）与 **control path**（一次性：派生
+    /// lease）分开报，否则两种成本会被混成一个数字。
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
-    fn bench_read_u32_baseline() {
+    fn bench_mmio_access_paths() {
         crate::handle::init();
         let mut buf = [0u32; 4];
         buf[0] = 0x7472_6976;
@@ -900,33 +912,90 @@ mod tests {
                 device_index: 0,
             },
         );
+        let ctx = context(owner);
 
-        const N: u32 = 1_000_000;
+        crate::bench::report_environment();
 
-        // 热身：避免首次缓存/分支预测冷启动污染数字
-        let mut warm = 0u32;
-        for _ in 0..10_000 {
-            warm = warm.wrapping_add(super::read_u32(&context(owner), handle, 0).unwrap());
+        // 上限：裸 volatile（无任何验证）。
+        crate::bench::run("mmio.raw_volatile", 10_000, || unsafe {
+            core::ptr::read_volatile(buf.as_ptr())
+        })
+        .report();
+
+        // 受控：表锁 + slot/generation/owner/生命周期验证 + bounds + align + volatile。
+        crate::bench::run("mmio.checked_read_u32", 10_000, || {
+            super::read_u32(&ctx, handle, 0).unwrap()
+        })
+        .report();
+
+        // lease fast path：一次校验后派生 (ptr,len)，之后就是裸访问。
+        let lease_ptr = super::derive_lease(&ctx, handle).unwrap().as_ptr() as *const u32;
+        crate::bench::run("mmio.lease_read_u32", 10_000, || unsafe {
+            core::ptr::read_volatile(lease_ptr)
+        })
+        .report();
+
+        // 纯验证成本（成功路径）。
+        crate::bench::run("handle.validate_ok", 10_000, || {
+            super::get_table().lock().get(owner, handle).is_ok()
+        })
+        .report();
+
+        // control path（一次性，不属于 hot path）。
+        let mut control = crate::bench::Bench::new("mmio.derive_lease");
+        control.run(1_000, || super::derive_lease(&ctx, handle).unwrap());
+        control.finish().report();
+
+        // 被拒绝的验证：handle 失效后（stale）。
+        super::get_table().lock().revoke_owner(owner);
+        crate::bench::run("handle.reject_stale", 10_000, || {
+            super::get_table().lock().get(owner, handle).is_err()
+        })
+        .report();
+    }
+
+    /// 性能基线（`make bench`）：**handle 数量增长时的趋势**。
+    ///
+    /// 按 spec 的指示：先证明 O(N) 是不是真问题，再决定加不加索引。
+    /// - `get`：每次访问都要走的 hot path（线性扫描 slot）。
+    /// - `revoke_regrant`：control path。`revoke_owner` 是 O(N) 扫描，这里测的是
+    ///   "撤销全部 + 重新 grant 全部"的受限往返（诚实标注：它含一次重新 grant）。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_handle_scaling() {
+        crate::bench::report_environment();
+        const SIZES: [(usize, &str, &str); 3] = [
+            (1, "handle.get.n1", "handle.revoke_regrant.n1"),
+            (32, "handle.get.n32", "handle.revoke_regrant.n32"),
+            (256, "handle.get.n256", "handle.revoke_regrant.n256"),
+        ];
+        for (count, get_name, revoke_name) in SIZES {
+            let owner = ComponentId::from_raw(0x61);
+            let mut table = MmioTable::new();
+            let region = |index: usize| MmioRegion {
+                base: 0x1000 * index,
+                size: 0x1000,
+                device_index: index as u8,
+            };
+            let handles: alloc::vec::Vec<_> = (0..count)
+                .map(|index| table.grant(owner, region(index)))
+                .collect();
+
+            // hot path：验证中间那一个（线性扫描要走一半）。
+            let probe = handles[count / 2];
+            let mut get = crate::bench::Bench::new(get_name);
+            get.run(100, || table.get(owner, probe).is_ok());
+            get.finish().report();
+
+            // control path：撤销全部（O(N)），再把它们放回去以便下一轮可测。
+            let mut revoke = crate::bench::Bench::new(revoke_name);
+            revoke.run(10, || {
+                table.revoke_owner(owner);
+                for index in 0..count {
+                    table.grant(owner, region(index));
+                }
+            });
+            revoke.finish().report();
         }
-
-        let t0 = std::time::Instant::now();
-        let mut acc = 0u32;
-        for _ in 0..N {
-            acc = acc.wrapping_add(super::read_u32(&context(owner), handle, 0).unwrap());
-        }
-        let mediated = t0.elapsed();
-
-        let t1 = std::time::Instant::now();
-        let mut raw = 0u32;
-        for _ in 0..N {
-            raw = raw.wrapping_add(unsafe { core::ptr::read_volatile(buf.as_ptr()) });
-        }
-        let direct = t1.elapsed();
-
-        std::println!(
-            "[bench] read_u32 mediated: {:.1} ns/call | direct volatile: {:.2} ns/call | warm={warm:#x} acc={acc:#x} raw={raw:#x}",
-            mediated.as_nanos() as f64 / N as f64,
-            direct.as_nanos() as f64 / N as f64,
-        );
     }
 }

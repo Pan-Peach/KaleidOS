@@ -34,7 +34,7 @@
 
 use super::lease::DmaLease;
 use super::mmio::{self, MmioError};
-use super::{Handle, HandleError, RequestContext, ResourceTable};
+use super::{Handle, HandleError, RawHandle, RequestContext, ResourceKind, ResourceTable};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::memory::{self, MemoryError, MemoryLease};
@@ -109,7 +109,7 @@ pub struct DmaTable {
 impl DmaTable {
     pub const fn new() -> Self {
         Self {
-            table: ResourceTable::new(),
+            table: ResourceTable::new(ResourceKind::Dma),
         }
     }
 
@@ -136,8 +136,8 @@ impl DmaTable {
 
     /// 撤销 owner 全部 DMA authority；每个 backing lease 同样先 quarantine。
     pub fn revoke_owner(&mut self, owner: ComponentId) {
-        for slot in self.table.slots_mut() {
-            if slot.owner() != owner {
+        for (index, slot) in self.table.slots_mut().iter_mut().enumerate() {
+            if slot.owner() != owner || slot.is_vacant() {
                 continue;
             }
             if let Some(region) = slot.object_mut()
@@ -145,7 +145,16 @@ impl DmaTable {
             {
                 quarantine(lease);
             }
+            let handle = Handle::<DmaRegion>::new(
+                u32::try_from(index).expect("resource slot index exhausted"),
+                slot.generation(),
+            );
             slot.revoke();
+            crate::trace::emit(crate::trace::TraceEvent::ResourceRevoke {
+                component: owner,
+                kind: ResourceKind::Dma,
+                handle: RawHandle::from_raw(handle.to_raw()),
+            });
         }
     }
 

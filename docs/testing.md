@@ -127,6 +127,45 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 Core 内提供 invariant check 机制：在关键路径断言不变式（如"同一帧最多一个 owner"、"Task 状态机合法"）。
 第一阶段只需要最简单的 assert 级检查，配合 Trace 记录违规点。
 
+### 实现现状（2026-09）
+
+- `os/core/src/trace/`：`TraceEvent`（task switch / policy proposal·accepted·rejected /
+  component state / resource grant·revoke / interface bind·refresh / IRQ
+  enter·dispatch·ack）+ 固定容量 ring（`emit` 热路径 O(1)、无分配、`seq` 单调，
+  ring 满逐出的条数由 `TraceStats::overwritten_total` 显式计数，序号耗尽时停止
+  记录、绝不回绕）。
+- 读侧：`trace::read_one`（O(1) 拷一条）+ `trace::visit_since`（**有界实时遍历，
+  不是原子快照**：进入时捕获排他终点；visitor 在锁外调用，可以安全 emit / 查
+  stats；覆盖造成的缺口 = `record.seq - 请求的 seq`）+ `inspector::Inspector`
+  （只读快照 + trace 遍历，只返回值拷贝，无 god-mode）。组件侧状态经
+  `kcore_trace_stats`（`TraceStatsAbi`：capacity / oldest_seq / next_seq /
+  overwritten_total / enabled_mask）。
+- **开关**：`CONFIG_TRACE`（默认 `y`）。关掉时 `trace::emit` 是内联空操作 ——
+  事件参数是纯值构造，会被编译器连同调用一起消除，热路径零成本。
+  **跑 benchmark 前应当关掉**（见 `docs/benchmark.md`）。编译期支持与运行时使能
+  分开发现：编译期关闭时 `kcore_trace_read` 恒 `-ENOENT`、`enabled_mask == 0`；
+  运行时 `enabled_mask` 报告哪些事件 kind 会被记录 —— 12 位掩码，bit i ↔ ABI
+  kind i+1（`u64` 视图高位恒 0），默认全开 = `0x0fff`。
+- **运行时过滤**：掩码由 Core 管理路径控制（Monitor 命令
+  `trace [<category|all> on|off]`，类别 = task / policy / component / resource /
+  interface / irq；`trace` 无参数打印状态）。组件没有全局 trace-control
+  authority，只能经 `kcore_trace_stats` **读**。`emit` 在**关中断、加锁、读时钟
+  之前**查掩码（原子 load + 分支，不是零开销）；被过滤的事件不记录、不消耗
+  `seq`，不算丢失。
+- **ring 容量**：`CONFIG_TRACE_CAPACITY`（int，默认 1024，`range 64 8192`）→
+  `KCFG_TRACE_CAPACITY` → `os/core/build.rs` 校验 → OUT_DIR 常量（**不是** Cargo
+  feature）。裸机构建缺值 / 越界直接报错，host 构建（`cargo test` / `clippy`）
+  用显式默认；`.config` 仍是唯一真相。
+- runtime `trace::clear()` 只清记录与逐出计数、**不回绕 `seq`**：老 reader 的
+  游标仍可用，缺口可由 `record.seq - 请求的 seq` 计算。"序号回到 1" 的完整复位
+  是 test-only（`trace::reset_for_test`）。
+- 事件序列断言：host test 用 `trace::test_support::assert_subsequence` 断言
+  **相对顺序**。不要"按 `ComponentId` 过滤后全等"：`ComponentId` 只在单个
+  `Registry` 实例内唯一，而 trace ring 是进程全局的，局部 registry 的测试会和
+  全局 registry 的测试复用同样的编号。
+- 尚未定义的事件：`TaskBlock` / `TaskWake`（Core 还没有 block/wake 路径）、
+  `Fault`（异常还在 arch 的 trap/panic 路径）。**有 chokepoint 再加**，不预先定义。
+
 ## 5. 测试纪律
 
 - 每个 Core 新功能：先写 host test，再写实现（至少同 PR 提交）；

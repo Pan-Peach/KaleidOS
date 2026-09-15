@@ -59,6 +59,12 @@ mod runtime {
         fn free_page_count() -> u32;
         #[link_name = "kcore_component_count"]
         fn component_count() -> u32;
+        #[link_name = "kcore_trace_read"]
+        fn trace_read(
+            since: u64,
+            out: *mut kcomp_sdk::abi::TraceRecordAbi,
+            out_next: *mut u64,
+        ) -> i32;
 
         // C4：组件生命周期 / 接口 / 任务 / 调度
         #[link_name = "kcore_component_load"]
@@ -333,6 +339,38 @@ mod runtime {
                 }
             };
         }
+
+        report.group("trace sequence");
+        // Core 在加载本组件时已为它自己发过 ComponentState（Declared → Resolved →
+        // Starting）与 InterfaceBind；这里用真实导出按 seq 逐条读回来（只读、
+        // 无 god-mode），验证"组件能读到 Core 自己产生的事件序列"。
+        let mut cursor = 1u64;
+        let mut seen = 0u32;
+        let mut saw_starting = false;
+        loop {
+            let mut record = kcomp_sdk::abi::TraceRecordAbi {
+                seq: 0,
+                timestamp: 0,
+                kind: 0,
+                flags: 0,
+                a: 0,
+                b: 0,
+                c: 0,
+            };
+            let mut next = 0u64;
+            let rc = unsafe { trace_read(cursor, &mut record, &mut next) };
+            if rc != 0 {
+                break; // 负 = 读完了（ENOENT）；成功才是 0。
+            }
+            seen += 1;
+            // ComponentState 的 to 在 payload c；ComponentState::Starting = 2。
+            if record.kind == kcomp_sdk::abi::KIND_COMPONENT_STATE && record.c == 2 {
+                saw_starting = true;
+            }
+            cursor = next;
+        }
+        check!("trace readable", seen > 0, 18);
+        check!("component_state seen", saw_starting, 19);
 
         report.group("boot basics");
         check!("data", data_ok(), 0);

@@ -50,3 +50,12 @@ fn assign_outcome_encoding_is_stable() {
     assert_eq!(crate::binding::ASSIGN_MATCH, 0);
     assert_eq!(crate::binding::ASSIGN_NO_MATCH, 1);
 }
+
+/// Trace ABI 布局锚定（编译期 `const _` 断言之外的 host 复核；与 Core
+/// `trace::abi` 的布局测试同值，改了字段必须双侧同步）。
+#[test]
+fn trace_abi_layouts_are_anchored() {
+    assert_eq!(core::mem::size_of::<crate::abi::TraceRecordAbi>(), 48);
+    assert_eq!(core::mem::size_of::<crate::abi::TraceStatsAbi>(), 40);
+    assert_eq!(core::mem::align_of::<crate::abi::TraceStatsAbi>(), 8);
+}

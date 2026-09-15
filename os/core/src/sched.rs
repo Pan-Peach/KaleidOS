@@ -162,10 +162,22 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
     let proposed = (vtable.choose_next)(ctx, ids.as_ptr(), ids.len(), current);
 
     let proposed = TaskId::from_raw(proposed);
+    crate::trace::emit(crate::trace::TraceEvent::PolicyProposal {
+        component: provider,
+        task: proposed,
+    });
     if runnable.contains(&proposed) {
+        crate::trace::emit(crate::trace::TraceEvent::PolicyAccepted {
+            component: provider,
+            task: proposed,
+        });
         return Ok(Some(proposed));
     }
     // 组件提出非法提议：隔离 + 回退（Core 不被错误组件挂起）。
+    crate::trace::emit(crate::trace::TraceEvent::PolicyRejected {
+        component: provider,
+        reason: crate::trace::RejectReason::NotRunnable,
+    });
     registry::get_registry().lock().mark_failed(provider).ok();
     Ok(Some(runnable[0]))
 }
@@ -272,6 +284,11 @@ fn schedule_next(
     // Phase 2：锁外 revoke（仅 abort 路径）+ 按 incoming 安装逃逸 guard + 切换。
     if let Some((dead, owner)) = abort {
         crate::component::fail_component(owner, ComponentLoadError::TaskPanicked(dead));
+    }
+    // Trace：状态 commit 已完成，这里记录"要切给谁"。放在真正切走之前，因此
+    // abort 路径上的顺序是 … → ComponentState{Failed} → TaskSwitch（先落账再切走）。
+    if let Some(id) = next {
+        crate::trace::emit(crate::trace::TraceEvent::TaskSwitch { from, to: id });
     }
     match next {
         Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
@@ -488,5 +505,245 @@ mod tests {
             reg.get(provider).unwrap().state,
             crate::component::ComponentState::Failed
         );
+    }
+
+    /// 对抗（**真实全局路径**，非局部复刻）：坏调度器提议不存在的任务。
+    ///
+    /// 断言三件事：
+    /// 1. Core 真相没有被错误组件改写 —— 退回确定性回退（id 序首项），
+    ///    绝不把 CPU 交给那个不存在的 TaskId(999)；
+    /// 2. 错误 provider 被隔离（`Failed`）；
+    /// 3. **真实事件序列**（只看 provider 自己的事件，因此与并行测试互不干扰）：
+    ///    `出生 → Ready → 坏提议 → Core 拒绝 → 隔离`。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn invalid_proposal_emits_real_event_sequence_and_keeps_truth() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _trace = crate::trace::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+
+        // Given：一个 Ready 的坏调度器组件 —— 永远提议 TaskId(999)。
+        extern "C" fn bad_choose(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
+            999
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: bad_choose,
+        };
+        let provider = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"sched_bad_real", 0x8000_0000, 0x8000_0000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        {
+            let reg = registry::get_registry().lock();
+            let mut ifs = crate::component::interface::get_interfaces().lock();
+            ifs.stage_publish(
+                &reg,
+                provider,
+                b"scheduler",
+                InterfaceKind::Policy,
+                SCHEDULER_POLICY_ABI,
+                &vtable as *const SchedulerPolicyApi as *const (),
+                ptr::null_mut(),
+            )
+            .unwrap();
+            ifs.commit_pending(&reg, provider).unwrap();
+        }
+        registry::get_registry()
+            .lock()
+            .finish_start(provider)
+            .unwrap();
+
+        // 一个 Ready 的 task owner + 一个 Runnable 任务（真实全局 task 表）。
+        let owner = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"sched_real_owner", 0x8000_0000, 0x8000_0000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, 0x8000_0000)
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Runnable)
+            .unwrap();
+
+        // When：走**真实** pick_next（resolve_policy → bind → 提议 → Core 验证）。
+        let runnable = collect_runnable();
+        assert!(runnable.contains(&task), "活实例的任务应在候选里");
+        let picked = pick_next(&runnable).unwrap();
+
+        // Then 1：真相未被改写 —— 回退到 id 序首项，而不是那个不存在的 999。
+        assert_ne!(picked, Some(TaskId::from_raw(999)));
+        assert_eq!(
+            picked,
+            runnable.first().copied(),
+            "回退 = id 序首项（确定性）"
+        );
+
+        // Then 2：错误 provider 被隔离。
+        assert_eq!(
+            registry::get_registry().lock().get(provider).unwrap().state,
+            crate::component::ComponentState::Failed
+        );
+
+        // Then 3：真实事件序列（子序列匹配，对并行测试插入的事件免疫）。
+        use crate::component::ComponentState;
+        use crate::trace::{RejectReason, TraceEvent};
+        crate::trace::test_support::assert_subsequence(
+            &[
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: None,
+                    to: ComponentState::Declared,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Declared),
+                    to: ComponentState::Resolved,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Resolved),
+                    to: ComponentState::Starting,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Starting),
+                    to: ComponentState::Ready,
+                },
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: TaskId::from_raw(999),
+                },
+                TraceEvent::PolicyRejected {
+                    component: provider,
+                    reason: RejectReason::NotRunnable,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Ready),
+                    to: ComponentState::Failed,
+                },
+            ],
+            &crate::trace::test_support::events(),
+        );
+
+        // 清理：移除任务，避免污染其它调度测试。
+        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
+    }
+
+    /// 性能基线（`make bench`）：**调度 proposal + Core 验证** 的成本。
+    ///
+    /// 只测到 `pick_next` 为止。commit（`TaskTable::transition`）单独测；
+    /// 真正的 context switch 必须在目标端测 —— host 的 `context_switch` 是
+    /// Fake no-op（见 docs/benchmark.md §6）。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_scheduler_propose_and_validate() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+
+        // 好调度器：永远提议 runnable[0]（合法 → 走 accept 路径）。
+        extern "C" fn good_choose(_: *mut (), runnable: *const u32, count: usize, _: u32) -> u32 {
+            if count == 0 {
+                u32::MAX
+            } else {
+                unsafe { *runnable }
+            }
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: good_choose,
+        };
+        let provider = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"sched_bench_policy", 0x8000_0000, 0x8000_0000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        {
+            let reg = registry::get_registry().lock();
+            let mut ifs = crate::component::interface::get_interfaces().lock();
+            ifs.stage_publish(
+                &reg,
+                provider,
+                b"scheduler",
+                InterfaceKind::Policy,
+                SCHEDULER_POLICY_ABI,
+                &vtable as *const SchedulerPolicyApi as *const (),
+                ptr::null_mut(),
+            )
+            .unwrap();
+            ifs.commit_pending(&reg, provider).unwrap();
+        }
+        registry::get_registry()
+            .lock()
+            .finish_start(provider)
+            .unwrap();
+
+        let owner = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(b"sched_bench_owner", 0x8000_0000, 0x8000_0000, None)
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, 0x8000_0000)
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Runnable)
+            .unwrap();
+        let runnable = collect_runnable();
+
+        crate::bench::report_environment();
+
+        // 全路径：resolve_policy（锁 + bind）+ 提议 + Core 验证。
+        crate::bench::run("sched.pick_next", 1_000, || pick_next(&runnable).unwrap()).report();
+
+        // commit：状态转移的验证 + 落笔（不含真正切换）。
+        let mut table = crate::task::TaskTable::new();
+        let local_owner = ComponentId::from_raw(0x7b);
+        let local = table.create(local_owner, 0x8000_0000).unwrap();
+        table.transition(local, TaskState::Runnable).unwrap();
+        let mut commit = crate::bench::Bench::new("sched.task_transition");
+        commit.run(1_000, || {
+            table
+                .transition(local, TaskState::Running(CpuId(0)))
+                .unwrap();
+            table.transition(local, TaskState::Runnable).unwrap();
+        });
+        commit.finish().report();
+
+        // 清理：移除任务，避免污染其它调度测试。
+        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
     }
 }

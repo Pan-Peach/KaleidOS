@@ -106,6 +106,13 @@ impl Registry {
             exit: None,
             memory,
         });
+        // 出生也入 trace：否则"只声明未 resolve"的实例在事件流里不可见，
+        // 而"失败组件是否被回收"这类断言需要看到它从哪来。
+        crate::trace::emit(crate::trace::TraceEvent::ComponentState {
+            component: id,
+            from: None,
+            to: ComponentState::Declared,
+        });
         Ok(id)
     }
 
@@ -174,10 +181,17 @@ impl Registry {
     /// 合法转换表只存在于一处。
     fn transition(&mut self, id: ComponentId, to: ComponentState) -> Result<(), RegistryError> {
         let rec = self.record_mut(id)?;
-        if !rec.state.can_transition(to) {
+        let from = rec.state;
+        if !from.can_transition(to) {
             return Err(RegistryError::InvalidTransition);
         }
         rec.state = to;
+        // 所有合法转换都在这里落一笔 —— 单点覆盖，任何新转换入口自动被记录。
+        crate::trace::emit(crate::trace::TraceEvent::ComponentState {
+            component: id,
+            from: Some(from),
+            to,
+        });
         Ok(())
     }
 
@@ -280,6 +294,41 @@ mod tests {
         let b = reg.declare(b"b", 0x300, 0x400, None).unwrap();
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
+    }
+
+    /// 对抗：非法转换被拒绝时，**真相不变**。
+    ///
+    /// 不断言"没有产生事件"：trace 只记录合法提交（`emit` 位于状态提交之后），
+    /// 非法转换本就永远不会出现在事件流里，"事件为空"是不可证伪的断言。
+    /// 真正有意义的是：被拒绝的尝试改不动真相。
+    #[test]
+    fn rejected_transition_leaves_truth_unchanged() {
+        init();
+        let id = get_registry()
+            .lock()
+            .declare(b"registry_rejected_transition", 1, 2, None)
+            .unwrap();
+
+        // Declared → Ready 非法（跳过 Resolved / Starting）。
+        assert_eq!(
+            get_registry().lock().finish_start(id),
+            Err(RegistryError::InvalidTransition)
+        );
+        assert_eq!(
+            get_registry().lock().get(id).unwrap().state,
+            crate::component::ComponentState::Declared,
+            "被拒绝的转换不得改变真相"
+        );
+
+        // 其它非法边（Declared → Starting）同样不动真相。
+        assert_eq!(
+            get_registry().lock().begin_start(id),
+            Err(RegistryError::InvalidTransition)
+        );
+        assert_eq!(
+            get_registry().lock().get(id).unwrap().state,
+            crate::component::ComponentState::Declared
+        );
     }
 
     #[test]
@@ -595,5 +644,31 @@ mod tests {
         let second = reg.declare(b"a", 3, 4, None).unwrap();
         assert_ne!(second, first);
         assert_eq!(second.raw(), first.raw() + 1);
+    }
+
+    /// 性能基线（`make bench`）：**component 数量增长时的 lookup 趋势**。
+    ///
+    /// 用局部 `Registry`（`r()`），不碰全局真相，因此不需要串行锁。
+    #[test]
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_component_scaling() {
+        crate::bench::report_environment();
+        const SIZES: [(usize, &str); 3] = [
+            (1, "component.lookup.n1"),
+            (32, "component.lookup.n32"),
+            (256, "component.lookup.n256"),
+        ];
+        for (count, name) in SIZES {
+            let mut reg = r();
+            let mut ids = alloc::vec::Vec::new();
+            for index in 0..count {
+                let label = alloc::format!("comp{index}");
+                ids.push(reg.declare(label.as_bytes(), 1, 2, None).unwrap());
+            }
+            let probe = ids[count / 2];
+            let mut bench = crate::bench::Bench::new(name);
+            bench.run(100, || reg.get(probe).is_some());
+            bench.finish().report();
+        }
     }
 }

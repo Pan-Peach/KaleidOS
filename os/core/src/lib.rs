@@ -15,6 +15,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// build.rs ↔ Kconfig 的窄契约（`TRACE_CAPACITY` 解析 / 校验）只在 host test 下
+// 编译进 lib：测试锁定的是 build.rs 实际用的那一份实现（见 `src/build_config.rs`）。
+#[cfg(test)]
+mod build_config;
+
+pub mod bench;
 pub mod component;
 pub mod errno;
 pub mod handle;
