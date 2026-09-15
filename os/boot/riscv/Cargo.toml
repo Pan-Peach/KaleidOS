@@ -21,6 +21,7 @@ machine = ["arch/machine", "kernel/machine"]
 vm-mmu = ["arch/vm-mmu", "kernel/vm-mmu"]
 vm-nommu = ["arch/vm-nommu", "kernel/vm-nommu"]
 preempt = ["kernel/preempt"]
+trace = ["kernel/trace"]
 selftest = []
 
 [dependencies]

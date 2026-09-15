@@ -6,12 +6,15 @@ publish = false
 build = "build.rs"
 
 [features]
-default = ["supervisor", "vm-mmu"]
+default = ["supervisor", "vm-mmu", "trace"]
 supervisor = ["arch/supervisor"]
 machine = ["arch/machine"]
 vm-mmu = ["arch/vm-mmu"]
 vm-nommu = ["arch/vm-nommu"]
 preempt = []
+# Structured Core trace (CONFIG_TRACE).  `default` so host tests can assert on
+# event sequences; target builds get it only through KCFG_BOOT_FEATURES.
+trace = []
 
 [dependencies]
 arch = { path = "../arch", default-features = false }

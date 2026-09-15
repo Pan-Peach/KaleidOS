@@ -40,7 +40,8 @@ Kconfig 前端复用 `third_party/Kconfiglib`（git submodule，pin 到具体 co
 | `KCFG_QEMU_MEM` | QEMU 内存（`1G` / `4G`） |
 | `KCFG_BOOT_FEATURES` | 传给 boot crate 的 Cargo features（如 `supervisor,vm-mmu`） |
 | `KCFG_SELFTEST` | `y` / `n`，决定产物名与 selftest 入口 |
-| `CONFIG_<symbol>` | 每个 bool symbol 都按原值镜像一份 |
+| `KCFG_TRACE_CAPACITY` | 解析后的 trace ring 容量（`CONFIG_TRACE_CAPACITY`），由 Makefile 作为环境变量传给 `os/core/build.rs` |
+| `CONFIG_<symbol>` | 每个 bool / int symbol 都按解析后的值镜像一份 |
 
 所有变量都以 `override` 写出：命令行上误加的 `make KCFG_...=...` 无法制造第二个真相，解析后的 config 永远获胜。构建命令形如：
 
@@ -80,6 +81,8 @@ make menuconfig && make qemu            # 第二条：交互调参后直接构�
 | `VM_MMU` / `VM_NOMMU` | choice | MMU | 虚拟内存模型；`VM_NOMMU depends on ARCH_RISCV32` |
 | `PREEMPT` | bool | n | 抢占式调度；当前基线是协作式 RR |
 | `SELFTEST` | bool | n | 构建 ArchTest 镜像；`depends on VM_MMU`，位于 "Debugging / Testing" |
+| `TRACE` | bool | y | 结构化 Core trace（`trace::emit`）。关掉即内联空操作、热路径零成本；**跑 benchmark 时应当关掉** |
+| `TRACE_CAPACITY` | int | 1024 | trace ring 容量（records，`range 64 8192`）；经 `KCFG_TRACE_CAPACITY` → `os/core/build.rs` 校验 → OUT_DIR 常量，不是 Cargo feature |
 
 `os/components/Kconfig` 目前是空的扩展点：组件选择留到 loader + manifest 里程碑，Phase 1 不迁移（组件列表仍在 Makefile 的 `KCOMP_SRCS`）。
 
@@ -102,7 +105,7 @@ Kconfig 本身让不可能的组合不可表达：
 
 ### 4.4 只有 `make` 拥有 config → build 映射
 
-映射只存在于 `genmk.py` 的一张注释表里（`ARCH_MAP` + 特权 / VM feature 表 + `KCFG_BOOT_FEATURES` 组装）。Makefile、Cargo、`.cargo/config.toml` 都不各自决定 profile。判断标准：**一个事实只有一处真相**。
+映射只存在于 `genmk.py` 的一张注释表里（`ARCH_MAP` + 特权 / VM feature 表 + `KCFG_BOOT_FEATURES` 组装 + 整数运输 `KCFG_TRACE_CAPACITY`）。Makefile、Cargo、`.cargo/config.toml` 都不各自决定 profile。判断标准：**一个事实只有一处真相**。
 
 ### 4.5 fragment 路径是按 config 派生的
 
@@ -137,6 +140,7 @@ Phase 1 **不迁移**：组件 / 驱动选择、调度器、PMP/MPU、平台发�
 3. 如果它改变**构建契约**（target triple、linker、QEMU 二进制、内存），扩展 `genmk.py` 里的 `ARCH_MAP`。
 4. 如果某个 profile 默认要打开它，加到对应的 `configs/*_defconfig`。
 5. 如果某个 Rust crate 编译期需要它，让它成为一个 Cargo feature，由 Makefile 通过生成的 `KCFG_*` 传入；**不要让 crate 自己决定**。
+   **bool 之外的取值（int 等）不拆成"每个值一个 Cargo feature"**：Makefile 把解析后的 `KCFG_*` 作为**环境变量**传给 `os/core/build.rs`，build.rs 校验后写入 `OUT_DIR` 常量（见 `TRACE_CAPACITY`）。build.rs **不读 `.config`**；裸机构建缺值 / 越界直接报错，host 构建（`cargo test` / `clippy`）用显式默认。
 6. 命名禁止版本后缀（`V1`、`_v2`）：契约变了就原地替换，不做兼容别名。
 
 ## 8. 验证（验收标准）

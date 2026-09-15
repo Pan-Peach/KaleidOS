@@ -67,6 +67,15 @@ def is_y(kconf, name):
     return sym is not None and sym.str_value == "y"
 
 
+def int_value(kconf, name):
+    """Resolved decimal value of an int symbol.  `name` carries the CONFIG_ prefix."""
+    sym = kconf.syms.get(name[len("CONFIG_"):] if name.startswith("CONFIG_")
+                         else name)
+    if sym is None or sym.type != kconfiglib.INT:
+        sys.exit("error: expected int symbol {}".format(name))
+    return sym.str_value
+
+
 def exactly_one(kconf, mapping, what):
     """Return the single selected key, or exit with a clear message."""
     chosen = [key for key in mapping if is_y(kconf, key)]
@@ -85,6 +94,8 @@ def variables(kconf):
     features = [PRIV_MAP[priv], VM_MAP[vm]]
     if is_y(kconf, "CONFIG_PREEMPT"):
         features.append("preempt")
+    if is_y(kconf, "CONFIG_TRACE"):
+        features.append("trace")
     if is_y(kconf, "CONFIG_SELFTEST"):
         features.append("selftest")
 
@@ -97,10 +108,14 @@ def variables(kconf):
         ("KCFG_QEMU_MEM", qemu_mem),
         ("KCFG_BOOT_FEATURES", ",".join(features)),
         ("KCFG_SELFTEST", "y" if is_y(kconf, "CONFIG_SELFTEST") else "n"),
+        # Resolved integer handed to os/core/build.rs (validated there).  The
+        # value is not a Cargo feature: one build variable, one source of truth.
+        ("KCFG_TRACE_CAPACITY", int_value(kconf, "CONFIG_TRACE_CAPACITY")),
     ]
-    # Every BOOL symbol in the configuration is mirrored as CONFIG_<name>.
+    # Mirror every BOOL as CONFIG_<name>=y/n and every INT as its resolved
+    # decimal value, so a resolved number can reach build.rs unchanged.
     for sym in kconf.unique_defined_syms:
-        if sym.type == kconfiglib.BOOL:
+        if sym.type in (kconfiglib.BOOL, kconfiglib.INT):
             lines.append(("CONFIG_" + sym.name, sym.str_value))
     return lines
 

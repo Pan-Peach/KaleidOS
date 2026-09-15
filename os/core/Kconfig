@@ -17,6 +17,32 @@ endmenu
 
 menu "Debugging / Testing"
 
+config TRACE
+	bool "Structured Core trace"
+	default y
+	help
+	  Compile the structured Core trace (the TraceEvent ring behind
+	  trace::emit / trace::visit_since).  It is the evidence base for CoreTest
+	  event-sequence assertions and for cost attribution.
+
+	  Turning it OFF makes trace::emit an inlined no-op: nothing is recorded and
+	  the hot path pays zero cost.  Do that for performance measurement --
+	  tracing perturbs exactly the paths a benchmark wants to measure.
+
+config TRACE_CAPACITY
+	int "Trace ring capacity (records)"
+	default 1024
+	range 64 8192
+	help
+	  Fixed capacity of the structured Core trace ring, in records.  The ring
+	  storage lives in Core BSS whether or not CONFIG_TRACE is on, so this
+	  still sizes the image when tracing is compiled out.
+
+	  The value travels to the Core crate as one resolved number (not a Cargo
+	  feature): genmk.py emits KCFG_TRACE_CAPACITY, the Makefile passes it to
+	  os/core/build.rs, and build.rs validates it before writing the Rust
+	  constant.  1024 records cover a full boot plus one core_test round.
+
 config SELFTEST
 	bool "Build the ArchTest selftest image"
 	default n
