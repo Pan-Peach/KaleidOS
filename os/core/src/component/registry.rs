@@ -155,7 +155,8 @@ impl Registry {
     /// 回收）尚未接线。
     ///
     /// TODO(component-exit): 未来 ComponentManager 的 stop 路径驱动本方法，
-    /// 随后 `finish_stop`；当前停在声明层。
+    /// 随后 `finish_stop`；当前停在声明层——编排 seam 骨架见
+    /// `component/exit.rs::stop_component`（同样尚未接线）。
     pub fn begin_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Stopping)
     }

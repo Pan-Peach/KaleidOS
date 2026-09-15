@@ -610,6 +610,32 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 
 **panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存、制造 UB、持有裸指针、带锁死亡。真正的 memory-fault containment 是 IsolatedNative / U-mode 的职责（见 §4.4 与 `driver-model.md`）。
 
+### 5.2 退出语义：开放问题（**定稿前不要实现**）
+
+`Stopping` / `Stopped` 与 `kcomp_exit` 当前只是 seam（loader 可选解析、Core 从不
+调用）。填空位置：Core 侧 `component/exit.rs::stop_component`（shape-only stub，
+调用顺序骨架见模块文档），组件侧各组件 `kcomp_exit!(0)` 的 TODO 占位。以下
+问题**没有定稿答案**，实现前必须由人决定——这里只列选项：
+
+1. **退出契约本身**：`kcomp_exit() -> i32` 可以失败吗——非 0 是忽略、转 `Failed`
+   还是重试？可以阻塞 / `yield` 吗？需要超时或看门狗吗？在退出钩子里 `panic`
+   走哪条路径（现有 containment、直接 `Failed`、还是"退出期间 panic 不可容忍"）？
+2. **谁触发退出**：组件自己（self-exit：任务里主动请求）、Core / monitor 发起、
+   还是依赖它的 consumer 解绑触发？要不要都支持，优先级如何？
+3. **"意外退出"的表示**：独立于 `Failed` 的终态，还是沿用现有 `Failed` 路径？
+   （现状 panic containment 统一提交 `Failed`；新增状态会改变 `can_transition`
+   规则表与锚定它的 host 测试。）
+4. **仍持有的 authority**：由组件在退出钩子里自行 `release`，还是 Core 事后逐表
+   `revoke` 兜底（像 `fail_component`）？对称问题：graceful 释放的设备要不要
+   像失败设备一样进 quarantine？
+5. **退出钩子的执行上下文**：组件自己的任务上、Core-owned 临时栈（`kcomp_init`
+   containment 的对称物）、还是专门的退出任务？期间允许创建 / 运行任务吗？
+6. **loader 是否要求该符号**：保持可选（缺省 = 跳过退出钩子，`exit == None`），
+   还是变成必需（契约变更，所有 `.kcomp` 都要导出）？
+7. **与"逻辑重启 = 全新实例"的关系**：`Stopped` 之后是 unload 记录并重新探测
+   （新 `ComponentId`）、保留名字槽只重新 `start`、还是先保留 `Stopped` 记录？
+   在 phase 1 没有段内存回收的前提下，`Stopped` 实例的段内存与名字槽归谁？
+
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 
 整个系统**不是一棵树**，而是两种关系的叠加：

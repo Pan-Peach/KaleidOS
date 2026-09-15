@@ -29,3 +29,6 @@ pub extern "C" fn kcomp_init() -> i32 {
     trace::group(&mut checks, &sched, &resource);
     checks.finish()
 }
+
+// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+kcomp_sdk::kcomp_exit!(0);

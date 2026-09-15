@@ -6,6 +6,7 @@
 
 pub mod containment;
 mod elf;
+pub mod exit;
 pub mod export;
 pub mod failure;
 pub mod interface;
@@ -15,6 +16,7 @@ pub mod registry;
 pub mod store;
 
 pub use containment::panic_escape;
+pub use exit::stop_component;
 pub use failure::fail_component;
 
 /// Core 真相门禁：`id` 是否为 `Failed`（逻辑死亡）实例。

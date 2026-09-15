@@ -51,13 +51,5 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-/// 组件退出入口（Linux `module_exit` 类比）——本演示组件是 no-op：定义它是为了
-/// 让 loader 的 optional-exit seam 有真实符号可解析，并断言 `.kcomp` 流程
-/// （partial link / GC）不会丢掉它。
-///
-/// **Core 本轮只解析、永不调用**（见 `os/core/src/component/loader.rs` 的
-/// `LoadedComponent::exit` 与 `TODO(component-exit)`）。
-#[unsafe(no_mangle)]
-pub extern "C" fn kcomp_exit() -> i32 {
-    0
-}
+// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+kcomp_sdk::kcomp_exit!(0);

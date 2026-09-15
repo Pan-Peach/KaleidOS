@@ -317,12 +317,12 @@ mod tests {
 
     #[test]
     fn exit_entry_is_none_when_symbol_absent() {
-        // Given：core_test 未导出 kcomp_exit。
+        // Given：kcomp_min 只导出 kcomp_init，刻意没有 kcomp_exit。
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
 
         // When：加载组件。
-        let comp = load_component(CORETEST_KCOMP).expect("load core_test.kcomp");
+        let comp = load_component(SMOKE_MIN_KCOMP).expect("load smoke_min.kcomp");
 
         // Then：可选 exit seam 保持 None（组件不导出 exit 是正常情况）。
         assert_eq!(comp.exit, None);

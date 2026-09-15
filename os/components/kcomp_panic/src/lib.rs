@@ -15,3 +15,6 @@ use kcomp_sdk as _;
 kcomp_sdk::kcomp_init!({
     panic!("kcomp_panic: deliberate panic for containment test");
 });
+
+// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+kcomp_sdk::kcomp_exit!(0);
