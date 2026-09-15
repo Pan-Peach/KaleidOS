@@ -122,6 +122,15 @@ def main() -> int:
               f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
         return 1
 
+    # 陈旧镜像守卫：`make kernel` 跟随 `.config`，而本 runner 按 arch 只 boot
+    # `kaleidos-<arch>`。两者对不上时（例如 `.config` 是 rv32，而归此处 boot rv64）
+    # 会**静默地测试一个旧镜像** —— 已经踩过一次坑，所以这里直接硬失败。
+    package = os.path.join(REPO, "tools", "qemu", "init.kpkg")
+    if os.path.exists(package) and os.path.getmtime(kernel) < os.path.getmtime(package):
+        print(f"FAIL: {conf['kernel']} is older than tools/qemu/init.kpkg (stale image): "
+              f"run `make qemu_{arch}_defconfig && make kernel`")
+        return 1
+
     os.makedirs(LOGS_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = os.path.join(LOGS_DIR, f"{arch}-{stamp}.log")
