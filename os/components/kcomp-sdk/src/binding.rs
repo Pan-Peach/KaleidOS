@@ -3,7 +3,9 @@
 //! 这一层把 ABI 编码（kind / fingerprint）变成类型、把 `0/-errno` 变成
 //! `Result`、把裸指针收窄成 [`RawBinding`] / [`ServiceBinding`]。
 //! 契约由实现 [`Service`] 的类型表达（provider 与 consumer 共享），本模块
-//! 随附 `SchedulerPolicy` / `DriverProber` 两个契约；**不做**字符串函数查找 / 反射 /
+//! 随附 `SchedulerPolicy` / `DriverProber` 两个契约；`BlockDevice` 的契约与
+//! provider wrapper 在 [`crate::block`]（这里只 re-export）。
+//! **不做**字符串函数查找 / 反射 /
 //! 动态类型——KernelNative phase 1 就是 typed `#[repr(C)]` function table + direct call。
 
 use crate::abi;
@@ -329,3 +331,13 @@ impl Service for DriverProber {
     const ABI: InterfaceAbi = DRIVER_PROBER_ABI;
     type Api = DriverProberApi;
 }
+
+// -----------------------------------------------------------------------
+// block.device —— 契约与 provider wrapper 同处一室：[`crate::block`]
+// -----------------------------------------------------------------------
+//
+// 定义（function table / 契约类型 / BlockDeviceProvider / BlockDeviceService）
+// 都在 `crate::block`；这里只 re-export，让既有路径 `binding::BlockDevice` /
+// `binding::BlockDeviceApi` 保持不变。
+
+pub use crate::block::{BLOCK_DEVICE_ABI, BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceApi};

@@ -9,8 +9,8 @@
 //!
 //! 模块划分与 crate 外部路径一一对应（`abi` / `binding` / `DmaDirection` / `log`
 //! / `console_write_byte` 保持原路径不变）：
-//! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、`dma`、`logging`、
-//! `panic`、`alloc`。
+//! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、[`block`] block.device
+//! 契约 + provider wrapper、`dma`、`logging`、`panic`、`alloc`。
 //!
 //! # panic adapter（本 crate 存在的关键理由）
 //!
@@ -35,6 +35,7 @@ extern crate std;
 
 pub mod abi;
 pub mod binding;
+pub mod block;
 
 mod dma;
 mod logging;
