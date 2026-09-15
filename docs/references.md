@@ -25,6 +25,7 @@
 | FSCQ | 论文 | 文件系统验证、崩溃一致性 | 未来对 Component contract 的强验证 |
 | Kani / Loom / Miri / Verus | 工具链 | 模型检查 / 并发探索 / UB 检查 / 演绎验证 | 未来 Developer-First 测试工具链 |
 | Zephyr | 开源 RTOS | arch / SoC / board / device model 的硬件边界 | `Machine Discovery`、设备描述、驱动 Component |
+| Linux 内核模块（`rmmod` / livepatch） | 内核机制（Linux） | 卸载的引用计数与静默、原地替换 | 组件 stop/unload、热替换、过期访问收口（见第 17 条） |
 
 ---
 
@@ -404,6 +405,47 @@ KaleidOS 不照搬：
 - [Zephyr RISC-V architecture notes](https://github.com/zephyrproject-rtos/zephyr/blob/main/doc/hardware/arch/risc-v.rst)
 - [Zephyr Device Driver Model](https://docs.zephyrproject.org/latest/kernel/drivers/index.html)
 - [Zephyr board porting guide](https://github.com/zephyrproject-rtos/zephyr/blob/main/doc/hardware/porting/board_porting.rst)
+
+---
+
+## 17. Linux 内核模块：卸载、引用计数与原地替换
+
+**是什么**：Linux 的模块生命周期（`init_module`/`finit_module` → `MODULE_STATE_COMING`
+→ `do_init_module` → `LIVE` → `delete_module` → `try_stop_module` → `GOING` →
+`free_module`），以及"使用中不许卸"的引用计数机制（`module_refcount` /
+`try_module_get` / `module_put`）。**模块不是线程**：`module_init` 返回后模块只是
+代码 + 数据 + 状态，只在被调用时执行；要长期运行就自己建 kthread/workqueue。
+
+**借鉴什么（逐条对应我们的开放项）**：
+
+| Linux 机制 | 它回答的问题 | 我们的对应 |
+|---|---|---|
+| `module_refcount` + `try_module_get`/`module_put` | "使用中不许卸"怎么做到 | 今天只有"名下有未结束任务就拒绝"这一条粗粒度门；**接口绑定是否也该计入**是开放项 |
+| `MODULE_STATE_GOING` | 先封新用，再执行退出 | 我们的 `Stopping`（封新 work） |
+| `free_module` | 真卸载 = 释放模块内存 + **让名字可复用** | **我们缺这一半**：段内存不回收、名字槽不还、同名 stop 后不能再 `load` |
+| `kthread_stop` + `kthread_should_stop` | 合作式"请求停止 + 等待" | `kcomp_exit` 要能等自己的 worker（drain variant 的先例） |
+| `synchronize_rcu` / `stop_machine` | **如何证明"没人还在引用"** | "真回收"的前置条件；见 `component-model.md` §5 的过期访问边界 |
+| 卸载序（先停 kthread/workqueue/timer，再注销设备） | 退出钩子该按什么顺序干什么 | `kcomp_exit` 的语义参考 |
+| init 失败不调 `exit` | 谁负责擦屁股 | 我们失败路径**刻意不调** `kcomp_exit`，同一个理由 |
+| built-in 永不调 `exit` | 什么时候没有退出这回事 | 无 `kcomp_exit` 符号 = 跳过（可选符号） |
+| `__init` 段 + `free_initmem` | "一次性组件"的回收 | 不是卸载模块，而是 init 后回收 init-only 内存；我们 phase 1 不做 |
+| `rmmod -f`（`CONFIG_MODULE_FORCE_UNLOAD`） | 不合作时怎么办 | 存在但被标注**危险**，且**不真正回收** —— 对应"不合作的组件只能标记死亡，不能回收" |
+| **`livepatch`（ftrace 函数重定向）** | **"动态替换"到底怎么做** | Linux 的答案**不是 unload + reload**，而是**原地重定向行为**；这是"热插拔"最值得先读的一条 |
+
+**怎么映射**：
+- 我们 phase 1 的 `unload` = `rmmod` 的**前半段**（状态 + 资源），缺 `free_module` 那一半；
+- "热插拔"要成立，最短路径是先补"**名字槽 + 新 `ComponentId` + 退休记录**"（让同名重载
+  成立、旧 id 作废），再谈"何时可以安全 free"（需要一种 `synchronize_rcu` 的对应物）；
+- 如果目标只是"运行中换掉已绑定组件的**行为**"，先看 livepatch 的思路，而不是强行 unload。
+
+**不照搬**：`insmod`/`rmmod` 的用户态 syscall 面；模块依赖解析与 `modules.dep`；
+`rmmod -f` 的强制语义；livepatch 的 ftrace 打补丁实现（我们**不做 text patching**，
+见 trace 的运行时开关决策）；以及"重启策略在用户态"之外的部分 —— 我们对应的是
+"Core 记事实、policy 决定要不要重启"。
+
+**阅读入口**：`kernel/module/main.c`（`load_module` / `do_init_module` /
+`delete_module` / `free_module`）、`include/linux/module.h`（`MODULE_STATE_*` /
+`try_module_get`）、`kernel/kthread.c`（`kthread_stop`）、`Documentation/livepatch/`。
 
 ---
 

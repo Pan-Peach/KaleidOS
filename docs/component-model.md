@@ -600,6 +600,21 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 > `Stopping → Stopped`（第一版语义见 §5.2；drain variant / 实例退役仍开放）。
 >
 > **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
+>
+> **"阻断过期访问"的实际边界（重要，勿高估）**：它只对 **Core 经手的路径**成立
+> —— `bind` / `refresh` / `claim` / IRQ 投递 / 调度都会查生命周期（provider 必须
+> `Ready`，见 `component/interface.rs`；Core 每次调度决策都重新 `resolve_policy()`，
+> 见 `os/core/src/sched.rs`）。它**不覆盖"consumer 手里已经拿到的裸函数表指针"**：
+> 接口交付的是 `api: *const ()` / `ctx: *mut ()`，且 Core 明确"永不解引用"
+> （`component/interface.rs` 顶部文档）—— 因此 consumer 若缓存了这张表，
+> **组件 `Stopped`（甚至 `Failed`）之后调用仍会成功**，因为段内存未被释放。
+> 这是"物理驻留 + KernelNative 无隔离"的直接后果，不是 bug。
+>
+> 收口方案（按代价）：①约定 consumer 每次调用前 `refresh(binding_id)` 重新取表
+> （Core 内部已是此模式，但对外只是约定、非强制）；②Core 受控间接层
+> （per-binding trampoline，唯一能在不换架构的前提下强制的做法）；③真回收 +
+> per-domain 地址空间（`ExecutionDomain`，旧指针直接 fault）。三条的取舍与
+> "热插拔到底做到哪一步"绑定，Linux 对照见 `references.md` 第 17 条。
 
 > 意外退出 / abort 当前统一由 `Failed` 覆盖（组件 panic containment 路径）。未来
 > 独立 abort/exit 通知的 hook 点见 `ComponentState::Failed` 的 `TODO(unexpected-exit)`。
