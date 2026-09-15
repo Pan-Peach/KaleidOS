@@ -58,6 +58,11 @@ const COMMANDS: &[Command] = &[
         run: cmds::load,
     },
     Command {
+        name: "unload",
+        help: "stop a kcomp by name (e.g. unload kcomp_smoke)",
+        run: cmds::unload,
+    },
+    Command {
         name: "components",
         help: "list loaded components",
         run: cmds::components,
@@ -249,6 +254,13 @@ mod tests {
         let r = resolve_command(b"trace irq off");
         assert_eq!(name(&r), "trace");
         assert_eq!(args(&r), b"irq off");
+    }
+
+    #[test]
+    fn unload_command_resolves_with_arguments() {
+        let r = resolve_command(b"unload kcomp_smoke");
+        assert_eq!(name(&r), "unload");
+        assert_eq!(args(&r), b"kcomp_smoke");
     }
 
     /// `trace` 是 Core 管理路径：类别开关真的落到运行时掩码上。

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! Declared --resolve--> Resolved --begin_start--> Starting --finish_start--> Ready
-//!     Ready --begin_stop--> Stopping --finish_stop--> Stopped   （stop 路径仅声明，未接线）
+//!     Ready --begin_stop--> Stopping --finish_stop--> Stopped   （stop 编排：component/exit.rs）
 //!     any state --mark_failed--> Failed   （恢复 = 全新实例）
 //!     any state --unload--> 记录移除       （phase 1 不回收放段内存）
 //! ```
@@ -40,12 +40,8 @@ pub struct ComponentRecord {
     /// 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）地址；仅当组件
     /// 导出该符号时存在。
     ///
-    /// **本轮是 seam only：Core 记录但从不调用**——与 `handle/generic.rs`
-    /// 保留未使用形状的先例一致。
-    ///
-    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径会调用它并推进
-    /// `Stopping → Stopped`；当前没有任何路径读它。
-    #[allow(dead_code)]
+    /// 由停止路径（`component/exit.rs::stop_component`）读取并在 Core-owned
+    /// 隔离栈上调用；`None` = 组件没有退出钩子，停止时跳过（正常情况）。
     pub exit: Option<usize>,
     #[allow(dead_code)]
     pub(crate) memory: Option<MemoryLease>,
@@ -119,7 +115,7 @@ impl Registry {
     /// 记录组件的可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）。
     ///
     /// 与 `declare` 分开：只有 load 路径有真实值，registry 单测只关心状态机，
-    /// 不必让每个调用点都携带 `exit`。**Core 本轮只存不调用**（seam only）。
+    /// 不必让每个调用点都携带 `exit`。读取方是 `component/exit.rs::stop_component`。
     pub fn record_exit(
         &mut self,
         id: ComponentId,
@@ -150,24 +146,18 @@ impl Registry {
 
     /// Ready → Stopping：开始优雅停止。
     ///
-    /// **仅声明转换，无生产调用方。** 合法边由 [`ComponentState::can_transition`]
-    /// 唯一定义；stop orchestration（调用 `kcomp_exit`、quiesce/drain、authority
-    /// 回收）尚未接线。
-    ///
-    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径驱动本方法，
-    /// 随后 `finish_stop`；当前停在声明层——编排 seam 骨架见
-    /// `component/exit.rs::stop_component`（同样尚未接线）。
+    /// 合法边由 [`ComponentState::can_transition`] 唯一定义；生产调用方是
+    /// `component/exit.rs::stop_component`（在确认实例不拥有未退出任务之后）。
+    /// 提交后 `may_run` 立即不再放行该实例的任务——"停止中仍等待任务收尾"不在
+    /// 本版语义内（drain variant 明确未实现）。
     pub fn begin_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Stopping)
     }
 
     /// Stopping → Stopped：停止完成。
     ///
-    /// **仅声明转换，无生产调用方**（见 [`Self::begin_stop`] 的
-    /// `TODO(component-exit)`）。
-    ///
-    /// TODO(component-exit): 未来 stop 路径在 `kcomp_exit` 返回、authority 回收后
-    /// 调用本方法；当前停在声明层。
+    /// 生产调用方是 `component/exit.rs::stop_component`，在 `kcomp_exit` 返回 0
+    /// 且 authority 兜底回收之后调用（唯一合法前驱是 `Stopping`）。
     pub fn finish_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Stopped)
     }
@@ -210,8 +200,8 @@ impl Registry {
     ///
     /// 只有活着的实例（`Starting` = `kcomp_init` 执行期、`Ready`）可以运行任务；
     /// `Failed`、`Stopping`、`Stopped` 实例的任务必须从 runnable 候选中剔除，并在
-    /// commit 前再次验证（`Stopping` / `Stopped` 的转换已由规则表声明，但当前没有
-    /// 生产路径驱动它们——stop orchestration deferred；门禁语义已经正确）。
+    /// commit 前再次验证。`Stopping` / `Stopped` 现在由 `component/exit.rs`
+    /// 的停止编排真实驱动。
     pub fn may_run(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))

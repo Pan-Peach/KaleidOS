@@ -2,7 +2,8 @@
 //!
 //! 通过 Component SDK 调用 `kcore_*` 白名单（不再自己写 extern / console helper），
 //! 验证链接后的 `.kcomp` 重定位链路（UNDEF 只解析白名单符号），并保持与迁移前
-//! 相同的可观测行为：输出 `[smoke] hex=<n>\n!`（`n` = 组件数 + 空闲页数）。
+//! 相同的可观测行为：init 输出 `[smoke] hex=<n>\n!`（`n` = 组件数 + 空闲页数），
+//! 退出钩子输出 `[smoke] exit`（Core 停止路径真的调用 `kcomp_exit` 的证据）。
 
 #![no_std]
 
@@ -51,5 +52,13 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
-kcomp_sdk::kcomp_exit!(0);
+// 参考退出钩子（其他组件抄这个形状）：释放自己**实际持有**的东西，并留一行
+// 可观测证据。kcomp_smoke 不持有 authority，所以只有证据行——没有资源的组件
+// 也要显式声明退出钩子，让"没有收尾逻辑"是一行可见的代码。
+// 返回 0 = 干净退出；非零 / panic 的暂定语义见 docs/component-model.md §5.2。
+kcomp_sdk::kcomp_exit!({
+    for &c in "[smoke] exit\n".as_bytes() {
+        kcomp_sdk::console_write_byte(c);
+    }
+    0
+});

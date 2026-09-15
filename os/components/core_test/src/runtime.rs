@@ -30,5 +30,7 @@ pub extern "C" fn kcomp_init() -> i32 {
     checks.finish()
 }
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+// 退出钩子：Core 停止路径（monitor `unload`）会调用。core_test 的 resource 用例
+// 全程自行 release authority（init 结束时不剩常驻持有），显式 no-op；有常驻资源
+// 的组件应像 kcomp_smoke / virtio_blk 那样在钩子里 release。
 kcomp_sdk::kcomp_exit!(0);

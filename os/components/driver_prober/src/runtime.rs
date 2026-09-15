@@ -184,5 +184,7 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+// 退出钩子：Core 停止路径（monitor `unload`）会调用。driver_prober 不持有
+// authority，显式 no-op；注意 dispatch 任务未退出时 stop 会拒绝（drain 未实现，
+// 见 docs/component-model.md §5.2）。
 kcomp_sdk::kcomp_exit!(0);

@@ -7,26 +7,31 @@
 //! 资源表 revoke 只前进 generation，不回收物理驻留（phase 1 无隔离，回收留给
 //! 未来 ExecutionDomain）。
 //!
+//! # 与优雅停止的分工（stop orchestration 已接线）
+//!
+//! - **失败路径（本模块）刻意不调用 `kcomp_exit`**：失败的组件不值得信任，
+//!   Linux 也不对崩溃模块执行 `module_exit`——Core 直接收回 authority。代价：
+//!   组件侧的设备收尾（stop DMA / reset / mask IRQ）不会发生，Core 的
+//!   revoke + 设备 quarantine 是唯一兜底（见 `docs/component-model.md` §5.2）。
+//! - **优雅停止（`component/exit.rs::stop_component`）**先信任组件的
+//!   `kcomp_exit` 自行收尾，再调用本模块共享的 [`revoke_authority_and_unbind`]
+//!   兜底；两条路径的回收序列同源，只差状态提交。
+//!
 //! # 明确 DEFERRED（本增量不做）
 //!
 //! - **强制停止失败组件的任务**：Core 已从 runnable 候选与 commit 路径剔除
 //!   `Failed` 组件拥有的任务（`sched.rs`），但不会**强制停止**正在跑的任务——
-//!   那需要 task-stop API（当前只有 yield/exit），本增量不做；任务在下次
-//!   yield/exit 时自然退出。
-//! - **Stopping / Stopped 与 `kcomp_exit`**：本增量只把 `Failed` 接入
-//!   acquiring / work 门禁（`component::is_failed` / `component::may_run`，入口见
-//!   `export.rs`）；`kcomp_exit` 只被 loader 可选解析为 seam（从不调用），优雅
-//!   quiesce / drain / 实例退役留给后续增量。
-//!   TODO(unexpected-exit): 本文件是失败实例状态提交的汇合点——未来"独立
-//!   abort/exit 通知"（区分普通失败与组件主动退出）会从这里分流。
+//!   那需要 task-stop API（当前只有 yield/exit）。
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
+//!
+//! TODO(unexpected-exit): 本文件是失败实例状态提交的汇合点——未来"独立
+//! abort/exit 通知"（区分普通失败与组件主动退出）会从这里分流。
 
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, interface, registry};
 use crate::handle::{dma, irq, mmio};
 
-/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → quarantine + 撤销 MMIO →
-/// 撤销 IRQ → 撤销 DMA → 解绑它作为 provider 的所有接口并丢弃其 pending publications。
+/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 共享 authority 兜底。
 ///
 /// **设备 quarantine**：revoke MMIO authority 不等于设备可被下一个驱动安全复用
 /// （设备可能仍被硬件引用 / 未静默）。因此撤销前先把失败组件占用的每个
@@ -39,15 +44,29 @@ use crate::handle::{dma, irq, mmio};
 pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
     let _ = reason;
     registry::get_registry().lock().mark_failed(id).ok();
+    revoke_authority_and_unbind(id);
+}
+
+/// Core 兜底：收回组件剩余的 authority 并解绑它提供的接口。
+///
+/// 精确序列（失败路径与优雅停止路径**共用**，见模块文档）：
+/// 1. MMIO：撤销 owner 的全部 live claim，并把设备标进失败 quarantine
+///    （revoke ≠ 设备可安全复用；phase 1 直到 reboot 不可认领）；
+/// 2. IRQ：撤销 slot（投递目标随之消失）；
+/// 3. DMA：backing lease 进 QUARANTINE（不 free，设备可能仍在 DMA）；
+/// 4. Interface：解绑 active bindings，丢弃 staged pending publications。
+///
+/// 调用方负责状态提交（失败 = `Failed`；优雅停止 = 随后 `Stopping → Stopped`）。
+/// 锁纪律：各表各自取锁、互不嵌套，可在无锁上下文中调用。
+pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
     mmio::get_table().lock().quarantine_owner(id);
     irq::get_table().lock().revoke_owner(id);
-    // DMA authority：failed 组件的 backing lease 进 QUARANTINE（不 free）。
-    // （`dma::revoke_owner` 早已存在，此前未接在失败路径上。）
+    // DMA authority：backing lease 进 QUARANTINE（不 free）。
     dma::get_table().lock().revoke_owner(id);
     let mut ifs = interface::get_interfaces().lock();
     // active bindings：provider 解绑（consumer 立即不可 bind/refresh）。
     ifs.unbind_provider(id);
-    // staged publish：init 失败/panic 时 pending 全丢弃，旧 provider 完全不受影响。
+    // staged publish：pending 全丢弃，旧 provider 完全不受影响。
     ifs.discard_pending(id);
 }
 

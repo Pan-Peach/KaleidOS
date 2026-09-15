@@ -258,6 +258,12 @@ revoke_component_resources(id) —— Core 兜底，收回剩余 authority
 ResourceDomain becomes empty
 ```
 
+> 现状（§5.2 的第一版实现）：quiesce = `begin_stop`（`Ready → Stopping`，任务
+> run 门禁 + publish 拒绝）、component-specific shutdown = 组件退出钩子
+> `kcomp_exit`（monitor `unload` 触发）、stop = `finish_stop`；Core 兜底与失败
+> 路径共用 `failure::revoke_authority_and_unbind`（剩余 MMIO claim 进
+> quarantine）。有未退出任务的实例在第一步就被拒绝（drain variant 未实现）。
+
 #### Forced containment（强制隔离）
 
 组件 crashed / hung / 恶意行为时：
@@ -377,7 +383,8 @@ impl ComponentManager {
 { failure → Failed | success → 提交 pending interfaces → finish_start → Ready }`：
 `resolve()` 已落地（语义 = requires 全部绑定成功）；`Starting` 已接线为
 `kcomp_init()` 执行期（此期间 `kcore_interface_publish` 只记录 pending，不修改
-active binding）。当前 unload 只删记录、不释放段内存。）
+active binding）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，monitor
+`unload` 驱动）；`Stopped` 记录保留、段内存不回收（phase 1）。）
 
 > **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
 >
@@ -581,16 +588,16 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 | Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
 | Starting | 正在初始化（执行 `kcomp_init`） |
 | Ready | 可以对外提供 Interface |
-| Stopping | **shape-only stub**：正在停止（未来在此执行 `kcomp_exit` 并 quiesce/drain；当前无任何转换进入） |
-| Stopped | **shape-only stub**：已停止（当前无任何转换进入） |
+| Stopping | 正在停止：`kcomp_exit` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有 authority 仍可 `release`） |
+| Stopped | 已停止：`kcomp_exit` 已返回、剩余 authority 与接口已被 Core 兜底回收（记录保留；不回收段内存） |
 | Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
 
-> **`kcomp_exit`（Linux `module_exit` 类比）已定义为组件 ABI 的对称退出入口**
+> **`kcomp_exit`（Linux `module_exit` 类比）已是组件 ABI 的对称退出入口**
 > （`#[unsafe(no_mangle)] pub extern "C" fn kcomp_exit() -> i32`）：Core loader 会
-> **可选解析**该符号并记录为 seam（`LoadedComponent::exit` /
-> `ComponentRecord::exit`），但本阶段**从不调用**它；`Stopping` / `Stopped` 也只是
-> `ComponentState` 里的 shape-only 变体。优雅停止（调用 `kcomp_exit` + quiesce/drain
-> + authority 回收 + 实例退役 + 重新探测）留待后续增量。
+> **可选解析**该符号（`LoadedComponent::exit` / `ComponentRecord::exit`；缺省 =
+> 没有钩子，停止时跳过）；monitor `unload <name>` 驱动的停止路径
+> （`component/exit.rs::stop_component`）在实例 `Ready` 时调用它，并把实例推进
+> `Stopping → Stopped`（第一版语义见 §5.2；drain variant / 实例退役仍开放）。
 >
 > **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
 
@@ -601,7 +608,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 
 | 类别 | 表达 | 语义 |
 |---|---|---|
-| 普通失败 | `Result` / status code / `kcomp_init() != 0` | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
+| 普通失败 | `Result` / status code / `kcomp_init() != 0` / `kcomp_exit() != 0`（退出语义暂定，见 §5.2） | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
 | 意外 panic | `panic!`（`panic=abort`） | 进程级 abort，不能凭空转成组件 recovery boundary |
 
 > `panic=abort` 下，Core 栈上的普通 panic 不可能"魔法般"变成组件 recovery boundary。
@@ -610,31 +617,65 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 
 **panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存、制造 UB、持有裸指针、带锁死亡。真正的 memory-fault containment 是 IsolatedNative / U-mode 的职责（见 §4.4 与 `driver-model.md`）。
 
-### 5.2 退出语义：开放问题（**定稿前不要实现**）
+### 5.2 退出语义：第一版（small option）已实现
 
-`Stopping` / `Stopped` 与 `kcomp_exit` 当前只是 seam（loader 可选解析、Core 从不
-调用）。填空位置：Core 侧 `component/exit.rs::stop_component`（shape-only stub，
-调用顺序骨架见模块文档），组件侧各组件 `kcomp_exit!(0)` 的 TODO 占位。以下
-问题**没有定稿答案**，实现前必须由人决定——这里只列选项：
+`Stopping` / `Stopped` 与 `kcomp_exit` 已接线：Core 侧唯一汇合点 =
+`component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>`
+（组件侧参考实现 = `kcomp_smoke`：无资源可释放时也留一行"钩子已跑"的证据）。
 
-1. **退出契约本身**：`kcomp_exit() -> i32` 可以失败吗——非 0 是忽略、转 `Failed`
-   还是重试？可以阻塞 / `yield` 吗？需要超时或看门狗吗？在退出钩子里 `panic`
-   走哪条路径（现有 containment、直接 `Failed`、还是"退出期间 panic 不可容忍"）？
-2. **谁触发退出**：组件自己（self-exit：任务里主动请求）、Core / monitor 发起、
-   还是依赖它的 consumer 解绑触发？要不要都支持，优先级如何？
-3. **"意外退出"的表示**：独立于 `Failed` 的终态，还是沿用现有 `Failed` 路径？
-   （现状 panic containment 统一提交 `Failed`；新增状态会改变 `can_transition`
-   规则表与锚定它的 host 测试。）
-4. **仍持有的 authority**：由组件在退出钩子里自行 `release`，还是 Core 事后逐表
-   `revoke` 兜底（像 `fail_component`）？对称问题：graceful 释放的设备要不要
-   像失败设备一样进 quarantine？
-5. **退出钩子的执行上下文**：组件自己的任务上、Core-owned 临时栈（`kcomp_init`
-   containment 的对称物）、还是专门的退出任务？期间允许创建 / 运行任务吗？
-6. **loader 是否要求该符号**：保持可选（缺省 = 跳过退出钩子，`exit == None`），
-   还是变成必需（契约变更，所有 `.kcomp` 都要导出）？
-7. **与"逻辑重启 = 全新实例"的关系**：`Stopped` 之后是 unload 记录并重新探测
-   （新 `ComponentId`）、保留名字槽只重新 `start`、还是先保留 `Stopped` 记录？
-   在 phase 1 没有段内存回收的前提下，`Stopped` 实例的段内存与名字槽归谁？
+**已实现顺序（small option，Oracle 评审后定稿）**：
+
+```text
+1. 拒绝门（任何提交之前；拒绝不改 Core 真相）
+   a. 实例必须不拥有未退出的任务             → 否则 OwnsLiveTasks / EBUSY（不 join、不等待）
+   b. 实例必须存在且处于 Ready（规则表）      → 否则 NotFound / ENOENT 或 NotReady / EINVAL
+2. begin_stop                              Ready → Stopping：任务 run 门禁 + publish 拒绝
+3. kcomp_exit（可选符号）                   Core-owned 隔离栈；ambient identity = 被停止实例
+4. Core 兜底                               revoke authority + 解绑 provider（与失败路径同序列）
+5. finish_stop                             Stopping → Stopped（记录保留）
+```
+
+- **为什么是这个顺序**：`may_run` 只允许 `Starting` / `Ready`，一旦提交
+  `Stopping`，该实例的任务就不可能再被调度回来收尾——"先停后等任务"自相矛盾；
+  `yield` 只提交 `Runnable`（不是 `Exited`），任务不会"自然退出"。
+- **身份**：退出钩子跑在 Core-owned 临时栈上（与 `kcomp_init` 对称，
+  `containment::call_component_exit`），其 Core 调用身份是**被停止的实例**
+  （`EscapeKind::Exit`），不是发起 stop 的 monitor / 其他组件；
+  `kcore_interface_publish` 在 exit 边界被拒（publish 是 init 期操作）。
+- **authority**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
+  周期门禁限制）；钩子返回后 Core 仍兜底撤销一切**剩余** authority。剩余的
+  MMIO claim 会进失败 quarantine（revoke ≠ 设备可安全复用），组件自己
+  `release` 的不会——兜底与失败路径共用 `failure::revoke_authority_and_unbind`。
+- **失败路径刻意不调用 exit**（Linux 类比：崩溃的模块不值得信任）：`Failed`
+  只走 `fail_component`（mark + 兜底）。**未闭合**：组件侧的设备收尾
+  （stop DMA / reset / mask IRQ）在失败路径上不会发生，Core 的 revoke +
+  quarantine 是唯一兜底。
+- **暂定默认（待人类定稿）**：`kcomp_exit` 返回非零 → 镜像 `InitFailed`
+  （`Failed` + 兜底）；钩子 panic → 镜像 `InitPanicked`（Exit 边界容纳 →
+  `Failed`）。反方论证：退出失败可能不值得把实例标为逻辑死亡（它已经停了一
+  半），也可以选择记录并继续 `Stopped`。
+- **拒绝语义**：非 `Ready`（重复 stop / `Failed` / 未完成 init）→ `NotReady` /
+  `EINVAL`；未知实例 → `NotFound` / `ENOENT`；有活任务 → `OwnsLiveTasks` /
+  `EBUSY`（errno 映射见 `errno.rs::From<ComponentStopError>`）。
+
+**仍开放（本版不做，需人类定稿）**：
+
+1. **drain variant**（等任务清空再停）：需要 (a) `may_run` 增加"停止中仍允许
+   收尾"的第三种语义，(b) 任务完成协议 / 超时 / 看门狗，(c) 与强制停止的关系。
+   当前 small option 是"有活任务直接拒绝"。
+2. **非零退出 / 退出 panic 的最终分类**：见上"暂定默认"。
+3. **`UnexpectedExit` 是否作为独立终态**：当前意外退出统一 `Failed`；新增状态
+   要改 `can_transition` 规则表与锚定它的 host 测试。
+4. **信任域分叉**：本版退出钩子与 `kcomp_init` 一样跑在 Core-owned 栈上
+   （KernelNative、协作式、无隔离）；IsolatedNative / SandboxedNative 的停止
+   （地址空间销毁、真正停止任务）是各自 ExecutionDomain 的职责。
+5. **实例退役**：`Stopped` 记录保留（不回收段内存、`ComponentId` 不复用）；
+   unload 记录 / 重新探测仍待定。
+6. **退出期间的新 authority 门禁**：现有 export 门禁只拦 `Failed`；钩子在
+   `Stopping` 期间仍可 `kcore_mmio_claim`（随后被兜底撤销）。硬拦需要把
+   acquiring 门禁从"非 `Failed`"改成生命周期判定（会同时影响 `Stopped`）。
+7. **退出钩子的阻塞 / 超时 / 看门狗**：钩子同步执行、无超时；挂死会挂住
+   stop（KernelNative 协作式信任，与 `kcomp_init` 同）。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 

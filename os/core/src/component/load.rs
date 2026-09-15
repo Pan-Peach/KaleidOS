@@ -32,6 +32,11 @@ pub enum ComponentLoadError {
     InitFailed(i32),
     /// 组件入口 panic 已切回 Core；组件状态由 caller 提交为 Failed。
     InitPanicked,
+    /// 退出钩子返回非零（**暂定**：镜像 `InitFailed` → `Failed` + 兜底；待人类定稿）。
+    /// 由 `component/exit.rs::stop_component` 作为失败原因传入。
+    ExitFailed(i32),
+    /// 退出钩子 panic，已由 Exit 边界切回 Core（**暂定**：镜像 `InitPanicked` → `Failed`）。
+    ExitPanicked,
     /// `kcomp_init` 返回 0，但 pending interfaces 提交冲突（ABI mismatch /
     /// kind mismatch）——组件被提交为 Failed，旧 binding 不受影响。
     InterfaceCommitFailed(InterfaceError),
@@ -83,11 +88,9 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
         let id = reg
             .declare(name, comp.entry, comp.base, comp.take_memory())
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
-        // 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）：只记录 seam。
-        //
-        // TODO(component-exit): 未来 ComponentManager 的 stop 路径会读取
-        //   `ComponentRecord.exit` 并调用它（`Ready → Stopping → Stopped`）。
-        //   当前**从未调用**——`kcomp_exit` 的定义/解析只是完成生命周期形状。
+        // 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）：记录为 seam，
+        // 由停止路径（`component/exit.rs::stop_component`）读取并调用。
+        // loader 不要求该符号：`None` = 组件没有退出钩子，停止时跳过。
         reg.record_exit(id, comp.exit)
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
         reg.resolve(id)

@@ -1,7 +1,7 @@
 //! Component panic containment: init boundary **and** runtime task boundary.
 //!
-//! A KernelNative component can panic in two places, and both are contained by
-//! escaping to a Core-owned context instead of unwinding:
+//! A KernelNative component can panic at three Core boundaries, and all are
+//! contained by escaping to a Core-owned context instead of unwinding:
 //!
 //! 1. **Init boundary** (`kcomp_init`): the component entry runs on a temporary
 //!    Core-owned stack ([`call_on_isolated_stack`]).  Its normal return and the
@@ -12,6 +12,11 @@
 //!    to a Core-owned **task-abort context** ([`task_abort_trampoline`]), which
 //!    commits the dead task to `Exited`, fails its owning component, and
 //!    reschedules in a clean Core context.
+//! 3. **Exit boundary** (`kcomp_exit`, graceful stop): the hook runs on the same
+//!    temporary Core-owned stack as init ([`call_component_exit`]) and records
+//!    the **stopped instance** as its ambient identity.  A panic escapes back
+//!    to `component/exit.rs::stop_component`, which classifies it as an exit
+//!    failure.
 //!
 //! Because control never returns through the panicking frame this is **not**
 //! Rust unwinding and remains compatible with `panic = "abort"`.
@@ -40,8 +45,11 @@
 //! - The failed component's image, allocations, and abandoned stack frames stay
 //!   resident; only authority is revoked via `fail_component`.  The aborted
 //!   task's kernel stack is **not** reclaimed.
-//! - Other tasks owned by the failed component are **not** force-stopped: Core
-//!   has no task-stop API yet, so they keep running until they yield/exit.
+//! - Other tasks owned by the failed component are **not** force-stopped:
+//!   `may_run` excludes them from runnable candidates (they never run again),
+//!   but their records stay non-`Exited` because Core has no task-stop API yet.
+//!   The graceful-stop path therefore refuses components that still own live
+//!   tasks (see `component/exit.rs`).
 //! - No Core lock may span the switch.  A panic while a Core lock is held can
 //!   still leave that lock held (known KernelNative limitation).
 //! - The task-abort context is single-CPU and reused; it is only entered once
@@ -78,6 +86,12 @@ pub enum EscapeKind {
     /// `kcomp_init` running on a temporary Core stack.  The owner is the
     /// component Core is initializing, or `None` for a direct (selftest) call.
     Init { owner: Option<ComponentId> },
+    /// `kcomp_exit` running on a temporary Core stack during a graceful stop.
+    ///
+    /// The owner is the **instance being stopped** — never the monitor or other
+    /// component that initiated the stop — so identity-sensitive Core calls made
+    /// by the hook are attributed to the stopped instance.
+    Exit { owner: ComponentId },
     /// A component task running on its own kernel stack.
     Task { task: TaskId, owner: ComponentId },
 }
@@ -89,18 +103,20 @@ pub struct EscapeInfo {
 }
 
 impl EscapeInfo {
-    /// Owning component, when known (`Task` always, `Init` only inside a load).
+    /// Owning component, when known (`Task` / `Exit` always, `Init` only inside
+    /// a load).
     pub fn owner(self) -> Option<ComponentId> {
         match self.kind {
             EscapeKind::Init { owner } => owner,
+            EscapeKind::Exit { owner } => Some(owner),
             EscapeKind::Task { owner, .. } => Some(owner),
         }
     }
 
-    /// Running task id, or `None` at the init boundary.
+    /// Running task id, or `None` at the init and exit boundaries.
     pub fn task(self) -> Option<TaskId> {
         match self.kind {
-            EscapeKind::Init { .. } => None,
+            EscapeKind::Init { .. } | EscapeKind::Exit { .. } => None,
             EscapeKind::Task { task, .. } => Some(task),
         }
     }
@@ -222,8 +238,34 @@ pub fn call_component_init(entry: usize) -> CallOutcome {
     call_on_isolated_stack(init)
 }
 
+/// Calls a component **exit hook** (`kcomp_exit`) on a Core-owned stack.
+///
+/// The guard records `owner` — the instance being stopped — as the ambient
+/// identity, so `RequestContext::ambient()` inside the hook resolves to that
+/// instance (never to the monitor/caller that initiated the stop, and never to
+/// `load::current_component()`).  Panic routing is the same as init: the escape
+/// switches back to `stop_component`, which classifies the outcome.
+pub fn call_component_exit(entry: usize, owner: ComponentId) -> CallOutcome {
+    // SAFETY: `entry` comes from `LoadedComponent::exit`, which the loader
+    // resolved and relocated from the component's own symbol table (same
+    // contract as `call_component_init`).
+    let exit = unsafe { core::mem::transmute::<usize, ComponentEntry>(entry) };
+    call_on_isolated_stack_with(exit, EscapeKind::Exit { owner })
+}
+
 /// Calls a component entry on a Core-owned stack and contains its panic escape.
 pub fn call_on_isolated_stack(entry: ComponentEntry) -> CallOutcome {
+    call_on_isolated_stack_with(
+        entry,
+        EscapeKind::Init {
+            owner: crate::component::load::current_component(),
+        },
+    )
+}
+
+/// Shared body of the init / exit boundaries: allocate a Core-owned stack,
+/// install `kind` as the active escape guard, switch, and collect the outcome.
+fn call_on_isolated_stack_with(entry: ComponentEntry, kind: EscapeKind) -> CallOutcome {
     let stack = match memory::alloc_region(COMPONENT_STACK_BYTES) {
         Ok(stack) => stack,
         Err(_) => return CallOutcome::Returned(STACK_ALLOCATION_FAILED),
@@ -232,9 +274,7 @@ pub fn call_on_isolated_stack(entry: ComponentEntry) -> CallOutcome {
     let mut core_context = CpuImpl::new_context(0, 0);
     let mut component_context = CpuImpl::new_context(trampoline as *const () as usize, stack_top);
     let mut guard = EscapeGuard {
-        kind: EscapeKind::Init {
-            owner: crate::component::load::current_component(),
-        },
+        kind,
         from_context: &mut component_context,
         to_context: &mut core_context,
         entry: Some(entry),
@@ -439,6 +479,32 @@ pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnO
     result
 }
 
+/// Runs `f` with an exit escape boundary installed over the current one, without
+/// a context switch.  Mirrors the guard installed by [`call_component_exit`], so
+/// host tests can assert the ambient identity of the stopped instance (the fake
+/// context backend does not actually execute component entries).
+#[cfg(test)]
+pub(crate) fn with_test_exit_boundary<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R {
+    let mut from_context = CpuImpl::new_context(0, 0);
+    let mut to_context = CpuImpl::new_context(0, 0);
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::Exit { owner },
+        from_context: &mut from_context,
+        to_context: &mut to_context,
+        entry: None,
+        returned: 0,
+        state: GuardState::new(None),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
+}
+
 /// Marks the active escape as panicked, as the boot panic handler does before
 /// escaping.  Lets host tests assert that popping a panicked guard still
 /// restores the previous boundary.
@@ -500,6 +566,42 @@ mod tests {
         // When / Then: both identities are visible to the diagnostics.
         assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
         assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+    }
+
+    #[test]
+    fn escape_info_reports_exit_owner_without_task() {
+        // Given: an exit-boundary escape for the stopped instance 9.
+        let info = EscapeInfo {
+            kind: EscapeKind::Exit {
+                owner: ComponentId::from_raw(9),
+            },
+        };
+
+        // When / Then: it names the instance and has no task.
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(9)));
+        assert_eq!(info.task(), None);
+    }
+
+    #[test]
+    fn exit_boundary_is_the_ambient_identity_and_not_a_publish_principal() {
+        // Given: no ambient boundary.
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        assert!(active_escape().is_none());
+
+        // When: an exit boundary for component 5 is active (as during kcomp_exit).
+        let owner = ComponentId::from_raw(5);
+        with_test_exit_boundary(owner, || {
+            // Then: Core calls are attributed to the stopped instance...
+            let ambient = crate::handle::RequestContext::ambient().expect("ambient identity");
+            assert_eq!(ambient.component, owner);
+            assert_eq!(ambient.task, None);
+            // ...and publish remains an init-time operation.
+            assert!(crate::handle::RequestContext::ambient_init().is_none());
+        });
+
+        // Then: the previous boundary is restored after the hook returns.
+        assert!(active_escape().is_none());
     }
 
     #[test]

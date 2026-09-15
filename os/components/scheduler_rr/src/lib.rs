@@ -82,7 +82,8 @@ pub extern "C" fn kcomp_init() -> i32 {
     0
 }
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+// 退出钩子：Core 停止路径（monitor `unload`）会调用。scheduler_rr 不持有
+// MMIO/IRQ/DMA authority（接口 teardown 由 Core 兜底解绑），显式 no-op。
 kcomp_sdk::kcomp_exit!(0);
 
 #[cfg(test)]

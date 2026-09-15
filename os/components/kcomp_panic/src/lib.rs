@@ -16,5 +16,6 @@ kcomp_sdk::kcomp_init!({
     panic!("kcomp_panic: deliberate panic for containment test");
 });
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+// 退出钩子：本组件的 `kcomp_init` 必然 panic → 实例永不进入 Ready，停止路径
+// 不会到达这里；显式 no-op 只为保持 ABI 形状对称（见 docs/component-model.md §5.2）。
 kcomp_sdk::kcomp_exit!(0);

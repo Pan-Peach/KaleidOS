@@ -66,6 +66,18 @@ impl TaskTable {
         self.tasks.contains_key(&id)
     }
 
+    /// `owner` 是否仍拥有**未退出**的任务（只读扫表；不引入第二账本）。
+    ///
+    /// `Exited` 是唯一终态：`yield` 只提交 `Runnable`、不会"自然退出"，
+    /// 所以除 `Exited` 外的一切状态（`Created`/`Runnable`/`Running`/`Blocked`）
+    /// 都算未完成。停止编排（`component/exit.rs::stop_component`）用它做拒绝门；
+    /// 它不提供 join / 等待，也不改变任何任务状态。
+    pub fn has_live_tasks(&self, owner: ComponentId) -> bool {
+        self.tasks
+            .iter()
+            .any(|(_, record)| record.owner() == owner && record.state() != TaskState::Exited)
+    }
+
     fn insert(&mut self, id: TaskId, record: TaskRecord) -> Result<(), TaskError> {
         match self.tasks.entry(id) {
             Entry::Vacant(v) => {
@@ -314,6 +326,30 @@ mod tests {
 
         assert_eq!(t.start(OWNER, id), Ok(()));
         assert_eq!(t.get(id).unwrap().state(), TaskState::Runnable);
+    }
+
+    #[test]
+    fn has_live_tasks_counts_only_owned_unfinished_tasks() {
+        let _g = setup();
+
+        // Given：空表。
+        let mut t = TaskTable::new();
+        assert!(!t.has_live_tasks(OWNER), "empty table owns nothing");
+
+        // When/Then：Created 算未完成；别人的任务不算我的。
+        let created = t.create(OWNER, ENTRY).unwrap();
+        assert!(t.has_live_tasks(OWNER), "Created is unfinished");
+        assert!(
+            !t.has_live_tasks(OTHER_OWNER),
+            "foreign owner must not block"
+        );
+
+        // When/Then：Exited 是唯一终态；yield 只提交 Runnable，不自然退出。
+        t.transition(created, TaskState::Runnable).unwrap();
+        assert!(t.has_live_tasks(OWNER), "Runnable is unfinished");
+        t.transition(created, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(created, TaskState::Exited).unwrap();
+        assert!(!t.has_live_tasks(OWNER), "Exited does not block stop");
     }
 
     /// 性能基线（`make bench`）：**task 数量增长时的趋势**。

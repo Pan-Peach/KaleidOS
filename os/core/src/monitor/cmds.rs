@@ -137,6 +137,45 @@ pub fn load(args: &[u8]) {
     }
 }
 
+/// `unload <name>`：优雅停止一个已加载组件（`Ready → Stopping → Stopped`）。
+///
+/// 薄 caller：停止编排在 `component/exit.rs::stop_component`（拒绝拥有未退出
+/// 任务的实例；调用可选 `kcomp_exit`；Core 兜底回收）。记录保留——phase 1 不
+/// 回收段内存、不退役实例，`components` 仍能看到 `state=Stopped`。
+pub fn unload(args: &[u8]) {
+    let name = args.trim_ascii();
+    if name.is_empty() {
+        printk!("usage: unload <name>\n");
+        return;
+    }
+    let name = String::from_utf8_lossy(name);
+    let id = crate::component::registry::get_registry()
+        .lock()
+        .iter()
+        .find(|record| record.name.as_slice() == name.as_bytes())
+        .map(|record| record.id);
+    let Some(id) = id else {
+        printk!("unload {name}: no such component\n");
+        return;
+    };
+    match crate::component::exit::stop_component(id) {
+        Ok(()) => {
+            let reg = crate::component::registry::get_registry().lock();
+            match reg.get(id) {
+                Some(record) => printk!(
+                    "unload {}: OK (id={}, state={:?})\n",
+                    name,
+                    id.raw(),
+                    record.state
+                ),
+                // 不变式：stop 成功不删记录；phase 1 记录必然还在。
+                None => printk!("unload {}: OK (id={})\n", name, id.raw()),
+            }
+        }
+        Err(error) => printk!("unload {name}: {error:?}\n"),
+    }
+}
+
 /// `components`：已加载组件列表。
 pub fn components(_line: &[u8]) {
     let reg = crate::component::registry::get_registry().lock();

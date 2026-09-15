@@ -31,10 +31,12 @@ pub struct RequestContext {
 impl RequestContext {
     /// Resolves the ambient caller identity at the Component → Core ABI boundary.
     pub(crate) fn ambient() -> Option<Self> {
-        // Innermost active boundary wins. `call_on_isolated_stack` installs the
-        // init guard over the task guard and restores it on return/panic, so a
-        // nested `kcomp_init` is attributed to the nested component rather than
-        // to the task that requested the load.
+        // Innermost active boundary wins. `call_on_isolated_stack` /
+        // `call_component_exit` install the init / exit guard over the task
+        // guard and restore it on return/panic, so a nested `kcomp_init` is
+        // attributed to the nested component rather than to the task that
+        // requested the load, and a stopping component's hook is attributed to
+        // the instance being stopped.
         if let Some(escape) = containment::active_escape()
             && let Some(component) = escape.owner()
         {
@@ -65,15 +67,16 @@ impl RequestContext {
 
     /// Like [`Self::ambient`] but restricted to an active `kcomp_init` boundary.
     ///
-    /// Interface publication is an init-time operation: a component task is an
-    /// active boundary but is not a valid publication principal.
+    /// Interface publication is an init-time operation: a component task and a
+    /// `kcomp_exit` hook are active boundaries but are not valid publication
+    /// principals.
     pub(crate) fn ambient_init() -> Option<Self> {
         match containment::active_escape()?.kind {
             EscapeKind::Init { owner } => owner.map(|component| Self {
                 component,
                 task: None,
             }),
-            EscapeKind::Task { .. } => None,
+            EscapeKind::Exit { .. } | EscapeKind::Task { .. } => None,
         }
     }
 }

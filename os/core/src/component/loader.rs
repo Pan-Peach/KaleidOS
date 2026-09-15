@@ -43,12 +43,9 @@ pub struct LoadedComponent {
     pub entry: usize,
     /// 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）地址。
     ///
-    /// 组件**可以**导出该 C ABI 符号（`extern "C" fn() -> i32`）；Core 解析它
-    /// 并记录为 seam，但**本轮从不调用**。
-    ///
-    /// TODO(component-exit): 未来 ComponentManager 的 stop 路径会调用它——
-    /// 那时它配合 `ComponentState::Stopping` / `Stopped` 使用。当前没有任何
-    /// 调用点；这是与 `handle/generic.rs` 相同的"保留形状、暂不使用"先例。
+    /// 组件**可以**导出该 C ABI 符号（`extern "C" fn() -> i32`）；Core 解析它，
+    /// 由停止路径（`component/exit.rs::stop_component`）在 Core-owned 隔离栈上
+    /// 调用。`None` = 组件没有退出钩子（正常情况，停止时跳过）。
     pub exit: Option<usize>,
     pub text_size: usize,
     pub(crate) memory: Option<memory::MemoryLease>,
@@ -64,7 +61,7 @@ impl LoadedComponent {
 ///
 /// 加载入口 `kcomp_init` 必须存在；退出入口 `kcomp_exit`（Linux `module_exit`
 /// 类比）**可选**——存在则解析其地址存入 [`LoadedComponent::exit`]，不存在则为
-/// `None`。Core 只解析、从不调用退出入口。
+/// `None`。Core 记录该地址，由停止路径在 Core-owned 隔离栈上调用。
 pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let object = ElfObject::parse(blob)?;
     if object.machine() != ComponentRelocationImpl::ELF_MACHINE {

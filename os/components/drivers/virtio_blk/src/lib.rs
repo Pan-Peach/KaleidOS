@@ -273,5 +273,7 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-// TODO(component-exit): 退出收尾（停 DMA / mask IRQ / 释放 authority）——Core 只解析、从不调用，当前显式 no-op。
+// TODO(component-exit): virtio_blk 持有 MMIO/DMA authority（attached 时），退出
+// 钩子应像 kcomp_smoke 那样显式 release（停 DMA 顺序由驱动决定）；当前 no-op，
+// 停止时由 Core 兜底 revoke + quarantine（见 docs/component-model.md §5.2）。
 kcomp_sdk::kcomp_exit!(0);

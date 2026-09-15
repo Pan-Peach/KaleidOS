@@ -16,6 +16,7 @@
 //!   不再新增"正数成功 / 负数错误"协议；纯 query 与 allocator 风格 API
 //!   不强制（见 `component/export.rs`）。
 
+use crate::component::exit::ComponentStopError;
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
 use crate::handle::{HandleError, dma, irq, mmio};
@@ -129,8 +130,25 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::StartFailed => Errno::EIO,
             ComponentLoadError::InitFailed(_) => Errno::EIO,
             ComponentLoadError::InitPanicked => Errno::EIO,
+            ComponentLoadError::ExitFailed(_) => Errno::EIO,
+            ComponentLoadError::ExitPanicked => Errno::EIO,
             ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
+        }
+    }
+}
+
+impl From<ComponentStopError> for Errno {
+    fn from(error: ComponentStopError) -> Self {
+        match error {
+            ComponentStopError::NotFound => Errno::ENOENT,
+            // 状态机拒绝 `Ready → Stopping`（重复 stop / 非 Ready 实例）。
+            ComponentStopError::NotReady => Errno::EINVAL,
+            // 实例仍被任务占用（Linux `delete_module` 的 EBUSY 类比）。
+            ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
+            ComponentStopError::ExitFailed(_) => Errno::EIO,
+            ComponentStopError::ExitPanicked => Errno::EIO,
+            ComponentStopError::StateRejected => Errno::EIO,
         }
     }
 }
@@ -221,6 +239,15 @@ mod tests {
         assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
         assert_eq!(Errno::from(InterfaceError::ProviderNotReady), Errno::EAGAIN);
         assert_eq!(Errno::from(ComponentLoadError::NotFound), Errno::ENOENT);
+        assert_eq!(Errno::from(ComponentLoadError::ExitFailed(1)), Errno::EIO);
+        assert_eq!(Errno::from(ComponentLoadError::ExitPanicked), Errno::EIO);
+        // 优雅停止的错误在边界处有稳定档位（当前消费者 = monitor unload / host tests）。
+        assert_eq!(Errno::from(ComponentStopError::NotFound), Errno::ENOENT);
+        assert_eq!(Errno::from(ComponentStopError::NotReady), Errno::EINVAL);
+        assert_eq!(Errno::from(ComponentStopError::OwnsLiveTasks), Errno::EBUSY);
+        assert_eq!(Errno::from(ComponentStopError::ExitFailed(1)), Errno::EIO);
+        assert_eq!(Errno::from(ComponentStopError::ExitPanicked), Errno::EIO);
+        assert_eq!(Errno::from(ComponentStopError::StateRejected), Errno::EIO);
         assert_eq!(Errno::from(mmio::MmioClaimError::DeviceBusy), Errno::EBUSY);
         assert_eq!(Errno::from(mmio::MmioClaimError::NotMmio), Errno::ENOTSUP);
         assert_eq!(

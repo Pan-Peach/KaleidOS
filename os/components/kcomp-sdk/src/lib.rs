@@ -73,20 +73,20 @@ macro_rules! kcomp_init {
 // 可选退出入口 `kcomp_exit`（Linux module_exit 风格）。
 //
 // 组件用与 `kcomp_init!` 对称的宏声明退出钩子；没有收尾工作的组件写**显式
-// no-op**，让"没有退出逻辑"本身也是一行声明（当前各组件占位即此形状）：
+// no-op**，让"没有退出逻辑"本身也是一行声明（kcomp_smoke 是带证据行的参考）。
 //
 //     kcomp_sdk::kcomp_exit!(0);
 //
-// 本阶段只完成生命周期**形状**：Core loader 会可选地解析该符号并存为 seam
-// （`os/core/src/component/loader.rs::LoadedComponent::exit`、
-// `component::registry::ComponentRecord::exit`），但**从不调用**它——未来的
-// ComponentManager stop 路径才会真正驱动（`Ready → Stopping → Stopped`，见
-// `component::ComponentState` 与 `component/exit.rs::stop_component`）。
+// Core loader 会可选地解析该符号（`LoadedComponent::exit` /
+// `ComponentRecord::exit`）；monitor `unload` 驱动的停止路径
+// （`os/core/src/component/exit.rs::stop_component`）在实例 `Ready` 时于
+// Core-owned 隔离栈上调用它：`Ready → Stopping → Stopped`。
 // **loader 不要求该符号**：不导出 = 该组件没有退出钩子（`exit == None`），
-// 这是正常情况。
+// 停止时跳过钩子，这是正常情况。
 //
-// 返回码约定（future，与 `kcomp_init` 对称）：`0` = 干净退出，非 0 = 失败
-// 位图；当前未驱动，Core 侧无处理语义。
+// 返回码约定（**暂定**，与 `kcomp_init` 对称）：`0` = 干净退出；非 0 / panic
+// 目前镜像 init 失败语义（`Failed` + Core 兜底 revoke）。最终语义待人类定稿，
+// 见 `docs/component-model.md` §5.2。
 #[macro_export]
 macro_rules! kcomp_exit {
     ($($body:tt)*) => {

@@ -16,7 +16,7 @@ pub mod registry;
 pub mod store;
 
 pub use containment::panic_escape;
-pub use exit::stop_component;
+pub use exit::{ComponentStopError, stop_component};
 pub use failure::fail_component;
 
 /// Core 真相门禁：`id` 是否为 `Failed`（逻辑死亡）实例。
@@ -60,19 +60,17 @@ pub enum ComponentState {
     Resolved,
     Starting,
     Ready,
-    /// 正在停止：**shape-only stub**——本增量没有任何路径进入此状态，
-    /// `Stopping → Stopped` 的转换也尚未接线。
+    /// 正在停止：组件退出入口 `kcomp_exit`（Linux `module_exit` 类比）执行期，
+    /// 由 `component/exit.rs::stop_component` 驱动（`Ready → Stopping`）。
     ///
-    /// 预期（future）语义：组件退出入口 `kcomp_exit`（Linux `module_exit` 类比）
-    /// 执行期，publish/claim 等新 work 被拒绝，已有状态逐步清理（quiesce/drain）。
-    ///
-    /// TODO(component-exit): ComponentManager 的 stop 路径落地后
-    /// （`Ready → Stopping → Stopped`），由它调用 `ComponentRecord.exit`。
+    /// 此状态下 `may_run` 不再放行该实例的任务，`kcore_interface_publish` 也
+    /// 不再接受（exit 边界不是 publish principal）；已有 authority 仍可由钩子
+    /// 自行 `release`（teardown 不受生命周期门禁限制，见 `export.rs`）。
     Stopping,
-    /// 已停止：**shape-only stub**——本增量没有任何路径进入此状态。
+    /// 已停止：`kcomp_exit` 已返回、剩余 authority 与接口已由 Core 兜底回收
+    /// （`Stopping → Stopped`，由 `stop_component` 提交）。
     ///
-    /// 预期（future）语义：`kcomp_exit` 已返回、实例的 authority 与接口已回收，
-    /// 之后可退休该实例（释放名字槽、分配新 `ComponentId`）并重新探测。
+    /// phase 1 保留记录：不回收段内存、不退役实例、`ComponentId` 不复用。
     Stopped,
     /// 运行过程中失败（逻辑死亡，可触发恢复流程）。
     ///
@@ -101,10 +99,9 @@ impl ComponentState {
     /// 任意状态  → Failed          （逻辑死亡；含 Failed → Failed 幂等）
     /// ```
     ///
-    /// `Ready → Stopping → Stopped` 已在此声明为规则，但当前**没有任何生产路径
-    /// 驱动它们**（stop orchestration 仍 deferred；`Registry::begin_stop` /
-    /// `finish_stop` 是仅声明未接线的入口）。`Failed` 目标从任意状态均合法，
-    /// 保持 `mark_failed` 的既有语义（可重复标记、保持 `Failed`）。
+    /// `Ready → Stopping → Stopped` 由 `component/exit.rs::stop_component` 的停止
+    /// 编排驱动（`Registry::begin_stop` / `finish_stop`）。`Failed` 目标从任意
+    /// 状态均合法，保持 `mark_failed` 的既有语义（可重复标记、保持 `Failed`）。
     pub const fn can_transition(self, to: Self) -> bool {
         if matches!(to, Self::Failed) {
             return true;
