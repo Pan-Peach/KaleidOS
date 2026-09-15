@@ -119,6 +119,47 @@ UEFI tables / PCI bus probing / 其他 firmware description（未来）
 - Core 不直接处理机器细节：bootstrap 阶段做 discovery → 归一化 MachineInfo → `core::init(&MachineInfo)`（单镜像内函数调用）；
 - 换架构时改 Arch，换 discovery backend 时换机制，Core 不变 —— 这是多架构支持的根基。
 
+### 从 Zephyr 借鉴的硬件边界（不复制 platform 层）
+
+Zephyr 的 `arch / SoC / board / device driver` 拆分值得保留为**概念模型**：
+
+```text
+Architecture   = ISA / 特权级 / trap / context / MMU 等机制
+SoC            = 芯片级中断、clock、memory map 等能力
+Board          = 具体 PCB 的内存、外设实例和连接关系
+Driver         = 设备协议实现，通过 generic Interface 提供语义
+```
+
+在 KaleidOS 中，前三者不要求一一对应三个 crate：
+
+- `os/arch` 只承载 ISA 与 CPU 原语；不能出现 `if board == ...` 才改变的架构机制；
+- SoC/board 的事实由 Machine Discovery backend 发现，归一化为 `MachineInfo` /
+  `DeviceDescriptor` 后交给 Core；Core 不知道事实来自 FDT、ACPI 还是其他来源；
+- driver 是 `os/components/drivers/` 下的 Component，通过 `DeviceId → typed Handle
+  → Lease` 获得 authority，再发布 Device Interface；
+- 当前不建立独立 `platform` 层，是为了避免把板卡目录结构误当成 Core 契约。未来若
+  平台特例增多，只能加入窄的 discovery/backend 模块，不能让 board 名称渗透资源模型。
+
+因此，硬件链路固定为：
+
+```text
+FDT / ACPI / probing
+        ↓
+Machine Discovery → MachineInfo（事实提案）
+        ↓ core::init 校验并提交
+Core Resource Truth
+        ↓ DeviceId（身份，不是权限）
+driver claim → typed Handle / Lease
+        ↓
+Component Interface（设备语义）
+```
+
+另一个直接借鉴是**按能力而不是按板卡名选择机制**。`.config` / Kconfig 表达
+build/profile 能力，`MachineInfo` 表达运行时机器事实；MMU/NoMMU、特权级、PMP/MPU、
+IOMMU/DMA isolation 等能力必须按轴表达。Core 与执行域只承诺实际能力支持的强制
+程度，详见 `driver-model.md` §11。未来如果需要 `ArchCapabilities`，它应是窄的
+能力契约，而不是包含所有板卡差异的大枚举。
+
 依赖方向（当前模型，精确表述）：
 
 ```text
@@ -437,6 +478,7 @@ Scheduler（Component）         Core
 - seL4 → typed authority、不可伪造 capability（Handle 设计来源）
 - Exokernel → 保护与管理分离（Core/Component 分工的理论源头）
 - Theseus / RedLeaf → 状态归属与资源回收（ResourceDomain 思想）
+- Zephyr → arch / SoC / board / device model 的硬件边界（映射到 Machine Discovery 与驱动 Component）
 - Singularity / Inferno / Wasm → 执行域与虚拟 ISA（未来方向）
 
 ## 10. 本文件与其他文档的关系

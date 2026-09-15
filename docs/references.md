@@ -24,6 +24,7 @@
 | CHESS | 论文（微软） | 确定性并发测试 | 未来 Test Scheduler / Hunt Mode |
 | FSCQ | 论文 | 文件系统验证、崩溃一致性 | 未来对 Component contract 的强验证 |
 | Kani / Loom / Miri / Verus | 工具链 | 模型检查 / 并发探索 / UB 检查 / 演绎验证 | 未来 Developer-First 测试工具链 |
+| Zephyr | 开源 RTOS | arch / SoC / board / device model 的硬件边界 | `Machine Discovery`、设备描述、驱动 Component |
 
 ---
 
@@ -292,9 +293,123 @@
 
 ---
 
+## 16. Zephyr：硬件模型与设备边界
+
+**是什么**：面向多架构、众多 SoC 与开发板的 RTOS。这里重点参考它的
+Architecture Porting Guide、RISC-V port、SoC/board 组织方式，以及 Device Driver
+Model；不把它的 scheduler 或 RTOS API 当作 KaleidOS 的架构来源。
+
+### 借鉴一：把硬件差异拆成不同问题
+
+Zephyr 最有价值的提醒是：以下几件事不能混成一个 `hal/<board>.rs`：
+
+```text
+Architecture   = ISA / ABI 原语：trap、context、MMU/MPU、atomic、idle
+SoC            = 芯片能力：中断控制器、clock/pinctrl、memory map
+Board          = PCB 连接：RAM/flash、外设实例、连线和描述
+Device driver  = 某个设备协议/实现：通过 generic API 提供语义
+```
+
+映射到 KaleidOS：
+
+| 硬件模型概念 | KaleidOS 落点 | 边界要求 |
+|---|---|---|
+| Architecture | `os/arch` | 只放 ISA/特权级/翻译与 CPU 原语，不按板卡分支 |
+| SoC / Board facts | Machine Discovery → `MachineInfo` / `DeviceDescriptor` | 归一化机器事实，Core 不知道来源是 FDT、ACPI 还是其他 backend |
+| Device identity | `DeviceId` | 只能发现/选择，不是 authority，不携带地址或 IRQ 权限 |
+| Device driver | `os/components/drivers/` | 驱动是 Component；通过 Core 授予的 typed Handle/Lease 访问硬件 |
+| Generic device API | Component Interface | 表达 BlockDevice/UART 等语义，不暴露板卡地址，也不绑定 transport |
+
+这意味着 **VisionFive 2 不是一种 RISC-V**：RV64 是架构，JH7110 是 SoC，
+VisionFive 2 是 board。未来增加板卡时，不能把板卡名渗透到 Core 的资源语义或驱动
+接口中。
+
+KaleidOS 当前**不建立独立 `platform` crate**，这是有意的实现取舍，而不是否认
+上述分类：概念上仍然区分 arch / SoC / board；代码上先由 Machine Discovery
+backend 把 SoC/board 事实归一化为 `MachineInfo`。只有当发现 backend 或平台特例
+形成稳定、可复用的机制时，才增加窄的模块/目录；platform quirks 仍应是 escape hatch，
+不是默认层。
+
+### 借鉴二：按能力描述机器，不按板卡名称写条件分支
+
+不应把机制写成：
+
+```rust
+if board == VisionFive2 { /* Sv39 / 某个 UART / 某种 IRQ */ }
+```
+
+而应让构建配置和机器发现分别表达能力：
+
+```text
+build/profile capability：XLEN、特权级、MMU/NoMMU、已选择的 backend
+runtime machine fact：CPU topology、RAM、MMIO/PIO、IRQ、timebase、设备实例
+future protection capability：PMP/MPU、IOMMU、DMA isolation 等
+```
+
+当前映射是 `.config` / Kconfig 负责 build/profile 选择，`MachineInfo` 负责启动时
+提交的机器事实；`driver-model.md` §11 的 capability honesty 负责限制执行域承诺。
+未来若引入 `ArchCapabilities` 或等价快照，应保持它是窄的 capability contract，
+不能变成把所有板卡差异塞进 Core 的大枚举。新增机制优先依赖能力谓词，而不是
+`#[cfg(feature = "某块板")]`。
+
+### 借鉴三：设备描述、设备实例、驱动实现和设备语义要分开
+
+Zephyr 的 device model 提醒我们，静态设备描述/API table、具体 driver instance
+和 generic API 是不同层次。KaleidOS 采用更适合运行期组件图的版本：
+
+```text
+MachineInfo / DeviceDescriptor   -- 发现到的事实
+        ↓
+DeviceId                          -- 纯身份，选择候选
+        ↓ Core claim
+MmioHandle / IrqHandle / DmaHandle -- authority
+        ↓ derive lease
+Driver Component                  -- 私有协议状态与 runtime data
+        ↓ publish/bind
+Device Interface                  -- BlockDevice/UART 等语义
+```
+
+因此：
+
+- Core 记录设备存在性、资源范围、所有权和生命周期；不把 UART/virtio/NVMe 协议
+  塞回 Core；
+- generic API 是 Interface 语义，跨边界时用窄的 typed function table；不能让 Rust
+  trait-object ABI 或裸 MMIO 地址成为设备模型；
+- driver instance 的 runtime state 归组件，设备描述的权威事实归 Core；
+- `DeviceId` 只负责发现，Handle 才负责 authority；不能用设备号、地址或 IRQ 号
+  自报身份；
+- 这不意味着要建立一个庞大的统一 driver framework。匹配、probe、组件加载和
+  Interface binding 仍按现有 Component Manager / prober 模型组合。
+
+### 借鉴四：吸收硬件边界，不吸收“全部编译期解决”
+
+Zephyr 的 Kconfig + Devicetree + build system 很适合为一个确定硬件生成固件，
+但不能直接成为 KaleidOS 的整体哲学。KaleidOS 保留：
+
+- Machine Description 与 FDT/ACPI 等具体来源分离；
+- boot-time discovery → Core validation/commit 的硬件事实链；
+- 窄 generic device API 与独立 driver implementation。
+
+KaleidOS 不照搬：
+
+- 把所有设备实例固定成静态全局 device；
+- 用板卡配置取代运行期 Component Graph；
+- 把 Kconfig、Devicetree、CMake/west 组合成一个新的强制框架；
+- 为了模仿 Zephyr 的目录而提前建立 platform/SoC/board 大层级；
+- Zephyr 的 scheduler、线程 API 或 RTOS 语义。
+
+当前阅读入口：
+
+- [Zephyr Architecture Porting Guide](https://docs.zephyrproject.org/latest/hardware/porting/arch.html)
+- [Zephyr RISC-V architecture notes](https://github.com/zephyrproject-rtos/zephyr/blob/main/doc/hardware/arch/risc-v.rst)
+- [Zephyr Device Driver Model](https://docs.zephyrproject.org/latest/kernel/drivers/index.html)
+- [Zephyr board porting guide](https://github.com/zephyrproject-rtos/zephyr/blob/main/doc/hardware/porting/board_porting.rst)
+
+---
+
 ## 使用建议
 
 1. **动手写之前**：读一遍 `core-philosophy.md` 和 `architecture.md`，对照本表的"对应设计点"列。
 2. **设计某个具体机制时**（如 Handle、生命周期、替换流程）：先看对应条目的"借鉴什么/不照搬"，避免重复发明或过度设计。
-3. **第一阶段**：只需要 Asterinas（策略验证）、seL4（typed authority）、Exokernel（保护/管理分离）、Theseus（状态归属）这四条作为主要思想来源，其余条目留作未来参考。
+3. **第一阶段**：主要看 Asterinas（策略验证）、seL4（typed authority）、Exokernel（保护/管理分离）、Theseus（状态归属）；涉及硬件边界和第一个驱动时，优先补看 Zephyr，其余条目留作未来参考。
 4. 本文件是活文档：每深入一个方向（如 Wasm、IPC、验证），就把对应的参考条目写详细。
