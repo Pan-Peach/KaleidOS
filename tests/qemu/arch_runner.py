@@ -45,9 +45,16 @@ CASES = (
     # survive and the adapter's diagnostic line must reach the serial console.
     ("panic-component", None, "[kcomp] panic"),
     ("illegal-instruction", 2, None),
+    ("breakpoint", 3, None),
     ("load-fault", 13, None),
     ("store-readonly", 15, None),
     ("execute-nx", 12, None),
+    # docs/testing.md §2: "TLB flush 是否正确" — a remap (and an invalidation)
+    # must become visible only after sfence.vma; tlb-invalidate faults like
+    # load-fault but fills the TLB first, so it additionally proves the stale
+    # translation is gone.
+    ("tlb-flush", None, None),
+    ("tlb-invalidate", 13, None),
     ("timer", None, None),
     ("external-irq", None, None),
 )

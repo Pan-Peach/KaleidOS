@@ -11,6 +11,17 @@ const PTE_READ_ONLY: u32 = 0xc3;
 #[cfg(target_arch = "riscv32")]
 const PTE_READ_WRITE: u32 = 0xc7;
 
+/// TLB 用例的 VA：页对齐、Sv32/Sv39 都合法，且在长期地址空间里未映射
+/// （与 `UNMAPPED_ADDRESS` 同一空洞；每个 case 跑在独立 QEMU 进程里）。
+const TLB_TEST_ADDRESS: usize = 0x4000_0000;
+/// Sv32 与 Sv39 的 PTE 低 8 位布局相同；TLB 用例只用到这几个叶子位。
+const PTE_V: usize = 1 << 0;
+const PTE_R: usize = 1 << 1;
+const PTE_W: usize = 1 << 2;
+const PTE_A: usize = 1 << 6;
+const PTE_D: usize = 1 << 7;
+const PTE_LEAF_RW: usize = PTE_V | PTE_R | PTE_W | PTE_A | PTE_D;
+
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
 
@@ -45,6 +56,27 @@ static UART_IER_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "riscv32")]
 static mut SV32_TEST_TABLE: [u32; 1024] = [0; 1024];
+
+/// TLB 用例的两个物理后备页：各自独占一页，测试只比较第一字节。
+#[repr(align(4096))]
+struct TestPage([u8; 4096]);
+static mut TLB_PAGE_A: TestPage = TestPage([0; 4096]);
+static mut TLB_PAGE_B: TestPage = TestPage([0; 4096]);
+
+/// TLB 用例自己 poke 的页表页（纯测试代码，不进生产 arch）。
+#[cfg(target_arch = "riscv32")]
+#[repr(align(4096))]
+struct Sv32TestTable([u32; 1024]);
+#[cfg(target_arch = "riscv32")]
+static mut TLB_TABLE32: Sv32TestTable = Sv32TestTable([0; 1024]);
+
+#[cfg(target_arch = "riscv64")]
+#[repr(align(4096))]
+struct Sv39TestTable([u64; 512]);
+#[cfg(target_arch = "riscv64")]
+static mut TLB_L2: Sv39TestTable = Sv39TestTable([0; 512]);
+#[cfg(target_arch = "riscv64")]
+static mut TLB_L1: Sv39TestTable = Sv39TestTable([0; 512]);
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(
@@ -138,6 +170,9 @@ pub fn run(info: &MachineInfo) -> ! {
         b"load-fault" => load_fault(),
         b"store-readonly" => store_readonly_fault(),
         b"execute-nx" => execute_nx_fault(),
+        b"tlb-flush" => tlb_flush(),
+        b"tlb-invalidate" => tlb_invalidate(),
+        b"breakpoint" => breakpoint_fault(),
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
         _ => fail("unknown command"),
@@ -348,6 +383,77 @@ fn execute_nx_fault() -> ! {
     let entry: unsafe extern "C" fn() = unsafe { core::mem::transmute(address) };
     unsafe { entry() };
     fail("NX execute returned")
+}
+
+/// TLB flush ArchTest（docs/testing.md §2「TLB flush 是否正确」）。
+///
+/// 在**活动** satp 页表里把同一个 VA 依次改指到两个不同的物理页，每次改完
+/// `sfence.vma`，然后读 VA：必须读到**新**后备页的标记。关键在中间那一步——
+/// 第一次读已经把旧翻译填进 TLB，若改 PTE 后 flush 失效，第二次读会命中旧项、
+/// 读到旧页的 0xa1；只有真的走了页表才可能读到 0xb2。
+///
+/// 页表由本用例自己 poke（白盒测试代码），RV32/RV64 各一份机制；生产 arch
+/// 不动。
+fn tlb_flush() -> ! {
+    // SAFETY: 两个静态测试页都活着且只被本用例使用。
+    let (pa_a, pa_b) = unsafe {
+        (
+            test_page_pa(core::ptr::addr_of_mut!(TLB_PAGE_A)),
+            test_page_pa(core::ptr::addr_of_mut!(TLB_PAGE_B)),
+        )
+    };
+    // SAFETY: 两个后备页在 identity 映射的 RAM 里；VA 是测试专用空洞，
+    // 每次 poke 后立即 sfence.vma，旧翻译不会再被合法使用。
+    unsafe {
+        core::ptr::write_volatile(pa_a as *mut u8, 0xa1);
+        core::ptr::write_volatile(pa_b as *mut u8, 0xb2);
+
+        selftest_map_page(TLB_TEST_ADDRESS, pa_a, PTE_LEAF_RW);
+        if core::ptr::read_volatile(TLB_TEST_ADDRESS as *const u8) != 0xa1 {
+            fail("tlb-flush: first translation did not take effect");
+        }
+
+        selftest_map_page(TLB_TEST_ADDRESS, pa_b, PTE_LEAF_RW);
+        if core::ptr::read_volatile(TLB_TEST_ADDRESS as *const u8) != 0xb2 {
+            fail("tlb-flush: stale translation survived sfence.vma");
+        }
+
+        selftest_map_page(TLB_TEST_ADDRESS, pa_a, PTE_LEAF_RW);
+        if core::ptr::read_volatile(TLB_TEST_ADDRESS as *const u8) != 0xa1 {
+            fail("tlb-flush: remap back did not take effect");
+        }
+    }
+    pass("tlb-flush")
+}
+
+/// TLB invalidation ArchTest：**先访问**建好的翻译（灌 TLB），再清掉 PTE 并
+/// `sfence.vma`；此后访问必须由硬件 fault（fault-based，runner 期待 scause 13）。
+/// 若 flush 缺失，访问会命中 TLB 旧项、把已撤销页读回来，落到 `fail`。
+fn tlb_invalidate() -> ! {
+    // SAFETY: 静态测试页活着且只被本用例使用。
+    let pa_a = unsafe { test_page_pa(core::ptr::addr_of_mut!(TLB_PAGE_A)) };
+    // SAFETY: 同 `tlb_flush`；最后一次访问必须 fault，不会返回这里。
+    unsafe {
+        core::ptr::write_volatile(pa_a as *mut u8, 0xa1);
+        selftest_map_page(TLB_TEST_ADDRESS, pa_a, PTE_LEAF_RW);
+        if core::ptr::read_volatile(TLB_TEST_ADDRESS as *const u8) != 0xa1 {
+            fail("tlb-invalidate: translation did not take effect");
+        }
+        selftest_map_page(TLB_TEST_ADDRESS, 0, 0);
+        // SAFETY: 映射已撤销且已 sfence，这次 load 必须触发 load page fault。
+        core::ptr::read_volatile(TLB_TEST_ADDRESS as *const u8);
+    }
+    fail("tlb-invalidate: stale translation survived invalidation")
+}
+
+/// `ebreak` → scause 3（Breakpoint）。OpenSBI 把 breakpoint 异常委托给
+/// S-mode（`medeleg` bit 3），所以 S-mode 执行 `ebreak` 必须进本内核的 trap
+/// 入口；runner 断言 `scause=0x3`。
+fn breakpoint_fault() -> ! {
+    // SAFETY: 委托成立时 trap handler 接管且永不返回；若平台不委托，
+    // 执行流落回下一行进入 fail（而不是 UB）。
+    unsafe { core::arch::asm!("ebreak") };
+    fail("breakpoint returned")
 }
 
 /// 定时器 ArchTest（C5 骨架位）：N tick 窗口内时钟中断确实触发，且 `sret`
@@ -595,6 +701,75 @@ unsafe fn rv32_root() -> *mut u32 {
         core::arch::asm!("csrr {satp}, satp", satp = out(reg) satp, options(nostack, preserves_flags));
     }
     ((satp & 0x003f_ffff) << 12) as *mut u32
+}
+
+/// TLB 用例后备页的物理地址（`#[repr(align(4096))]`，页对齐）。
+///
+/// # Safety
+/// `page` 必须指向一个活的测试页。
+unsafe fn test_page_pa(page: *mut TestPage) -> usize {
+    // SAFETY: 调用者保证指针有效；只取首字节地址，不解引用内容。
+    arch::physical_address_of(unsafe { (*page).0.as_mut_ptr() } as usize)
+}
+
+/// 在**活动** satp 页表里重写 `va` 的 4 KiB 叶子（测试侧 poke）。
+///
+/// 只服务 TLB 用例：`va` 是测试空洞，调用方用 `flags` 指定叶子权限，
+/// `flags = 0` 表示撤销。中间层在 RV64 上优先复用现有表；写完必 `sfence.vma`。
+///
+/// # Safety
+/// `va` / `pa` 必须页对齐，且 `va` 除 TLB 用例之外没有别的使用者。
+unsafe fn selftest_map_page(va: usize, pa: usize, flags: usize) {
+    #[cfg(target_arch = "riscv32")]
+    {
+        // SAFETY: TLB_TABLE32 是静态测试表，页对齐且只被本用例使用。
+        let entries = unsafe { &mut (*core::ptr::addr_of_mut!(TLB_TABLE32)).0 };
+        // RV32 全程 identity（VA == PA）：表指针本身即物理地址。
+        let link = (((entries.as_ptr() as usize >> 12) as u32) << 10) | PTE_V as u32;
+        let root = unsafe { rv32_root() };
+        unsafe { root.add(va >> 22).write_volatile(link) };
+        entries.fill(0);
+        entries[(va >> 12) & 0x3ff] = (((pa >> 12) as u32) << 10) | flags as u32;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let satp: usize;
+        unsafe {
+            core::arch::asm!("csrr {satp}, satp", satp = out(reg) satp, options(nostack, preserves_flags));
+        }
+        let root = ((satp & ((1 << 44) - 1)) << 12) as *mut u64;
+        // SAFETY: 两个测试表页对齐、只被本用例使用；PA 由恒等/低别名约定给出。
+        let l2_entries = unsafe { &mut (*core::ptr::addr_of_mut!(TLB_L2)).0 };
+        let l2_pa = arch::physical_address_of(l2_entries.as_mut_ptr() as usize);
+        let l2 = unsafe { sv39_child_table(root, (va >> 30) & 0x1ff, l2_pa) };
+        let l1_entries = unsafe { &mut (*core::ptr::addr_of_mut!(TLB_L1)).0 };
+        let l1_pa = arch::physical_address_of(l1_entries.as_mut_ptr() as usize);
+        let l1 = unsafe { sv39_child_table(l2, (va >> 21) & 0x1ff, l1_pa) };
+        let leaf = ((pa >> 12) as u64) << 10 | flags as u64;
+        unsafe { l1.add((va >> 12) & 0x1ff).write_volatile(leaf) };
+    }
+
+    unsafe {
+        core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+    }
+}
+
+/// RV64：取（必要时安装）`parent[index]` 的下级表——已有表复用，无效或大叶
+/// 槽位换成 `fallback_pa`。返回的指针按 identity 约定可直接解引用。
+///
+/// # Safety
+/// `parent` 必须指向活动的 Sv39 页表页，`fallback_pa` 必须是页对齐的测试表。
+#[cfg(target_arch = "riscv64")]
+unsafe fn sv39_child_table(parent: *mut u64, index: usize, fallback_pa: usize) -> *mut u64 {
+    let entry = unsafe { parent.add(index) };
+    let bits = unsafe { entry.read_volatile() };
+    let is_leaf = bits & ((PTE_R | PTE_W | (1 << 3)) as u64) != 0;
+    if bits & PTE_V as u64 != 0 && !is_leaf {
+        return (((bits >> 10) & ((1 << 44) - 1)) << 12) as *mut u64;
+    }
+    unsafe { entry.write_volatile((((fallback_pa >> 12) as u64) << 10) | PTE_V as u64) };
+    fallback_pa as *mut u64
 }
 
 fn pass(name: &str) -> ! {
