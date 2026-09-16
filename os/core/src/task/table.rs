@@ -352,6 +352,319 @@ mod tests {
         assert!(!t.has_live_tasks(OWNER), "Exited does not block stop");
     }
 
+    // -- Property tests（task 状态机真相，docs/testing.md §2 / §5）------------
+    //
+    // 对同一张 TaskTable 施加随机长序列的 transition / start，逐操作验证：
+    // 1. 合法性精确：transition 成功 <=> (from, to) 属于文档化的合法边
+    // 2. 拒绝保真：Err 时观察到的状态不变
+    // 3. 接受提交：Ok 时观察到的状态 == to
+    // 4. Exited 终态：一旦 Exited，序列后续任何 transition 都不得成功
+    // 5. has_live_tasks(owner) == 模型：owner 是否存在 state != Exited 的任务
+    // 6. 未创建的 id -> NotFound
+    //
+    // 模型谓词 is_legal 独立于生产实现、直接镜像文档，使断言是真正的 oracle。
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Target {
+        A,
+        B,
+        /// 从未 create 过的随机 id（create 只产出 0/1）。
+        Unknown(TaskId),
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Transition {
+            target: Target,
+            to: TaskState,
+        },
+        Start {
+            target: Target,
+            requester: ComponentId,
+        },
+    }
+
+    impl Op {
+        fn target(&self) -> Target {
+            match self {
+                Op::Transition { target, .. } | Op::Start { target, .. } => *target,
+            }
+        }
+    }
+
+    /// 文档化状态机的唯一真相（与 `transition` 的 doc comment 逐条对应）：
+    /// `Created→Runnable`、`Runnable→Running(_)`、`Running(_)→Runnable`、
+    /// `Running(_)→Exited`；其余一律非法（含 Exited 终态）。
+    fn is_legal(from: &TaskState, to: &TaskState) -> bool {
+        matches!(
+            (from, to),
+            (TaskState::Created, TaskState::Runnable)
+                | (TaskState::Runnable, TaskState::Running(_))
+                | (TaskState::Running(_), TaskState::Runnable)
+                | (TaskState::Running(_), TaskState::Exited)
+        )
+    }
+
+    fn state_strategy() -> impl Strategy<Value = TaskState> {
+        prop_oneof![
+            Just(TaskState::Created),
+            Just(TaskState::Runnable),
+            Just(TaskState::Running(CpuId(0))),
+            Just(TaskState::Blocked),
+            Just(TaskState::Exited),
+        ]
+    }
+
+    fn target_strategy() -> impl Strategy<Value = Target> {
+        prop_oneof![
+            Just(Target::A),
+            Just(Target::B),
+            // 合法 create 只产出 0/1，故 [2, 0xffff] 必为不存在的 id。
+            (2u32..=0xffff).prop_map(|raw| Target::Unknown(TaskId::from_raw(raw))),
+        ]
+    }
+
+    fn op_kind_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (target_strategy(), state_strategy())
+                .prop_map(|(target, to)| Op::Transition { target, to }),
+            (
+                target_strategy(),
+                prop_oneof![Just(OWNER), Just(OTHER_OWNER)]
+            )
+                .prop_map(|(target, requester)| Op::Start { target, requester }),
+        ]
+    }
+
+    /// 序列生成器：随机 transition（随机目标状态）与随机 start（随机请求者）。
+    /// 上限压到 80，避免在持有全局堆 GUARD 时放大 proptest 用例开销。
+    fn op_seq() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(op_kind_strategy(), 1..=80)
+    }
+
+    /// 被测对象 + 独立模型：两个任务分属不同 owner（A=OWNER，B=OTHER_OWNER）。
+    struct Harness {
+        table: TaskTable,
+        a: TaskId,
+        b: TaskId,
+        model_a: TaskState,
+        model_b: TaskState,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut table = TaskTable::new();
+            let a = table.create(OWNER, ENTRY).expect("create task A");
+            let b = table.create(OTHER_OWNER, ENTRY).expect("create task B");
+            Self {
+                table,
+                a,
+                b,
+                model_a: TaskState::Created,
+                model_b: TaskState::Created,
+            }
+        }
+
+        fn id_of(&self, target: Target) -> TaskId {
+            match target {
+                Target::A => self.a,
+                Target::B => self.b,
+                Target::Unknown(id) => id,
+            }
+        }
+
+        fn owner_of(&self, target: Target) -> ComponentId {
+            match target {
+                Target::A => OWNER,
+                Target::B => OTHER_OWNER,
+                Target::Unknown(_) => OWNER,
+            }
+        }
+
+        fn is_known(target: Target) -> bool {
+            matches!(target, Target::A | Target::B)
+        }
+
+        fn model_state(&self, target: Target) -> TaskState {
+            match target {
+                Target::A => self.model_a.clone(),
+                Target::B => self.model_b.clone(),
+                Target::Unknown(_) => TaskState::Exited,
+            }
+        }
+
+        fn set_model_state(&mut self, target: Target, state: TaskState) {
+            match target {
+                Target::A => self.model_a = state,
+                Target::B => self.model_b = state,
+                Target::Unknown(_) => panic!("unknown target has no model state"),
+            }
+        }
+    }
+
+    /// 模型侧不变量 5 的期望：owner 是否有 state != Exited 的任务。
+    fn live_model(h: &Harness, owner: ComponentId) -> bool {
+        if owner == OWNER {
+            h.model_a != TaskState::Exited
+        } else if owner == OTHER_OWNER {
+            h.model_b != TaskState::Exited
+        } else {
+            false
+        }
+    }
+
+    fn assert_live_matches_model(h: &Harness, owner: ComponentId) {
+        assert_eq!(
+            h.table.has_live_tasks(owner),
+            live_model(h, owner),
+            "has_live_tasks(owner={}) drifted from model",
+            owner.raw()
+        );
+    }
+
+    /// 施加一个操作并逐条校验不变量 1–6，随后校验不变量 5。
+    fn apply_and_check(h: &mut Harness, op: Op) {
+        let target = op.target();
+        let id = h.id_of(target);
+        let known = Harness::is_known(target);
+
+        // Given：操作前的 Core 真相，先与独立模型交叉核对，保证 oracle 可信。
+        let observed_before = h.table.get(id).map(|r| r.state());
+        if known {
+            assert_eq!(
+                observed_before,
+                Some(h.model_state(target)),
+                "table/model drift before op {op:?}"
+            );
+        } else {
+            assert_eq!(observed_before, None, "unknown id {id} must not exist");
+        }
+
+        match op {
+            Op::Transition { to, .. } => {
+                let result = h.table.transition(id, to.clone());
+
+                if !known {
+                    // 6：未创建的 id 只暴露存在性失败，且不产生任何状态。
+                    assert_eq!(result, Err(TaskError::NotFound));
+                } else {
+                    let from = h.model_state(target);
+                    let legal = is_legal(&from, &to);
+
+                    // 4：Exited 终态——对任意 to 都没有合法出边。
+                    if from == TaskState::Exited {
+                        assert!(
+                            !legal,
+                            "Exited must have no legal outgoing edge (to={to:?})"
+                        );
+                    }
+
+                    if legal {
+                        // 3：接受即提交精确状态。
+                        assert_eq!(result, Ok(()), "legal edge {from:?} -> {to:?} must succeed");
+                        assert_eq!(
+                            h.table.get(id).map(|r| r.state()),
+                            Some(to.clone()),
+                            "accepted transition must commit `to`"
+                        );
+                        h.set_model_state(target, to);
+                    } else {
+                        // 1：每个非法 (from, to) 都必须被显式拒绝。
+                        assert_eq!(
+                            result,
+                            Err(TaskError::InvalidTransition),
+                            "illegal edge {from:?} -> {to:?} must be rejected"
+                        );
+                        // 2：拒绝保真——状态不变。
+                        assert_eq!(
+                            h.table.get(id).map(|r| r.state()),
+                            Some(from),
+                            "rejected transition must not change state"
+                        );
+                    }
+                }
+            }
+            Op::Start { requester, .. } => {
+                let result = h.table.start(requester, id);
+
+                if !known {
+                    assert_eq!(result, Err(TaskError::NotFound));
+                } else if requester != h.owner_of(target) {
+                    // 非 owner 不得启动，且不得改变状态。
+                    let before = h.model_state(target);
+                    assert_eq!(result, Err(TaskError::WrongOwner));
+                    assert_eq!(h.table.get(id).map(|r| r.state()), Some(before));
+                } else {
+                    let from = h.model_state(target);
+                    if is_legal(&from, &TaskState::Runnable) {
+                        assert_eq!(result, Ok(()));
+                        assert_eq!(
+                            h.table.get(id).map(|r| r.state()),
+                            Some(TaskState::Runnable)
+                        );
+                        h.set_model_state(target, TaskState::Runnable);
+                    } else {
+                        assert_eq!(result, Err(TaskError::InvalidTransition));
+                        assert_eq!(h.table.get(id).map(|r| r.state()), Some(from));
+                    }
+                }
+            }
+        }
+
+        // 5：每步之后，两个 owner 的存活判定都必须与模型一致。
+        assert_live_matches_model(h, OWNER);
+        assert_live_matches_model(h, OTHER_OWNER);
+    }
+
+    proptest! {
+        #[test]
+        fn random_transition_sequence_preserves_task_truth(ops in op_seq()) {
+            // Given：全局堆一次初始化 + 进程级互斥（create 会分配真实 kstack region）。
+            let _g = setup();
+            let mut h = Harness::new();
+
+            // When：施加随机长序列。
+            for op in ops {
+                apply_and_check(&mut h, op);
+            }
+
+            // Then（收尾）：归还 kstack region，确认清理路径也成立。
+            h.table.remove(h.a).expect("remove task A");
+            h.table.remove(h.b).expect("remove task B");
+            prop_assert_eq!(h.table.len(), 0);
+        }
+    }
+
+    #[test]
+    fn is_legal_matches_documented_edges_exhaustively() {
+        // 防呆：独立 oracle 本身必须恰好等于文档化的 4 条边（5×5 穷举）。
+        let states = [
+            TaskState::Created,
+            TaskState::Runnable,
+            TaskState::Running(CpuId(0)),
+            TaskState::Blocked,
+            TaskState::Exited,
+        ];
+        let documented = [
+            (TaskState::Created, TaskState::Runnable),
+            (TaskState::Runnable, TaskState::Running(CpuId(0))),
+            (TaskState::Running(CpuId(0)), TaskState::Runnable),
+            (TaskState::Running(CpuId(0)), TaskState::Exited),
+        ];
+        for from in &states {
+            for to in &states {
+                let expected = documented.iter().any(|(f, t)| f == from && t == to);
+                assert_eq!(
+                    is_legal(from, to),
+                    expected,
+                    "is_legal({from:?}, {to:?}) must equal documented edge set"
+                );
+            }
+        }
+    }
+
     /// 性能基线（`make bench`）：**task 数量增长时的趋势**。
     ///
     /// 先证明 O(N) 是不是真问题，再决定加不加索引（与 handle scaling 同一模式）。
@@ -383,5 +696,152 @@ mod tests {
                 table.remove(id).unwrap();
             }
         }
+    }
+
+    // -- 并发探索（docs/testing.md §2）：全局 TASK_TABLE 多线程压力 ---------------
+    //
+    // 守卫分析：**所有会改动全局任务表的测试都持有 `memory::test_support::GUARD`**
+    // （task/mod.rs 与本文件的 setup、sched.rs 绝大多数用例、exit.rs / failure.rs /
+    // inspector.rs 的 setup、export.rs 的合格用例——见各文件）。本用例主线程在
+    // spawn 之前就取下同一把 GUARD（外加 `ensure_init`），把其它测试整体排除；
+    // worker 线程绝不再取 GUARD（否则与主线程自锁），互斥交给 Core 自己的
+    // `TASK_TABLE: spin::Mutex`。
+    //
+    // 少数只读用例（sched::commit_gate_fails_closed_for_unknown_task 查固定幽灵 id、
+    // handle::context 解析 ambient 身份）不持 GUARD，但它们只读固定值，且本用例
+    // 的 TaskId 由全局计数器唯一分配、跑完即 remove，不会与它们相撞。
+    //
+    // 加锁纪律：每个操作只取一次全局任务表锁（create / get / transition / remove
+    // 各自独立作用域，锁在语句结束即释放），绝不并发持有两把表锁。
+
+    /// 在全局任务表上跑完一次合法生命周期：
+    /// `create → Created → Runnable → Running(CpuId(0)) → Runnable → Running → Exited → remove`。
+    ///
+    /// 每一步都重新取锁并断言"接受即提交精确状态"；任何一步失败（包括因其它线程
+    /// 干扰拿到 `NotFound` / `WrongOwner` / `InvalidTransition`）都会 panic，
+    /// 由 join 处的 `expect("worker thread panicked")` 传播到测试。
+    fn global_lifecycle(owner: ComponentId, entry: usize) -> TaskId {
+        let table = crate::task::get_task_table();
+
+        let id = table.lock().create(owner, entry).expect("create");
+
+        let state = table.lock().get(id).expect("created task present").state();
+        assert_eq!(state, TaskState::Created, "create must commit Created");
+
+        table
+            .lock()
+            .transition(id, TaskState::Runnable)
+            .expect("Created -> Runnable");
+        assert_eq!(
+            table.lock().get(id).expect("present").state(),
+            TaskState::Runnable,
+            "accepted transition must commit Runnable"
+        );
+
+        table
+            .lock()
+            .transition(id, TaskState::Running(CpuId(0)))
+            .expect("Runnable -> Running");
+        assert_eq!(
+            table.lock().get(id).expect("present").state(),
+            TaskState::Running(CpuId(0)),
+            "accepted transition must commit Running(CpuId(0))"
+        );
+
+        table
+            .lock()
+            .transition(id, TaskState::Runnable)
+            .expect("Running -> Runnable");
+        assert_eq!(
+            table.lock().get(id).expect("present").state(),
+            TaskState::Runnable,
+            "accepted transition must commit Runnable"
+        );
+
+        table
+            .lock()
+            .transition(id, TaskState::Running(CpuId(0)))
+            .expect("Runnable -> Running");
+        assert_eq!(
+            table.lock().get(id).expect("present").state(),
+            TaskState::Running(CpuId(0)),
+            "accepted transition must commit Running(CpuId(0))"
+        );
+
+        table
+            .lock()
+            .transition(id, TaskState::Exited)
+            .expect("Running -> Exited");
+        assert_eq!(
+            table.lock().get(id).expect("present").state(),
+            TaskState::Exited,
+            "accepted transition must commit Exited"
+        );
+
+        let record = table.lock().remove(id).expect("remove");
+        assert_eq!(record.owner(), owner, "owner must round-trip");
+        assert_eq!(
+            record.state(),
+            TaskState::Exited,
+            "removed record must still be Exited"
+        );
+        id
+    }
+
+    /// 4 线程同起跑，在同一张全局任务表上各跑 200 次完整生命周期：
+    /// id 跨线程唯一、每次转换精确提交、每个线程只看到 `Ok`、结束后无任务泄漏。
+    #[test]
+    fn concurrent_lifecycles_on_global_task_table_keep_ids_unique_and_states_exact() {
+        // Given：进程级任务表 + 全局堆一次初始化；GUARD 在 spawn 之前就持有，
+        // 之后所有会改动全局任务表的测试都被排除在外。
+        crate::task::init();
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        const THREADS: usize = 4;
+        const OPS: usize = 200;
+        let before = crate::task::get_task_table().lock().len();
+        let barrier = std::sync::Barrier::new(THREADS);
+
+        // When：所有线程在 barrier 上对齐后各自反复跑完整生命周期。
+        let per_thread: Vec<Vec<u32>> = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    let owner = ComponentId::from_raw(0x4000 + t as u32);
+                    barrier.wait();
+                    let mut ids = Vec::with_capacity(OPS);
+                    for _ in 0..OPS {
+                        ids.push(global_lifecycle(owner, ENTRY).raw());
+                    }
+                    ids
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("worker thread panicked"))
+                .collect()
+        });
+
+        // Then：4×200 个 id 全部返回，且跨线程两两不同。
+        let all: Vec<u32> = per_thread.iter().flatten().copied().collect();
+        assert_eq!(all.len(), THREADS * OPS, "every op must return an id");
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "task ids must be unique across threads"
+        );
+
+        // Then：每个生命周期都在 worker 内 remove 过——全局表长度回到测试前，
+        // 没有泄漏的任务（我们在持 GUARD，期间无其它测试能改动全表）。
+        assert_eq!(
+            crate::task::get_task_table().lock().len(),
+            before,
+            "every created task must be removed again"
+        );
     }
 }

@@ -142,3 +142,323 @@ impl<T> ResourceTable<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Handle, HandleError, ResourceKind, ResourceTable};
+    use crate::component::ComponentId;
+    use alloc::vec::Vec;
+    use proptest::prelude::*;
+
+    /// 固定的小 owner 域（3 个），让 shrink 时跨 owner 的 `WrongOwner` 分支可复现。
+    const OWNER_COUNT: usize = 3;
+    const OWNERS: [ComponentId; OWNER_COUNT] = [
+        ComponentId::from_raw(1),
+        ComponentId::from_raw(2),
+        ComponentId::from_raw(3),
+    ];
+
+    /// 参考模型的单个 slot：与 Core 真相一一对应（generation / owner / object）。
+    #[derive(Debug, Clone, Copy)]
+    struct ModelSlot {
+        generation: u32,
+        owner: ComponentId,
+        object: Option<u32>,
+    }
+
+    /// 参考模型：每个 slot 的真相 + 本次运行中所有 grant 真实返回过的 handle。
+    struct Model {
+        slots: Vec<ModelSlot>,
+        history: Vec<Handle<u32>>,
+        /// 同时存活资源数的历史峰值（= slot 数组应停住的高水位）。
+        peak_live: usize,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Self {
+                slots: Vec::new(),
+                history: Vec::new(),
+                peak_live: 0,
+            }
+        }
+
+        /// 复刻 `Slot::revoke`：只有仍持有 object 时才 bump generation。
+        fn revoke_slot(&mut self, index: usize) {
+            if self.slots[index].object.take().is_some() {
+                self.slots[index].generation = self.slots[index].generation.wrapping_add(1);
+            }
+        }
+    }
+
+    /// 一次 get/get_mut/release 使用的 handle 来源。
+    ///
+    /// `History` 只会挑 Core 真实返回过的 handle（不手造）；`OutOfRange` 是唯一
+    /// 允许的手造 handle，用来钉住 `Invalid` 分支。
+    #[derive(Debug, Clone, Copy)]
+    enum HandlePick {
+        History(usize),
+        OutOfRange(u32),
+    }
+
+    /// 对 `ResourceTable<u32>` 的一个操作（每个变体是一条 strategy arm）。
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Grant { owner: usize, value: u32 },
+        Get { pick: HandlePick, caller: usize },
+        GetMut { pick: HandlePick, caller: usize },
+        Release { pick: HandlePick, caller: usize },
+        RevokeOwner { owner: usize },
+    }
+
+    fn owner_strategy() -> impl Strategy<Value = usize> {
+        0usize..OWNER_COUNT
+    }
+
+    fn value_strategy() -> impl Strategy<Value = u32> {
+        0u32..4
+    }
+
+    fn pick_strategy() -> impl Strategy<Value = HandlePick> {
+        prop_oneof![
+            (0usize..64).prop_map(HandlePick::History),
+            any::<u32>().prop_map(HandlePick::OutOfRange),
+        ]
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (owner_strategy(), value_strategy())
+                .prop_map(|(owner, value)| Op::Grant { owner, value }),
+            (pick_strategy(), owner_strategy()).prop_map(|(pick, caller)| Op::Get { pick, caller }),
+            (pick_strategy(), owner_strategy())
+                .prop_map(|(pick, caller)| Op::GetMut { pick, caller }),
+            (pick_strategy(), owner_strategy())
+                .prop_map(|(pick, caller)| Op::Release { pick, caller }),
+            owner_strategy().prop_map(|owner| Op::RevokeOwner { owner }),
+        ]
+    }
+
+    /// 有界随机序列：1..=60 个 op，覆盖 grant 与全部校验路径。
+    fn op_seq() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(op_strategy(), 1..=60)
+    }
+
+    /// 复刻 `ResourceTable::get` 的判定顺序：
+    /// slot 越界 → `Invalid`；generation 不符 → `Stale`；owner 不符 → `WrongOwner`；
+    /// slot 已空 → `Revoked`。（`get_mut` 规则相同。）
+    fn predict_get(
+        model: &Model,
+        caller: ComponentId,
+        handle: Handle<u32>,
+    ) -> Result<u32, HandleError> {
+        let slot = model
+            .slots
+            .get(handle.slot() as usize)
+            .ok_or(HandleError::Invalid)?;
+        if slot.generation != handle.generation() {
+            return Err(HandleError::Stale);
+        }
+        if slot.owner != caller {
+            return Err(HandleError::WrongOwner);
+        }
+        slot.object.ok_or(HandleError::Revoked)
+    }
+
+    /// 复刻 `ResourceTable::release` 的判定顺序（无 `Revoked` 分支：
+    /// 只要 slot/generation/owner 成立就 Ok）。
+    fn predict_release(
+        model: &Model,
+        caller: ComponentId,
+        handle: Handle<u32>,
+    ) -> Result<(), HandleError> {
+        let slot = model
+            .slots
+            .get(handle.slot() as usize)
+            .ok_or(HandleError::Invalid)?;
+        if slot.generation != handle.generation() {
+            return Err(HandleError::Stale);
+        }
+        if slot.owner != caller {
+            return Err(HandleError::WrongOwner);
+        }
+        Ok(())
+    }
+
+    fn resolve(pick: HandlePick, model: &Model) -> Option<Handle<u32>> {
+        match pick {
+            HandlePick::History(index) => {
+                // 尚无 grant：没有真实 handle 可用，跳过该 op（OutOfRange 仍可跑）。
+                if model.history.is_empty() {
+                    None
+                } else {
+                    Some(model.history[index % model.history.len()])
+                }
+            }
+            HandlePick::OutOfRange(generation) => Some(Handle::new(u32::MAX, generation)),
+        }
+    }
+
+    /// 每个 op 之后都跑一遍：真实表必须与模型逐 slot 一致，且所有历史 handle
+    /// 在所有 caller 下的解析结果都必须被模型精确预测。
+    fn check_invariants(table: &mut ResourceTable<u32>, model: &mut Model) {
+        // (1)(2)(3)(6) Core truth == 模型 truth：slot/generation/owner/object 全等。
+        // 模型只在 revoke/release 时 wrapping_add(1)，相等即蕴含 generation 单调不减。
+        assert_eq!(
+            table.slots().len(),
+            model.slots.len(),
+            "slot count must match model"
+        );
+        for (index, (real, expected)) in table.slots().iter().zip(model.slots.iter()).enumerate() {
+            assert_eq!(
+                real.generation(),
+                expected.generation,
+                "slot {index}: generation diverged"
+            );
+            assert_eq!(real.owner(), expected.owner, "slot {index}: owner diverged");
+            assert_eq!(
+                real.is_vacant(),
+                expected.object.is_none(),
+                "slot {index}: liveness diverged"
+            );
+            assert_eq!(
+                real.object().copied(),
+                expected.object,
+                "slot {index}: object diverged"
+            );
+        }
+
+        // (5) 空 slot 必须被优先复用：slot 数组长度 == 同时存活资源数的高水位
+        // （grant 只在所有 slot 都存活时才 +1，之后必被释放的 slot 复用）。
+        let live = model
+            .slots
+            .iter()
+            .filter(|slot| slot.object.is_some())
+            .count();
+        model.peak_live = model.peak_live.max(live);
+        assert!(
+            live <= table.slots().len(),
+            "live resources cannot exceed slots"
+        );
+        assert_eq!(
+            table.slots().len(),
+            model.peak_live,
+            "slots must stop at the simultaneous-live high-water mark"
+        );
+
+        // (2)(3)(6) 每个历史 handle × 每个 owner：get/get_mut 结果必须与模型预测逐位
+        // 相等——stale handle 永不解析、跨 owner 必 WrongOwner、revoked owner 的 handle
+        // 失效而其他 owner 的存活 handle 照常工作。
+        for &handle in &model.history {
+            for &caller in &OWNERS {
+                let want = predict_get(model, caller, handle);
+                assert_eq!(
+                    table.get(caller, handle).copied(),
+                    want,
+                    "get({caller:?}, {handle:?}) diverged"
+                );
+                assert_eq!(
+                    table.get_mut(caller, handle).copied(),
+                    want,
+                    "get_mut({caller:?}, {handle:?}) diverged"
+                );
+            }
+        }
+    }
+
+    fn apply(table: &mut ResourceTable<u32>, model: &mut Model, op: Op) {
+        match op {
+            Op::Grant { owner, value } => {
+                // Given: 该资源尚不存在；When: grant(owner, value)。
+                // 预期复用第一个空 slot（保留其 generation），否则在尾部新增 gen=0 的 slot。
+                let owner = OWNERS[owner];
+                let expected = model.slots.iter().position(|slot| slot.object.is_none());
+                let (index, generation) = match expected {
+                    Some(index) => (index, model.slots[index].generation),
+                    None => (model.slots.len(), 0),
+                };
+                let handle = table.grant(owner, value);
+                // Then: handle 必须指向预测的 slot，且 generation 与模型一致。
+                assert_eq!(
+                    handle.slot() as usize,
+                    index,
+                    "grant must reuse the first vacant slot"
+                );
+                assert_eq!(
+                    handle.generation(),
+                    generation,
+                    "reuse must preserve generation"
+                );
+                if index == model.slots.len() {
+                    model.slots.push(ModelSlot {
+                        generation,
+                        owner,
+                        object: Some(value),
+                    });
+                } else {
+                    model.slots[index].owner = owner;
+                    model.slots[index].object = Some(value);
+                }
+                model.history.push(handle);
+            }
+            Op::Get { pick, caller } => {
+                if let Some(handle) = resolve(pick, model) {
+                    let caller = OWNERS[caller];
+                    // Then: get 的结果（含 Ok 时的值）必须与模型预测一致。
+                    assert_eq!(
+                        table.get(caller, handle).copied(),
+                        predict_get(model, caller, handle)
+                    );
+                }
+            }
+            Op::GetMut { pick, caller } => {
+                if let Some(handle) = resolve(pick, model) {
+                    let caller = OWNERS[caller];
+                    // get_mut 与 get 的验证规则完全相同。
+                    assert_eq!(
+                        table.get_mut(caller, handle).copied(),
+                        predict_get(model, caller, handle)
+                    );
+                }
+            }
+            Op::Release { pick, caller } => {
+                if let Some(handle) = resolve(pick, model) {
+                    let caller = OWNERS[caller];
+                    let result = table.release(caller, handle);
+                    assert_eq!(result, predict_release(model, caller, handle));
+                    // (7) 二次 release 时会因 generation 已 bump 而 Stale；模型只在
+                    // release 成功时同步一次 revoke，因此 Stale 判定天然成立。
+                    if result.is_ok() {
+                        model.revoke_slot(handle.slot() as usize);
+                    }
+                }
+            }
+            Op::RevokeOwner { owner } => {
+                let owner = OWNERS[owner];
+                table.revoke_owner(owner);
+                // 仅该 owner 的存活 slot 失效（generation +1）；空 slot 与其他 owner 不动
+                // （revoke_slot 对空 slot 是 no-op，与 Core 的 is_vacant 跳过等价）。
+                for index in 0..model.slots.len() {
+                    if model.slots[index].owner == owner {
+                        model.revoke_slot(index);
+                    }
+                }
+            }
+        }
+        check_invariants(table, model);
+    }
+
+    proptest! {
+        /// 模型对照的随机生命周期：随机 grant/get/get_mut/release/revoke_owner 序列
+        /// 之后，真实 `ResourceTable<u32>` 的 slot/generation/owner 生命周期必须与
+        /// 参考模型逐操作一致（authority 真相不可撒谎）。
+        #[test]
+        fn random_handle_lifecycles_keep_authority_invariants(ops in op_seq()) {
+            let mut table: ResourceTable<u32> = ResourceTable::new(ResourceKind::Mmio);
+            let mut model = Model::new();
+            for op in ops {
+                apply(&mut table, &mut model, op);
+            }
+        }
+    }
+}

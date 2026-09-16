@@ -153,3 +153,81 @@ pub fn ticks() -> u64 {
     let _irq_guard = crate::irq::IrqSaveGuard::new();
     STATE.lock().ticks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    /// 序列化触碰进程级 timer 全局的测试。
+    ///
+    /// `STATE` 是进程级 `static`，`init()` 每个进程只能成功一次且无法重置，
+    /// 所以整条生命周期必须放在单个 `#[test]` 里。锁本身沿用 irq / sched /
+    /// containment / trace 的纪律，防止未来新增测试并发改动同一全局。
+    static TIMER_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    /// 验收：one-shot timer 机制在 host 上的完整生命周期（未初始化 → init →
+    /// 编程 deadline → trap 计数 → 一次性清除 deadline）。
+    #[test]
+    fn timer_lifecycle_covers_init_arm_trap_and_ticks() {
+        let _serial = TIMER_TEST_LOCK.lock();
+
+        // Given: 机制尚未初始化。
+        assert!(!STATE.lock().initialized);
+
+        // When: 未初始化时编程 deadline。
+        let armed = arm_deadline(123);
+
+        // Then: 被拒绝（未初始化），且没有 tick 产生。
+        assert_eq!(armed, Err(TimerError::NotInitialized));
+        assert_eq!(ticks(), 0);
+
+        // When: 未初始化时时钟 trap 到达。
+        on_trap();
+
+        // Then: not-initialized 早退路径不改变 tick 计数。
+        assert_eq!(ticks(), 0);
+
+        // When: 首次 init。
+        let first = init();
+
+        // Then: 首次成功；单例机制拒绝第二次 init。
+        assert_eq!(first, Ok(()));
+        assert_eq!(init(), Err(TimerError::AlreadyInitialized));
+
+        // When: init 之后编程 deadline。
+        let armed = arm_deadline(500);
+
+        // Then: 这次被接受并记录（One-shot 语义：只等这一次）。
+        assert_eq!(armed, Ok(()));
+        assert_eq!(STATE.lock().next_deadline, Some(500));
+
+        // When: 时钟 trap 连续到达 3 次。
+        on_trap();
+        on_trap();
+        on_trap();
+
+        // Then: 每次 trap 都推进 tick 计数。
+        assert_eq!(ticks(), 3);
+
+        // When/Then: 默认（非 preempt）profile 下 on_trap 清除待处理的
+        // deadline（one-shot 语义），后续 trap 继续计数。
+        #[cfg(not(feature = "preempt"))]
+        assert_eq!(STATE.lock().next_deadline, None);
+        on_trap();
+        assert_eq!(ticks(), 4);
+    }
+
+    /// 验收：`TimerError` 支持 `Debug` + 相等比较。
+    #[test]
+    fn timer_error_supports_debug_and_equality() {
+        // Given/When: 同一个变体的两个值，以及一个不同变体。
+        let a = TimerError::NotInitialized;
+        let b = TimerError::NotInitialized;
+
+        // Then: 同变体相等、异变体不等，且 Debug 可格式化。
+        assert_eq!(a, b);
+        assert_ne!(a, TimerError::AlreadyInitialized);
+        assert_eq!(format!("{a:?}"), "NotInitialized");
+    }
+}

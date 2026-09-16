@@ -367,6 +367,95 @@ mod tests {
     /// 串行化触碰进程全局 task table / registry 的调度测试。
     static SCHED_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
+    const ENTRY: usize = 0x8000_0000;
+
+    /// 全局 CPU 真相是进程级 `Once`：`run()` / `yield` / `exit` 会留下
+    /// `current` / `anchor`，用例结束必须复位，否则污染后续用例（例如 handle
+    /// 的 ambient 解析依赖 `current_task() == None`，见 `handle/context.rs`）。
+    fn reset_cpu() {
+        let mut state = cpu().lock();
+        state.anchor = None;
+        state.current = None;
+    }
+
+    fn set_current(id: Option<TaskId>) {
+        cpu().lock().current = id;
+    }
+
+    /// 全局 registry 里的一个 `Ready` 活组件（名字每例唯一：registry 跨用例累积）。
+    fn ready_component(name: &[u8]) -> ComponentId {
+        let mut reg = registry::get_registry().lock();
+        let id = reg.declare(name, ENTRY, ENTRY, None).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        id
+    }
+
+    /// 全局 task 表里的一个 `Runnable` 任务（owner 是否存活由调用方决定）。
+    fn runnable_task(owner: ComponentId) -> TaskId {
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, ENTRY)
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Runnable)
+            .unwrap();
+        task
+    }
+
+    /// 向全局 interfaces 发布一个 `scheduler` policy（provider 走到 `Ready`）。
+    ///
+    /// `vtable` 只以指针存入 binding，调用方的局部 vtable 必须活到用例结束。
+    fn publish_policy(name: &[u8], vtable: &SchedulerPolicyApi) -> ComponentId {
+        let provider = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(name, ENTRY, ENTRY, None).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        {
+            let reg = registry::get_registry().lock();
+            let mut ifs = crate::component::interface::get_interfaces().lock();
+            ifs.stage_publish(
+                &reg,
+                provider,
+                b"scheduler",
+                InterfaceKind::Policy,
+                SCHEDULER_POLICY_ABI,
+                vtable as *const SchedulerPolicyApi as *const (),
+                ptr::null_mut(),
+            )
+            .unwrap();
+            ifs.commit_pending(&reg, provider).unwrap();
+        }
+        registry::get_registry()
+            .lock()
+            .finish_start(provider)
+            .unwrap();
+        provider
+    }
+
+    /// 隔离一个不再可信的 policy provider：`bind` 的存活复验从此失败
+    /// （`resolve_policy` → `NoPolicy`）。让"无 policy"用例与执行顺序无关。
+    fn retire_policy(provider: ComponentId) {
+        registry::get_registry().lock().mark_failed(provider).ok();
+    }
+
+    fn state_of(task: TaskId) -> TaskState {
+        crate::task::get_task_table()
+            .lock()
+            .get(task)
+            .expect("task record")
+            .state()
+    }
+
+    fn remove_task(task: TaskId) {
+        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
+    }
+
     /// 纯逻辑：任务耗尽后 run() 不再切换（无锚点捕获、无 state 变更）。
     #[test]
     fn run_with_no_runnable_tasks_is_noop() {
@@ -745,5 +834,705 @@ mod tests {
 
         // 清理：移除任务，避免污染其它调度测试。
         assert!(crate::task::get_task_table().lock().remove(task).is_ok());
+    }
+
+    /// 对抗：提议一个**存在但不可运行**的任务（`Created`，不在 Core 裁剪过的
+    /// runnable 列表里）——与"提议不存在的 id"同等拒绝：Core 回退 id 序首项、
+    /// 隔离坏 provider、发 `NotRunnable` 事件；被提议任务的状态不被改写。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn proposal_of_existing_but_not_runnable_task_is_rejected() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _trace = crate::trace::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+
+        // Given：一个 Created 任务（存在但不在候选里）+ 一个 Runnable 任务。
+        let owner = ready_component(b"sched_created_owner");
+        let created = crate::task::get_task_table()
+            .lock()
+            .create(owner, ENTRY)
+            .unwrap();
+        let live = runnable_task(owner);
+        assert_eq!(state_of(created), TaskState::Created);
+
+        // Given：一个坏策略，永远提议那个 Created 任务。
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static PROPOSED: AtomicU32 = AtomicU32::new(0);
+        PROPOSED.store(created.raw(), Ordering::SeqCst);
+        extern "C" fn propose_created(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
+            PROPOSED.load(Ordering::SeqCst)
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: propose_created,
+        };
+        let provider = publish_policy(b"sched_created_policy", &vtable);
+
+        // When：走真实提议验证路径（Core 自己裁剪候选 → 验证 → 拒绝）。
+        let runnable = collect_runnable();
+        assert!(runnable.contains(&live), "活任务应在候选里");
+        assert!(!runnable.contains(&created), "Created 不进候选");
+        let picked = pick_next(&runnable).unwrap();
+
+        // Then：拒绝 + 确定性回退；被提议任务状态不变。
+        assert_eq!(picked, Some(live));
+        assert_eq!(
+            state_of(created),
+            TaskState::Created,
+            "被拒绝的提议不得改写真相"
+        );
+        assert_eq!(
+            registry::get_registry().lock().get(provider).unwrap().state,
+            crate::component::ComponentState::Failed,
+            "坏 provider 被隔离"
+        );
+
+        // Then：真实事件序列：坏提议 → Core 拒绝 → provider 隔离。
+        use crate::component::ComponentState;
+        use crate::trace::{RejectReason, TraceEvent};
+        crate::trace::test_support::assert_subsequence(
+            &[
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: created,
+                },
+                TraceEvent::PolicyRejected {
+                    component: provider,
+                    reason: RejectReason::NotRunnable,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Ready),
+                    to: ComponentState::Failed,
+                },
+            ],
+            &crate::trace::test_support::events(),
+        );
+
+        // 清理。
+        remove_task(created);
+        remove_task(live);
+        retire_policy(provider);
+    }
+
+    /// 对抗（**真实 commit 门禁**）：scheduler provider 恰好是唯一 Runnable
+    /// 任务的 owner。坏提议触发 provider 隔离，随后回退任务过不了 commit-time
+    /// `owner_still_runnable` 复验 —— Core 退回锚点，绝不把 CPU 交给已死实例
+    /// 的任务；全程不挂起、不改写任务状态。
+    ///
+    /// 记录一个契约缺口：`RejectReason::OwnerNotRunnable` 目前是**未发射**的
+    /// 词汇（Commit 门禁静默回退），本用例显式断言它没有出现——未来该门禁若
+    /// 开始发事件，这条断言会失败并提醒更新事件契约。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn dead_owner_gate_blocks_dispatch_of_isolated_providers_task() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _trace = crate::trace::test_support::GUARD.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：同一实例既是 policy provider，又是唯一 Runnable 任务的 owner。
+        extern "C" fn propose_ghost(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
+            0xDEAD
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: propose_ghost,
+        };
+        let provider = publish_policy(b"sched_owner_gate", &vtable);
+        let task = runnable_task(provider);
+        assert!(
+            collect_runnable().contains(&task),
+            "活 owner 的任务应在候选里"
+        );
+
+        // When：从锚点进入调度（真实 run → pick_next → commit 门禁）。
+        let result = run();
+
+        // Then 1：不挂起、不 commit —— 任务保持 Runnable，CPU 无 current。
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            state_of(task),
+            TaskState::Runnable,
+            "已死 owner 的任务不得被 dispatch"
+        );
+        assert_eq!(current_task(), None);
+
+        // Then 2：坏提议被拒绝、provider 被隔离。
+        assert_eq!(
+            registry::get_registry().lock().get(provider).unwrap().state,
+            crate::component::ComponentState::Failed
+        );
+        use crate::component::ComponentState;
+        use crate::trace::{RejectReason, TraceEvent};
+        let events = crate::trace::test_support::events();
+        crate::trace::test_support::assert_subsequence(
+            &[
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: TaskId::from_raw(0xDEAD),
+                },
+                TraceEvent::PolicyRejected {
+                    component: provider,
+                    reason: RejectReason::NotRunnable,
+                },
+                TraceEvent::ComponentState {
+                    component: provider,
+                    from: Some(ComponentState::Ready),
+                    to: ComponentState::Failed,
+                },
+            ],
+            &events,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::TaskSwitch { to, .. } if *to == task)),
+            "Core 不得把 CPU 交给已死实例的任务（无 TaskSwitch）"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                TraceEvent::PolicyRejected {
+                    component,
+                    reason: RejectReason::OwnerNotRunnable,
+                } if *component == provider
+            )),
+            "commit 门禁当前是静默回退，不发射 OwnerNotRunnable"
+        );
+
+        // 清理。
+        remove_task(task);
+        retire_policy(provider);
+        reset_cpu();
+    }
+
+    /// 未绑定 SchedulerPolicy 时 Core 不猜、不退化成内置调度器：`run()` 返回
+    /// `NoPolicy`，任务保持 Runnable、无 current、无状态推进。
+    #[test]
+    fn dispatch_without_policy_is_rejected_and_changes_nothing() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：活 owner + Runnable 任务，全程没有发布任何 policy。
+        let owner = ready_component(b"sched_no_policy_owner");
+        let task = runnable_task(owner);
+        assert!(collect_runnable().contains(&task));
+
+        // When
+        let result = run();
+
+        // Then
+        assert_eq!(result, Err(SchedError::NoPolicy));
+        assert_eq!(
+            state_of(task),
+            TaskState::Runnable,
+            "无 policy 不得推进任务状态"
+        );
+        assert_eq!(current_task(), None);
+
+        // 清理。
+        remove_task(task);
+        reset_cpu();
+    }
+
+    /// provider 已死（Failed）的 policy 等价于没有 policy：解析在 bind 的存活
+    /// 复验处失败 → `NoPolicy`；Core 不会静默换用其它 provider。
+    #[test]
+    fn failed_policy_provider_resolves_to_no_policy() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：一个发布过 policy 的 provider + 一个无关的活 owner 与任务。
+        extern "C" fn propose_ghost(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
+            0xDEAD
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: propose_ghost,
+        };
+        let provider = publish_policy(b"sched_dead_policy", &vtable);
+        let owner = ready_component(b"sched_dead_policy_owner");
+        let task = runnable_task(owner);
+
+        // When：provider 在调度请求之前死亡（隔离）。
+        retire_policy(provider);
+        let result = run();
+
+        // Then：binding 的存活复验失败 = 没有可用 policy。
+        assert_eq!(result, Err(SchedError::NoPolicy));
+        assert_eq!(state_of(task), TaskState::Runnable);
+        assert_eq!(current_task(), None);
+
+        // 清理。
+        remove_task(task);
+        reset_cpu();
+    }
+
+    /// `yield` / `exit` 只属于正在运行的任务：本 CPU 无 current 时两个入口都
+    /// 返回 `NoCurrent`，且不产生任何状态/上下文副作用。
+    #[test]
+    fn yield_and_exit_without_current_task_are_rejected() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        crate::task::init();
+        init();
+        reset_cpu();
+
+        assert_eq!(current_task(), None);
+        assert_eq!(yield_current(), Err(SchedError::NoCurrent));
+        assert_eq!(exit_current(), Err(SchedError::NoCurrent));
+        assert_eq!(current_task(), None);
+    }
+
+    /// 非法转换（yield）：current 指向一个已 `Exited` 的任务（陈旧 current，
+    /// Core 不变式被破坏）。yield 只能把 `Running` 推回 `Runnable`，其余状态
+    /// 一律 `InvalidTransition`；失败路径既不回滚也不推进真相。
+    #[test]
+    fn yield_of_exited_current_is_invalid_transition() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：一个已走完生命周期（Exited）的任务被错记为本 CPU 的 current。
+        let owner = ready_component(b"sched_stale_exited_owner");
+        let task = runnable_task(owner);
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Running(CpuId(0)))
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Exited)
+            .unwrap();
+        set_current(Some(task));
+
+        // When
+        let result = yield_current();
+
+        // Then：状态机拒绝推进，当前记录保持不变。
+        assert_eq!(result, Err(SchedError::InvalidTransition));
+        assert_eq!(state_of(task), TaskState::Exited);
+        assert_eq!(current_task(), Some(task), "失败路径不推进 current");
+
+        // 清理。
+        remove_task(task);
+        reset_cpu();
+    }
+
+    /// 非法转换（exit）：`Created` 任务从未运行，不能被 exit 提交为 `Exited`。
+    #[test]
+    fn exit_of_created_current_is_invalid_transition() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：一个 Created 任务被错记为本 CPU 的 current。
+        let owner = ready_component(b"sched_stale_created_owner");
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, ENTRY)
+            .unwrap();
+        set_current(Some(task));
+
+        // When
+        let result = exit_current();
+
+        // Then：非法转换被拒绝，任务与 current 都不动。
+        assert_eq!(result, Err(SchedError::InvalidTransition));
+        assert_eq!(state_of(task), TaskState::Created);
+        assert_eq!(current_task(), Some(task));
+
+        // 清理。
+        remove_task(task);
+        reset_cpu();
+    }
+
+    /// 内部契约防御：`from = Some(id)` 必须显式携带目标状态（生产入口
+    /// `run`/`yield`/`exit` 都携带）；缺失时 Core 拒绝推进而不是猜测——
+    /// `InvalidTransition`，且 current / 任务状态都不动。
+    #[test]
+    fn advance_without_target_state_is_rejected() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：一个任务被记为本 CPU 的 current，但没有给出目标状态。
+        let owner = ready_component(b"sched_no_after_owner");
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(owner, ENTRY)
+            .unwrap();
+        set_current(Some(task));
+
+        // When：缺失 `after`（私有入口防御；生产路径永不这样调用）。
+        let result = schedule_next(Some(task), None, None);
+
+        // Then：拒绝，真相不变。
+        assert_eq!(result, Err(SchedError::InvalidTransition));
+        assert_eq!(state_of(task), TaskState::Created);
+        assert_eq!(current_task(), Some(task));
+
+        // 清理。
+        remove_task(task);
+        reset_cpu();
+    }
+
+    /// Abort 交接（**bookkeeping 部分**；栈抛弃 / 永不返回是 QEMU 契约）：
+    /// 任务 panic 后 Core 在同一次 commit 里把死任务标 `Exited`、选好后继、
+    /// 再 `fail_component` 撤销 owner 的 authority——`ComponentState{Failed}`
+    /// 事件先于 `TaskSwitch` 落账，Core 不被失败组件挂起。
+    ///
+    /// 直接调用私有 `schedule_next`：生产入口 `abort_current_task` 在 host 上
+    /// 会落入永不返回的自旋（见该函数），真实 trampoline 由 QEMU ArchTest 覆盖。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn abort_handoff_commits_exit_fails_owner_and_switches_to_successor() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _trace = crate::trace::test_support::GUARD.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        crate::handle::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：活 owner 与活后继 owner；一个 Running 的"panicking"任务 +
+        // 一个 Runnable 后继（后继必须在 owner 死亡前完成选择）。
+        extern "C" fn first_runnable(
+            _: *mut (),
+            runnable: *const u32,
+            count: usize,
+            _: u32,
+        ) -> u32 {
+            if count == 0 {
+                u32::MAX
+            } else {
+                unsafe { *runnable }
+            }
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: first_runnable,
+        };
+        let provider = publish_policy(b"sched_abort_policy", &vtable);
+        let owner = ready_component(b"sched_abort_owner");
+        let succ_owner = ready_component(b"sched_abort_successor_owner");
+        let dying = runnable_task(owner);
+        crate::task::get_task_table()
+            .lock()
+            .transition(dying, TaskState::Running(CpuId(0)))
+            .unwrap();
+        let successor = runnable_task(succ_owner);
+        set_current(Some(dying));
+
+        // When：abort 交接（等价于 abort_current_task 里的 schedule_next 调用）。
+        let result = schedule_next(Some(dying), Some(TaskState::Exited), Some((dying, owner)));
+
+        // Then 1：死任务 Exited、后继 Running、current = 后继。
+        assert_eq!(result, Ok(()));
+        assert_eq!(state_of(dying), TaskState::Exited);
+        assert_eq!(state_of(successor), TaskState::Running(CpuId(0)));
+        assert_eq!(current_task(), Some(successor));
+
+        // Then 2：owner 逻辑死亡；后继 owner 不受影响。
+        assert_eq!(
+            registry::get_registry().lock().get(owner).unwrap().state,
+            crate::component::ComponentState::Failed
+        );
+        assert_eq!(
+            registry::get_registry()
+                .lock()
+                .get(succ_owner)
+                .unwrap()
+                .state,
+            crate::component::ComponentState::Ready
+        );
+
+        // Then 3：事件顺序——先落 owner 的 Failed 账，再 TaskSwitch。
+        use crate::component::ComponentState;
+        use crate::trace::TraceEvent;
+        crate::trace::test_support::assert_subsequence(
+            &[
+                TraceEvent::ComponentState {
+                    component: owner,
+                    from: Some(ComponentState::Ready),
+                    to: ComponentState::Failed,
+                },
+                TraceEvent::TaskSwitch {
+                    from: Some(dying),
+                    to: successor,
+                },
+            ],
+            &crate::trace::test_support::events(),
+        );
+
+        // 清理：本路径没有经过锚点进入（from = Some），anchor 未建立——
+        // 只复位边界与 CPU 真相，不经过 exit 路径。
+        containment::enter_anchor();
+        remove_task(dying);
+        remove_task(successor);
+        retire_policy(provider);
+        reset_cpu();
+    }
+
+    /// 完整接受链（host 侧，`context_switch` 为 no-op）：run → yield → exit ×2。
+    ///
+    /// 断言三件事：
+    /// 1. commit 真相：任务状态与 `current_task()` 的每次推进；
+    /// 2. policy 输入契约：裁剪后的 runnable 数量与 current 参数按 Core 真相传入；
+    /// 3. 真实事件序列 `PolicyProposal → PolicyAccepted → TaskSwitch`（子序列匹配）。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn run_yield_exit_commit_sequence_is_observable_in_truth_and_trace() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _trace = crate::trace::test_support::GUARD.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：好策略（提议 id 序首项）+ 一个活 owner + 两个 Runnable 任务。
+        use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        static SEEN_CURRENT: AtomicU32 = AtomicU32::new(u32::MAX);
+        static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn first_runnable(
+            _: *mut (),
+            runnable: *const u32,
+            count: usize,
+            current: u32,
+        ) -> u32 {
+            SEEN_CURRENT.store(current, Ordering::SeqCst);
+            SEEN_COUNT.store(count, Ordering::SeqCst);
+            if count == 0 {
+                u32::MAX
+            } else {
+                unsafe { *runnable }
+            }
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: first_runnable,
+        };
+        let provider = publish_policy(b"sched_commit_policy", &vtable);
+        let owner = ready_component(b"sched_commit_owner");
+        let a = runnable_task(owner);
+        let b = runnable_task(owner);
+        assert!(a.raw() < b.raw(), "BTreeMap 迭代序 = id 升序");
+
+        // When 1：锚点 → 调度。A 拿到 CPU（id 序首项）。
+        assert_eq!(run(), Ok(()));
+        assert_eq!(
+            SEEN_COUNT.load(Ordering::SeqCst),
+            2,
+            "policy 只看到两个活任务"
+        );
+        assert_eq!(
+            SEEN_CURRENT.load(Ordering::SeqCst),
+            u32::MAX,
+            "从锚点进入时无 current"
+        );
+        assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
+        assert_eq!(state_of(b), TaskState::Runnable);
+        assert_eq!(current_task(), Some(a));
+
+        // When 2：A 让出 → 只剩 B 是候选；policy 看到的 current 是 A。
+        assert_eq!(yield_current(), Ok(()));
+        assert_eq!(SEEN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(SEEN_CURRENT.load(Ordering::SeqCst), a.raw());
+        assert_eq!(state_of(a), TaskState::Runnable);
+        assert_eq!(state_of(b), TaskState::Running(CpuId(0)));
+        assert_eq!(current_task(), Some(b));
+
+        // When 3：B 退出 → A 接管（Runnable 里还有 A）。
+        assert_eq!(exit_current(), Ok(()));
+        assert_eq!(SEEN_CURRENT.load(Ordering::SeqCst), b.raw());
+        assert_eq!(state_of(b), TaskState::Exited);
+        assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
+        assert_eq!(current_task(), Some(a));
+
+        // When 4：A 退出 → 候选为空，policy 不再被咨询，控制权回锚点。
+        assert_eq!(exit_current(), Ok(()));
+        assert_eq!(
+            SEEN_CURRENT.load(Ordering::SeqCst),
+            b.raw(),
+            "无候选时不咨询 policy"
+        );
+        assert_eq!(state_of(a), TaskState::Exited);
+        assert_eq!(current_task(), None);
+
+        // Then：真实事件序列（thread-local ring 只含本用例事件）。
+        use crate::trace::TraceEvent;
+        crate::trace::test_support::assert_subsequence(
+            &[
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: a,
+                },
+                TraceEvent::PolicyAccepted {
+                    component: provider,
+                    task: a,
+                },
+                TraceEvent::TaskSwitch { from: None, to: a },
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: b,
+                },
+                TraceEvent::PolicyAccepted {
+                    component: provider,
+                    task: b,
+                },
+                TraceEvent::TaskSwitch {
+                    from: Some(a),
+                    to: b,
+                },
+                TraceEvent::PolicyProposal {
+                    component: provider,
+                    task: a,
+                },
+                TraceEvent::PolicyAccepted {
+                    component: provider,
+                    task: a,
+                },
+                TraceEvent::TaskSwitch {
+                    from: Some(b),
+                    to: a,
+                },
+            ],
+            &crate::trace::test_support::events(),
+        );
+
+        // 清理。
+        remove_task(a);
+        remove_task(b);
+        retire_policy(provider);
+        reset_cpu();
+    }
+
+    /// 候选裁剪只放行活实例：死 owner 的 Runnable 任务既不进 policy 输入，
+    /// 也不会被 commit；同一时刻活 owner 的任务照常被调度。
+    #[test]
+    fn dispatch_skips_dead_owner_and_runs_live_owner_task() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        crate::component::interface::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        // Given：一个活 owner 的任务 + 一个 Failed owner 的任务；policy 提议首项。
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count_and_first(
+            _: *mut (),
+            runnable: *const u32,
+            count: usize,
+            _: u32,
+        ) -> u32 {
+            SEEN_COUNT.store(count, Ordering::SeqCst);
+            if count == 0 {
+                u32::MAX
+            } else {
+                unsafe { *runnable }
+            }
+        }
+        let vtable = SchedulerPolicyApi {
+            choose_next: count_and_first,
+        };
+        let provider = publish_policy(b"sched_mixed_policy", &vtable);
+        let live_owner = ready_component(b"sched_mixed_live_owner");
+        let dead_owner = ready_component(b"sched_mixed_dead_owner");
+        let live = runnable_task(live_owner);
+        let dead = runnable_task(dead_owner);
+        registry::get_registry()
+            .lock()
+            .mark_failed(dead_owner)
+            .unwrap();
+
+        // When
+        assert_eq!(run(), Ok(()));
+
+        // Then：policy 只看到活任务（1 个），被 dispatch 的也是它；死任务不动。
+        assert_eq!(
+            SEEN_COUNT.load(Ordering::SeqCst),
+            1,
+            "死实例任务不得进入 policy 输入"
+        );
+        assert_eq!(state_of(live), TaskState::Running(CpuId(0)));
+        assert_eq!(state_of(dead), TaskState::Runnable, "死实例任务不得运行");
+        assert_eq!(current_task(), Some(live));
+        assert!(!collect_runnable().contains(&dead));
+
+        // 清理：让 live 退出（无候选时回锚点），再摘除两个任务。
+        assert_eq!(exit_current(), Ok(()));
+        remove_task(live);
+        remove_task(dead);
+        retire_policy(provider);
+        reset_cpu();
+    }
+
+    /// commit 门禁对"表里不存在的任务"必须 fail-closed：未知 id 不能被当作
+    /// 可运行（`None` 不是 `Some`——不会误调度幽灵任务，也不会 panic）。
+    #[test]
+    fn commit_gate_fails_closed_for_unknown_task() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+
+        assert!(!owner_still_runnable(TaskId::from_raw(0x0BAD_F00D)));
     }
 }

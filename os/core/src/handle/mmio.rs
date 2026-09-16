@@ -387,6 +387,7 @@ mod tests {
     use crate::component::ComponentId;
     use crate::handle::{HandleError, RequestContext};
     use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
+    use alloc::vec::Vec;
 
     fn region(device_index: u8) -> MmioRegion {
         MmioRegion {
@@ -997,5 +998,132 @@ mod tests {
             });
             revoke.finish().report();
         }
+    }
+
+    // -- 并发探索（docs/testing.md §2）：全局 MMIO 表多线程压力 -------------------
+    //
+    // 守卫分析（本文件 + 跨文件）：
+    // - 会断言"自己独占之外的全局 MMIO 真相"的测试都持有
+    //   `memory::test_support::GUARD`（dma.rs 全部用例、export.rs 的 Failed 门禁用例、
+    //   exit.rs / failure.rs 的兜底用例），主线程全程持有同一把 GUARD 即全部排除；
+    // - 只持 `machine::test_support::GUARD` 的用例（本文件 claim 用例、irq.rs 的
+    //   claim_derived 用例）与无守卫用例（read_u32 / write_u32 / derive_lease）各自
+    //   使用独立的 owner 与 device_index：MMIO 验证锚在"自己 slot 的
+    //   slot/generation/owner/生命周期"上，本用例用互不重叠的 owner（0x2000+）与
+    //   device_index（100+），改不到它们的 slot，也不依赖全表计数。
+    // - 刻意**不**取 machine GUARD：它保护的是全局 MachineInfo 提交（本用例根本不读
+    //   MachineInfo），且 failure / exit 的获取顺序是 machine→memory 而 dma 是
+    //   memory→machine——再引入一个同时持两把锁的用例只会放大既有锁序反转的死锁
+    //   窗口。只取 memory GUARD 时，本用例的获取顺序（memory → MMIO 表锁）是现有
+    //   所有顺序的前缀，构不成等待环。
+    //
+    // 加锁纪律：每次操作只取一次全局 MMIO 表锁（grant / get / release 各自独立作用域），
+    // 刻意不走会嵌套扫 IRQ/DMA 子表的模块级 `release`，因此绝不并发持有两张表锁。
+
+    /// 在全局 MMIO 表上跑完一次 root 生命周期：
+    /// `grant(owner) → get(owner)` 命中 → `get(other)` 必 `WrongOwner` → `release` →
+    /// 双方都只能看到 `Stale`。返回本次 grant 的 opaque handle 值用于唯一性断言。
+    fn global_mmio_lifecycle(
+        owner: ComponentId,
+        other: ComponentId,
+        device_index: u8,
+        base: usize,
+    ) -> u64 {
+        let handle = super::get_table().lock().grant(
+            owner,
+            MmioRegion {
+                base,
+                size: 0x1000,
+                device_index,
+            },
+        );
+
+        {
+            let table = super::get_table().lock();
+            let region = table
+                .get(owner, handle)
+                .expect("owner must resolve its live handle");
+            assert_eq!(region.base, base, "region payload must round-trip");
+            assert_eq!(region.size, 0x1000);
+            assert_eq!(region.device_index, device_index);
+            assert_eq!(
+                table.get(other, handle).err(),
+                Some(HandleError::WrongOwner),
+                "a foreign owner must never resolve a live handle"
+            );
+        }
+
+        assert_eq!(
+            super::get_table().lock().release(owner, handle),
+            Ok(()),
+            "owner must be able to release its own handle"
+        );
+
+        {
+            let table = super::get_table().lock();
+            assert!(
+                matches!(table.get(owner, handle), Err(HandleError::Stale)),
+                "released handle must be Stale for its owner"
+            );
+            assert!(
+                matches!(table.get(other, handle), Err(HandleError::Stale)),
+                "released handle must never resolve for a foreign owner"
+            );
+        }
+
+        handle.to_raw()
+    }
+
+    /// 4 线程同起跑，各用自己的 owner / device_index 在同一张全局 MMIO 表上反复
+    /// grant→get→release：所有权验证恒成立、释放后恒 Stale、handle 值跨线程唯一。
+    #[test]
+    fn concurrent_mmio_lifecycles_on_global_table_keep_owners_isolated() {
+        // Given：全局 MMIO 表 + 全局堆一次初始化；GUARD 在 spawn 之前就持有。
+        crate::handle::init();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        const THREADS: usize = 4;
+        const OPS: usize = 200;
+        // 100+ 是本用例专用区，避开所有现有用例的 device_index（0–24、200–240）。
+        const FIRST_DEVICE_INDEX: u8 = 100;
+        let barrier = std::sync::Barrier::new(THREADS);
+
+        // When：所有线程在 barrier 上对齐后各自反复跑完整生命周期；断言都在
+        // worker 内，失败即 panic，由 join 处的 `expect` 传播到测试。
+        let per_thread: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    let owner = ComponentId::from_raw(0x2000 + t as u32);
+                    let other = ComponentId::from_raw(0x2100 + t as u32);
+                    let device_index = FIRST_DEVICE_INDEX + t as u8;
+                    barrier.wait();
+                    let mut handles = Vec::with_capacity(OPS);
+                    for op in 0..OPS {
+                        let base = 0x1000_0000 + device_index as usize * 0x1_0000 + op * 0x10;
+                        handles.push(global_mmio_lifecycle(owner, other, device_index, base));
+                    }
+                    handles
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("worker thread panicked"))
+                .collect()
+        });
+
+        // Then：4×200 个 handle 全部返回。slot 复用只会让 generation +1、绝不回退，
+        // 因此 (slot, generation) 在表生命周期内不会重复——handle 值跨线程唯一。
+        let mut all: Vec<u64> = per_thread.into_iter().flatten().collect();
+        assert_eq!(all.len(), THREADS * OPS, "every op must return a handle");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            THREADS * OPS,
+            "granted handle values must be unique across threads"
+        );
     }
 }

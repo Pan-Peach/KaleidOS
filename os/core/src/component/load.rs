@@ -146,3 +146,79 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::ComponentState;
+
+    /// 与 `store::tests` 同一份真实包（`manifest` + `kcomp_smoke.kcomp`）。
+    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
+
+    /// 串行化本模块触碰全局真相（store / registry / interface / handle / HEAP）
+    /// 的测试；将来新增 load 相关用例都必须先拿这把锁。
+    static LOAD_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    /// 完整有序场景：NotFound → 成功到 `Ready` → 重名 `DeclareFailed` → CURRENT 恢复。
+    ///
+    /// 为什么全放在一个测试里：store / registry 是进程级 `Once`，无法重置，拆开
+    /// 会引入执行顺序依赖。host 边界（`arch::fake`）：`context_switch` 是 no-op，
+    /// 组件入口体永不执行、trampoline 永不进入，`call_component_init` 恒返回
+    /// `CallOutcome::Returned(0)`——因此能断言生命周期链走到 `Ready`，但不能断言
+    /// 组件代码真实跑过（真实执行由 QEMU CoreTest 覆盖）。
+    #[test]
+    fn load_and_start_drives_ready_and_rejects_duplicate_name() {
+        let _serial = LOAD_TEST_LOCK.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        // 本测试是全 crate 唯一挂载 store 的 host 路径（其余 `store::init` 调用点
+        // 只有 boot 的 main32/main64），所以仓库内容必然是 REAL_KPKG——先挂载，
+        // `kcomp_smoke.kcomp` 的查找才是确定性的。
+        crate::component::store::init(REAL_KPKG);
+        registry::init();
+        interface::init();
+        crate::handle::init();
+
+        // Given：没有组件正在初始化。
+        assert_eq!(current_component(), None, "init 之外没有当前组件");
+
+        // When：加载 store 中不存在的名字。
+        // Then：NotFound（仓库已挂载，因此不是 StoreNotMounted）。
+        assert_eq!(
+            load_and_start(b"load_tests_missing_component"),
+            Err(ComponentLoadError::NotFound)
+        );
+        assert_eq!(current_component(), None, "失败路径不得残留 CURRENT");
+
+        // When：加载真实 fixture 组件。
+        // Then：生命周期提交到 Ready（Declared → Resolved → Starting → Ready）。
+        let id = load_and_start(b"kcomp_smoke").expect("kcomp_smoke 必须加载成功");
+        assert_eq!(
+            registry::get_registry().lock().get(id).map(|r| r.state),
+            Some(ComponentState::Ready)
+        );
+        assert_eq!(current_component(), None, "call_init 之后 CURRENT 必须恢复");
+
+        // When：同名再次加载（registry 已拥有该名字）。
+        // Then：DeclareFailed，且原实例真相不受影响。
+        assert_eq!(
+            load_and_start(b"kcomp_smoke"),
+            Err(ComponentLoadError::DeclareFailed)
+        );
+        assert_eq!(
+            registry::get_registry().lock().get(id).map(|r| r.state),
+            Some(ComponentState::Ready),
+            "重复声明失败不得改变原记录"
+        );
+        assert_eq!(current_component(), None, "失败路径不得残留 CURRENT");
+
+        // 未覆盖分支（host 不可确定性到达，不伪造）：
+        // - StoreNotMounted：store 挂载后无法卸载（Once）；
+        // - ReadFailed / Loader：REAL_KPKG 的条目与 ELF 都合法；
+        // - ResolveFailed / StartFailed：无 requires，且声明成功后的状态机边都由
+        //   本路径按序驱动，不可能被拒绝；
+        // - InitFailed / InitPanicked / InterfaceCommitFailed：入口体在 fake
+        //   context backend 下不执行（恒 Returned(0)），无法产生非零返回、panic
+        //   或 pending publication——真实执行 / 失败路径由 QEMU CoreTest 覆盖。
+    }
+}

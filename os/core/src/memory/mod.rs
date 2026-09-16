@@ -382,4 +382,185 @@ mod tests {
             bench.finish().report();
         }
     }
+
+    // ------------------------------------------------------------------
+    // init 的非法区间（纯逻辑，返回前不锁 HEAP，不碰全局堆）----
+    // ------------------------------------------------------------------
+
+    /// 验收：`region_start >= region_end` 直接被拒，且在**锁 HEAP 之前**返回。
+    ///
+    /// 测试显式持有 `HEAP` 锁再调用：若 `init` 试图上锁会自旋死锁（测试挂死），
+    /// 以此证明非法路径不触碰全局堆——也正因如此，它不会重初始化被其它测试
+    /// 共享的 HEAP。`HEAP` 锁下无嵌套 `GUARD` 需求，故不取 GUARD。
+    #[test]
+    fn init_rejects_invalid_region_without_touching_heap() {
+        let _heap = HEAP.lock();
+        assert_eq!(init(10, 5), Err("invalid frame region"));
+        assert_eq!(init(4096, 4096), Err("invalid frame region"));
+    }
+
+    // ------------------------------------------------------------------
+    // 纯 helper：order_for_size / align_up_page（无全局状态，不取 GUARD）----
+    // ------------------------------------------------------------------
+
+    /// 验收：size → buddy order 的映射 + 越界尺寸拒绝。
+    #[test]
+    fn order_for_size_maps_sizes_to_buddy_orders() {
+        assert_eq!(order_for_size(0), Err(MemoryError::InvalidSize));
+        assert_eq!(order_for_size(ALLOC_GRANULE), Ok(HEAP_MIN_ORDER));
+        assert_eq!(order_for_size(2 * ALLOC_GRANULE), Ok(HEAP_MIN_ORDER + 1));
+        // 非 2 的幂向上取整到下一档
+        assert_eq!(order_for_size(ALLOC_GRANULE + 1), Ok(HEAP_MIN_ORDER + 1));
+        // 超过最大块 / 溢出 → InvalidSize（不 panic）
+        assert_eq!(order_for_size(usize::MAX), Err(MemoryError::InvalidSize));
+    }
+
+    /// 验收：`align_up_page` 对已对齐地址不变、对未对齐地址向上取整，
+    /// 结果恒为 4 KiB 对齐且 `>= addr`。
+    #[test]
+    fn align_up_page_rounds_up_and_preserves_alignment() {
+        assert_eq!(align_up_page(0x1000), 0x1000, "already aligned stays");
+        assert_eq!(align_up_page(0x1001), 0x2000, "unaligned rounds up");
+
+        for addr in [
+            0usize,
+            1,
+            ALLOC_GRANULE - 1,
+            ALLOC_GRANULE,
+            ALLOC_GRANULE + 1,
+        ] {
+            let aligned = align_up_page(addr);
+            assert!(
+                aligned >= addr,
+                "align_up_page must never lower the address"
+            );
+            assert_eq!(aligned % ALLOC_GRANULE, 0, "result must be page-aligned");
+            assert!(
+                aligned - addr < ALLOC_GRANULE,
+                "round-up must advance by less than one granule"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 全局 HEAP 入口（分配 / 查询 / lease）——须持 GUARD + ensure_init ----
+    // ------------------------------------------------------------------
+
+    /// 验收：`alloc_region(0)` 在锁 HEAP 之前就因非法尺寸返回（无 GUARD 需求）。
+    #[test]
+    fn alloc_region_rejects_zero_size() {
+        assert_eq!(alloc_region(0), Err(MemoryError::InvalidSize));
+    }
+
+    /// 验收：`vm_page_alloc()` 返回非空、页对齐、前 16 字节已归零的页。
+    ///
+    /// 注意：该函数**故意 `forget` lease**（v1 页表页不回收），本测试只调用一次，
+    /// 泄漏一页可接受。
+    #[test]
+    fn vm_page_alloc_returns_zeroed_aligned_page() {
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        let page = vm_page_alloc().expect("page allocation should succeed");
+        assert_ne!(page, 0, "physical page address must be non-null");
+        assert_eq!(page % ALLOC_GRANULE, 0, "page must be granule-aligned");
+
+        // SAFETY: page 来自 alloc_region，是 4 KiB 有效可写物理页（v1 pa==va）。
+        let head = unsafe { core::slice::from_raw_parts(page as *const u8, 16) };
+        assert!(
+            head.iter().all(|&b| b == 0),
+            "fresh page must be zeroed in its first 16 bytes"
+        );
+    }
+
+    /// 验收：`init` 之后 `free_block_counts()` 返回按 order 的直方图，
+    /// 且至少有一个 order 存在空闲块（不断言精确数量）。
+    #[test]
+    fn free_block_counts_reports_nonempty_histogram_after_init() {
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        let counts = free_block_counts();
+        assert_eq!(
+            counts.len(),
+            HEAP_ORDER,
+            "histogram covers every buddy order"
+        );
+        let total: usize = counts.iter().sum();
+        assert!(
+            total > 0,
+            "initialized heap must expose at least one free block"
+        );
+    }
+
+    /// 验收：`MemoryLease` 的 `base()`/`size()` 如实报告底层区域——基址页对齐、
+    /// 容量不小于请求尺寸（实为 buddy order 的块大小）；`free_region` 可归还。
+    #[test]
+    fn memory_lease_accessors_report_region_truth() {
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        let lease = alloc_region(ALLOC_GRANULE).expect("alloc should succeed");
+        assert!(
+            lease.size() >= ALLOC_GRANULE,
+            "lease size must cover the requested bytes"
+        );
+        assert!(
+            lease.size().is_power_of_two(),
+            "buddy block size is a power of two"
+        );
+        assert_eq!(lease.base() % ALLOC_GRANULE, 0, "base must be page-aligned");
+
+        free_region(lease).expect("free should succeed");
+    }
+
+    /// 验收：`MemoryError` 具备值语义（`PartialEq`/`Eq`）与 `Debug` 输出能力。
+    #[test]
+    fn memory_error_equality_and_debug_are_available() {
+        assert_eq!(MemoryError::Exhausted, MemoryError::Exhausted);
+        assert_ne!(MemoryError::Exhausted, MemoryError::InvalidSize);
+        assert_eq!(MemoryError::DoubleFree, MemoryError::DoubleFree);
+
+        let formatted = std::format!("{:?}", MemoryError::InvalidSize);
+        assert!(
+            formatted.contains("InvalidSize"),
+            "Debug output should name the variant, got {formatted:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Property：order_for_size 覆盖 + 单调，align_up_page 只向上且 < 一页 ----
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// size 在 1..=(1 MiB) 内必落在合法 order 且能覆盖请求；对采样的一对
+        /// (size, other) 单调非减。align_up_page 只向上对齐、步长 < 一页。
+        #[test]
+        fn size_and_address_helpers_hold_invariants(
+            size in 1usize..=(1 << 20),
+            other in 1usize..=(1 << 20),
+            addr in 0usize..=(1 << 24),
+        ) {
+            let order = order_for_size(size)
+                .expect("every size within 1 MiB must map to an order");
+            prop_assert!(order >= HEAP_MIN_ORDER);
+            prop_assert!(order < HEAP_ORDER);
+            prop_assert!((1usize << order) >= size, "order must cover the request");
+
+            // 单调非减：更大的 size 不会得到更小的 order。
+            let other_order = order_for_size(other).expect("in-range size");
+            if size <= other {
+                prop_assert!(order <= other_order);
+            } else {
+                prop_assert!(order >= other_order);
+            }
+
+            let aligned = align_up_page(addr);
+            prop_assert!(aligned >= addr);
+            prop_assert_eq!(aligned % ALLOC_GRANULE, 0);
+            prop_assert!(aligned - addr < ALLOC_GRANULE);
+        }
+    }
 }

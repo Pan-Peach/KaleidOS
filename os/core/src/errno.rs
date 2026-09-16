@@ -296,4 +296,276 @@ mod tests {
         assert_eq!(status(Ok::<(), HandleError>(())), 0);
         assert_eq!(status(Err::<(), HandleError>(HandleError::Invalid)), -9);
     }
+
+    /// ABI 错误码数字**稳定不变**：进入 public ABI 后这些值是契约，测试即锚点。
+    #[test]
+    fn abi_error_codes_are_pinned_to_stable_numbers() {
+        assert_eq!(Errno::ENOENT.code(), -2);
+        assert_eq!(Errno::EIO.code(), -5);
+        assert_eq!(Errno::ENOMEM.code(), -12);
+        assert_eq!(Errno::EBUSY.code(), -16);
+        assert_eq!(Errno::EINVAL.code(), -22);
+        assert_eq!(Errno::ESTALE.code(), -116);
+        assert_eq!(Errno::EKEYREVOKED.code(), -128);
+    }
+
+    // —— 每个错误枚举的**全部**变体 → Errno 映射 ——
+    //
+    // 每个测试里的 `match` 都不带通配臂：枚举新增变体时这里必须同步更新，
+    // 否则无法编译——"映射表漏测"从"靠人记得"变成"编译器强制"。
+
+    #[test]
+    fn every_handle_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            HandleError::Invalid,
+            HandleError::Stale,
+            HandleError::WrongOwner,
+            HandleError::Revoked,
+            HandleError::AlreadyReleased,
+        ] {
+            let expected = match error {
+                HandleError::Invalid => Errno::EBADF,
+                HandleError::Stale => Errno::ESTALE,
+                HandleError::WrongOwner => Errno::EACCES,
+                HandleError::Revoked => Errno::EKEYREVOKED,
+                HandleError::AlreadyReleased => Errno::EALREADY,
+            };
+            assert_eq!(Errno::from(error), expected, "HandleError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_task_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            TaskError::AlreadyExists,
+            TaskError::NotFound,
+            TaskError::NoMemory,
+            TaskError::InvalidTransition,
+            TaskError::RequesterNotFound,
+            TaskError::RequesterNotReady,
+            TaskError::WrongOwner,
+            TaskError::EntryOutOfImage,
+        ] {
+            let expected = match &error {
+                TaskError::AlreadyExists => Errno::EEXIST,
+                TaskError::NotFound => Errno::ESRCH,
+                TaskError::NoMemory => Errno::ENOMEM,
+                TaskError::InvalidTransition => Errno::EINVAL,
+                TaskError::RequesterNotFound => Errno::ESRCH,
+                TaskError::RequesterNotReady => Errno::EAGAIN,
+                TaskError::WrongOwner => Errno::EACCES,
+                TaskError::EntryOutOfImage => Errno::EFAULT,
+            };
+            assert_eq!(Errno::from(error), expected, "TaskError 映射不符");
+        }
+    }
+
+    #[test]
+    fn every_sched_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            SchedError::NoPolicy,
+            SchedError::InvalidTransition,
+            SchedError::NotFound,
+            SchedError::NoCurrent,
+        ] {
+            let expected = match error {
+                SchedError::NoPolicy => Errno::ENOTSUP,
+                SchedError::InvalidTransition => Errno::EINVAL,
+                SchedError::NotFound => Errno::ESRCH,
+                SchedError::NoCurrent => Errno::ESRCH,
+            };
+            assert_eq!(Errno::from(error), expected, "SchedError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_interface_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            InterfaceError::ProviderNotFound,
+            InterfaceError::ProviderNotReady,
+            InterfaceError::UnknownInterface,
+            InterfaceError::KindMismatch,
+            InterfaceError::AbiMismatch,
+            InterfaceError::Unbound,
+            InterfaceError::BindingNotFound,
+            InterfaceError::IdExhausted,
+        ] {
+            let expected = match error {
+                InterfaceError::ProviderNotFound => Errno::ESRCH,
+                InterfaceError::ProviderNotReady => Errno::EAGAIN,
+                InterfaceError::UnknownInterface => Errno::ENOENT,
+                InterfaceError::KindMismatch => Errno::EINVAL,
+                InterfaceError::AbiMismatch => Errno::EINVAL,
+                InterfaceError::Unbound => Errno::ENOENT,
+                InterfaceError::BindingNotFound => Errno::ENOENT,
+                InterfaceError::IdExhausted => Errno::EOVERFLOW,
+            };
+            assert_eq!(Errno::from(error), expected, "InterfaceError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_component_load_error_arm_maps_to_its_pinned_errno() {
+        use crate::component::loader::LoaderError;
+        for error in [
+            ComponentLoadError::StoreNotMounted,
+            ComponentLoadError::NotFound,
+            ComponentLoadError::ReadFailed,
+            ComponentLoadError::Loader(LoaderError::BadMagic),
+            ComponentLoadError::DeclareFailed,
+            ComponentLoadError::ResolveFailed,
+            ComponentLoadError::StartFailed,
+            ComponentLoadError::InitFailed(1),
+            ComponentLoadError::InitPanicked,
+            ComponentLoadError::ExitFailed(1),
+            ComponentLoadError::ExitPanicked,
+            ComponentLoadError::InterfaceCommitFailed(InterfaceError::ProviderNotFound),
+            ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
+        ] {
+            let expected = match error {
+                ComponentLoadError::StoreNotMounted => Errno::ENODEV,
+                ComponentLoadError::NotFound => Errno::ENOENT,
+                ComponentLoadError::ReadFailed => Errno::EIO,
+                ComponentLoadError::Loader(_) => Errno::ENOEXEC,
+                ComponentLoadError::DeclareFailed => Errno::EEXIST,
+                ComponentLoadError::ResolveFailed => Errno::ENOENT,
+                ComponentLoadError::StartFailed => Errno::EIO,
+                ComponentLoadError::InitFailed(_) => Errno::EIO,
+                ComponentLoadError::InitPanicked => Errno::EIO,
+                ComponentLoadError::ExitFailed(_) => Errno::EIO,
+                ComponentLoadError::ExitPanicked => Errno::EIO,
+                ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
+                ComponentLoadError::TaskPanicked(_) => Errno::EIO,
+            };
+            assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_component_stop_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            ComponentStopError::NotFound,
+            ComponentStopError::NotReady,
+            ComponentStopError::OwnsLiveTasks,
+            ComponentStopError::ExitFailed(1),
+            ComponentStopError::ExitPanicked,
+            ComponentStopError::StateRejected,
+        ] {
+            let expected = match error {
+                ComponentStopError::NotFound => Errno::ENOENT,
+                ComponentStopError::NotReady => Errno::EINVAL,
+                ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
+                ComponentStopError::ExitFailed(_) => Errno::EIO,
+                ComponentStopError::ExitPanicked => Errno::EIO,
+                ComponentStopError::StateRejected => Errno::EIO,
+            };
+            assert_eq!(Errno::from(error), expected, "ComponentStopError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_device_lookup_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            machine::DeviceLookupError::NoMachineInfo,
+            machine::DeviceLookupError::NoSuchOrdinal,
+        ] {
+            let expected = match error {
+                machine::DeviceLookupError::NoMachineInfo => Errno::ENODEV,
+                machine::DeviceLookupError::NoSuchOrdinal => Errno::ENOENT,
+            };
+            assert_eq!(Errno::from(error), expected, "DeviceLookupError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_mmio_claim_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            mmio::MmioClaimError::DeviceNotFound,
+            mmio::MmioClaimError::NotMmio,
+            mmio::MmioClaimError::DeviceBusy,
+            mmio::MmioClaimError::Denied,
+        ] {
+            let expected = match error {
+                mmio::MmioClaimError::DeviceNotFound => Errno::ENODEV,
+                mmio::MmioClaimError::NotMmio => Errno::ENOTSUP,
+                mmio::MmioClaimError::DeviceBusy => Errno::EBUSY,
+                mmio::MmioClaimError::Denied => Errno::EPERM,
+            };
+            assert_eq!(Errno::from(error), expected, "MmioClaimError {error:?}");
+        }
+    }
+
+    /// `MmioError::Handle` 委托给 `HandleError` 的映射表（不重复定档）。
+    #[test]
+    fn every_mmio_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            mmio::MmioError::Handle(HandleError::Stale),
+            mmio::MmioError::OutOfBounds,
+            mmio::MmioError::Unaligned,
+            mmio::MmioError::HasChildren,
+        ] {
+            let expected = match error {
+                mmio::MmioError::Handle(inner) => Errno::from(inner),
+                mmio::MmioError::OutOfBounds => Errno::EINVAL,
+                mmio::MmioError::Unaligned => Errno::EINVAL,
+                mmio::MmioError::HasChildren => Errno::EBUSY,
+            };
+            assert_eq!(Errno::from(error), expected, "MmioError {error:?}");
+        }
+    }
+
+    /// `DmaError::Handle` / `DmaError::Mmio` 逐层委托到最内层映射。
+    #[test]
+    fn every_dma_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            dma::DmaError::Handle(HandleError::WrongOwner),
+            dma::DmaError::Mmio(mmio::MmioError::Unaligned),
+            dma::DmaError::InvalidSize,
+            dma::DmaError::Exhausted,
+        ] {
+            let expected = match error {
+                dma::DmaError::Handle(inner) => Errno::from(inner),
+                dma::DmaError::Mmio(inner) => Errno::from(inner),
+                dma::DmaError::InvalidSize => Errno::EINVAL,
+                dma::DmaError::Exhausted => Errno::ENOMEM,
+            };
+            assert_eq!(Errno::from(error), expected, "DmaError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_irq_claim_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            irq::IrqClaimError::DeviceNotFound,
+            irq::IrqClaimError::DeviceHasNoIrq,
+            irq::IrqClaimError::LineBusy,
+            irq::IrqClaimError::MmioHandle(HandleError::Invalid),
+            irq::IrqClaimError::Denied,
+        ] {
+            let expected = match error {
+                irq::IrqClaimError::DeviceNotFound => Errno::ENODEV,
+                irq::IrqClaimError::DeviceHasNoIrq => Errno::ENODEV,
+                irq::IrqClaimError::LineBusy => Errno::EBUSY,
+                irq::IrqClaimError::MmioHandle(inner) => Errno::from(inner),
+                irq::IrqClaimError::Denied => Errno::EPERM,
+            };
+            assert_eq!(Errno::from(error), expected, "IrqClaimError {error:?}");
+        }
+    }
+
+    #[test]
+    fn every_irq_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            irq::IrqError::Handle(HandleError::Revoked),
+            irq::IrqError::NoDelivery,
+            irq::IrqError::NotPolled,
+        ] {
+            let expected = match error {
+                irq::IrqError::Handle(inner) => Errno::from(inner),
+                irq::IrqError::NoDelivery => Errno::EINVAL,
+                irq::IrqError::NotPolled => Errno::EINVAL,
+            };
+            assert_eq!(Errno::from(error), expected, "IrqError {error:?}");
+        }
+    }
 }

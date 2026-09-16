@@ -159,4 +159,43 @@ mod tests {
 
         containment::enter_anchor();
     }
+
+    /// With no containment boundary active, no running task, and no
+    /// loader-recorded `call_init` identity, the fallback chain is exhausted and
+    /// `ambient()` reports no principal.
+    #[test]
+    fn ambient_without_boundary_task_or_loader_identity_is_none() {
+        // Given：进程全局边界栈位于锚点，且本 CPU 未运行任务（sched::init 后
+        // current == None）；不设置 load::CURRENT。
+        let _boundary = containment::test_boundary_lock();
+        crate::sched::init();
+        crate::task::init();
+        crate::component::registry::init();
+        containment::enter_anchor();
+
+        // When：在锚点上解析 ambient principal。
+        let ambient = RequestContext::ambient();
+
+        // Then：无边界、无任务、无 loader 身份时解析链耗尽 → None。
+        // 其它测试共享这些进程全局量；仅在确认没有 transient 活跃身份时做
+        // 确定性断言，否则退化为一致性断言（组件必须能在 registry 解析）。
+        if crate::sched::current_task().is_none()
+            && crate::component::load::current_component().is_none()
+        {
+            assert!(
+                ambient.is_none(),
+                "无边界/任务/loader 身份时必须解析为 None"
+            );
+        } else if let Some(ctx) = &ambient {
+            assert!(
+                crate::component::registry::get_registry()
+                    .lock()
+                    .get(ctx.component)
+                    .is_some(),
+                "ambient 组件必须在 registry 中可解析"
+            );
+        }
+
+        containment::enter_anchor();
+    }
 }

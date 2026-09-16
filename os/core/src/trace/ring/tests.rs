@@ -10,6 +10,7 @@ use crate::handle::{RawHandle, ResourceKind};
 use crate::task::TaskId;
 use crate::trace::RejectReason;
 use crate::trace::abi::TraceRecordAbi;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::trace::test_support::GUARD as TEST_LOCK;
@@ -349,4 +350,276 @@ fn disabled_event_touches_neither_clock_nor_ring() {
     assert_eq!(clock_reads(), clock_before + 1);
     assert_eq!(collect(0), [seq_before]);
     reset_for_test();
+}
+
+// —— Property tests：随机 emit / visit / clear 序列上的 ring 记账不变量 ——
+//
+// 把 ring 模块文档承诺的语义（docs/testing.md §4）编码成影子模型，逐操作核对：
+//   1. `seq` 由 Core 分配、从 1 起严格单调（`next_seq == 1 + 成功 emit 次数`）。
+//   2. `overwritten_total` 精确 == `max(0, emitted - capacity)`，无静默丢失。
+//   3. ring 绝不超过 `capacity()` 条，且保留的总是**最新**记录。
+//   4. `visit_since(cursor)` 严格递增、跳过比 cursor 更旧的记录，
+//      缺口 = `record.seq - requested_seq`。
+//   5. `read_one` 游标边界：一次推进一条，越过终点报告结束而非伪造记录。
+//   6. 序号耗尽停止记录、绝不回绕（bounded 序列无法自然触达，见
+//      `random_emits_near_exhaustion_never_wrap`）。
+//
+// **host 局限**：`#[cfg(test)]` 下生产 `Mutex<TraceRing>` 被替换为 thread_local
+// （见 ring.rs 顶部注释），跨线程 / SMP / 中断重入行为**不可观测**，本文件不做
+// 任何并发断言；那部分由 QEMU / 真机承担。
+
+use proptest::prelude::*;
+
+/// 一条随机 ring 操作。
+#[derive(Debug, Clone, Copy)]
+enum RingOp {
+    /// 从 `all_events()` 里选 `which`，发射 `count` 条。
+    Emit { which: u8, count: u16 },
+    /// 从"当前 `next_seq` 往回 `back` 条"的位置读一条（覆盖精确命中 / 逐出缺口 /
+    /// 越过终点 / 早于最旧）。
+    ReadOne { back: u32 },
+    /// 同上的起点做一次有界遍历。
+    Visit { back: u32 },
+    /// runtime `clear()`：清记录与逐出计数，但保留 `seq`。
+    Clear,
+}
+
+/// 随机 op 序列（长度有界；单次 Emit 可批量，故能跨过 `capacity()`）。
+fn op_seq() -> impl Strategy<Value = Vec<RingOp>> {
+    proptest::collection::vec(op_kind_strategy(), 1..=200)
+}
+
+fn op_kind_strategy() -> impl Strategy<Value = RingOp> {
+    // 回看窗口略大于容量：既命中留存区，也落进被逐出的缺口 / 越过终点。
+    let back = 0u32..=(capacity() as u32 + 8);
+    prop_oneof![
+        3 => (any::<u8>(), 1u16..=64u16)
+            .prop_map(|(which, count)| RingOp::Emit { which, count }),
+        1 => back.clone().prop_map(|back| RingOp::ReadOne { back }),
+        1 => back.prop_map(|back| RingOp::Visit { back }),
+        1 => Just(RingOp::Clear),
+    ]
+}
+
+/// 影子模型：ring 应满足的记账真值（与实现同构，独立推导）。
+struct Model {
+    /// 下一条记录将拿到的 `seq`（从 1 起）。
+    next_seq: u64,
+    /// 成功 emit 的总数（`next_seq == 1 + total_emits`；`clear` 不重置）。
+    total_emits: u64,
+    /// 自上次 `clear` 以来成功 emit 数（决定 `overwritten_total`）。
+    emitted_since_clear: u64,
+    /// 当前留存记录的 `seq`（旧 → 新）；长度 <= `capacity()`。
+    retained: VecDeque<u64>,
+}
+
+impl Model {
+    fn new() -> Self {
+        Self {
+            next_seq: 1,
+            total_emits: 0,
+            emitted_since_clear: 0,
+            retained: VecDeque::new(),
+        }
+    }
+
+    /// 最旧存活记录的 `seq`；无记录时 == `next_seq`。
+    fn oldest(&self) -> u64 {
+        self.retained.front().copied().unwrap_or(self.next_seq)
+    }
+
+    /// 一次成功 emit：分配 `seq`，必要时逐出最旧记录。
+    fn record(&mut self, seq: u64) {
+        self.retained.push_back(seq);
+        if self.retained.len() > capacity() {
+            self.retained.pop_front();
+        }
+        self.total_emits += 1;
+        self.emitted_since_clear += 1;
+        self.next_seq = seq + 1;
+    }
+}
+
+/// `read_one(since)` 的模型期望：`seq >= since` 的最旧存活记录；越过终点读空。
+fn model_read_one(model: &Model, since: u64) -> Option<u64> {
+    let oldest = model.retained.front().copied()?;
+    let wanted = since.max(oldest);
+    (wanted < model.next_seq).then_some(wanted)
+}
+
+/// 断言 ring 的完整快照（stats + 留存内容）与模型一致。
+fn assert_matches_model(model: &Model) {
+    let snapshot = stats();
+    // 1. seq 从 1 起、每次成功 emit 恰好 +1（`clear` 不回绕）。
+    assert_eq!(
+        model.next_seq,
+        1 + model.total_emits,
+        "seq 必须从 1 起严格单调"
+    );
+    assert_eq!(snapshot.next_seq, model.next_seq, "next_seq 必须等于模型");
+    // 2. overwritten_total 精确 == max(0, emitted - capacity)。
+    assert_eq!(
+        snapshot.overwritten_total,
+        model.emitted_since_clear.saturating_sub(capacity() as u64),
+        "overwritten_total 必须精确 == max(0, emitted - capacity)"
+    );
+    // 3. 绝不超容量，且留存的就是最新记录。
+    assert!(
+        model.retained.len() <= capacity(),
+        "ring 留存数 {} 超过容量 {}",
+        model.retained.len(),
+        capacity()
+    );
+    assert_eq!(
+        snapshot.oldest_seq,
+        model.oldest(),
+        "oldest_seq 必须等于模型"
+    );
+    assert_eq!(snapshot.enabled_mask, ENABLED_MASK_ALL);
+    let expected: Vec<u64> = model.retained.iter().copied().collect();
+    assert_eq!(
+        collect(0),
+        expected,
+        "ring 必须保留最新的记录（旧记录被逐出）"
+    );
+}
+
+/// 不变式 5：`read_one` 游标边界（精确命中 / 逐出缺口 / 越过终点）。
+fn check_read_one(model: &Model, back: u32) {
+    let since = model.next_seq.saturating_sub(u64::from(back));
+    let record = read_one(since);
+    assert_eq!(
+        record.map(|r| r.seq),
+        model_read_one(model, since),
+        "read_one(since={since}) 边界不符"
+    );
+    if let Some(record) = record {
+        assert!(record.seq < model.next_seq, "不得返回尚未分配的 seq");
+        // 游标推进一条：下一条要么是相邻留存记录，要么报告结束。
+        let next = record.seq.saturating_add(1);
+        assert_eq!(
+            read_one(next).map(|r| r.seq),
+            model_read_one(model, next),
+            "read_one 必须一次推进一条"
+        );
+    }
+    // 越过终点 / 最大游标：报告结束，绝不伪造记录。
+    assert_eq!(read_one(model.next_seq), None, "since == next_seq 必须读空");
+    assert_eq!(read_one(u64::MAX), None, "游标耗尽必须读空");
+}
+
+/// 不变式 4：`visit_since` 跳过旧记录、严格递增、缺口可计算。
+fn check_visit(model: &Model, back: u32) {
+    let since = model.next_seq.saturating_sub(u64::from(back));
+    let seqs = collect(since);
+    let expected: Vec<u64> = model
+        .retained
+        .iter()
+        .copied()
+        .filter(|seq| *seq >= since)
+        .collect();
+    assert_eq!(seqs, expected, "visit_since(since={since}) 结果不符");
+    // 非递减（实现里是严格递增）且不返回比 cursor 更旧的记录。
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "visit 必须按 seq 严格递增"
+    );
+    assert!(
+        seqs.iter().all(|seq| *seq >= since),
+        "不得返回比 cursor 更旧的记录"
+    );
+    if let Some(&first) = seqs.first() {
+        // 缺口 = returned_seq - requested_seq；被逐出时从最旧存活记录起步。
+        assert_eq!(
+            first,
+            since.max(model.oldest()),
+            "遍历起点必须是游标或最旧存活"
+        );
+    }
+}
+
+/// 施加一次批量 emit，模型与实现同构（耗尽时停止，见不变式 6）。
+fn apply_emit(model: &mut Model, which: u8, count: u16, events: &[TraceEvent; 12]) {
+    for _ in 0..count {
+        // bounded 序列不可达 `u64::MAX`；守卫只为与实现同构。
+        if model.next_seq.checked_add(1).is_none() {
+            break;
+        }
+        let seq = model.next_seq;
+        emit(events[usize::from(which) % events.len()]);
+        model.record(seq);
+    }
+}
+
+proptest! {
+    /// 不变式 1–5：随机 emit / read_one / visit_since / clear 序列上的记账。
+    #[test]
+    fn random_ring_ops_preserve_accounting_invariants(ops in op_seq()) {
+        let _serial = TEST_LOCK.lock();
+
+        // Given: 干净 ring（seq 回到 1、无记录、掩码全开）。
+        reset_for_test();
+        let mut model = Model::new();
+        let events = all_events();
+        assert_matches_model(&model);
+
+        // When: 依次施加随机操作。
+        for op in ops {
+            match op {
+                RingOp::Emit { which, count } => apply_emit(&mut model, which, count, &events),
+                RingOp::Clear => {
+                    clear();
+                    // runtime clear 只清记录与逐出计数，`seq` 不回绕。
+                    model.retained.clear();
+                    model.emitted_since_clear = 0;
+                }
+                RingOp::ReadOne { back } => check_read_one(&model, back),
+                RingOp::Visit { back } => check_visit(&model, back),
+            }
+
+            // Then: 每一步之后记账与留存内容都必须与模型一致。
+            assert_matches_model(&model);
+        }
+    }
+
+    /// 不变式 6：序号耗尽可能无法在 bounded 随机序列里自然出现，故把 `next_seq`
+    /// 直接推到 `u64::MAX - back` 再随机发射：耗尽前每次 +1，耗尽后停止记录、
+    /// 绝不回绕。
+    #[test]
+    fn random_emits_near_exhaustion_never_wrap(back in 0u16..=8, count in 1u16..=32) {
+        let _serial = TEST_LOCK.lock();
+
+        // Given: 序号被推到耗尽边界附近。
+        reset_for_test();
+        let start = u64::MAX - u64::from(back);
+        RING.with(|cell| cell.borrow_mut().next_seq = start);
+
+        // When: 再发射 `count` 次（`back` 次成功，其余在耗尽后停止）。
+        let events = all_events();
+        let successful = u64::from(count).min(u64::from(back));
+        let mut expected = Vec::new();
+        for step in 0..count {
+            let before = next_seq();
+            emit(events[usize::from(step) % events.len()]);
+            if u64::from(step) < successful {
+                expected.push(before);
+                assert_eq!(next_seq(), before + 1, "耗尽前每次 emit 恰好 +1");
+            } else {
+                assert_eq!(next_seq(), before, "耗尽后必须停止记录，绝不回绕");
+            }
+        }
+
+        // Then: 留存的就是耗尽前的记录，seq 严格递增且从不分配 u64::MAX。
+        assert_eq!(
+            next_seq(),
+            start + successful,
+            "next_seq 冻结在 u64::MAX 以内"
+        );
+        assert_eq!(collect(0), expected, "耗尽后不得再落记录");
+        assert!(expected.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            expected.iter().all(|seq| *seq < u64::MAX),
+            "u64::MAX 本身永不分配给记录"
+        );
+    }
 }

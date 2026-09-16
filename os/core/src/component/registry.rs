@@ -637,6 +637,258 @@ mod tests {
         assert_eq!(second.raw(), first.raw() + 1);
     }
 
+    // -- Property tests（生命周期状态机；docs/testing.md §2 / component-model.md §5）--
+    //
+    // 对随机 declare / resolve / begin_start / finish_start / begin_stop /
+    // finish_stop / mark_failed 序列，逐操作验证：
+    //   1. 合法性精确：Ok ⟺ 当前状态按文档转移表放行；非法 → Err 且真相不变
+    //   2. 不可复活：Stopped / Failed 之后任何成功操作都不得回到活状态
+    //   3. 重名拒绝：同名二次 declare → AlreadyDeclared，id 全局唯一且单调
+    //   4. 精确前驱：resolve 仅自 Declared，其余各步仅自其文档前驱
+    //   5. mark_failed 从任意状态可达且为终态
+    //   6. 观察到的 registry 真相逐步等于模型
+    //
+    // 用局部 `Registry`（与其它测试同款 `Registry::new()`）：零全局状态，
+    // 不碰 `Once<Mutex<Registry>>`，因此无需串行锁或唯一命名。
+
+    use proptest::prelude::*;
+
+    /// 文档转移表的**独立**副本（不调用 `ComponentState::can_transition`）——
+    /// 作为 oracle 验证实现与文档一致，而非复述实现。
+    fn is_legal(from: ComponentState, to: ComponentState) -> bool {
+        use ComponentState::*;
+        match (from, to) {
+            (Declared, Resolved)
+            | (Resolved, Starting)
+            | (Starting, Ready)
+            | (Ready, Stopping)
+            | (Stopping, Stopped)
+            | (_, Failed) => true, // 任意状态 → Failed（含 Failed → Failed 幂等）
+            _ => false,
+        }
+    }
+
+    /// 可被随机化的生命周期操作（每个对应一个 `Registry` 转换方法）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LifecycleOp {
+        Resolve,
+        BeginStart,
+        FinishStart,
+        BeginStop,
+        FinishStop,
+        MarkFailed,
+    }
+
+    impl LifecycleOp {
+        fn target(self) -> ComponentState {
+            match self {
+                Self::Resolve => ComponentState::Resolved,
+                Self::BeginStart => ComponentState::Starting,
+                Self::FinishStart => ComponentState::Ready,
+                Self::BeginStop => ComponentState::Stopping,
+                Self::FinishStop => ComponentState::Stopped,
+                Self::MarkFailed => ComponentState::Failed,
+            }
+        }
+
+        fn apply(self, reg: &mut Registry, id: ComponentId) -> Result<(), RegistryError> {
+            match self {
+                Self::Resolve => reg.resolve(id),
+                Self::BeginStart => reg.begin_start(id),
+                Self::FinishStart => reg.finish_start(id),
+                Self::BeginStop => reg.begin_stop(id),
+                Self::FinishStop => reg.finish_stop(id),
+                Self::MarkFailed => reg.mark_failed(id),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        /// 声明一个新组件（名字取自小池，制造重名）。
+        Declare { name: u8 },
+        /// 对一个"声明序号"引用组件执行生命周期操作；序号越界 = 未声明 id。
+        Lifecycle { target: usize, op: LifecycleOp },
+    }
+
+    /// 名字池：故意很小，让随机序列频繁产生重名/合法声明交错。
+    const NAMES: [u8; 3] = *b"abc";
+    /// 可被引用的组件序号上限（大于典型序列中的成功声明数，以覆盖 NotFound）。
+    const SLOTS: usize = 4;
+
+    fn lifecycle_op_strategy() -> impl Strategy<Value = LifecycleOp> {
+        prop_oneof![
+            Just(LifecycleOp::Resolve),
+            Just(LifecycleOp::BeginStart),
+            Just(LifecycleOp::FinishStart),
+            Just(LifecycleOp::BeginStop),
+            Just(LifecycleOp::FinishStop),
+            Just(LifecycleOp::MarkFailed),
+        ]
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        let declare = (0usize..NAMES.len()).prop_map(|i| Op::Declare { name: NAMES[i] });
+        let lifecycle = (0usize..SLOTS, lifecycle_op_strategy())
+            .prop_map(|(target, op)| Op::Lifecycle { target, op });
+        prop_oneof![declare, lifecycle]
+    }
+
+    /// 序列生成器：随机声明 + 随机生命周期操作的混合序列。
+    fn op_seq() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(op_strategy(), 1..=40)
+    }
+
+    /// 模型中的一条组件真相（`id == index + 1`：无 unload、id 单调不回收）。
+    #[derive(Debug, Clone, Copy)]
+    struct ModelRecord {
+        id: ComponentId,
+        name: u8,
+        state: ComponentState,
+    }
+
+    /// 测试本地模型：独立于 `Registry` 记录"应当"的真相。
+    #[derive(Debug)]
+    struct Model {
+        records: alloc::vec::Vec<ModelRecord>,
+        next_id: u32,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Self {
+                records: alloc::vec::Vec::new(),
+                next_id: 1,
+            }
+        }
+    }
+
+    /// 不变量 6：观察到的 registry 真相必须逐步等于模型；并检查 id 唯一/非哨兵。
+    fn assert_model_matches(reg: &Registry, model: &Model) {
+        assert_eq!(reg.len(), model.records.len(), "记录数须与模型一致");
+
+        let observed: alloc::vec::Vec<(ComponentId, ComponentState)> =
+            reg.iter().map(|r| (r.id, r.state)).collect();
+        let expected: alloc::vec::Vec<(ComponentId, ComponentState)> =
+            model.records.iter().map(|r| (r.id, r.state)).collect();
+        assert_eq!(observed, expected, "观察真相须逐步等于模型");
+
+        for (i, (id, _)) in expected.iter().enumerate() {
+            assert_ne!(*id, ComponentId::from_raw(0), "id 不得为哨兵 0");
+            for (j, (other, _)) in expected.iter().enumerate() {
+                if i != j {
+                    assert_ne!(id, other, "组件 id 必须唯一（不回收）");
+                }
+            }
+        }
+    }
+
+    fn apply_and_check(model: &mut Model, reg: &mut Registry, op: Op) {
+        match op {
+            Op::Declare { name } => {
+                // Given：模型已知的同名组件集合。
+                let duplicate = model.records.iter().any(|r| r.name == name);
+
+                // When：用同一名字声明。
+                let result = reg.declare(&[name], 0, 0, None);
+
+                // Then：重名 → AlreadyDeclared；否则分配下一单调 id 且状态为 Declared。
+                if duplicate {
+                    assert_eq!(
+                        result,
+                        Err(RegistryError::AlreadyDeclared),
+                        "重名声明必须被拒绝"
+                    );
+                } else {
+                    let expected_id = ComponentId::from_raw(model.next_id);
+                    assert_eq!(result, Ok(expected_id), "新名字须以单调 id 声明成功");
+                    model.records.push(ModelRecord {
+                        id: expected_id,
+                        name,
+                        state: ComponentState::Declared,
+                    });
+                    model.next_id += 1;
+                }
+            }
+            Op::Lifecycle { target, op } => {
+                // Given：序号对应的已声明实例（越界 → 哨兵 id，模型为"未声明"）。
+                let declared = model.records.get(target).copied();
+                let id = declared.map_or(ComponentId::from_raw(0), |r| r.id);
+                let before = declared.map(|r| r.state);
+                assert_eq!(
+                    reg.get(id).map(|r| r.state),
+                    before,
+                    "操作前观察真相须等于模型"
+                );
+
+                // When：执行生命周期操作。
+                let result = op.apply(reg, id);
+
+                // Then 1：Ok ⟺ 文档转移表放行；未声明 → NotFound。
+                let expected = match before {
+                    None => Err(RegistryError::NotFound),
+                    Some(from) if is_legal(from, op.target()) => Ok(()),
+                    Some(_) => Err(RegistryError::InvalidTransition),
+                };
+                assert_eq!(result, expected, "{op:?} 自 {before:?} 的合法性");
+
+                if result.is_ok() {
+                    model.records[target].state = op.target();
+                }
+
+                if let Some(from) = before {
+                    // Then 2：mark_failed 从任意状态可达（含 Stopped / Failed）。
+                    if op == LifecycleOp::MarkFailed {
+                        assert!(result.is_ok(), "mark_failed 须自 {from:?} 可达");
+                    }
+                    // Then 3：不可复活——Stopped / Failed 之后任何成功操作都
+                    // 不得回到活状态（终态仅可幂等再标记 Failed）。
+                    if result.is_ok()
+                        && matches!(from, ComponentState::Stopped | ComponentState::Failed)
+                    {
+                        let to = model.records[target].state;
+                        assert!(
+                            !matches!(
+                                to,
+                                ComponentState::Declared
+                                    | ComponentState::Resolved
+                                    | ComponentState::Starting
+                                    | ComponentState::Ready
+                                    | ComponentState::Stopping
+                            ),
+                            "不可复活：{from:?} -> {to:?}"
+                        );
+                    }
+                    // Then 4：非法操作不得改变真相。
+                    if result.is_err() {
+                        assert_eq!(
+                            reg.get(id).map(|r| r.state),
+                            Some(from),
+                            "被拒绝的操作不得改变真相"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 不变量 6：每步之后观察真相 == 模型。
+        assert_model_matches(reg, model);
+    }
+
+    proptest! {
+        #[test]
+        fn random_lifecycle_sequences_match_state_machine(ops in op_seq()) {
+            // Given：局部 Registry + 空模型（零全局状态；无需串行锁）。
+            let mut reg = Registry::new();
+            let mut model = Model::new();
+
+            // When / Then：逐步执行并对每个操作验证全部不变量。
+            for op in ops {
+                apply_and_check(&mut model, &mut reg, op);
+            }
+        }
+    }
+
     /// 性能基线（`make bench`）：**component 数量增长时的 lookup 趋势**。
     ///
     /// 用局部 `Registry`（`r()`），不碰全局真相，因此不需要串行锁。

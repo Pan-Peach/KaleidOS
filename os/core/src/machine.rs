@@ -377,4 +377,189 @@ mod tests {
         let copy = zero;
         assert_eq!(copy, zero);
     }
+
+    /// `write_size`（经 `MemoryRegion` Debug 观察）：**只有**整数 GiB/MiB/KiB 使用
+    /// 单位；其余一律按字节显示，绝不做会撒谎的四舍五入。
+    #[test]
+    fn memory_region_debug_formats_size_units_exactly() {
+        let region = |size: usize| {
+            alloc::format!(
+                "{:?}",
+                MemoryRegion {
+                    base: 0x8000_0000,
+                    size
+                }
+            )
+        };
+
+        // 整数单位（含边界 1、倍数、0）。
+        assert_eq!(region(0), "MemoryRegion { base: 0x80000000, size: 0 B }");
+        assert_eq!(
+            region(1 << 10),
+            "MemoryRegion { base: 0x80000000, size: 1 KiB }"
+        );
+        assert_eq!(
+            region(1 << 20),
+            "MemoryRegion { base: 0x80000000, size: 1 MiB }"
+        );
+        assert_eq!(
+            region(256 << 20),
+            "MemoryRegion { base: 0x80000000, size: 256 MiB }"
+        );
+        assert_eq!(
+            region(1 << 30),
+            "MemoryRegion { base: 0x80000000, size: 1 GiB }"
+        );
+        assert_eq!(
+            region(2 << 30),
+            "MemoryRegion { base: 0x80000000, size: 2 GiB }"
+        );
+
+        // 非整数倍：>= KiB 但不是 KiB 整数倍 → 按字节；>= MiB 但非 MiB 整数倍
+        // 也会一路落到字节（不显示 "1 MiB + 1 B" 这种近似）。
+        assert_eq!(
+            region(1500),
+            "MemoryRegion { base: 0x80000000, size: 1500 B }"
+        );
+        assert_eq!(
+            region((1 << 10) + 1),
+            "MemoryRegion { base: 0x80000000, size: 1025 B }"
+        );
+        assert_eq!(
+            region((1 << 20) + 1),
+            "MemoryRegion { base: 0x80000000, size: 1048577 B }"
+        );
+    }
+
+    /// CompatStr：从字节复制、截断到 32B 容量、`as_str` 往返、空串语义；
+    /// Debug 是带引号的字符串（不是 derive 的字段转储）。
+    #[test]
+    fn compat_str_copies_truncates_and_reports_as_str() {
+        // 空串。
+        assert_eq!(CompatStr::empty().as_str(), "");
+        assert_eq!(alloc::format!("{:?}", CompatStr::empty()), "\"\"");
+
+        // 往返。
+        let s = CompatStr::from_bytes(b"virtio,mmio");
+        assert_eq!(s.as_str(), "virtio,mmio");
+        assert_eq!(alloc::format!("{s:?}"), "\"virtio,mmio\"");
+
+        // 边界：恰好 32B 完整保留；33B 及以上截断到 32B（不 panic）。
+        let exact = CompatStr::from_bytes(&[b'x'; 32]);
+        assert_eq!(exact.as_str().len(), 32);
+        let truncated = CompatStr::from_bytes(&[b'x'; 40]);
+        assert_eq!(truncated.as_str().len(), 32, "容量上限是 32B");
+        assert!(
+            truncated.as_str().bytes().all(|b| b == b'x'),
+            "截断保留的是前 32B"
+        );
+    }
+
+    /// `DeviceDescriptor::matches`：空描述符不匹配任何 compatible；声明的任一
+    /// 串命中即为真；只有 `compat_count` 之内的槽位参与匹配。
+    #[test]
+    fn device_matches_only_declared_compatibles_within_count() {
+        // 零个 compatible：无论问什么都是 false。
+        assert!(!DeviceDescriptor::empty().matches(b"virtio,mmio"));
+        assert!(!DeviceDescriptor::empty().matches(b""));
+
+        // 声明两个 compatible：命中任一为真，无关串为假（前缀也不算命中）。
+        let d = device(
+            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
+            Some(1),
+        );
+        assert!(d.matches(b"virtio,mmio"), "第一个声明的 compatible");
+        assert!(d.matches(b"legacy,mmio"), "第二个声明的 compatible");
+        assert!(!d.matches(b"ns16550a"), "未声明的 compatible");
+        assert!(!d.matches(b"virtio,mmi"), "前缀不是命中");
+        assert!(!d.matches(b""), "空查询不命中非空串");
+
+        // 槽位内容存在，但超出 compat_count 即被忽略。
+        let mut clipped = device(
+            &[b"virtio,mmio".as_slice(), b"hidden,mmio".as_slice()],
+            None,
+        );
+        assert!(clipped.matches(b"hidden,mmio"), "未截断前参与匹配");
+        clipped.compat_count = 1;
+        assert!(
+            !clipped.matches(b"hidden,mmio"),
+            "超出 compat_count 的槽位不得参与匹配"
+        );
+        assert!(clipped.matches(b"virtio,mmio"), "计数内的槽位仍然命");
+    }
+
+    /// DeviceDescriptor Debug：MMIO/PIO 都带空间标签、`write_size` 单位、IRQ
+    /// Some/None 与 compatible 列表；不 panic 且含预期子串。
+    #[test]
+    fn device_descriptor_debug_reports_space_irq_and_compatibles() {
+        // Given: 一个带 IRQ 与两个 compatible 的 MMIO 描述符。
+        let mut d = device(
+            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
+            Some(7),
+        );
+        d.space = IoSpace::Mmio {
+            base: 0x1000,
+            size: 0x1000,
+        };
+
+        // When: 格式化。
+        let text = alloc::format!("{d:?}");
+
+        // Then: 空间/大小/IRQ/compatible 都可读。
+        assert!(text.contains("DeviceDescriptor"), "{text}");
+        assert!(text.contains("mmio: 0x1000"), "{text}");
+        assert!(text.contains("size: 4 KiB"), "{text}");
+        assert!(text.contains("irq: 7"), "{text}");
+        assert!(text.contains("virtio,mmio"), "{text}");
+        assert!(text.contains("legacy,mmio"), "{text}");
+
+        // 无 IRQ：显式 `None`（不是省略），零 compatible 打印空列表。
+        let mut no_irq = DeviceDescriptor::empty();
+        no_irq.space = IoSpace::Mmio { base: 0, size: 0 };
+        let text = alloc::format!("{no_irq:?}");
+        assert!(text.contains("irq: None"), "{text}");
+        assert!(text.contains("compatibles: []"), "{text}");
+
+        // PIO 空间（x86 专用）同样被标注。
+        let mut pio = DeviceDescriptor::empty();
+        pio.space = IoSpace::Pio {
+            base: 0x3f8,
+            size: 8,
+        };
+        let text = alloc::format!("{pio:?}");
+        assert!(text.contains("pio: 0x3f8"), "{text}");
+        assert!(text.contains("size: 8 B"), "{text}");
+    }
+
+    /// MachineInfo Debug：按 count 切片 CPU/内存/设备表，不 panic 且含身份、
+    /// 计数与已声明设备；`dev_count == 0` 时为空列表。
+    #[test]
+    fn machine_info_debug_contains_counts_and_sliced_tables() {
+        // Given: 1 CPU / 1 memory region / 3 devices。
+        let mut devices = [DeviceDescriptor::empty(); 26];
+        devices[0] = device(&[b"virtio,mmio".as_slice()], Some(1));
+        devices[1] = device(&[b"ns16550a".as_slice()], Some(10));
+        devices[2] = device(&[b"riscv,clint0".as_slice()], None);
+        let machine_info = info(devices, 3);
+
+        // When: 格式化（切片 cpu/mem/device 表不得越界）。
+        let text = alloc::format!("{machine_info:?}");
+
+        // Then: 身份 + 计数 + 声明设备可见，尾部空槽不可见。
+        assert!(text.contains("MachineInfo"), "{text}");
+        assert!(text.contains("boot_hart: 0"), "{text}");
+        assert!(text.contains("cpu_count: 1"), "{text}");
+        assert!(text.contains("mem_count: 1"), "{text}");
+        assert!(text.contains("memory_regions"), "{text}");
+        assert!(text.contains("256 MiB"), "{text}");
+        assert!(text.contains("dev_count: 3"), "{text}");
+        assert!(text.contains("virtio,mmio"), "{text}");
+        assert!(text.contains("riscv,clint0"), "{text}");
+
+        // dev_count == 0：空切片正常 Debug，仍然不 panic。
+        let empty = info([DeviceDescriptor::empty(); 26], 0);
+        let text = alloc::format!("{empty:?}");
+        assert!(text.contains("dev_count: 0"), "{text}");
+        assert!(text.contains("devices: []"), "{text}");
+    }
 }

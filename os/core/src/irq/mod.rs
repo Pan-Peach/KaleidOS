@@ -222,4 +222,39 @@ mod tests {
 
         crate::handle::irq::get_table().lock().revoke_owner(owner);
     }
+
+    // ------------------------------------------------------------------
+    // irq-save guard + 外部中断入口（host 只验证接线层面，不碰全局 IRQ 表）
+    // ------------------------------------------------------------------
+
+    /// 验收：`IrqSaveGuard::default()`（走 `Default` impl → `new()`）能构造并析构。
+    ///
+    /// host 的 `arch::fake::Fake` 里 `disable_irq`/`restore_irq` 都是 no-op，
+    /// 因此这里**不断言标志值**——irq-save 的真机语义由 Riscv 实现 + QEMU
+    /// ArchTest 覆盖，host 只能证明该类型可构造/可析构。
+    #[test]
+    fn irq_save_guard_default_constructs_and_drops_on_host() {
+        let guard = IrqSaveGuard::default();
+        drop(guard);
+        // 显式 `new()` 路径同样可构造/析构（Drop 会 take flags 后 restore）。
+        let guard = IrqSaveGuard::new();
+        drop(guard);
+    }
+
+    /// 验收：`crate::irq::init()` 可调用——host 上把 `on_external` 注册进 fake
+    /// backend（`register_external_handler` 是 no-op）且不 panic。
+    #[test]
+    fn irq_init_registers_external_handler() {
+        crate::irq::init();
+    }
+
+    /// host 的 `InterruptController::claim()` 恒返回 `None`，因此 `on_external`
+    /// 的 claim→route→dispatch 循环体一次都不执行，调用应立即返回。
+    ///
+    /// 这里**只断言"调用返回、不 panic"**——绝不判定 body 行为：真实的
+    /// claim/投递循环依赖真 PLIC 硬件，属于 QEMU ArchTest 的契约。
+    #[test]
+    fn on_external_returns_when_host_claim_is_none() {
+        on_external();
+    }
 }
