@@ -16,9 +16,11 @@ use crate::memory::address_space::PhysicalRange;
 use buddy_system_allocator::{MetadataHeap, PageOrder, PageRun};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
+use slab::SlabAllocator;
 use spin::Mutex;
 
 pub mod address_space;
+mod slab;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -93,6 +95,8 @@ impl Drop for MemoryLease {
 /// Phase 1 单核（副 hart 已 park），spin 锁够用；
 /// 多核唤醒后需评估锁粒度。
 static HEAP: Mutex<MetadataHeap<HEAP_ORDER, HEAP_MIN_ORDER>> = Mutex::new(MetadataHeap::empty());
+
+static SLABS: Mutex<SlabAllocator> = Mutex::new(SlabAllocator::new());
 
 // ---------------------------------------------------------------------------
 // Init
@@ -226,15 +230,29 @@ pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        HEAP.lock()
-            .alloc(layout)
-            .map_or(core::ptr::null_mut(), |p| p.as_ptr())
+        match slab::slab_class(layout) {
+            Some(class_size) => SLABS
+                .lock()
+                .alloc(class_size)
+                .map(|nn| nn.as_ptr())
+                .unwrap_or(core::ptr::null_mut()),
+            None => HEAP
+                .lock()
+                .alloc(layout)
+                .map(|nn| nn.as_ptr())
+                .unwrap_or(core::ptr::null_mut()),
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: ptr/layout 必须匹配一次成功的 alloc（Rust 调用方保证）。
-        unsafe {
-            HEAP.lock().dealloc(NonNull::new_unchecked(ptr), layout);
+        match slab::slab_class(layout) {
+            Some(class_size) => {
+                SLABS.lock().dealloc(ptr, class_size);
+            }
+            None => unsafe {
+                HEAP.lock().dealloc(NonNull::new_unchecked(ptr), layout);
+            },
         }
     }
 }
@@ -289,6 +307,24 @@ mod tests {
             "buddy should reuse the freed block"
         );
         free_region(second).expect("free second");
+    }
+
+    #[test]
+    fn kernel_allocator_uses_class_size_for_small_layout() {
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
+
+        // 24 字节请求应该进入 32-byte slab class，而不是把 24
+        // 直接传给 SlabAllocator::alloc。
+        let layout = Layout::from_size_align(24, 8).unwrap();
+        let ptr = unsafe { KernelAllocator.alloc(layout) };
+
+        assert!(!ptr.is_null(), "small allocation should use the slab");
+        assert_eq!(ptr as usize % layout.align(), 0);
+
+        unsafe {
+            KernelAllocator.dealloc(ptr, layout);
+        }
     }
 
     // ------------------------------------------------------------------
