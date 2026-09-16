@@ -87,6 +87,18 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let magic_ok = mmio_claimed && unsafe { kcore_mmio_read_u32(mmio, 0, &mut magic) } == 0;
     checks.check(10, "mmio-magic", magic_ok && magic == VIRTIO_MMIO_MAGIC);
 
+    // 拒绝路径：访问必须落在 region 内且 4 字节对齐 —— 越过 region 末端
+    // （offset = size）→ OutOfBounds、未对齐（offset = 1）→ Unaligned，
+    // 两者 Core 都在触碰硬件之前拒绝 → -EINVAL。
+    let mut bounds_value = 0u32;
+    let out_of_bounds = mmio_claimed
+        && unsafe { kcore_mmio_read_u32(mmio, VIRTIO_MMIO_WINDOW as u32, &mut bounds_value) }
+            == EINVAL;
+    let mut unaligned_value = 0u32;
+    let unaligned =
+        mmio_claimed && unsafe { kcore_mmio_read_u32(mmio, 1, &mut unaligned_value) } == EINVAL;
+    checks.check(30, "mmio-access-bounds", out_of_bounds && unaligned);
+
     // 拒绝路径：独占锚在**设备**上 —— 同一 DeviceId 重复认领 → -EBUSY。
     let mut duplicate = 0u64;
     checks.check(
@@ -188,6 +200,11 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let stale_read = unsafe { kcore_mmio_read_u32(mmio, 0, &mut stale_value) };
     checks.check(14, "mmio-release", mmio_released && stale_read == ESTALE);
 
+    // 拒绝路径：double release —— 首次释放已 bump generation，第二次对同一
+    // handle 释放 → -ESTALE（重复释放不能再改动任何真相）。
+    let double_release = unsafe { kcore_mmio_release(mmio) } == ESTALE;
+    checks.check(31, "mmio-double-release", mmio_released && double_release);
+
     // 拒绝路径：死 root 不能派生新 authority —— IRQ / DMA 请求都 → -ESTALE
     // （root 释放后 slot generation 前进，旧 raw handle 一律过期）。
     let mut irq_from_dead = 0u64;
@@ -207,6 +224,13 @@ pub fn group(checks: &mut Checks) -> Outcome {
         mmio_released && irq_denied && dma_denied,
     );
 
+    // 拒绝路径：poll 只对轮询投递的线有效 —— 仍是回调投递（尚未
+    // `register_polled`）时 poll → -EINVAL（NotPolled），Core 不改状态。
+    let mut pre_poll_count = 0u64;
+    let poll_before_polled =
+        irq_registered && unsafe { kcore_irq_poll(irq, &mut pre_poll_count) } == EINVAL;
+    checks.check(32, "irq-poll-order", poll_before_polled);
+
     // --- IRQ polled：把已 enable 的线切成轮询投递 → poll 计数（run 中无 UART
     //     中断 = 0）→ ack 闭环。不 enable 该线、不碰 UART IER/THR。 ---
     let polled = irq_enabled && unsafe { kcore_irq_register_polled(irq) } == 0;
@@ -221,6 +245,14 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let mut released_count = 0u64;
     let stale_poll = unsafe { kcore_irq_poll(irq, &mut released_count) } == ESTALE;
     checks.check(17, "irq-release", irq_released && stale_poll);
+
+    // 拒绝路径：DMA 尺寸 0 非法（分配器要求 > 0）→ -EINVAL（InvalidSize），
+    // 不产生任何 grant；随后的合法分配仍走同一个 live UART MmioHandle。
+    let mut zero_dma = 0u64;
+    let zero_size = uart_claimed
+        && unsafe { kcore_dma_alloc(uart, 0, DmaDirection::ToDevice.as_i32(), &mut zero_dma) }
+            == EINVAL;
+    checks.check(33, "dma-invalid-size", zero_size);
 
     // --- DMA：用仍持有的 UART MmioHandle 推导设备身份（授权模型见模块文档）---
     // alloc → lease backing → 写读回 0xDEADBEEF → release → 后续 lease 过期。

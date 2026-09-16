@@ -6,8 +6,8 @@
 //! （见 `runtime/trace.rs` 的身份限制说明）。
 
 use kcomp_sdk::abi::{
-    kcore_component_load, kcore_sched_run, kcore_task_create, kcore_task_exit, kcore_task_start,
-    kcore_task_state, kcore_task_yield,
+    kcore_component_load, kcore_sched_run, kcore_task_count, kcore_task_create, kcore_task_exit,
+    kcore_task_start, kcore_task_state, kcore_task_yield,
 };
 use kcomp_sdk::binding::{self, InterfaceKind, SCHEDULER_POLICY_ABI};
 
@@ -16,6 +16,9 @@ use super::trace;
 
 /// `TaskState::Exited` 的编码（Core `kcore_task_state` 契约）。
 const STATE_EXITED: i32 = 4;
+
+/// Core `errno.rs` 稳定数值的镜像（本组只断言，不解释）。
+const EFAULT: i32 = -14;
 
 /// 任务体迭代数：3 轮 yield 后各自计数必须为 3（host-testable 的纯常量）。
 const EXPECTED_ITERS: usize = 3;
@@ -83,6 +86,18 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let a = unsafe { kcore_task_create(task_a as *const () as usize) };
     let b = unsafe { kcore_task_create(task_b as *const () as usize) };
     checks.check(5, "task-create", a >= 0 && b >= 0 && a != b);
+
+    // 拒绝路径：entry 必须落在本组件**装载镜像内**（`[base, base+size)`）——
+    // 镜像外的指针一律 -EFAULT，且被拒绝的创建不得留下任务（计数不变）。
+    // 组件因此无法把执行权指向任意内核/别的组件地址。
+    let tasks_before = unsafe { kcore_task_count() };
+    let rogue = unsafe { kcore_task_create(usize::MAX) };
+    let tasks_after = unsafe { kcore_task_count() };
+    checks.check(
+        29,
+        "task-entry-out-of-image",
+        rogue == EFAULT && tasks_after == tasks_before,
+    );
 
     // 调度器接口已发布/绑定且 provider 存活（发布发生在 scheduler_rr 的 init）。
     let bound = binding::available(b"scheduler", InterfaceKind::Policy, SCHEDULER_POLICY_ABI);
