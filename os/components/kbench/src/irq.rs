@@ -42,11 +42,11 @@
 //! - baseline=none：IRQ 触发没有等价 null baseline（制造一个就等于关中断/抑制
 //!   触发，被明令禁止），因此不做任何减法。
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use kcomp_sdk::abi;
 
-use crate::{Context, measure, report, stats};
+use crate::{Context, State, measure, report, stats};
 
 const NAME: &str = "irq.uart_trigger_to_handler";
 const UART_COMPATIBLE: &[u8] = b"ns16550a";
@@ -78,27 +78,27 @@ const MAX_DISCARDS: u64 = 64;
 /// 单次等待的超时毫秒数（换算用二进制搜索，不做除法）。
 const TIMEOUT_MS: u64 = 20;
 
-/// handler 记录的入口时间戳低 32 位（RV32/RV64 都只有 32 位原子；区间远小于
-/// 半程 2^31 tick，低位的 wrapping 差值是正确的——见 [`classify`]）。
-static ENTRY_LOW: AtomicU32 = AtomicU32::new(0);
-/// handler 已运行标记（本样本）。
-static SERVED: AtomicBool = AtomicBool::new(false);
-/// owned UART 的 lease 基址（handler 清 source 用；实验结束后清零）。
-static UART_LEASE: AtomicUsize = AtomicUsize::new(0);
+// handler 的入口戳 / SERVED 标记 / lease 基址已迁入 `crate::State` 的
+// `irq_entry_low`/`irq_served`/`irq_uart_lease` 字段（docs/component-lifecycle.md
+// §10）。handler 经 `kcore_irq_register` 的 `ctx` 拿到 state 指针读取它们——
+// 不再读 image-global static。区间远小于半程 2^31 tick，低位 wrapping 差值正确
+// （见 [`classify`]）；RV32/RV64 都只有 32 位原子，入口戳仍存低 32 位。
 
 /// 组件侧 handler（trap 上下文调用，锁外）。
 ///
 /// 第一件事读入口时间戳（这就是测量端点）；随后把 owned device 的 IER 清零
 /// （清 source，避免电平触发在 `on_external` 的 claim 循环里反复进入）。
 /// 同一 trap 里若重复进入，只认第一次的时间戳（`SERVED` 先到先得）。
-extern "C" fn handler(_ctx: *mut ()) {
+extern "C" fn handler(ctx: *mut ()) {
+    let state = ctx as *mut State;
     // 先落入口戳、再置 SERVED（单 hart、trap 内关中断，观测者不会看到中间态；
     // 同一 trap 的重复 claim 不覆盖第一次的时间戳）。
-    if !SERVED.load(Ordering::SeqCst) {
-        ENTRY_LOW.store(unsafe { abi::kcore_now() } as u32, Ordering::SeqCst);
-        SERVED.store(true, Ordering::SeqCst);
+    if !unsafe { (*state).irq_served.load(Ordering::SeqCst) } {
+        let now = unsafe { abi::kcore_now() } as u32;
+        unsafe { (*state).irq_entry_low.store(now, Ordering::SeqCst) };
+        unsafe { (*state).irq_served.store(true, Ordering::SeqCst) };
     }
-    let ptr = UART_LEASE.load(Ordering::SeqCst) as *mut u8;
+    let ptr = unsafe { (*state).irq_uart_lease.load(Ordering::SeqCst) } as *mut u8;
     if !ptr.is_null() {
         // SAFETY: lease (ptr, len >= MIN_HOST_LEN) 在本实验期间有效；offset 1 = IER
         //（QEMU virt 的 16550 字节编址）。volatile 写 owned device 的寄存器
@@ -134,13 +134,15 @@ fn classify(entry_low: u32, start_low: u32) -> Sample {
 ///
 /// 协议：masked IER 下先写 THR（占位字节）→ 读 `start` → 写 IER=THRE（触发）
 /// → 有界自旋等 `SERVED`。返回 `None` = 超时（此时主动 mask 源）。
-fn sample_once(timeout: u64) -> Option<Sample> {
-    let ptr = UART_LEASE.load(Ordering::SeqCst) as *mut u8;
+fn sample_once(state: *mut State, timeout: u64) -> Option<Sample> {
+    let ptr = unsafe { (*state).irq_uart_lease.load(Ordering::SeqCst) } as *mut u8;
     if ptr.is_null() {
         return Some(Sample::Missing);
     }
-    SERVED.store(false, Ordering::SeqCst);
-    ENTRY_LOW.store(0, Ordering::SeqCst);
+    unsafe {
+        (*state).irq_served.store(false, Ordering::SeqCst);
+        (*state).irq_entry_low.store(0, Ordering::SeqCst);
+    }
 
     // masked IER 下先写 THR（占位字节）——这是准备，不是触发点；读 `start`
     // 后写 IER=THRE 才是触发。THR 写不计入区间（与模块头的协议一致）。
@@ -150,17 +152,20 @@ fn sample_once(timeout: u64) -> Option<Sample> {
     let start_low = start as u32;
     unsafe { core::ptr::write_volatile(ptr.add(REG_IER), IER_THRE) };
 
-    while !SERVED.load(Ordering::SeqCst) {
+    while !unsafe { (*state).irq_served.load(Ordering::SeqCst) } {
         if unsafe { abi::kcore_now() }.wrapping_sub(start) > timeout {
             unsafe { core::ptr::write_volatile(ptr.add(REG_IER), 0) };
             // 超时时若 handler 恰好刚到，仍按真实样本处理（不丢好数据）。
-            if SERVED.load(Ordering::SeqCst) {
-                return Some(classify(ENTRY_LOW.load(Ordering::SeqCst), start_low));
+            if unsafe { (*state).irq_served.load(Ordering::SeqCst) } {
+                return Some(classify(
+                    unsafe { (*state).irq_entry_low.load(Ordering::SeqCst) },
+                    start_low,
+                ));
             }
             return None;
         }
     }
-    let entry_low = ENTRY_LOW.load(Ordering::SeqCst);
+    let entry_low = unsafe { (*state).irq_entry_low.load(Ordering::SeqCst) };
     // 下一次触发前保持 mask（handler 已写 0；再写一次是幂等的保险）。
     unsafe { core::ptr::write_volatile(ptr.add(REG_IER), 0) };
     Some(classify(entry_low, start_low))
@@ -191,8 +196,38 @@ fn blocked_window(ptr: usize, len: usize) {
     report::key_str("status", "mmio_window_too_small");
 }
 
-/// 执行一次 `irq.uart_trigger_to_handler`（从 `kcomp_init` 的锚点上下文调用）。
-pub(crate) fn run(context: &Context) {
+/// 释放本 primitive 认领的 authority（顺序：irq release → mmio release；
+/// mmio release 在仍有 live IRQ child 时会拒绝），并清零 state 里的记录。
+/// 正常采样结束与每条失败路径都走它；destroy 兜底再调一次（幂等）。
+fn release_authority(state: *mut State) {
+    let irq = unsafe { (*state).irq_handle };
+    if irq != 0 {
+        let _ = unsafe { abi::kcore_irq_release(irq) };
+        unsafe { (*state).irq_handle = 0 };
+    }
+    let mmio = unsafe { (*state).irq_mmio_handle };
+    if mmio != 0 {
+        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        unsafe { (*state).irq_mmio_handle = 0 };
+    }
+}
+
+/// destroy 的兜底 quiesce：清 handler 的 lease / SERVED 标记，并释放可能残留的
+/// authority。正常 create 已在 [`run`] 内同步释放（设备已 mask、IRQ 已 release），
+/// 所以这是幂等空操作；防御未来改动漏放，保证 destroy 时没有 live authority。
+pub(crate) fn quiesce(state: *mut State) {
+    unsafe {
+        (*state).irq_uart_lease.store(0, Ordering::SeqCst);
+        (*state).irq_served.store(false, Ordering::SeqCst);
+    }
+    release_authority(state);
+}
+
+/// 执行一次 `irq.uart_trigger_to_handler`（从 `kcomp_instance_create` 的锚点上下文调用）。
+///
+/// `state` 是本实例的 per-run 状态；注册 handler 时作为 `ctx` 原样回传，handler
+/// 只经 `ctx` 读状态（不再读 image-global static）。
+pub(crate) fn run(state: *mut State, context: &Context) {
     // ---- 合法 authority 链（每一步都如实报告失败在哪） ----
     let mut device = 0u32;
     if unsafe {
@@ -216,17 +251,19 @@ pub(crate) fn run(context: &Context) {
         blocked("mmio_not_owned", claimed);
         return;
     }
+    // 记录认领到的 handle：destroy 用它兜底 quiesce（正常路径下面同步释放清零）。
+    unsafe { (*state).irq_mmio_handle = mmio };
     let mut irq = 0u64;
     let irq_claimed = unsafe { abi::kcore_irq_claim(mmio, &mut irq) };
     if irq_claimed != 0 {
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        release_authority(state);
         blocked("irq_not_owned", irq_claimed);
         return;
     }
-    let registered = unsafe { abi::kcore_irq_register(irq, handler, core::ptr::null_mut()) };
+    unsafe { (*state).irq_handle = irq };
+    let registered = unsafe { abi::kcore_irq_register(irq, handler, state as *mut ()) };
     if registered != 0 {
-        let _ = unsafe { abi::kcore_irq_release(irq) };
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        release_authority(state);
         blocked("register_failed", registered);
         return;
     }
@@ -234,27 +271,24 @@ pub(crate) fn run(context: &Context) {
     let mut len = 0usize;
     let leased = unsafe { abi::kcore_mmio_lease(mmio, &mut ptr, &mut len) };
     if leased != 0 {
-        let _ = unsafe { abi::kcore_irq_release(irq) };
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        release_authority(state);
         blocked("lease_failed", leased);
         return;
     }
     if ptr == 0 || len < MIN_HOST_LEN {
         // 拒绝的是本地长度要求（Core 已派生成功），如实报告窗口本身。
-        let _ = unsafe { abi::kcore_irq_release(irq) };
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        release_authority(state);
         blocked_window(ptr, len);
         return;
     }
-    UART_LEASE.store(ptr, Ordering::SeqCst);
+    unsafe { (*state).irq_uart_lease.store(ptr, Ordering::SeqCst) };
     // IER 是字节寄存器（偏移 1），Core 的 u32 校验访问要求 4 字节对齐、表达不了；
     // 开局先 mask 走 lease 的字节写（Core 校验过一次的 KernelNative 快路径）。
     unsafe { core::ptr::write_volatile((ptr as *mut u8).add(REG_IER), 0) };
     let enabled = unsafe { abi::kcore_irq_enable(irq) };
     if enabled != 0 {
-        UART_LEASE.store(0, Ordering::SeqCst);
-        let _ = unsafe { abi::kcore_irq_release(irq) };
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
+        unsafe { (*state).irq_uart_lease.store(0, Ordering::SeqCst) };
+        release_authority(state);
         blocked("enable_failed", enabled);
         return;
     }
@@ -267,7 +301,7 @@ pub(crate) fn run(context: &Context) {
 
     let mut warmups = 0u64;
     while warmups < WARMUP_SAMPLES {
-        let _ = sample_once(timeout);
+        let _ = sample_once(state, timeout);
         warmups += 1;
     }
 
@@ -277,7 +311,7 @@ pub(crate) fn run(context: &Context) {
     let mut discarded_backwards = 0u64;
     let mut truncated = false;
     while valid < crate::SAMPLES {
-        match sample_once(timeout) {
+        match sample_once(state, timeout) {
             Some(Sample::Interval(interval)) => {
                 samples[valid] = interval;
                 valid += 1;
@@ -296,9 +330,8 @@ pub(crate) fn run(context: &Context) {
     // 先关源、断线、还设备（顺序：irq release → mmio release；mmio release 在
     // 仍有 live IRQ child 时会拒绝）。关源走 lease 字节写（同上）。
     unsafe { core::ptr::write_volatile((ptr as *mut u8).add(REG_IER), 0) };
-    UART_LEASE.store(0, Ordering::SeqCst);
-    let _ = unsafe { abi::kcore_irq_release(irq) };
-    let _ = unsafe { abi::kcore_mmio_release(mmio) };
+    unsafe { (*state).irq_uart_lease.store(0, Ordering::SeqCst) };
+    release_authority(state);
 
     report::bench_header(NAME);
     report::key_str("method", "one_shot");

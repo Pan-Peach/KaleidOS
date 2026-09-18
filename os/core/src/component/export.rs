@@ -15,8 +15,8 @@
 //! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
-//! | Component lifecycle（v2） | `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件加载/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 call_init 上下文解析，不信任组件自报身份）。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_init` 期间只记录 pending（staged），init 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
-//! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 组件镜像内；状态推进过 Core 状态机验证） |
+//! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
+//! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
 //! | Resource authority（v3 起步） | `kcore_device_nth` `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_mmio_write_u32` `kcore_mmio_release` `kcore_mmio_lease` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` `kcore_irq_register_polled` `kcore_irq_poll` `kcore_irq_ack` `kcore_irq_release` | 设备身份/认领链（identity → root → derived）：`device_nth` = 纯发现（列候选，不授权，`DeviceId` 是 identity 不是 handle）；`mmio_claim` = 用 `DeviceId` 认领**确切设备**（不是"第一台匹配"）→ Core authorize → grant；`irq_claim` = 从 caller 已持有的 `MmioHandle` 派生**同一台设备**的中断线（`irq=None` → `-ENODEV`）；`dma_alloc` 同样从 `MmioHandle` 推导设备身份。`mmio_release` 在仍有 live IRQ/DMA 子 authority 时拒绝（`-EBUSY`）；`irq_release` 真的关断投递（撤销 slot + 关断控制器线）。IRQ 投递两态：`register` = trap 上下文回调；`register_polled` + `poll`/`ack` = 轮询（Core 计数并掩蔽，驱动任务读完计数后 `ack` 由 Core 重新放行）。常规访问组件拿到的只是 raw handle，**不是地址/中断号**；`kcore_mmio_lease` 额外派生 Core 校验过一次的 `(ptr, len)` + provenance（受信 KernelNative 直接访问，撤销为协作式，见 `handle/lease.rs`）。全部 `0 / -Errno`、值走 out 参数 |
@@ -49,8 +49,9 @@
 //! # 身份解析与 Failed 门禁
 //!
 //! - **principal = 最内层当前活动的 Core-managed 执行边界**
-//!   （`containment::active_escape`）：组件任务 → task owner；`kcomp_init`
-//!   （含**嵌套加载**）→ 被初始化的组件；嵌套 init 返回/panic 后恢复上一层边界。
+//!   （`containment::active_escape`）：组件任务 → task owner；
+//!   `kcomp_instance_create`（含**嵌套创建**）→ 被创建的实例；嵌套 create
+//!   返回/panic 后恢复上一层边界。
 //!   所有 authority / task / interface 入口统一走 `RequestContext::ambient()` /
 //!   `ambient_init()`，不再各自偏好当前任务 owner。
 //! - **Failed 实例门禁**：获取 authority / 创建 work 的入口
@@ -72,8 +73,9 @@
 //!   truth 的 mutation 一律不导出；v2 的 `kcore_task_*` 是**带验证的语义入口**
 //!   （requester 校验 + entry 镜像校验 + 状态机），不是 `TaskTable` 的透传。
 //! - 注册表：`registry::declare/start/unload`——组件生命周期由 Core 掌控，
-//!   `kcore_component_load` 是完整语义请求（store → loader → declare → resolve
-//!   → start → call_init）。
+//!   `kcore_component_create`（store → image 复用 → declare → resolve →
+//!   start → kcomp_instance_create）与默认配置便利入口 `kcore_component_load`
+//!   是完整语义请求（registry 无 unload：Stopped/Failed 记录留作 tombstone）。
 //! - Trace 事件：组件未来只能提交"组件自定义事件"，`TaskSwitch/Grant/Revoke/
 //!   CoreRejected` 等 Core authoritative event 由 Core 自己产生（TODO：trace
 //!   环形缓冲落地后加 `kcore_trace_component_event`，sequence 由 Core 分配）。
@@ -86,6 +88,7 @@
 //! 严格匹配，违反 = UB（与 C `malloc/free` 错配同类）。组件失败后的泄漏在 phase 1
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
+use crate::component::containment::KcompCreateArgs;
 use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
@@ -321,8 +324,11 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
     }
 }
 
-/// 请求 Core 加载并启动组件（store → loader → registry → call_init 全链，
-/// 与 monitor `load` 同源）。返回 ComponentId raw（≥ 0）/ `-Errno`
+/// 请求 Core 用**默认配置**创建组件实例（store → image 复用/加载 → registry →
+/// `kcomp_instance_create` 全链，与 monitor `load` 同源）。
+///
+/// 这是 `kcore_component_create` 的便利入口（`config_abi = 0`，无 config 负载）。
+/// 返回 ComponentId raw（≥ 0）/ `-Errno`
 /// （`EINVAL` 名字非法；其余见 `Errno::from(ComponentLoadError)`）。
 extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
     let Some(name) = checked_name(name_ptr, name_len) else {
@@ -334,18 +340,52 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
     }
 }
 
-/// 发布接口（**staged**：`kcomp_init` 期间只记录 pending，不修改 active binding）。
-/// provider = 当前正在初始化的组件（Core 记录，**不信任组件自报身份**）。
+/// 用指定 config 负载创建一个新实例（`docs/component-lifecycle.md` §4）。
+///
+/// 同名 artifact 复用已登记的常驻 image（新实例、新 id、新 state）；否则
+/// store → loader → image 登记。`args` 是组件自定义的 C 布局小结构，Core 视为
+/// **不透明字节**（只在调用期间借用，不持久化、不解释）。
+///
+/// 成功 = 0，实例 id（`u32`）写入 `*out_instance`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` `args` / `out_instance` 为空 / `EINVAL` 名字非法 /
+/// 其余见 `Errno::from(ComponentLoadError)`）。
+extern "C" fn kcore_component_create(
+    image_name: *const u8,
+    image_name_len: usize,
+    args: *const KcompCreateArgs,
+    out_instance: *mut u32,
+) -> i32 {
+    if args.is_null() || out_instance.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(name) = checked_name(image_name, image_name_len) else {
+        return Errno::EINVAL.code();
+    };
+    // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
+    // Core 只在本次调用内借用它。
+    let args = unsafe { &*args };
+    match crate::component::load::create_component(name, args) {
+        Ok(id) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 发布接口（**staged**：`kcomp_instance_create` 期间只记录 pending，不修改
+/// active binding）。provider = 当前正在创建的实例（Core 记录，**不信任组件自报身份**）。
 ///
 /// `abi` 是 exact ABI fingerprint（`u64`，无版本兼容语义）：provider 与 consumer
 /// 必须由完全相同的 Service ABI contract 编译。`api` 指向 provider 的 `#[repr(C)]`
 /// function table，`ctx` 是 provider opaque state；Core 只存指针、永不解引用。
 ///
-/// `kcomp_init` 返回 0 后 Core 原子提交该组件的 pending interfaces；ABI 冲突的
+/// create 返回 0 后 Core 原子提交该实例的 pending interfaces；ABI 冲突的
 /// replacement 在提交时被拒绝。因此本函数返回 `0` 只表示"已记录 pending"。
-/// provider 由最内层活动 init 边界解析（嵌套加载 = 被初始化的组件），不信任组件
+/// provider 由最内层活动 create 边界解析（嵌套创建 = 被创建的实例），不信任组件
 /// 自报身份；`Failed` provider → `-EPERM`。
-/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在组件 init 上下文或
+/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在 create 上下文或
 /// provider 已 `Failed`；其余见 `Errno::from(InterfaceError)`）。
 extern "C" fn kcore_interface_publish(
     name_ptr: *const u8,
@@ -486,7 +526,7 @@ extern "C" fn kcore_interface_refresh(
 // ---------------------------------------------------------------------------
 
 /// 解析 Core API caller：身份统一走 [`RequestContext::ambient`]——最内层活动执行
-/// 边界优先（组件任务 → task owner；`kcomp_init`，含嵌套加载 → 被初始化组件）。
+/// 边界优先（组件任务 → task owner；`kcomp_instance_create`，含嵌套创建 → 被创建的实例）。
 fn current_task_requester() -> Option<crate::component::ComponentId> {
     RequestContext::ambient().map(|ctx| ctx.component)
 }
@@ -500,18 +540,30 @@ fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
     crate::component::is_failed(component).then_some(Errno::EPERM.code())
 }
 
-/// 创建任务。requester = 当前 caller；`entry` 必须落在该组件的
-/// 装载镜像内（越界指针一律拒绝）。返回 TaskId raw（≥ 0）/ `-Errno`
-/// （`EPERM` 无法解析 caller；其余见 `Errno::from(TaskError)`）。
-extern "C" fn kcore_task_create(entry: usize) -> i32 {
+/// 创建任务。requester = 当前 caller；`entry` 必须落在该实例的
+/// 装载镜像内（越界指针一律拒绝）；`arg` 是 opaque 参数，Core 原样透传给任务
+/// 入口（`typedef void (*)(void *)`），**任务归属仍来自 Core 的执行边界**，
+/// 与 `arg` 内容无关。
+///
+/// 成功 = 0，TaskId（`u32`）写入 `*out_task`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller；
+/// 其余见 `Errno::from(TaskError)`）。
+extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) -> i32 {
+    if out_task.is_null() {
+        return Errno::EFAULT.code();
+    }
     let Some(requester) = current_task_requester() else {
         return Errno::EPERM.code();
     };
     if let Some(denied) = deny_if_failed(requester) {
         return denied;
     }
-    match task::create_task(requester, entry) {
-        Ok(id) => id.raw() as i32,
+    match task::create_task(requester, entry, arg) {
+        Ok(id) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe { core::ptr::write_unaligned(out_task, id.raw()) };
+            0
+        }
         Err(error) => Errno::from(error).code(),
     }
 }
@@ -980,7 +1032,7 @@ extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 42] = [
+static EXPORTS: [Export; 43] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -1043,6 +1095,10 @@ static EXPORTS: [Export; 42] = [
         address: ExportAddress(kcore_component_count as *const ()),
     },
     // Category 5：Component lifecycle（v2）
+    Export {
+        name: b"kcore_component_create",
+        address: ExportAddress(kcore_component_create as *const ()),
+    },
     Export {
         name: b"kcore_component_load",
         address: ExportAddress(kcore_component_load as *const ()),
@@ -1192,6 +1248,7 @@ mod tests {
             &b"kcore_free_page_count"[..],
             &b"kcore_task_count"[..],
             &b"kcore_component_count"[..],
+            &b"kcore_component_create"[..],
             &b"kcore_component_load"[..],
             &b"kcore_interface_publish"[..],
             &b"kcore_interface_available"[..],
@@ -1367,7 +1424,7 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(b"gate_failed_demo", 0x1000, 0x2000, None)
+                .declare(crate::component::image::ComponentImageId::from_raw(1))
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -1375,14 +1432,18 @@ mod tests {
             id
         };
 
-        // When / Then：身份解析到该 Failed 组件（init 边界）；acquiring 入口
+        // When / Then：身份解析到该 Failed 组件（create 边界）；acquiring 入口
         // 全部 `-EPERM`，但 release 一个已持有的 handle 仍然成功。
         containment::with_test_init_boundary(Some(id), || {
             let mut out = 0u64;
+            let mut out_task = 0u32;
             assert_eq!(kcore_mmio_claim(0, &mut out), Errno::EPERM.code());
             assert_eq!(kcore_irq_claim(0, &mut out), Errno::EPERM.code());
             assert_eq!(kcore_dma_alloc(0, 4096, 0, &mut out), Errno::EPERM.code());
-            assert_eq!(kcore_task_create(0x1000), Errno::EPERM.code());
+            assert_eq!(
+                kcore_task_create(0x1000, core::ptr::null_mut(), &mut out_task),
+                Errno::EPERM.code()
+            );
             assert_eq!(
                 kcore_interface_publish(
                     b"svc".as_ptr(),

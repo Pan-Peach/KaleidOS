@@ -359,10 +359,14 @@ pub fn on_timer_tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::image::ComponentImageId;
     use crate::component::interface::InterfaceRegistry;
     use crate::component::registry::Registry;
     use alloc::vec;
     use core::ptr;
+
+    /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
+    const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
     /// 串行化触碰进程全局 task table / registry 的调度测试。
     static SCHED_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
@@ -382,10 +386,10 @@ mod tests {
         cpu().lock().current = id;
     }
 
-    /// 全局 registry 里的一个 `Ready` 活组件（名字每例唯一：registry 跨用例累积）。
-    fn ready_component(name: &[u8]) -> ComponentId {
+    /// 全局 registry 里的一个 `Ready` 活实例（同一 image 可无限复用，id 跨用例累积）。
+    fn ready_component(_name: &[u8]) -> ComponentId {
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(name, ENTRY, ENTRY, None).unwrap();
+        let id = reg.declare(IMAGE).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -396,7 +400,7 @@ mod tests {
     fn runnable_task(owner: ComponentId) -> TaskId {
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, ENTRY)
+            .create(owner, ENTRY, ptr::null_mut())
             .unwrap();
         crate::task::get_task_table()
             .lock()
@@ -408,10 +412,10 @@ mod tests {
     /// 向全局 interfaces 发布一个 `scheduler` policy（provider 走到 `Ready`）。
     ///
     /// `vtable` 只以指针存入 binding，调用方的局部 vtable 必须活到用例结束。
-    fn publish_policy(name: &[u8], vtable: &SchedulerPolicyApi) -> ComponentId {
+    fn publish_policy(_name: &[u8], vtable: &SchedulerPolicyApi) -> ComponentId {
         let provider = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(name, ENTRY, ENTRY, None).unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -483,9 +487,7 @@ mod tests {
         // Given：一个 Ready 组件 + 一个 Runnable 任务（直接进全局 task 表）。
         let owner = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"sched_failed_owner", 0x8000_0000, 0x8000_0000, None)
-                .unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -493,7 +495,7 @@ mod tests {
         };
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, 0x8000_0000)
+            .create(owner, 0x8000_0000, ptr::null_mut())
             .unwrap();
         crate::task::get_task_table()
             .lock()
@@ -533,8 +535,8 @@ mod tests {
         let mut table = crate::task::TaskTable::new();
         const ENTRY: usize = 0x8000_0000;
         let owner = ComponentId::from_raw(1);
-        let a = table.create(owner, ENTRY).unwrap();
-        let b = table.create(owner, ENTRY).unwrap();
+        let a = table.create(owner, ENTRY, ptr::null_mut()).unwrap();
+        let b = table.create(owner, ENTRY, ptr::null_mut()).unwrap();
         table.transition(a, TaskState::Runnable).unwrap();
         table.transition(b, TaskState::Runnable).unwrap();
 
@@ -550,7 +552,7 @@ mod tests {
         let vtable = SchedulerPolicyApi {
             choose_next: bad_choose,
         };
-        let provider = reg.declare(b"scheduler_bad", ENTRY, ENTRY, None).unwrap();
+        let provider = reg.declare(IMAGE).unwrap();
         reg.resolve(provider).unwrap();
         reg.begin_start(provider).unwrap();
         ifs.stage_publish(
@@ -625,9 +627,7 @@ mod tests {
         };
         let provider = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"sched_bad_real", 0x8000_0000, 0x8000_0000, None)
-                .unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -655,9 +655,7 @@ mod tests {
         // 一个 Ready 的 task owner + 一个 Runnable 任务（真实全局 task 表）。
         let owner = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"sched_real_owner", 0x8000_0000, 0x8000_0000, None)
-                .unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -665,7 +663,7 @@ mod tests {
         };
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, 0x8000_0000)
+            .create(owner, 0x8000_0000, ptr::null_mut())
             .unwrap();
         crate::task::get_task_table()
             .lock()
@@ -766,9 +764,7 @@ mod tests {
         };
         let provider = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"sched_bench_policy", 0x8000_0000, 0x8000_0000, None)
-                .unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -795,9 +791,7 @@ mod tests {
 
         let owner = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"sched_bench_owner", 0x8000_0000, 0x8000_0000, None)
-                .unwrap();
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -805,7 +799,7 @@ mod tests {
         };
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, 0x8000_0000)
+            .create(owner, 0x8000_0000, ptr::null_mut())
             .unwrap();
         crate::task::get_task_table()
             .lock()
@@ -821,7 +815,9 @@ mod tests {
         // commit：状态转移的验证 + 落笔（不含真正切换）。
         let mut table = crate::task::TaskTable::new();
         let local_owner = ComponentId::from_raw(0x7b);
-        let local = table.create(local_owner, 0x8000_0000).unwrap();
+        let local = table
+            .create(local_owner, 0x8000_0000, ptr::null_mut())
+            .unwrap();
         table.transition(local, TaskState::Runnable).unwrap();
         let mut commit = crate::bench::Bench::new("sched.task_transition");
         commit.run(1_000, || {
@@ -855,7 +851,7 @@ mod tests {
         let owner = ready_component(b"sched_created_owner");
         let created = crate::task::get_task_table()
             .lock()
-            .create(owner, ENTRY)
+            .create(owner, ENTRY, ptr::null_mut())
             .unwrap();
         let live = runnable_task(owner);
         assert_eq!(state_of(created), TaskState::Created);
@@ -1167,7 +1163,7 @@ mod tests {
         let owner = ready_component(b"sched_stale_created_owner");
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, ENTRY)
+            .create(owner, ENTRY, ptr::null_mut())
             .unwrap();
         set_current(Some(task));
 
@@ -1203,7 +1199,7 @@ mod tests {
         let owner = ready_component(b"sched_no_after_owner");
         let task = crate::task::get_task_table()
             .lock()
-            .create(owner, ENTRY)
+            .create(owner, ENTRY, ptr::null_mut())
             .unwrap();
         set_current(Some(task));
 

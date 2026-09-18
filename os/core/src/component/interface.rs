@@ -42,8 +42,8 @@
 //!
 //! # Staged publish（`Declared → Resolved → Starting → Ready`）
 //!
-//! `kcomp_init()` 执行期间调用 publish **不会立即修改 active binding**：它记录为
-//! 该组件的 pending publication。Core 在 `kcomp_init()` 返回 0 后**原子提交**
+//! `kcomp_instance_create()` 执行期间调用 publish **不会立即修改 active binding**：它记录为
+//! 该组件的 pending publication。Core 在 `kcomp_instance_create()` 返回 0 后**原子提交**
 //! 该组件的 pending interfaces（见 [`InterfaceRegistry::commit_pending`]）：
 //!
 //! - interface 不存在 → 新建 binding（generation = 1）；
@@ -197,7 +197,7 @@ struct BindingRecord {
     generation: u64,
 }
 
-/// `kcomp_init` 期间记录的一次待提交发布（staged publish）。
+/// `kcomp_instance_create` 期间记录的一次待提交发布（staged publish）。
 struct PendingPublication {
     component: ComponentId,
     name: Vec<u8>,
@@ -235,7 +235,7 @@ impl InterfaceRegistry {
 
     /// **Staged publish**：记录一条 pending publication，不修改 active binding。
     ///
-    /// 由 `kcore_interface_publish` 在 `kcomp_init()` 执行期间调用（provider 此时
+    /// 由 `kcore_interface_publish` 在 `kcomp_instance_create()` 执行期间调用（provider 此时
     /// 处于 `Starting`）。Core 校验 provider 存在且处于可初始化状态，但**不**
     /// 在此刻提交——提交由 [`Self::commit_pending`] 在 init 成功后完成。
     ///
@@ -270,7 +270,7 @@ impl InterfaceRegistry {
         Ok(())
     }
 
-    /// 提交某组件的全部 pending publications（`kcomp_init()` 返回 0 后由 Core 调用）。
+    /// 提交某组件的全部 pending publications（`kcomp_instance_create()` 返回 0 后由 Core 调用）。
     ///
     /// **原子语义**：先整体校验该组件的 pending（kind / ABI 冲突），任一失败则
     /// 丢弃该组件全部 pending 并返回 `Err`——旧 active binding 完全不受影响；
@@ -526,7 +526,11 @@ pub fn get_interfaces() -> &'static Mutex<InterfaceRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::image::ComponentImageId;
     use crate::component::registry::Registry;
+
+    /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
+    const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
     const ABI_A: InterfaceAbi = InterfaceAbi::from_raw(0xAAAA_0001);
     const ABI_B: InterfaceAbi = InterfaceAbi::from_raw(0xBBBB_0002);
@@ -577,12 +581,12 @@ mod tests {
         ifs.bind(reg, name, kind, abi).unwrap().id
     }
 
-    /// 构造注册表并声明两个 Ready 组件（provider_a / provider_b / consumer）。
+    /// 构造注册表并声明三个 Ready 实例（provider_a / provider_b / consumer）。
     fn ready_world() -> (Registry, Vec<ComponentId>) {
         let mut reg = Registry::new();
         let mut ids = Vec::new();
-        for name in [&b"provider_a"[..], &b"provider_b"[..], &b"consumer"[..]] {
-            let id = reg.declare(name, 1, 2, None).unwrap();
+        for _ in 0..3 {
+            let id = reg.declare(IMAGE).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -756,7 +760,7 @@ mod tests {
     #[test]
     fn stage_publish_rejects_non_starting_provider() {
         let mut reg = Registry::new();
-        let declared = reg.declare(b"not_ready", 1, 2, None).unwrap();
+        let declared = reg.declare(IMAGE).unwrap();
         // 不 resolve/begin_start：保持 Declared
         let mut ifs = InterfaceRegistry::new();
         assert_eq!(
@@ -1121,7 +1125,7 @@ mod tests {
 
     #[test]
     fn provider_liveness_revalidated_on_bind() {
-        let (mut reg, ids) = ready_world();
+        let (reg, ids) = ready_world();
         let mut ifs = InterfaceRegistry::new();
         publish_ready(
             &reg,
@@ -1132,10 +1136,10 @@ mod tests {
             ABI_A,
             ctx(1),
         );
-        // provider 被卸载（从组件注册表移除）→ bind 必须拒绝
-        reg.unload(ids[0]).unwrap();
+        // provider 不在（另一个）registry 中 → bind 的存活复验必须拒绝。
+        let empty = Registry::new();
         assert_eq!(
-            ifs.bind(&reg, b"sample", InterfaceKind::Service, ABI_A),
+            ifs.bind(&empty, b"sample", InterfaceKind::Service, ABI_A),
             Err(InterfaceError::ProviderNotFound)
         );
     }

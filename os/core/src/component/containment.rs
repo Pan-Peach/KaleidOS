@@ -3,19 +3,20 @@
 //! A KernelNative component can panic at three Core boundaries, and all are
 //! contained by escaping to a Core-owned context instead of unwinding:
 //!
-//! 1. **Init boundary** (`kcomp_init`): the component entry runs on a temporary
-//!    Core-owned stack ([`call_on_isolated_stack`]).  Its normal return and the
-//!    boot panic handler both switch back to the saved caller context; neither
-//!    path returns through the component context.
+//! 1. **Create boundary** (`kcomp_instance_create`): the component entry runs on
+//!    a temporary Core-owned stack ([`call_component_create`]).  Its normal
+//!    return and the boot panic handler both switch back to the saved caller
+//!    context; neither path returns through the component context.
 //! 2. **Task boundary**: the scheduler installs an escape guard on every switch
 //!    into a component task ([`enter_task`]).  A panic in the task is redirected
 //!    to a Core-owned **task-abort context** ([`task_abort_trampoline`]), which
 //!    commits the dead task to `Exited`, fails its owning component, and
 //!    reschedules in a clean Core context.
-//! 3. **Exit boundary** (`kcomp_exit`, graceful stop): the hook runs on the same
-//!    temporary Core-owned stack as init ([`call_component_exit`]) and records
-//!    the **stopped instance** as its ambient identity.  A panic escapes back
-//!    to `component/exit.rs::stop_component`, which classifies it as an exit
+//! 3. **Destroy boundary** (`kcomp_instance_destroy`, graceful stop): the hook
+//!    runs on the same temporary Core-owned stack as create
+//!    ([`call_component_destroy`]) and records the **stopped instance** as its
+//!    ambient identity.  A panic escapes back to
+//!    `component/exit.rs::stop_component`, which classifies it as a destroy
 //!    failure.
 //!
 //! Because control never returns through the panicking frame this is **not**
@@ -71,7 +72,64 @@ const TASK_ABORT_STACK_BYTES: usize = 32 * 1024;
 const STACK_ALIGNMENT: usize = 16;
 const STACK_ALLOCATION_FAILED: i32 = -12;
 
-type ComponentEntry = extern "C" fn() -> i32;
+// ---------------------------------------------------------------------------
+// 组件实例 ABI（C 是根，见 `docs/component-lifecycle.md` §4）
+// ---------------------------------------------------------------------------
+
+/// 精确契约指纹（**手工维护，非版本号**；A/B 双侧锚定，Core 与 `kcomp.h` /
+/// `kcomp-sdk` 必须写入同一数值）。无兼容协商、不自动生成哈希。
+///
+/// 值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；loader 在放段后读取组件
+/// `kcomp_abi` 符号并与本值精确比对，不一致 = 拒绝加载。
+pub const KCOMP_ABI: u64 = 0x4B43_4F4D_5041_4249;
+
+/// `kcomp_instance_create` 参数：仅在调用期间借用；payload 必须拷贝后才能持久化。
+///
+/// C 声明见 `kcomp.h` 的 `struct KcompCreateArgs`；字段布局逐字节一致。
+/// `config_abi` 是 config 负载的精确指纹，`0` = 无负载。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KcompCreateArgs {
+    pub config_abi: u64,
+    /// Core 视为不透明字节；从不解释、不持久化引用。
+    pub config: *const (),
+    pub config_len: usize,
+}
+
+impl KcompCreateArgs {
+    /// 无配置负载（`kcore_component_load` 的默认配置）。
+    pub const fn empty() -> Self {
+        Self {
+            config_abi: 0,
+            config: core::ptr::null(),
+            config_len: 0,
+        }
+    }
+}
+
+/// `kcomp_instance_create(args, out_state) -> 0 / -errno`。
+/// Core 先把 `*out_state` 置 NULL；组件成功时写入自己的 state 指针
+/// （**无状态组件允许写 NULL**）。返回非零失败。
+type InstanceCreate = extern "C" fn(args: *const KcompCreateArgs, out_state: *mut *mut ()) -> i32;
+
+/// `kcomp_instance_destroy(state) -> 0 / -errno`。
+type InstanceDestroy = extern "C" fn(state: *mut ()) -> i32;
+
+/// 隔离栈上要执行的一次组件调用（参数由调用方在 Core 栈帧里携带）。
+#[derive(Clone, Copy)]
+enum IsolatedCall {
+    /// 测试边界 / 无组件调用。
+    None,
+    Create {
+        entry: usize,
+        args: *const KcompCreateArgs,
+        out_state: *mut *mut (),
+    },
+    Destroy {
+        entry: usize,
+        state: *mut (),
+    },
+}
 
 /// Result of invoking a component entry on its isolated stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +141,11 @@ pub enum CallOutcome {
 /// Which Core boundary an active escape guard protects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeKind {
-    /// `kcomp_init` running on a temporary Core stack.  The owner is the
-    /// component Core is initializing, or `None` for a direct (selftest) call.
+    /// `kcomp_instance_create` running on a temporary Core stack.  The owner is
+    /// the component Core is initializing, or `None` for a direct (selftest) call.
     Init { owner: Option<ComponentId> },
-    /// `kcomp_exit` running on a temporary Core stack during a graceful stop.
+    /// `kcomp_instance_destroy` running on a temporary Core stack during a
+    /// graceful stop.
     ///
     /// The owner is the **instance being stopped** — never the monitor or other
     /// component that initiated the stop — so identity-sensitive Core calls made
@@ -156,8 +215,8 @@ struct EscapeGuard {
     kind: EscapeKind,
     from_context: *mut ContextImpl,
     to_context: *mut ContextImpl,
-    /// Init only: entry run by the trampoline on normal return.
-    entry: Option<ComponentEntry>,
+    /// 隔离栈上要执行的那次组件调用（测试边界为 [`IsolatedCall::None`]）。
+    call: IsolatedCall,
     returned: i32,
     state: GuardState<*mut EscapeGuard>,
 }
@@ -230,42 +289,56 @@ pub fn active_escape() -> Option<EscapeInfo> {
     Some(EscapeInfo { kind })
 }
 
-/// Calls an entry after deriving its C ABI function pointer from a loaded ELF image.
-pub fn call_component_init(entry: usize) -> CallOutcome {
-    // SAFETY: `loader::load_component` validates and relocates `kcomp_init`
-    // before its entry address reaches this Core-only function.
-    let init = unsafe { core::mem::transmute::<usize, ComponentEntry>(entry) };
-    call_on_isolated_stack(init)
-}
-
-/// Calls a component **exit hook** (`kcomp_exit`) on a Core-owned stack.
+/// Calls a component **create entry** (`kcomp_instance_create`) on a Core-owned
+/// stack, under the identity of the instance Core is initializing
+/// (`load::current_component`, which also covers nested loads).
 ///
-/// The guard records `owner` — the instance being stopped — as the ambient
-/// identity, so `RequestContext::ambient()` inside the hook resolves to that
-/// instance (never to the monitor/caller that initiated the stop, and never to
-/// `load::current_component()`).  Panic routing is the same as init: the escape
-/// switches back to `stop_component`, which classifies the outcome.
-pub fn call_component_exit(entry: usize, owner: ComponentId) -> CallOutcome {
-    // SAFETY: `entry` comes from `LoadedComponent::exit`, which the loader
-    // resolved and relocated from the component's own symbol table (same
-    // contract as `call_component_init`).
-    let exit = unsafe { core::mem::transmute::<usize, ComponentEntry>(entry) };
-    call_on_isolated_stack_with(exit, EscapeKind::Exit { owner })
-}
-
-/// Calls a component entry on a Core-owned stack and contains its panic escape.
-pub fn call_on_isolated_stack(entry: ComponentEntry) -> CallOutcome {
+/// `out_state` must point at caller-owned storage; Core's caller is required to
+/// have initialized it to NULL before this call (the component may legally write
+/// NULL on success for a stateless component).
+pub fn call_component_create(
+    entry: usize,
+    args: *const KcompCreateArgs,
+    out_state: *mut *mut (),
+) -> CallOutcome {
+    // 契约 §4：Core 先把 `*out_state` 置 NULL（由 Core 调用方 = `load.rs` 在
+    // 传入前完成）；组件成功时写入自己的 state（无状态组件可保持 NULL）。
+    // SAFETY: `loader::load_component` validates and relocates
+    // `kcomp_instance_create` before its entry address reaches this Core-only
+    // function; `args` / `out_state` live in the suspended caller frame.
     call_on_isolated_stack_with(
-        entry,
+        IsolatedCall::Create {
+            entry,
+            args,
+            out_state,
+        },
         EscapeKind::Init {
             owner: crate::component::load::current_component(),
         },
     )
 }
 
-/// Shared body of the init / exit boundaries: allocate a Core-owned stack,
+/// Calls a component **destroy entry** (`kcomp_instance_destroy`) on a
+/// Core-owned stack.
+///
+/// The guard records `owner` — the instance being stopped — as the ambient
+/// identity, so `RequestContext::ambient()` inside the hook resolves to that
+/// instance (never to the monitor/caller that initiated the stop, and never to
+/// `load::current_component()`).  Panic routing is the same as create: the
+/// escape switches back to `stop_component`, which classifies the outcome.
+pub fn call_component_destroy(entry: usize, state: *mut (), owner: ComponentId) -> CallOutcome {
+    // SAFETY: `entry` comes from `ComponentImage::destroy`, which the loader
+    // resolved and relocated from the component's own symbol table (same
+    // contract as `call_component_create`).
+    call_on_isolated_stack_with(
+        IsolatedCall::Destroy { entry, state },
+        EscapeKind::Exit { owner },
+    )
+}
+
+/// Shared body of the create / destroy boundaries: allocate a Core-owned stack,
 /// install `kind` as the active escape guard, switch, and collect the outcome.
-fn call_on_isolated_stack_with(entry: ComponentEntry, kind: EscapeKind) -> CallOutcome {
+fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutcome {
     let stack = match memory::alloc_region(COMPONENT_STACK_BYTES) {
         Ok(stack) => stack,
         Err(_) => return CallOutcome::Returned(STACK_ALLOCATION_FAILED),
@@ -277,7 +350,7 @@ fn call_on_isolated_stack_with(entry: ComponentEntry, kind: EscapeKind) -> CallO
         kind,
         from_context: &mut component_context,
         to_context: &mut core_context,
-        entry: Some(entry),
+        call,
         returned: 0,
         state: GuardState::new(None),
     };
@@ -317,7 +390,7 @@ pub fn enter_task(task: TaskId, owner: ComponentId) {
             kind: EscapeKind::Task { task, owner },
             from_context: core::ptr::addr_of_mut!(TASK_SCRATCH_CONTEXT).cast::<ContextImpl>(),
             to_context: core::ptr::addr_of_mut!(TASK_ABORT_CONTEXT).cast::<ContextImpl>(),
-            entry: None,
+            call: IsolatedCall::None,
             returned: 0,
             state: GuardState::new(None),
         };
@@ -341,11 +414,28 @@ extern "C" fn trampoline() -> ! {
         halt()
     };
     // SAFETY: the active guard belongs to the caller frame suspended by
-    // `call_on_isolated_stack`; this context is the only execution using it.
+    // `call_on_isolated_stack_with`; this context is the only execution using it.
     let guard = unsafe { &mut *guard_ptr };
-    guard.returned = match guard.entry {
-        Some(entry) => entry(),
-        None => 0,
+    guard.returned = match guard.call {
+        IsolatedCall::None => 0,
+        IsolatedCall::Create {
+            entry,
+            args,
+            out_state,
+        } => {
+            // SAFETY: `entry` comes from `LoadedComponent::create` (loader
+            // validated + relocated the symbol); `args` / `out_state` point at
+            // the suspended caller's still-live frame.
+            let create: InstanceCreate = unsafe { core::mem::transmute(entry) };
+            create(args, out_state)
+        }
+        IsolatedCall::Destroy { entry, state } => {
+            // SAFETY: `entry` comes from `ComponentImage::destroy` (loader
+            // validated + relocated the symbol); `state` is the instance's
+            // opaque pointer (Core never dereferences it).
+            let destroy: InstanceDestroy = unsafe { core::mem::transmute(entry) };
+            destroy(state)
+        }
     };
     switch_to_core(guard)
 }
@@ -371,7 +461,7 @@ extern "C" fn task_abort_trampoline() -> ! {
 /// a task.  Never returns to the escaping frame.
 fn switch_to_core(guard: &mut EscapeGuard) -> ! {
     // SAFETY: both context records live in the suspended caller frame of
-    // `call_on_isolated_stack`; `from_context` is the current context and
+    // `call_on_isolated_stack_with`; `from_context` is the current context and
     // `to_context` was saved immediately before this component began.
     unsafe {
         CpuImpl::context_switch(&mut *guard.from_context, &*guard.to_context);
@@ -455,7 +545,7 @@ pub(crate) fn test_boundary_lock() -> spin::MutexGuard<'static, ()> {
 
 /// Runs `f` with an init escape boundary installed over the current one,
 /// without a context switch.  Mirrors the guard push/pop in
-/// [`call_on_isolated_stack`], so host tests can exercise the boundary nesting
+/// [`call_on_isolated_stack_with`], so host tests can exercise the boundary nesting
 /// that principal resolution depends on.
 #[cfg(test)]
 pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnOnce() -> R) -> R {
@@ -465,7 +555,7 @@ pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnO
         kind: EscapeKind::Init { owner },
         from_context: &mut from_context,
         to_context: &mut to_context,
-        entry: None,
+        call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
     };
@@ -480,7 +570,7 @@ pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnO
 }
 
 /// Runs `f` with an exit escape boundary installed over the current one, without
-/// a context switch.  Mirrors the guard installed by [`call_component_exit`], so
+/// a context switch.  Mirrors the guard installed by [`call_component_destroy`], so
 /// host tests can assert the ambient identity of the stopped instance (the fake
 /// context backend does not actually execute component entries).
 #[cfg(test)]
@@ -491,7 +581,7 @@ pub(crate) fn with_test_exit_boundary<R>(owner: ComponentId, f: impl FnOnce() ->
         kind: EscapeKind::Exit { owner },
         from_context: &mut from_context,
         to_context: &mut to_context,
-        entry: None,
+        call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
     };
@@ -521,6 +611,23 @@ pub(crate) fn test_mark_active_panicked() {
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    #[test]
+    fn empty_create_args_have_no_config_payload() {
+        // 默认配置 = 无负载：config_abi = 0，config = NULL，config_len = 0。
+        let args = KcompCreateArgs::empty();
+        assert_eq!(args.config_abi, 0);
+        assert!(args.config.is_null());
+        assert_eq!(args.config_len, 0);
+    }
+
+    #[test]
+    fn kcomp_abi_is_the_manual_anchor() {
+        // 手工锚定值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；与 SDK
+        // `abi.rs::KCOMP_ABI` / `kcomp.h` 三处必须同值（drift test 交叉校验）。
+        assert_eq!(KCOMP_ABI, 0x4B43_4F4D_5041_4249);
+        assert_eq!(&KCOMP_ABI.to_be_bytes(), b"KCOMPABI");
+    }
 
     #[test]
     fn guard_state_restores_previous_target_after_nested_panic() {
@@ -589,7 +696,7 @@ mod tests {
         enter_anchor();
         assert!(active_escape().is_none());
 
-        // When: an exit boundary for component 5 is active (as during kcomp_exit).
+        // When: an exit boundary for component 5 is active (as during kcomp_instance_destroy).
         let owner = ComponentId::from_raw(5);
         with_test_exit_boundary(owner, || {
             // Then: Core calls are attributed to the stopped instance...

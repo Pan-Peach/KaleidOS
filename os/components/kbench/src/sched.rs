@@ -34,12 +34,12 @@
 //!   发生了交替"，不证明切换开销本身。
 //! - batch 是在 QEMU TCG 上跑的；只作同环境相对趋势，不做真机预测。
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use kcomp_sdk::abi;
 use kcomp_sdk::binding::{self, InterfaceKind};
 
-use crate::{Context, report, trace as traceview};
+use crate::{Context, State, report, trace as traceview};
 
 /// 报告块名。
 const NAME: &str = "sched.yield_roundtrip";
@@ -49,43 +49,37 @@ const VERIFY_NAME: &str = "sched.yield_roundtrip.verify";
 /// 正常交替时 B_ACTIVATIONS == HANDOFFS_TOTAL（差值 0/1）。
 const STUCK_SLACK: usize = 8;
 
-static A_TASK: AtomicU32 = AtomicU32::new(0);
-static B_TASK: AtomicU32 = AtomicU32::new(0);
-/// B 每次被调度激活 +1（"实际发生了 handoff"的一侧）。
-static B_ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
-/// A 观察到的成功 A→B→A 往返总数（含 warmup / pilot / 重试）。
-static HANDOFFS_TOTAL: AtomicUsize = AtomicUsize::new(0);
-/// A 在**正式采样窗口**观察到的往返数（每次 collect 采样前清零）。
-static HANDOFFS_SAMPLED: AtomicUsize = AtomicUsize::new(0);
-/// 不是"B 恰好激活一次"的 body 次数（任何阶段；> 0 = 本次运行不可信）。
-static MISMATCHES: AtomicUsize = AtomicUsize::new(0);
-/// A 的测量流程已结束（B 看到后退出）。
-static A_DONE: AtomicBool = AtomicBool::new(false);
-/// B 兜底退出标记（坏调度策略下不挂死）。
-static STUCK: AtomicBool = AtomicBool::new(false);
-/// 供 `task_a` 读取的测量 Context（校准完成后写入；单 CPU 协作式）。
-static mut SCHED_CONTEXT: Option<Context> = None;
+// sched 的 per-run 状态已迁入 `crate::State`（任务 id / handoff 计数 / 测量
+// context），不再有 image-global static（docs/component-lifecycle.md §10）。
+// 单 CPU 也不构成放开 `&mut` 别名的理由：任务 A/B 与锚点共享同一地址空间，
+// 跨任务访问仍走原子字段 / state 指针。
 
 /// 一次 A→B→A 往返：yield 前读 B 的激活计数，恢复后必须恰好 +1。
 ///
 /// 返回 `1`（被 `black_box` 消耗）。handshake 计数本身在计时区间内——它是
 /// harness 工作的一部分，报告里如实声明（见模块头）。
-fn roundtrip() -> u64 {
-    let before = B_ACTIVATIONS.load(Ordering::SeqCst);
+fn roundtrip(state: *mut State) -> u64 {
+    let before = unsafe { (*state).b_activations.load(Ordering::SeqCst) };
     let rc = unsafe { abi::kcore_task_yield() };
-    let after = B_ACTIVATIONS.load(Ordering::SeqCst);
+    let after = unsafe { (*state).b_activations.load(Ordering::SeqCst) };
     if rc == 0 && after == before + 1 {
-        HANDOFFS_TOTAL.fetch_add(1, Ordering::SeqCst);
-        HANDOFFS_SAMPLED.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            (*state).handoffs_total.fetch_add(1, Ordering::SeqCst);
+            (*state).handoffs_sampled.fetch_add(1, Ordering::SeqCst);
+        }
     } else {
-        MISMATCHES.fetch_add(1, Ordering::SeqCst);
+        unsafe { (*state).mismatches.fetch_add(1, Ordering::SeqCst) };
     }
     1
 }
 
 /// 任务 A：跑整个测量（warmup → 校准 → 采样 → 打印），然后退出。
-extern "C" fn task_a() -> ! {
-    let Some(context) = (unsafe { core::ptr::read(core::ptr::addr_of!(SCHED_CONTEXT)) }) else {
+///
+/// `arg` 是本实例的 `*mut State`（`kcore_task_create` 原样回传）。任务归属仍来自
+/// Core 执行边界，**不是**来自 `arg`。
+extern "C" fn task_a(arg: *mut ()) {
+    let state = arg as *mut State;
+    let Some(context) = (unsafe { (*state).sched_context }) else {
         // 不可达：只有 Context 写入后才 start 任务；防御性退出而不是空转。
         let _ = unsafe { abi::kcore_task_exit() };
         loop {
@@ -96,37 +90,36 @@ extern "C" fn task_a() -> ! {
     // 独立正确性验证（计时之外）：按 Core 的 TaskSwitch 事件流数真实交替。
     let trace_mask = traceview::state().map_or(0, |state| state.enabled_mask);
     let trace_verdict = traceview::validate_task_alternation(
-        A_TASK.load(Ordering::SeqCst),
-        B_TASK.load(Ordering::SeqCst),
+        unsafe { (*state).a_task.load(Ordering::SeqCst) },
+        unsafe { (*state).b_task.load(Ordering::SeqCst) },
         traceview::VALIDATION_TRIPS,
         &mut || {
-            let _ = roundtrip();
+            let _ = roundtrip(state);
         },
     );
 
     crate::run_primitive_observed(
+        state,
         NAME,
         &context,
-        roundtrip,
+        || roundtrip(state),
         &mut || {
-            HANDOFFS_SAMPLED.store(0, Ordering::SeqCst);
+            unsafe { (*state).handoffs_sampled.store(0, Ordering::SeqCst) };
         },
         &mut || {
-            let mismatches = MISMATCHES.load(Ordering::SeqCst);
-            report::key_u64(
-                "handoff_count",
-                HANDOFFS_SAMPLED.load(Ordering::SeqCst) as u64,
-            );
-            report::key_u64(
-                "handoff_total",
-                HANDOFFS_TOTAL.load(Ordering::SeqCst) as u64,
-            );
+            let mismatches = unsafe { (*state).mismatches.load(Ordering::SeqCst) };
+            report::key_u64("handoff_count", unsafe {
+                (*state).handoffs_sampled.load(Ordering::SeqCst)
+            } as u64);
+            report::key_u64("handoff_total", unsafe {
+                (*state).handoffs_total.load(Ordering::SeqCst)
+            } as u64);
             report::key_u64("handoff_mismatches", mismatches as u64);
             report::key_str("trace_validation", trace_verdict);
             // 数字自带的 trace 状态：非 0 = 本块的计时包含 emit 成本
             // （与 BENCH-ENV 同一事实，放在块内防止断章取义）。
             report::key_u64("trace_mask", trace_mask);
-            let stuck = STUCK.load(Ordering::SeqCst);
+            let stuck = unsafe { (*state).stuck.load(Ordering::SeqCst) };
             if mismatches == 0 && trace_verdict != "mismatch" && !stuck {
                 "ok"
             } else {
@@ -135,7 +128,7 @@ extern "C" fn task_a() -> ! {
         },
     );
 
-    A_DONE.store(true, Ordering::SeqCst);
+    unsafe { (*state).a_done.store(true, Ordering::SeqCst) };
     let _ = unsafe { abi::kcore_task_exit() };
     loop {
         core::hint::spin_loop();
@@ -146,21 +139,22 @@ extern "C" fn task_a() -> ! {
 ///
 /// 兜底：若连续激活数远超 A 已确认的 handoff（坏策略导致 A 不被恢复），
 /// B 主动退出把 CPU 让回 A —— 测量会以 `handshake_mismatch` 结束，而不是挂死。
-extern "C" fn task_b() -> ! {
+///
+/// `arg` 是本实例的 `*mut State`（与任务 A 同一指针）。
+extern "C" fn task_b(arg: *mut ()) {
+    let state = arg as *mut State;
     loop {
-        if A_DONE.load(Ordering::SeqCst) {
+        if unsafe { (*state).a_done.load(Ordering::SeqCst) } {
             break;
         }
-        let activated = B_ACTIVATIONS.load(Ordering::SeqCst);
+        let activated = unsafe { (*state).b_activations.load(Ordering::SeqCst) };
         if activated
-            > HANDOFFS_TOTAL
-                .load(Ordering::SeqCst)
-                .saturating_add(STUCK_SLACK)
+            > unsafe { (*state).handoffs_total.load(Ordering::SeqCst) }.saturating_add(STUCK_SLACK)
         {
-            STUCK.store(true, Ordering::SeqCst);
+            unsafe { (*state).stuck.store(true, Ordering::SeqCst) };
             break;
         }
-        B_ACTIVATIONS.fetch_add(1, Ordering::SeqCst);
+        unsafe { (*state).b_activations.fetch_add(1, Ordering::SeqCst) };
         let _ = unsafe { abi::kcore_task_yield() };
     }
     let _ = unsafe { abi::kcore_task_exit() };
@@ -192,31 +186,36 @@ fn ensure_scheduler() -> bool {
     scheduler_available()
 }
 
-fn reset_counters() {
-    A_DONE.store(false, Ordering::SeqCst);
-    STUCK.store(false, Ordering::SeqCst);
-    MISMATCHES.store(0, Ordering::SeqCst);
-    HANDOFFS_TOTAL.store(0, Ordering::SeqCst);
-    HANDOFFS_SAMPLED.store(0, Ordering::SeqCst);
-    B_ACTIVATIONS.store(0, Ordering::SeqCst);
+fn reset_counters(state: *mut State) {
+    unsafe {
+        (*state).a_done.store(false, Ordering::SeqCst);
+        (*state).stuck.store(false, Ordering::SeqCst);
+        (*state).mismatches.store(0, Ordering::SeqCst);
+        (*state).handoffs_total.store(0, Ordering::SeqCst);
+        (*state).handoffs_sampled.store(0, Ordering::SeqCst);
+        (*state).b_activations.store(0, Ordering::SeqCst);
+    }
 }
 
 /// 终态证据（在锚点上下文、`sched_run` 返回之后）。
-fn verify_ok(run_status: i32, a: i32, b: i32) -> bool {
-    let total = HANDOFFS_TOTAL.load(Ordering::SeqCst);
+fn verify_ok(state: *mut State, run_status: i32, a: i32, b: i32) -> bool {
+    let total = unsafe { (*state).handoffs_total.load(Ordering::SeqCst) };
     run_status == 0
         && a == STATE_EXITED
         && b == STATE_EXITED
-        && MISMATCHES.load(Ordering::SeqCst) == 0
-        && !STUCK.load(Ordering::SeqCst)
-        && B_ACTIVATIONS.load(Ordering::SeqCst) == total
+        && unsafe { (*state).mismatches.load(Ordering::SeqCst) } == 0
+        && !unsafe { (*state).stuck.load(Ordering::SeqCst) }
+        && unsafe { (*state).b_activations.load(Ordering::SeqCst) } == total
 }
 
 /// `kcore_task_state` 的编码：4 = Exited（见 export.rs）。
 const STATE_EXITED: i32 = 4;
 
-/// 执行一次 `sched.yield_roundtrip`（从 `kcomp_init` 的锚点上下文调用）。
-pub(crate) fn run(context: &Context) {
+/// 执行一次 `sched.yield_roundtrip`（从 `kcomp_instance_create` 的锚点上下文调用）。
+///
+/// `state` 是本实例的 per-run 状态；任务 A/B 经 `kcore_task_create` 的 `arg`
+/// 拿到同一指针（opaque，任务归属仍来自 Core 执行边界）。
+pub(crate) fn run(state: *mut State, context: &Context) {
     if !ensure_scheduler() {
         report::bench_header(NAME);
         report::key_str("method", "task_handoff");
@@ -224,24 +223,28 @@ pub(crate) fn run(context: &Context) {
         return;
     }
 
-    reset_counters();
-    unsafe { core::ptr::write(core::ptr::addr_of_mut!(SCHED_CONTEXT), Some(*context)) };
+    reset_counters(state);
+    unsafe { (*state).sched_context = Some(*context) };
 
-    let a = unsafe { abi::kcore_task_create(task_a as *const () as usize) };
-    let b = unsafe { abi::kcore_task_create(task_b as *const () as usize) };
-    if a < 0 || b < 0 || a == b {
+    let mut a_id = 0u32;
+    let mut b_id = 0u32;
+    let create_a = unsafe { abi::kcore_task_create(task_a, state as *mut (), &mut a_id) };
+    let create_b = unsafe { abi::kcore_task_create(task_b, state as *mut (), &mut b_id) };
+    if create_a != 0 || create_b != 0 || a_id == b_id {
         report::bench_header(NAME);
         report::key_str("method", "task_handoff");
-        report::key_i64("task_a_create", i64::from(a));
-        report::key_i64("task_b_create", i64::from(b));
+        report::key_i64("task_a_create", i64::from(create_a));
+        report::key_i64("task_b_create", i64::from(create_b));
         report::key_str("status", "task_setup_failed");
         return;
     }
-    A_TASK.store(a as u32, Ordering::SeqCst);
-    B_TASK.store(b as u32, Ordering::SeqCst);
+    unsafe {
+        (*state).a_task.store(a_id, Ordering::SeqCst);
+        (*state).b_task.store(b_id, Ordering::SeqCst);
+    }
 
-    let started_a = unsafe { abi::kcore_task_start(a as u32) };
-    let started_b = unsafe { abi::kcore_task_start(b as u32) };
+    let started_a = unsafe { abi::kcore_task_start(a_id) };
+    let started_b = unsafe { abi::kcore_task_start(b_id) };
     if started_a != 0 || started_b != 0 {
         report::bench_header(NAME);
         report::key_str("method", "task_handoff");
@@ -253,34 +256,32 @@ pub(crate) fn run(context: &Context) {
 
     // 锚点进入调度：A 跑完整个测量并退出，B 随后退出，控制权回到这里。
     let run_status = unsafe { abi::kcore_sched_run() };
-    let (state_a, state_b) = unsafe {
-        (
-            abi::kcore_task_state(a as u32),
-            abi::kcore_task_state(b as u32),
-        )
-    };
+    let (state_a, state_b) = unsafe { (abi::kcore_task_state(a_id), abi::kcore_task_state(b_id)) };
 
     report::bench_header(VERIFY_NAME);
     report::key_i64("sched_run_status", i64::from(run_status));
     report::key_u64(
         "handoff_total",
-        HANDOFFS_TOTAL.load(Ordering::SeqCst) as u64,
+        unsafe { (*state).handoffs_total.load(Ordering::SeqCst) } as u64,
     );
-    report::key_u64("b_activations", B_ACTIVATIONS.load(Ordering::SeqCst) as u64);
+    report::key_u64(
+        "b_activations",
+        unsafe { (*state).b_activations.load(Ordering::SeqCst) } as u64,
+    );
     report::key_u64(
         "handoff_mismatches",
-        MISMATCHES.load(Ordering::SeqCst) as u64,
+        unsafe { (*state).mismatches.load(Ordering::SeqCst) } as u64,
     );
     report::key_i64("task_a_state", i64::from(state_a));
     report::key_i64("task_b_state", i64::from(state_b));
     report::key_str(
         "stuck",
-        if STUCK.load(Ordering::SeqCst) {
+        if unsafe { (*state).stuck.load(Ordering::SeqCst) } {
             "yes"
         } else {
             "no"
         },
     );
-    let ok = verify_ok(run_status, state_a, state_b);
+    let ok = verify_ok(state, run_status, state_a, state_b);
     report::key_str("status", if ok { "ok" } else { "mismatch" });
 }

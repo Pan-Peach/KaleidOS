@@ -6,7 +6,7 @@
 //! - 每项检查一行：`[core-test]   <name>: PASS|FAIL`（缩进属于组）；
 //! - 汇总：`[core-test]   <passed>/<total> checks PASS`（全过绿，否则红）。
 //!
-//! [`Checks`] 在 [`Reporter`] 之上叠加 `kcomp_init` 的失败位图：位号是组件内部
+//! [`Checks`] 在 [`Reporter`] 之上叠加实例 create 入口的失败位图：位号是组件内部
 //! 约定（runner 只看返回值是否为 0），追加新检查用新位、不复用旧位。
 
 use kcomp_sdk::abi::kcore_console_write_byte;
@@ -135,7 +135,7 @@ impl Reporter {
     }
 }
 
-/// 检查器：Reporter + `kcomp_init` 失败位图。
+/// 检查器：Reporter + 实例 create 入口的失败位图。
 pub struct Checks {
     report: Reporter,
     failed: u32,

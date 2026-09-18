@@ -15,7 +15,7 @@
 //! impl BlockDeviceProvider for MyDevice { ... }   // provider：纯 Rust，无 unsafe
 //! static DEVICE: BlockDeviceService<MyDevice> =
 //!     BlockDeviceService::new(MyDevice { ... });
-//! DEVICE.publish()?;                              // 安全 fn；Core 在 kcomp_init 返回后 commit
+//! DEVICE.publish()?;                              // 安全 fn；Core 在 instance_create 返回后 commit
 //! ```
 //!
 //! [`BlockDeviceService::new`] 用单态化 adapter 从 `P` 生成 table；adapter 统一执行
@@ -152,8 +152,8 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
         }
     }
 
-    /// 发布 `block.device`（staged：只在 `kcomp_init` 期间有效，Core 在
-    /// `kcomp_init` 返回 0 后原子提交）。
+    /// 发布 `block.device`（staged：只在 `kcomp_instance_create` 期间有效，
+    /// Core 在 `kcomp_instance_create` 返回 0 后原子提交）。
     ///
     /// # 为什么这是安全 fn
     ///

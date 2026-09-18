@@ -57,5 +57,6 @@ if [ ! -f "$lib" ]; then
     exit 1
 fi
 
-# 交给语言无关 packer：partial link（-u kcomp_init/kcomp_exit）→ strip → 校验。
+# 交给语言无关 packer：partial link（-u kcomp_instance_create/destroy + kcomp_abi）
+# → strip → 契约校验。
 exec "$script_dir/kcomp-link.sh" "$output" "$lib"

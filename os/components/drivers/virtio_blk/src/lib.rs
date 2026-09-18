@@ -13,15 +13,15 @@
 //!
 //! prober 只交**分配数据**（`DeviceId`/`attempt`，不是 authority）；authority 仍由
 //! 本驱动在**自己的 init 上下文**里向 Core claim，协议身份也由本驱动读设备头确认。
-//! 若直接 `load virtio_blk` 而没有 prober，bind 失败并打印清晰错误（见 `kcomp_init`）。
+//! 若直接 `load virtio_blk` 而没有 prober，bind 失败并打印清晰错误（见 `kcomp_instance_create`）。
 //! 没有支持的设备**不是失败**：init 返回 0、不 attach（干净的 no-device）。
 //!
 //! # 持久化：init 保留设备并 publish，exit 线性拆除
 //!
 //! fine match 通过后本驱动**不释放** claim：设备本体存进 `BLK`，init 末尾
-//! `BLOCK_SERVICE.publish()`（staged：Core 在 `kcomp_init` 返回 0 后提交），
+//! `BLOCK_SERVICE.publish()`（staged：Core 在 `kcomp_instance_create` 返回 0 后提交），
 //! 上层 Service 经 `block.device` bind 消费。停止（monitor `unload`）由
-//! `kcomp_exit` 线性拆除：reset 设备 → drop 设备（释放队列 DMA）→ DMA 兜底 →
+//! `kcomp_instance_destroy` 线性拆除：reset 设备 → drop 设备（释放队列 DMA）→ DMA 兜底 →
 //! release MMIO（**最后**：Core 在还有 live DMA/IRQ 子 authority 时返回 `-EBUSY`）。
 //!
 //! # 状态与锁序（不变量）
@@ -84,7 +84,7 @@ static DMA_MAP: Mutex<[(u64, u64); SLOTS]> = Mutex::new([(0, 0); SLOTS]);
 
 /// 设备本体；`None` = 未 attach。provider 方法只取这一把锁。
 ///
-/// `MmioTransport<'static>` 的论证见 `kcomp_init` 里构造处的注释。
+/// `MmioTransport<'static>` 的论证见 `kcomp_instance_create` 里构造处的注释。
 static BLK: Mutex<Option<VirtIOBlk<CoreHal, MmioTransport<'static>>>> = Mutex::new(None);
 
 fn dma_insert(paddr: u64, handle: u64) {
@@ -141,7 +141,7 @@ impl BlockDeviceProvider for VirtioBlkProvider {
 }
 
 /// publish 只在 init 末尾、且真的 attach 了设备时调用（staged：Core 在
-/// `kcomp_init` 返回 0 后提交）。
+/// `kcomp_instance_create` 返回 0 后提交）。
 static BLOCK_SERVICE: BlockDeviceService<VirtioBlkProvider> =
     BlockDeviceService::new(VirtioBlkProvider);
 
@@ -212,7 +212,7 @@ unsafe impl Hal for CoreHal {
 // 入口 / 退出
 // ---------------------------------------------------------------------------
 
-kcomp_sdk::kcomp_init!({
+kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
     // 设备选择由**协议无关**的 driver_prober 负责：它只做 compatible 级 coarse
     // candidate match，并把候选 DeviceId 放进 prober-owned cursor。本驱动 bind
     // `driver.prober`，逐台 claim + 做**自己的**协议级 fine match。
@@ -341,7 +341,7 @@ kcomp_sdk::kcomp_init!({
         // 保留设备：不 drop、不 release MMIO；状态进 static，随实例存活。
         *BLK.lock() = Some(blk);
 
-        // staged publish：Core 在 `kcomp_init` 返回 0 后提交；失败 = init 失败。
+        // staged publish：Core 在 `kcomp_instance_create` 返回 0 后提交；失败 = init 失败。
         if let Err(rc) = BLOCK_SERVICE.publish() {
             kcomp_sdk::klog!("virtio_blk: publish block.device failed (rc={})", rc);
             return rc;
@@ -357,7 +357,7 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-kcomp_sdk::kcomp_exit!({
+kcomp_sdk::kcomp_instance_destroy!(|_state| {
     let mmio = MMIO_HANDLE.load(Ordering::SeqCst) as u64;
 
     // 线性拆除（顺序即不变量，见模块文档）：

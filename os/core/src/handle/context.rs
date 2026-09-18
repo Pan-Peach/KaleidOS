@@ -5,16 +5,16 @@
 //! A Core ABI request is attributed to the **innermost currently-active
 //! Core-managed execution boundary** ([`containment::active_escape`]):
 //!
-//! - inside a component `kcomp_init` (including a **nested** load) the principal
-//!   is the component being initialized;
+//! - inside a component `kcomp_instance_create` (including a **nested** create)
+//!   the principal is the component instance being created;
 //! - inside a component task the principal is that task's owner;
-//! - after a nested init returns **or panics**, the containment guard stack
+//! - after a nested create returns **or panics**, the containment guard stack
 //!   restores the previous boundary (each guard stores the pointer it replaced),
-//!   so the enclosing task/init principal is effective again.
+//!   so the enclosing task/create principal is effective again.
 //!
 //! Only when no boundary is active (Core anchor / host tests) does resolution
 //! fall back to the running task's owner and then the loader-recorded
-//! `call_init` identity. This is the single source of identity for every
+//! `call_create` identity. This is the single source of identity for every
 //! authority / task / interface entry point: no entry point may prefer one
 //! source over the other.
 
@@ -33,9 +33,9 @@ impl RequestContext {
     pub(crate) fn ambient() -> Option<Self> {
         // Innermost active boundary wins. `call_on_isolated_stack` /
         // `call_component_exit` install the init / exit guard over the task
-        // guard and restore it on return/panic, so a nested `kcomp_init` is
+        // guard and restore it on return/panic, so a nested create is
         // attributed to the nested component rather than to the task that
-        // requested the load, and a stopping component's hook is attributed to
+        // requested the create, and a stopping component's hook is attributed to
         // the instance being stopped.
         if let Some(escape) = containment::active_escape()
             && let Some(component) = escape.owner()
@@ -46,7 +46,7 @@ impl RequestContext {
             });
         }
         // No boundary: fall back to the running task's owner, then the
-        // loader-recorded `call_init` identity.
+        // loader-recorded `create` identity.
         let task = crate::sched::current_task().and_then(|id| {
             crate::task::get_task_table()
                 .lock()
@@ -65,11 +65,12 @@ impl RequestContext {
         })
     }
 
-    /// Like [`Self::ambient`] but restricted to an active `kcomp_init` boundary.
+    /// Like [`Self::ambient`] but restricted to an active `kcomp_instance_create`
+    /// boundary.
     ///
-    /// Interface publication is an init-time operation: a component task and a
-    /// `kcomp_exit` hook are active boundaries but are not valid publication
-    /// principals.
+    /// Interface publication is a create-time operation: a component task and a
+    /// `kcomp_instance_destroy` hook are active boundaries but are not valid
+    /// publication principals.
     pub(crate) fn ambient_init() -> Option<Self> {
         match containment::active_escape()?.kind {
             EscapeKind::Init { owner } => owner.map(|component| Self {

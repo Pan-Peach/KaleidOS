@@ -9,6 +9,7 @@ mod elf;
 pub mod exit;
 pub mod export;
 pub mod failure;
+pub mod image;
 pub mod interface;
 pub mod load;
 pub mod loader;
@@ -18,6 +19,7 @@ pub mod store;
 pub use containment::panic_escape;
 pub use exit::{ComponentStopError, stop_component};
 pub use failure::fail_component;
+pub use image::{ComponentImage, ComponentImageId};
 
 /// Core 真相门禁：`id` 是否为 `Failed`（逻辑死亡）实例。
 ///
@@ -60,15 +62,16 @@ pub enum ComponentState {
     Resolved,
     Starting,
     Ready,
-    /// 正在停止：组件退出入口 `kcomp_exit`（Linux `module_exit` 类比）执行期，
-    /// 由 `component/exit.rs::stop_component` 驱动（`Ready → Stopping`）。
+    /// 正在停止：组件销毁入口 `kcomp_instance_destroy(state)`（Linux
+    /// `module_exit` 类比）执行期，由 `component/exit.rs::stop_component` 驱动
+    /// （`Ready → Stopping`）。
     ///
     /// 此状态下 `may_run` 不再放行该实例的任务，`kcore_interface_publish` 也
-    /// 不再接受（exit 边界不是 publish principal）；已有 authority 仍可由钩子
+    /// 不再接受（destroy 边界不是 publish principal）；已有 authority 仍可由钩子
     /// 自行 `release`（teardown 不受生命周期门禁限制，见 `export.rs`）。
     Stopping,
-    /// 已停止：`kcomp_exit` 已返回、剩余 authority 与接口已由 Core 兜底回收
-    /// （`Stopping → Stopped`，由 `stop_component` 提交）。
+    /// 已停止：`kcomp_instance_destroy` 已返回 0、剩余 authority 与接口已由 Core
+    /// 兜底回收（`Stopping → Stopped`，由 `stop_component` 提交）。
     ///
     /// phase 1 保留记录：不回收段内存、不退役实例、`ComponentId` 不复用。
     Stopped,

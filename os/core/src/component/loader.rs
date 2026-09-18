@@ -1,14 +1,38 @@
-//! Component loader: place a parsed ELF object and start its component entry.
+//! Component loader: place a parsed ELF object and resolve its instance entries.
 //!
 //! ELF structure lives in [`super::elf`].  Architecture-specific relocation
 //! and linked-address handling live in the selected `arch` backend; this module owns the Core
 //! policy around memory, exports, and component entry points.
+//!
+//! # 必需符号（`docs/component-lifecycle.md` §4，协调替换）
+//!
+//! ```text
+//! kcomp_instance_create(const struct KcompCreateArgs *args, void **out_state) -> i32
+//! kcomp_instance_destroy(void *state) -> i32
+//! kcomp_abi（const uint64_t，STT_OBJECT）
+//! ```
+//!
+//! 三个符号都必须 DEFINED；缺失 = 整个加载失败（`LoaderError`），**不做 legacy
+//! fallback**（旧的 `kcomp_init` / `kcomp_exit` 原地删除，不保证陈旧 `.kcomp` 可加载）。
+//! `kcomp_abi` 的**ELF 定义、边界与值**在放段后校验：定义（STT_OBJECT 且已定义）、
+//! 边界（8 字节落在装载镜像内）、值（等于 Core 手工锚定的 [`KCOMP_ABI`] 指纹）。
+//!
+//! `LoadedComponent` 是一次加载的**未登记**结果；登记进镜像表（`component/image.rs`）
+//! 后由 `ComponentImage` 持有常驻 lease 与入口地址。
 
+use super::containment::KCOMP_ABI;
 use super::elf::{ElfClass, ElfError, ElfObject, Relocation as ElfRelocation, Section};
 use crate::memory;
 use alloc::vec::Vec;
 use arch::ComponentRelocationImpl;
 use arch::component::{Relocation, RelocationBackend, RelocationError, WordSize};
+
+/// ELF symbol kind：`STT_OBJECT`。
+const STT_OBJECT: u8 = 1;
+/// ELF symbol kind：`STT_FUNC`。
+const STT_FUNC: u8 = 2;
+/// `kcomp_abi` 是 `const uint64_t`。
+const ABI_SIZE: usize = 8;
 
 /// 加载失败原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +42,14 @@ pub enum LoaderError {
     NotRelocatable,
     MachineMismatch,
     NoTextSection,
-    NoEntrySymbol,
+    /// `kcomp_instance_create` 缺失或未定义。
+    MissingCreate,
+    /// `kcomp_instance_destroy` 缺失或未定义。
+    MissingDestroy,
+    /// `kcomp_abi` 缺失、未定义、或不是 8 字节对象。
+    MissingAbi,
+    /// `kcomp_abi` 的值与 Core 手工锚定的契约指纹不一致（协调替换）。
+    AbiMismatch,
     UnsupportedRelocation,
     UnresolvedSymbol,
     OutOfMemory,
@@ -35,19 +66,19 @@ impl From<ElfError> for LoaderError {
     }
 }
 
-/// 加载完成的组件：代码已在内存中，入口已定位（未调用）。
+/// 加载完成的组件镜像：代码已在内存中，实例入口与契约指纹已定位（未调用）。
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadedComponent {
+    /// 段放置基址（`[base, base + text_size)` 是装载镜像区间）。
     pub base: usize,
-    /// 加载入口（`kcomp_init`，Linux `module_init` 类比）地址。
-    pub entry: usize,
-    /// 可选退出入口（`kcomp_exit`，Linux `module_exit` 类比）地址。
-    ///
-    /// 组件**可以**导出该 C ABI 符号（`extern "C" fn() -> i32`）；Core 解析它，
-    /// 由停止路径（`component/exit.rs::stop_component`）在 Core-owned 隔离栈上
-    /// 调用。`None` = 组件没有退出钩子（正常情况，停止时跳过）。
-    pub exit: Option<usize>,
+    /// `kcomp_instance_create` 的已重定位地址。
+    pub create: usize,
+    /// `kcomp_instance_destroy` 的已重定位地址。
+    pub destroy: usize,
+    /// 装载镜像大小（放段结果）。
     pub text_size: usize,
+    /// 已校验的 `kcomp_abi` 值（必等于 [`KCOMP_ABI`]）。
+    pub abi: u64,
     pub(crate) memory: Option<memory::MemoryLease>,
 }
 
@@ -57,11 +88,10 @@ impl LoadedComponent {
     }
 }
 
-/// 解析 ET_REL、放置 ALLOC 段、应用当前 ABI 重定位并定位入口。
+/// 解析 ET_REL、放置 ALLOC 段、应用当前 ABI 重定位，并定位实例入口与契约指纹。
 ///
-/// 加载入口 `kcomp_init` 必须存在；退出入口 `kcomp_exit`（Linux `module_exit`
-/// 类比）**可选**——存在则解析其地址存入 [`LoadedComponent::exit`]，不存在则为
-/// `None`。Core 记录该地址，由停止路径在 Core-owned 隔离栈上调用。
+/// 三个必需符号（create / destroy / `kcomp_abi`）任一缺失即失败；`kcomp_abi`
+/// 的值在放段后读出并与 [`KCOMP_ABI`] 精确比对（手工锚定的 A/B 契约）。
 pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let object = ElfObject::parse(blob)?;
     if object.machine() != ComponentRelocationImpl::ELF_MACHINE {
@@ -75,10 +105,12 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     }
 
     let symbol_table = object.symbol_table_index()?;
-    let entry_offset = function_symbol_offset(&object, symbol_table, b"kcomp_init")?
-        .ok_or(LoaderError::NoEntrySymbol)?;
-    // 可选退出入口：镜像里没有该符号是正常情况（不是每个组件都需要 exit）。
-    let exit_offset = function_symbol_offset(&object, symbol_table, b"kcomp_exit")?;
+    let create_offset = symbol_offset(&object, symbol_table, b"kcomp_instance_create", STT_FUNC)?
+        .ok_or(LoaderError::MissingCreate)?;
+    let destroy_offset = symbol_offset(&object, symbol_table, b"kcomp_instance_destroy", STT_FUNC)?
+        .ok_or(LoaderError::MissingDestroy)?;
+    let abi_offset = symbol_offset(&object, symbol_table, b"kcomp_abi", STT_OBJECT)?
+        .ok_or(LoaderError::MissingAbi)?;
 
     let image_memory = memory::alloc_region(image_size).map_err(|_| LoaderError::OutOfMemory)?;
     let base = image_memory.region().base;
@@ -102,30 +134,31 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
 
     apply_relocations(&object, base, image, &seg_place, &relocations)?;
 
-    let entry = resolve_function_address(&seg_place, base, entry_offset)?;
-    let exit = match exit_offset {
-        Some(offset) => Some(resolve_function_address(&seg_place, base, offset)?),
-        None => None,
-    };
+    let create = resolve_symbol_address(&seg_place, base, create_offset)?;
+    let destroy = resolve_symbol_address(&seg_place, base, destroy_offset)?;
+    let abi = read_abi(image, base, &seg_place, abi_offset)?;
+
     Ok(LoadedComponent {
         base,
-        entry,
-        exit,
+        create,
+        destroy,
         text_size: image_size,
+        abi,
         memory: Some(image_memory),
     })
 }
 
-/// 在符号表里查找名为 `name` 的 `STT_FUNC`（ELF kind == 2）符号，返回
-/// `(shndx, st_value)`；不存在返回 `None`。`kcomp_init` 必需，`kcomp_exit` 可选。
-fn function_symbol_offset(
+/// 在符号表里查找名为 `name`、kind 为 `kind` 的已定义（`shndx != 0`）符号，
+/// 返回 `(shndx, st_value)`；不存在 / 未定义返回 `None`。
+fn symbol_offset(
     object: &ElfObject<'_>,
     symbol_table: usize,
     name: &[u8],
+    kind: u8,
 ) -> Result<Option<(usize, usize)>, LoaderError> {
     for index in 0..object.symbol_count(symbol_table)? {
         let symbol = object.symbol(symbol_table, index)?;
-        if symbol.kind != 2 {
+        if symbol.kind != kind || symbol.shndx == 0 {
             continue;
         }
         if object.symbol_name(symbol_table, symbol)? == name {
@@ -138,7 +171,7 @@ fn function_symbol_offset(
 }
 
 /// `(shndx, st_value)` → 加载后的绝对地址（段放置偏移 + base）。
-fn resolve_function_address(
+fn resolve_symbol_address(
     seg_place: &[(usize, usize)],
     base: usize,
     (section, value): (usize, usize),
@@ -147,10 +180,36 @@ fn resolve_function_address(
         .iter()
         .find(|(index, _)| *index == section)
         .map(|(_, offset)| *offset)
-        .ok_or(LoaderError::NoEntrySymbol)?;
+        .ok_or(LoaderError::UnsupportedFormat)?;
     base.checked_add(image_offset)
         .and_then(|address| address.checked_add(value))
         .ok_or(LoaderError::UnsupportedFormat)
+}
+
+/// 校验 `kcomp_abi` 的边界与值：8 字节必须落在装载镜像内，且等于 [`KCOMP_ABI`]。
+fn read_abi(
+    image: &[u8],
+    base: usize,
+    seg_place: &[(usize, usize)],
+    abi_offset: (usize, usize),
+) -> Result<u64, LoaderError> {
+    let address = resolve_symbol_address(seg_place, base, abi_offset)?;
+    let offset = address
+        .checked_sub(base)
+        .ok_or(LoaderError::UnsupportedFormat)?;
+    let end = offset
+        .checked_add(ABI_SIZE)
+        .ok_or(LoaderError::UnsupportedFormat)?;
+    let bytes: [u8; ABI_SIZE] = image
+        .get(offset..end)
+        .ok_or(LoaderError::MissingAbi)?
+        .try_into()
+        .map_err(|_| LoaderError::MissingAbi)?;
+    let abi = u64::from_le_bytes(bytes);
+    if abi != KCOMP_ABI {
+        return Err(LoaderError::AbiMismatch);
+    }
+    Ok(abi)
 }
 
 /// 顶部对齐：只支持 `sh_addralign` ∈ {0,1,2,4,8}（已加载段实测上限 8）；
@@ -272,8 +331,16 @@ mod tests {
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let comp = load_component(CORETEST_KCOMP).expect("load core_test.kcomp");
-        assert!(comp.entry >= comp.base, "kcomp_init 必须位于放置段映射内");
+        assert!(comp.create >= comp.base, "create 入口必须位于放置段映射内");
+        assert!(
+            comp.destroy >= comp.base,
+            "destroy 入口必须位于放置段映射内"
+        );
         assert!(comp.text_size >= 4);
+        assert_eq!(
+            comp.abi, KCOMP_ABI,
+            "装载镜像的 kcomp_abi 必须与 Core 指纹一致"
+        );
     }
 
     #[test]
@@ -293,36 +360,66 @@ mod tests {
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let comp = load_component(SMOKE_KCOMP).expect("load smoke.kcomp");
-        assert!(comp.entry >= comp.base);
+        assert!(comp.create >= comp.base);
+        assert!(comp.destroy >= comp.base);
         assert!(comp.text_size > 0);
     }
 
     #[test]
-    fn records_optional_exit_entry_when_symbol_present() {
-        // Given：kcomp_smoke 定义 kcomp_exit（module_exit 类比）。
+    fn create_and_destroy_are_distinct_entries() {
+        // Given：kcomp_smoke 同时导出 create / destroy。
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
 
         // When：加载组件。
         let comp = load_component(SMOKE_KCOMP).expect("load smoke.kcomp");
 
-        // Then：exit seam 记录到非 None 的入口地址，且与 kcomp_init 不同。
-        let exit = comp.exit.expect("kcomp_smoke exports kcomp_exit");
-        assert!(exit >= comp.base, "kcomp_exit 必须位于放置段映射内");
-        assert_ne!(exit, comp.entry, "exit 与 init 是两个不同入口");
+        // Then：两个入口都落在镜像内，且不是同一个函数。
+        assert!(
+            comp.create >= comp.base,
+            "kcomp_instance_create 必须在镜像内"
+        );
+        assert!(
+            comp.destroy >= comp.base,
+            "kcomp_instance_destroy 必须在镜像内"
+        );
+        assert_ne!(comp.create, comp.destroy, "create 与 destroy 是两个入口");
     }
 
     #[test]
-    fn exit_entry_is_none_when_symbol_absent() {
-        // Given：kcomp_min 只导出 kcomp_init，刻意没有 kcomp_exit。
-        let _g = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
+    fn rejects_component_without_create_symbol() {
+        // Given：把 create 符号名从镜像的字符串表里破坏掉（同名串可能出现多次，
+        // 全部改掉，否则 loader 仍能解析到完整名字）。
+        let mut patched = SMOKE_KCOMP.to_vec();
+        let name = b"kcomp_instance_create";
+        let mut pos = 0usize;
+        while let Some(found) = patched[pos..].windows(name.len()).position(|w| w == name) {
+            let at = pos + found;
+            patched[at] = b'x';
+            pos = at + 1;
+        }
 
-        // When：加载组件。
-        let comp = load_component(SMOKE_MIN_KCOMP).expect("load smoke_min.kcomp");
+        // When / Then：必需符号缺失 → 整个加载失败。
+        assert_eq!(load_component(&patched), Err(LoaderError::MissingCreate));
+    }
 
-        // Then：可选 exit seam 保持 None（组件不导出 exit 是正常情况）。
-        assert_eq!(comp.exit, None);
+    #[test]
+    fn rejects_abi_mismatch() {
+        // Given：定位 `kcomp_abi` 在 **ELF 文件**里的字节（section 文件偏移 + st_value）。
+        let object = ElfObject::parse(SMOKE_KCOMP).expect("parse");
+        let symtab = object.symbol_table_index().unwrap();
+        let (shndx, value) = symbol_offset(&object, symtab, b"kcomp_abi", STT_OBJECT)
+            .unwrap()
+            .expect("abi symbol");
+        let section = object.section(shndx).expect("abi section");
+        let file_offset = section.offset + value;
+
+        // When：把 ELF 文件里的 abi 值改成别的（放段会把它拷进镜像）。
+        let mut patched = SMOKE_KCOMP.to_vec();
+        patched[file_offset..file_offset + ABI_SIZE].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+
+        // Then：值不一致 → AbiMismatch（而不是 UB / 静默装载）。
+        assert_eq!(load_component(&patched), Err(LoaderError::AbiMismatch));
     }
 
     #[test]
@@ -450,8 +547,8 @@ mod tests {
     /// - `load_component` 每次都会 `alloc_region`（放置段镜像），必须把 lease
     ///   还回去，否则会耗尽测试堆 —— 因此它的数字里**含一次 region 释放**。
     ///
-    /// 还缺 `kcomp_init` 执行与 `registry.declare/resolve`（要全局 registry），
-    /// 与 target 侧一起做（见 docs/benchmark.md §6）。
+    /// 还缺 `kcomp_instance_create` 执行与 `registry.declare/resolve`（要全局
+    /// registry），与 target 侧一起做（见 docs/benchmark.md §6）。
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
     fn bench_component_load_phases() {
@@ -473,14 +570,14 @@ mod tests {
         })
         .report();
 
-        // 完整加载：parse + place + alloc + copy + relocate + 解析 entry/exit。
+        // 完整加载：parse + place + alloc + copy + relocate + 解析 create/destroy/abi。
         let mut minimal = crate::bench::Bench::new("loader.load_component.min");
         minimal.run(100, || {
             let mut comp = load_component(SMOKE_MIN_KCOMP).unwrap();
             if let Some(lease) = comp.take_memory() {
                 crate::memory::free_region(lease).unwrap();
             }
-            comp.entry
+            comp.create
         });
         minimal.finish().report();
 

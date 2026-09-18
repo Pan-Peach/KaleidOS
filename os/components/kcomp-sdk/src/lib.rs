@@ -4,7 +4,8 @@
 //! Rust runtime，见 docs/component-model.md §2.2）：
 //!
 //! 1. [`abi`]：`kcore_*` 导出白名单的**单一来源**（组件不再各自复制 extern 块）；
-//! 2. 入口 / 日志 / panic adapter：`kcomp_init!`、[`log`]/`klog!`、`#[panic_handler]`；
+//! 2. 入口 / 日志 / panic adapter：`kcomp_instance_create!` /
+//!    `kcomp_instance_destroy!`、[`log`]/`klog!`、`#[panic_handler]`；
 //! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → Core 共享堆。
 //!
 //! 模块划分与 crate 外部路径一一对应（`abi` / `binding` / `DmaDirection` / `log`
@@ -53,48 +54,73 @@ pub use logging::{console_write_byte, log};
 mod tests;
 
 // ---------------------------------------------------------------------------
-// 组件入口约定
+// 组件生命周期入口约定（docs/component-lifecycle.md §4）
 // ---------------------------------------------------------------------------
 
-/// 定义加载入口 `kcomp_init`（Linux module_init 风格）。
+/// 定义组件实例创建入口 `kcomp_instance_create`，并发出契约指纹 `kcomp_abi`。
 ///
-/// 用法：`kcomp_sdk::kcomp_init!({ ...; 0 })`。块的值即返回码：`0` = 成功，
-/// 非 0 = 失败位图（Core 据此标记 Failed）。与手写
-/// `#[unsafe(no_mangle)] pub extern "C" fn kcomp_init() -> i32` 完全等价。
+/// 用法：`kcomp_instance_create!(|args, out_state| { ...; 0 })`。参数标识符由
+/// **调用点**给出（closure 风格），因此 body 可以直接命名它们——这正是
+/// macro_rules 卫生性需要的：`*out_state = state;` 在 body 里可见。
+///
+/// 生成 `extern "C" fn kcomp_instance_create(args: *const KcompCreateArgs,
+/// out_state: *mut *mut ()) -> i32`，外加 `#[unsafe(no_mangle)] pub static
+/// kcomp_abi: u64`（值 = [`abi::KCOMP_ABI`]）与 `abi::KcompInstanceCreate`
+/// 编译期锚定。宏内建 `#[allow(unused_variables)]`（`|_args, _out_state|` 不告警）
+/// 与 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`（写回 `*out_state` 是 ABI 契约，
+/// Core 保证可写）。
+///
+/// 返回 `0` / `-errno`（旧的"非零 = 失败 bitmap"约定已废弃）。Core 调用前把
+/// `*out_state` 初始化为 `NULL`；成功时组件写入自己完成的 state 指针，
+/// **无状态组件可以不写**（保持 NULL）。create 失败 / panic → 走 Core 的
+/// Failed 路径，且**不会**调用 destroy（构造期清理由组件自己负责）。
+///
+/// 一个组件只写一次本宏，析构用 [`kcomp_instance_destroy!`]。
 #[macro_export]
-macro_rules! kcomp_init {
-    ($($body:tt)*) => {
+macro_rules! kcomp_instance_create {
+    (|$args:ident, $out_state:ident| $body:block) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn kcomp_init() -> i32 {
-            $($body)*
-        }
+        #[allow(unused_variables)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn kcomp_instance_create(
+            $args: *const $crate::abi::KcompCreateArgs,
+            $out_state: *mut *mut (),
+        ) -> i32 $body
+
+        // 精确契约指纹（手工维护，非版本号）；Core 调用组件前校验。
+        #[unsafe(no_mangle)]
+        pub static kcomp_abi: u64 = $crate::abi::KCOMP_ABI;
+
+        // 编译期锚定：生成的函数必须与 `abi` 的 Rust 镜像同签名。
+        const _: $crate::abi::KcompInstanceCreate = kcomp_instance_create;
     };
 }
 
-// 可选退出入口 `kcomp_exit`（Linux module_exit 风格）。
-//
-// 组件用与 `kcomp_init!` 对称的宏声明退出钩子；没有收尾工作的组件写**显式
-// no-op**，让"没有退出逻辑"本身也是一行声明（kcomp_smoke 是带证据行的参考）。
-//
-//     kcomp_sdk::kcomp_exit!(0);
-//
-// Core loader 会可选地解析该符号（`LoadedComponent::exit` /
-// `ComponentRecord::exit`）；monitor `unload` 驱动的停止路径
-// （`os/core/src/component/exit.rs::stop_component`）在实例 `Ready` 时于
-// Core-owned 隔离栈上调用它：`Ready → Stopping → Stopped`。
-// **loader 不要求该符号**：不导出 = 该组件没有退出钩子（`exit == None`），
-// 停止时跳过钩子，这是正常情况。
-//
-// 返回码约定（**暂定**，与 `kcomp_init` 对称）：`0` = 干净退出；非 0 / panic
-// 目前镜像 init 失败语义（`Failed` + Core 兜底 revoke）。最终语义待人类定稿，
-// 见 `docs/component-model.md` §5.2。
+/// 定义组件实例析构入口 `kcomp_instance_destroy`。
+///
+/// 用法：`kcomp_instance_destroy!(|state| { ...; 0 })`。参数标识符由**调用点**
+/// 给出（同 create 的 closure 风格），body 可以直接命名它。
+///
+/// 生成 `extern "C" fn kcomp_instance_destroy(state: *mut ()) -> i32` 与
+/// `abi::KcompInstanceDestroy` 编译期锚定；宏内建 `#[allow(unused_variables)]`
+/// 与 `#[allow(clippy::not_unsafe_ptr_arg_deref)]`。
+///
+/// 返回 `0` / `-errno`；destroy 失败 / panic → Core 把实例置 Failed 并保留
+/// 内存（**绝不自动重试**）。Core 对未完整构造 / panic 的实例不调用本入口。
+///
+/// destroy 只做组件自己的 quiesce / 私有资源清理；Core 仍会兜底
+/// revoke authority / unbind。已交给外部（`'static` SDK 引用）的 state 存储
+/// 本轮保留——consumer 可能持有拷贝过的 binding。
 #[macro_export]
-macro_rules! kcomp_exit {
-    ($($body:tt)*) => {
+macro_rules! kcomp_instance_destroy {
+    (|$state:ident| $body:block) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn kcomp_exit() -> i32 {
-            $($body)*
-        }
+        #[allow(unused_variables)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn kcomp_instance_destroy($state: *mut ()) -> i32 $body
+
+        // 编译期锚定：生成的函数必须与 `abi` 的 Rust 镜像同签名。
+        const _: $crate::abi::KcompInstanceDestroy = kcomp_instance_destroy;
     };
 }
 

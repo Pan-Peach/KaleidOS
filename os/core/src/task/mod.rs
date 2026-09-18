@@ -31,40 +31,55 @@ pub fn get_task_table() -> &'static spin::Mutex<TaskTable> {
 /// Core 语义入口：创建任务（组件只能经 export ABI `kcore_task_create` 到达）。
 ///
 /// 验证（Core validates，组件只有提议权）：
-/// 1. `requester` 必须存在且处于 `Ready`（运行中）或 `Starting`（`kcomp_init`
-///    执行期间，组件可以创建自己的任务）——只有活着的组件能创建任务；
-/// 2. `entry` 必须落在该组件的**装载镜像内**（`[base, base+size)`）——
+/// 1. `requester` 必须存在且处于 `Ready`（运行中）或 `Starting`（`kcomp_instance_create`
+///    执行期间，组件可以创建自己的任务）——只有活着的实例能创建任务；
+/// 2. `entry` 必须落在该实例 **image 的装载镜像内**（`[base, base + text_size)`）——
 ///    组件不能把执行权指到任意内核地址，也不能指到别的组件的镜像。
 ///
-/// 通过后由 `TaskTable::create(requester, ...)` 记录 owner，并分配 id + 内核栈
-/// + 初始上下文（`Created` 态，经 `transition(Created→Runnable)` 后进入调度）。
+/// `arg` 是 opaque 参数：Core 只存/透传给任务入口，**任务归属仍来自 Core 的执行
+/// 边界**（`TaskRecord.owner` = requester），不来自 `arg` 内容。
+///
+/// 通过后由 `TaskTable::create(requester, entry, arg)` 记录 owner + entry + arg，
+/// 并分配 id + 内核栈 + 初始上下文（进入 Core trampoline，`Created` 态，
+/// 经 `transition(Created→Runnable)` 后进入调度）。
 ///
 /// # Seam
 /// caller 身份统一由 `handle::RequestContext::ambient()` 解析（最内层活动执行
-/// 边界优先：组件任务 → task owner；`kcomp_init` → 被初始化组件）。真正的
-/// per-execution-domain 凭证（TaskHandle 化）留给未来 ExecutionDomain 里程碑。
-pub fn create_task(requester: ComponentId, entry: usize) -> Result<TaskId, TaskError> {
-    let registry = crate::component::registry::get_registry().lock();
-    let record = registry
-        .get(requester)
-        .ok_or(TaskError::RequesterNotFound)?;
-    if !matches!(
-        record.state,
-        ComponentState::Starting | ComponentState::Ready
-    ) {
-        return Err(TaskError::RequesterNotReady);
-    }
-    let Some(lease) = &record.memory else {
-        // 无装载镜像（不应发生：Ready 组件必然已经 loader 放段）。
-        return Err(TaskError::EntryOutOfImage);
+/// 边界优先：组件任务 → task owner；`kcomp_instance_create` → 被创建的实例）。
+/// 真正的 per-execution-domain 凭证（TaskHandle 化）留给未来 ExecutionDomain 里程碑。
+pub fn create_task(
+    requester: ComponentId,
+    entry: usize,
+    arg: *mut (),
+) -> Result<TaskId, TaskError> {
+    // 锁序：registry → image（先后取得、不嵌套持有）。
+    let image = {
+        let registry = crate::component::registry::get_registry().lock();
+        let record = registry
+            .get(requester)
+            .ok_or(TaskError::RequesterNotFound)?;
+        if !matches!(
+            record.state,
+            ComponentState::Starting | ComponentState::Ready
+        ) {
+            return Err(TaskError::RequesterNotReady);
+        }
+        record.image
     };
-    let image = lease.region();
-    if entry < image.base || entry >= image.base + image.size {
+    let inside_image = {
+        let images = crate::component::image::get_images().lock();
+        let Some(image) = images.get(image) else {
+            // image 未登记（不应发生：Ready 实例必然有常驻 image）。
+            return Err(TaskError::EntryOutOfImage);
+        };
+        let region = image.memory.region();
+        entry >= region.base && entry < region.base + region.size
+    };
+    if !inside_image {
         return Err(TaskError::EntryOutOfImage);
     }
-    drop(registry);
 
-    get_task_table().lock().create(requester, entry)
+    get_task_table().lock().create(requester, entry, arg)
 }
 
 /// Core 语义入口：启动任务（Created → Runnable）。
@@ -75,37 +90,76 @@ pub fn start_task(requester: ComponentId, task: TaskId) -> Result<(), TaskError>
     get_task_table().lock().start(requester, task)
 }
 
+/// Core 拥有的任务入口 trampoline：按 `typedef void (*KcompTaskEntry)(void *)`
+/// 契约调用组件任务函数，`arg` **原样透传**（Core 不解引用）。
+///
+/// - 任务归属来自 Core 的执行边界（`TaskRecord.owner`），与 `arg` 无关；
+/// - 组件任务 panic 时由 containment 的 task 边界接管（scheduler 进入前已装
+///   escape guard），控制权切回 Core abort 上下文；
+/// - 入口返回违反"必须经 Core 退出"的契约：Core 兜底按 exit 处理，**绝不恢复
+///   该任务**（返回后自旋，等调度器切走）。
+extern "C" fn task_entry_trampoline() -> ! {
+    let Some(id) = crate::sched::current_task() else {
+        halt()
+    };
+    let (entry, arg) = {
+        let table = get_task_table().lock();
+        match table.get(id) {
+            Some(record) => (record.entry(), record.arg()),
+            // 不变式：被调度运行的任务必然在表里。
+            None => halt(),
+        }
+    };
+    // SAFETY: `entry` 由 `kcore_task_create` 提供并已通过"落在 owner 镜像内"
+    // 验证；签名契约 = SDK 侧 `KcompTaskEntry`（`extern "C" fn(*mut ())`）。
+    let task_entry: extern "C" fn(*mut ()) = unsafe { core::mem::transmute(entry) };
+    task_entry(arg);
+    // 契约要求任务必须经 `kcore_task_exit` 退出；返回视为 Core 兜底退出。
+    let _ = crate::sched::exit_current();
+    halt()
+}
+
+fn halt() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::image::{self, ComponentImageId};
     use crate::component::registry;
-    use crate::memory;
     use crate::memory::test_support;
 
-    /// 全局表（registry / task）是进程级 `Once`，`init()` 幂等。会分配装载镜像
-    /// lease / kstack 的用例必须持有 memory GUARD，串行化全局堆。组件名**每例唯一**，
-    /// 避免与其它用例（含 registry 自身测试）撞名导致 `declare` 冲突。
+    /// 全局表（registry / image / task）是进程级 `Once`，`init()` 幂等。会分配装载
+    /// 镜像 lease / kstack 的用例必须持有 memory GUARD，串行化全局堆。组件名**每例
+    /// 唯一**，避免与其它用例撞名导致 image 复用（image 身份是每名字一份）。
     fn setup() -> test_support::Guard<'static> {
         registry::init();
+        image::init();
         crate::task::init();
         let guard = test_support::GUARD.lock();
         test_support::ensure_init();
         guard
     }
 
-    /// 声明一个 `Starting` 组件并挂上装载镜像 lease，返回 `(id, base, size)`。
+    /// 登记一份测试 image 并声明一个 `Starting` 实例，返回 `(id, base, size)`。
     ///
-    /// 调用方须已持有 memory GUARD（分配 lease）。
+    /// 调用方须已持有 memory GUARD（分配常驻 lease）。
     fn starting_component(name: &[u8]) -> (ComponentId, usize, usize) {
-        let lease = memory::alloc_region(memory::ALLOC_GRANULE).expect("image lease");
-        let image = lease.region();
-        let (base, size) = (image.base, image.size);
+        let image = image::test_support::register_test_image(name, 0);
         let mut reg = registry::get_registry().lock();
-        let id = reg
-            .declare(name, base, base, Some(lease))
-            .expect("declare starting component");
+        let id = reg.declare(image).expect("declare starting component");
         reg.resolve(id).expect("resolve");
         reg.begin_start(id).expect("begin_start");
+        drop(reg);
+        let (base, size) = {
+            let images = image::get_images().lock();
+            let image = images.get(image).expect("registered image");
+            let region = image.memory.region();
+            (region.base, region.size)
+        };
         (id, base, size)
     }
 
@@ -117,7 +171,7 @@ mod tests {
         let before = get_task_table().lock().len();
 
         // When: 它请求创建任务。
-        let result = create_task(ghost, 0x1000);
+        let result = create_task(ghost, 0x1000, core::ptr::null_mut());
 
         // Then: 存在性验证拒绝，且真相上不产生任何任务。
         assert_eq!(result, Err(TaskError::RequesterNotFound));
@@ -133,19 +187,14 @@ mod tests {
         // Given: 三个存在但非 Starting/Ready 的实例。
         let _g = setup();
         let before = get_task_table().lock().len();
+        let image = image::test_support::register_test_image(b"task_perm_states", 0);
 
         // Declared：只声明。
-        let declared = {
-            let mut reg = registry::get_registry().lock();
-            reg.declare(b"task_perm_declared", 0x1000, 0x2000, None)
-                .unwrap()
-        };
+        let declared = registry::get_registry().lock().declare(image).unwrap();
         // Failed：走完 init 路径后逻辑死亡。
         let failed = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"task_perm_failed", 0x1000, 0x2000, None)
-                .unwrap();
+            let id = reg.declare(image).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.mark_failed(id).unwrap();
@@ -154,9 +203,7 @@ mod tests {
         // Stopped：完整初始化后优雅停止。
         let stopped = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"task_perm_stopped", 0x1000, 0x2000, None)
-                .unwrap();
+            let id = reg.declare(image).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -167,15 +214,15 @@ mod tests {
 
         // When/Then: 只有活着的组件能创建任务；三种非活状态一律拒绝。
         assert_eq!(
-            create_task(declared, 0x1000),
+            create_task(declared, 0x1000, core::ptr::null_mut()),
             Err(TaskError::RequesterNotReady)
         );
         assert_eq!(
-            create_task(failed, 0x1000),
+            create_task(failed, 0x1000, core::ptr::null_mut()),
             Err(TaskError::RequesterNotReady)
         );
         assert_eq!(
-            create_task(stopped, 0x1000),
+            create_task(stopped, 0x1000, core::ptr::null_mut()),
             Err(TaskError::RequesterNotReady)
         );
         assert_eq!(get_task_table().lock().len(), before);
@@ -191,14 +238,17 @@ mod tests {
         let end = base + size;
 
         // When/Then: 镜像下方一字节、末地址本身（右开区间）与更远处一律拒绝。
-        assert_eq!(create_task(id, below), Err(TaskError::EntryOutOfImage));
         assert_eq!(
-            create_task(id, end),
+            create_task(id, below, core::ptr::null_mut()),
+            Err(TaskError::EntryOutOfImage)
+        );
+        assert_eq!(
+            create_task(id, end, core::ptr::null_mut()),
             Err(TaskError::EntryOutOfImage),
             "base+size 是排他上界"
         );
         assert_eq!(
-            create_task(id, end + 1),
+            create_task(id, end + 1, core::ptr::null_mut()),
             Err(TaskError::EntryOutOfImage),
             "镜像之外"
         );
@@ -210,22 +260,23 @@ mod tests {
     }
 
     #[test]
-    fn create_task_rejects_starting_component_without_image() {
-        // Given: 一个 Starting 但未挂载镜像（memory == None）的组件。
+    fn create_task_rejects_unregistered_image() {
+        // Given: 一个 Starting 但 image 未登记的实例（不应发生的 Core 状态）。
         let _g = setup();
         let id = {
             let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(b"task_perm_no_image", 0x1000, 0x2000, None)
-                .unwrap();
+            let id = reg.declare(ComponentImageId::from_raw(0xFFFF)).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
         };
         let before = get_task_table().lock().len();
 
-        // When/Then: 没有镜像就没有合法 entry —— 拒绝而非猜测。
-        assert_eq!(create_task(id, 0x1000), Err(TaskError::EntryOutOfImage));
+        // When/Then: 没有 image 就没有合法 entry 区间 —— 拒绝而非猜测。
+        assert_eq!(
+            create_task(id, 0x1000, core::ptr::null_mut()),
+            Err(TaskError::EntryOutOfImage)
+        );
         assert_eq!(get_task_table().lock().len(), before);
     }
 
@@ -236,21 +287,78 @@ mod tests {
         let (id, base, size) = starting_component(b"task_perm_ok");
         let entry = base + 0x80;
         assert!(entry < base + size, "entry 必须落在镜像内");
+        let mut arg = 0u32;
+        let arg_ptr = core::ptr::addr_of_mut!(arg).cast::<()>();
 
-        // When: 请求创建任务。
-        let task = create_task(id, entry).expect("镜像内的 entry 应被接受");
+        // When: 请求创建任务（带 opaque arg）。
+        let task = create_task(id, entry, arg_ptr).expect("镜像内的 entry 应被接受");
 
-        // Then: Core 记录了一个 Created 任务，owner 就是 requester。
+        // Then: Core 记录了一个 Created 任务，owner 就是 requester，entry/arg 原样。
         {
             let table = get_task_table().lock();
             assert!(table.contains(task), "任务已登记");
             let record = table.get(task).expect("记录存在");
             assert_eq!(record.owner(), id, "owner 即 requester");
             assert_eq!(record.state(), TaskState::Created, "新任务以 Created 起步");
+            assert_eq!(record.entry(), entry, "entry 原样保存");
+            assert_eq!(record.arg(), arg_ptr, "arg 原样保存（归属与 arg 无关）");
         }
 
         // 清理：移除任务会归还 kstack 区域。
         get_task_table().lock().remove(task).expect("cleanup");
+    }
+
+    /// 契约核心：两个共享同一 image 的实例各自拥有独立任务；owner 是实例 id。
+    #[test]
+    fn instances_sharing_one_image_own_tasks_independently() {
+        // Given：同名的两份 image 登记（实为同一份）与两个 Starting 实例。
+        let _g = setup();
+        let image = image::test_support::register_test_image(b"task_share_image", 0);
+        let (first, first_base, first_size) = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            drop(reg);
+            let images = image::get_images().lock();
+            let region = images.get(image).unwrap().memory.region();
+            (id, region.base, region.size)
+        };
+        let second = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+
+        // When：两个实例各创建一个任务，各自携带不同 arg。
+        let mut arg_a = 1u32;
+        let mut arg_b = 2u32;
+        let a = create_task(
+            first,
+            first_base + 0x40,
+            core::ptr::addr_of_mut!(arg_a).cast::<()>(),
+        )
+        .unwrap();
+        let b = create_task(
+            second,
+            first_base + (first_size / 2),
+            core::ptr::addr_of_mut!(arg_b).cast::<()>(),
+        )
+        .unwrap();
+
+        // Then：owner 各归其实例；两个实例各自独立持有自己的任务。
+        let table = get_task_table().lock();
+        assert_eq!(table.get(a).unwrap().owner(), first);
+        assert_eq!(table.get(b).unwrap().owner(), second);
+        assert!(table.has_live_tasks(first), "first 拥有自己的任务");
+        assert!(table.has_live_tasks(second), "second 拥有自己的任务");
+        drop(table);
+
+        // 清理。
+        get_task_table().lock().remove(a).unwrap();
+        get_task_table().lock().remove(b).unwrap();
     }
 
     #[test]
@@ -258,7 +366,7 @@ mod tests {
         // Given: 一个属于某组件的任务。
         let _g = setup();
         let (owner, base, _size) = starting_component(b"task_start_wrong_owner");
-        let task = create_task(owner, base).unwrap();
+        let task = create_task(owner, base, core::ptr::null_mut()).unwrap();
         let intruder = ComponentId::from_raw(0xDEAD_BEEF);
 
         // When: 另一个身份尝试启动它。
@@ -293,7 +401,7 @@ mod tests {
         // Given: 一个由活组件拥有的 Created 任务。
         let _g = setup();
         let (owner, base, _size) = starting_component(b"task_start_ok");
-        let task = create_task(owner, base).unwrap();
+        let task = create_task(owner, base, core::ptr::null_mut()).unwrap();
         assert_eq!(
             get_task_table().lock().get(task).unwrap().state(),
             TaskState::Created

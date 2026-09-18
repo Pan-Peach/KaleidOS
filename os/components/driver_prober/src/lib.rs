@@ -20,21 +20,24 @@
 //!
 //! `driver.prober` 只传**数据**（device id / attempt），**从不携带 authority**：
 //! prober 不 claim / release 任何资源，也不替驱动创建任务；驱动在**自己的**
-//! `kcomp_init` 上下文里向 Core claim（Core 的 principal 规则把嵌套 init 归属到
-//! 驱动本身，不是发起 load 的 prober）。
+//! `kcomp_instance_create` 上下文里向 Core claim（Core 的 principal 规则把嵌套
+//! create 归属到驱动本身，不是发起 load 的 prober）。
 //!
 //! # 生命周期
 //!
-//! publish 是 **staged**：`kcomp_init` 期间只记录 pending，Core 在 init 返回 0 后
-//! 才提交（prober → `Ready`）。消费者（驱动）只有 prober `Ready` 后才能 bind，所以
-//! 本组件在 init 里创建一个**有限** dispatch 任务：monitor 在 load 提交后
-//! `sched::run()` 运行它——枚举候选 compatible → 有匹配就 `kcore_component_load`
-//! 候选驱动**一次** → 退出（无后台循环；重复加载 / 热插拔明确 deferred）。
+//! publish 是 **staged**：`kcomp_instance_create` 期间只记录 pending，Core 在
+//! create 返回 0 后才提交（prober → `Ready`）。消费者（驱动）只有 prober `Ready`
+//! 后才能 bind，所以本组件在 create 里创建一个**有限** dispatch 任务：monitor 在
+//! load 提交后 `sched::run()` 运行它——枚举候选 compatible → 有匹配就
+//! `kcore_component_load` 候选驱动**一次** → 退出（无后台循环；重复加载 /
+//! 热插拔明确 deferred）。实例状态（候选集 + cursor）由 create 显式分配，经
+//! `out_state` / 服务 ctx / task arg 传递，不再是可变全局。
 //!
 //! # 延期（deferred，勿在本轮长出来）
 //!
 //! - TODO(prober-classes): 更多设备类 / 每类优先级；当前只有一张极小静态目录。
-//! - TODO(prober-multi): 同一驱动 ↔ 多台设备（组件名唯一，多实例未解决）。
+//! - TODO(prober-multi): 每实例 state 已就位（create 分配、经 ctx / task arg
+//!   传递），但组合策略当前仍只加载**一个** prober（多实例 endpoint 命名未启用）。
 //! - TODO(prober-hotplug): 热插拔 / reset / recovery；枚举只在 dispatch 时做一次。
 
 #![no_std]

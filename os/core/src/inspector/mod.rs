@@ -9,7 +9,8 @@
 //!
 //! 已实现（第一阶段只做 CoreTest 真正会用的数据）：
 //! - task(TaskId) -> Option<TaskSnapshot>         owner / state / CPU 投影
-//! - component(ComponentId) -> Option<ComponentSnapshot>
+//! - component(ComponentId) -> Option<ComponentSnapshot>   实例真相 + image 投影
+//! - component_image(ComponentImageId) -> Option<ImageSnapshot>   常驻 image 真相
 //! - memory_region(base) -> Option<MemoryRegionSnapshot>   来自已提交 MachineInfo
 //! - visit_trace_since(seq, visitor)             只读遍历 trace（纯转发）
 //!
@@ -19,9 +20,9 @@
 
 pub mod snapshot;
 
-pub use snapshot::{ComponentSnapshot, MemoryRegionSnapshot, TaskSnapshot};
+pub use snapshot::{ComponentSnapshot, ImageSnapshot, MemoryRegionSnapshot, TaskSnapshot};
 
-use crate::component::ComponentId;
+use crate::component::{ComponentId, ComponentImageId};
 use crate::task::{TaskId, TaskState};
 use crate::trace::TraceRecord;
 
@@ -60,17 +61,45 @@ impl Inspector {
         })
     }
 
-    /// 某个组件此刻的真相（未声明 / 已卸载 → `None`）。
+    /// 某个组件**实例**此刻的真相（未声明 → `None`）。
     ///
-    /// 前置：`component::registry::init()` 已调用（`core::init` 保证）。
+    /// 实例真相（id / state / image / opaque `instance_state`）来自 registry；
+    /// image 投影（base / create / destroy / text_size / abi）来自常驻镜像表。
+    /// 锁序：registry → image（先后取得，不嵌套释放）。
+    ///
+    /// 前置：`component::registry::init()` 与 `component::image::init()` 已调用
+    /// （`core::init` 保证）。
     pub fn component(&self, id: ComponentId) -> Option<ComponentSnapshot> {
         let registry = crate::component::registry::get_registry().lock();
         let record = registry.get(id)?;
+        let images = crate::component::image::get_images().lock();
+        let image = images.get(record.image)?;
         Some(ComponentSnapshot {
             id: record.id,
             state: record.state,
-            base: record.base,
-            entry: record.entry,
+            image: record.image,
+            instance_state: record.instance_state as usize,
+            base: image.base,
+            create: image.create,
+            destroy: image.destroy,
+            text_size: image.text_size,
+            abi: image.abi,
+        })
+    }
+
+    /// 一份常驻 image 此刻的真相（未登记 → `None`）。
+    ///
+    /// 前置：`component::image::init()` 已调用（`core::init` 保证）。
+    pub fn component_image(&self, id: ComponentImageId) -> Option<ImageSnapshot> {
+        let images = crate::component::image::get_images().lock();
+        let image = images.get(id)?;
+        Some(ImageSnapshot {
+            id: image.id,
+            base: image.base,
+            create: image.create,
+            destroy: image.destroy,
+            text_size: image.text_size,
+            abi: image.abi,
         })
     }
 
@@ -115,7 +144,7 @@ mod tests {
         let owner = ComponentId::from_raw(0x51);
         let id = crate::task::get_task_table()
             .lock()
-            .create(owner, 0x1000)
+            .create(owner, 0x1000, core::ptr::null_mut())
             .expect("create task");
         {
             let mut table = crate::task::get_task_table().lock();
@@ -140,24 +169,50 @@ mod tests {
         assert!(inspector.task(id).is_none(), "移除后真相里就没有它了");
     }
 
-    /// 组件快照跟随注册表真相，且不随后续转换而变。
+    /// 实例快照跟随 registry + image 真相（实例字段 + image 投影），且不随后续
+    /// 转换而变；image 快照独立可读。
     #[test]
-    fn component_snapshot_reflects_registry_truth() {
+    fn component_snapshot_projects_instance_and_image_truth() {
         let _serial = INSPECTOR_TEST_LOCK.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
         crate::component::registry::init();
+        crate::component::image::init();
 
+        let image =
+            crate::component::image::test_support::register_test_image(b"inspector-probe", 0x2222);
         let id = crate::component::registry::get_registry()
             .lock()
-            .declare(b"inspector-probe", 0x1234, 0x1000, None)
+            .declare(image)
             .expect("declare");
+        let mut state = 0u32;
+        crate::component::registry::get_registry()
+            .lock()
+            .record_instance_state(id, core::ptr::addr_of_mut!(state).cast::<()>())
+            .expect("record instance state");
 
         let inspector = Inspector::new();
         let snapshot = inspector.component(id).expect("component exists");
         assert_eq!(snapshot.id, id);
         assert_eq!(snapshot.state, ComponentState::Declared);
-        assert_eq!(snapshot.base, 0x1000);
-        assert_eq!(snapshot.entry, 0x1234);
+        assert_eq!(snapshot.image, image);
+        assert_eq!(
+            snapshot.instance_state,
+            core::ptr::addr_of_mut!(state) as usize,
+            "opaque state 只作为数值观察，不解引用"
+        );
 
+        // image 投影：base / create / destroy / text_size / abi 来自常驻 image。
+        let image_snapshot = inspector.component_image(image).expect("image exists");
+        assert_eq!(snapshot.base, image_snapshot.base);
+        assert_eq!(snapshot.create, image_snapshot.create);
+        assert_eq!(snapshot.destroy, image_snapshot.destroy);
+        assert_eq!(snapshot.text_size, 64);
+        assert_eq!(image_snapshot.text_size, 64);
+        assert_eq!(snapshot.abi, crate::component::containment::KCOMP_ABI);
+        assert!(image_snapshot.create >= image_snapshot.base);
+
+        // 后续转换不改旧快照；未知 image id → None（不编造）。
         crate::component::registry::get_registry()
             .lock()
             .resolve(id)
@@ -170,6 +225,11 @@ mod tests {
             snapshot.state,
             ComponentState::Declared,
             "旧快照不随后续变化"
+        );
+        assert!(
+            inspector
+                .component_image(ComponentImageId::from_raw(0xFFFF))
+                .is_none()
         );
     }
 

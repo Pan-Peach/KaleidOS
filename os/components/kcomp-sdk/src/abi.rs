@@ -1,8 +1,13 @@
-//! `kcore_*` 导出 ABI（EXPORT_SYMBOL 教学版）。
+//! `kcore_*` 导出 ABI（EXPORT_SYMBOL 教学版）+ 组件生命周期入口的 Rust 镜像。
 //!
 //! 声明即契约：名字必须与 Core `component/export.rs` 的白名单逐字节一致，签名
 //! 错误 = UB（loader 只按名字精确解析，不校验签名）。这里保持**全量**声明，
 //! 让各组件只共用这一份；新增 Core 导出时同步加在这里。
+//!
+//! C 侧作者面是 `include/kcomp.h`（`AGENTS.md`：Rust ABI 永不成为组件 ABI），
+//! 本模块是它的薄镜像；三方（`kcomp.h` / 本文件 / Core `export.rs`）的漂移由
+//! `os/core/tests/kcomp_abi_drift.rs` 纯文本交叉校验。宽度规则：Rust `usize`
+//! ↔ C `size_t`（指针宽）；counts/ids → `u32`；不透明句柄 → `u64`。
 //!
 //! # Trace 支持状态（编译期 vs 运行时，组件要能分开发现）
 //!
@@ -22,6 +27,11 @@
 
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
+
+/// 任务入口（C `typedef void (*KcompTaskEntry)(void *arg)`）：`arg` 由
+/// [`kcore_task_create`] 原样回传；任务必须经 Core 退出。任务归属来自 Core 的
+/// 执行边界，**不是**来自 `arg`。
+pub type KcompTaskEntry = extern "C" fn(arg: *mut ());
 
 /// 一条 trace 记录的**稳定编码** —— 必须与 Core `trace::abi::TraceRecordAbi`
 /// 逐字节一致（loader 只按名字解析符号，不校验签名/布局；不一致 = UB）。
@@ -86,6 +96,47 @@ const _: () = {
     assert!(core::mem::align_of::<TraceStatsAbi>() == 8);
 };
 
+// ---------------------------------------------------------------------------
+// 组件生命周期入口（组件**导出**侧；Core 调用）
+// ---------------------------------------------------------------------------
+
+/// `kcomp_instance_create` 的参数（C `struct KcompCreateArgs`）：仅在调用期间
+/// 借用；`config` 必须拷贝后才能持久化，Core 视其为不透明字节。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KcompCreateArgs {
+    /// config 负载的精确指纹，`0` = 无负载。
+    pub config_abi: u64,
+    /// 组件自定义 C 布局的小结构（Core 不解释）。
+    pub config: *const (),
+    pub config_len: usize,
+}
+
+/// `KcompCreateArgs` 布局指纹：指针宽度相关（RV64 = 24，RV32 = 16），字段偏移
+/// 在两种宽度下一致（RISC-V ILP32 下 `u64` 仍 8 对齐）。
+const _: () = {
+    assert!(core::mem::size_of::<KcompCreateArgs>() == 8 + 2 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(KcompCreateArgs, config) == 8);
+    assert!(
+        core::mem::offset_of!(KcompCreateArgs, config_len) == 8 + core::mem::size_of::<usize>()
+    );
+    assert!(core::mem::align_of::<KcompCreateArgs>() == 8);
+};
+
+/// 组件入口 `kcomp_instance_create` 的 Rust 类型镜像（由
+/// [`kcomp_instance_create!`](crate::kcomp_instance_create) 宏生成并锚定）。
+pub type KcompInstanceCreate =
+    extern "C" fn(args: *const KcompCreateArgs, out_state: *mut *mut ()) -> i32;
+
+/// 组件入口 `kcomp_instance_destroy` 的 Rust 类型镜像（由
+/// [`kcomp_instance_destroy!`](crate::kcomp_instance_destroy) 宏生成并锚定）。
+pub type KcompInstanceDestroy = extern "C" fn(state: *mut ()) -> i32;
+
+/// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
+/// 边界与值。数值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数（与 `binding`
+/// 的 ABI tag 同一约定）；组件里的 `kcomp_abi` 符号由入口宏发出。
+pub const KCOMP_ABI: u64 = 0x4B43_4F4D_5041_4249;
+
 // 安全说明：以下符号由 Core 保证实现；调用方必须满足各自契约（指针有效性、
 // out 参数可写、handle 归宿等），故调用点均为 `unsafe`。
 unsafe extern "C" {
@@ -139,6 +190,15 @@ unsafe extern "C" {
     // -- Component lifecycle --
     #[link_name = "kcore_component_load"]
     pub fn kcore_component_load(name: *const u8, len: usize) -> i32;
+    /// 按 artifact 名创建新实例（同一 image 允许多实例）。成功 = `0` 且
+    /// `*out_instance` 写 instance id（`ComponentId` raw）；失败 = `-Errno`。
+    #[link_name = "kcore_component_create"]
+    pub fn kcore_component_create(
+        image_name: *const u8,
+        image_name_len: usize,
+        args: *const KcompCreateArgs,
+        out_instance: *mut u32,
+    ) -> i32;
     #[link_name = "kcore_interface_publish"]
     pub fn kcore_interface_publish(
         name: *const u8,
@@ -171,8 +231,11 @@ unsafe extern "C" {
     ) -> i32;
 
     // -- Task control --
+    /// 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
+    /// （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入
+    /// `*out_task`；失败 = `-Errno`。
     #[link_name = "kcore_task_create"]
-    pub fn kcore_task_create(entry: usize) -> i32;
+    pub fn kcore_task_create(entry: KcompTaskEntry, arg: *mut (), out_task: *mut u32) -> i32;
     #[link_name = "kcore_task_start"]
     pub fn kcore_task_start(id: u32) -> i32;
     #[link_name = "kcore_task_yield"]

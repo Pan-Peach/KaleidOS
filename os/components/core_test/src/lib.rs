@@ -1,7 +1,7 @@
 //! CoreTest 测试组件（第一个 .kcomp）：核内自检 Core 的真实接口。
 //!
-//! - `kcomp_init`：loader 放段 + 重定位后调用；返回 0 = 全部通过，
-//!   非 0 = 失败位图（`load` 命令会据此报告 FAILED）
+//! - `kcomp_instance_create`：loader 放段 + 重定位后由 Core 调用；返回 0 =
+//!   全部通过，非 0 = 失败位图（`load` 命令会据此报告 FAILED）
 //! - 报告分组（`runtime/`，每个分组一个模块 —— 模块边界 = 责任边界）：
 //!   - `boot`：`.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表
 //!   - `sched`：组件加载 → 接口可用 → 任务创建/启动 → RR 调度 → yield/exit

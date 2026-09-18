@@ -70,6 +70,9 @@ cflags=(
     -ffunction-sections -fdata-sections
     -fno-asynchronous-unwind-tables -fno-unwind-tables
     -fno-pic -mno-relax -O2
+    # 组件 ABI 的 C 作者面：C 组件 `#include "kcomp.h"`（kcore_* 白名单 +
+    # kcomp_* 生命周期入口声明；Rust 镜像在 kcomp-sdk/src/abi.rs）。
+    -I"$repo_root/os/components/kcomp-sdk/include"
 )
 if [ -n "${CFLAGS:-}" ]; then
     # shellcheck disable=SC2206  # 故意按空白拆分调用方传入的额外旗标
@@ -112,5 +115,6 @@ for src in "${sources[@]}"; do
     objects+=("$obj")
 done
 
-# 交给语言无关 packer：partial link（-u kcomp_init/kcomp_exit）→ strip → 校验。
+# 交给语言无关 packer：partial link（-u kcomp_instance_create/destroy + kcomp_abi）
+# → strip → 契约校验。
 exec "$script_dir/kcomp-link.sh" "$output" "${objects[@]}"

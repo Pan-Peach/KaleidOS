@@ -180,15 +180,23 @@ pub fn run(info: &MachineInfo) -> ! {
 }
 
 fn panic_containment() -> ! {
-    match kernel::component::containment::call_on_isolated_stack(panic_containment_entry) {
-        kernel::component::containment::CallOutcome::Panicked => pass("panic-containment"),
-        kernel::component::containment::CallOutcome::Returned(_) => {
-            fail("component panic returned unexpectedly")
-        }
+    use kernel::component::containment::{call_component_create, CallOutcome, KcompCreateArgs};
+    let args = KcompCreateArgs::empty();
+    let mut state: *mut () = core::ptr::null_mut();
+    match call_component_create(
+        panic_containment_entry as *const () as usize,
+        &args,
+        &mut state,
+    ) {
+        CallOutcome::Panicked => pass("panic-containment"),
+        CallOutcome::Returned(_) => fail("component panic returned unexpectedly"),
     }
 }
 
-extern "C" fn panic_containment_entry() -> i32 {
+extern "C" fn panic_containment_entry(
+    _args: *const kernel::component::containment::KcompCreateArgs,
+    _out_state: *mut *mut (),
+) -> i32 {
     panic!("component panic test");
 }
 
@@ -215,10 +223,18 @@ fn task_panic() -> ! {
 
     let (panicking, normal) = {
         let mut table = kernel::task::get_task_table().lock();
-        let Ok(panicking) = table.create(victim, task_panic_entry as *const () as usize) else {
+        let Ok(panicking) = table.create(
+            victim,
+            task_panic_entry as *const () as usize,
+            core::ptr::null_mut(),
+        ) else {
             fail("task-panic: panic task create failed");
         };
-        let Ok(normal) = table.create(victim, task_normal_entry as *const () as usize) else {
+        let Ok(normal) = table.create(
+            victim,
+            task_normal_entry as *const () as usize,
+            core::ptr::null_mut(),
+        ) else {
             fail("task-panic: normal task create failed");
         };
         if table
@@ -262,31 +278,36 @@ fn task_panic() -> ! {
     }
 }
 
-extern "C" fn task_panic_entry() -> ! {
+extern "C" fn task_panic_entry(_arg: *mut ()) -> ! {
     panic!("component task panic");
 }
 
 /// step 2 D：**真实 `.kcomp`** 的 panic containment。
 ///
-/// 从内嵌 kpkg 加载 `kcomp_panic`。它的 `kcomp_init` 刻意 `panic!`，进入的是
-/// **组件镜像自己的** SDK panic adapter（不是 boot panic handler）；adapter 经
-/// `kcore_log_line` 打印诊断后调 `kcore_panic_escape`，逃逸回 Core 的 init
-/// containment 边界。这里断言：Core 存活、该 instance 被提交为 Failed；诊断行
-/// 由 `arch_runner.py` 在串口输出上断言。
+/// 从内嵌 kpkg 加载 `kcomp_panic`。它的 `kcomp_instance_create` 刻意 `panic!`，
+/// 进入的是**组件镜像自己的** SDK panic adapter（不是 boot panic handler）；
+/// adapter 经 `kcore_log_line` 打印诊断后调 `kcore_panic_escape`，逃逸回 Core 的
+/// create containment 边界。这里断言：Core 存活、该 instance 被提交为 Failed；
+/// 诊断行由 `arch_runner.py` 在串口输出上断言。
 fn panic_component() -> ! {
     use kernel::component::load::ComponentLoadError;
     match kernel::component::load::load_and_start(b"kcomp_panic") {
-        Err(ComponentLoadError::InitPanicked) => {}
+        Err(ComponentLoadError::CreatePanicked) => {}
         Ok(_) => fail("panic-component: component did not panic"),
         Err(_) => fail("panic-component: unexpected load error"),
     }
-    let failed = kernel::component::registry::get_registry()
-        .lock()
-        .iter()
-        .any(|record| {
-            record.name.as_slice() == b"kcomp_panic"
+    let failed = {
+        let reg = kernel::component::registry::get_registry().lock();
+        let images = kernel::component::image::get_images().lock();
+        // 先取出 bool，避免块尾表达式把 `reg` 的借用拖过局部变量析构。
+        let any = reg.iter().any(|record| {
+            images
+                .get(record.image)
+                .is_some_and(|img| img.name.as_slice() == b"kcomp_panic")
                 && record.state == kernel::component::ComponentState::Failed
         });
+        any
+    };
     if failed {
         pass("panic-component")
     } else {
@@ -294,7 +315,7 @@ fn panic_component() -> ! {
     }
 }
 
-extern "C" fn task_normal_entry() -> ! {
+extern "C" fn task_normal_entry(_arg: *mut ()) -> ! {
     let _ = kernel::sched::exit_current();
     loop {
         core::hint::spin_loop();

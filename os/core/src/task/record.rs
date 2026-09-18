@@ -9,20 +9,33 @@ use arch::ContextImpl;
 
 #[derive(Debug, PartialEq)]
 pub struct TaskRecord {
-    /// 创建该任务的组件。任务运行时的 caller identity 从这里解析，
-    /// 不依赖 component loader 的 `call_init` 上下文。
+    /// 创建该任务的组件**实例**。任务运行时的 caller identity 从这里解析，
+    /// 不依赖 create 调用上下文。多个实例共享一个 image 时，owner 仍是实例。
     owner: ComponentId,
     /// Core-controlled truth：状态只能通过 Core 内部入口改变，组件（外部 crate）
     /// 无法直接赋值。调度器里程碑落地后在此之上加验证式 transition API。
     state: TaskState,
+    /// 组件任务入口（`KcompTaskEntry`：`void (*)(void *)`），由
+    /// `kcore_task_create` 提供并验证落在 owner 的装载镜像内。
+    entry: usize,
+    /// opaque 参数：Core 原样透传给入口；**任务归属与它无关**（来自 Core 的
+    /// 执行边界 = 本记录的 owner）。
+    arg: *mut (),
     pub context: Box<ContextImpl>,
     pub kstack: Kernelstack,
     pub(crate) memory: Option<MemoryLease>,
 }
 
+// `arg` 是组件 opaque 指针：Core 只存/透传、永不解引用。跨线程使用由
+// `TASK_TABLE` 的 Mutex 串行化（与 interface.rs 的 BindingRecord 同一理由）。
+unsafe impl Send for TaskRecord {}
+unsafe impl Sync for TaskRecord {}
+
 impl TaskRecord {
     pub(crate) fn new(
         owner: ComponentId,
+        entry: usize,
+        arg: *mut (),
         context: Box<ContextImpl>,
         kstack: Kernelstack,
         memory: MemoryLease,
@@ -30,6 +43,8 @@ impl TaskRecord {
         Self {
             owner,
             state: TaskState::Created,
+            entry,
+            arg,
             context,
             kstack,
             memory: Some(memory),
@@ -44,6 +59,16 @@ impl TaskRecord {
     /// 只读观察状态（monitor / trace / 调度器读侧）。
     pub fn state(&self) -> TaskState {
         self.state.clone()
+    }
+
+    /// 组件任务入口地址（Core trampoline 读取后调用）。
+    pub(crate) fn entry(&self) -> usize {
+        self.entry
+    }
+
+    /// opaque 任务参数（Core trampoline 原样透传）。
+    pub(crate) fn arg(&self) -> *mut () {
+        self.arg
     }
 
     /// Core 内部写入点：组件（外部 crate）拿不到 `&mut`，改不了状态。

@@ -125,13 +125,14 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::NotFound => Errno::ENOENT,
             ComponentLoadError::ReadFailed => Errno::EIO,
             ComponentLoadError::Loader(_) => Errno::ENOEXEC,
+            ComponentLoadError::ImageFailed => Errno::EEXIST,
             ComponentLoadError::DeclareFailed => Errno::EEXIST,
             ComponentLoadError::ResolveFailed => Errno::ENOENT,
             ComponentLoadError::StartFailed => Errno::EIO,
-            ComponentLoadError::InitFailed(_) => Errno::EIO,
-            ComponentLoadError::InitPanicked => Errno::EIO,
-            ComponentLoadError::ExitFailed(_) => Errno::EIO,
-            ComponentLoadError::ExitPanicked => Errno::EIO,
+            ComponentLoadError::CreateFailed(_) => Errno::EIO,
+            ComponentLoadError::CreatePanicked => Errno::EIO,
+            ComponentLoadError::DestroyFailed(_) => Errno::EIO,
+            ComponentLoadError::DestroyPanicked => Errno::EIO,
             ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
         }
@@ -146,8 +147,8 @@ impl From<ComponentStopError> for Errno {
             ComponentStopError::NotReady => Errno::EINVAL,
             // 实例仍被任务占用（Linux `delete_module` 的 EBUSY 类比）。
             ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
-            ComponentStopError::ExitFailed(_) => Errno::EIO,
-            ComponentStopError::ExitPanicked => Errno::EIO,
+            ComponentStopError::DestroyFailed(_) => Errno::EIO,
+            ComponentStopError::DestroyPanicked => Errno::EIO,
             ComponentStopError::StateRejected => Errno::EIO,
         }
     }
@@ -239,14 +240,20 @@ mod tests {
         assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
         assert_eq!(Errno::from(InterfaceError::ProviderNotReady), Errno::EAGAIN);
         assert_eq!(Errno::from(ComponentLoadError::NotFound), Errno::ENOENT);
-        assert_eq!(Errno::from(ComponentLoadError::ExitFailed(1)), Errno::EIO);
-        assert_eq!(Errno::from(ComponentLoadError::ExitPanicked), Errno::EIO);
+        assert_eq!(
+            Errno::from(ComponentLoadError::DestroyFailed(1)),
+            Errno::EIO
+        );
+        assert_eq!(Errno::from(ComponentLoadError::DestroyPanicked), Errno::EIO);
         // 优雅停止的错误在边界处有稳定档位（当前消费者 = monitor unload / host tests）。
         assert_eq!(Errno::from(ComponentStopError::NotFound), Errno::ENOENT);
         assert_eq!(Errno::from(ComponentStopError::NotReady), Errno::EINVAL);
         assert_eq!(Errno::from(ComponentStopError::OwnsLiveTasks), Errno::EBUSY);
-        assert_eq!(Errno::from(ComponentStopError::ExitFailed(1)), Errno::EIO);
-        assert_eq!(Errno::from(ComponentStopError::ExitPanicked), Errno::EIO);
+        assert_eq!(
+            Errno::from(ComponentStopError::DestroyFailed(1)),
+            Errno::EIO
+        );
+        assert_eq!(Errno::from(ComponentStopError::DestroyPanicked), Errno::EIO);
         assert_eq!(Errno::from(ComponentStopError::StateRejected), Errno::EIO);
         assert_eq!(Errno::from(mmio::MmioClaimError::DeviceBusy), Errno::EBUSY);
         assert_eq!(Errno::from(mmio::MmioClaimError::NotMmio), Errno::ENOTSUP);
@@ -415,10 +422,10 @@ mod tests {
             ComponentLoadError::DeclareFailed,
             ComponentLoadError::ResolveFailed,
             ComponentLoadError::StartFailed,
-            ComponentLoadError::InitFailed(1),
-            ComponentLoadError::InitPanicked,
-            ComponentLoadError::ExitFailed(1),
-            ComponentLoadError::ExitPanicked,
+            ComponentLoadError::CreateFailed(1),
+            ComponentLoadError::CreatePanicked,
+            ComponentLoadError::DestroyFailed(1),
+            ComponentLoadError::DestroyPanicked,
             ComponentLoadError::InterfaceCommitFailed(InterfaceError::ProviderNotFound),
             ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
         ] {
@@ -427,13 +434,14 @@ mod tests {
                 ComponentLoadError::NotFound => Errno::ENOENT,
                 ComponentLoadError::ReadFailed => Errno::EIO,
                 ComponentLoadError::Loader(_) => Errno::ENOEXEC,
+                ComponentLoadError::ImageFailed => Errno::EEXIST,
                 ComponentLoadError::DeclareFailed => Errno::EEXIST,
                 ComponentLoadError::ResolveFailed => Errno::ENOENT,
                 ComponentLoadError::StartFailed => Errno::EIO,
-                ComponentLoadError::InitFailed(_) => Errno::EIO,
-                ComponentLoadError::InitPanicked => Errno::EIO,
-                ComponentLoadError::ExitFailed(_) => Errno::EIO,
-                ComponentLoadError::ExitPanicked => Errno::EIO,
+                ComponentLoadError::CreateFailed(_) => Errno::EIO,
+                ComponentLoadError::CreatePanicked => Errno::EIO,
+                ComponentLoadError::DestroyFailed(_) => Errno::EIO,
+                ComponentLoadError::DestroyPanicked => Errno::EIO,
                 ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
                 ComponentLoadError::TaskPanicked(_) => Errno::EIO,
             };
@@ -447,16 +455,16 @@ mod tests {
             ComponentStopError::NotFound,
             ComponentStopError::NotReady,
             ComponentStopError::OwnsLiveTasks,
-            ComponentStopError::ExitFailed(1),
-            ComponentStopError::ExitPanicked,
+            ComponentStopError::DestroyFailed(1),
+            ComponentStopError::DestroyPanicked,
             ComponentStopError::StateRejected,
         ] {
             let expected = match error {
                 ComponentStopError::NotFound => Errno::ENOENT,
                 ComponentStopError::NotReady => Errno::EINVAL,
                 ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
-                ComponentStopError::ExitFailed(_) => Errno::EIO,
-                ComponentStopError::ExitPanicked => Errno::EIO,
+                ComponentStopError::DestroyFailed(_) => Errno::EIO,
+                ComponentStopError::DestroyPanicked => Errno::EIO,
                 ComponentStopError::StateRejected => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "ComponentStopError {error:?}");

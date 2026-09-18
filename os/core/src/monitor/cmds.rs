@@ -10,6 +10,7 @@ use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
 use crate::printk;
 use alloc::string::String;
+use alloc::vec::Vec;
 use arch::{ResetImpl, ResetType, SystemReset};
 
 /// 挂载 MachineInfo（core::init 完成时调用一次）：写入 machine 模块的唯一真相点。
@@ -102,7 +103,7 @@ pub fn tasks(_line: &[u8]) {
     }
 }
 
-/// `load <name>`：走 Core 的组件加载语义入口（薄 caller，加载流程在
+/// `load <name>`：走 Core 的组件实例创建语义入口（薄 caller，创建流程在
 /// `component::load::load_and_start`，与组件 ABI `kcore_component_load` 同源）。
 pub fn load(args: &[u8]) {
     let name = args.trim_ascii();
@@ -113,22 +114,32 @@ pub fn load(args: &[u8]) {
     let name = String::from_utf8_lossy(name);
     match crate::component::load::load_and_start(name.as_bytes()) {
         Ok(id) => {
-            let entry = crate::component::registry::get_registry()
-                .lock()
-                .get(id)
-                .map_or(0, |r| r.entry);
-            printk!("load {}: OK (id={}, entry={:#x})\n", name, id.raw(), entry);
-            // 组件可能在 `kcomp_init` 期间创建了任务（例如 driver_prober 的
-            // post-init dispatch 任务）。init 期间 publish 是 staged：消费者必须等
-            // provider `Ready`，所以这类任务只能在 load 提交之后运行。Monitor 是
-            // 交互态下唯一的调度锚点，这里在加载成功后把 CPU 交给调度器；没有
-            // Runnable 任务时 `sched::run()` 是 no-op（现有加载路径不受影响）。
+            let (image, create) = {
+                let reg = crate::component::registry::get_registry().lock();
+                let Some(record) = reg.get(id) else {
+                    printk!("load {name}: instance vanished\n");
+                    return;
+                };
+                let image = record.image;
+                drop(reg);
+                let images = crate::component::image::get_images().lock();
+                (image, images.get(image).map_or(0, |image| image.create))
+            };
+            printk!(
+                "load {}: OK (id={}, image={}, create={:#x})\n",
+                name,
+                id.raw(),
+                image.raw(),
+                create
+            );
+            // 组件可能在 `kcomp_instance_create` 期间创建了任务（例如
+            // driver_prober 的 post-init dispatch 任务）。create 期间 publish 是
+            // staged：消费者必须等 provider `Ready`，所以这类任务只能在 create
+            // 提交之后运行。Monitor 是交互态下唯一的调度锚点，这里在加载成功后把
+            // CPU 交给调度器；没有 Runnable 任务时 `sched::run()` 是 no-op。
             if let Err(error) = crate::sched::run() {
                 printk!("load {name}: post-load scheduling failed: {error:?}\n");
             }
-        }
-        Err(ComponentLoadError::DeclareFailed) => {
-            printk!("load {name}: already loaded\n");
         }
         Err(ComponentLoadError::NotFound) => {
             printk!("load {name}: no such component\n");
@@ -137,11 +148,12 @@ pub fn load(args: &[u8]) {
     }
 }
 
-/// `unload <name>`：优雅停止一个已加载组件（`Ready → Stopping → Stopped`）。
+/// `unload <name>`：优雅停止该 artifact 的实例（`Ready → Stopping → Stopped`）。
 ///
 /// 薄 caller：停止编排在 `component/exit.rs::stop_component`（拒绝拥有未退出
-/// 任务的实例；调用可选 `kcomp_exit`；Core 兜底回收）。记录保留——phase 1 不
-/// 回收段内存、不退役实例，`components` 仍能看到 `state=Stopped`。
+/// 任务的实例；调用 `kcomp_instance_destroy`；Core 兜底回收）。一份 image 可以有
+/// 多个实例，本命令停掉该 name 的**全部**实例。记录保留——phase 1 不回收段内存、
+/// 不退役实例，`components` 仍能看到 `state=Stopped`。
 pub fn unload(args: &[u8]) {
     let name = args.trim_ascii();
     if name.is_empty() {
@@ -149,46 +161,52 @@ pub fn unload(args: &[u8]) {
         return;
     }
     let name = String::from_utf8_lossy(name);
-    let id = crate::component::registry::get_registry()
-        .lock()
-        .iter()
-        .find(|record| record.name.as_slice() == name.as_bytes())
-        .map(|record| record.id);
-    let Some(id) = id else {
+    let ids: Vec<crate::component::ComponentId> = {
+        let reg = crate::component::registry::get_registry().lock();
+        let images = crate::component::image::get_images().lock();
+        reg.iter()
+            .filter(|record| {
+                images
+                    .get(record.image)
+                    .is_some_and(|image| image.name.as_slice() == name.as_bytes())
+            })
+            .map(|record| record.id)
+            .collect()
+    };
+    if ids.is_empty() {
         printk!("unload {name}: no such component\n");
         return;
-    };
-    match crate::component::exit::stop_component(id) {
-        Ok(()) => {
-            let reg = crate::component::registry::get_registry().lock();
-            match reg.get(id) {
-                Some(record) => printk!(
-                    "unload {}: OK (id={}, state={:?})\n",
-                    name,
-                    id.raw(),
-                    record.state
-                ),
-                // 不变式：stop 成功不删记录；phase 1 记录必然还在。
-                None => printk!("unload {}: OK (id={})\n", name, id.raw()),
-            }
+    }
+    for id in ids {
+        match crate::component::exit::stop_component(id) {
+            Ok(()) => printk!("unload {}: OK (id={}, state=Stopped)\n", name, id.raw()),
+            Err(error) => printk!("unload {}: id={} {error:?}\n", name, id.raw()),
         }
-        Err(error) => printk!("unload {name}: {error:?}\n"),
     }
 }
 
-/// `components`：已加载组件列表。
+/// `components`：已声明实例列表（实例 id + image 投影）。
 pub fn components(_line: &[u8]) {
     let reg = crate::component::registry::get_registry().lock();
+    let images = crate::component::image::get_images().lock();
     printk!("components: {}\n", reg.len());
     for rec in reg.iter() {
-        printk!(
-            "  id={} state={:?} entry={:#x} base={:#x} name={}\n",
-            rec.id.raw(),
-            rec.state,
-            rec.entry,
-            rec.base,
-            String::from_utf8_lossy(&rec.name)
-        );
+        match images.get(rec.image) {
+            Some(image) => printk!(
+                "  id={} state={:?} image={} create={:#x} base={:#x}\n",
+                rec.id.raw(),
+                rec.state,
+                String::from_utf8_lossy(&image.name),
+                image.create,
+                image.base
+            ),
+            None => printk!(
+                "  id={} state={:?} image={} (unregistered)\n",
+                rec.id.raw(),
+                rec.state,
+                rec.image.raw()
+            ),
+        }
     }
 }
 
@@ -207,13 +225,13 @@ pub fn catalog(_line: &[u8]) {
             return;
         }
     };
-    let reg = crate::component::registry::get_registry().lock();
+    let images = crate::component::image::get_images().lock();
     let mut count = 0usize;
     for entry in &entries {
         let Some(stem) = entry.name.strip_suffix(b".kcomp") else {
             continue;
         };
-        let loaded = reg.iter().any(|record| record.name.as_slice() == stem);
+        let loaded = images.find(stem).is_some();
         printk!(
             "  {} ({} bytes){}\n",
             String::from_utf8_lossy(stem),

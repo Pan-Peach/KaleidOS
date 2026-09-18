@@ -2,8 +2,9 @@
 //!
 //! 通过 Component SDK 调用 `kcore_*` 白名单（不再自己写 extern / console helper），
 //! 验证链接后的 `.kcomp` 重定位链路（UNDEF 只解析白名单符号），并保持与迁移前
-//! 相同的可观测行为：init 输出 `[smoke] hex=<n>\n!`（`n` = 组件数 + 空闲页数），
-//! 退出钩子输出 `[smoke] exit`（Core 停止路径真的调用 `kcomp_exit` 的证据）。
+//! 相同的可观测行为：create 输出 `[smoke] hex=<n>\n!`（`n` = 组件数 + 空闲页数），
+//! destroy 输出 `[smoke] exit`（Core 停止路径真的调用 `kcomp_instance_destroy`
+//! 的证据）。无状态组件：create 成功不写 out_state（保持 Core 初始化的 NULL）。
 
 #![no_std]
 
@@ -41,7 +42,7 @@ fn do_smoke() -> u32 {
     components.wrapping_add(free_pages)
 }
 
-kcomp_sdk::kcomp_init!({
+kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
     let n = do_smoke();
     for &c in "[smoke] hex=".as_bytes() {
         kcomp_sdk::console_write_byte(c);
@@ -52,11 +53,11 @@ kcomp_sdk::kcomp_init!({
     0
 });
 
-// 参考退出钩子（其他组件抄这个形状）：释放自己**实际持有**的东西，并留一行
+// 参考析构钩子（其他组件抄这个形状）：释放自己**实际持有**的东西，并留一行
 // 可观测证据。kcomp_smoke 不持有 authority，所以只有证据行——没有资源的组件
-// 也要显式声明退出钩子，让"没有收尾逻辑"是一行可见的代码。
-// 返回 0 = 干净退出；非零 / panic 的暂定语义见 docs/component-model.md §5.2。
-kcomp_sdk::kcomp_exit!({
+// 也要显式声明析构入口，让"没有收尾逻辑"是一行可见的代码。
+// destroy 失败 / panic → Core 置 Failed 并保留内存，绝不自动重试。
+kcomp_sdk::kcomp_instance_destroy!(|_state| {
     for &c in "[smoke] exit\n".as_bytes() {
         kcomp_sdk::console_write_byte(c);
     }

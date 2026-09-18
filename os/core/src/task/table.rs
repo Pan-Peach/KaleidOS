@@ -32,15 +32,23 @@ impl TaskTable {
         }
     }
 
-    /// 唯二创建入口（public）：记录 owner，分配 id + 登记 record。
-    pub fn create(&mut self, owner: ComponentId, entry: usize) -> Result<TaskId, TaskError> {
+    /// 唯二创建入口（public）：记录 owner + 任务入口，分配 id + 内核栈 +
+    /// 初始上下文（进入 Core 的 `task_entry_trampoline`，由它按 `void (*)(void *)`
+    /// 契约调用 `entry(arg)`）。
+    pub fn create(
+        &mut self,
+        owner: ComponentId,
+        entry: usize,
+        arg: *mut (),
+    ) -> Result<TaskId, TaskError> {
         let id = self.alloc();
         let memory =
             memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| TaskError::NoMemory)?;
         let region = memory.region();
         let kstack = Kernelstack::new(region.base, memory::ALLOC_GRANULE);
-        let context = CpuImpl::new_context(entry, kstack.base + kstack.size);
-        let record = TaskRecord::new(owner, Box::new(context), kstack, memory);
+        let trampoline = crate::task::task_entry_trampoline as *const () as usize;
+        let context = CpuImpl::new_context(trampoline, kstack.base + kstack.size);
+        let record = TaskRecord::new(owner, entry, arg, Box::new(context), kstack, memory);
         self.insert(id, record)?;
         Ok(id)
     }
@@ -173,7 +181,9 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(OWNER, ENTRY).expect("create");
+        let id = t
+            .create(OWNER, ENTRY, core::ptr::null_mut())
+            .expect("create");
         assert_eq!(id.raw(), 0, "first id is 0");
 
         assert_eq!(t.len(), 1);
@@ -193,7 +203,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(OWNER, ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
         // 组件/外部 crate 拿不到 &mut state：只能走 Core 的 transition 写入点。
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Created));
         t.transition(id, TaskState::Runnable).unwrap();
@@ -207,7 +217,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(OWNER, ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
 
         // Created 直接 Running / Exited：非法（必须经 Runnable / 先跑起来）。
         assert_eq!(
@@ -244,7 +254,11 @@ mod tests {
         let mut t = TaskTable::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            ids.push(t.create(OWNER, ENTRY).expect("create").raw());
+            ids.push(
+                t.create(OWNER, ENTRY, core::ptr::null_mut())
+                    .expect("create")
+                    .raw(),
+            );
         }
         assert_eq!(ids, [0, 1, 2], "sequential unique ids");
 
@@ -257,7 +271,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(OWNER, ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
         let rec = t.remove(id).expect("remove");
         assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
         assert!(t.is_empty());
@@ -277,7 +291,10 @@ mod tests {
         while let Ok(lease) = memory::alloc_region(memory::ALLOC_GRANULE) {
             held.push(lease);
         }
-        assert!(matches!(t.create(OWNER, ENTRY), Err(TaskError::NoMemory)));
+        assert!(matches!(
+            t.create(OWNER, ENTRY, core::ptr::null_mut()),
+            Err(TaskError::NoMemory)
+        ));
         assert!(t.is_empty(), "failed create must not register");
 
         drop(held);
@@ -292,6 +309,8 @@ mod tests {
         let r1 = f1.region();
         let rec1 = TaskRecord::new(
             OWNER,
+            ENTRY,
+            core::ptr::null_mut(),
             Box::new(CpuImpl::new_context(ENTRY, r1.base + memory::ALLOC_GRANULE)),
             Kernelstack::new(r1.base, memory::ALLOC_GRANULE),
             f1,
@@ -303,6 +322,8 @@ mod tests {
         let r2 = f2.region();
         let rec2 = TaskRecord::new(
             OWNER,
+            ENTRY,
+            core::ptr::null_mut(),
             Box::new(CpuImpl::new_context(ENTRY, r2.base + memory::ALLOC_GRANULE)),
             Kernelstack::new(r2.base, memory::ALLOC_GRANULE),
             f2,
@@ -319,7 +340,7 @@ mod tests {
         let _g = setup();
 
         let mut t = TaskTable::new();
-        let id = t.create(OWNER, ENTRY).unwrap();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
 
         assert_eq!(t.start(OTHER_OWNER, id), Err(TaskError::WrongOwner));
         assert_eq!(t.get(id).unwrap().state(), TaskState::Created);
@@ -337,7 +358,7 @@ mod tests {
         assert!(!t.has_live_tasks(OWNER), "empty table owns nothing");
 
         // When/Then：Created 算未完成；别人的任务不算我的。
-        let created = t.create(OWNER, ENTRY).unwrap();
+        let created = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
         assert!(t.has_live_tasks(OWNER), "Created is unfinished");
         assert!(
             !t.has_live_tasks(OTHER_OWNER),
@@ -456,8 +477,12 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let mut table = TaskTable::new();
-            let a = table.create(OWNER, ENTRY).expect("create task A");
-            let b = table.create(OTHER_OWNER, ENTRY).expect("create task B");
+            let a = table
+                .create(OWNER, ENTRY, core::ptr::null_mut())
+                .expect("create task A");
+            let b = table
+                .create(OTHER_OWNER, ENTRY, core::ptr::null_mut())
+                .expect("create task B");
             Self {
                 table,
                 a,
@@ -684,7 +709,9 @@ mod tests {
             let mut table = TaskTable::new();
             let mut ids = alloc::vec::Vec::new();
             for _ in 0..count {
-                let id = table.create(OWNER, 0x8000_0000).unwrap();
+                let id = table
+                    .create(OWNER, 0x8000_0000, core::ptr::null_mut())
+                    .unwrap();
                 table.transition(id, TaskState::Runnable).unwrap();
                 ids.push(id);
             }
@@ -723,7 +750,10 @@ mod tests {
     fn global_lifecycle(owner: ComponentId, entry: usize) -> TaskId {
         let table = crate::task::get_task_table();
 
-        let id = table.lock().create(owner, entry).expect("create");
+        let id = table
+            .lock()
+            .create(owner, entry, core::ptr::null_mut())
+            .expect("create");
 
         let state = table.lock().get(id).expect("created task present").state();
         assert_eq!(state, TaskState::Created, "create must commit Created");

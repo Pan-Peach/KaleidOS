@@ -141,8 +141,8 @@ impl<S: Service> ServiceBinding<S> {
 /// 两侧各有锚定测试钉死数值）。
 pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_4845_4455_4C52);
 
-/// 发布接口（**只在 `kcomp_init` 期间有效**）：Core 记录 pending，
-/// `kcomp_init` 返回 0 后原子提交。返回 `Ok(())` = 已记录 pending。
+/// 发布接口（**只在 `kcomp_instance_create` 期间有效**）：Core 记录 pending，
+/// `kcomp_instance_create` 返回 0 后原子提交。返回 `Ok(())` = 已记录 pending。
 ///
 /// # Safety
 /// `api` 必须指向 `'static` 的 `#[repr(C)]` function table，`ctx` 必须是
@@ -178,6 +178,24 @@ pub unsafe fn publish_service<S: Service>(api: *const S::Api, ctx: *mut ()) -> R
     unsafe { publish(S::NAME, S::KIND, S::ABI, api as *const (), ctx) }
 }
 
+/// 类型化 publish，endpoint 名由调用方给定（ABI 指纹仍是 `S::ABI`）。
+///
+/// 多实例场景下同一契约的每个实例发布到不同 endpoint（组合策略分配名字）；
+/// 单例角色继续用固定名 helper [`publish_service`]。Core 语义不变（staged、
+/// exact ABI、`0/-errno`）。
+///
+/// # Safety
+/// 同 [`publish`]：`api` 必须指向 `'static` 且布局 = `S::Api` 的 function table，
+/// `ctx` 必须是 provider 存活期内有效的 opaque state。
+pub unsafe fn publish_named<S: Service>(
+    name: &[u8],
+    api: *const S::Api,
+    ctx: *mut (),
+) -> Result<(), i32> {
+    // SAFETY: 调用方保证 `api` 布局 = `S::Api`（见 Safety）。
+    unsafe { publish(name, S::KIND, S::ABI, api as *const (), ctx) }
+}
+
 /// consumer 按名 bind：Core exact-compare ABI + 验证 provider 后返回当前快照。
 pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBinding, i32> {
     let (mut binding, mut api, mut ctx, mut generation) = (0u64, 0usize, 0usize, 0u64);
@@ -204,6 +222,14 @@ pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBi
     } else {
         Err(status)
     }
+}
+
+/// 类型化 bind，endpoint 名由调用方给定（Core 仍 exact-compare `S::ABI`）。
+///
+/// 与 [`ServiceBinding::bind`] 的唯一区别是名字：单例角色用固定 `S::NAME`，
+/// 多实例场景用组合策略分配的 endpoint 名（provider 侧对应 [`publish_named`]）。
+pub fn bind_named<S: Service>(name: &[u8]) -> Result<ServiceBinding<S>, i32> {
+    Ok(ServiceBinding::from_raw(bind(name, S::KIND, S::ABI)?))
 }
 
 /// consumer 用已有 binding id refresh：Core exact-compare ABI + 重新验证

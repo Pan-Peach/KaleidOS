@@ -19,9 +19,12 @@
 #   OBJCOPY   strip 工具（默认 llvm-objcopy）
 #   READELF   符号/重定位读取（默认 llvm-readelf）
 #
-# 入口契约（loader 侧见 os/core/src/component/loader.rs）：
-#   kcomp_init  必须 DEFINED（STT_FUNC）
-#   kcomp_exit  可选；定义在**任一**输入里就一并钉住（否则会被 GC 丢掉）
+# 入口契约（loader 侧见 os/core/src/component/loader.rs；坐标系：
+# docs/component-lifecycle.md §4）：
+#   kcomp_instance_create   必须 DEFINED（STT_FUNC）
+#   kcomp_instance_destroy  必须 DEFINED（STT_FUNC）
+#   kcomp_abi               必须 DEFINED（8 字节 STT_OBJECT；Core 校验其值）
+# 旧的 kcomp_init / kcomp_exit 已原地删除——无 legacy fallback。
 
 set -euo pipefail
 
@@ -50,16 +53,9 @@ if [ ! -x "$lld" ]; then
     exit 1
 fi
 
-# -u 钉住加载入口：--gc-sections 会丢掉「未被引用」的入口段。kcomp_exit 在
-# staticlib 里是独立 archive member、在 C 里是独立函数段，不显式 -u 就会被丢；
-# 只有确实定义时才钉住——未定义它的组件保持 UNDEF 白名单干净（loader 按可选解析）。
-force=(-u kcomp_init)
-for input in "$@"; do
-    if "$readelf" -s "$input" 2>/dev/null \
-        | awk '$4=="FUNC" && $8=="kcomp_exit" && $7!="UND" {found=1} END{exit !found}'; then
-        force+=(-u kcomp_exit)
-    fi
-done
+# -u 钉住组件生命周期入口：--gc-sections 会丢掉「未被引用」的入口段，三个符号
+# 都是**必需导出**（docs/component-lifecycle.md §4），缺失 = packer 立即失败。
+force=(-u kcomp_instance_create -u kcomp_instance_destroy -u kcomp_abi)
 
 # partial link：只抽可达成员、GC 未引用段。--no-relax 避免 R_RISCV_ALIGN
 # （loader 不支持；relax 在本步骤没有收益）。
@@ -79,8 +75,21 @@ if ! "$readelf" -h "$output" | grep -q 'REL (Relocatable file)'; then
     exit 1
 fi
 
-if ! "$readelf" -s "$output" | awk '$4=="FUNC" && $8=="kcomp_init" && $7!="UND" {found=1} END{exit !found}'; then
-    echo "kcomp-link: kcomp_init (STT_FUNC) not defined in $output" >&2
+# ---- 生命周期入口契约：三个必需导出（符号存在且类型正确）----
+
+if ! "$readelf" -s "$output" | awk '$4=="FUNC" && $8=="kcomp_instance_create" && $7!="UND" {found=1} END{exit !found}'; then
+    echo "kcomp-link: kcomp_instance_create (STT_FUNC) not defined in $output" >&2
+    exit 1
+fi
+
+if ! "$readelf" -s "$output" | awk '$4=="FUNC" && $8=="kcomp_instance_destroy" && $7!="UND" {found=1} END{exit !found}'; then
+    echo "kcomp-link: kcomp_instance_destroy (STT_FUNC) not defined in $output" >&2
+    exit 1
+fi
+
+# kcomp_abi：8 字节 OBJECT（Core 校验其定义、边界与值；值 = SDK `KCOMP_ABI`）。
+if ! "$readelf" -s "$output" | awk '$4=="OBJECT" && $8=="kcomp_abi" && $7!="UND" && $3==8 {found=1} END{exit !found}'; then
+    echo "kcomp-link: kcomp_abi (8-byte STT_OBJECT) not defined in $output" >&2
     exit 1
 fi
 

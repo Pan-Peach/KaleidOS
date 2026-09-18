@@ -60,6 +60,37 @@ fn trace_abi_layouts_are_anchored() {
     assert_eq!(core::mem::align_of::<crate::abi::TraceStatsAbi>(), 8);
 }
 
+/// `KcompCreateArgs` 布局锚定（host = 64-bit 指针 → 24 字节）：C 头文件
+/// `struct KcompCreateArgs` 的 `_Static_assert` 与本测试必须同值；RV32 为 16。
+#[test]
+fn kcomp_create_args_layout_is_anchored() {
+    use crate::abi::KcompCreateArgs;
+    assert_eq!(core::mem::size_of::<KcompCreateArgs>(), 24);
+    assert_eq!(core::mem::align_of::<KcompCreateArgs>(), 8);
+    assert_eq!(core::mem::offset_of!(KcompCreateArgs, config), 8);
+    assert_eq!(core::mem::offset_of!(KcompCreateArgs, config_len), 16);
+}
+
+/// 生命周期入口的 Rust 镜像：函数指针 = 指针宽（C 侧 `KcompTaskEntry` /
+/// `kcomp_instance_create` 的 ABI 宽度由这里钉死）。
+#[test]
+fn lifecycle_entry_types_are_anchored() {
+    use crate::abi::{KcompInstanceCreate, KcompInstanceDestroy, KcompTaskEntry};
+    let ptr = core::mem::size_of::<usize>();
+    assert_eq!(core::mem::size_of::<KcompTaskEntry>(), ptr);
+    assert_eq!(core::mem::size_of::<KcompInstanceCreate>(), ptr);
+    assert_eq!(core::mem::size_of::<KcompInstanceDestroy>(), ptr);
+}
+
+/// `kcomp_abi` 指纹锚定（ASCII "KCOMPABI"）：Core 校验组件 ELF 里该符号的值，
+/// 数值本身可当 8 字节大端 ASCII 读出来——两个断言同时钉死数值与 tag 拼写。
+#[test]
+fn kcomp_abi_fingerprint_is_anchored() {
+    let abi = crate::abi::KCOMP_ABI;
+    assert_eq!(abi, 0x4B43_4F4D_5041_4249);
+    assert_eq!(&abi.to_be_bytes(), b"KCOMPABI");
+}
+
 /// `block.device` 名字 / kind 锚定：publish / bind 两侧必须逐字节一致，kind
 /// 必须为 Device（Core 拒绝同名不同 kind）；改动必须是一次刻意的测试修改。
 #[test]

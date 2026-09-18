@@ -9,13 +9,15 @@
 //!
 //! # 与优雅停止的分工（stop orchestration 已接线）
 //!
-//! - **失败路径（本模块）刻意不调用 `kcomp_exit`**：失败的组件不值得信任，
-//!   Linux 也不对崩溃模块执行 `module_exit`——Core 直接收回 authority。代价：
+//! - **失败路径（本模块）刻意不调用 `kcomp_instance_destroy`**：失败的组件不值得
+//!   信任，Linux 也不对崩溃模块执行 `module_exit`——Core 直接收回 authority。代价：
 //!   组件侧的设备收尾（stop DMA / reset / mask IRQ）不会发生，Core 的
-//!   revoke + 设备 quarantine 是唯一兜底（见 `docs/component-model.md` §5.2）。
+//!   revoke + device quarantine 是唯一兜底（见 docs/component-model.md §5.2）。
 //! - **优雅停止（`component/exit.rs::stop_component`）**先信任组件的
-//!   `kcomp_exit` 自行收尾，再调用本模块共享的 [`revoke_authority_and_unbind`]
-//!   兜底；两条路径的回收序列同源，只差状态提交。
+//!   `kcomp_instance_destroy` 自行收尾，再调用本模块共享的
+//!   [`revoke_authority_and_unbind`] 兜底；两条路径的回收序列同源，只差状态提交。
+//! - **未完整构造 / panicked 的实例绝不调用 destroy**（契约 §8）：create 失败、
+//!   发布提交失败与 panic 都只走本模块的状态提交 + 兜底。
 //!
 //! # 明确 DEFERRED（本增量不做）
 //!
@@ -100,6 +102,7 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
+        crate::component::image::init();
         interface::init();
         crate::handle::init();
 
@@ -144,9 +147,10 @@ mod tests {
         }
 
         // Given：Starting 组件 + 三个 authority + 一个已提交接口。
+        let image = crate::component::image::test_support::register_test_image(b"fail_demo", 0);
         let id = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(b"fail_demo", 1, 2, None).unwrap();
+            let id = reg.declare(image).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -185,7 +189,7 @@ mod tests {
         registry::get_registry().lock().finish_start(id).unwrap();
 
         // When：Core 编排组件失败。
-        fail_component(id, ComponentLoadError::InitFailed(1));
+        fail_component(id, ComponentLoadError::CreateFailed(1));
 
         // Then：三种 authority 都被撤销（generation 前进 → Stale）。
         assert_eq!(
@@ -241,6 +245,85 @@ mod tests {
         );
 
         // 清理：进程全局 quarantine 标记不能在用例间残留。
+        mmio::get_table().lock().clear_quarantine();
+    }
+
+    /// 契约核心：失败**只影响被选中的实例**——共享同一 image 的另一个实例
+    /// 保持 Ready，其 authority 原样（instance 才是 owner 单位）。
+    #[test]
+    fn failure_affects_only_the_selected_instance() {
+        let _machine = crate::machine::test_support::GUARD.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::component::image::init();
+        crate::handle::init();
+
+        // Given：两个共享同一 image 的 Ready 实例，各自持有一份 MMIO authority。
+        let image = crate::component::image::test_support::register_test_image(b"fail_two", 0);
+        let first = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let second = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        assert_ne!(first, second, "两个实例身份不同、image 相同");
+        let first_handle = mmio::get_table().lock().grant(
+            first,
+            MmioRegion {
+                base: 0x4000_0000,
+                size: 0x1000,
+                device_index: 40,
+            },
+        );
+        let second_handle = mmio::get_table().lock().grant(
+            second,
+            MmioRegion {
+                base: 0x4100_0000,
+                size: 0x1000,
+                device_index: 41,
+            },
+        );
+
+        // When：只让第一个实例失败。
+        fail_component(first, ComponentLoadError::CreateFailed(1));
+
+        // Then：第一个 Failed + authority 撤销 + 设备 quarantine；
+        // 第二个仍 Ready + handle 仍可用、设备未被 quarantine。
+        {
+            let reg = registry::get_registry().lock();
+            assert_eq!(reg.get(first).unwrap().state, ComponentState::Failed);
+            assert_eq!(reg.get(second).unwrap().state, ComponentState::Ready);
+        }
+        assert_eq!(
+            mmio::get_table()
+                .lock()
+                .get(first, first_handle)
+                .map(|_| ()),
+            Err(HandleError::Stale)
+        );
+        assert!(
+            mmio::get_table().lock().get(second, second_handle).is_ok(),
+            "未选中实例的 authority 必须原样"
+        );
+        assert!(mmio::get_table().lock().is_quarantined(40));
+        assert!(!mmio::get_table().lock().is_quarantined(41));
+
+        // 清理：释放未选中实例的 authority，并清掉进程全局 quarantine 标记。
+        mmio::get_table()
+            .lock()
+            .release(second, second_handle)
+            .unwrap();
         mmio::get_table().lock().clear_quarantine();
     }
 }
