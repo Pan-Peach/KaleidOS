@@ -22,7 +22,7 @@
 //! - **preempt_count**（Linux 式）：计数 > 0 时延迟抢占；更通用、规模更大，
 //!   等真实工作量需要时再上。
 
-use crate::component::ComponentId;
+use crate::component::{ComponentId, containment};
 use crate::handle::irq::{IrqDelivery, IrqHandler};
 use arch::{CpuArch, CpuImpl, InterruptController, InterruptImpl};
 
@@ -66,6 +66,9 @@ pub fn init() {
 /// 循环从中断控制器取一条 pending 中断 → [`route`] 取得投递处置 →
 /// 按处置执行（回调 inline / Polled 计数+掩蔽）→ `complete`。一次 trap 可能
 /// 对应多条 pending（PLIC 共享一个 mip 位），必须循环到 claim 返回 `None`。
+///
+/// Callback 投递在 Core 建立的 **IRQ 归属作用域**内执行（[`dispatch_callback`]）：
+/// principal = 该线 owner，`task = None`；作用域同步、不可 yield。
 pub extern "C" fn on_external() {
     while let Some(line) = InterruptImpl::claim() {
         crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq: line });
@@ -80,8 +83,14 @@ pub extern "C" fn on_external() {
         });
         match outcome {
             // Callback：锁内已取拷贝，这里在锁外直接调用（trap 可重入，
-            // 持锁调用组件代码会自死锁）。
-            RouteOutcome::Callback { handler, ctx, .. } => handler(ctx),
+            // 持锁调用组件代码会自死锁）。Core 用该线的 owner 建立 IRQ 归属
+            // 作用域：回调内 `ambient()` 解析为 line owner、task = None，而不是
+            // 被中断的执行；作用域同步、不可 yield，调度类操作在作用域内被拒绝。
+            RouteOutcome::Callback {
+                handler,
+                ctx,
+                owner,
+            } => dispatch_callback(handler, ctx, owner),
             // Polled：Core 计数；首个事件要求在锁外掩蔽该线，防止电平触发源
             // 在协作调度下反复打断。驱动任务随后 poll/ack 才重新放行。
             RouteOutcome::Polled { .. } => {
@@ -98,6 +107,19 @@ pub extern "C" fn on_external() {
         crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq: line });
         InterruptImpl::complete(line);
     }
+}
+
+/// 在 Core 建立的 IRQ 归属作用域内调用一个组件回调：principal = 该中断线的
+/// owner，`task = None`（IRQ 回调不是任务）。
+///
+/// 从 [`on_external`] 单独提出来，让 host 测试能走**生产路径**（host 的
+/// `claim()` 恒为 `None`，永远进不了 `on_external` 的循环体）。作用域由
+/// [`crate::component::containment::with_irq_scope`] 安装/恢复，同步、不可
+/// yield；因此调度类 Core 操作在回调内返回 errno 而不是 panic。它是**可信
+/// KernelNative 组件下的记账，不是认证边界**——Core 记录"这次投递属于谁"，
+/// 不能证明回调代码真的属于那个 owner。
+fn dispatch_callback(handler: IrqHandler, ctx: *mut (), owner: ComponentId) {
+    containment::with_irq_scope(owner, || handler(ctx));
 }
 
 /// [`route`] 的处置结果：锁内只读一份 Core 真相，实际动作在锁外执行。
@@ -221,6 +243,168 @@ mod tests {
         assert_eq!(number, Some(7));
 
         crate::handle::irq::get_table().lock().revoke_owner(owner);
+    }
+
+    // ------------------------------------------------------------------
+    // IRQ 归属：回调在 Core 建立的 line-owner 作用域内执行
+    // ------------------------------------------------------------------
+
+    static OBSERVED_COMPONENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static OBSERVED_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static NESTED_COMPONENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static RESTORED_COMPONENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    fn ambient_component_raw() -> usize {
+        crate::handle::RequestContext::ambient()
+            .map_or(usize::MAX, |ctx| ctx.component.raw() as usize)
+    }
+
+    /// 观测 ambient principal：组件 raw id（无 → `usize::MAX`）与是否带 task。
+    extern "C" fn observe_ambient(_ctx: *mut ()) {
+        let ambient = crate::handle::RequestContext::ambient();
+        OBSERVED_COMPONENT.store(ambient_component_raw(), Ordering::Release);
+        OBSERVED_TASK.store(
+            ambient.as_ref().is_some_and(|ctx| ctx.task.is_some()) as usize,
+            Ordering::Release,
+        );
+    }
+
+    /// 外层回调：先记录自己的 principal，转发内层回调，再记录恢复后的 principal。
+    extern "C" fn observe_outer(_ctx: *mut ()) {
+        OBSERVED_COMPONENT.store(ambient_component_raw(), Ordering::Release);
+        match route(43) {
+            RouteOutcome::Callback {
+                handler,
+                ctx,
+                owner,
+            } => dispatch_callback(handler, ctx, owner),
+            _ => NESTED_COMPONENT.store(usize::MAX, Ordering::Release),
+        }
+        RESTORED_COMPONENT.store(ambient_component_raw(), Ordering::Release);
+    }
+
+    extern "C" fn observe_inner(_ctx: *mut ()) {
+        NESTED_COMPONENT.store(ambient_component_raw(), Ordering::Release);
+    }
+
+    /// 验收：`route` 给出的 owner 就是回调内的 principal —— `dispatch_callback`
+    /// （`on_external` 的生产调用）让 `ambient()` 解析为 line owner、`task =
+    /// None`，而不是被中断的执行。
+    #[test]
+    fn callback_dispatch_attributes_to_line_owner() {
+        let _serial = IRQ_TEST_LOCK.lock();
+        let _boundary = crate::component::containment::test_boundary_lock();
+        crate::component::containment::enter_anchor();
+        crate::handle::irq::init();
+        let owner = ComponentId::from_raw(0xfeed);
+        let handle = crate::handle::irq::get_table()
+            .lock()
+            .grant(owner, Irq::new(42, 0));
+        crate::handle::irq::get_table()
+            .lock()
+            .set_delivery(
+                owner,
+                handle,
+                IrqDelivery::new(observe_ambient, core::ptr::null_mut()),
+            )
+            .unwrap();
+        OBSERVED_COMPONENT.store(usize::MAX, Ordering::Release);
+        OBSERVED_TASK.store(usize::MAX, Ordering::Release);
+
+        match route(42) {
+            RouteOutcome::Callback {
+                handler,
+                ctx,
+                owner: routed,
+            } => {
+                assert_eq!(routed, owner, "route yields the Core-truth line owner");
+                dispatch_callback(handler, ctx, routed);
+            }
+            _ => panic!("expected Callback disposition"),
+        }
+
+        assert_eq!(
+            OBSERVED_COMPONENT.load(Ordering::Acquire),
+            owner.raw() as usize,
+            "principal inside the callback is the IRQ line's owner"
+        );
+        assert_eq!(
+            OBSERVED_TASK.load(Ordering::Acquire),
+            0,
+            "an IRQ callback carries no task"
+        );
+        assert!(
+            !crate::component::containment::in_irq_context(),
+            "scope is restored after the callback"
+        );
+
+        crate::component::containment::enter_anchor();
+        crate::handle::irq::get_table().lock().revoke_owner(owner);
+    }
+
+    /// 验收：嵌套回调按后进先出恢复 —— 内层看到内层 line owner，内层返回后
+    /// 外层重新看到外层 line owner，外层返回后 IRQ scope 清空。
+    #[test]
+    fn nested_callback_dispatch_restores_in_order() {
+        let _serial = IRQ_TEST_LOCK.lock();
+        let _boundary = crate::component::containment::test_boundary_lock();
+        crate::component::containment::enter_anchor();
+        crate::handle::irq::init();
+        let outer = ComponentId::from_raw(0x0AA);
+        let inner = ComponentId::from_raw(0x0BB);
+        let outer_handle = crate::handle::irq::get_table()
+            .lock()
+            .grant(outer, Irq::new(42, 0));
+        let inner_handle = crate::handle::irq::get_table()
+            .lock()
+            .grant(inner, Irq::new(43, 0));
+        crate::handle::irq::get_table()
+            .lock()
+            .set_delivery(
+                outer,
+                outer_handle,
+                IrqDelivery::new(observe_outer, core::ptr::null_mut()),
+            )
+            .unwrap();
+        crate::handle::irq::get_table()
+            .lock()
+            .set_delivery(
+                inner,
+                inner_handle,
+                IrqDelivery::new(observe_inner, core::ptr::null_mut()),
+            )
+            .unwrap();
+        OBSERVED_COMPONENT.store(usize::MAX, Ordering::Release);
+        NESTED_COMPONENT.store(usize::MAX, Ordering::Release);
+        RESTORED_COMPONENT.store(usize::MAX, Ordering::Release);
+
+        match route(42) {
+            RouteOutcome::Callback {
+                handler,
+                ctx,
+                owner,
+            } => dispatch_callback(handler, ctx, owner),
+            _ => panic!("expected Callback disposition"),
+        }
+
+        assert_eq!(
+            OBSERVED_COMPONENT.load(Ordering::Acquire),
+            outer.raw() as usize
+        );
+        assert_eq!(
+            NESTED_COMPONENT.load(Ordering::Acquire),
+            inner.raw() as usize
+        );
+        assert_eq!(
+            RESTORED_COMPONENT.load(Ordering::Acquire),
+            outer.raw() as usize,
+            "outer scope is effective again after the nested callback"
+        );
+        assert!(!crate::component::containment::in_irq_context());
+
+        crate::component::containment::enter_anchor();
+        crate::handle::irq::get_table().lock().revoke_owner(outer);
+        crate::handle::irq::get_table().lock().revoke_owner(inner);
     }
 
     // ------------------------------------------------------------------

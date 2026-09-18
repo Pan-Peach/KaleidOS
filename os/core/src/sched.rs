@@ -56,11 +56,26 @@ pub enum SchedError {
     /// 没有绑定的 SchedulerPolicy（`scheduler`/Policy 未 publish 或 provider 已 Failed）。
     NoPolicy,
     /// 任务表状态机拒绝推进（yield/exit 时当前任务不是 Running 等）。
+    ///
+    /// 也用于**上下文种类拒绝**：调度操作不得在 IRQ 回调作用域内执行
+    /// （`containment::in_irq_context`，见 [`deny_in_irq_context`]），ABI 上是
+    /// `-EINVAL`。复用本变体是为了不改内部错误枚举与唯一的 errno 映射表。
     InvalidTransition,
     /// 当前任务从表中消失（Core 不变式被破坏，不应发生）。
     NotFound,
     /// yield/exit 调用时本 CPU 没有在跑任务（只有任务能 yield/exit）。
     NoCurrent,
+}
+
+/// 上下文种类门禁：IRQ 回调是同步、不可 yield 的顶半部，调度操作在里面一律
+/// 拒绝（返回 `-EINVAL`，绝不 panic），因为 `schedule_next` 会在 trap 上下文里
+/// 做 context switch、且没有 Core 拥有的恢复点。Core 机制层就拒绝，ABI 边界
+/// （`component/export.rs`）保持原样。
+fn deny_in_irq_context() -> Result<(), SchedError> {
+    if containment::in_irq_context() {
+        return Err(SchedError::InvalidTransition);
+    }
+    Ok(())
 }
 
 /// 本 CPU 的调度真相：锚点上下文 + 当前任务。
@@ -323,6 +338,7 @@ pub(crate) fn abort_current_task(task: TaskId, owner: ComponentId) -> ! {
 /// 任务轮流跑到尽。没有 Runnable 任务时直接返回（no-op）。
 /// 全部任务退出（或阻塞）后，控制权在锚点上下文回到调用者。
 pub fn run() -> Result<(), SchedError> {
+    deny_in_irq_context()?;
     if collect_runnable().is_empty() {
         return Ok(());
     }
@@ -331,6 +347,7 @@ pub fn run() -> Result<(), SchedError> {
 
 /// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
 pub fn yield_current() -> Result<(), SchedError> {
+    deny_in_irq_context()?;
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Runnable), None)
 }
@@ -338,6 +355,7 @@ pub fn yield_current() -> Result<(), SchedError> {
 /// 当前任务退出：Running → Exited，切换走。**本任务从此不再恢复**——
 /// 若还有 Runnable 任务则它们接管；全部退出后控制权回到锚点。
 pub fn exit_current() -> Result<(), SchedError> {
+    deny_in_irq_context()?;
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Exited), None)
 }
@@ -464,6 +482,7 @@ mod tests {
     #[test]
     fn run_with_no_runnable_tasks_is_noop() {
         let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
         crate::memory::test_support::ensure_init();
         let _guard = crate::memory::test_support::GUARD.lock();
         crate::task::init();
@@ -478,6 +497,7 @@ mod tests {
     #[test]
     fn failed_component_tasks_are_not_scheduled() {
         let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
         crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::task::init();
@@ -1095,6 +1115,7 @@ mod tests {
     #[test]
     fn yield_and_exit_without_current_task_are_rejected() {
         let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
         crate::task::init();
         init();
         reset_cpu();
@@ -1103,6 +1124,38 @@ mod tests {
         assert_eq!(yield_current(), Err(SchedError::NoCurrent));
         assert_eq!(exit_current(), Err(SchedError::NoCurrent));
         assert_eq!(current_task(), None);
+    }
+
+    /// 上下文种类门禁：IRQ 回调作用域内 `run` / `yield` / `exit` 一律拒绝
+    /// （`-EINVAL`，ABI 上是负 errno），绝不 panic、绝不切换任务；离开作用域后
+    /// 被中断的上下文恢复，正常路径不受影响。
+    #[test]
+    fn scheduler_operations_are_rejected_in_irq_context() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+            assert_eq!(run(), Err(SchedError::InvalidTransition));
+            assert_eq!(yield_current(), Err(SchedError::InvalidTransition));
+            assert_eq!(exit_current(), Err(SchedError::InvalidTransition));
+            assert_eq!(
+                crate::errno::Errno::from(SchedError::InvalidTransition).code(),
+                -22,
+                "ABI 上是负 errno（EINVAL），不是 panic"
+            );
+        });
+
+        // 离开 scope：上下文种类恢复，不再走 IRQ 拒绝路径（其它用例可能留下
+        // 无关 Runnable 任务，故只断言不再是 IRQ 拒绝）。
+        assert!(!containment::in_irq_context());
+        assert_ne!(run(), Err(SchedError::InvalidTransition));
+        assert_eq!(current_task(), None);
+        containment::enter_anchor();
     }
 
     /// 非法转换（yield）：current 指向一个已 `Exited` 的任务（陈旧 current，

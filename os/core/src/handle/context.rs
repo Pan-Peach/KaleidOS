@@ -8,6 +8,8 @@
 //! - inside a component `kcomp_instance_create` (including a **nested** create)
 //!   the principal is the component instance being created;
 //! - inside a component task the principal is that task's owner;
+//! - inside an IRQ callback scope (`containment::with_irq_scope`) the principal
+//!   is the **IRQ line's owner** with no task — never the interrupted execution;
 //! - after a nested create returns **or panics**, the containment guard stack
 //!   restores the previous boundary (each guard stores the pointer it replaced),
 //!   so the enclosing task/create principal is effective again.
@@ -68,16 +70,18 @@ impl RequestContext {
     /// Like [`Self::ambient`] but restricted to an active `kcomp_instance_create`
     /// boundary.
     ///
-    /// Interface publication is a create-time operation: a component task and a
-    /// `kcomp_instance_destroy` hook are active boundaries but are not valid
-    /// publication principals.
+    /// Interface publication is a create-time operation: a component task, a
+    /// `kcomp_instance_destroy` hook, and an **IRQ callback scope** are active
+    /// boundaries but are not valid publication principals.  In particular, an
+    /// IRQ scope must not confer create-time publication permission even though
+    /// it establishes a principal for resource requests.
     pub(crate) fn ambient_init() -> Option<Self> {
         match containment::active_escape()?.kind {
             EscapeKind::Init { owner } => owner.map(|component| Self {
                 component,
                 task: None,
             }),
-            EscapeKind::Exit { .. } | EscapeKind::Task { .. } => None,
+            EscapeKind::Exit { .. } | EscapeKind::Task { .. } | EscapeKind::Irq { .. } => None,
         }
     }
 }
@@ -157,6 +161,84 @@ mod tests {
             RequestContext::ambient().unwrap().component,
             ComponentId::from_raw(3)
         );
+
+        containment::enter_anchor();
+    }
+
+    /// An IRQ callback scope resolves to the IRQ line's owner with `task = None`,
+    /// overriding the interrupted task, and the task boundary is restored after.
+    #[test]
+    fn irq_scope_resolves_to_line_owner_and_restores_task_boundary() {
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        containment::enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        let irq_owner = ComponentId::from_raw(0xBEEF);
+        containment::with_irq_scope(irq_owner, || {
+            let ctx = RequestContext::ambient().expect("IRQ scope is a boundary");
+            assert_eq!(ctx.component, irq_owner, "IRQ owner is the principal");
+            assert_eq!(ctx.task, None, "an IRQ callback is not a task");
+        });
+
+        let restored = RequestContext::ambient().expect("interrupted task restored");
+        assert_eq!(restored.component, ComponentId::from_raw(3));
+        assert_eq!(restored.task, Some(TaskId::from_raw(7)));
+        containment::enter_anchor();
+    }
+
+    /// Nested IRQ scopes resolve to the innermost line owner and restore in
+    /// order (inner → outer → interrupted task).
+    #[test]
+    fn nested_irq_scopes_resolve_innermost_and_restore_in_order() {
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        containment::enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        let outer = ComponentId::from_raw(9);
+        let inner = ComponentId::from_raw(11);
+        containment::with_irq_scope(outer, || {
+            assert_eq!(RequestContext::ambient().unwrap().component, outer);
+            containment::with_irq_scope(inner, || {
+                let ctx = RequestContext::ambient().unwrap();
+                assert_eq!(ctx.component, inner, "innermost IRQ owner wins");
+                assert_eq!(ctx.task, None);
+            });
+            assert_eq!(
+                RequestContext::ambient().unwrap().component,
+                outer,
+                "inner scope restored the outer IRQ scope"
+            );
+        });
+
+        let restored = RequestContext::ambient().unwrap();
+        assert_eq!(restored.component, ComponentId::from_raw(3));
+        assert_eq!(restored.task, Some(TaskId::from_raw(7)));
+        containment::enter_anchor();
+    }
+
+    /// The IRQ scope is an attribution boundary, **not** a create boundary:
+    /// `ambient_init()` stays unavailable inside it, and a surrounding create
+    /// boundary is effective again once the IRQ scope returns.
+    #[test]
+    fn irq_scope_does_not_confer_create_publication() {
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+
+        let creator = ComponentId::from_raw(5);
+        containment::with_test_init_boundary(Some(creator), || {
+            assert_eq!(RequestContext::ambient_init().unwrap().component, creator);
+            containment::with_irq_scope(ComponentId::from_raw(6), || {
+                assert!(
+                    RequestContext::ambient_init().is_none(),
+                    "IRQ scope must not look like a create boundary"
+                );
+            });
+            assert_eq!(
+                RequestContext::ambient_init().unwrap().component,
+                creator,
+                "create boundary is effective again after the IRQ scope"
+            );
+        });
 
         containment::enter_anchor();
     }

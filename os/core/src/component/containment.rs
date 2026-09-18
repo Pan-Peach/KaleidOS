@@ -35,6 +35,25 @@
 //! restored when control returns to the anchor ([`enter_anchor`]); this also
 //! preserves an enclosing init guard when a component task drives the scheduler.
 //!
+//! # IRQ attribution scope
+//!
+//! [`with_irq_scope`] layers one more boundary over the active guard around one
+//! component IRQ callback ([`crate::irq::on_external`]): the principal is the
+//! **IRQ line's owner** (Core truth from the routing table) with `task = None`,
+//! never the interrupted execution.  The scope stores the guard it replaced and
+//! restores it **explicitly** (same discipline as the create/destroy boundaries);
+//! nested scopes restore in order.  It is **bookkeeping for trusted
+//! KernelNative components, not an authentication boundary** — it records who
+//! Core is dispatching for, it cannot prove the callback code really belongs to
+//! that owner.
+//!
+//! An IRQ scope is synchronous and non-yielding: scheduler-affecting Core calls
+//! are rejected while it is active (see [`in_irq_context`]).  It is also **not
+//! escapable**: [`panic_escape`] restores the interrupted guard and refuses,
+//! because an IRQ callback has no Core-owned context to resume and escaping
+//! into the interrupted task would misattribute the callback's panic.  A panic
+//! inside an IRQ scope therefore stays fatal.
+//!
 //! # Diagnostics
 //!
 //! [`active_escape`] is the lock-free read side used by the boot panic handler;
@@ -153,6 +172,15 @@ pub enum EscapeKind {
     Exit { owner: ComponentId },
     /// A component task running on its own kernel stack.
     Task { task: TaskId, owner: ComponentId },
+    /// A component IRQ callback running synchronously on the trap path
+    /// ([`crate::irq::on_external`]).
+    ///
+    /// The owner is the **IRQ line's owner** (Core truth from the routing
+    /// table), never the interrupted execution; there is no task because an
+    /// IRQ callback is not a task.  Installed by [`with_irq_scope`], which is
+    /// cooperative bookkeeping — not an authentication boundary — and is
+    /// neither yielding nor escapable (see the module docs).
+    Irq { owner: ComponentId },
 }
 
 /// Lock-free snapshot of the active escape guard, for boot diagnostics.
@@ -169,13 +197,14 @@ impl EscapeInfo {
             EscapeKind::Init { owner } => owner,
             EscapeKind::Exit { owner } => Some(owner),
             EscapeKind::Task { owner, .. } => Some(owner),
+            EscapeKind::Irq { owner } => Some(owner),
         }
     }
 
-    /// Running task id, or `None` at the init and exit boundaries.
+    /// Running task id, or `None` at the init, exit, and IRQ boundaries.
     pub fn task(self) -> Option<TaskId> {
         match self.kind {
-            EscapeKind::Init { .. } | EscapeKind::Exit { .. } => None,
+            EscapeKind::Init { .. } | EscapeKind::Exit { .. } | EscapeKind::Irq { .. } => None,
             EscapeKind::Task { task, .. } => Some(task),
         }
     }
@@ -289,6 +318,20 @@ pub fn active_escape() -> Option<EscapeInfo> {
     Some(EscapeInfo { kind })
 }
 
+/// Whether the active Core-managed boundary is an IRQ callback
+/// ([`EscapeKind::Irq`]) — the context-kind gate for operations that must not
+/// run in a synchronous, non-yielding top half.
+///
+/// The Core mechanisms (`sched::run` / `yield_current` / `exit_current`,
+/// `task::create_task` / `start_task`) consult this and return an errno
+/// instead of panicking.  Lock-free: one read of the active guard.
+pub(crate) fn in_irq_context() -> bool {
+    matches!(
+        active_escape().map(|info| info.kind),
+        Some(EscapeKind::Irq { .. })
+    )
+}
+
 /// Calls a component **create entry** (`kcomp_instance_create`) on a Core-owned
 /// stack, under the identity of the instance Core is initializing
 /// (`load::current_component`, which also covers nested loads).
@@ -371,6 +414,46 @@ fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutc
     };
     let _ = memory::free_region(stack);
     outcome
+}
+
+/// Runs `f` inside an **IRQ attribution scope** ([`EscapeKind::Irq`]): Core
+/// calls made by `f` resolve to `owner` with `task = None`.
+///
+/// Installed by [`crate::irq::on_external`] around exactly one component
+/// callback, using the same save/replace/restore discipline as the create and
+/// destroy boundaries: the interrupted guard (task / init / exit / anchor) is
+/// captured in the scope record and restored **explicitly** after `f` returns,
+/// so nesting restores in order.  There is deliberately no `Drop` recovery —
+/// the codebase has no unwinding (`panic = "abort"`); if a panic escapes the
+/// scope, [`panic_escape`] restores the interrupted guard and refuses the
+/// escape (fatal).
+///
+/// This is **bookkeeping for trusted KernelNative components, not an
+/// authentication boundary**: it records who Core is dispatching for, it cannot
+/// prove the callback code really belongs to `owner`.  The scope is synchronous
+/// and non-yielding; scheduler-affecting Core operations are rejected while it
+/// is active ([`in_irq_context`]).
+pub(crate) fn with_irq_scope<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R {
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::Irq { owner },
+        // Never used: an IRQ scope is not escapable (see `panic_escape`), and no
+        // context switch may be attempted from the trap context.
+        from_context: core::ptr::null_mut(),
+        to_context: core::ptr::null_mut(),
+        call: IsolatedCall::None,
+        returned: 0,
+        state: GuardState::new(None),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    // Explicit restore (no unwinding; see module docs).  The record captured
+    // the guard it replaced, so nested IRQ scopes pop in order.
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
 }
 
 /// Scheduler hook: install the ambient guard before switching **into** a task.
@@ -473,9 +556,12 @@ fn switch_to_core(guard: &mut EscapeGuard) -> ! {
 ///
 /// Both the init and the task boundary escape through `from_context` →
 /// `to_context`; the resumed Core context performs the containment bookkeeping.
-/// Returns `false` when the panic originated outside an isolated component.
-/// A `true` result is unreachable in a functioning context backend because the
-/// switch resumes the Core context instead of this panic handler.
+/// Returns `false` when the panic originated outside an isolated component, or
+/// inside an IRQ attribution scope ([`with_irq_scope`]) — an IRQ callback has no
+/// Core context to resume, so its panic stays fatal (the interrupted guard is
+/// restored before returning).  A `true` result is unreachable in a functioning
+/// context backend because the switch resumes the Core context instead of this
+/// panic handler.
 pub fn panic_escape() -> bool {
     let Some(guard_ptr) = active_guard() else {
         return false;
@@ -483,6 +569,20 @@ pub fn panic_escape() -> bool {
     // SAFETY: `guard_ptr` is installed by the suspended caller/scheduler on this
     // CPU and remains valid until it is replaced after the switch back.
     let guard = unsafe { &mut *guard_ptr };
+    if let EscapeKind::Irq { .. } = guard.kind {
+        // An IRQ attribution scope has no Core-owned context to resume, and
+        // escaping into the interrupted task would misattribute the callback's
+        // panic to a task that did not panic.  Restore the interrupted guard
+        // (explicit recovery — never rely on `Drop`, there is no unwinding) and
+        // report the panic as uncontained: it stays fatal.  A stale IRQ scope
+        // therefore cannot outlive the escape attempt.
+        let previous = match guard.state.previous() {
+            Some(previous) => previous,
+            None => core::ptr::null_mut(),
+        };
+        let _ = replace_active(previous);
+        return false;
+    }
     guard.state.mark_panicked();
     switch_to_core(guard)
 }
@@ -687,6 +787,97 @@ mod tests {
         // When / Then: it names the instance and has no task.
         assert_eq!(info.owner(), Some(ComponentId::from_raw(9)));
         assert_eq!(info.task(), None);
+    }
+
+    #[test]
+    fn escape_info_reports_irq_owner_without_task() {
+        // Given: an IRQ attribution scope for the line owner 7.
+        let info = EscapeInfo {
+            kind: EscapeKind::Irq {
+                owner: ComponentId::from_raw(7),
+            },
+        };
+
+        // When / Then: it names the line owner and carries no task.
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(7)));
+        assert_eq!(info.task(), None);
+    }
+
+    /// 验收：IRQ scope 报告 line owner / 无 task；离开后**被中断的 task 边界**
+    /// 原样恢复，且上下文种类不再是 IRQ。
+    #[test]
+    fn irq_scope_installs_owner_and_restores_interrupted_boundary() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+        assert!(!in_irq_context());
+
+        let owner = ComponentId::from_raw(0xBEEF);
+        with_irq_scope(owner, || {
+            assert!(in_irq_context(), "IRQ scope is the active context kind");
+            let info = active_escape().expect("IRQ scope is an active boundary");
+            assert_eq!(info.owner(), Some(owner));
+            assert_eq!(info.task(), None, "an IRQ callback is not a task");
+        });
+
+        assert!(!in_irq_context());
+        let info = active_escape().expect("interrupted task boundary restored");
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        enter_anchor();
+    }
+
+    /// 验收：嵌套 IRQ scope 按后进先出恢复（内层退出 → 外层，外层退出 → task）。
+    #[test]
+    fn nested_irq_scopes_restore_in_order() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        let outer = ComponentId::from_raw(9);
+        let inner = ComponentId::from_raw(11);
+        with_irq_scope(outer, || {
+            assert_eq!(active_escape().unwrap().owner(), Some(outer));
+            with_irq_scope(inner, || {
+                assert_eq!(active_escape().unwrap().owner(), Some(inner));
+            });
+            assert_eq!(
+                active_escape().unwrap().owner(),
+                Some(outer),
+                "inner scope restores the outer IRQ scope"
+            );
+        });
+
+        let info = active_escape().expect("task boundary restored");
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        enter_anchor();
+    }
+
+    /// 验收：IRQ scope 内 panic escape 被拒绝（返回 `false`，panic 在 IRQ
+    /// 上下文致命），且**当场**恢复被中断的 guard —— 不会留下 stale IRQ scope，
+    /// 也不会把回调 panic 误算到被中断的 task 头上。
+    #[test]
+    fn panic_escape_inside_irq_scope_restores_and_refuses() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+            assert!(
+                !panic_escape(),
+                "IRQ scope has no Core context to resume — escape refused"
+            );
+            assert!(!in_irq_context(), "stale IRQ scope must not survive");
+            let info = active_escape().expect("interrupted guard restored by panic_escape");
+            assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+            assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        });
+
+        // The scope's own explicit restore at return is idempotent.
+        let info = active_escape().expect("task boundary still restored");
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        enter_anchor();
     }
 
     #[test]

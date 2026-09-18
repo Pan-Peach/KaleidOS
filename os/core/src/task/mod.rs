@@ -16,7 +16,7 @@ pub use record::TaskRecord;
 pub use state::TaskState;
 pub use table::TaskTable;
 
-use crate::component::{ComponentId, ComponentState};
+use crate::component::{ComponentId, ComponentState, containment};
 
 pub static TASK_TABLE: spin::Once<spin::Mutex<TaskTable>> = spin::Once::new();
 
@@ -52,6 +52,13 @@ pub fn create_task(
     entry: usize,
     arg: *mut (),
 ) -> Result<TaskId, TaskError> {
+    // 上下文种类门禁：IRQ 回调是同步、不可 yield 的顶半部，不得创建 work
+    //（创建任务会分配内核栈/新执行流）。Core 机制层拒绝，返回 `-EINVAL`
+    //（复用 `InvalidTransition`，不改内部错误枚举与唯一 errno 映射表），
+    // 绝不 panic。
+    if containment::in_irq_context() {
+        return Err(TaskError::InvalidTransition);
+    }
     // 锁序：registry → image（先后取得、不嵌套持有）。
     let image = {
         let registry = crate::component::registry::get_registry().lock();
@@ -86,7 +93,13 @@ pub fn create_task(
 ///
 /// 任务 ID 只是可猜测的 identity；Core 必须在状态转换前验证 requester
 /// 是否等于任务记录中的 owner。
+///
+/// 上下文种类门禁：IRQ 回调作用域内拒绝启动任务（`-EINVAL`），理由同
+/// [`create_task`]。
 pub fn start_task(requester: ComponentId, task: TaskId) -> Result<(), TaskError> {
+    if containment::in_irq_context() {
+        return Err(TaskError::InvalidTransition);
+    }
     get_task_table().lock().start(requester, task)
 }
 
@@ -166,6 +179,7 @@ mod tests {
     #[test]
     fn create_task_rejects_undeclared_requester() {
         // Given: 一个从未声明的身份（ID 可被猜测，但存在性由 Core 验证）。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let ghost = ComponentId::from_raw(0xFFFF_FF00);
         let before = get_task_table().lock().len();
@@ -185,6 +199,7 @@ mod tests {
     #[test]
     fn create_task_rejects_requester_that_is_not_live() {
         // Given: 三个存在但非 Starting/Ready 的实例。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let before = get_task_table().lock().len();
         let image = image::test_support::register_test_image(b"task_perm_states", 0);
@@ -231,6 +246,7 @@ mod tests {
     #[test]
     fn create_task_rejects_entry_outside_loaded_image() {
         // Given: 一个带装载镜像 lease（[base, base+size)）的 Starting 组件。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let (id, base, size) = starting_component(b"task_perm_entry");
         let before = get_task_table().lock().len();
@@ -262,6 +278,7 @@ mod tests {
     #[test]
     fn create_task_rejects_unregistered_image() {
         // Given: 一个 Starting 但 image 未登记的实例（不应发生的 Core 状态）。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let id = {
             let mut reg = registry::get_registry().lock();
@@ -283,6 +300,7 @@ mod tests {
     #[test]
     fn create_task_accepts_entry_inside_loaded_image() {
         // Given: 一个带装载镜像的 Starting 组件。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let (id, base, size) = starting_component(b"task_perm_ok");
         let entry = base + 0x80;
@@ -312,6 +330,7 @@ mod tests {
     #[test]
     fn instances_sharing_one_image_own_tasks_independently() {
         // Given：同名的两份 image 登记（实为同一份）与两个 Starting 实例。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let image = image::test_support::register_test_image(b"task_share_image", 0);
         let (first, first_base, first_size) = {
@@ -364,6 +383,7 @@ mod tests {
     #[test]
     fn start_task_rejects_wrong_owner() {
         // Given: 一个属于某组件的任务。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let (owner, base, _size) = starting_component(b"task_start_wrong_owner");
         let task = create_task(owner, base, core::ptr::null_mut()).unwrap();
@@ -386,6 +406,7 @@ mod tests {
     #[test]
     fn start_task_unknown_id_is_not_found() {
         // Given: 表内没有该 id（ID 可被猜测；存在性先于所有权验证）。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let ghost = TaskId::from_raw(0xFFFF_FFFF);
 
@@ -399,6 +420,7 @@ mod tests {
     #[test]
     fn start_task_by_owner_moves_created_to_runnable() {
         // Given: 一个由活组件拥有的 Created 任务。
+        let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let (owner, base, _size) = starting_component(b"task_start_ok");
         let task = create_task(owner, base, core::ptr::null_mut()).unwrap();
@@ -418,5 +440,40 @@ mod tests {
         );
 
         get_task_table().lock().remove(task).unwrap();
+    }
+
+    /// 上下文种类门禁：IRQ 回调作用域内不得创建/启动任务 —— 两个语义入口都
+    /// 返回 `-EINVAL`（负 errno），且不在真相上产生任何任务（拒绝而非 panic）。
+    ///
+    /// 不取 `setup()` 的 memory GUARD：本用例不分配，而调度测试的锁序是
+    /// boundary → memory，这里若 memory → boundary 会与它们死锁。
+    #[test]
+    fn task_create_and_start_are_rejected_in_irq_context() {
+        crate::task::init();
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        let requester = ComponentId::from_raw(0xfeed);
+
+        containment::with_irq_scope(ComponentId::from_raw(9), || {
+            assert_eq!(
+                create_task(requester, 0x1000, core::ptr::null_mut()),
+                Err(TaskError::InvalidTransition)
+            );
+            assert_eq!(
+                start_task(requester, TaskId::from_raw(1)),
+                Err(TaskError::InvalidTransition)
+            );
+            assert_eq!(
+                crate::errno::Errno::from(TaskError::InvalidTransition).code(),
+                -22,
+                "ABI 上是负 errno（EINVAL），不是 panic"
+            );
+        });
+
+        assert!(
+            !get_task_table().lock().has_live_tasks(requester),
+            "IRQ 上下文的拒绝不得创建任务"
+        );
+        containment::enter_anchor();
     }
 }
