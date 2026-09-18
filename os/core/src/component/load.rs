@@ -202,7 +202,9 @@ fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError
         .map_err(|_| ComponentLoadError::ImageFailed)
 }
 
-#[cfg(test)]
+// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（REAL_KPKG）；
+// KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控。
+#[cfg(all(test, not(no_kcomp)))]
 mod tests {
     use super::*;
     use crate::component::ComponentState;

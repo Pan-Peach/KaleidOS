@@ -11,6 +11,16 @@ use std::process::Command;
 const RV32_TARGET: &str = "riscv32imac-unknown-none-elf";
 const RV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
+/// Core-only 开发开关：非空且不等于 `0` 视为开启。开启时跳过下面全部组件
+/// fixture 构建，让 Core 在 `os/components/**` 暂时损坏时仍能单独构建 / host 测试
+/// （`make core` / `make qemu-core` 会导出它）。
+const CORE_ONLY_ENV: &str = "KALEIDOS_CORE_ONLY";
+
+/// 见 [`CORE_ONLY_ENV`]。
+fn core_only() -> bool {
+    matches!(std::env::var(CORE_ONLY_ENV).as_deref(), Ok(value) if !value.is_empty() && value != "0")
+}
+
 fn main() {
     let target = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv32") {
         RV32_TARGET
@@ -22,6 +32,12 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let target_dir = out.join("component-target");
 
+    // 两种模式都无条件声明 `no_kcomp`：Core-only 下由本脚本开启；默认模式下
+    // `cfg(no_kcomp)` 虽未定义但已被 check-cfg 声明，clippy 的 unexpected_cfgs
+    // 不会因测试上的 `not(no_kcomp)` 而报警。切换开关需重跑脚本。
+    println!("cargo:rustc-check-cfg=cfg(no_kcomp)");
+    println!("cargo:rerun-if-env-changed={CORE_ONLY_ENV}");
+
     transport_trace_capacity(&out);
 
     // Benchmark 报告要写明 git commit（`bench::report_environment`）。commit 由
@@ -31,6 +47,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KALEIDOS_GIT_COMMIT");
     if let Ok(commit) = std::env::var("KALEIDOS_GIT_COMMIT") {
         println!("cargo:rustc-env=KALEIDOS_GIT_COMMIT={commit}");
+    }
+
+    // Core-only：不构建任何组件 fixture（`os/components/**` 可能暂时损坏），
+    // 因此不产生 OUT_DIR 的 *.kcomp / init.kpkg；依赖这些 fixture 的测试由
+    // `cfg(no_kcomp)` 门控。上面的 trace capacity / git commit 已照常转发。
+    if core_only() {
+        println!("cargo:rustc-cfg=no_kcomp");
+        return;
     }
 
     // 组件 → .kcomp 的构建管线（与 Makefile 共用脚本）：Rust 前端

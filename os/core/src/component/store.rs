@@ -140,7 +140,9 @@ pub fn get_component_store() -> Option<&'static dyn ComponentStore> {
     STORE.get().map(|s| s as &dyn ComponentStore)
 }
 
-#[cfg(test)]
+// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（REAL_KPKG）；
+// KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控（其他测试照常运行）。
+#[cfg(all(test, not(no_kcomp)))]
 mod tests {
     use super::*;
     use alloc::boxed::Box;

@@ -726,6 +726,9 @@ mod tests {
         assert_eq!(object.sections()[1].align, 2);
     }
 
+    // 需要 os/core/build.rs 生成的真实 `.kcomp` fixture；KALEIDOS_CORE_ONLY 下
+    // 跳过组件构建，故用 `no_kcomp` 门控（本模块其余用例两种模式都运行）。
+    #[cfg(not(no_kcomp))]
     #[test]
     fn real_kcomp_parses_as_elf64() {
         let kcomp = include_bytes!(concat!(env!("OUT_DIR"), "/core_test.kcomp"));

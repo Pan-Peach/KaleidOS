@@ -75,6 +75,8 @@ endif
 BOOT_RUSTFLAGS := $(REMAP_RUSTFLAGS) -C link-arg=-T$(KCFG_LINKER)
 KERNEL := $(BOOT_DIR)/target/$(KCFG_TARGET)/release/bootstrap
 OUTPUT := kaleidos-$(KCFG_ARCH)$(if $(filter y,$(KCFG_SELFTEST)),-selftest,)
+# Core-only 开发镜像的产物名：故意与真实镜像区分，永远不会被误当成完整系统。
+CORE_OUTPUT := kaleidos-$(KCFG_ARCH)-core
 
 # ————————————————————————— configuration targets —————————————————————————
 .PHONY: menuconfig olddefconfig savedefconfig syncconfig defconfig help FORCE
@@ -118,6 +120,8 @@ help:
 	@echo "KaleidOS — build"
 	@echo "  make kernel                      build kaleidos-\$$(KCFG_ARCH)"
 	@echo "  make qemu                        build + run in QEMU"
+	@echo "  make core                        Core-only dev image (skips all components)"
+	@echo "  make qemu-core                   run the Core-only dev image (no rootfs drive)"
 	@echo "  make rootfs                      build the small FAT image attached to make qemu"
 	@echo "  make check | test-host | test-build | test-kconfig | test-qemu | test-arch | test-driver-prober"
 
@@ -130,7 +134,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 	@$(GENMK) --config $(KCONFIG_CONFIG) --mk $@
 
 # ————————————————————————— build —————————————————————————
-.PHONY: kernel qemu rootfs clean distclean init.kpkg
+.PHONY: kernel qemu core qemu-core rootfs clean distclean init.kpkg
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
 # 两段管线：语言前端（Rust: tools/build-kcomp.sh / C: tools/build-kcomp-c.sh）
@@ -176,6 +180,23 @@ kernel: init.kpkg
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
+# —— Core-only 开发镜像：跳过全部组件，只验证 Core + boot 能否在真实目标启动 ——
+# 用途：`os/components/**` 暂时损坏时，仍能构建 / 启动 / host 测试 Core。
+# KALEIDOS_CORE_ONLY=1 让 os/core/build.rs 跳过 fixture 组件构建（core_test /
+# kcomp_smoke / kcomp_min）——依赖它们的测试被 cfg(no_kcomp) 门控。
+# boot crate 用 include_bytes!("../../../../tools/qemu/init.kpkg") 内嵌组件归档，
+# 所以这里必须让它存在且是合法归档：空 newc 归档只含 TRAILER!!!，store 解析到
+# trailer 即返回空目录，boot 不会 eager 解析 manifest，空 catalog 也能启动。
+# init.kpkg 是 .PHONY，下一次 `make kernel` 会无条件重建真实归档——本目标对它的
+# 覆盖是自愈的。
+core:
+	@mkdir -p $(CURDIR)/tools/qemu
+	printf '' | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
+	cd $(BOOT_DIR) && KALEIDOS_CORE_ONLY=1 CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cp $(KERNEL) $(CORE_OUTPUT)
+	@echo "built: $(CORE_OUTPUT) (core-only, features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
+	@echo "WARNING: tools/qemu/init.kpkg is now EMPTY; the next 'make kernel' rebuilds the real one (init.kpkg is .PHONY)."
+
 # —— 交互运行默认挂载的小 FAT 盘（块设备驱动有真实设备可读）——
 # 文本源在 tests/fixtures/rootfs/（mtools 按目录树原样拷进镜像根），成品进
 # build/（已 gitignore，不提交二进制）。`--invariant` 让镜像字节可复现。
@@ -205,6 +226,11 @@ qemu: kernel rootfs
 		-kernel $(OUTPUT) -nographic \
 		-drive file=$(ROOTFS),if=none,format=raw,id=rootfs \
 		-device virtio-blk-device,drive=rootfs
+
+# Core-only 镜像没有组件可读盘，因此不挂 rootfs drive（其余 flags 与 qemu 一致）。
+qemu-core: core
+	$(KCFG_QEMU) -machine virt -smp 2 -m $(KCFG_QEMU_MEM) -bios default \
+		-kernel $(CORE_OUTPUT) -nographic
 
 clean:
 	rm -f kaleidos-*
