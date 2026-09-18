@@ -8,3 +8,6 @@
 [submodule "third_party/Kconfiglib"]
 	path = third_party/Kconfiglib
 	url = https://github.com/zephyrproject-rtos/Kconfiglib
+[submodule "third_party/fatfs"]
+	path = third_party/fatfs
+	url = https://github.com/abbrev/fatfs.git
