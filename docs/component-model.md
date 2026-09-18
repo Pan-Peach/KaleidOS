@@ -329,22 +329,18 @@ pub enum ExecutionDomain {
 
 ### 4.1 不塞进 ComponentRecord
 
-`ComponentRecord`（现状：`{id, name, state, entry, base}`）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
+组件记录（**现状**：`InstanceRecord`，见 `docs/component-lifecycle.md`；旧的 `ComponentRecord` 已随 image/instance 拆分删除）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
 
 ```rust
-pub struct ComponentRecord {
-    pub id: ComponentId,
-    pub name: Vec<u8>,
+pub struct InstanceRecord {
+    pub id: ComponentId,          // 实例身份
     pub state: ComponentState,
-    pub execution_kind: ExecutionKind,   // 只加一个轻量种类字段
+    pub image: ComponentImageId,  // 代码 / 入口 / MemoryLease 归 image
+    pub instance_state: *mut (),  // 组件私有的实例状态（create 返回）
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ExecutionKind {
-    KernelNative,
-    IsolatedNative,   // 可选实验（S + 私有 AS），非里程碑
-    // future: SandboxedNative  —— U + 私有 AS，未来的硬件强制边界
-}
+// 未来若引入执行域，只在这里加一个轻量种类字段（**尚未实现**）：
+//   pub execution_kind: ExecutionKind,   // KernelNative / IsolatedNative / …
 ```
 
 真正 runtime：

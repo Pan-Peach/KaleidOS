@@ -181,8 +181,9 @@ OpenSBI → kaleidos.elf
   → boot：discover（fdt/ACPI... backend）→ MachineInfo
   → core::init(MachineInfo)（BSS 清零 → MetadataHeap 帧分配器 → 探测）
   → Core Monitor（core> 交互调试面，裸 Core 常态能力）
-  → （未来）Component Manager 解包内嵌 .initpkg（cpio 归档）
-  → （未来）按 manifest（文本）加载组件 .kcomp（ELF，Linux insmod/depmod 模式）
+  → Component Manager 解包内嵌 .initpkg（cpio 归档）→ store → loader → registry（已落地）
+  → 按 manifest（文本）装载组件 .kcomp（ELF，Linux insmod/depmod 模式；已落地）
+  → （未来）运行期热插拔 / Runtime Graph / 依赖解析
 ```
 
 - **Resource Core 不依赖具体 ISA 实现和 Discovery backend**（core-lib 只依赖 `os/arch` 的稳定 contract，不依赖 fdt；bootstrap 负责组合具体实现）；
@@ -204,7 +205,7 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 - 内核对象（Kernel Object）
 - Handle / Authority（不可伪造的授权）
 - ComponentId
-- ResourceDomain（组件拥有什么资源）
+- ResourceDomain（**视图**，非对象：所有 `owner == ComponentId` 的资源；**不设 struct**，见 `docs/component-model.md` §3）
 - 基础同步机制
 - Trace / invariant 支持
 
@@ -387,7 +388,7 @@ Component
 ```
 
 - **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是设备/执行域 authority 和受管理的内存区域，**不是**逐帧 handle、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的资源），owner 字段直接落在各资源表（irq/mmio/dma/timer）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
-- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative` / `Wasm`）。`ComponentRecord` 只记轻量 `execution_kind`，真正的 runtime（`LoadedComponent` + `ExecutionDomain`）放 `ComponentRuntime`，由 `ComponentManager` 串起来（见 component-model.md §4）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
+- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative` / `Wasm`）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/component-lifecycle.md`），旧 `ComponentRecord` 已删除；执行域字段**尚未实现**（未来若加，只在实例记录上放一个轻量 `execution_kind`；`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
   - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / Handle→Lease / 撤销不变式见 `driver-model.md`。
 
 **三个组件信任域（Trust Domain）与 ABI 分离：**
