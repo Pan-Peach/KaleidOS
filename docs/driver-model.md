@@ -306,7 +306,7 @@ PLIC → trap → Core/Arch claim(line)（authority 在 Core）
 
 - **不在被打断的上下文里跑 polled 组件的回调**：trap 顶半部只做计数 + 掩蔽 + `complete`，全部 arch 调用在 IRQ 表锁外；组件逻辑延后到驱动任务上下文。
 - **软件掩蔽闭环**：首事件掩蔽该线，电平触发源在协作调度下不会反复打断；驱动 `ack` 后 Core 才重新使能。组件拿不到中断号，掩蔽/放行 authority 全在 Core。
-- `IrqDelivery::Callback`（受信 KernelNative）保持旧行为：锁外 inline 调用 handler，再 `complete`。两态互斥（`delivery` 是 `Option<IrqDelivery>`）。
+- `IrqDelivery::Callback`（受信 KernelNative）：锁外 inline 调用 handler，再 `complete`；两态互斥（`delivery` 是 `Option<IrqDelivery>`）。投递在 Core 建立的 **IRQ 归属作用域**内进行（`with_irq_scope`；`os/core/src/irq/mod.rs:121-123`）：principal = 该线在 Core 路由表里的 owner、`task = None`，被中断的边界在回调返回后恢复。作用域同步、不可 yield：回调内的调度类 Core 调用（`kcore_task_create` / `kcore_task_start` / `kcore_task_yield` / `kcore_task_exit` / `kcore_sched_run`）返回 `-EINVAL`；回调内 panic **致命**（没有 Core 拥有的上下文可恢复，不像 init / task 边界）。这是**受信组件下的记账，不是认证边界**，不能证明回调代码属于该 owner。
 - **暂不引入 block/wake**。
 
 ### DMA

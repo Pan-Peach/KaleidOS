@@ -181,7 +181,9 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 ## 7. authority identity 规则（重要陷阱）
 
-`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/handle/context.rs:31-65`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。**
+`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/handle/context.rs:31-65`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。** 但 **IRQ 回调会安装一个 Core 拥有的归属边界**（`EscapeKind::Irq`，由 `containment::with_irq_scope` 在 `irq::dispatch_callback` 投递 `RouteOutcome::Callback` 时建立；`os/core/src/irq/mod.rs:121-123`）：principal = **该中断线的 owner**（Core 路由表的真相，不是被中断的执行），`task` 为 `None`；被中断执行的边界被保存，并在回调返回后**显式恢复**（嵌套按后进先出；`os/core/src/component/containment.rs:436-457`）。该作用域**同步、不可 yield**，是**受信 KernelNative 组件下的协作式记账，不是认证边界**：它记录 Core 这次投递为谁而做，但**不能证明**回调代码真的属于那个 owner。
+
+在 IRQ 回调作用域内，调度类 Core 操作在 Core 机制层被拒绝并返回 `-EINVAL`（`SchedError::InvalidTransition` / `TaskError::InvalidTransition`，`os/core/src/errno.rs:86,99`）：`sched::run` / `yield_current` / `exit_current`（`os/core/src/sched.rs:340-361`，门禁 `:74-79`）与 `task::create_task` / `start_task`（`os/core/src/task/mod.rs:59-61,100-102`）；只读入口与资源访问不受影响。IRQ 回调内的 panic **不**被收敛，保持**致命**：`panic_escape()` 恢复被中断的 guard 后拒绝逃逸，因为 IRQ 回调没有 Core 拥有的上下文可恢复（`os/core/src/component/containment.rs:572-585`），这与 init / task 边界不同。
 
 因此：
 - 通过 provider 的 `ctx` **读**它的状态：可以。

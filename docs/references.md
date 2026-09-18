@@ -59,7 +59,7 @@
 - `MmioHandle`、`IrqHandle`、`DmaHandle`、`TaskHandle`、`TimerHandle`、`AddressSpaceHandle` 是 seL4 风格 typed capability 的简化形态；
 - Core 校验 handle 的持有者、状态、生命周期 = capability 的 access control。
 
-**不照搬**：完整 capability 系统（派生、revoke 树、badge 等）、形式化证明、IPC endpoint 体系 —— 第一阶段只做"不可伪造的类型化 Handle + Core 验证"。
+**不照搬**：完整 capability 系统（派生、revoke 树、badge 等）、形式化证明、IPC endpoint 体系 —— 第一阶段只做"类型化 Handle + Core 验证"（Handle 本身可被伪造，authority 由 Core 在资源表内验证）。
 
 ---
 
@@ -164,7 +164,7 @@
 **怎么映射**：
 - 我们的"Core 存真相、Scheduler 存 runqueue、Buddy 存 free list"边界划分 = Theseus 的状态归属原则；
 - 未来做热替换时，Theseus 的 live evolution 是主要参考；
-- 组件失败恢复协议（kcomp_exit / Failed 状态 / 后续重启）参考它的 cell 失败模型。
+- 组件失败恢复协议（`kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`） / Failed 状态 / 后续重启）参考它的 cell 失败模型。
 
 **不照搬**：在线演化本身（第一阶段明确不做）；单地址空间无锁消息传递模型（我们现在也不需要）。
 
@@ -287,7 +287,7 @@
 
 **借鉴什么（具体机制，不是整体哲学）**：
 - **实时调度器**：优先级抢占 + 同优先级轮转/时间片——我们未来 scheduler 组件的参考实现（算法层面，policy 仍由组件提交、Core 验证）；
-- **动态模块机制**：它也有 ELF 模块加载，看它的模块清理链（卸载顺序）与我们的 kcomp_exit/卸载协议互相印证；
+- **动态模块机制**：它也有 ELF 模块加载，看它的模块清理链（卸载顺序）与我们的 `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）/卸载协议互相印证；
 - **设备框架交互**：设备注册（rt_hw_* / 串口框架、I2C 框架）的"注册-分发"模式，对照我们的 Interface（trait 语义）+ Handle（传输）设计。
 
 **不照搬**：它的整体"嵌入式通用内核聚合"架构（我们保持小、权威边界清楚）；Kconfig 组件选择心智（那是构建期配置，我们坚持运行时组件图）；BSP/板级模板堆叠（我们保持 bootstrap+core 单镜像）。
@@ -423,11 +423,11 @@ KaleidOS 不照搬：
 | `module_refcount` + `try_module_get`/`module_put` | "使用中不许卸"怎么做到 | 今天只有"名下有未结束任务就拒绝"这一条粗粒度门；**接口绑定是否也该计入**是开放项 |
 | `MODULE_STATE_GOING` | 先封新用，再执行退出 | 我们的 `Stopping`（封新 work） |
 | `free_module` | 真卸载 = 释放模块内存 + **让名字可复用** | **我们缺这一半**：段内存不回收、名字槽不还、同名 stop 后不能再 `load` |
-| `kthread_stop` + `kthread_should_stop` | 合作式"请求停止 + 等待" | `kcomp_exit` 要能等自己的 worker（drain variant 的先例） |
+| `kthread_stop` + `kthread_should_stop` | 合作式"请求停止 + 等待" | `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）要能等自己的 worker（drain variant 的先例） |
 | `synchronize_rcu` / `stop_machine` | **如何证明"没人还在引用"** | "真回收"的前置条件；见 `component-model.md` §5 的过期访问边界 |
-| 卸载序（先停 kthread/workqueue/timer，再注销设备） | 退出钩子该按什么顺序干什么 | `kcomp_exit` 的语义参考 |
-| init 失败不调 `exit` | 谁负责擦屁股 | 我们失败路径**刻意不调** `kcomp_exit`，同一个理由 |
-| built-in 永不调 `exit` | 什么时候没有退出这回事 | 无 `kcomp_exit` 符号 = 跳过（可选符号） |
+| 卸载序（先停 kthread/workqueue/timer，再注销设备） | 退出钩子该按什么顺序干什么 | `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）的语义参考 |
+| init 失败不调 `exit` | 谁负责擦屁股 | 我们失败路径**刻意不调** `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`），同一个理由 |
+| built-in 永不调 `exit` | 什么时候没有退出这回事 | `kcomp_exit`（**已删除**）；现为**必需**入口 `kcomp_instance_destroy`（缺失即加载失败，无"可选跳过"） |
 | `__init` 段 + `free_initmem` | "一次性组件"的回收 | 不是卸载模块，而是 init 后回收 init-only 内存；我们 phase 1 不做 |
 | `rmmod -f`（`CONFIG_MODULE_FORCE_UNLOAD`） | 不合作时怎么办 | 存在但被标注**危险**，且**不真正回收** —— 对应"不合作的组件只能标记死亡，不能回收" |
 | **`livepatch`（ftrace 函数重定向）** | **"动态替换"到底怎么做** | Linux 的答案**不是 unload + reload**，而是**原地重定向行为**；这是"热插拔"最值得先读的一条 |

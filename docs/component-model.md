@@ -63,8 +63,8 @@ Component → Component     = Interface binding（interface.rs）——禁止 fl
   不同的 function table 交给 consumer。自动 ABI hash 生成器 / compatible range /
   ABI-changing coordinated update 属下一阶段（只留 seam）。
 - Core 真相：`InterfaceRegistry` 记录 谁提供了什么接口（InterfaceId / abi /
-  kind / provider / api / ctx / generation）；`publish` 在 `kcomp_init()` 期间
-  只记录 pending（**staged**），init 成功后 Core 原子提交；consumer `bind` /
+  kind / provider / api / ctx / generation）；`publish` 在 `kcomp_instance_create()` 期间
+  只记录 pending（**staged**），create 成功后 Core 原子提交；consumer `bind` /
   `refresh` 时 Core 再次校验 provider 存活（组件卸载/失败后 binding 立即不可用）。
 - 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
   call）不改 binding 数据模型。
@@ -90,7 +90,7 @@ component wrapper
 
 | | 内容 |
 |---|---|
-| DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_init` |
+| DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_instance_create` / `kcomp_instance_destroy` |
 | UNDEFINED | 只允许显式放行的 `kcore_*` imports（对齐 §2.1 的 export 白名单） |
 
 - **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_line`、`kcore_irq_*`、`kcore_mmio_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
@@ -103,7 +103,7 @@ component wrapper
 > 两者都把输入交给 `tools/kcomp-link.sh` 做 partial link + section GC + strip，产出
 > ET_REL `.kcomp`——因此 `.kcomp` 是**语言无关的组件二进制格式**，不是 Rust 格式。
 > Makefile 与 `os/core/build.rs` 共用这些脚本，两条构建路径不再分叉；packer 在输出前
-> 校验「ET_REL + `kcomp_init` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
+> 校验「ET_REL + `kcomp_instance_create` / `kcomp_instance_destroy` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
 > 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
 > （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
@@ -120,7 +120,7 @@ panic handler → component panic adapter     → kcore_log_line（打印诊断�
 > 这不是"每个组件自带一个堆"：每个组件有自己的 adapter（满足 Rust 类型/宏契约），但**底层资源仍由 Core 统一管理**。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带。
 
 > 现状（step 2）：`os/components/kcomp-sdk` 是这一层的落地——它是 `kcore_*` 导出白名单的
-> 单一来源，提供 `kcomp_init!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
+> 单一来源，提供 `kcomp_instance_create!` / `kcomp_instance_destroy!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
 > `#[panic_handler]`（打印诊断后调 `kcore_panic_escape` 协作式逃逸），以及 feature `alloc`
 > 下的 `#[global_allocator]`（接 Core 共享堆，无 per-component 堆）。SDK 是普通 library，
 > 编译进每个 `.kcomp`，不是可加载组件、也不是 shared runtime。
@@ -263,7 +263,7 @@ ResourceDomain becomes empty
 
 > 现状（§5.2 的第一版实现）：quiesce = `begin_stop`（`Ready → Stopping`，任务
 > run 门禁 + publish 拒绝）、component-specific shutdown = 组件退出钩子
-> `kcomp_exit`（monitor `unload` 触发）、stop = `finish_stop`；Core 兜底与失败
+> `kcomp_instance_destroy`（monitor `unload` 触发）、stop = `finish_stop`；Core 兜底与失败
 > 路径共用 `failure::revoke_authority_and_unbind`（剩余 MMIO claim 进
 > quarantine）。有未退出任务的实例在第一步就被拒绝（drain variant 未实现）。
 
@@ -327,7 +327,7 @@ pub enum ExecutionDomain {
 
 > **契约不能 ABI 锁定**：Interface 和 Handle 的定义必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
 
-### 4.1 不塞进 ComponentRecord
+### 4.1 不塞进 InstanceRecord
 
 组件记录（**现状**：`InstanceRecord`，见 `docs/component-lifecycle.md`；旧的 `ComponentRecord` 已随 image/instance 拆分删除）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
 
@@ -340,7 +340,7 @@ pub struct InstanceRecord {
 }
 
 // 未来若引入执行域，只在这里加一个轻量种类字段（**尚未实现**）：
-//   pub execution_kind: ExecutionKind,   // KernelNative / IsolatedNative / …
+//   pub execution_kind: ExecutionKind,   // KernelNative / IsolatedNative / …（未来字段，尚未实现；旧 ComponentRecord 已删除）
 ```
 
 真正 runtime：
@@ -378,10 +378,10 @@ impl ComponentManager {
 ```
 
 （概念代码；落地时按现有 Registry 状态机接轨。当前 load 链是
-`Declared → resolve → Resolved → begin_start → Starting → call kcomp_init →
+`Declared → resolve → Resolved → begin_start → Starting → call kcomp_instance_create →
 { failure → Failed | success → 提交 pending interfaces → finish_start → Ready }`：
 `resolve()` 已落地（语义 = requires 全部绑定成功）；`Starting` 已接线为
-`kcomp_init()` 执行期（此期间 `kcore_interface_publish` 只记录 pending，不修改
+`kcomp_instance_create()` 执行期（此期间 `kcore_interface_publish` 只记录 pending，不修改
 active binding）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，monitor
 `unload` 驱动）；`Stopped` 记录保留、段内存不回收（phase 1）。）
 
@@ -394,7 +394,7 @@ active binding）。停止链已落地（§5.2：`Ready → Stopping → Stopped
 `KernelNative` 只需要保存已加载镜像和执行种类，调用方式与现在一致：
 
 ```rust
-let ret = loader::call_init(&runtime.image);
+let ret = containment::call_component_create(runtime.image.create, args, &mut out_state);
 ```
 
 ### 4.4 私有 AddressSpace 与执行域（未来 C10）
@@ -505,11 +505,11 @@ component/
 │   └── ExecutionKind
 │
 ├── registry.rs
-│   └── ComponentRecord
+│   └── InstanceRecord
 │       ├── id
-│       ├── name
 │       ├── state
-│       └── execution_kind
+│       ├── image
+│       └── instance_state
 │
 ├── manager.rs                 ← 以后新增
 │   ├── ComponentManager
@@ -575,6 +575,12 @@ DMA table  ─ owner=A ─┘
 
 ## 5. 生命周期
 
+> **本节已被取代（superseded）：组件生命周期与组件 ABI 的冻结契约在
+> `docs/component-lifecycle.md`。** 该文件定义 instance-aware 入口
+> `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定与
+> `ComponentImageId` + `InstanceRecord` 身份模型；本节保留原设计叙述，仅就地
+> 更新事实性的 ABI 名称与签名。两者冲突时以冻结契约为准。
+
 所有组件共享统一生命周期（但**不共享**业务接口）：
 
 ```text
@@ -585,16 +591,16 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 |---|---|
 | Declared | 系统知道这个组件存在 |
 | Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
-| Starting | 正在初始化（执行 `kcomp_init`） |
+| Starting | 正在初始化（执行 `kcomp_instance_create`） |
 | Ready | 可以对外提供 Interface |
-| Stopping | 正在停止：`kcomp_exit` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有 authority 仍可 `release`） |
-| Stopped | 已停止：`kcomp_exit` 已返回、剩余 authority 与接口已被 Core 兜底回收（记录保留；不回收段内存） |
+| Stopping | 正在停止：`kcomp_instance_destroy` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有 authority 仍可 `release`） |
+| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余 authority 与接口已被 Core 兜底回收（记录保留；不回收段内存） |
 | Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
 
-> **`kcomp_exit`（Linux `module_exit` 类比）已是组件 ABI 的对称退出入口**
-> （`#[unsafe(no_mangle)] pub extern "C" fn kcomp_exit() -> i32`）：Core loader 会
-> **可选解析**该符号（`LoadedComponent::exit` / `ComponentRecord::exit`；缺省 =
-> 没有钩子，停止时跳过）；monitor `unload <name>` 驱动的停止路径
+> **`kcomp_instance_destroy`（Linux `module_exit` 类比）是组件 ABI 的对称退出入口**
+> （`int32_t kcomp_instance_destroy(void *state)`，返回 `0 / -errno`）：Core loader 会
+> **必需解析**该符号（`ComponentImage::destroy` / `LoadedComponent::destroy`；缺失即
+> 加载失败）；monitor `unload <name>` 驱动的停止路径
 > （`component/exit.rs::stop_component`）在实例 `Ready` 时调用它，并把实例推进
 > `Stopping → Stopped`（第一版语义见 §5.2；drain variant / 实例退役仍开放）。
 >
@@ -622,7 +628,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 
 | 类别 | 表达 | 语义 |
 |---|---|---|
-| 普通失败 | `Result` / status code / `kcomp_init() != 0` / `kcomp_exit() != 0`（退出语义暂定，见 §5.2） | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
+| 普通失败 | `Result` / status code / `kcomp_instance_create() != 0` / `kcomp_instance_destroy() != 0`（返回 `0 / -errno`，见 §5.2） | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
 | 意外 panic | `panic!`（`panic=abort`） | 进程级 abort，不能凭空转成组件 recovery boundary |
 
 > `panic=abort` 下，Core 栈上的普通 panic 不可能"魔法般"变成组件 recovery boundary。
@@ -633,7 +639,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 
 ### 5.2 退出语义：第一版（small option）已实现
 
-`Stopping` / `Stopped` 与 `kcomp_exit` 已接线：Core 侧唯一汇合点 =
+`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 =
 `component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>`
 （组件侧参考实现 = `kcomp_smoke`：无资源可释放时也留一行"钩子已跑"的证据）。
 
@@ -644,7 +650,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
    a. 实例必须不拥有未退出的任务             → 否则 OwnsLiveTasks / EBUSY（不 join、不等待）
    b. 实例必须存在且处于 Ready（规则表）      → 否则 NotFound / ENOENT 或 NotReady / EINVAL
 2. begin_stop                              Ready → Stopping：任务 run 门禁 + publish 拒绝
-3. kcomp_exit（可选符号）                   Core-owned 隔离栈；ambient identity = 被停止实例
+3. kcomp_instance_destroy（必需入口）        Core-owned 隔离栈；ambient identity = 被停止实例
 4. Core 兜底                               revoke authority + 解绑 provider（与失败路径同序列）
 5. finish_stop                             Stopping → Stopped（记录保留）
 ```
@@ -652,8 +658,8 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 - **为什么是这个顺序**：`may_run` 只允许 `Starting` / `Ready`，一旦提交
   `Stopping`，该实例的任务就不可能再被调度回来收尾——"先停后等任务"自相矛盾；
   `yield` 只提交 `Runnable`（不是 `Exited`），任务不会"自然退出"。
-- **身份**：退出钩子跑在 Core-owned 临时栈上（与 `kcomp_init` 对称，
-  `containment::call_component_exit`），其 Core 调用身份是**被停止的实例**
+- **身份**：退出钩子跑在 Core-owned 临时栈上（与 `kcomp_instance_create` 对称，
+  `containment::call_component_destroy`），其 Core 调用身份是**被停止的实例**
   （`EscapeKind::Exit`），不是发起 stop 的 monitor / 其他组件；
   `kcore_interface_publish` 在 exit 边界被拒（publish 是 init 期操作）。
 - **authority**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
@@ -664,7 +670,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
   只走 `fail_component`（mark + 兜底）。**未闭合**：组件侧的设备收尾
   （stop DMA / reset / mask IRQ）在失败路径上不会发生，Core 的 revoke +
   quarantine 是唯一兜底。
-- **暂定默认（待人类定稿）**：`kcomp_exit` 返回非零 → 镜像 `InitFailed`
+- **暂定默认（待人类定稿）**：`kcomp_instance_destroy` 返回非零（`-errno`）→ 镜像 `InitFailed`
   （`Failed` + 兜底）；钩子 panic → 镜像 `InitPanicked`（Exit 边界容纳 →
   `Failed`）。反方论证：退出失败可能不值得把实例标为逻辑死亡（它已经停了一
   半），也可以选择记录并继续 `Stopped`。
@@ -680,7 +686,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 2. **非零退出 / 退出 panic 的最终分类**：见上"暂定默认"。
 3. **`UnexpectedExit` 是否作为独立终态**：当前意外退出统一 `Failed`；新增状态
    要改 `can_transition` 规则表与锚定它的 host 测试。
-4. **信任域分叉**：本版退出钩子与 `kcomp_init` 一样跑在 Core-owned 栈上
+4. **信任域分叉**：本版退出钩子与 `kcomp_instance_create` 一样跑在 Core-owned 栈上
    （KernelNative、协作式、无隔离）；IsolatedNative / SandboxedNative 的停止
    （地址空间销毁、真正停止任务）是各自 ExecutionDomain 的职责。
 5. **实例退役**：`Stopped` 记录保留（不回收段内存、`ComponentId` 不复用）；
@@ -689,7 +695,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
    `Stopping` 期间仍可 `kcore_mmio_claim`（随后被兜底撤销）。硬拦需要把
    acquiring 门禁从"非 `Failed`"改成生命周期判定（会同时影响 `Stopped`）。
 7. **退出钩子的阻塞 / 超时 / 看门狗**：钩子同步执行、无超时；挂死会挂住
-   stop（KernelNative 协作式信任，与 `kcomp_init` 同）。
+   stop（KernelNative 协作式信任，与 `kcomp_instance_create` 同）。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 

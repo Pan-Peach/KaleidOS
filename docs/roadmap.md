@@ -19,9 +19,9 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
      重定位由 `arch/riscv/elf.rs` 的 RiscvRelocator 提供：R_RISCV_CALL/CALL_PLT
      + PCREL_HI20/LO12_I + R_RISCV_32/64；host 测试直接测该实现）
   → registry（declare → resolve → begin_start → finish_start 状态机：
-     Declared → Resolved → Starting → Ready；Starting = kcomp_init 执行期，
+     Declared → Resolved → Starting → Ready；Starting = kcomp_instance_create 执行期，
      Resolved = requires 全部绑定；Failed 吸收态）
-  → monitor `load <name>` → call_init（kcomp_init）
+  → monitor `load <name>` → call_component_create（kcomp_instance_create）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
   一组 kcore_*，按稳定 ABI 分类：
     Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
@@ -49,7 +49,7 @@ Component Interface Registry（os/core/src/component/interface.rs）：
   staged publish（commit_pending / discard_pending）/ bind / refresh / unbind /
   unbind_provider
   —— 组件→组件 依赖只走 Interface binding（逻辑 binding + typed #[repr(C)]
-     function table）；publish 在 kcomp_init 期间只记 pending，init 成功后原子
+     function table）；publish 在 kcomp_instance_create 期间只记 pending，create 成功后原子
      提交；同 ABI replacement 保留 BindingId、generation++；不建立 flat ELF
      symbol 全局符号表；provider 替换后 consumer 只需 refresh，无需 ELF reload
 内存粒度定案：ALLOC_GRANULE（物理分配）与 AddressSpaceBackend::GRANULE（VM 映射）解耦
@@ -93,7 +93,7 @@ P2 中断/驱动雏形：
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
   C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
-  C9   任务化组件（kcomp_task + TaskTable）+ kcomp_exit / 卸载协议（逻辑层先行）
+  C9   任务化组件（kcomp_task + TaskTable）+ kcomp_instance_destroy / 卸载协议（逻辑层先行）
 P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
   C10 Core AddressSpaceManager + 私有 AS（IsolatedNative=S 可选实验、非里程碑；
      SandboxedNative=U 未来强制边界）（见 §10 与 driver-model.md；D2=A）
@@ -242,7 +242,7 @@ manifest   = 文本清单（modules.dep 模式：depmod 生成 / modprobe 读取
 TaskId        —— 任务身份
 PhysicalRange —— Core 管理的物理内存区域
 ComponentId   —— 组件身份
-Handle        —— 不可伪造的授权（类型化，如 AddressSpaceHandle）
+Handle        —— 类型化授权 token（可被伪造；authority 由 Core 验证，如 AddressSpaceHandle）
 ResourceDomain—— 组件资源集合（拥有什么、如何回收）
 Core 物理内存 —— 帧真相 + canonical 帧分配器机制（`buddy_system_allocator::MetadataHeap`，per-unit metadata O(1) buddy，metadata 自托管前端；区域 `[align_up(__bootstrap_end), RAM 末尾)`，ELF/DTB 天然保留）
 ```
@@ -361,7 +361,7 @@ Power On
 > QEMU TCG 不是 cycle-accurate，ASID 收益在 QEMU 中可能不可见——用 QEMU 做功能验证，
 > 不做延迟预测。
 
-**对当前阶段的意义**：现在**零切换成本**（call_init 是普通调用；未来每组件任务共享 satp，
+**对当前阶段的意义**：现在**零切换成本**（call_component_create 是普通调用；未来每组件任务共享 satp，
 切换只花寄存器+栈）。"切页表"只在**隔离执行域**发生——按触发器推迟（C10）。
 
 **执行域定位（D2=A，见 `driver-model.md`）**：**KernelNative 是常态、长期模式**——同特权级、
@@ -389,7 +389,7 @@ Power On
 panic 时先打印诊断、再 stack-switch 回 Core 上下文 → Core 标记 Failed → 停止该 task /
 instance），**不是** Rust stack unwinding（跨组件边界展开不安全）。phase 1 已实现
 init / task 边界的协作式 containment（见 `component-model.md` §5.1）；正常回收由组件
-自己做（`kcomp_exit` 显式清理 / 组件内部 RAII drop）——参考 Theseus 的
+自己做（`kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）显式清理 / 组件内部 RAII drop）——参考 Theseus 的
 "组件失败 → 状态 Failed → 重启"模型。
 
 ### 10.3 最小卸载协议（为未来留，Phase 1 不实现物理回收）
@@ -398,7 +398,7 @@ init / task 边界的协作式 containment（见 `component-model.md` §5.1）�
 1. Ready→Unloading 原子转换，拒绝该组件新调用/任务/回调/IRQ/新 handle
 2. 停止调度 + 等待活跃执行归零（任务到来前 = no-op 钩子）
 3. 注销 IRQ/timer + 排空排队投递，确认无回调能进组件
-4. 调 kcomp_exit（handle 仍有效，组件语义清理）；非零 → Failed + 保留内存（不冒险回收）
+4. 调 kcomp_exit（**已删除**，现为 `kcomp_instance_destroy`；handle 仍有效，组件语义清理）；非零 → Failed + 保留内存（不冒险回收）
 5. 撤销该 ComponentId 所有 handle；已通过 Core 转出的属于接收者，幸存
 6. 验证零引用 → 整体释放（一次 free_pages(base, order)）
 ```

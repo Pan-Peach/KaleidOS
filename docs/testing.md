@@ -49,7 +49,7 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
 CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Core 与 Arch 的**真实行为**。
 以普通 `.kcomp` 身份运行（无 god-mode），源码按**报告分组**拆为 `src/runtime/`：
 `report`（输出骨架 + 失败位图）/ `boot` / `sched` / `resource` / `trace`，
-入口与编排在 `src/runtime.rs`（`kcomp_init`）。模块边界 = 责任边界（不是行数）。
+入口与编排在 `src/runtime.rs`（`kcomp_instance_create`）。模块边界 = 责任边界（不是行数）。
 
 > **边界**：CoreTest 只走 Core 导出白名单、只断言 Core 自己报告的返回值 / 状态编码 /
 > trace 事件。**平台白盒事实**（QEMU virt 的 PLIC 线号、S-mode context 公式、

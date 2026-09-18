@@ -203,7 +203,7 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 - AddressSpace
 - IRQ / Timer / MMIO / DMA
 - 内核对象（Kernel Object）
-- Handle / Authority（不可伪造的授权）
+- Handle / Authority（类型化授权 token；可被伪造，authority 由 Core 验证）
 - ComponentId
 - ResourceDomain（**视图**，非对象：所有 `owner == ComponentId` 的资源；**不设 struct**，见 `docs/component-model.md` §3）
 - 基础同步机制
@@ -476,7 +476,7 @@ Scheduler（Component）         Core
 ## 9. 与参考系统的关系（详见 references.md）
 
 - Asterinas → 策略注入与策略输出验证（propose/validate 先例）
-- seL4 → typed authority、不可伪造 capability（Handle 设计来源）
+- seL4 → typed authority、不可伪造 capability（Handle 借鉴 typed authority，不继承不可伪造性）
 - Exokernel → 保护与管理分离（Core/Component 分工的理论源头）
 - Theseus / RedLeaf → 状态归属与资源回收（ResourceDomain 思想）
 - Zephyr → arch / SoC / board / device model 的硬件边界（映射到 Machine Discovery 与驱动 Component）

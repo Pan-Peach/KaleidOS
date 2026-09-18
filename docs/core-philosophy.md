@@ -151,7 +151,7 @@ KaleidOS 不追求某种纯粹的内核教条，也不再要求"Core 中绝不�
 
 ### Resource Authority —— "你有权动什么"
 
-由 Core 产生、不可伪造、最终由 Core 验证：
+由 Core 产生的类型化 token；token 可被伪造，authority 最终由 Core 验证：
 
 ```text
 MmioHandle  IrqHandle  DmaHandle
@@ -287,8 +287,8 @@ interface registry primitive   fault routing        machine capability
 
 Phase 1 中，KernelNative component 的**普通失败**与**panic**必须区分：
 
-- **普通失败**（可恢复的 component failure）：`Result` / status code / `kcomp_init() != 0`；
-- **意外 panic**：不要假装拥有不存在的恢复能力。如果组件仍然直接跑在 Core 栈上（`Core stack → kcomp_init() → panic`），`panic=abort` 不可能凭空形成 component recovery boundary。
+- **普通失败**（可恢复的 component failure）：`Result` / status code / `kcomp_instance_create() != 0`（返回 `0 / -errno`）；
+- **意外 panic**：不要假装拥有不存在的恢复能力。如果组件仍然直接跑在 Core 栈上（`Core stack → kcomp_init()`（**已删除**，现为 `kcomp_instance_create`）→ panic），`panic=abort` 不可能凭空形成 component recovery boundary。
 
 因此诚实的契约是：**expected failure → return error；unexpected panic → 默认 fatal。** 若要"panic → 杀掉 instance → Core 继续"，组件必须先拥有一个**可独立丢弃的 execution context**（独立 task / 独立 stack / component trampoline / instance identity），panic handler 再进入 Core 的 abort 路径。
 

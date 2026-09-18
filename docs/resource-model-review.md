@@ -75,13 +75,13 @@
 
 ### C.1 调用归属：缺的是两条路径，不是"整机制"（**本条修正了我的初稿**）
 
-现状：create / destroy / task 执行**都有** Core 建立并恢复的归属（`containment.rs:299-336,376-390`）。缺的是：
+现状：create / destroy / task 执行**都有** Core 建立并恢复的归属（`containment.rs:299-336,376-390`）。**IRQ 回调这一半已由 §G step 3 关闭**（**不改任何 ABI**：无签名 / 布局 / 导出变更）；仍缺的是：
 
 - **普通直调**：A 调 B 的函数表，不安装任何边界 → `ambient()` 在 B 内解析为 **A**。这是**已冻结契约的有意选择**（`docs/component-lifecycle.md:182-191`：provider 应在自己的生命周期/任务上下文里获取资源）。
-- **IRQ 回调**：`RouteOutcome::Callback` 已带 `owner`（`irq/mod.rs:104-110,126-143`），但**没有**据它安装归属 → 回调内 `ambient()` 是**被中断的活动边界**（可能是 create/destroy，而非任务）。
-- **调度器策略回调**同样没有 provider scope（`sched.rs:156-162`）——盘点漏了这条。
+- **IRQ 回调（已落地，step 3）**：`RouteOutcome::Callback` 的 `owner`（`irq/mod.rs:121-133`）现在经 `with_irq_scope` 安装归属 → 回调内 `ambient()` 解析为该线 owner、`task = None`，被中断的边界在回调返回后恢复；作用域内调度类调用返回 `-EINVAL`，回调 panic 保持致命。
+- **调度器策略回调**仍没有 provider scope（`sched.rs:177`）——盘点漏了这条，是 **step 4 的职责**。
 
-同时必须承认：`ambient()` 读的是 `active_escape()`（`handle/context.rs:40-46`），所以**归属与 panic 路由目前是耦合的**。加一个 principal 字段并不能自动获得可恢复的 provider panic。
+同时必须承认：`ambient()` 读的是 `active_escape()`（`handle/context.rs:40-46`），所以**归属与 panic 路由是耦合的**。IRQ 作用域因此**没有**可恢复的 panic 语义（回调 panic 致命）；为其它边界加 principal 字段也不能自动获得可恢复的 provider panic。
 
 ### C.2 真正"过度"的是 `AddressSpaceHandle`/`KernelAddressSpace`（但**不要删整个模块**）
 
@@ -208,7 +208,7 @@ Grant 会**打破**"设备 owner == IRQ owner == DMA owner"这个等式，于是
 |---|---|---|
 | 1 | **修正本审查 + 冻结范围**：保留 `ComponentId`、generational handle、按表 owner、共享 teardown；显式批准任何对 `component-lifecycle.md` §7 与 deferred-Grant 规则的偏离 | 无 |
 | 2 | **锁住既有不变量 + 修正误导性词汇**：stale 复用、teardown/quarantine、create/destroy 恢复；内部指针快照按需改名（保留导出名） | 无 |
-| 3 | **IRQ 归属 + 上下文种类限制**（内部）：owner 选择/恢复、禁止在 IRQ 上下文做调度操作；QEMU 验证真实中断进出 | 无签名/布局变更，但需记录行为契约 |
+| 3 | **IRQ 归属 + 上下文种类限制**（内部）：owner 选择/恢复、禁止在 IRQ 上下文做调度操作；QEMU 验证真实中断进出（**已落地**；归属作用域目前由 host 测试锁定，QEMU 门尚未触发 Core 路由的 IRQ 回调） | 无签名/布局变更，但需记录行为契约 |
 | 4 | **窄 provider 调用 scope + 迁移需要它的服务**：嵌套、stale binding 拒绝、发布限制、不可 yield、panic 策略同批落地 | **协调替换**（新 `kcore_*` 边界入口 + SDK/C 声明） |
 | 5 | **DMA backing 与 device mapping 拆分**（若用例仍需要）：allocation 归实例；mapping 同时校验 buffer 访问与 MMIO 派生的设备权威，保留 backing 生命周期与暴露后的 quarantine | **协调替换**（若 `kcore_dma_alloc` 去掉 MMIO 参数或 `_lease` 语义/输出变化） |
 | 6 | **MMIO Grant + 真实交接工作流 + 依赖清理同批**：attach 引导、owner/grantee 失败、子对象授权、root-release 检查、grant/resource generation 测试 | **协调替换** |
