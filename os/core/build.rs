@@ -33,8 +33,9 @@ fn main() {
         println!("cargo:rustc-env=KALEIDOS_GIT_COMMIT={commit}");
     }
 
-    // 组件 → .kcomp 的单一构建管线（与 Makefile 共用 tools/build-kcomp.sh）：
-    // staticlib → rust-lld -r --gc-sections -u kcomp_init → strip。host 测试
+    // 组件 → .kcomp 的构建管线（与 Makefile 共用脚本）：Rust 前端
+    // tools/build-kcomp.sh 编出 staticlib，语言无关的 tools/kcomp-link.sh
+    // 做 partial link + --gc-sections + -u 入口 → strip → 契约校验。host 测试
     // fixture（<name>.kcomp / init.kpkg / smoke_min.kcomp）保持不变。
     let script = repo.join("tools/build-kcomp.sh");
     println!("cargo:rerun-if-changed={}", script.display());
@@ -44,6 +45,7 @@ fn main() {
         // SDK 已拆成多模块：跟踪整个 src/ 目录，任一源文件变化都触发重建。
         sdk_dir.join("src"),
         repo.join("tools/build-kcomp.sh"),
+        repo.join("tools/kcomp-link.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", changed.display());
     }

@@ -133,19 +133,23 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 .PHONY: kernel qemu rootfs clean distclean init.kpkg
 
 # —— 组件 .kcomp 打包 + 内嵌（Linux insmod/depmod 模式）——
-# 每个组件经共享管线 tools/build-kcomp.sh 构建成**链接后的** .kcomp（ET_REL 组件程序）：
-# staticlib → rust-lld -r --gc-sections -u kcomp_init → strip → 白名单/重定位契约校验。
+# 两段管线：语言前端（Rust: tools/build-kcomp.sh / C: tools/build-kcomp-c.sh）
+# 各自编出 .o/.a，再交给语言无关的 tools/kcomp-link.sh 做 partial link +
+# --gc-sections + -u 入口 → strip → 白名单/重定位契约校验，产出 ET_REL .kcomp。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench
+KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench
+# C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
+KCOMP_C_SRCS :=
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
-KPKG_DIR   := $(CURDIR)/build/kpkg
-KPKG_BUILD := $(CURDIR)/build/kpkg-build
+KPKG_DIR     := $(CURDIR)/build/kpkg
+KPKG_BUILD   := $(CURDIR)/build/kpkg-build
+KPKG_BUILD_C := $(CURDIR)/build/kpkg-build-c
 
 # 构建所有组件 .kcomp → 统一打包 init.kpkg（cpio newc + manifest）
 init.kpkg:
 	@rm -rf $(KPKG_DIR)
-	@mkdir -p $(KPKG_DIR) $(KPKG_BUILD) $(CURDIR)/tools/qemu
+	@mkdir -p $(KPKG_DIR) $(KPKG_BUILD) $(KPKG_BUILD_C) $(CURDIR)/tools/qemu
 	@for src in $(KCOMP_SRCS); do \
 		n=$$(basename $$src); \
 		RUSTFLAGS="$(REMAP_RUSTFLAGS)" tools/build-kcomp.sh \
@@ -153,8 +157,15 @@ init.kpkg:
 			$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD) || exit 1; \
 		echo $$n >> $(KPKG_DIR)/manifest; \
 	done
+	@for src in $(KCOMP_C_SRCS); do \
+		n=$$(basename $$src); \
+		tools/build-kcomp-c.sh \
+			$(CURDIR)/os/components/$$src $(KCFG_TARGET) \
+			$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD_C) || exit 1; \
+		echo $$n >> $(KPKG_DIR)/manifest; \
+	done
 	cd $(KPKG_DIR) && find . -type f | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
-	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS))"
+	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS) $(KCOMP_C_SRCS))"
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 # CONFIG_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 由生成的片段镜像成

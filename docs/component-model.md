@@ -97,10 +97,13 @@ component wrapper
 - **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
 - **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
 
-> 现状（step 2）：上述管线已落地——组件编成 `staticlib`（SDK / 依赖随镜像私有携带），
-> 再由 `tools/build-kcomp.sh` 做 partial link + section GC + strip，产出 ET_REL `.kcomp`。
-> Makefile 与 `os/core/build.rs` 共用这一脚本，两条构建路径不再分叉；脚本在输出前校验
-> 「ET_REL + `kcomp_init` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
+> 现状（step 2）：上述管线已落地，且已拆成「语言前端 + 语言无关 packer」两段：
+> Rust 前端 `tools/build-kcomp.sh` 编出 `staticlib`（SDK / 依赖随镜像私有携带），
+> C 前端 `tools/build-kcomp-c.sh` 编出 freestanding `.o`（clang，不链 libc），
+> 两者都把输入交给 `tools/kcomp-link.sh` 做 partial link + section GC + strip，产出
+> ET_REL `.kcomp`——因此 `.kcomp` 是**语言无关的组件二进制格式**，不是 Rust 格式。
+> Makefile 与 `os/core/build.rs` 共用这些脚本，两条构建路径不再分叉；packer 在输出前
+> 校验「ET_REL + `kcomp_init` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
 > 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
 > （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
