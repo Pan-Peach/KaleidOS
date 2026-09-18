@@ -1,36 +1,44 @@
-//! Core 派生、持有 provenance 的 MMIO 执行能力（Lease）。
+//! Core 派生、持有 provenance 的 MMIO/DMA **只读快照视图**（View）。
 //!
-//! **Handle = authority；Lease = execution capability。** [`MmioLease`] 是
-//! `MmioHandle` 经 Core 一次性校验后派生出的 scoped 访问能力：内部持有
-//! `region.base` 的裸指针与长度，以及派生自的 `source` handle（slot +
-//! generation）。受信 KernelNative 驱动可据此直接 volatile 访问，稳态不再
-//! per-access 进 Core。
+//! **Handle = authority；View = 一次性校验后的裸指针 / 设备地址快照。**
+//! [`MmioView`] / [`DmaView`] 由 Core 在一次性校验 handle 后派生，字段私有，
+//! 组件不能自行构造：
 //!
-//! # provenance 与撤销
-//!
-//! - 裸指针不可由组件凭空构造：只有 [`crate::handle::mmio::derive_lease`]
-//!   能产出 lease，其 `source` 绑定具体的 handle 身份。
+//! - 携带 `region.base` 裸指针（DMA 另有设备可见地址）以及派生自的 `source`
+//!   handle（slot + generation）作为 provenance；
+//! - 是 `Copy` 的**快照**：**不 pin 任何东西**——没有 `Drop`、不做引用计数、
+//!   不阻止资源被 revoke / 释放 / 复用；
 //! - **撤销是协作式的**：Core 撤销 / 释放 authority 后，此前已经派生出去的
 //!   裸指针不会被追回（KernelNative 与 Core 共享同一地址空间、同特权级）。
-//!   调用方必须在组件静默、相关使用结束后才认为 lease 失效（见
+//!   调用方必须在组件静默、相关使用结束后才认为 view 失效（见
 //!   `docs/driver-model.md` §3 / §7）。Sandboxed / Isolated 域由地址空间映射 +
 //!   页表强制，撤销可真正切断访问。
+//!
+//! **命名注意**：这两个 `Copy` 类型**不是** `MemoryLease`（`crate::memory` 中的
+//! 唯一 RAII 分配属主，代表区域占用）；它们只是快照。旧名 `MmioLease` /
+//! `DmaLease` 容易被误读成"持有/钉住资源"，故内部改名为 `MmioView` / `DmaView`
+//! （见 `docs/resource-model-review.md` §C.3）。**导出名 `kcore_mmio_lease` /
+//! `kcore_dma_lease` 是 ABI，保持不动。**
 
 use super::MmioHandle;
 use super::dma::DmaHandle;
 
-/// MMIO 执行能力。
+/// MMIO 只读快照视图。
 ///
 /// 由 [`crate::handle::mmio::derive_lease`] 在 Core 校验
 /// slot / generation / owner / 生命周期后派生；字段私有，组件不能自行构造。
+///
+/// 它是 `Copy` 的裸指针（+ 长度）+ provenance（`source` handle）**快照**：
+/// 不 pin、不阻止 revoke、撤销为协作式（已派生出去的裸指针不被追回）。
+/// **不是** `MemoryLease`——后者才是 RAII 分配属主。
 #[derive(Clone, Copy, Debug)]
-pub struct MmioLease {
+pub struct MmioView {
     ptr: *mut u8,
     len: usize,
     source: MmioHandle,
 }
 
-impl MmioLease {
+impl MmioView {
     /// 仅供 Core 派生路径构造（字段私有，不对外暴露）。
     pub(crate) const fn new(ptr: *mut u8, len: usize, source: MmioHandle) -> Self {
         Self { ptr, len, source }
@@ -57,20 +65,24 @@ impl MmioLease {
     }
 }
 
-/// DMA 执行能力。
+/// DMA 只读快照视图。
 ///
 /// 由 [`crate::handle::dma::derive_lease`] 在 Core 校验 slot / generation /
 /// owner / 生命周期后派生；字段私有，组件不能自行构造。`device_addr` 是设备
 /// 可见地址——**v1 identity：等于 backing 物理基址**（无 IOMMU）。
+///
+/// 与 [`MmioView`] 一样，它是 `Copy` 的裸指针 / 设备地址 + provenance **快照**：
+/// 不 pin backing、不阻止 revoke、撤销为协作式；DMA backing 的物理回收是
+/// quarantine 路径的职责，不在本类型。**不是** `MemoryLease`。
 #[derive(Clone, Copy, Debug)]
-pub struct DmaLease {
+pub struct DmaView {
     ptr: *mut u8,
     len: usize,
     device_addr: usize,
     source: DmaHandle,
 }
 
-impl DmaLease {
+impl DmaView {
     /// 仅供 Core 派生路径构造（字段私有，不对外暴露）。
     pub(crate) const fn new(
         ptr: *mut u8,

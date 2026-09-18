@@ -127,7 +127,8 @@ impl<T> Slot<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Handle;
+    use super::{Handle, Slot};
+    use crate::component::ComponentId;
 
     #[test]
     fn raw_roundtrip_preserves_slot_and_generation() {
@@ -145,5 +146,29 @@ mod tests {
         let decoded = Handle::<u8>::from_raw(u64::MAX);
         assert_eq!(decoded.slot(), u32::MAX);
         assert_eq!(decoded.generation(), u32::MAX);
+    }
+
+    /// 锁定既有事实：`Slot::revoke` 在 `generation == u32::MAX` 时按
+    /// `wrapping_add(1)` 回绕到 0（`generic.rs` 中 `revoke` 的实现）。
+    ///
+    /// TODO(strict-generation): review `docs/resource-model-review.md` §C.5 指出，
+    /// 完整回绕会让一个撑过 2^32 次 slot 复用的陈旧 handle 重新与新 slot 匹配
+    /// （stale 排除因此**不是永久的**）。最小严格修法是"generation 耗尽即退役该
+    /// slot"（不再复用），但本步骤只做 tests + naming，**刻意不改行为**——这里
+    /// 只把当前回绕行为钉住，等待后续步骤显式决策。
+    #[test]
+    fn slot_generation_wraps_at_u32_max() {
+        let mut slot = Slot::<u8>::new(u32::MAX, ComponentId::from_raw(1), 0x2A);
+        assert_eq!(slot.generation(), u32::MAX);
+        assert!(!slot.is_vacant());
+
+        slot.revoke();
+
+        assert_eq!(
+            slot.generation(),
+            0,
+            "revoke 在 u32::MAX 上必须按 wrapping_add 回绕到 0（当前既有行为）"
+        );
+        assert!(slot.is_vacant());
     }
 }

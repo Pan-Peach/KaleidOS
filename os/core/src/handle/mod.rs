@@ -1,4 +1,4 @@
-//! Handle / Authority：类型化、不可伪造的授权。
+//! Handle / Authority：类型化的 Core authority token（token 可被伪造，authority 由 Core 验证）。
 //!
 //! 通用 token/slot 机制 + `MmioHandle` / `IrqHandle`。Handle 的 authority
 //! 不来自 token bits（`to_raw` 可被伪造），而来自 Core 对 slot 存在性、
@@ -41,7 +41,7 @@ pub use dma::DmaHandle;
 pub use error::HandleError;
 pub use generic::Handle;
 pub use irq::IrqHandle;
-pub use lease::{DmaLease, MmioLease};
+pub use lease::{DmaView, MmioView};
 pub use mmio::MmioHandle;
 
 pub(crate) use generic::Slot;

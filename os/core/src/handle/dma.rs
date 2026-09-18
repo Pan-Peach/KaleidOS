@@ -6,7 +6,7 @@
 //!    由 Core 在 MMIO 表锁下从该 handle 的 MMIO 表记录推导（MMIO 锁是最外层），
 //!    **绝不接受组件自报的设备号**。Core 再分配一段物理连续区域
 //!    （`memory::alloc_region`），把区域真相记进 `DmaRegion`，grant 出 `DmaHandle`。
-//! 2. [`derive_lease`]：Core 一次性校验 handle 后派生 [`DmaLease`]——携带
+//! 2. [`derive_lease`]：Core 一次性校验 handle 后派生 [`DmaView`]——携带
 //!    backing 指针、长度、**设备可见地址**与 `source`（provenance）。受信
 //!    KernelNative 驱动据此直接读写。**v1 无 IOMMU：设备可见地址 == 物理基址
 //!    （identity）**；映射由 Core 提交，组件不能自行指定设备地址。
@@ -32,7 +32,7 @@
 //! 上跑完 alloc → derive → release/revoke 全路径（不需要真实设备）。DMA 测试
 //! 与其它碰全局堆的测试靠 `memory::test_support::GUARD` 串行化。
 
-use super::lease::DmaLease;
+use super::lease::DmaView;
 use super::mmio::{self, MmioError};
 use super::{Handle, HandleError, RawHandle, RequestContext, ResourceKind, ResourceTable};
 use crate::component::ComponentId;
@@ -248,12 +248,13 @@ pub fn alloc(
     ))
 }
 
-/// 派生 [`DmaLease`]：Core 校验一次 handle，返回 backing `(ptr, len)` +
+/// 派生 [`DmaView`]：Core 校验一次 handle，返回 backing `(ptr, len)` +
 /// **设备可见地址** + `source` handle（KernelNative 直接 DMA 快路径）。
 ///
-/// 撤销是协作式的：release/revoke 之前派生出去的指针不会被追回；且 backing
+/// 与 [`MmioView`](super::MmioView) 一样是 `Copy` 快照：**不 pin backing**、
+/// 撤销是协作式的——release/revoke 之前派生出去的指针不会被追回；且 backing
 /// 只进 quarantine（见模块文档）。
-pub fn derive_lease(ctx: &RequestContext, h: DmaHandle) -> Result<DmaLease, DmaError> {
+pub fn derive_lease(ctx: &RequestContext, h: DmaHandle) -> Result<DmaView, DmaError> {
     let _guard = IrqSaveGuard::new();
     let table = get_table().lock();
     let region = table.get(ctx.component, h).map_err(DmaError::Handle)?;
@@ -261,7 +262,7 @@ pub fn derive_lease(ctx: &RequestContext, h: DmaHandle) -> Result<DmaLease, DmaE
         .lease
         .as_ref()
         .ok_or(DmaError::Handle(HandleError::Revoked))?;
-    Ok(DmaLease::new(
+    Ok(DmaView::new(
         lease.base() as *mut u8,
         region.size,
         region.device_addr,
@@ -487,6 +488,91 @@ mod tests {
             derive_lease(&ctx, h1).unwrap_err(),
             DmaError::Handle(HandleError::Stale)
         );
+    }
+
+    /// 验收：`release` **先把 backing 停进 QUARANTINE，再 revoke slot**。
+    ///
+    /// 顺序可观测：`revoke` 会清空 region；若先 revoke，`region.lease` 会随 region
+    /// drop 当场归还 buddy heap。因此这里同时断言三件事：
+    /// 1. quarantine 计数 +1（lease 被停车）；
+    /// 2. buddy 空闲块统计在 release 前后**不变**（backing 没有回到堆）；
+    /// 3. slot 已 revoke（handle Stale）——revoke 发生在 parking 之后。
+    ///
+    /// review 依据：§F「顺序不变量」（DMA 必须先停车再 revoke，否则 Drop 会在设备
+    /// 可能仍 DMA 时释放 backing = UAF）与 §C.4「从未暴露 ≠ 可能仍被访问」。
+    #[test]
+    fn release_parks_lease_in_quarantine_before_revoke() {
+        let _heap = test_support::GUARD.lock();
+        test_support::ensure_init();
+        crate::handle::init();
+
+        let owner = ComponentId::from_raw(60);
+        let ctx = context(owner);
+        let mmio = grant_mmio(owner, 12);
+        let handle = alloc(&ctx, mmio, 4096, DmaDirection::ToDevice).expect("alloc");
+
+        let before_quarantine = quarantine_len();
+        let before_free = crate::memory::free_block_counts();
+
+        assert_eq!(release(&ctx, handle), Ok(()));
+
+        assert_eq!(
+            quarantine_len(),
+            before_quarantine + 1,
+            "backing lease 必须先被停车"
+        );
+        assert_eq!(
+            crate::memory::free_block_counts(),
+            before_free,
+            "quarantine 的 backing 不得归还 buddy heap"
+        );
+        assert!(
+            matches!(
+                get_table().lock().get(owner, handle),
+                Err(HandleError::Stale)
+            ),
+            "slot 必须在停车之后才 revoke"
+        );
+    }
+
+    /// 验收：`revoke_owner` 对每条 DMA authority 同样**先 parking 再 revoke**：
+    /// 全部 backing 进 QUARANTINE，且没有一块归还 buddy heap。
+    #[test]
+    fn revoke_owner_parks_leases_before_revoke() {
+        let _heap = test_support::GUARD.lock();
+        test_support::ensure_init();
+        crate::handle::init();
+
+        let owner = ComponentId::from_raw(61);
+        let ctx = context(owner);
+        let first = grant_mmio(owner, 13);
+        let second = grant_mmio(owner, 14);
+        let h1 = alloc(&ctx, first, 4096, DmaDirection::ToDevice).expect("alloc 1");
+        let h2 = alloc(&ctx, second, 8192, DmaDirection::FromDevice).expect("alloc 2");
+
+        let before_quarantine = quarantine_len();
+        let before_free = crate::memory::free_block_counts();
+
+        get_table().lock().revoke_owner(owner);
+
+        assert_eq!(
+            quarantine_len(),
+            before_quarantine + 2,
+            "两条 backing 都必须先被停车"
+        );
+        assert_eq!(
+            crate::memory::free_block_counts(),
+            before_free,
+            "被撤销的 backing 不得归还 buddy heap"
+        );
+        assert!(matches!(
+            get_table().lock().get(owner, h1),
+            Err(HandleError::Stale)
+        ));
+        assert!(matches!(
+            get_table().lock().get(owner, h2),
+            Err(HandleError::Stale)
+        ));
     }
 
     /// 验收：同一设备有 live DMA 子项时 MMIO root 拒绝释放（`-EBUSY`）；

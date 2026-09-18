@@ -448,6 +448,40 @@ mod tests {
         check_invariants(table, model);
     }
 
+    /// 验收：slot 复用必须让**旧 handle 立即 stale，即使复用者是同一个 owner**。
+    ///
+    /// 这是"为什么 handle 必须带 generation"的具体危害（ABA）：组件 A 释放资源 R
+    /// 后用同一 slot grant 新资源 R'，若 handle 只有 slot index，A 手里过期的 R
+    /// handle 会在 R' 上重新"命中"，把 authority 指向一个完全不同的对象。
+    /// `revoke` 在复用前 bump generation，正是为堵死这条路径。
+    ///
+    /// review 依据：`docs/resource-model-review.md` §C.2（`AddressSpaceHandle` 的
+    /// generation 恒为 1、manager 从不实例化——没有 slot 复用就不需要 generation，
+    /// 反证复用必须靠 generation 区分）与 §0 对提案 §3（handle-vs-ID）的裁定：
+    /// 移除 handle 不会带来安全收益，typed ID 恰恰保住了 generation/类型/O(1)。
+    #[test]
+    fn reused_slot_stales_old_handle_for_same_owner() {
+        let owner = OWNERS[0];
+        let mut table: ResourceTable<u32> = ResourceTable::new(ResourceKind::Mmio);
+
+        let before = table.grant(owner, 0xAA);
+        assert_eq!(table.get(owner, before), Ok(&0xAA));
+
+        // 释放后立即用**同一个 owner** 复用同一 slot。
+        assert_eq!(table.release(owner, before), Ok(()));
+        let after = table.grant(owner, 0xBB);
+
+        // 同一 slot、同一 owner，但 generation 已前进 → 旧 handle 必 Stale。
+        assert_eq!(after.slot(), before.slot(), "grant 必须复用空 slot");
+        assert_ne!(
+            after.generation(),
+            before.generation(),
+            "slot 复用必须 bump generation，否则旧 handle 会 ABA 命中"
+        );
+        assert_eq!(table.get(owner, before), Err(HandleError::Stale));
+        assert_eq!(table.get(owner, after), Ok(&0xBB));
+    }
+
     proptest! {
         /// 模型对照的随机生命周期：随机 grant/get/get_mut/release/revoke_owner 序列
         /// 之后，真实 `ResourceTable<u32>` 的 slot/generation/owner 生命周期必须与

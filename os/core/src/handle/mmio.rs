@@ -72,8 +72,7 @@
 //!   寻址 / capability 语义未定，见 §12 Q2）。
 
 use super::{
-    Handle, HandleError, MmioLease, RawHandle, RequestContext, ResourceKind, ResourceTable, dma,
-    irq,
+    Handle, HandleError, MmioView, RawHandle, RequestContext, ResourceKind, ResourceTable, dma, irq,
 };
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
@@ -282,20 +281,20 @@ pub fn claim_device(ctx: &RequestContext, device: DeviceId) -> Result<MmioHandle
         .claim_checked(ctx.component, base, size, device_index)
 }
 
-/// 派生 [`MmioLease`]：KernelNative 直接 MMIO 快路径。
+/// 派生 [`MmioView`]：KernelNative 直接 MMIO 快路径。
 ///
 /// Core 只在这里校验一次 handle（slot/generation/owner/生命周期），成功则
 /// 返回携带 `region.base` 指针、`region.size` 长度与 `source = handle`
-/// （provenance）的 lease。受信 KernelNative 驱动据此直接 volatile 访问，
-/// 稳态不再 per-access 进 Core。**撤销是协作式的**：在 revoke/release 之前
-/// 已经派生出去的裸指针不会被追回（见 `lease` 模块文档）。
-pub fn derive_lease(ctx: &RequestContext, handle: MmioHandle) -> Result<MmioLease, MmioError> {
+/// （provenance）的 `Copy` 快照视图。受信 KernelNative 驱动据此直接 volatile
+/// 访问，稳态不再 per-access 进 Core。**视图不 pin 任何东西、撤销是协作式的**：
+/// 在 revoke/release 之前已经派生出去的裸指针不会被追回（见 `lease` 模块文档）。
+pub fn derive_lease(ctx: &RequestContext, handle: MmioHandle) -> Result<MmioView, MmioError> {
     let _guard = IrqSaveGuard::new();
     let table = get_table().lock();
     let region = table
         .get(ctx.component, handle)
         .map_err(MmioError::Handle)?;
-    Ok(MmioLease::new(region.base as *mut u8, region.size, handle))
+    Ok(MmioView::new(region.base as *mut u8, region.size, handle))
 }
 
 /// 单次 32-bit MMIO 读：每次调用重新验证 handle（slot/generation/owner/
@@ -662,6 +661,45 @@ mod tests {
         assert!(table.claim_checked(other, 0x1000_6000, 0x1000, 6).is_ok());
     }
 
+    /// 验收：`quarantine_owner` 必须**先把 device 标记写进 quarantine，再 revoke
+    /// slot**——latch 必须存活于被清空的 slot 之外。
+    ///
+    /// 可观测证明：调用后 slot 已空（`holds_device` 为 false、handle Stale）；若标记
+    /// 写在 revoke 之后，`region.device_index` 已不可读，latch 就会丢失。测试因此
+    /// 在"slot 已空"的事实下仍断言 `is_quarantined` 为真——只有"先记标记"才成立。
+    /// 这也让后续 claim 恒被 `DeviceBusy` 挡住。
+    ///
+    /// review 依据：§F「顺序不变量」——MMIO 必须先标记 device quarantine 再 revoke。
+    #[test]
+    fn quarantine_owner_latches_device_before_emptying_slot() {
+        let owner = ComponentId::from_raw(84);
+        let mut table = MmioTable::new();
+        let device_index = 30;
+        let handle = table.grant(owner, region(device_index));
+
+        assert!(!table.is_quarantined(device_index));
+        assert!(table.holds_device(device_index));
+
+        table.quarantine_owner(owner);
+
+        // slot 已被清空并 bump generation（revoke 已发生）。
+        assert!(
+            !table.holds_device(device_index),
+            "quarantine_owner 必须清空该 owner 的 live slot"
+        );
+        assert!(matches!(table.get(owner, handle), Err(HandleError::Stale)));
+        // latch 仍然存在 → 必然是在清空 slot 之前写入的。
+        assert!(
+            table.is_quarantined(device_index),
+            "quarantine latch 必须存活于被清空的 slot 之外"
+        );
+        // 因而普通认领（含新 owner）恒被挡住。
+        assert_eq!(
+            table.claim_checked(owner, 0x1000_5000, 0x1000, device_index),
+            Err(MmioClaimError::DeviceBusy)
+        );
+    }
+
     /// 验收：普通 release 可回收（不 quarantine），设备仍可再次认领。
     #[test]
     fn graceful_release_does_not_quarantine_device() {
@@ -810,7 +848,7 @@ mod tests {
         );
     }
 
-    // ---- MmioLease 派生（KernelNative 直接 MMIO 快路径）----
+    // ---- MmioView 派生（KernelNative 直接 MMIO 快路径）----
 
     /// Core 一次性校验后派生 lease：指针 / 长度 / source 都来自已 grant 的 region。
     #[test]

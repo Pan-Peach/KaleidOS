@@ -753,7 +753,7 @@ extern "C" fn kcore_mmio_release(handle: u64) -> i32 {
     status(mmio::release(&ctx, mmio::MmioHandle::from_raw(handle)))
 }
 
-/// 派生 `MmioLease`：Core 校验 handle 后一次性给出 `(ptr, len)`（KernelNative
+/// 派生 `MmioView`：Core 校验 handle 后一次性给出 `(ptr, len)`（KernelNative
 /// 直接 MMIO 快路径，C6 起步）。受信 KernelNative 驱动据此直接 volatile 访问，
 /// 稳态不再 per-access 进 Core；provenance 绑定 `source` handle。**撤销是协作
 /// 式的**：Core 撤销 authority 后不会追回已经派生出去的裸指针。
@@ -841,7 +841,7 @@ extern "C" fn kcore_dma_alloc(
     }
 }
 
-/// 派生 `DmaLease`：Core 校验 handle 后一次性给出 backing `(ptr, len)` +
+/// 派生 `DmaView`：Core 校验 handle 后一次性给出 backing `(ptr, len)` +
 /// **设备可见地址**（v1 identity：等于物理基址，无 IOMMU）+ provenance
 /// （`source` handle）。受信 KernelNative 驱动据此直接 DMA；撤销是协作式，
 /// 且 backing 只进 quarantine（不 free）。
@@ -1466,6 +1466,50 @@ mod tests {
             );
             assert_eq!(kcore_mmio_release(granted.to_raw()), 0);
         });
+    }
+
+    /// 锁定 `deny_if_failed` 的**已知范围**：只拒绝 `Failed`（逻辑死亡）实例；
+    /// 已 `Stopped` 的实例**不在**其内。
+    ///
+    /// review `docs/resource-model-review.md` §C.5 明确记录这是 known gap：
+    /// 其它"不应获得新权威"的状态（`Stopping` / `Stopped`）未被该门禁覆盖。
+    /// 本步骤只 documenting + 锁定现状，**不修改行为**。
+    #[test]
+    fn deny_if_failed_denies_failed_only_not_stopped() {
+        use crate::component::registry;
+
+        registry::init();
+
+        let image = crate::component::image::ComponentImageId::from_raw(9001);
+        let failed = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.mark_failed(id).unwrap();
+            id
+        };
+        let stopped = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            reg.begin_stop(id).unwrap();
+            reg.finish_stop(id).unwrap();
+            id
+        };
+
+        assert_eq!(
+            deny_if_failed(failed),
+            Some(Errno::EPERM.code()),
+            "Failed 实例必须被获取权威门禁拒绝"
+        );
+        assert_eq!(
+            deny_if_failed(stopped),
+            None,
+            "Stopped 实例当前不被 deny_if_failed 拒绝（已知 gap，仅锁定现状）"
+        );
     }
 
     /// 接口 ABI（exact fingerprint）：bind/refresh 的早期错误约定
