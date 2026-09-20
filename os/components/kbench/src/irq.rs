@@ -2,20 +2,18 @@
 //!
 //! # 合法性边界（为什么这不是 benchmark 特权）
 //!
-//! 全程只走正常 authority 链：`device_nth`（发现）→ `mmio_claim`（认领确切
-//! 设备）→ `irq_claim`（派生同设备中断线）→ `irq_register`（正常注册）→
-//! `mmio_lease`（Core 校验后派生裸指针）→ `irq_enable`（开线）。触发是写**自己
-//! 设备的** IER/THR 寄存器（ns16550a 的 TX-empty 中断；QEMU virt 的 16550 没有
-//! `reg-shift`，寄存器按字节编址：THR@0x00、IER@0x01），handler 用同一 owned
-//! device 的 **lease 指针**清 source。没有 raw PLIC 访问、没有全局中断控制、
-//! 没有 benchmark god-mode、不关中断。
+//! 全程只走正常 device 链：`device_nth`（发现）→ `device_claim`（认领确切设备，
+//! 直接拿 MMIO 裸指针）→ `irq_register`（锚在 DeviceId）→ `irq_enable`（开线）。
+//! 触发是写**自己设备的** IER/THR 寄存器（ns16550a 的 TX-empty 中断；QEMU virt
+//! 的 16550 没有 `reg-shift`，寄存器按字节编址：THR@0x00、IER@0x01），handler 用
+//! 同一 owned device 的 **claim 指针**清 source。没有 raw PLIC 访问、没有全局
+//! 中断控制、没有 benchmark god-mode、不关中断。
 //!
 //! 每一步失败都如实报告 `status=`（`error=` / `lease_len=` 给证据）：
-//! `no_device` / `mmio_not_owned`（设备已被其它组件持有，如 core_test 先跑并
-//! 认领了 UART）/ `irq_not_owned` / `register_failed` / `lease_failed`（Core
-//! 拒绝派生，带 `error=`）/ `mmio_window_too_small`（派生成功，但设备窗口不
-//! 覆盖要碰的寄存器，带 `lease_len=`）/ `enable_failed` / `trigger_timeout`
-//! （触发路径不可用，达到丢弃上限）。kbench 不索取任何"只为 benchmark"的权限。
+//! `no_device` / `device_not_owned`（设备已被其它组件持有）/ `register_failed` /
+//! `mmio_window_too_small`（claim 成功，但设备窗口不覆盖要碰的寄存器，带
+//! `lease_len=`）/ `enable_failed` / `trigger_timeout`（触发路径不可用，达到丢弃
+//! 上限）。kbench 不索取任何"只为 benchmark"的权限。
 //!
 //! # 测的是什么（必须连同数字一起读）
 //!
@@ -196,20 +194,17 @@ fn blocked_window(ptr: usize, len: usize) {
     report::key_str("status", "mmio_window_too_small");
 }
 
-/// 释放本 primitive 认领的 authority（顺序：irq release → mmio release；
-/// mmio release 在仍有 live IRQ child 时会拒绝），并清零 state 里的记录。
-/// 正常采样结束与每条失败路径都走它；destroy 兜底再调一次（幂等）。
+/// 释放本 primitive 认领的设备（顺序：irq release → device release；device
+/// release 在仍有 live IRQ route 时会拒绝），并清零 state 里的记录。正常采样
+/// 结束与每条失败路径都走它；destroy 兜底再调一次（幂等）。
 fn release_authority(state: *mut State) {
-    let irq = unsafe { (*state).irq_handle };
-    if irq != 0 {
-        let _ = unsafe { abi::kcore_irq_release(irq) };
-        unsafe { (*state).irq_handle = 0 };
+    let device = unsafe { (*state).irq_device };
+    if device != 0 {
+        let _ = unsafe { abi::kcore_irq_release(device) };
+        let _ = unsafe { abi::kcore_device_release(device) };
+        unsafe { (*state).irq_device = 0 };
     }
-    let mmio = unsafe { (*state).irq_mmio_handle };
-    if mmio != 0 {
-        let _ = unsafe { abi::kcore_mmio_release(mmio) };
-        unsafe { (*state).irq_mmio_handle = 0 };
-    }
+    unsafe { (*state).irq_uart_lease.store(0, Ordering::SeqCst) };
 }
 
 /// destroy 的兜底 quiesce：清 handler 的 lease / SERVED 标记，并释放可能残留的
@@ -242,52 +237,38 @@ pub(crate) fn run(state: *mut State, context: &Context) {
         blocked("no_device", 0);
         return;
     }
-    let mut mmio = 0u64;
-    let claimed = unsafe { abi::kcore_mmio_claim(device, &mut mmio) };
+    let mut ptr = core::ptr::null_mut();
+    let mut len = 0usize;
+    let claimed = unsafe { abi::kcore_device_claim(device, &mut ptr, &mut len) };
     if claimed != 0 {
-        // 设备已被其它组件持有（core_test 的 UART 用例不会释放）或 quarantine；
-        // 这**不是**需要 workaround 的障碍——如实报告缺的是"一台空闲的
-        // ns16550a"，而不是去要 PLIC/god-mode。
-        blocked("mmio_not_owned", claimed);
+        // 设备已被其它组件持有（quarantine / 已 claim）；这**不是**需要 workaround
+        // 的障碍——如实报告缺的是"一台空闲的 ns16550a"。
+        blocked("device_not_owned", claimed);
         return;
     }
-    // 记录认领到的 handle：destroy 用它兜底 quiesce（正常路径下面同步释放清零）。
-    unsafe { (*state).irq_mmio_handle = mmio };
-    let mut irq = 0u64;
-    let irq_claimed = unsafe { abi::kcore_irq_claim(mmio, &mut irq) };
-    if irq_claimed != 0 {
+    // 记录认领到的设备身份：destroy 用它兜底 quiesce（正常路径下面同步释放清零）。
+    unsafe { (*state).irq_device = device };
+    if ptr.is_null() || len < MIN_HOST_LEN {
+        // claim 成功但窗口不覆盖要碰的寄存器，如实报告窗口本身。
         release_authority(state);
-        blocked("irq_not_owned", irq_claimed);
+        blocked_window(ptr as usize, len);
         return;
     }
-    unsafe { (*state).irq_handle = irq };
-    let registered = unsafe { abi::kcore_irq_register(irq, handler, state as *mut ()) };
+    unsafe {
+        (*state)
+            .irq_uart_lease
+            .store(ptr as usize, Ordering::SeqCst)
+    };
+    let registered = unsafe { abi::kcore_irq_register(device, handler, state as *mut ()) };
     if registered != 0 {
         release_authority(state);
         blocked("register_failed", registered);
         return;
     }
-    let mut ptr = 0usize;
-    let mut len = 0usize;
-    let leased = unsafe { abi::kcore_mmio_lease(mmio, &mut ptr, &mut len) };
-    if leased != 0 {
-        release_authority(state);
-        blocked("lease_failed", leased);
-        return;
-    }
-    if ptr == 0 || len < MIN_HOST_LEN {
-        // 拒绝的是本地长度要求（Core 已派生成功），如实报告窗口本身。
-        release_authority(state);
-        blocked_window(ptr, len);
-        return;
-    }
-    unsafe { (*state).irq_uart_lease.store(ptr, Ordering::SeqCst) };
-    // IER 是字节寄存器（偏移 1），Core 的 u32 校验访问要求 4 字节对齐、表达不了；
-    // 开局先 mask 走 lease 的字节写（Core 校验过一次的 KernelNative 快路径）。
-    unsafe { core::ptr::write_volatile((ptr as *mut u8).add(REG_IER), 0) };
-    let enabled = unsafe { abi::kcore_irq_enable(irq) };
+    // IER 是字节寄存器（偏移 1），开局先 mask。
+    unsafe { core::ptr::write_volatile(ptr.add(REG_IER), 0) };
+    let enabled = unsafe { abi::kcore_irq_enable(device) };
     if enabled != 0 {
-        unsafe { (*state).irq_uart_lease.store(0, Ordering::SeqCst) };
         release_authority(state);
         blocked("enable_failed", enabled);
         return;
@@ -329,7 +310,7 @@ pub(crate) fn run(state: *mut State, context: &Context) {
 
     // 先关源、断线、还设备（顺序：irq release → mmio release；mmio release 在
     // 仍有 live IRQ child 时会拒绝）。关源走 lease 字节写（同上）。
-    unsafe { core::ptr::write_volatile((ptr as *mut u8).add(REG_IER), 0) };
+    unsafe { core::ptr::write_volatile(ptr.add(REG_IER), 0) };
     unsafe { (*state).irq_uart_lease.store(0, Ordering::SeqCst) };
     release_authority(state);
 

@@ -1,33 +1,25 @@
-//! 第 3 组（resource authority）：MMIO / IRQ / DMA 的通用链 + Core 已定义的拒绝路径。
+//! 第 3 组（device / IRQ / DMA）：discover → claim → 直接访问 → release 的完整链，
+//! 以及 Core 已定义的拒绝路径。
 //!
 //! # 边界：这里没有平台事实
 //!
 //! 只按 compatible 枚举（名字来自机器自己的 discovery）、认领 Core 给的
-//! `DeviceId`、经 Core 句柄访问，断言 Core 自己报告的 errno / 派生结果。
-//! QEMU virt 的**平台白盒**事实（PLIC 线号、S-mode context 公式、enable bit
-//! 控制器布局/读回）不在这里 —— 那是 ArchTest `external-irq`
-//! （`os/boot/riscv/src/selftest.rs`）的职责，它直接驱动 PLIC + UART 验证
-//! “硬件真的被写”。CoreTest 只验证组件能走完 Core 的授权链。
+//! `DeviceId`、**直接 volatile 访问** Core 返回的 MMIO 指针，断言 Core 自己报告的
+//! errno。QEMU virt 的**平台白盒**事实（PLIC 线号、enable bit 布局/读回）不在这里
+//! ——那是 ArchTest `external-irq` 的职责。
 //!
-//! # DMA 授权模型（刻意如此，别把“没建模”读成疏漏）
+//! # mechanism-first 模型（刻意如此）
 //!
-//! 1. **不建模“设备是不是 DMA master”**：FDT 没有可靠来源（真实 QEMU virt DTB
-//!    只在 `/soc/pci@30000000` 上标 `dma-coherent`，virtio-mmio / uart 节点
-//!    什么都不带），组件也无法可靠自报。
-//! 2. `kcore_dma_alloc` 的授权证明 = caller **已持有该设备的 `MmioHandle`**
-//!    （Core 从 handle 推导设备身份，不接受组件自报设备号）。
-//! 3. 这是**协作式信任**（cooperative trust），本阶段刻意接受：KernelNative
-//!    组件与 Core 同特权、按设计同级信任，本就不承诺恶意隔离。
-//! 4. **未决问题**：组件目前可以自己 claim 中断控制器（PLIC）等设备 ——
-//!    “认领一台设备 = 拿到它的全部语义（含控制其他设备的中断线）”这个能力
-//!    （capability）问题还没有人回答；记录在此以免被当成遗漏。
+//! - KernelNative claim 后直接拿到寄存器裸指针，**不存在** per-access Core 鉴权；
+//!   越界/对齐由 driver 自己负责（这里不再有 `mmio-read-bounds` 检查）。
+//! - IRQ 锚在 `DeviceId`：register/enable/disable/release；没有 poll/ack。
+//! - DMA allocation 与 mapping 分离：`alloc → buffer`，`map(device_id) → device addr`。
 
 use kcomp_sdk::DmaDirection;
 use kcomp_sdk::abi::{
-    kcore_device_nth, kcore_dma_alloc, kcore_dma_lease, kcore_dma_release, kcore_irq_ack,
-    kcore_irq_claim, kcore_irq_enable, kcore_irq_poll, kcore_irq_register,
-    kcore_irq_register_polled, kcore_irq_release, kcore_mmio_claim, kcore_mmio_lease,
-    kcore_mmio_read_u32, kcore_mmio_release, kcore_mmio_write_u32,
+    kcore_device_claim, kcore_device_nth, kcore_device_release, kcore_dma_alloc, kcore_dma_free,
+    kcore_dma_map, kcore_dma_unmap, kcore_irq_disable, kcore_irq_enable, kcore_irq_register,
+    kcore_irq_release,
 };
 
 use super::report::Checks;
@@ -36,16 +28,13 @@ use super::trace;
 /// Core `errno.rs` 稳定数值的镜像（本组只断言，不解释）。
 const ENOENT: i32 = -2;
 const EBUSY: i32 = -16;
+const ENODEV: i32 = -19;
 const EINVAL: i32 = -22;
-const ESTALE: i32 = -116;
 
 /// VirtIO MMIO transport 的 MagicValue（VirtIO 规范，设备身份而非平台事实）。
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
 /// Goldfish RTC 的 IRQ_ENABLED 寄存器（4 字节 RW，读回精确回显）。
-/// 不用 virtio-mmio Status 做写回读：不挂后端设备时 QEMU 对 transport 的寄存器
-/// 写一律忽略（读也只回 magic/version/vendor），而 RTC 一直有后端；reset 后
-/// `irq_pending == 0`，写 1 无副作用。
-const RTC_IRQ_ENABLED: u32 = 0x10;
+const RTC_IRQ_ENABLED: usize = 0x10;
 /// virtio-mmio transport 寄存器窗口大小（VirtIO 规范：4 KiB）。
 const VIRTIO_MMIO_WINDOW: usize = 0x1000;
 
@@ -56,22 +45,32 @@ extern "C" fn irq_handler(_ctx: *mut ()) {}
 pub struct Outcome {
     /// 本组第一个 claim 之前取的 trace 游标。
     pub cursor: u64,
-    /// 三个 authority 的 raw handle（= claim/alloc 返回值；匹配 grant/revoke 事件）。
-    pub mmio: u64,
+    /// 三者的资源 id（与 trace `ResourceGrant.c` 精确匹配）：
+    /// device = DeviceId（= device_index），irq = DeviceId，dma = mapping id。
+    pub device: u64,
     pub irq: u64,
     pub dma: u64,
-    /// 三个获取操作是否全部成功（失败时 trace 断言必须失败，不靠 handle 巧合）。
+    /// 三个获取操作是否全部成功。
     pub grants_ok: bool,
     /// 三个显式释放是否全部成功。
     pub revokes_ok: bool,
 }
 
+/// 直接读 32-bit MMIO 寄存器（driver 自己的 volatile 访问，Core 不参与）。
+unsafe fn read_u32(base: *mut u8, offset: usize) -> u32 {
+    unsafe { core::ptr::read_volatile((base as usize + offset) as *const u32) }
+}
+
+/// 直接写 32-bit MMIO 寄存器。
+unsafe fn write_u32(base: *mut u8, offset: usize, value: u32) {
+    unsafe { core::ptr::write_volatile((base as usize + offset) as *mut u32, value) };
+}
+
 pub fn group(checks: &mut Checks) -> Outcome {
-    checks.group("resource authority");
+    checks.group("device / irq / dma");
     let cursor = trace::cursor();
 
-    // --- MMIO root：纯枚举 → 认领**确切设备** → 经句柄读回设备身份 ---
-    // QEMU 的 virtio-mmio transport 按 compatible 被机器发现；组件全程不持有地址。
+    // --- VirtIO device：枚举 → claim → 直接 volatile 读 MagicValue ---
     let mut virtio_device = 0u32;
     let enumerated = unsafe {
         kcore_device_nth(
@@ -81,92 +80,71 @@ pub fn group(checks: &mut Checks) -> Outcome {
             &mut virtio_device,
         ) == 0
     };
-    let mut mmio = 0u64;
-    let mmio_claimed = enumerated && unsafe { kcore_mmio_claim(virtio_device, &mut mmio) } == 0;
-    let mut magic = 0u32;
-    let magic_ok = mmio_claimed && unsafe { kcore_mmio_read_u32(mmio, 0, &mut magic) } == 0;
-    checks.check(10, "mmio-magic", magic_ok && magic == VIRTIO_MMIO_MAGIC);
-
-    // 拒绝路径：访问必须落在 region 内且 4 字节对齐 —— 越过 region 末端
-    // （offset = size）→ OutOfBounds、未对齐（offset = 1）→ Unaligned，
-    // 两者 Core 都在触碰硬件之前拒绝 → -EINVAL。
-    let mut bounds_value = 0u32;
-    let out_of_bounds = mmio_claimed
-        && unsafe { kcore_mmio_read_u32(mmio, VIRTIO_MMIO_WINDOW as u32, &mut bounds_value) }
-            == EINVAL;
-    let mut unaligned_value = 0u32;
-    let unaligned =
-        mmio_claimed && unsafe { kcore_mmio_read_u32(mmio, 1, &mut unaligned_value) } == EINVAL;
-    checks.check(30, "mmio-access-bounds", out_of_bounds && unaligned);
-
-    // 拒绝路径：独占锚在**设备**上 —— 同一 DeviceId 重复认领 → -EBUSY。
-    let mut duplicate = 0u64;
+    let (mut mmio, mut mmio_len) = (core::ptr::null_mut(), 0usize);
+    let claimed =
+        enumerated && unsafe { kcore_device_claim(virtio_device, &mut mmio, &mut mmio_len) } == 0;
+    let magic_ok = claimed && unsafe { read_u32(mmio, 0) } == VIRTIO_MMIO_MAGIC;
+    checks.check(10, "device-claim-magic", magic_ok);
     checks.check(
-        18,
-        "mmio-double-claim",
-        mmio_claimed && unsafe { kcore_mmio_claim(virtio_device, &mut duplicate) } == EBUSY,
+        11,
+        "device-window-len",
+        claimed && mmio_len == VIRTIO_MMIO_WINDOW,
     );
 
-    // --- IRQ：从 UART 的 MMIO root 派生**同台设备**的中断线（不按 compatible 另配）---
+    // 拒绝路径：独占锚在**设备**上 —— 同一 DeviceId 重复认领 → -EBUSY。
+    let (mut dup, mut dup_len) = (core::ptr::null_mut(), 0usize);
+    checks.check(
+        12,
+        "device-double-claim",
+        claimed && unsafe { kcore_device_claim(virtio_device, &mut dup, &mut dup_len) } == EBUSY,
+    );
+
+    // --- UART：claim 后用于 IRQ / DMA ---
     let mut uart_device = 0u32;
     let uart_enumerated = unsafe {
         kcore_device_nth(b"ns16550a".as_ptr(), b"ns16550a".len(), 0, &mut uart_device) == 0
     };
-    let mut uart = 0u64;
-    let uart_claimed = uart_enumerated && unsafe { kcore_mmio_claim(uart_device, &mut uart) } == 0;
-    let mut irq = 0u64;
-    let irq_claimed = uart_claimed && unsafe { kcore_irq_claim(uart, &mut irq) } == 0;
+    let (mut uart, mut uart_len) = (core::ptr::null_mut(), 0usize);
+    let uart_claimed = uart_enumerated
+        && unsafe { kcore_device_claim(uart_device, &mut uart, &mut uart_len) } == 0;
 
-    // 拒绝路径：使能前必须先注册投递 —— 未注册就 enable → -EINVAL
-    // （Core 在碰控制器之前拒绝）。
+    // 拒绝路径：使能前必须先注册 handler —— 未注册就 enable → -EINVAL。
     checks.check(
-        19,
+        13,
         "irq-enable-order",
-        irq_claimed && unsafe { kcore_irq_enable(irq) } == EINVAL,
+        uart_claimed && unsafe { kcore_irq_enable(uart_device) } == EINVAL,
     );
 
-    let irq_registered =
-        irq_claimed && unsafe { kcore_irq_register(irq, irq_handler, core::ptr::null_mut()) } == 0;
-    let irq_enabled = irq_registered && unsafe { kcore_irq_enable(irq) } == 0;
-    // 只断言 Core 报告的整链成功；“控制器寄存器真的被写”由 ArchTest 覆盖。
+    let irq_registered = uart_claimed
+        && unsafe { kcore_irq_register(uart_device, irq_handler, core::ptr::null_mut()) } == 0;
+    let irq_enabled = irq_registered && unsafe { kcore_irq_enable(uart_device) } == 0;
+    let irq_disabled = irq_enabled && unsafe { kcore_irq_disable(uart_device) } == 0;
     checks.check(
-        11,
+        14,
         "irq-line-enable",
-        irq_claimed && irq_registered && irq_enabled,
+        irq_registered && irq_enabled && irq_disabled,
     );
 
-    // 拒绝路径：同一条线重复认领（即使还是同一个 root）→ -EBUSY。
-    let mut irq_again = 0u64;
+    // 拒绝路径：仍有 live IRQ route 时释放 device → -EBUSY（拆机顺序）。
     checks.check(
-        20,
-        "irq-double-claim",
-        irq_claimed && unsafe { kcore_irq_claim(uart, &mut irq_again) } == EBUSY,
+        15,
+        "device-release-busy",
+        irq_registered && unsafe { kcore_device_release(uart_device) } == EBUSY,
     );
 
-    // 拒绝路径：root 生命周期 —— 仍有 live IRQ 子 authority 时释放 MMIO root
-    // → -EBUSY（优雅拆机顺序：先释放子项再放 root）。
-    checks.check(
-        21,
-        "mmio-release-busy",
-        irq_claimed && unsafe { kcore_mmio_release(uart) } == EBUSY,
-    );
+    // --- IRQ release：撤销 route 后重复释放 → -EINVAL（该设备已无 route）。 ---
+    let irq_released = irq_registered && unsafe { kcore_irq_release(uart_device) } == 0;
+    let irq_double = unsafe { kcore_irq_release(uart_device) } == EINVAL;
+    checks.check(16, "irq-release", irq_released && irq_double);
 
-    // --- MMIO lease：一次性派生 (ptr, len)，只读一个 u32（MagicValue）作证 ---
-    let mut lease_ptr = 0usize;
-    let mut lease_len = 0usize;
-    let leased =
-        mmio_claimed && unsafe { kcore_mmio_lease(mmio, &mut lease_ptr, &mut lease_len) } == 0;
-    let lease_magic =
-        leased && unsafe { core::ptr::read_volatile(lease_ptr as *const u32) } == VIRTIO_MMIO_MAGIC;
-    checks.check(
-        12,
-        "mmio-lease",
-        leased && lease_len == VIRTIO_MMIO_WINDOW && lease_magic,
-    );
+    // --- Device release：释放后同一设备可被再次认领（无 quarantine）。 ---
+    let uart_released = uart_claimed && unsafe { kcore_device_release(uart_device) } == 0;
+    let (mut uart2, mut uart2_len) = (core::ptr::null_mut(), 0usize);
+    let uart_reclaimed = uart_released
+        && unsafe { kcore_device_claim(uart_device, &mut uart2, &mut uart2_len) } == 0;
+    checks.check(17, "device-release", uart_released && uart_reclaimed);
 
-    // --- MMIO 写回读：goldfish RTC 的 IRQ_ENABLED（0x10，4 字节 RW，读回精确
-    //     回显）。写 1 → 读回应为 1 → 还原原值并释放。RTC 一直有后端，写读回
-    //     在 test-qemu（不挂设备的 virtio transport）之外同样成立。 ---
+    // --- MMIO 直接写回读：goldfish RTC 的 IRQ_ENABLED（0x10，4 字节 RW）。 ---
     let mut rtc_device = 0u32;
     let rtc_enumerated = unsafe {
         kcore_device_nth(
@@ -176,124 +154,77 @@ pub fn group(checks: &mut Checks) -> Outcome {
             &mut rtc_device,
         ) == 0
     };
-    let mut rtc = 0u64;
-    let rtc_claimed = rtc_enumerated && unsafe { kcore_mmio_claim(rtc_device, &mut rtc) } == 0;
-    let mut rtc_state = 0u32;
-    let rtc_read =
-        rtc_claimed && unsafe { kcore_mmio_read_u32(rtc, RTC_IRQ_ENABLED, &mut rtc_state) } == 0;
-    let rtc_wrote = rtc_read && unsafe { kcore_mmio_write_u32(rtc, RTC_IRQ_ENABLED, 1) } == 0;
-    let mut rtc_echo = 0u32;
-    let rtc_echo_read =
-        rtc_wrote && unsafe { kcore_mmio_read_u32(rtc, RTC_IRQ_ENABLED, &mut rtc_echo) } == 0;
-    let rtc_restored =
-        rtc_echo_read && unsafe { kcore_mmio_write_u32(rtc, RTC_IRQ_ENABLED, rtc_state) } == 0;
-    let rtc_released = rtc_restored && unsafe { kcore_mmio_release(rtc) } == 0;
-    checks.check(
-        13,
-        "mmio-write-readback",
-        rtc_restored && rtc_released && rtc_echo == 1,
-    );
+    let (mut rtc, mut rtc_len) = (core::ptr::null_mut(), 0usize);
+    let rtc_claimed =
+        rtc_enumerated && unsafe { kcore_device_claim(rtc_device, &mut rtc, &mut rtc_len) } == 0;
+    let rtc_state = rtc_claimed && {
+        let value = unsafe { read_u32(rtc, RTC_IRQ_ENABLED) };
+        unsafe { write_u32(rtc, RTC_IRQ_ENABLED, 1) };
+        let echo = unsafe { read_u32(rtc, RTC_IRQ_ENABLED) };
+        unsafe { write_u32(rtc, RTC_IRQ_ENABLED, value) };
+        echo == 1
+    };
+    let rtc_released = rtc_claimed && unsafe { kcore_device_release(rtc_device) } == 0;
+    checks.check(18, "device-write-readback", rtc_state && rtc_released);
 
-    // --- MMIO release：显式撤销 authority 后同一 handle 立即失效（过期 → -ESTALE）---
-    let mmio_released = mmio_claimed && unsafe { kcore_mmio_release(mmio) } == 0;
-    let mut stale_value = 0u32;
-    let stale_read = unsafe { kcore_mmio_read_u32(mmio, 0, &mut stale_value) };
-    checks.check(14, "mmio-release", mmio_released && stale_read == ESTALE);
-
-    // 拒绝路径：double release —— 首次释放已 bump generation，第二次对同一
-    // handle 释放 → -ESTALE（重复释放不能再改动任何真相）。
-    let double_release = unsafe { kcore_mmio_release(mmio) } == ESTALE;
-    checks.check(31, "mmio-double-release", mmio_released && double_release);
-
-    // 拒绝路径：死 root 不能派生新 authority —— IRQ / DMA 请求都 → -ESTALE
-    // （root 释放后 slot generation 前进，旧 raw handle 一律过期）。
-    let mut irq_from_dead = 0u64;
-    let irq_denied = unsafe { kcore_irq_claim(mmio, &mut irq_from_dead) } == ESTALE;
-    let mut dma_from_dead = 0u64;
-    let dma_denied = unsafe {
-        kcore_dma_alloc(
-            mmio,
-            4096,
-            DmaDirection::ToDevice.as_i32(),
-            &mut dma_from_dead,
-        )
-    } == ESTALE;
-    checks.check(
-        22,
-        "stale-root-derive",
-        mmio_released && irq_denied && dma_denied,
-    );
-
-    // 拒绝路径：poll 只对轮询投递的线有效 —— 仍是回调投递（尚未
-    // `register_polled`）时 poll → -EINVAL（NotPolled），Core 不改状态。
-    let mut pre_poll_count = 0u64;
-    let poll_before_polled =
-        irq_registered && unsafe { kcore_irq_poll(irq, &mut pre_poll_count) } == EINVAL;
-    checks.check(32, "irq-poll-order", poll_before_polled);
-
-    // --- IRQ polled：把已 enable 的线切成轮询投递 → poll 计数（run 中无 UART
-    //     中断 = 0）→ ack 闭环。不 enable 该线、不碰 UART IER/THR。 ---
-    let polled = irq_enabled && unsafe { kcore_irq_register_polled(irq) } == 0;
-    let mut poll_count = 0u64;
-    let poll_read = polled && unsafe { kcore_irq_poll(irq, &mut poll_count) } == 0;
-    let poll_acked = poll_read && unsafe { kcore_irq_ack(irq) } == 0;
-    checks.check(15, "irq-polled", poll_read && poll_count == 0 && poll_acked);
-
-    // --- IRQ release：真正撤销该线（撤销 slot + 关断控制器线）后同一 handle
-    //     立即失效（过期 → -ESTALE）。 ---
-    let irq_released = poll_acked && unsafe { kcore_irq_release(irq) } == 0;
-    let mut released_count = 0u64;
-    let stale_poll = unsafe { kcore_irq_poll(irq, &mut released_count) } == ESTALE;
-    checks.check(17, "irq-release", irq_released && stale_poll);
-
-    // 拒绝路径：DMA 尺寸 0 非法（分配器要求 > 0）→ -EINVAL（InvalidSize），
-    // 不产生任何 grant；随后的合法分配仍走同一个 live UART MmioHandle。
-    let mut zero_dma = 0u64;
-    let zero_size = uart_claimed
-        && unsafe { kcore_dma_alloc(uart, 0, DmaDirection::ToDevice.as_i32(), &mut zero_dma) }
-            == EINVAL;
-    checks.check(33, "dma-invalid-size", zero_size);
-
-    // --- DMA：用仍持有的 UART MmioHandle 推导设备身份（授权模型见模块文档）---
-    // alloc → lease backing → 写读回 0xDEADBEEF → release → 后续 lease 过期。
-    let mut dma = 0u64;
-    let dma_allocated = uart_claimed
-        && unsafe { kcore_dma_alloc(uart, 8192, DmaDirection::Bidirectional.as_i32(), &mut dma) }
-            == 0;
-    let mut dma_ptr = 0usize;
-    let mut dma_len = 0usize;
-    let mut dma_device_addr = 0u64;
-    let dma_leased = dma_allocated
-        && unsafe { kcore_dma_lease(dma, &mut dma_ptr, &mut dma_len, &mut dma_device_addr) } == 0;
-    let dma_roundtrip = dma_leased
-        && dma_ptr != 0
-        && dma_len >= 8192
+    // --- DMA：allocation 与 mapping 分离；alloc → map → 写读回 → unmap → free。 ---
+    let (mut dma_ptr, mut dma_len) = (core::ptr::null_mut(), 0usize);
+    let dma_allocated =
+        uart_reclaimed && unsafe { kcore_dma_alloc(8192, &mut dma_ptr, &mut dma_len) } == 0;
+    let (mut dma_device_addr, mut dma_mapping) = (0u64, 0u64);
+    let dma_mapped = dma_allocated
+        && unsafe {
+            kcore_dma_map(
+                uart_device,
+                dma_ptr,
+                dma_len,
+                DmaDirection::Bidirectional.as_i32(),
+                &mut dma_device_addr,
+                &mut dma_mapping,
+            )
+        } == 0;
+    let dma_roundtrip = dma_mapped
+        && !dma_ptr.is_null()
         && dma_device_addr != 0
         && unsafe {
             core::ptr::write_volatile(dma_ptr as *mut u32, 0xDEAD_BEEF);
             core::ptr::read_volatile(dma_ptr as *const u32) == 0xDEAD_BEEF
         };
-    let dma_released = dma_roundtrip && unsafe { kcore_dma_release(dma) } == 0;
-    let mut stale_ptr = 0usize;
-    let mut stale_len = 0usize;
-    let mut stale_addr = 0u64;
-    let dma_stale =
-        unsafe { kcore_dma_lease(dma, &mut stale_ptr, &mut stale_len, &mut stale_addr) } == ESTALE;
-    checks.check(16, "dma-ring", dma_roundtrip && dma_released && dma_stale);
+    let dma_unmapped = dma_roundtrip && unsafe { kcore_dma_unmap(dma_mapping) } == 0;
+    let dma_freed = dma_unmapped && unsafe { kcore_dma_free(dma_ptr) } == 0;
+    checks.check(19, "dma-ring", dma_roundtrip && dma_unmapped && dma_freed);
+
+    // 拒绝路径：DMA 尺寸 0 非法 → -EINVAL。
+    let (mut zero_ptr, mut zero_len) = (core::ptr::null_mut(), 0usize);
+    checks.check(
+        20,
+        "dma-invalid-size",
+        unsafe { kcore_dma_alloc(0, &mut zero_ptr, &mut zero_len) } == EINVAL,
+    );
 
     // 拒绝路径：不存在的 ordinal 是 discovery 的唯一终止信号 → -ENOENT。
     let mut missing = 0u32;
     let miss = unsafe {
         kcore_device_nth(b"ns16550a".as_ptr(), b"ns16550a".len(), 1, &mut missing) == ENOENT
     };
-    checks.check(23, "device-ordinal-miss", miss);
+    checks.check(21, "device-ordinal-miss", miss);
+
+    // 拒绝路径：释放未认领的设备 → -ENODEV（已释放的 RTC）。
+    checks.check(
+        22,
+        "device-release-unclaimed",
+        unsafe { kcore_device_release(rtc_device) } == ENODEV,
+    );
+
+    // 清理：释放 virtio claim（其 trace revoke 也在本组窗口内）。
+    let virtio_released = claimed && unsafe { kcore_device_release(virtio_device) } == 0;
 
     Outcome {
         cursor,
-        mmio,
-        irq,
-        dma,
-        grants_ok: mmio_claimed && irq_claimed && dma_allocated,
-        revokes_ok: mmio_released && irq_released && dma_released,
+        device: u64::from(virtio_device),
+        irq: u64::from(uart_device),
+        dma: dma_mapping,
+        grants_ok: claimed && irq_registered && dma_mapped,
+        revokes_ok: virtio_released && irq_released && dma_unmapped,
     }
 }

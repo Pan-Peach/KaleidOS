@@ -7,9 +7,10 @@
 //! -negative  failure: -Errno
 //! ```
 //!
-//! - **内部保持丰富**：`TaskError` / `HandleError` / `ComponentLoadError` /
-//!   `SchedError` / `InterfaceError` / `MmioError` 等继续各自为政（强类型、
-//!   可重构），只在 Core ABI 边界翻译成 `Errno`——本文件是唯一映射表。
+//! - **内部保持丰富**：`TaskError` / `ComponentLoadError` /
+//!   `SchedError` / `InterfaceError` / `DeviceClaimError` / `IrqError` / `DmaError`
+//!   等继续各自为政（强类型、可重构），只在 Core ABI 边界翻译成 `Errno`——
+//!   本文件是唯一映射表。
 //! - **数值稳定**：Linux/POSIX 风格；进入 public ABI 后，数字不再变更。
 //! - 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
 //! - 有返回值的 action 统一 `i32 status + out 参数`（`0` / `-errno`），
@@ -19,8 +20,8 @@
 use crate::component::exit::ComponentStopError;
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
-use crate::handle::{HandleError, dma, irq, mmio};
 use crate::machine;
+use crate::resource::{device, dma, irq};
 use crate::sched::SchedError;
 use crate::task::TaskError;
 
@@ -62,18 +63,6 @@ pub(crate) fn status<E: Into<Errno>>(result: Result<(), E>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => error.into().code(),
-    }
-}
-
-impl From<HandleError> for Errno {
-    fn from(error: HandleError) -> Self {
-        match error {
-            HandleError::Invalid => Errno::EBADF,
-            HandleError::Stale => Errno::ESTALE,
-            HandleError::WrongOwner => Errno::EACCES,
-            HandleError::Revoked => Errno::EKEYREVOKED,
-            HandleError::AlreadyReleased => Errno::EALREADY,
-        }
     }
 }
 
@@ -163,23 +152,22 @@ impl From<machine::DeviceLookupError> for Errno {
     }
 }
 
-impl From<mmio::MmioClaimError> for Errno {
-    fn from(error: mmio::MmioClaimError) -> Self {
+impl From<device::DeviceClaimError> for Errno {
+    fn from(error: device::DeviceClaimError) -> Self {
         match error {
-            mmio::MmioClaimError::DeviceNotFound => Errno::ENODEV,
-            mmio::MmioClaimError::NotMmio => Errno::ENOTSUP,
-            mmio::MmioClaimError::DeviceBusy => Errno::EBUSY,
-            mmio::MmioClaimError::Denied => Errno::EPERM,
+            device::DeviceClaimError::DeviceNotFound => Errno::ENODEV,
+            device::DeviceClaimError::NotMmio => Errno::ENOTSUP,
+            device::DeviceClaimError::DeviceBusy => Errno::EBUSY,
         }
     }
 }
 
-impl From<mmio::MmioError> for Errno {
-    fn from(error: mmio::MmioError) -> Self {
+impl From<device::DeviceReleaseError> for Errno {
+    fn from(error: device::DeviceReleaseError) -> Self {
         match error {
-            mmio::MmioError::Handle(inner) => inner.into(),
-            mmio::MmioError::OutOfBounds | mmio::MmioError::Unaligned => Errno::EINVAL,
-            mmio::MmioError::HasChildren => Errno::EBUSY,
+            device::DeviceReleaseError::DeviceNotFound => Errno::ENODEV,
+            device::DeviceReleaseError::NotOwner => Errno::EACCES,
+            device::DeviceReleaseError::HasChildren => Errno::EBUSY,
         }
     }
 }
@@ -187,22 +175,11 @@ impl From<mmio::MmioError> for Errno {
 impl From<dma::DmaError> for Errno {
     fn from(error: dma::DmaError) -> Self {
         match error {
-            dma::DmaError::Handle(inner) => inner.into(),
-            dma::DmaError::Mmio(inner) => inner.into(),
-            dma::DmaError::InvalidSize => Errno::EINVAL,
+            dma::DmaError::InvalidSize | dma::DmaError::BadRange => Errno::EINVAL,
             dma::DmaError::Exhausted => Errno::ENOMEM,
-        }
-    }
-}
-
-impl From<irq::IrqClaimError> for Errno {
-    fn from(error: irq::IrqClaimError) -> Self {
-        match error {
-            irq::IrqClaimError::DeviceNotFound => Errno::ENODEV,
-            irq::IrqClaimError::DeviceHasNoIrq => Errno::ENODEV,
-            irq::IrqClaimError::LineBusy => Errno::EBUSY,
-            irq::IrqClaimError::MmioHandle(inner) => inner.into(),
-            irq::IrqClaimError::Denied => Errno::EPERM,
+            dma::DmaError::DeviceNotFound => Errno::ENODEV,
+            dma::DmaError::NotOwner => Errno::EACCES,
+            dma::DmaError::NotFound => Errno::ENOENT,
         }
     }
 }
@@ -210,9 +187,9 @@ impl From<irq::IrqClaimError> for Errno {
 impl From<irq::IrqError> for Errno {
     fn from(error: irq::IrqError) -> Self {
         match error {
-            irq::IrqError::Handle(inner) => inner.into(),
-            irq::IrqError::NoDelivery => Errno::EINVAL,
-            irq::IrqError::NotPolled => Errno::EINVAL,
+            irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
+            irq::IrqError::NotOwner => Errno::EACCES,
+            irq::IrqError::NoHandler => Errno::EINVAL,
         }
     }
 }
@@ -233,8 +210,6 @@ mod tests {
 
     #[test]
     fn internal_errors_translate_at_the_boundary() {
-        assert_eq!(Errno::from(HandleError::Stale), Errno::ESTALE);
-        assert_eq!(Errno::from(HandleError::WrongOwner), Errno::EACCES);
         assert_eq!(Errno::from(TaskError::NoMemory), Errno::ENOMEM);
         assert_eq!(Errno::from(TaskError::InvalidTransition), Errno::EINVAL);
         assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
@@ -255,14 +230,6 @@ mod tests {
         );
         assert_eq!(Errno::from(ComponentStopError::DestroyPanicked), Errno::EIO);
         assert_eq!(Errno::from(ComponentStopError::StateRejected), Errno::EIO);
-        assert_eq!(Errno::from(mmio::MmioClaimError::DeviceBusy), Errno::EBUSY);
-        assert_eq!(Errno::from(mmio::MmioClaimError::NotMmio), Errno::ENOTSUP);
-        assert_eq!(
-            Errno::from(mmio::MmioError::Handle(HandleError::Revoked)),
-            Errno::EKEYREVOKED
-        );
-        assert_eq!(Errno::from(mmio::MmioError::Unaligned), Errno::EINVAL);
-        assert_eq!(Errno::from(mmio::MmioError::HasChildren), Errno::EBUSY);
         assert_eq!(
             Errno::from(machine::DeviceLookupError::NoMachineInfo),
             Errno::ENODEV
@@ -271,37 +238,28 @@ mod tests {
             Errno::from(machine::DeviceLookupError::NoSuchOrdinal),
             Errno::ENOENT
         );
-        assert_eq!(Errno::from(irq::IrqClaimError::LineBusy), Errno::EBUSY);
         assert_eq!(
-            Errno::from(irq::IrqClaimError::DeviceHasNoIrq),
-            Errno::ENODEV
+            Errno::from(device::DeviceClaimError::DeviceBusy),
+            Errno::EBUSY
         );
         assert_eq!(
-            Errno::from(irq::IrqClaimError::MmioHandle(HandleError::WrongOwner)),
-            Errno::EACCES
+            Errno::from(device::DeviceReleaseError::HasChildren),
+            Errno::EBUSY
         );
-        assert_eq!(
-            Errno::from(irq::IrqError::Handle(HandleError::Stale)),
-            Errno::ESTALE
-        );
-        assert_eq!(Errno::from(irq::IrqError::NoDelivery), Errno::EINVAL);
-        assert_eq!(Errno::from(irq::IrqError::NotPolled), Errno::EINVAL);
-        assert_eq!(
-            Errno::from(dma::DmaError::Handle(HandleError::Stale)),
-            Errno::ESTALE
-        );
-        assert_eq!(
-            Errno::from(dma::DmaError::Mmio(mmio::MmioError::Unaligned)),
-            Errno::EINVAL
-        );
+        assert_eq!(Errno::from(irq::IrqError::NotOwner), Errno::EACCES);
+        assert_eq!(Errno::from(irq::IrqError::NoHandler), Errno::EINVAL);
+        assert_eq!(Errno::from(dma::DmaError::NotFound), Errno::ENOENT);
         assert_eq!(Errno::from(dma::DmaError::InvalidSize), Errno::EINVAL);
         assert_eq!(Errno::from(dma::DmaError::Exhausted), Errno::ENOMEM);
     }
 
     #[test]
     fn status_maps_ok_and_err() {
-        assert_eq!(status(Ok::<(), HandleError>(())), 0);
-        assert_eq!(status(Err::<(), HandleError>(HandleError::Invalid)), -9);
+        assert_eq!(status(Ok::<(), TaskError>(())), 0);
+        assert_eq!(
+            status(Err::<(), TaskError>(TaskError::NotFound)),
+            Errno::ESRCH.code()
+        );
     }
 
     /// ABI 错误码数字**稳定不变**：进入 public ABI 后这些值是契约，测试即锚点。
@@ -314,31 +272,6 @@ mod tests {
         assert_eq!(Errno::EINVAL.code(), -22);
         assert_eq!(Errno::ESTALE.code(), -116);
         assert_eq!(Errno::EKEYREVOKED.code(), -128);
-    }
-
-    // —— 每个错误枚举的**全部**变体 → Errno 映射 ——
-    //
-    // 每个测试里的 `match` 都不带通配臂：枚举新增变体时这里必须同步更新，
-    // 否则无法编译——"映射表漏测"从"靠人记得"变成"编译器强制"。
-
-    #[test]
-    fn every_handle_error_arm_maps_to_its_pinned_errno() {
-        for error in [
-            HandleError::Invalid,
-            HandleError::Stale,
-            HandleError::WrongOwner,
-            HandleError::Revoked,
-            HandleError::AlreadyReleased,
-        ] {
-            let expected = match error {
-                HandleError::Invalid => Errno::EBADF,
-                HandleError::Stale => Errno::ESTALE,
-                HandleError::WrongOwner => Errno::EACCES,
-                HandleError::Revoked => Errno::EKEYREVOKED,
-                HandleError::AlreadyReleased => Errno::EALREADY,
-            };
-            assert_eq!(Errno::from(error), expected, "HandleError {error:?}");
-        }
     }
 
     #[test]
@@ -485,93 +418,76 @@ mod tests {
         }
     }
 
+    // —— 每个错误枚举的**全部**变体 → Errno 映射 ——
+    //
+    // 每个测试里的 `match` 都不带通配臂：枚举新增变体时这里必须同步更新，
+    // 否则无法编译——"映射表漏测"从"靠人记得"变成"编译器强制"。
+
     #[test]
-    fn every_mmio_claim_error_arm_maps_to_its_pinned_errno() {
+    fn every_device_claim_error_arm_maps_to_its_pinned_errno() {
         for error in [
-            mmio::MmioClaimError::DeviceNotFound,
-            mmio::MmioClaimError::NotMmio,
-            mmio::MmioClaimError::DeviceBusy,
-            mmio::MmioClaimError::Denied,
+            device::DeviceClaimError::DeviceNotFound,
+            device::DeviceClaimError::NotMmio,
+            device::DeviceClaimError::DeviceBusy,
         ] {
             let expected = match error {
-                mmio::MmioClaimError::DeviceNotFound => Errno::ENODEV,
-                mmio::MmioClaimError::NotMmio => Errno::ENOTSUP,
-                mmio::MmioClaimError::DeviceBusy => Errno::EBUSY,
-                mmio::MmioClaimError::Denied => Errno::EPERM,
+                device::DeviceClaimError::DeviceNotFound => Errno::ENODEV,
+                device::DeviceClaimError::NotMmio => Errno::ENOTSUP,
+                device::DeviceClaimError::DeviceBusy => Errno::EBUSY,
             };
-            assert_eq!(Errno::from(error), expected, "MmioClaimError {error:?}");
+            assert_eq!(Errno::from(error), expected, "DeviceClaimError {error:?}");
         }
     }
 
-    /// `MmioError::Handle` 委托给 `HandleError` 的映射表（不重复定档）。
     #[test]
-    fn every_mmio_error_arm_maps_to_its_pinned_errno() {
+    fn every_device_release_error_arm_maps_to_its_pinned_errno() {
         for error in [
-            mmio::MmioError::Handle(HandleError::Stale),
-            mmio::MmioError::OutOfBounds,
-            mmio::MmioError::Unaligned,
-            mmio::MmioError::HasChildren,
+            device::DeviceReleaseError::DeviceNotFound,
+            device::DeviceReleaseError::NotOwner,
+            device::DeviceReleaseError::HasChildren,
         ] {
             let expected = match error {
-                mmio::MmioError::Handle(inner) => Errno::from(inner),
-                mmio::MmioError::OutOfBounds => Errno::EINVAL,
-                mmio::MmioError::Unaligned => Errno::EINVAL,
-                mmio::MmioError::HasChildren => Errno::EBUSY,
+                device::DeviceReleaseError::DeviceNotFound => Errno::ENODEV,
+                device::DeviceReleaseError::NotOwner => Errno::EACCES,
+                device::DeviceReleaseError::HasChildren => Errno::EBUSY,
             };
-            assert_eq!(Errno::from(error), expected, "MmioError {error:?}");
+            assert_eq!(Errno::from(error), expected, "DeviceReleaseError {error:?}");
         }
     }
 
-    /// `DmaError::Handle` / `DmaError::Mmio` 逐层委托到最内层映射。
     #[test]
     fn every_dma_error_arm_maps_to_its_pinned_errno() {
         for error in [
-            dma::DmaError::Handle(HandleError::WrongOwner),
-            dma::DmaError::Mmio(mmio::MmioError::Unaligned),
             dma::DmaError::InvalidSize,
             dma::DmaError::Exhausted,
+            dma::DmaError::DeviceNotFound,
+            dma::DmaError::NotOwner,
+            dma::DmaError::NotFound,
+            dma::DmaError::BadRange,
         ] {
             let expected = match error {
-                dma::DmaError::Handle(inner) => Errno::from(inner),
-                dma::DmaError::Mmio(inner) => Errno::from(inner),
-                dma::DmaError::InvalidSize => Errno::EINVAL,
+                dma::DmaError::InvalidSize | dma::DmaError::BadRange => Errno::EINVAL,
                 dma::DmaError::Exhausted => Errno::ENOMEM,
+                dma::DmaError::DeviceNotFound => Errno::ENODEV,
+                dma::DmaError::NotOwner => Errno::EACCES,
+                dma::DmaError::NotFound => Errno::ENOENT,
             };
             assert_eq!(Errno::from(error), expected, "DmaError {error:?}");
         }
     }
 
     #[test]
-    fn every_irq_claim_error_arm_maps_to_its_pinned_errno() {
-        for error in [
-            irq::IrqClaimError::DeviceNotFound,
-            irq::IrqClaimError::DeviceHasNoIrq,
-            irq::IrqClaimError::LineBusy,
-            irq::IrqClaimError::MmioHandle(HandleError::Invalid),
-            irq::IrqClaimError::Denied,
-        ] {
-            let expected = match error {
-                irq::IrqClaimError::DeviceNotFound => Errno::ENODEV,
-                irq::IrqClaimError::DeviceHasNoIrq => Errno::ENODEV,
-                irq::IrqClaimError::LineBusy => Errno::EBUSY,
-                irq::IrqClaimError::MmioHandle(inner) => Errno::from(inner),
-                irq::IrqClaimError::Denied => Errno::EPERM,
-            };
-            assert_eq!(Errno::from(error), expected, "IrqClaimError {error:?}");
-        }
-    }
-
-    #[test]
     fn every_irq_error_arm_maps_to_its_pinned_errno() {
         for error in [
-            irq::IrqError::Handle(HandleError::Revoked),
-            irq::IrqError::NoDelivery,
-            irq::IrqError::NotPolled,
+            irq::IrqError::DeviceNotFound,
+            irq::IrqError::NoIrq,
+            irq::IrqError::NotOwner,
+            irq::IrqError::NoHandler,
         ] {
             let expected = match error {
-                irq::IrqError::Handle(inner) => Errno::from(inner),
-                irq::IrqError::NoDelivery => Errno::EINVAL,
-                irq::IrqError::NotPolled => Errno::EINVAL,
+                irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
+                irq::IrqError::NotOwner => Errno::EACCES,
+                irq::IrqError::NoHandler => Errno::EINVAL,
             };
             assert_eq!(Errno::from(error), expected, "IrqError {error:?}");
         }

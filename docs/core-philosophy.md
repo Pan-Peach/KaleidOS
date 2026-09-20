@@ -35,7 +35,7 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 >
 > 注意：这条只适用于**可替换的策略组件**（如调度器）。物理帧分配是 Core 内部机制，不是"提议"的策略 —— 见 §3 分配示例。
 
-更完整地说，Core 的职责是系统中的 **authority / resource / isolation / lifetime arbiter**：它回答"谁拥有这个资源、谁可以访问、当前 authority 是否仍有效、资源如何被授予/转移/撤销、一个 execution domain 能看见哪些内存、IRQ / DMA / MMIO 的硬件边界如何建立、一个组件死亡后哪些资源必须失效、一个任务如何被切换、一个 fault 应该终止哪个 execution domain"。
+更完整地说，Core 的职责是系统中的**机制与所有权核心（mechanism & ownership）**：它回答"谁拥有这个资源、资源如何被认领/释放、一个 execution domain 能看见哪些内存、IRQ / DMA / MMIO 的硬件边界如何建立、一个组件死亡后哪些资源记录必须失效、一个任务如何被切换、一个 fault 应该终止哪个 execution domain"。**Core 提供 mechanism，不伪造不存在的 security boundary**：访问强制只来自执行域（私有 AS + 页表），不是每次 API 鉴权。
 
 而 Core **不决定**：用什么调度策略；网络栈 / 文件系统如何设计；驱动用什么框架；服务如何组合；POSIX 如何实现；某个组件采用什么内部数据结构；某个系统必须采用宏内核、微内核还是用户态服务形态。
 
@@ -47,11 +47,11 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 
 | 状态 | 例子 |
 |---|---|
-| 对象存在性 | Task #7 存在；Frame #100 存在 |
+| 对象存在性 | Task #7 存在；某段 `PhysicalRange` 已被分配 |
 | 对象状态 | Task #7 是 Runnable |
-| 所有权 | Frame #100 属于 Component A；IRQ #5 已分配给 virtio-net |
+| 所有权 | 设备 N 已认领给 virtio-net；某条 IRQ route / DMA mapping 归某组件；某段 `PhysicalRange` 属于某 AddressSpace |
 | 执行位置 | Task #7 当前运行在 CPU 0 |
-| 生命周期 | Component 处于哪个阶段；Handle 是否还有效 |
+| 生命周期 | Component 处于哪个阶段；设备 / IRQ route / DMA mapping 的归属记录是否仍有效 |
 
 ### Component 保存（策略/算法私有状态）
 
@@ -69,7 +69,7 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 
 | 分类 | 定义 | 例子 | 归属 |
 |---|---|---|---|
-| **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | PhysicalRegion 占用与归属、Task state、运行 CPU、AddressSpace 映射、资源所有权、Handle 有效性、IRQ 所有权 | Core |
+| **Core Resource Truth** | 真实世界的资源事实；错了会破坏**跨组件资源安全** | PhysicalRegion 占用与归属、Task state、运行 CPU、AddressSpace 映射、设备所有权、IRQ route 归属、DMA mapping 归属 | Core |
 | **Component Semantic State** | 某个 Component 自己负责的"业务真相"；**不能随便丢**，但也不是 Core 的责任 | VFS mount 表、TCP 连接状态、POSIX fd table、文件系统事务状态、game runtime 会话状态 | Component |
 | **Derived** | 从权威状态构造的策略/加速状态；允许丢失，但丢失后必须能恢复到 **safe usable state**（不要求行为完全等价） | runqueue、LRU list、CFS vruntime、缓存索引 | Component |
 | **Ephemeral** | 丢失完全不影响正确性的短暂状态 | debug buffer、临时统计、部分 trace 聚合 | Component |
@@ -87,7 +87,7 @@ POSIX 的 fd table 都是 Component 自己的业务真相（见 §2 状态四级
 关键边界：
 
   Component Semantic State（mount 表、TCP 连接、fd table）可能完全无法从 Core 的
-  Task / Frame / Handle / IRQ 推导出来，是组件自己必须认真维护的语义真相；
+  Task / Frame / 设备所有权 / IRQ 推导出来，是组件自己必须认真维护的语义真相；
   网络栈丢失 RTT 估计）—— 但这**不会破坏 safety、不会导致资源账本错误**；
 
 ## 3. Policy proposes, Core validates and commits
@@ -119,7 +119,7 @@ Core 的分配器：
   - 选择一个 PhysicalRange
   - 验证：区域存在？空闲？范围合法？
   - commit region ownership
-  - grant memory region / address-space authority
+  - 由 Core 提交 region ownership 与 address-space mapping
 ```
 
 未来若引入 `MemoryPolicy` 组件，它只能**提议偏好**（如 NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
@@ -139,40 +139,42 @@ KaleidOS 不追求某种纯粹的内核教条，也不再要求"Core 中绝不�
 | IsolatedNative | S | 私有 AS | 半信任；native 性能 + 条件性故障隔离（可选实验，非里程碑） |
 | U-mode（SandboxedNative） | U | 私有 AS | 不信任；syscall 边界，硬件强制隔离 |
 
-**部署形态本身就是安全策略的一部分**：不信任它，就不要部署成 KernelNative。Core 不应该靠"所有组件都经过同样重的安全机制"来解决信任问题。KernelNative 的安全边界不是"防御恶意组件"，而是 API 边界、ownership、lifetime、authority bookkeeping 与可撤销资源身份——它仍可能通过裸指针、非法内存写、UB 破坏整个 Core。
+**部署形态本身就是安全策略的一部分**：不信任它，就不要部署成 KernelNative。Core 不应该靠"所有组件都经过同样重的安全机制"来解决信任问题。KernelNative 的安全边界不是"防御恶意组件"，而是 API 边界、ownership、lifetime、设备/IRQ/DMA 归属记账与 teardown——它仍可能通过裸指针、非法内存写、UB 破坏整个 Core。
 
 **同一语义、不同传输**：allocate / map / irq / log / interface-call 这些语义可以复用，但传输方式必须分离——KernelNative 用窄 `extern "C"` ABI，IsolatedNative 走受控边界，U-mode 用独立的 syscall wire ABI。不要因为三个域最终都做"同一件事"，就强行让它们共享同一个底层 ABI。
 
-（执行域与 Handle→Lease 细节见 `driver-model.md`；AddressSpace 注册表见 `component-model.md`。）
+（执行域与 device claim / IRQ / DMA 细节见 `driver-model.md`；AddressSpace 注册表见 `component-model.md`。）
 
-## 4. Authority ≠ Interface
+## 4. 机制与所有权 ≠ Interface
 
-不要把所有东西都叫 capability。两个概念必须分开：
-
-### Resource Authority —— "你有权动什么"
-
-由 Core 产生的类型化 token；token 可被伪造，authority 最终由 Core 验证：
+不要把所有东西都叫 capability。必须分开的是三件事（见 `driver-model.md` §1.1）：
 
 ```text
-MmioHandle  IrqHandle  DmaHandle
-TaskHandle  TimerHandle AddressSpaceHandle
+Security / access enforcement   —— KernelNative 不做；Isolated/Sandboxed 只由执行域强制
+Ownership / lifecycle bookkeeping —— Core 记 device owner / IRQ route / DMA mapping
+Mechanism                        —— 分配器、页表、IRQ 路由、加载、切换、IOMMU mapping、机器发现
 ```
 
-**硬性要求**：驱动永远不应该拿到裸物理地址、裸 IRQ 号、裸 DMA 指针或任意 MMIO 指针。
-它应该拿到 `MmioHandle`、`IrqHandle`、`DmaHandle` —— 通过 handle 间接访问，Core 在中间校验。
+### 机制与所有权 —— "你是谁、你拥有什么"
 
-#### Handle 的真正意义：control plane，不是内存屏障
+Core 维护裸机程序自己无法知道的那部分真相：
 
-即使 KernelNative 可以接触裸地址，Handle 仍然有存在价值，但必须明确：**Handle 在 KernelNative 中不是内存安全屏障。** 如果一个受信组件已经拿到裸 MMIO pointer，撤销 handle 并不能神奇地让已泄漏的裸 pointer 停止工作。
+- **设备所有权**：哪台设备被哪个 Component 认领（用于独占、unload、失败清理与复用）；
+- **IRQ route**：哪条中断线归哪个 owner、回调是谁（trap 需要一个锚点）；
+- **DMA mapping**：哪段 buffer 映射给哪台设备。
 
-Handle 的意义在 **control plane**：resource identity / ownership / authority / generation / lifetime / revocation / accounting / cleanup。它表达的是"你现在被授予了对这个资源的 authority"，而不是"CPU 从物理上绝不允许你绕过我"。因此 KernelNative 可以有这样的分层：
+这些记录服务 **unload / 失败清理 / 防止重复认领 / teardown / quarantine**，**不是**用来阻止受信 KernelNative 组件。驱动取得设备的路径是 **mechanism**，不是 capability token：
 
 ```text
-control plane:  handle / authority
-fast path:      经 Core 校验一次后派生的 native pointer / mapping（typed Lease）
+kcore_device_nth（纯发现）→ DeviceId（identity，非权限）→ kcore_device_claim
+                                                          │
+        ┌─────────────────────────────────────────────────┴──────────────────┐
+        ▼                                                                    ▼
+KernelNative：裸寄存器基址                         Isolated（未来）：映射进组件 AS 的 VA
+driver 自己 volatile 读写，稳态不进 Core           未映射访问 → 页表 fault
 ```
 
-Handle 负责：谁拥有设备；资源是否仍有效；teardown 时撤销谁；generation 防止 stale handle；restart 后旧 authority 失效；由 Core 统一管理资源生命周期。（`smoltcp` 式的直觉：handle 是稳定的身份与管理引用，而不是对象本身。）
+**KernelNative 就是可信代码**：Core 不做 per-access 鉴权。旧的 `Handle → validate → Core MMIO read/write` / typed `MmioLease` / `DmaLease` 模型已删除——对同特权级、同地址空间的受信代码，它没有真实安全含义。真正的访问强制只来自执行域（私有 AS + 页表），而 KernelNative 的撤销是**协作式**的：Core 能撤销所有权记录，但追不回已经交出的裸指针。
 
 ### Interface —— "你能提供什么"
 
@@ -188,7 +190,8 @@ Policy:   SchedulerPolicy  PageReplacementPolicy  （未来：MemoryPolicy）
 
 ```text
 Core
- │  grant Resource Authority（Handle）
+ │  mechanism：device_nth → device_claim（记 owner + 访问窗口）
+ │             IRQ route / DMA mapping 归属记账
  ▼
 NVMe Component
  │  provides
@@ -202,7 +205,7 @@ BlockDevice（Interface）
 新增任何东西进 Core 之前，问这组问题：
 
 1. **它是不是真相？**（对象存在性 / 状态 / 所有权 / 生命周期 —— 是）
-2. **它是否必须拥有系统级 authority 才能正确工作？**
+2. **它是否必须拥有全局真相 / 机制才能正确工作？**（例如：只有 Core 能操作页表、知道全局设备所有权、路由 IRQ、管理组件生命周期、避免 DMA backing 被错误复用）
 3. **把它做成 component / library，会不会破坏安全边界？**
 4. **它是 mechanism，还是 policy？**
 5. **不同 KaleidOS 部署是否可能希望替换它？**
@@ -210,12 +213,12 @@ BlockDevice（Interface）
 7. **它进入 Core 后，会不会迫使其它 domain 也接受这个设计？**
 8. **它能否通过一个更小的 primitive 暴露给上层？** 是不是因为"Linux / 传统 OS 都这么做"才想放进来？
 
-如果最后的答案是"它只是方便放 Core"，那通常就不应该放。特别警惕"它是不是基础功能？"——"基础功能"恰恰最容易误入 Core：**Core 收的是 authority，不是功能**。
+如果最后的答案是"它只是方便放 Core"，那通常就不应该放。特别警惕"它是不是基础功能？"——"基础功能"恰恰最容易误入 Core：**Core 收的是机制与真相，不是功能**。
 
 核心判据（litmus test）：
 
 > 如果一个完全错误的 Component 能通过某个 API 破坏其他 Component 或全局 invariant，
-> 那么应该缩小 API，或者把最终 authority 收回 Core。
+> 那么应该缩小 API，或者把最终裁决权收回 Core。
 
 **反例自查**：RR 算法放进 Core？—— 不需要。它错了只会调度得烂，不会让两个任务同时占一个 CPU（检查在 Core）。物理帧分配则相反：它是 Core 内部机制 —— 分配错了会破坏所有权真相，必须由 Core 掌握（见 §3 分配示例）。
 
@@ -272,13 +275,14 @@ Core 校验自动退化为 no-op，Core 不需要写任何 `#[cfg]`（host 测�
 
 ## 5.7 最小性不是代码高尔夫
 
-"Core 越小越好"不是"代码越少越好"的代码高尔夫。真正含义是：**Core 只保留那些必须拥有全局 authority 才能正确完成的机制。** 典型的 Core 内容：
+"Core 越小越好"不是"代码越少越好"的代码高尔夫。真正含义是：**Core 只保留那些必须拥有全局真相 / 机制才能正确完成的机制。** 典型的 Core 内容：
 
 ```text
-resource authority        handle lifecycle          memory ownership
-address-space primitive   task / context primitive  interrupt primitive
-timer primitive           component loader          component lifecycle
-interface registry primitive   fault routing        machine capability
+device ownership & claim   IRQ routes                DMA mapping
+memory ownership           memory allocator          address-space primitive
+task / context primitive   interrupt primitive       timer primitive
+component loader           component lifecycle       interface registry primitive
+fault routing              machine discovery         ownership bookkeeping
 ```
 
 可以独立选择策略的东西，尽量外置（见 §0）。不塞进 Core 的典型：某个调度算法、文件系统格式、网络协议栈、设备协议、POSIX 语义、ELF loader、Wasm runtime。
@@ -298,15 +302,15 @@ Phase 1 **已实现** init 边界与任务边界的协作式 containment：组�
 
 ## 6. 由哲学推导出的工程约束
 
-- **默认外置**：新能力默认不进 Core；只有"无法安全外置的 authority 机制"才进（§0 / §5）。
-- **显式 authority**：涉及 authority 的 Core 操作都显式接收 `RequestContext`（谁在请求 / 属于哪个 instance / 哪个 domain / 什么 rights），不偷偷读 `current_task()` 或全局 caller（见 `driver-model.md`）。
+- **默认外置**：新能力默认不进 Core；只有"无法安全外置的机制与 truth"才进（§0 / §5）。
+- **显式归属**：Core 操作都显式接收 `RequestContext`（谁在请求 / 属于哪个 instance / 哪个 task），不偷偷读 `current_task()` 或全局 caller；**它是执行归属 + 生命周期所有权，不是 security principal**（见 `driver-model.md` §5.1）。
 - **能力退化可见**：MMU / IOMMU / 特权级等平台能力差异必须显式可见，不能伪装（见 `architecture.md`）。
-- **契约不绑 ABI / 传输**：Interface 与 Handle 和"怎么调用"解耦；组件边界使用稳定 C ABI，Rust ABI 永不成为组件 ABI（见 `architecture.md`）。
-- **组件间只走 Interface registry**：禁止 flat ELF symbol 互链，组件间交互经 typed interface + explicit authority（见 `component-model.md` §2.1）。
+- **契约不绑 ABI / 传输**：Interface 与 device claim 机制和"怎么调用"解耦；组件边界使用稳定 C ABI，Rust ABI 永不成为组件 ABI（见 `architecture.md`）。
+- **组件间只走 Interface registry**：禁止 flat ELF symbol 互链，组件间交互经 typed interface + explicit ownership（资源获取/释放保持在实例生命周期或被拥有的任务上下文里，见 `component-model.md` §2.1）。
 - **失败可推理**：普通失败用 Result；panic 走协作式 containment；teardown 按资源生命周期回收（§5.8）。
 
 ## 7. 哲学来源（详见 references.md）
 
 ## 8. 最核心的一句话
 
-> **KaleidOS 要统一的不是"系统长什么样"，而是 authority、resource identity、lifetime、execution primitives、isolation primitives、component lifecycle、explicit interfaces。** 它提供一个足够小的权力与资源核心，使不同信任模型、执行模型、策略与服务能在同一套基础机制之上自由组合——**少即是多。**
+> **KaleidOS 要统一的不是"系统长什么样"，而是 resource identity、ownership、device/IRQ/DMA bookkeeping、lifetime、execution primitives、isolation primitives、component lifecycle、explicit interfaces。** 它提供一个足够小的机制与资源核心，使不同信任模型、执行模型、策略与服务能在同一套基础机制之上自由组合——**少即是多。**

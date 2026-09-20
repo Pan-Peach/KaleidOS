@@ -5,13 +5,13 @@
 > **Core 中所有与硬件无关的 truth logic 必须 host-testable；Core 与 Arch / Hardware 的真实契约通过 QEMU / CoreTest / 真机验证。**
 
 如果某段 Core 逻辑只能通过启动整个 OS 来测试，第一反应应该是：**它是不是和 Arch 耦合得太深了？**
-正确姿势是把与硬件无关的 truth logic（任务状态机、所有权、handle 生命周期）做成纯逻辑，在宿主上直接 `cargo test`。
+正确姿势是把与硬件无关的 truth logic（任务状态机、所有权、设备·IRQ·DMA 归属）做成纯逻辑，在宿主上直接 `cargo test`。
 
 ### Host Test（与硬件无关的 truth logic）
 
 ```text
-帧所有权 / 任务状态机 / handle 生命周期 / ResourceDomain
-组件生命周期 / 权限验证 / 策略验证（policy validation）
+帧所有权 / 任务状态机 / 设备·IRQ·DMA 归属 / ResourceDomain
+组件生命周期 / 归属校验（owner / quarantine 规则） / 策略验证（policy validation）
 ```
 
 ### QEMU / CoreTest / 真机（与硬件相关的真实契约）
@@ -37,7 +37,7 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
     Host Test（宿主单测 —— 主体，日常主力）
 ```
 
-- **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、handle 生命周期、资源权限、组件生命周期、依赖解析器）都在宿主上测；RISC-V 的纯算法（重定位、Sv32/Sv39 页表编码与 walk）同样 host 测生产实现；
+- **Host Test**：Core 与硬件无关的一切真相逻辑（帧所有权、任务状态机、设备·IRQ·DMA 归属、组件生命周期、依赖解析器）都在宿主上测；RISC-V 的纯算法（重定位、Sv32/Sv39 页表编码与 walk）同样 host 测生产实现；
 - **Property Test**：对 Core 的不变式做随机化验证（已引入 proptest，dev-dependency、仅 host profile：AddressSpace 随机序列四不变式 + parser never-panic）；
 - **Model Checking / Concurrency Exploration**：未来用 Kani / Loom 类工具（见 references.md）；
 - **QEMU ArchTest（系统级内核 selftest）**：feature-gated 的 test kernel，跑在**完整 `core::init` + runtime VM 之后**（device MMIO 已映射），直接验证 Arch/HAL 与真实 CPU/设备的契约——trap/scause、页表权限生效（RO/NX/未映射 fault）、context switch 寄存器保存、时钟与**外部中断**实际投递；每 case 单独 QEMU 进程；
@@ -62,27 +62,30 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 - 任务状态转换（task state transitions）：所有合法路径
 - 地址空间映射（address-space mapping）
 - 定时器（timer）
-- IRQ（中断分配、mask、dispatch）
-- handle 生命周期（handle lifetime）：创建、使用、过期
-- 资源回收（resource revocation）：组件停止时 ResourceDomain 完整回收
+- IRQ（route 注册、enable/disable、dispatch）
+- 设备认领 / IRQ / DMA 归属生命周期：认领、子项检查（live route/mapping）、release、quarantine
+- 资源回收（resource revocation）：组件停止时 ResourceDomain 完整撤销（device 进 quarantine、DMA 停车）
 
-### C6 IRQ 测试现状（2026-09）
+### C6 设备 / IRQ / DMA 测试现状（2026-09）
 
-- **Host Test**：`handle::irq` 表语义（grant/get/revoke/release/holds_line/delivery）、
-  `claim_derived`（从 `MmioHandle` 推导同台设备的 IRQ、独占、`DeviceHasNoIrq`/
-  `LineBusy`/`MmioHandle(WrongOwner|Stale)` 优先级）、`release`（撤销并清子标记）、
-  `irq::route`（只投递给「live slot + 已注册 delivery」，revoke 后立刻截断）全部
-  host 覆盖；`machine::nth_compatible` 纯枚举（ordinal/`NoSuchOrdinal`、一条描述符
-  命中多个 compatible 只计一次、`NoMachineInfo`）与 `handle::mmio::claim_device`
-  精确认领（越界/`NotMmio`/`DeviceBusy`/release 后新 handle + 旧 token stale）、
-  child-aware `mmio::release`（live IRQ/DMA 子项 → `HasChildren`）、失败 quarantine
-  （`fail_component` 后设备 `-EBUSY`）同样 host 覆盖。
-- **QEMU CoreTest（通用链，只断言 Core 自己的报告）**：`irq-line-enable` —— 组件先
-  `kcore_mmio_claim` 认领 UART 的 MMIO root，再 `kcore_irq_claim(uart_mmio_handle, ...)`
-  派生**同台设备**的中断线 → `kcore_irq_register` → `kcore_irq_enable`；`irq-release`
-  用 `kcore_irq_release` 撤销并验证旧 handle 过期（`-ESTALE`）。**不** claim PLIC、
-  不读控制器寄存器——“PLIC 线号 / context 公式 / enable bit 真的被写”是平台白盒
-  事实，由下面的 ArchTest 直接覆盖（去重：同一事实只在一个层次证明）。
+- **Host Test**：`resource::device::DeviceTable`（独占认领、非 owner 拒绝、
+  quarantine 后不可再认领、release 后可复用）、`resource::irq::IrqTable`
+  （register 记 route、release 仅限 owner、revoke_owner 只清自己的 route、
+  按中断号 `route_of` 投递）、`resource::dma::DmaTable`（mapping id 单调唯一、
+  已移除 id 查不到、free / revoke 把 backing 移入 QUARANTINE 且不归还 buddy）
+  全部 host 覆盖；`machine::nth_compatible` 纯枚举（ordinal / `NoSuchOrdinal`、
+  一条描述符命中多个 compatible 只计一次、`NoMachineInfo`）与
+  `resource::device::claim` 精确认领（越界 / `NotMmio` / `DeviceBusy`、
+  KernelNative identity 返回寄存器基址）、child-aware `device::release`
+  （live IRQ/DMA 子项 → `HasChildren`）、失败 quarantine（`fail_component`
+  后设备 `-EBUSY`）同样 host 覆盖。
+- **QEMU CoreTest（通用链，只断言 Core 自己的报告）**：`irq-line-enable` —— 组件
+  先 `kcore_device_claim` 认领 UART 的 `DeviceId`（KernelNative：直接拿到寄存器
+  基址），再 `kcore_irq_register(uart_device_id, handler, ctx)` → `kcore_irq_enable`；
+  `irq-release` 用 `kcore_irq_release` 撤销 route，并验证 `device_release` 不再
+  因该子项 `-EBUSY`。**不** claim PLIC、不读控制器寄存器——“PLIC 线号 / context
+  公式 / enable bit 真的被写”是平台白盒事实，由下面的 ArchTest 直接覆盖
+  （去重：同一事实只在一个层次证明）。
 - **QEMU ArchTest**：ArchTest 已在**完整初始化之后**运行（`core::init` + runtime VM，
   device MMIO 已映射）。`external-irq` 用例用 UART 的 **THRE** 中断作触发源
   （打开 `IER.THRE` 即拉线，无需 runner 注入输入），验证
@@ -99,13 +102,13 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 ```text
 操作前取游标（kcore_trace_stats 的 next_seq）
   → 执行**一个**受控 Core 操作
-  → 从游标读取事件，用该操作返回的 id / raw handle 精确匹配载荷
+  → 从游标读取事件，用该操作返回的 id 精确匹配载荷
 ```
 
 - `component-lifecycle`：`kcore_component_load` 返回的 `ComponentId` ↔ `ComponentState.a`，
   且只接受 `Declared → Resolved → Starting → Ready` 这条确切序列；
-- `authority-{grant,revoke}-trace`：claim/alloc/release 返回的 raw handle ↔
-  `ResourceGrant` / `ResourceRevoke.c`（同时匹配资源类别 `b`）；
+- `resource-{grant,revoke}-trace`：claim/alloc/release 返回的 id（DeviceId /
+  mapping id / ComponentId）↔ `ResourceGrant` / `ResourceRevoke.c`（同时匹配资源类别 `b`）；
 - `sched-trace`：`task_create` 返回的 TaskId ↔ `TaskSwitch.b` / `PolicyAccepted.b`，
   要求窗口内的切换目标全是本测试创建的任务、提案全来自本次加载的 scheduler_rr、
   且 `PolicyAccepted` 数 == `TaskSwitch` 数。
@@ -116,18 +119,20 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 > 这是当前身份模型允许的最强形式。要彻底移除限制需要身份跨 registry 全局唯一
 > （全局单调 ComponentId / trace 记录带 boot epoch）——Core 语义决策，未做。
 
-### DMA 授权模型（已决，刻意如此；含未决问题）
+### DMA 归属模型（已决，刻意如此；含未决问题）
 
 - **不建模“设备是不是 DMA master”**：FDT 没有可靠来源 —— 真实 QEMU virt DTB 只在
   `/soc/pci@30000000` 上标 `dma-coherent`，`virtio_mmio@1000X000` 与 `ns16550a`
   节点什么都不带。组件也无法可靠自报。
-- `kcore_dma_alloc` 的授权证明 = caller **已持有该设备的 `MmioHandle`**（Core 从
-  handle 推导设备身份，不接受组件自报设备号）。
+- **allocation 是 device-agnostic**：`kcore_dma_alloc(size)` 不要设备身份证明；
+  **mapping 是 device-related**：`kcore_dma_map(device_id, ptr, len, dir)` 要求
+  caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报），并把 mapping
+  记在 device owner 名下。
 - 这是**协作式信任**（cooperative trust），本阶段刻意接受：KernelNative 组件与
   Core 同特权、按设计同级信任，本就不承诺恶意隔离。**未决问题**：组件目前可以自己
   claim 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义（含控制其他
-  设备的中断线）”，这个能力（capability）问题还没有人回答；记录在此，不要把它当
-  疏漏去“修”成额外的 DMA 能力建模。
+  设备的中断线）”，这个边界问题还没有人回答；记录在此，不要把它当疏漏去“修”成
+  额外的 DMA 能力建模。
 
 ### 对抗性测试（adversarial tests）—— 重点
 
@@ -135,25 +140,27 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 
 - double free（重复释放）
 - wrong owner（错误的所有者尝试操作资源）
-- stale handle（过期 handle 使用）
+- stale 资源身份（已释放的 `DeviceId` / 已 unmapped 的 mapping id）
 - invalid task transition（非法任务状态转换）
 - duplicate claim（重复声明资源）
 - illegal map（非法映射）
 - invalid scheduler proposal（无效调度提案，如调度不存在/非 Runnable/已在别的 CPU 的任务）
 
 **CoreTest 侧已落地的子集（拒绝路径，断言精确 errno；实现见 `component/export.rs`
-与 `handle/*`，逐条核对过）：**
+与 `resource/*`，逐条核对过）：**
 
-- duplicate claim：同一 `DeviceId` 重复 `mmio_claim` → `-EBUSY`；同一中断线重复
-  `irq_claim` → `-EBUSY`；
-- root 生命周期：仍有 live IRQ 子 authority 时 `mmio_release` → `-EBUSY`；
-- stale：release 后旧 handle 的 read / lease / poll → `-ESTALE`；**死 root** 派生
-  IRQ / DMA（`irq_claim` / `dma_alloc`）→ `-ESTALE`；
-- 顺序错误：`irq_enable` 先于 `irq_register` → `-EINVAL`；
-- 发现边界：`device_nth` 的 ordinal 超出匹配数 → `-ENOENT`。
+- duplicate claim：同一 `DeviceId` 重复 `kcore_device_claim` → `-EBUSY`；已
+  quarantine 的设备再认领 → `-EBUSY`；
+- 拆机顺序：仍有 live IRQ route / DMA mapping 时 `kcore_device_release` → `-EBUSY`；
+- 归属拒绝：非 owner `kcore_irq_register` / `kcore_dma_map` → `-EACCES`（host test /
+  多组件场景）；
+- 顺序错误：`kcore_irq_enable` 先于 `kcore_irq_register` → `-EINVAL`；
+- 发现边界：`kcore_device_nth` 的 ordinal 超出匹配数 → `-ENOENT`；
+- 已移除的 mapping：`kcore_dma_unmap` 一个 stale id → `-ENOENT`（id 从不复用，
+  无 ABA 误命中）。
 
 （wrong owner 需要第二个组件才有意义，CoreTest 单组件上下文不可表达 —— 由
-host test 的 `HandleError::WrongOwner` 用例覆盖。）
+host test 的 owner 拒绝用例覆盖。）
 
 ### 约束：没有 god-mode
 
@@ -211,7 +218,7 @@ Core 内提供 invariant check 机制：在关键路径断言不变式（如"同
 - **运行时过滤**：掩码由 Core 管理路径控制（Monitor 命令
   `trace [<category|all> on|off]`，类别 = task / policy / component / resource /
   interface / irq；`trace` 无参数打印状态）。组件没有全局 trace-control
-  authority，只能经 `kcore_trace_stats` **读**。`emit` 在**关中断、加锁、读时钟
+  权限，只能经 `kcore_trace_stats` **读**。`emit` 在**关中断、加锁、读时钟
   之前**查掩码（原子 load + 分支，不是零开销）；被过滤的事件不记录、不消耗
   `seq`，不算丢失。
 - **ring 容量**：Kconfig `TRACE_CAPACITY` → `.config` 的 `CONFIG_TRACE_CAPACITY`（int，

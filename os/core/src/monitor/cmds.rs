@@ -112,6 +112,28 @@ pub fn load(args: &[u8]) {
         return;
     }
     let name = String::from_utf8_lossy(name);
+    // Monitor 单实例便利语义：同名 artifact 已有 Ready/Starting 实例时不再新建
+    // （组件 ABI 的 `kcore_component_create` 仍支持多实例；这是交互式 load 的 UX）。
+    // `image → instance` 的匹配与 `components` 命令同源。
+    {
+        let images = crate::component::image::get_images().lock();
+        if let Some(image) = images.find(name.as_bytes()) {
+            drop(images);
+            let reg = crate::component::registry::get_registry().lock();
+            let already = reg.iter().any(|record| {
+                record.image == image
+                    && matches!(
+                        record.state,
+                        crate::component::ComponentState::Ready
+                            | crate::component::ComponentState::Starting
+                    )
+            });
+            if already {
+                printk!("load {name}: already loaded\n");
+                return;
+            }
+        }
+    }
     match crate::component::load::load_and_start(name.as_bytes()) {
         Ok(id) => {
             let (image, create) = {

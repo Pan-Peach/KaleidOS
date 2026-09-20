@@ -11,7 +11,7 @@
 | 参考 | 类型 | 借鉴的核心 | 对应 KaleidOS 设计点 |
 |---|---|---|---|
 | Asterinas | 开源 OS（Rust） | 安全策略注入、策略输出校验 | Core/Component 分离、Policy proposes → Core validates |
-| seL4 | 微内核 OS（形式化验证） | typed capability、不可伪造授权 | Handle / Authority、内核对象 |
+| seL4 | 微内核 OS（形式化验证） | typed capability、资源真相在核心 | 资源身份 / 所有权记账、内核对象 |
 | Exokernel | 论文（经典） | 保护与管理分离、底层资源暴露 | Core 保护资源、Component 决定策略 |
 | SPIN | 论文（经典） | 语言级安全的内核扩展 | 类型安全组件运行在内核地址空间 |
 | Singularity | 研究 OS（微软） | 软件隔离、契约式通信 | 不依赖硬件地址空间的组件隔离 |
@@ -51,15 +51,15 @@
 **是什么**：形式化验证的微内核，以 capability 为核心：一切内核对象（task、frame、IRQ、IPC endpoint...）都通过不可伪造、不可混淆的 capability 访问，授权粒度极细（typed capability）。
 
 **借鉴什么**：
-- **typed authority**：设备和执行域授权有明确类型，不能把一种 handle 当成另一种资源使用；内存映射采用 Core 管理的 region/address-space 语义，不把每个 frame 暴露成组件 authority；
-- **不可伪造**：capability 只能由内核创建和传递，用户无法构造 —— 我们要求"驱动不能靠知道裸物理地址 / 裸 IRQ 号 / 裸地址获得 authority；裸指针只存在于 Core 派生并持有 provenance 的 typed Lease 内部"就是这个原则；
-- 内核对象（kernel object）作为资源存在性/所有权记录在核心 —— 我们的 `Handle / Authority` + 内核对象表。
+- **typed capability / 资源身份**：设备与执行域资源有明确类型，不能把一种资源当成另一种；内存映射采用 Core 管理的 region/address-space 语义，不把每个 frame 暴露成组件资源；
+- **资源真相在核心**：capability 只能由内核创建和传递，用户无法构造。我们只借用"资源存在性 / 所有权 / 生命周期由 Core 记录"的思想，**不实现 capability 系统**——KernelNative 不做 per-access 鉴权，访问强制交给执行域（`driver-model.md` §1.1）；
+- 内核对象（kernel object）作为资源存在性/所有权记录在核心 —— 对应我们的设备表 / IRQ route 表 / DMA 表。
 
 **怎么映射**：
-- `MmioHandle`、`IrqHandle`、`DmaHandle`、`TaskHandle`、`TimerHandle`、`AddressSpaceHandle` 是 seL4 风格 typed capability 的简化形态；
-- Core 校验 handle 的持有者、状态、生命周期 = capability 的 access control。
+- KaleidOS 的 `DeviceId`（identity）+ `kcore_device_claim`（记 owner 并返回本执行域访问窗口）是"资源在 Core 有真相"的简化形态，但**不是** capability——没有 per-access 校验，也没有"不可伪造"承诺；
+- Core 记录设备 / IRQ route / DMA mapping 的 owner 与生命周期，用于独占、unload、失败清理与 teardown。
 
-**不照搬**：完整 capability 系统（派生、revoke 树、badge 等）、形式化证明、IPC endpoint 体系 —— 第一阶段只做"类型化 Handle + Core 验证"（Handle 本身可被伪造，authority 由 Core 在资源表内验证）。
+**不照搬**：完整 capability 系统（派生、revoke 树、badge 等）、形式化证明、IPC endpoint 体系 —— 第一阶段只做"资源身份 + Core 归属记账"，不做 capability 派生/撤销树。
 
 ---
 
@@ -71,13 +71,13 @@
 
 **借鉴什么**：
 - **Protection vs Management 分离**：这正是"Core 保护资源，Component 决定策略"的源头；
-- 向低层组件暴露接近硬件的资源接口（当然我们要包一层 Handle，这是对裸暴露的修正）。
+- 向低层组件暴露接近硬件的资源接口（KaleidOS 用 Core 的 device claim 返回本域访问窗口：KernelNative = 裸寄存器基址，同时对设备/IRQ/DMA 做归属记账）。
 
 **怎么映射**：
 - Core = 保护层（资源存在性、所有权、权限）；Component = 管理层（调度策略、分配算法）；
 - Exokernel 的"每个应用有自己的 LibOS" ≈ 我们的"每个 Profile 组合自己的 Component Graph"。
 
-**不照搬**：把裸物理地址/裸中断直接暴露给应用 —— 我们坚持 Authority（Handle）抽象，这是 exokernel 实践中最被诟病的点，我们通过 typed Handle 修正。
+**不照搬**：把裸物理地址/裸中断直接暴露给不受信代码 —— KernelNative 是可信代码，可以直接拿访问窗口；真正不信任的组件交给未来的执行域（私有 AS + 页表）强制。
 
 ---
 
@@ -94,7 +94,7 @@
 
 **怎么映射**：
 - 我们的 Component（Rust 实现，静态注册）运行在 KernelNative 域，靠 Rust 类型系统 + Core 验证保证边界，而不是每个组件一个地址空间；
-- 组件只能通过 Interface（trait）和 Handle 与外界交互。
+- 组件只能通过 Interface（trait）和 Core mechanism（device claim / IRQ route / DMA mapping）与外界交互。
 
 **不照搬**：Modula-3 语言运行时依赖；它的动态扩展模型 —— 我们第一阶段静态注册。
 
@@ -143,7 +143,7 @@
 - 驱动故障恢复路径（域崩溃 → 回收资源 → 重建）≈ 我们的 ResourceDomain revoke → replace → restart。
 
 **怎么映射**：
-- 每个 Component 的 ResourceDomain = 一个轻量"域"：它拥有的 Handle 集合由 Core 记录；
+- 每个 Component 的 ResourceDomain = 一个轻量"域"：它拥有的设备 / IRQ route / DMA mapping 归属由 Core 记录；
 - 驱动（如 VirtIO block）作为 Component 实现并支持替换，直接参考 RedLeaf 的驱动恢复。
 
 **不照搬**：它的域间通信语言设施（语言内 channel 等）；我们第一阶段组件间只是 Rust direct call，不引入新通信机制。
@@ -263,10 +263,10 @@
 
 **借鉴什么**：
 - 未来 Developer-First 测试工具链的四个层次：模型检查（Kani）、并发探索（Loom）、UB 检查（Miri）、演绎验证（Verus）；
-- 特别适合验证 Core 的不变式（handle 生命周期、资源所有权规则）。
+- 特别适合验证 Core 的不变式（设备 / IRQ route / DMA mapping 归属生命周期、资源所有权规则）。
 
 **怎么映射**：
-- Core 的关键逻辑（任务状态机、handle 生命周期、资源域回收）先用普通 host test，成熟后加 Kani/Miri；
+- Core 的关键逻辑（任务状态机、设备/IRQ/DMA 归属生命周期、资源域回收）先用普通 host test，成熟后加 Kani/Miri；
 - 并发部分（Core 被多个 CPU 访问）未来用 Loom 探索。
 
 **不照搬**：不在第一阶段引入任何验证工具链依赖 —— 先保证代码可以用普通 `cargo test` 测试。
@@ -282,13 +282,13 @@
 | | RT-Thread | KaleidOS |
 |---|---|---|
 | 组件 | **编译期** Kconfig 勾选，链进一个镜像 | **运行期** 加载（.kcomp ELF 可重定位）+ 权威分离 |
-| 权威模型 | 平级"聚合"（内核与组件无边界） | **Core owns truth**（资源权威在内核，组件只有句柄） |
+| 资源模型 | 平级"聚合"（内核与组件无边界） | **Core owns truth**（资源真相与归属记账在内核，组件拿到本域访问窗口） |
 | 隔离 | 同地址空间，全部裸 API | 组件只能调白名单（本阶段=约定；隔离=未来执行域） |
 
 **借鉴什么（具体机制，不是整体哲学）**：
 - **实时调度器**：优先级抢占 + 同优先级轮转/时间片——我们未来 scheduler 组件的参考实现（算法层面，policy 仍由组件提交、Core 验证）；
 - **动态模块机制**：它也有 ELF 模块加载，看它的模块清理链（卸载顺序）与我们的 `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）/卸载协议互相印证；
-- **设备框架交互**：设备注册（rt_hw_* / 串口框架、I2C 框架）的"注册-分发"模式，对照我们的 Interface（trait 语义）+ Handle（传输）设计。
+- **设备框架交互**：设备注册（rt_hw_* / 串口框架、I2C 框架）的"注册-分发"模式，对照我们的 Interface（trait 语义）+ device claim / IRQ / DMA mechanism 设计。
 
 **不照搬**：它的整体"嵌入式通用内核聚合"架构（我们保持小、权威边界清楚）；Kconfig 组件选择心智（那是构建期配置，我们坚持运行时组件图）；BSP/板级模板堆叠（我们保持 bootstrap+core 单镜像）。
 
@@ -317,8 +317,8 @@ Device driver  = 某个设备协议/实现：通过 generic API 提供语义
 |---|---|---|
 | Architecture | `os/arch` | 只放 ISA/特权级/翻译与 CPU 原语，不按板卡分支 |
 | SoC / Board facts | Machine Discovery → `MachineInfo` / `DeviceDescriptor` | 归一化机器事实，Core 不知道来源是 FDT、ACPI 还是其他 backend |
-| Device identity | `DeviceId` | 只能发现/选择，不是 authority，不携带地址或 IRQ 权限 |
-| Device driver | `os/components/drivers/` | 驱动是 Component；通过 Core 授予的 typed Handle/Lease 访问硬件 |
+| Device identity | `DeviceId` | 只能发现/选择，不是权限，不携带地址或 IRQ 权限 |
+| Device driver | `os/components/drivers/` | 驱动是 Component；经 Core 的 device claim（本域访问窗口）+ IRQ / DMA mechanism 访问硬件 |
 | Generic device API | Component Interface | 表达 BlockDevice/UART 等语义，不暴露板卡地址，也不绑定 transport |
 
 这意味着 **VisionFive 2 不是一种 RISC-V**：RV64 是架构，JH7110 是 SoC，
@@ -363,8 +363,8 @@ MachineInfo / DeviceDescriptor   -- 发现到的事实
         ↓
 DeviceId                          -- 纯身份，选择候选
         ↓ Core claim
-MmioHandle / IrqHandle / DmaHandle -- authority
-        ↓ derive lease
+本域访问窗口（裸 MMIO 指针 / mapped VA）-- mechanism，非 capability
+        ↓ driver 自己 volatile 访问
 Driver Component                  -- 私有协议状态与 runtime data
         ↓ publish/bind
 Device Interface                  -- BlockDevice/UART 等语义
@@ -377,7 +377,7 @@ Device Interface                  -- BlockDevice/UART 等语义
 - generic API 是 Interface 语义，跨边界时用窄的 typed function table；不能让 Rust
   trait-object ABI 或裸 MMIO 地址成为设备模型；
 - driver instance 的 runtime state 归组件，设备描述的权威事实归 Core；
-- `DeviceId` 只负责发现，Handle 才负责 authority；不能用设备号、地址或 IRQ 号
+- `DeviceId` 只负责发现，`kcore_device_claim` 才建立所有权并给出访问窗口；不能用设备号、地址或 IRQ 号
   自报身份；
 - 这不意味着要建立一个庞大的统一 driver framework。匹配、probe、组件加载和
   Interface binding 仍按现有 Component Manager / prober 模型组合。
@@ -452,6 +452,6 @@ KaleidOS 不照搬：
 ## 使用建议
 
 1. **动手写之前**：读一遍 `core-philosophy.md` 和 `architecture.md`，对照本表的"对应设计点"列。
-2. **设计某个具体机制时**（如 Handle、生命周期、替换流程）：先看对应条目的"借鉴什么/不照搬"，避免重复发明或过度设计。
-3. **第一阶段**：主要看 Asterinas（策略验证）、seL4（typed authority）、Exokernel（保护/管理分离）、Theseus（状态归属）；涉及硬件边界和第一个驱动时，优先补看 Zephyr，其余条目留作未来参考。
+2. **设计某个具体机制时**（如 device claim、生命周期、替换流程）：先看对应条目的"借鉴什么/不照搬"，避免重复发明或过度设计。
+3. **第一阶段**：主要看 Asterinas（策略验证）、seL4（typed capability / 资源真相）、Exokernel（保护/管理分离）、Theseus（状态归属）；涉及硬件边界和第一个驱动时，优先补看 Zephyr，其余条目留作未来参考。
 4. 本文件是活文档：每深入一个方向（如 Wasm、IPC、验证），就把对应的参考条目写详细。

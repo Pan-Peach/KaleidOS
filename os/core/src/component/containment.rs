@@ -891,11 +891,11 @@ mod tests {
         let owner = ComponentId::from_raw(5);
         with_test_exit_boundary(owner, || {
             // Then: Core calls are attributed to the stopped instance...
-            let ambient = crate::handle::RequestContext::ambient().expect("ambient identity");
+            let ambient = crate::resource::RequestContext::ambient().expect("ambient identity");
             assert_eq!(ambient.component, owner);
             assert_eq!(ambient.task, None);
             // ...and publish remains an init-time operation.
-            assert!(crate::handle::RequestContext::ambient_init().is_none());
+            assert!(crate::resource::RequestContext::ambient_init().is_none());
         });
 
         // Then: the previous boundary is restored after the hook returns.

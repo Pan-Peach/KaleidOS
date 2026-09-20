@@ -168,7 +168,7 @@ pub enum DeviceLookupError {
 ///   claim/release 稳定；
 /// - `ordinal >= 匹配数` → [`DeviceLookupError::NoSuchOrdinal`]。
 ///
-/// 身份不是权限：调用方只能拿这个 ID 去 [`crate::handle::mmio::claim_device`]
+/// 身份不是权限：调用方只能拿这个 ID 去 [`crate::resource::device::claim`]
 /// 请求该**确切设备**的 authority；ID 本身不授予任何东西。
 pub fn nth_compatible(compatible: &[u8], ordinal: u32) -> Result<DeviceId, DeviceLookupError> {
     nth_compatible_in(committed().as_ref(), compatible, ordinal)

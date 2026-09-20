@@ -23,7 +23,6 @@ mod build_config;
 pub mod bench;
 pub mod component;
 pub mod errno;
-pub mod handle;
 pub mod inspector;
 pub mod irq;
 pub mod machine;
@@ -32,6 +31,7 @@ pub mod monitor;
 pub mod object;
 #[macro_use]
 pub mod print;
+pub mod resource;
 pub mod sched;
 pub mod task;
 pub mod timer;
@@ -106,7 +106,7 @@ pub fn init(
     component::image::init();
     component::registry::init();
     component::interface::init();
-    handle::init();
+    resource::init();
     irq::init();
     log!("core", "init OK");
     monitor::mount(info);

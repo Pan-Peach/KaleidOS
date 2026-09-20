@@ -22,7 +22,7 @@ harness 会把 git commit 带进报告（`KALEIDOS_GIT_COMMIT`，由 Makefile �
 调用路径，输出与 host 同一套 `BENCH-ENV` / `BENCH <name>` / `key=value` 约定，
 但 `unit=timebase-ticks`（换算成时间需要 `timebase_hz`）。目标端现在包含：
 
-- `kbench.clock_read` / `kbench.free_pages_query`：无 authority 的导出调用成本；
+- `kbench.clock_read` / `kbench.free_pages_query`：无资源归属的导出调用成本；
 - `sched.yield_roundtrip`：**两个组件自有任务**的完整 A→B→A 调度交接（走既有
   任务/调度导出，无 benchmark 特权；协议与诚实声明见 §3.5）；
 - `irq.uart_trigger_to_handler`：**合法持有的** ns16550a 自触发 → 组件 handler
@@ -108,8 +108,9 @@ status=ok
   （只有循环 / `black_box`，没有实际工作）。差值小或为负 = 增量成本无法分辨。
 - `status`：`ok` / `clock_unusable`（时钟不前进或倒退，直接不测、如实上报）；
   另有 primitive 专属的 `scheduler_unavailable` / `task_setup_failed` /
-  `handshake_mismatch`（见 §3.5）与 `mmio_not_owned` / `lease_failed` /
-  `mmio_window_too_small` / `trigger_timeout`（见 §3.6），含义都在同一行写明。
+  `handshake_mismatch`（见 §3.5）与 `no_device` / `device_not_owned` /
+  `register_failed` / `enable_failed` / `mmio_window_too_small` /
+  `trigger_timeout`（见 §3.6），含义都在同一行写明。
 - **`sched.yield_roundtrip` 附加 key**：`handoff_count`（正式采样窗口内完成的
   A→B→A 往返数，无 mismatch 时 == `iterations`）、`handoff_total`（含
   warmup/pilot/重试的总往返数）、`handoff_mismatches`（不是"恰好一次 B 激活"的
@@ -174,7 +175,7 @@ bias —— 这四项要分开说，不能拿一个 min 全包了。
 
 - **拆 primitive**（借鉴 lmbench 的思路）：一次只测一个基本操作，不把
   "proposal + validate + commit + switch" 混成一个数字。
-- **hot path 与 control path 分开报**：`bind` / `publish` / `derive_lease`
+- **hot path 与 control path 分开报**：`bind` / `publish` / `device_claim`
   是一次性成本，绝不能和"每次调用都要付"的成本混在一起。
 - **不造总分**（借鉴 UnixBench 的"重复运行形成 baseline"，但不学它的综合分）：
   先报告原始数据，趋势由人判断。
@@ -230,25 +231,25 @@ bias —— 这四项要分开说，不能拿一个 min 全包了。
 ### 3.6 `irq.uart_trigger_to_handler`：owned 设备自触发
 
 **合法性边界**（不制造任何 benchmark 特权）：`device_nth` 找 ns16550a →
-`mmio_claim` 认领**确切设备** → `irq_claim` 派生同设备中断线 → `irq_register`
-正常注册 → `mmio_lease` 派生裸指针 → `irq_enable` 开线。触发是写自己设备的
-IER/THR（TX-empty 中断），handler 用同一 owned device 的 lease 指针清 source。
-没有 raw PLIC 访问、没有全局中断控制、**不关中断**。
+`device_claim` 认领**确切设备**（KernelNative：直接拿到寄存器基址）→
+`irq_register(uart_device_id, handler, ctx)` 正常注册 → `irq_enable` 开线。
+触发是写自己设备的 IER/THR（TX-empty 中断），handler 用同一 owned device 的
+claim 指针清 source。没有 raw PLIC 访问、没有全局中断控制、**不关中断**。
 
-**寄存器编址（为什么 IER 走 lease 字节写）**：QEMU virt 的 ns16550a 没有
+**寄存器编址（为什么 IER 走 claim 指针字节写）**：QEMU virt 的 ns16550a 没有
 `reg-shift`（`serial_mm_init(..., regshift=0, ...)`），寄存器按**字节**编址：
-THR@0x00、IER@0x01。`kcore_mmio_write_u32` 的 offset 是字节偏移且要求 4 字节
-对齐，表达不了 IER；因此 IER 的置位/清除只走 `kcore_mmio_lease` 派生的裸指针
-字节写（Core 校验过一次的 KernelNative 快路径）。设备窗口长度取 FDT 的
-`reg`（ns16550a = 0x100，**不是一整页**）——曾把"需要一整页"当成 UART 的属性，
-把 Core 已经派生成功的 lease 本地误判为 `lease_failed`。
+THR@0x00、IER@0x01。现在没有 `kcore_mmio_write_u32` 这种 per-access Core
+入口——claim 返回的裸指针本身就能做任意宽度访问，因此 IER 的置位/清除直接对
+claim 指针做字节写（KernelNative 快路径）。设备窗口长度取 FDT 的 `reg`
+（ns16550a = 0x100，**不是一整页**）——曾把"需要一整页"当成 UART 的属性，
+把 Core 已经派出的窗口本地误判为不可用。
 
 **它是什么、不是什么**：
 
 - 单次样本 = **触发写之前（`rdtime`）→ handler 入口（`rdtime`）** 的原始 tick；
   一次触发一个样本（`method=one_shot`），不是 batch；warmup 不计入。THR 占位写
   在 `rdtime` 之前（准备，不计入），区间从 `IER=THRE` 的触发写开始。
-- 区间包含：触发写自身的 lease MMIO 写（KernelNative 快路径）、UART/PLIC 设备
+- 区间包含：触发写自身的 claim 指针 MMIO 写（KernelNative 快路径）、UART/PLIC 设备
   模型、CPU trap 入口、PLIC claim、Core `route`，以及 trace 打开时 `IrqEnter`
   的 emit 成本——**第一个事件的记录工作就在被测量区间内**。**不是**"中断投递延迟"。
 - 已有 `IrqEnter` / `IrqAck` 事件**不能**当延迟用：`IrqEnter` 在 PLIC claim
@@ -256,8 +257,9 @@ THR@0x00、IER@0x01。`kcore_mmio_write_u32` 的 offset 是字节偏移且要求
   插桩软件区间。本 primitive 不派生自它。
 - 超时（handler 未到）与倒退（entry < start）的样本**丢弃并计数**；丢弃有硬上限，
   触发路径不可用 → `status=trigger_timeout`（绝不无界自旋）。设备被其它组件持有
-  （如 core_test 先跑并认领 UART）→ `status=mmio_not_owned`；Core 拒绝 lease
-  派生 → `status=lease_failed`（带 `error=`）；派生成功但 FDT 窗口不覆盖要碰的
+  （如 core_test 先跑并认领 UART）→ `status=device_not_owned`；找不到设备 →
+  `status=no_device`；注册 / 开线失败 → `status=register_failed` /
+  `status=enable_failed`（都带 `error=`）；认领成功但 FDT 窗口不覆盖要碰的
   寄存器 → `status=mmio_window_too_small`（带 `lease_len=`）：缺的是"一台空闲的
   ns16550a"，不是去要 PLIC/god-mode。
 - `baseline=none`：IRQ 触发没有等价 null baseline（制造一个 = 抑制触发/关中断，
@@ -268,18 +270,10 @@ THR@0x00、IER@0x01。`kcore_mmio_write_u32` 的 offset 是字节偏移且要求
 
 | 名称 | 测什么 |
 |---|---|
-| `mmio.raw_volatile` | 裸 `read_volatile`（无验证）—— fast path 的上限 |
-| `mmio.checked_read_u32` | 表锁 + slot/generation/owner/生命周期 + bounds + align + volatile |
-| `mmio.lease_read_u32` | lease 派生后直访（fast path 收回了多少） |
-| `handle.validate_ok` | 纯 handle 验证（成功路径） |
-| `handle.reject_stale` | 失效 handle 的拒绝路径 |
-| `mmio.derive_lease` | 一次性 lease 派生（control path） |
 | `interface.direct_call` | 直接 Rust 调用（基线） |
 | `interface.table_call` | 经 `#[repr(C)]` function table 调用（Interface 的 steady-state 成本） |
 | `interface.bind` / `interface.refresh` / `interface.publish` | control path |
 | `registry.bind.n1/n8/n32/n128` | Interface Registry 规模趋势（线性扫描是否成为问题） |
-| `handle.get.n1/n32/n256` | handle 数量增长时的 hot path（验证成本） |
-| `handle.revoke_regrant.n1/n32/n256` | handle 数量增长时的 control path（`revoke_owner` 的 O(N)；含一次重新 grant） |
 | `task.lookup.n1/n32/n256` | task 数量增长（`BTreeMap` lookup） |
 | `component.lookup.n1/n32/n256` | component 数量增长（`Vec` 线性扫描） |
 | `alloc_free.order0..3` | buddy alloc/free 往返，按 order 分档 |
@@ -291,7 +285,7 @@ THR@0x00、IER@0x01。`kcore_mmio_write_u32` 的 offset 是字节偏移且要求
 | `loader.load_component.min` / `.core_test` | 完整加载（parse + place + alloc + copy + relocate + 解析入口） |
 | `kbench.clock_read` / `kbench.free_pages_query` | **目标端**：真实导出调用路径（host 测不出） |
 | `sched.yield_roundtrip` | **目标端**：两个组件自有任务的完整 A→B→A 交接（policy + Core 验证 + commit + `__switch`；含 handshake 与 trace 独立验证，见 §3.5） |
-| `irq.uart_trigger_to_handler` | **目标端**：owned ns16550a 自触发 → 组件 handler 入口（合法 authority 链；含超时/倒退丢弃，见 §3.6） |
+| `irq.uart_trigger_to_handler` | **目标端**：owned ns16550a 自触发 → 组件 handler 入口（合法 claim 链；含超时/倒退丢弃，见 §3.6） |
 
 ## 5. 结果解读与诚实声明
 
@@ -341,7 +335,7 @@ THR@0x00、IER@0x01。`kcore_mmio_write_u32` 的 offset 是字节偏移且要求
      前**的插桩软件区间；target 侧若要出数只缺"触发 + 调用"，**不得**当作投递
      延迟发布。
   2. kbench 的 `irq.uart_trigger_to_handler`：owned 设备自触发 → handler 入口的
-     软件可观测区间（§3.6），合法 authority 链、丢弃规则、trace 成本披露齐备；
+     软件可观测区间（§3.6），合法 claim 链、丢弃规则、trace 成本披露齐备；
      未被 core_test 认领 UART 的独立启动下可跑。剩余未做：真机数据、无 trace
      构建下的对照、以及更接近硬件语义的投递测量（需要新的合法机制，不在本阶段）。
 - **真实页表 backend**：`Sv32/Sv39` 的 map/unmap/translate 成本（host 只能测

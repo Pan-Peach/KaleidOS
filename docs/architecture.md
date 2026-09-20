@@ -8,8 +8,8 @@ KaleidOS 是一个**组件化、多架构**的操作系统，面向学习、实�
 - 核心目标是亲手实现 OS 的关键基础机制，并让 Core 以上的大部分 OS 功能成为**可组合的 Component**；
 - 同一个 Resource Core 底座，通过重新组合 Component，可以长出完全不同的操作系统（One core, countless systems）。
 
-> **A small resource-authority core beneath a composable graph of operating-system components.**
-> 中文：一个小型资源权威 Core，以及构建在其上的可组合操作系统组件图。
+> **A small mechanism-first core beneath a composable graph of operating-system components.**
+> 中文：一个提供机制与所有权记账的小型 Core，以及构建在其上的可组合操作系统组件图。
 
 ## 2. 分层结构
 
@@ -20,7 +20,7 @@ Applications / System Personality（应用 / 系统性格）
                 │
             Components（组件）
                 │
-          Resource Core（资源权威核心）
+          Resource Core（机制 + 所有权核心）
                 │
    Arch + Machine Discovery（架构 + 机器发现）
                 │
@@ -45,7 +45,7 @@ Applications / System Personality（应用 / 系统性格）
 KaleidOS 最重要的边界不是"模块"，而是一组概念分离：
 
 ```text
-Identity         ≠  Authority           —— 名字 ≠ 权限
+Identity         ≠  Ownership           —— 名字 ≠ 所有权（DeviceId 不是权限）
 Interface        ≠  Transport           —— 契约 ≠ 调用方式
 ResourceDomain   ≠  ExecutionDomain     —— 拥有什么 ≠ 在哪里运行
 Ownership Tree   ≠  Dependency DAG      —— 生命周期 ≠ 依赖关系
@@ -135,8 +135,8 @@ Driver         = 设备协议实现，通过 generic Interface 提供语义
 - `os/arch` 只承载 ISA 与 CPU 原语；不能出现 `if board == ...` 才改变的架构机制；
 - SoC/board 的事实由 Machine Discovery backend 发现，归一化为 `MachineInfo` /
   `DeviceDescriptor` 后交给 Core；Core 不知道事实来自 FDT、ACPI 还是其他来源；
-- driver 是 `os/components/drivers/` 下的 Component，通过 `DeviceId → typed Handle
-  → Lease` 获得 authority，再发布 Device Interface；
+- driver 是 `os/components/drivers/` 下的 Component，用 `kcore_device_nth` 发现候选、
+  `DeviceId` 认领确切设备并拿到本执行域访问窗口（KernelNative = 裸寄存器基址），再发布 Device Interface；
 - 当前不建立独立 `platform` 层，是为了避免把板卡目录结构误当成 Core 契约。未来若
   平台特例增多，只能加入窄的 discovery/backend 模块，不能让 board 名称渗透资源模型。
 
@@ -149,7 +149,7 @@ Machine Discovery → MachineInfo（事实提案）
         ↓ core::init 校验并提交
 Core Resource Truth
         ↓ DeviceId（身份，不是权限）
-driver claim → typed Handle / Lease
+driver claim → 本执行域访问窗口（裸 MMIO 指针 / 映射 VA）
         ↓
 Component Interface（设备语义）
 ```
@@ -193,7 +193,7 @@ OpenSBI → kaleidos.elf
 
 ## 4. Resource Core
 
-Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / Reference Monitor）**。
+Core 是整个系统的**机制与所有权真相核心（mechanism & ownership core）**：提供推进自身资源/生命周期操作所需的机制，并记录裸机程序无法自行知道的所有权真相。**它不是 capability 系统，也不对 KernelNative 做访问强制**（见 `driver-model.md` §1.1）。
 
 ### Core 持有（owns truth）
 
@@ -203,7 +203,7 @@ Core 是整个系统的**资源权威 / 参考监视器（Resource Authority / R
 - AddressSpace
 - IRQ / Timer / MMIO / DMA
 - 内核对象（Kernel Object）
-- Handle / Authority（类型化授权 token；可被伪造，authority 由 Core 验证）
+- 设备所有权 / IRQ route / DMA mapping 的**归属记账**（用于独占、unload、失败清理、teardown、quarantine；**不是** per-access 鉴权）
 - ComponentId
 - ResourceDomain（**视图**，非对象：所有 `owner == ComponentId` 的资源；**不设 struct**，见 `docs/component-model.md` §3）
 - 基础同步机制
@@ -253,8 +253,8 @@ COW 或任意虚拟地址空间等 MMU 语义。
 抹平（差异如何暴露给驱动见 `driver-model.md`）。
 
 当前 RISC-V 已提供 RV64/Sv39 与 RV32/Sv32 backend，但它们只是 address-translation
-实现，不是 KaleidOS 的内存模型。Core 公共路径使用 typed handle、virtual region、
-permission 等抽象；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
+实现，不是 KaleidOS 的内存模型。Core 公共路径使用 virtual region、PhysicalRange、
+抽象 permission 等概念；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
 arch/backend 内部。具体映射、撤销和地址空间激活接口随实现阶段演进，
 不在这里提前固定完整 API。
 
@@ -272,7 +272,7 @@ arch/backend 内部。具体映射、撤销和地址空间激活接口随实现�
 ### Core 的边界判断
 
 > 如果一个完全错误的 Component 能通过某个 API 破坏其他 Component 或全局 invariant，
-> 那么应该**缩小 API**，或者把**最终 authority 收回 Core**。
+> 那么应该**缩小 API**，或者把**最终裁决权收回 Core**。保留一个 Core API 的判据：是否**只有 Core 能**操作页表 / 知道全局设备所有权 / 路由 IRQ / 管理组件生命周期 / 避免 DMA backing 被错误复用；否则删除。
 
 这条"litmus test"是新增内容进 Core 的唯一判据：进 Core 的不是"基础功能"，而是"撒谎就会全盘崩溃的真相"。
 
@@ -318,11 +318,12 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 
 - Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
   （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
-  Core validation 的**语义入口**（组件加载 / 接口发布 / 任务控制 / 资源
-  claim：`kcore_device_nth` + `kcore_mmio_claim/read`、`kcore_irq_claim/register/enable/release`）。**不导出未经 Core validation 的裸
-  authority mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动
-  仍是 Core 内部提交点——组件只能 request（propose），authorize + grant +
-  记录由 Core 完成。
+  Core 处理的**语义入口**（组件加载 / 接口发布 / 任务控制 / 设备与 IRQ 与 DMA：
+  `kcore_device_nth` + `kcore_device_claim/release`、
+  `kcore_irq_register/enable/disable/release`、
+  `kcore_dma_alloc/free/map/unmap`）。**不导出未经 Core 提交的裸 mutation**：
+  物理帧分配的最终提交、地址空间变更、裸任务表改动仍是 Core 内部提交点——
+  组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。
 - Component Interface Registry 是 **Core 的组件依赖真相**：谁提供什么接口、
   当前绑到谁。两者是独立概念，互不替代。
 - 内存粒度定案：`ALLOC_GRANULE`（物理分配）与 `AddressSpaceBackend::GRANULE`
@@ -339,8 +340,9 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 
 - `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）：
   用到哪个加哪个，进入 public ABI 后数字不再变更。
-- 各子系统的内部错误（`TaskError` / `HandleError` / `ComponentLoadError` /
-  `SchedError` / `InterfaceError` / `MmioError` / `IrqError` ...）保持丰富与类型安全，
+- 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
+  `InterfaceError` / `DeviceClaimError` / `DeviceReleaseError` / `IrqError` /
+  `DmaError` / `MemoryError` ...）保持丰富与类型安全，
   只在 Core ABI 边界翻译成 `Errno`——映射表集中在 `errno.rs`。
 - 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
 
@@ -349,7 +351,7 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 | 形状 | 用于 | 例 |
 |---|---|---|
 | `i32 status`（`0` / `-Errno`） | 可失败、无值 | `kcore_task_yield` |
-| `i32 status + out` | 可失败、有值 | `kcore_mmio_read_u32` |
+| `i32 status + out` | 可失败、有值 | `kcore_device_claim` |
 | 直接返回值 | 不会失败的纯 query（`0` 是普通值，不是哨兵） | `kcore_free_page_count` |
 
 **宽度规则**（kcore ABI 数值类型的唯一口径）：
@@ -359,17 +361,18 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 | `usize` | 仅"语义就是指针宽"的量：地址（`entry`）、`(ptr, len)`、分配器 `size/align` |
 | `u32` | counts / ids（hart / cpu / page / task / component ...） |
 | `i32` | 布尔与编码（`has_hart` / `task_state` / `interface_available`） |
-| `u64` | 不透明句柄，只经 `status + out` 回传 |
+| `u64` | 不透明 id（`BindingId` / DMA mapping id），只经 `status + out` 回传 |
 
 KernelNative 下组件与 Core 同 target 编译，宽度天然一致；跨 transport（IPC / Wasm）
 不复用本签名，宽度另行定义。旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容；
 新增"可为空的查询"用 `status + out`，不拿 0 当哨兵（`boot_hart` 的 0 是历史唯一样本）。
 
-### 授权流（Authority 流）
+### 资源认领流（claim 流）
 
 ```text
 Core
- │  grant Resource Authority（Handle）
+ │  mechanism：device_nth → device_claim（记 owner + 返回本域访问窗口）
+ │             IRQ route / DMA mapping 归属记账
  ▼
 NVMe Component
  │  provides
@@ -387,9 +390,9 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件持有的 Handle 集合（MmioHandle、IrqHandle、DmaHandle、TimerHandle...），由 Core 统一记录；它记录的是设备/执行域 authority 和受管理的内存区域，**不是**逐帧 handle、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的资源），owner 字段直接落在各资源表（irq/mmio/dma/timer）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终回收**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
+- **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping 和受管理的内存区域，**不是**逐帧 identity、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的归属记录），owner 字段直接落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终撤销归属并做 teardown/quarantine**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
 - **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative` / `Wasm`）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/component-lifecycle.md`），旧 `ComponentRecord` 已删除；执行域字段**尚未实现**（未来若加，只在实例记录上放一个轻量 `execution_kind`；`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码）。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
-  - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / Handle→Lease / 撤销不变式见 `driver-model.md`。
+  - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，**KernelNative 就是可信代码**（无硬件访问强制，撤销为协作式）；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / device claim / IRQ / DMA / teardown 不变式见 `driver-model.md`。
 
 **三个组件信任域（Trust Domain）与 ABI 分离：**
 
@@ -408,25 +411,22 @@ Component
 `KernelNative`——而不是让 Core 把每个组件都塞进同等重量的机制。信任问题首先由"选择
 哪种执行域"回答，Core 不为统一性牺牲部署自由度。
 
-**AddressSpace 不是普通驱动 capability。** 驱动不应取得任意 `AddressSpaceHandle`
-后到处映射；它只能请求"把这个资源映射进请求者自己的域"。目标地址空间由
-`RequestContext` / execution domain 推导，`AddressSpaceHandle` 保留给 Core /
-domain-manager / lifecycle-manager（driver 视角见 `driver-model.md`）：
+**AddressSpace 是 Core 内部机制，不是驱动可取用的对象。** 驱动不应取得任意地址空间后到处映射；设备窗口的映射由 `kcore_device_claim` 在解析调用者 execution domain 时自动完成（KernelNative identity，未来 Isolated 映射进组件 AS）。Core 只在 `driver-model.md` §3 的同一 seam 内决定返回裸指针还是 mapped VA：
 
 ```text
-driver   request: map(resource)
+driver   claim(device_id)
            │
            ▼
 Core     解析调用者的 execution domain（推导目标 AS）
            │
            ▼
-Core     验证 authority（资源属于该域？权限足够？）
+Core     记 device owner + 解析本域窗口（KernelNative 裸指针 / Isolated mapped VA）
            │
            ▼
-Core     映射进调用者自己的 domain（记录 ownership / trace）
+Core     记录 ownership / trace
 ```
 
-> 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"：契约（Interface + Handle）与执行域解耦，才能在同一组件图上自由选择信任边界。
+> 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"：契约（Interface + mechanism）与执行域解耦，才能在同一组件图上自由选择信任边界。
 
 ## 7. OS Profile
 
@@ -476,7 +476,7 @@ Scheduler（Component）         Core
 ## 9. 与参考系统的关系（详见 references.md）
 
 - Asterinas → 策略注入与策略输出验证（propose/validate 先例）
-- seL4 → typed authority、不可伪造 capability（Handle 借鉴 typed authority，不继承不可伪造性）
+- seL4 → typed capability 与"资源真相在核心"（KaleidOS 只借用思想，**不实现 capability 系统**；access enforcement 交给执行域）
 - Exokernel → 保护与管理分离（Core/Component 分工的理论源头）
 - Theseus / RedLeaf → 状态归属与资源回收（ResourceDomain 思想）
 - Zephyr → arch / SoC / board / device model 的硬件边界（映射到 Machine Discovery 与驱动 Component）
@@ -486,7 +486,7 @@ Scheduler（Component）         Core
 
 - `core-philosophy.md`：为什么这样设计（判断标准与取舍）；
 - `component-model.md`：组件的完整模型（生命周期、关系、替换）；
-- `driver-model.md`：驱动 / Handle→Lease / 执行域 / 撤销不变式的设计契约；
+- `driver-model.md`：驱动 / device claim / 执行域 / teardown 安全的设计契约；
 - `testing.md`：如何保证 Core 可信；
 - `roadmap.md`：按里程碑怎么一步步长出来；
 - `references.md`：每个参考系统借鉴什么、怎么用。

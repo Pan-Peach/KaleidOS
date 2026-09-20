@@ -164,11 +164,11 @@ def wait_for(proc, sink, expected, label):
 
 
 def component_is_ready(proc, sink, name):
-    """Drive `components` and assert <name> is listed with state=Ready."""
+    """Drive `components` and assert the instance for <name>'s image is Ready."""
     send(proc, "components\n")
-    joined = wait_for(proc, sink, [f"name={name}"], f"components/{name}")
+    joined = wait_for(proc, sink, [f"image={name}"], f"components/{name}")
     for line in joined.splitlines():
-        if f"name={name}" in line:
+        if f"image={name}" in line:
             if "state=Ready" in line:
                 return
             raise RunFailure(f"{name} not Ready: {line!r}")
@@ -194,7 +194,7 @@ def drive_case(proc, sink, case):
         if attachments != 1:
             raise RunFailure(f"{case}: expected exactly 1 attach, saw {attachments}")
 
-    # 第二次 load 必须是 already loaded（单实例）。
+    # 第二次 load：monitor 的单实例便利语义拒绝重复加载（组件 ABI 仍支持多实例）。
     send(proc, "load virtio_blk\n")
     wait_for(proc, sink, ["load virtio_blk: already loaded"], "second load")
 

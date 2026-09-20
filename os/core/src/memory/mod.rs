@@ -64,10 +64,10 @@ pub enum MemoryError {
 /// 它不是"借用 / 引用计数 pin"：没有 clone、没有共享计数，`Drop` 时把区域
 /// 整体归还 buddy heap。谁持有它，谁就独占这段物理内存；`forget` 即保活。
 /// DMA backing 用 `Option<MemoryLease>` 承载这份占用，回收时 move 进 Core 私有
-/// `QUARANTINE`（见 `handle/dma.rs`）。
+/// `QUARANTINE`（见 `resource/dma.rs`）。
 ///
-/// 命名对照：`MmioView` / `DmaView`（`handle/lease.rs`）只是 `Copy` 的指针 /
-/// 设备地址快照，**不是**本类型（见 `docs/resource-model-review.md` §C.3）。
+/// 命名对照：它**不是** capability；MMIO/DMA 数据路径上的 old `*View/*Lease`
+/// 中间层已随 authority 模型一起删除（见 `resource` 模块文档）。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MemoryLease {
     region: PhysicalRange,

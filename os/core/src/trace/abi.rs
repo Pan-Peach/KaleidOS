@@ -17,8 +17,8 @@
 //! 3  POLICY_ACCEPTED           component          task                 -
 //! 4  POLICY_REJECTED           component          reason               -
 //! 5  COMPONENT_STATE           component          from(State|ABSENT)   to(State)
-//! 6  RESOURCE_GRANT            component          ResourceKind         RawHandle
-//! 7  RESOURCE_REVOKE           component          ResourceKind         RawHandle
+//! 6  RESOURCE_GRANT            component          ResourceKind         id
+//! 7  RESOURCE_REVOKE           component          ResourceKind         id
 //! 8  INTERFACE_BIND            consumer|ABSENT    provider             interface
 //! 9  INTERFACE_REFRESH         binding            generation           -
 //! 10 IRQ_ENTER                 irq                -                    -
@@ -31,7 +31,7 @@
 
 use super::{RejectReason, TraceEvent, TraceRecord, TraceStats, capacity};
 use crate::component::ComponentState;
-use crate::handle::ResourceKind;
+use crate::resource::ResourceKind;
 
 /// payload 词里的"该字段不存在"哨兵。
 pub const ABSENT: u64 = u64::MAX;
@@ -133,7 +133,7 @@ const fn state_code(state: ComponentState) -> u64 {
 
 const fn kind_code(kind: ResourceKind) -> u64 {
     match kind {
-        ResourceKind::Mmio => 0,
+        ResourceKind::Device => 0,
         ResourceKind::Irq => 1,
         ResourceKind::Dma => 2,
     }
@@ -186,22 +186,22 @@ impl From<&TraceRecord> for TraceRecordAbi {
             TraceEvent::ResourceGrant {
                 component,
                 kind,
-                handle,
+                id,
             } => (
                 KIND_RESOURCE_GRANT,
                 u64::from(component.raw()),
                 kind_code(kind),
-                handle.raw(),
+                id,
             ),
             TraceEvent::ResourceRevoke {
                 component,
                 kind,
-                handle,
+                id,
             } => (
                 KIND_RESOURCE_REVOKE,
                 u64::from(component.raw()),
                 kind_code(kind),
-                handle.raw(),
+                id,
             ),
             TraceEvent::InterfaceBind {
                 consumer,

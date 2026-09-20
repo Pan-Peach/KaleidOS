@@ -1,7 +1,7 @@
 //! Trace 事件类型与 payload。
 //!
 //! 事件只携带**类型化 ID 与理由**（`TaskId` / `ComponentId` / `InterfaceId` /
-//! `BindingId` / `ResourceKind` / `RawHandle` / `RejectReason`…），
+//! `BindingId` / `ResourceKind` / opaque resource id / `RejectReason`…），
 //! 不携带格式化字符串或裸指针。Trace 面向机器、测试与性能分析，
 //! 不是给人读的 log：绝不能靠反向解析字符串来还原系统行为。
 //!
@@ -19,7 +19,7 @@
 use crate::component::ComponentId;
 use crate::component::ComponentState;
 use crate::component::interface::{BindingId, InterfaceId};
-use crate::handle::{RawHandle, ResourceKind};
+use crate::resource::ResourceKind;
 use crate::task::TaskId;
 
 /// Core 拒绝一次提议的理由（Core owns truth：理由由 Core 判定，不由组件自报）。
@@ -63,17 +63,17 @@ pub enum TraceEvent {
         to: ComponentState,
     },
 
-    /// 授予 authority（handle 由 Core 分配）。
+    /// 授予资源归属（device claim / IRQ route / DMA mapping；id 由 Core 分配）。
     ResourceGrant {
         component: ComponentId,
         kind: ResourceKind,
-        handle: RawHandle,
+        id: u64,
     },
-    /// 回收 authority（撤销后旧 handle 一律 Stale）。
+    /// 回收资源归属（撤销后旧 id 一律失效）。
     ResourceRevoke {
         component: ComponentId,
         kind: ResourceKind,
-        handle: RawHandle,
+        id: u64,
     },
 
     /// consumer 完成一次 interface 绑定解析（`InterfaceRegistry::bind`）。

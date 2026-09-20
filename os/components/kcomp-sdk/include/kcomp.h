@@ -179,30 +179,26 @@ int32_t kcore_panic_escape(void);
 /* -- Scheduler -- */
 int32_t kcore_sched_run(void);
 
-/* -- Resource authority: device discovery / MMIO -- */
+/* -- Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）-- */
 int32_t kcore_device_nth(const uint8_t *compatible, size_t len, uint32_t ordinal,
                          uint32_t *out_device_id);
-int32_t kcore_mmio_claim(uint32_t device_id, uint64_t *out_handle);
-int32_t kcore_mmio_read_u32(uint64_t handle, uint32_t offset, uint32_t *out_value);
-int32_t kcore_mmio_write_u32(uint64_t handle, uint32_t offset, uint32_t value);
-int32_t kcore_mmio_release(uint64_t handle);
-int32_t kcore_mmio_lease(uint64_t handle, size_t *out_ptr, size_t *out_len);
+/* 认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。
+ * KernelNative 下就是寄存器基址；driver 之后自己 volatile 读写。 */
+int32_t kcore_device_claim(uint32_t device_id, uint8_t **out_mmio, size_t *out_len);
+int32_t kcore_device_release(uint32_t device_id);
 
-/* -- Resource authority: DMA -- */
-int32_t kcore_dma_alloc(uint64_t mmio_handle, size_t size, int32_t direction,
-                        uint64_t *out_handle);
-int32_t kcore_dma_lease(uint64_t handle, size_t *out_ptr, size_t *out_len,
-                        uint64_t *out_device_addr);
-int32_t kcore_dma_release(uint64_t handle);
+/* -- IRQ routes（锚点是 DeviceId；只支持 native callback）-- */
+int32_t kcore_irq_register(uint32_t device_id, void (*handler)(void *ctx), void *ctx);
+int32_t kcore_irq_enable(uint32_t device_id);
+int32_t kcore_irq_disable(uint32_t device_id);
+int32_t kcore_irq_release(uint32_t device_id);
 
-/* -- Resource authority: IRQ -- */
-int32_t kcore_irq_claim(uint64_t mmio_handle, uint64_t *out_handle);
-int32_t kcore_irq_register(uint64_t handle, void (*handler)(void *ctx), void *ctx);
-int32_t kcore_irq_enable(uint64_t handle);
-int32_t kcore_irq_register_polled(uint64_t handle);
-int32_t kcore_irq_poll(uint64_t handle, uint64_t *out_count);
-int32_t kcore_irq_ack(uint64_t handle);
-int32_t kcore_irq_release(uint64_t handle);
+/* -- DMA（allocation 与 mapping 分离）-- */
+int32_t kcore_dma_alloc(size_t size, uint8_t **out_ptr, size_t *out_len);
+int32_t kcore_dma_free(uint8_t *ptr);
+int32_t kcore_dma_map(uint32_t device_id, uint8_t *ptr, size_t len, int32_t direction,
+                      uint64_t *out_device_addr, uint64_t *out_mapping);
+int32_t kcore_dma_unmap(uint64_t mapping);
 
 #ifdef __cplusplus
 }

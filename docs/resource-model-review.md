@@ -1,4 +1,15 @@
-# Core 资源模型 / Authority 模型审查
+# Core 资源模型 / Authority 模型审查（历史文档）
+
+> ## ⚠️ HISTORICAL —— 已被 mechanism-first 重构取代，请勿据以实现
+>
+> 本文件是**旧 Handle / Slot / ResourceTable / Lease / authority 资源模型**的审查记录（基线 commit `c833863`）。该模型已被**整块删除**，本文件中的 `Handle` / `Slot` / `ResourceTable` / `MmioHandle` / `IrqHandle` / `DmaHandle` / `MmioLease` / `DmaLease` / `HandleError` / `authority` / `handle/` 等词汇**全部属于已废弃模型**，不代表现状。
+>
+> 现行机制见 `docs/driver-model.md`：
+> - `DeviceId`（identity，非 handle）→ `kcore_device_claim`（记 owner + 返回本执行域 MMIO 窗口）；
+> - IRQ 锚点是已认领 `DeviceId`（`kcore_irq_register/enable/disable/release`，只走 native callback）；
+> - DMA `kcore_dma_alloc/free` 与 `kcore_dma_map/unmap` **分离**，mapping id 单调递增，撤销 backing 进 `QUARANTINE`。
+>
+> 已删除的 ABI：`kcore_mmio_*`、`kcore_irq_claim`、`kcore_irq_register_polled`、`kcore_irq_poll`、`kcore_irq_ack`、`kcore_dma_lease`、`kcore_dma_release`。保留本文只为记录当时的推理与未采纳提案。
 
 > 对象：`os/core/` 的数据结构、资源模型、鉴权模型、生命周期模型。
 > 依据：5 份代码盘点（handle/slot 表、鉴权与调用上下文、ResourceDomain 与 teardown、docs-vs-code、interface lease 与生命周期）+ Oracle 独立评审。

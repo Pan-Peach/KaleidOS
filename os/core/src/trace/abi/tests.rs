@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::component::ComponentId;
-use crate::handle::RawHandle;
+use crate::resource::ResourceKind;
 use crate::task::TaskId;
 
 fn record(seq: u64, event: TraceEvent) -> TraceRecord {
@@ -40,13 +40,13 @@ fn every_event_has_a_distinct_stable_tag() {
         },
         TraceEvent::ResourceGrant {
             component,
-            kind: ResourceKind::Mmio,
-            handle: RawHandle::from_raw(1),
+            kind: ResourceKind::Device,
+            id: 1,
         },
         TraceEvent::ResourceRevoke {
             component,
             kind: ResourceKind::Dma,
-            handle: RawHandle::from_raw(2),
+            id: 2,
         },
         TraceEvent::InterfaceBind {
             consumer: Some(component),
@@ -99,7 +99,7 @@ fn enum_values_map_to_stable_codes() {
     let abi = encode(TraceEvent::ResourceGrant {
         component: ComponentId::from_raw(1),
         kind: ResourceKind::Irq,
-        handle: RawHandle::from_raw(0xdead),
+        id: 0xdead,
     });
     assert_eq!(abi.b, 1, "ResourceKind::Irq = 1");
     assert_eq!(abi.c, 0xdead, "raw handle 原样透传");

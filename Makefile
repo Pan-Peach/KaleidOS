@@ -255,7 +255,7 @@ distclean: clean
 .PHONY: fmt clippy check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
-OUR_CRATES := -p kernel -p arch -p scheduler_rr -p allocator_simple -p core_test -p logger
+OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test -p logger
 
 # 代码格式化（rustfmt）；kcomp-sdk 是独立 workspace（root exclude），单独 fmt。
 fmt:

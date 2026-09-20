@@ -253,7 +253,7 @@ unsafe extern "C" {
     #[link_name = "kcore_sched_run"]
     pub fn kcore_sched_run() -> i32;
 
-    // -- Resource authority: device discovery / MMIO --
+    // -- Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）--
     #[link_name = "kcore_device_nth"]
     pub fn kcore_device_nth(
         compatible: *const u8,
@@ -261,48 +261,40 @@ unsafe extern "C" {
         ordinal: u32,
         out_device_id: *mut u32,
     ) -> i32;
-    #[link_name = "kcore_mmio_claim"]
-    pub fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32;
-    #[link_name = "kcore_mmio_read_u32"]
-    pub fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32;
-    #[link_name = "kcore_mmio_write_u32"]
-    pub fn kcore_mmio_write_u32(handle: u64, offset: u32, value: u32) -> i32;
-    #[link_name = "kcore_mmio_release"]
-    pub fn kcore_mmio_release(handle: u64) -> i32;
-    #[link_name = "kcore_mmio_lease"]
-    pub fn kcore_mmio_lease(handle: u64, out_ptr: *mut usize, out_len: *mut usize) -> i32;
+    /// 认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。
+    /// KernelNative 下就是寄存器基址；driver 之后自己 volatile 读写。
+    #[link_name = "kcore_device_claim"]
+    pub fn kcore_device_claim(device_id: u32, out_mmio: *mut *mut u8, out_len: *mut usize) -> i32;
+    #[link_name = "kcore_device_release"]
+    pub fn kcore_device_release(device_id: u32) -> i32;
 
-    // -- Resource authority: DMA --
-    #[link_name = "kcore_dma_alloc"]
-    pub fn kcore_dma_alloc(
-        mmio_handle: u64,
-        size: usize,
-        direction: i32,
-        out_handle: *mut u64,
-    ) -> i32;
-    #[link_name = "kcore_dma_lease"]
-    pub fn kcore_dma_lease(
-        handle: u64,
-        out_ptr: *mut usize,
-        out_len: *mut usize,
-        out_device_addr: *mut u64,
-    ) -> i32;
-    #[link_name = "kcore_dma_release"]
-    pub fn kcore_dma_release(handle: u64) -> i32;
-
-    // -- Resource authority: IRQ --
-    #[link_name = "kcore_irq_claim"]
-    pub fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32;
+    // -- IRQ routes（锚点是 DeviceId；只支持 native callback）--
     #[link_name = "kcore_irq_register"]
-    pub fn kcore_irq_register(handle: u64, handler: IrqHandler, ctx: *mut ()) -> i32;
+    pub fn kcore_irq_register(device_id: u32, handler: IrqHandler, ctx: *mut ()) -> i32;
     #[link_name = "kcore_irq_enable"]
-    pub fn kcore_irq_enable(handle: u64) -> i32;
-    #[link_name = "kcore_irq_register_polled"]
-    pub fn kcore_irq_register_polled(handle: u64) -> i32;
-    #[link_name = "kcore_irq_poll"]
-    pub fn kcore_irq_poll(handle: u64, out_count: *mut u64) -> i32;
-    #[link_name = "kcore_irq_ack"]
-    pub fn kcore_irq_ack(handle: u64) -> i32;
+    pub fn kcore_irq_enable(device_id: u32) -> i32;
+    #[link_name = "kcore_irq_disable"]
+    pub fn kcore_irq_disable(device_id: u32) -> i32;
     #[link_name = "kcore_irq_release"]
-    pub fn kcore_irq_release(handle: u64) -> i32;
+    pub fn kcore_irq_release(device_id: u32) -> i32;
+
+    // -- DMA（allocation 与 mapping 分离）--
+    /// 分配 CPU-visible、物理连续的 DMA 缓冲（device-agnostic）。
+    #[link_name = "kcore_dma_alloc"]
+    pub fn kcore_dma_alloc(size: usize, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32;
+    /// 释放一段 DMA 缓冲（backing 进 Core quarantine，不立即 free）。
+    #[link_name = "kcore_dma_free"]
+    pub fn kcore_dma_free(ptr: *mut u8) -> i32;
+    /// 把 buffer 映射给设备：设备可见地址 + mapping id（No-IOMMU identity）。
+    #[link_name = "kcore_dma_map"]
+    pub fn kcore_dma_map(
+        device_id: u32,
+        ptr: *mut u8,
+        len: usize,
+        direction: i32,
+        out_device_addr: *mut u64,
+        out_mapping: *mut u64,
+    ) -> i32;
+    #[link_name = "kcore_dma_unmap"]
+    pub fn kcore_dma_unmap(mapping: u64) -> i32;
 }

@@ -32,14 +32,14 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
       interface_bind / interface_refresh
     Task control：task_create / task_start / task_yield / task_exit / task_state
     Scheduler：sched_run
-    Resource authority（C6）：mmio_claim / mmio_read_u32 / mmio_write_u32 / mmio_release /
-      mmio_lease / irq_claim / irq_register / irq_enable / irq_register_polled / irq_poll /
-      irq_ack（认领设备/中断线 → MmioHandle/IrqHandle；常规访问每次由 Core 重新验证，
-      kcore_mmio_lease 可派生一次校验过的 (ptr,len) 供受信 KernelNative 直访；
-      IRQ 两态：trap 回调 / 轮询（Core 计数+掩蔽，驱动 poll/ack 后重新放行））
-    DMA authority（C6）：dma_alloc / dma_lease / dma_release（用 caller 已持有的 MmioHandle
-      推导设备身份 → Core 分配物理连续 backing → 派生 (ptr, len, device_addr) + provenance；
-      release/revoke 把 backing 移入 Core 私有 QUARANTINE——无 IOMMU 时设备静默不可证，不立即释放）
+    Device ownership / MMIO（C6）：device_nth（纯发现）/ device_claim（认领确切设备，Core 记
+      owner 并返回本执行域 MMIO 窗口：KernelNative = 裸寄存器基址，steady state 不再进 Core）/
+      device_release（仍有 live IRQ/DMA 子项 → -EBUSY）——不做 per-access 鉴权
+    IRQ routes（C6）：irq_register / irq_enable / irq_disable / irq_release（锚点是已认领的
+      DeviceId；只投递 native callback，无 poll/ack/event 层）
+    DMA（C6）：dma_alloc / dma_free（device-agnostic 物理连续缓冲）+ dma_map / dma_unmap
+      （device-related：返回 device_addr + 单调 mapping id；No-IOMMU identity）；
+      free/revoke 把 backing 移入 Core 私有 QUARANTINE——无 IOMMU 时设备静默不可证，不立即释放）
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
@@ -83,13 +83,14 @@ P1 任务系统打通：
 P2 中断/驱动雏形：
   🚧 C5  timer（SBI TIME）+ 时钟中断——骨架已搭（trap 可返回路径、Timer/Irq 原语签名、
          timer/sched seam、ArchTest 位），逻辑待手写
-  🚧 C6  驱动 authority 层（见 `driver-model.md`）：request→authorize→grant→access 走
-         `RequestContext`；MMIO `read/write/release` + `kcore_mmio_lease`（派生 (ptr,len) 直访，
-         受信 KernelNative，撤销协作式）；IRQ 两态（trap 回调 / Polled 计数+掩蔽，驱动
-         poll/ack 重新放行）；DMA `alloc/lease/release`（设备身份从 MmioHandle 推导，backing
-         撤销进 QUARANTINE）；`fail_component` 编排拆除。CoreTest 覆盖 mmio
-         magic/lease/write/release + `irq-line-enable`/polled + dma-ring；ArchTest
-         `external-irq` 真设备投递。后续：第一个 driver component（virtio 等）
+  🚧 C6  设备 / IRQ / DMA 机制层（见 `driver-model.md`）：device_nth（纯发现）→
+         device_claim（记 owner + 返回本执行域 MMIO 窗口，KernelNative = 裸寄存器基址，
+         稳态不进 Core，撤销协作式）→ device_release；IRQ 锚在 DeviceId（register /
+         enable / disable / release，只走 native callback）；DMA alloc 与 map 分离
+         （alloc device-agnostic，map device-related，backing 撤销进 QUARANTINE）；
+         `fail_component` 编排拆除。CoreTest 覆盖 claim/identity/release/子项检查 +
+         `irq-line-enable` + dma alloc/map/unmap；ArchTest `external-irq` 真设备投递。
+         后续：第一个 driver component（virtio 等）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
   C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
@@ -108,16 +109,16 @@ P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔
 ### 下一阶段方向（2026-09 架构重构后）
 
 ```text
-DeviceTable / MMIO / IRQ     → 第一个 Driver Component
+DeviceTable / device claim / IRQ / DMA → 第一个 Driver Component
                              → QEMU RV32 M-mode NoMMU（trap/machine.rs + nommu.rs 骨架就位）
                              → 真实 MCU
 ```
 
-- Interface Registry 已为驱动/服务提供 binding 机制；DeviceRecord 未来含
-  `owner: ComponentId` + `generation`，并支持 `revoke_owner(ComponentId)`
-  （见 component-model.md §3.2）——本轮不实现完整 DeviceTable。
-- 设备发现链（未来方向，本轮不做）：FDT/board description → DeviceRecord →
-  MMIO/IRQ/DMA authority → Driver Component → Device Interface → Service Component。
+- Interface Registry 已为驱动/服务提供 binding 机制；`DeviceTable` 已含独占
+  owner + 失败 quarantine，并支持 `revoke_owner(ComponentId)`
+  （见 component-model.md §3.2）。
+- 设备发现链：FDT/board description → DeviceRecord → DeviceId（identity）→
+  `kcore_device_claim` → Driver Component → Device Interface → Service Component。
 
 #### Phase T —— 最小 S-mode trap（0.5-1 天）
 
@@ -149,7 +150,7 @@ DeviceTable / MMIO / IRQ     → 第一个 Driver Component
 
 - 纯 Sv39 逻辑放 `os/arch/src/riscv/mmu/sv39.rs`（PTE 编解码/walk）；
   CSR/TLB 操作留 `riscv/mmu/mod.rs`
-- 页表页来源：map 接口收零页分配回调（bootstrap 注入 region allocator），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceHandle
+- 页表页来源：map 接口收零页分配回调（bootstrap 注入 region allocator），避免 arch→core 反向依赖；当前只服务 KernelPageTable，不提前引入通用 AddressSpaceManager
 - API 只暴露 `map_range / translate`（unmap 推迟：表回收/shootdown 未到）
 - 新根在 buddy allocator 活后建（Phase B 兜底），预映射全部 RAM（4G ≈ 8MiB 页表页）
 - 权限分段：.text=RX / .rodata+.initpkg=R / .data+.bss+栈+页表=RW/NX；
@@ -157,7 +158,7 @@ DeviceTable / MMIO / IRQ     → 第一个 Driver Component
 
 验收：host tests + make check 绿；boot/monitor/load 正常；写 rodata → cause 15；读未映射 → cause 13。
 
-M0.5 只构建永久的 KernelPageTable：不引入 AddressSpaceHandle、ExecutionDomain
+M0.5 只构建永久的 KernelPageTable：不引入 AddressSpaceManager、ExecutionDomain
 隔离实例、ASID 管理或通用 AddressSpaceManager。运行期地址空间属于 C10；届时
 Core 保存 owner、generation、生命周期和语义 mapping ledger，backend 保存 opaque
 页表投影，所有 map/unmap/activate/destroy 都由 Core 串行化和提交。
@@ -241,9 +242,9 @@ manifest   = 文本清单（modules.dep 模式：depmod 生成 / modprobe 读取
 ```text
 TaskId        —— 任务身份
 PhysicalRange —— Core 管理的物理内存区域
-ComponentId   —— 组件身份
-Handle        —— 类型化授权 token（可被伪造；authority 由 Core 验证，如 AddressSpaceHandle）
-ResourceDomain—— 组件资源集合（拥有什么、如何回收）
+ComponentId   —— 组件身份（实例 ID）
+DeviceId      —— 设备身份（identity，非权限；经 device_nth 发现）
+ResourceDomain—— 组件资源归属集合（拥有什么、如何回收；视图，非 struct）
 Core 物理内存 —— 帧真相 + canonical 帧分配器机制（`buddy_system_allocator::MetadataHeap`，per-unit metadata O(1) buddy，metadata 自托管前端；区域 `[align_up(__bootstrap_end), RAM 末尾)`，ELF/DTB 天然保留）
 ```
 
@@ -285,14 +286,14 @@ provides / requires / bind / start / stop
 - 生命周期状态机（Declared → Resolved → Starting → Ready → Stopping → Stopped → Destroyed）落地；
 - Ownership Tree 与 Dependency DAG 两套关系分开维护。
 
-**验收标准**：一个配置好的 minimal profile 能按声明完成 bind → start → stop → destroy 全流程，authority-backed 资源（handle）被 revoke。
+**验收标准**：一个配置好的 minimal profile 能按声明完成 bind → start → stop → destroy 全流程，剩余资源归属（device / IRQ route / DMA mapping）被撤销，设备进 quarantine。
 
 ## 6. M4 —— 第一个 Device Component
 
 建议选择：**UART** 或**简单 VirtIO block**。
 
 ```text
-Core Resource Authority（grant MmioHandle / IrqHandle / DmaHandle）
+Core mechanism（device_nth → device_claim → MMIO 窗口；irq_register；dma_alloc/map）
         ↓
 Driver Component（驱动组件）
         ↓
@@ -300,7 +301,7 @@ Device Interface（如 BlockDevice / UART 设备）
 ```
 
 **验收标准**：上层组件只通过 Interface 使用设备，从不接触裸地址/裸 IRQ；
-驱动可以被 stop → revoke authority（handle）→ 重新 start。走到这里如果边界仍然舒服，说明架构基本成立。
+驱动可以被 stop → 撤销归属（device release / irq release / dma unmap）→ 重新 start。走到这里如果边界仍然舒服，说明架构基本成立。
 
 ## 7. 第一阶段明确不做（务必遵守）
 
@@ -326,7 +327,7 @@ Device Interface（如 BlockDevice / UART 设备）
 - **热替换**：在 Phase-1 替换模型（quiesce → stop → unbind → reset → replace → bind → start）基础上，向无感替换演进；
 - **验证工具链**：Kani / Loom / Miri / Verus 逐步引入；
 - **确定性测试**：Test Scheduler / Hunt Mode（CHESS 思路）；
-- **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、完整 panic recovery（内存回收 / 真隔离）—— 均推迟到显式未来里程碑；phase 1 已实现 init / task 边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，见 `component-model.md` §5.1），但只做 authority-backed 资源 revoke，不承诺共享堆字节回收。
+- **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、完整 panic recovery（内存回收 / 真隔离）—— 均推迟到显式未来里程碑；phase 1 已实现 init / task 边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，见 `component-model.md` §5.1），但只做资源归属撤销与 quarantine，不承诺共享堆字节回收。
 
 ## 9. 长期愿景
 
@@ -346,7 +347,7 @@ Power On
 
 ## 10. 执行域性能模型与卸载协议（2026-08 Oracle 咨询结论）
 
-> 驱动 / Handle→Lease / 执行域与撤销不变式的最终契约见 `driver-model.md`；本节保留性能数量级与卸载协议的原始结论。
+> 驱动 / device claim / 执行域与 teardown 安全的最终契约见 `driver-model.md`；本节保留性能数量级与卸载协议的原始结论。
 
 ### 10.1 执行域切换成本（数量级；GHz 级硬件 + 热缓存）
 
@@ -365,13 +366,13 @@ Power On
 切换只花寄存器+栈）。"切页表"只在**隔离执行域**发生——按触发器推迟（C10）。
 
 **执行域定位（D2=A，见 `driver-model.md`）**：**KernelNative 是常态、长期模式**——同特权级、
-零切换、逻辑 authority（受信代码，未强制部分靠自觉），不追求硬件隔离。私有地址空间只在
+零切换、可信代码（无硬件访问强制，撤销协作式），不追求硬件隔离。私有地址空间只在
 执行域实验 / 隔离时引入：
 
 - **IsolatedNative（可选实验，非里程碑）**：S-mode + 私有 AS（每域 Sv39 根 + **ASID** 免 flush）；
   只提供条件性故障隔离（协作与偶然 bug，**对恶意无效**），**同特权 S-mode 换页表不构成恶意代码边界**；
 - **SandboxedNative（未来）**：U-mode + 私有 AS，才是对抗隔离的**硬件强制边界**
-  （Handle + MMU + 特权级；组件 U-mode 低于 Core 特权）。
+  （私有 AS + 页表 + 特权级；组件 U-mode 低于 Core 特权）。
 
 **否决项**：单内核页表 + 子集权限（RISC-V 无 MPK、PTE 不按键区分组件；PMP 是 M-mode 专属
 且窄——都不是正解）。
@@ -409,6 +410,6 @@ init / task 边界的协作式 containment（见 `component-model.md` §5.1）�
 
 1. 单次幂次分配；记录 `base` + `allocation_order` + `allocation_size`，**`loaded_size` 分开**（slack ≠ 内容）
 2. 元数据入 LoadedComponent → registry 记录 → 关联 ComponentId
-3. 原始分配记录 **Core-private**（`machine::MemoryRegion` 是机器描述，不是 authority）
+3. 原始分配记录 **Core-private**（`machine::MemoryRegion` 是机器描述，不是权限）
 4. 内部精确 `free_pages(base, order)` 用于加载失败回滚（构造期清理 ≠ 运行时回收）
 5. 校验：取整回绕/非零/对齐/entry 在内容内；不要现在加段权限隔离

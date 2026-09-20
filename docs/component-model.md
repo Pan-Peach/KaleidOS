@@ -2,7 +2,7 @@
 
 ## 1. Component 是什么
 
-Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而是 **lifecycle 与 authority 的同一单位（unit of lifecycle AND authority）**：一个组件实例代表它的 code、execution、authority、resources、interfaces、lifetime 与 failure state。因此它是一个完整的可管理单元：
+Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而是 **lifecycle 与 ownership 的同一单位（unit of lifecycle AND ownership）**：一个组件实例代表它的 code、execution、资源归属、interfaces、lifetime 与 failure state。因此它是一个完整的可管理单元：
 
 - 消费（requires）和提供（provides）Interface；
 - 拥有 ResourceDomain（Core 维护的资源集合）；
@@ -11,7 +11,7 @@ Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而�
 - 可以包含子 Component（Composite，见 §7）；
 - 可以被替换 / 重启 / 恢复。
 
-一个实例因此可以拥有：tasks、stacks、handles、memory mappings、irq bindings、DMA leases、interfaces、device ownership；失败时 Core 能按实例（per-instance）拆除它们（见 §3.3 与 §4.9）。
+一个实例因此可以拥有：tasks、stacks、claimed 设备、IRQ routes、DMA allocations/mappings、memory mappings、interfaces；失败时 Core 能按实例（per-instance）拆除它们（见 §3.3 与 §4.9）。
 
 **组件 ≠ crate**：第一阶段里，一个只有几十行的小模块就是普通 Rust module，不需要为架构图强行建 crate。组件是概念边界，crate 是实现选择。
 
@@ -29,8 +29,8 @@ Interface 表达"这个组件提供什么能力"，按领域分三类：
 
 ```text
 NVMe Component
-requires:  MmioHandle, IrqHandle, DmaHandle   （Authority，来自 Core）
-provides:  BlockDevice                        （Interface）
+requires:  DeviceId（identity）+ Core mechanism（device_claim / irq_register / dma_*）
+provides:  BlockDevice（Interface）
 
 Ext4 Component
 requires:  BlockDevice, PageCache
@@ -93,7 +93,7 @@ component wrapper
 | DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_instance_create` / `kcomp_instance_destroy` |
 | UNDEFINED | 只允许显式放行的 `kcore_*` imports（对齐 §2.1 的 export 白名单） |
 
-- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_line`、`kcore_irq_*`、`kcore_mmio_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
+- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_line`、`kcore_device_*`、`kcore_irq_*`、`kcore_dma_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
 - **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
 - **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
 
@@ -132,7 +132,7 @@ panic handler → component panic adapter     → kcore_log_line（打印诊断�
 ```text
 ResourceDomain(ComponentId(7))
 =
-Core 里所有 owner == ComponentId(7) 的 authority 资源
+Core 里所有 owner == ComponentId(7) 的归属记录（device / irq / dma）
 ```
 
 不写外置集合：
@@ -140,90 +140,83 @@ Core 里所有 owner == ComponentId(7) 的 authority 资源
 ```rust
 // ✗ 不要这样
 struct ResourceDomain {
-    irq_handles: Vec<IrqHandle>,
-    mmio_handles: Vec<MmioHandle>,
-    dma_handles: Vec<DmaHandle>,
+    devices: Vec<DeviceId>,
+    irq_routes: Vec<IrqRoute>,
+    dma_mappings: Vec<Mapping>,
 }
 ```
 
 而是资源自己的表记录 owner（数据库"视图"的直觉）：
 
 ```rust
-struct IrqRecord {
-    owner: ComponentId,
-    irq: IrqId,
-    generation: u32,
+struct DeviceTable {
+    owner: [Option<ComponentId>; 256],
+    quarantine: [bool; 256],
 }
 
-struct MmioRecord {
+struct IrqRoute {
     owner: ComponentId,
-    range: PhysRange,
-    generation: u32,
+    number: u32,
+    handler: extern "C" fn(*mut ()),
+    ctx: *mut (),
 }
 
-struct DmaRecord {
+struct Allocation {            // DMA allocation（device-agnostic）
+    base: usize,
     owner: ComponentId,
-    // ...
-    generation: u32,
+    lease: Option<MemoryLease>,
+}
+
+struct Mapping {               // DMA mapping（device-related）
+    id: u64,
+    owner: ComponentId,
+    device_index: u8,
 }
 ```
 
-> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录 authority handle（MMIO/IRQ/DMA）和受管理的内存区域，用于保护与 revoke。
+> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录设备所有权 / IRQ route / DMA mapping 和受管理的内存区域，用于 revoke / teardown / quarantine。
 >
-> `ComponentId` 是 identity（不是 authority），`handle/` 把 Handle 定义成 Core 创建、类型化的 authority —— 两者已经明确分离。
+> `ComponentId` 是 identity（不是权限），`DeviceId` 也是 identity。所有权记录只存在于各资源表，两者已经明确分离。
 
-> **DMA 授权模型（已决，刻意如此）**：`dma_alloc` 的授权证明 = caller 已持有该设备的
-> `MmioHandle`（Core 从 handle 推导设备身份，不接受组件自报）。**不建模**“设备是不是
-> DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标
-> `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim
-> 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个 capability 边界
-> 还没有人回答；记录见 `docs/testing.md` §3。
+> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报设备号），并把 mapping 记在 device owner 名下；`kcore_dma_alloc` 本身是 device-agnostic 的，所以**不需要**也不接受"设备身份证明"。**不建模**“设备是不是 DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标 `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个边界还没有人回答；记录见 `docs/testing.md` §3。
 
-### 3.1 Handle table 可以非常普通
+### 3.1 归属表可以非常普通
+
+Core 不再有泛型 `Handle<T>` / `Slot<T>` / `ResourceTable<T>`。每张表只记原始归属与（必要时）一个永不误命中的 id：
 
 ```rust
-struct Slot<T> {
-    generation: u32,
-    owner: ComponentId,
-    object: T,
-}
-
-pub struct Handle<T> {
-    slot: u32,
-    generation: u32,
-    _marker: PhantomData<T>,
-}
+struct DeviceTable { owner: [Option<ComponentId>; 256], quarantine: [bool; 256] }
+struct IrqTable    { routes: [Option<IrqRoute>; 256] }        // 锚点 = device_index
+struct DmaTable    { allocations: Vec<Allocation>, mappings: Vec<Mapping>, next_id: u64 }
 ```
 
-```rust
-type IrqHandle = Handle<Irq>;
-type MmioHandle = Handle<MmioRegion>;
-type DmaHandle = Handle<DmaMapping>;
-```
-
-control path（Core 校验，必须记录 trace）：
+control path（Core 校验归属，必须记录 trace）：
 
 ```rust
-fn get_irq(caller: ComponentId, handle: IrqHandle) -> Result<&Irq, HandleError> {
-    let slot = IRQ_TABLE.get(handle.slot)?;
-    if slot.generation != handle.generation {
-        return Err(HandleError::Stale);
+// 认领：已认领 / 已 quarantine → 拒绝；否则记 owner。
+fn claim(caller: ComponentId, device_index: u8) -> Result<(), DeviceClaimError> { ... }
+
+// 注册 IRQ route：只有 device owner 能注册。
+fn register(caller: ComponentId, device_index: u8, handler, ctx) -> Result<(), IrqError> {
+    if device_table.owner(device_index) != Some(caller) {
+        return Err(IrqError::NotOwner);
     }
-    if slot.owner != caller {
-        return Err(HandleError::WrongOwner);
-    }
-    Ok(&slot.object)
+    ...
 }
+
+// 释放设备：non-owner 拒绝；仍有 live IRQ route / DMA mapping → -EBUSY。
+fn release(caller: ComponentId, device_index: u8) -> Result<(), DeviceReleaseError> { ... }
 ```
+
+**这些归属检查是"谁拥有 / 谁能拆"的记账，不是 per-access 鉴权**：`kcore_device_claim` 之后，driver 直接拿到裸 MMIO 指针，Core 不再参与每次寄存器读写（KernelNative 就是可信代码，见 `driver-model.md` §1.1）。
 
 ### 3.2 回收：revoke_owner
 
 ```rust
 fn revoke_component_resources(id: ComponentId) {
+    device::revoke_owner(id);   // 失败路径：设备进 quarantine（保持到 reboot）
     irq::revoke_owner(id);
-    mmio::revoke_owner(id);
-    dma::revoke_owner(id);
-    timer::revoke_owner(id);
+    dma::revoke_owner(id);      // backing 进 QUARANTINE（不 free）
 }
 ```
 
@@ -231,9 +224,9 @@ fn revoke_component_resources(id: ComponentId) {
 
 ```rust
 fn revoke_owner(owner: ComponentId) {
-    for slot in TABLE.iter_mut() {
-        if slot.owner == owner {
-            revoke(slot);
+    for record in TABLE.iter_mut() {
+        if record.owner == owner {
+            revoke(record);
         }
     }
 }
@@ -256,7 +249,7 @@ component-specific shutdown    —— 设备相关收尾（停 DMA / reset / mas
   ↓
 stop
   ↓
-revoke_component_resources(id) —— Core 兜底，收回剩余 authority
+revoke_component_resources(id) —— Core 兜底，撤销剩余归属（device 进 quarantine / DMA backing 停车）
   ↓
 ResourceDomain becomes empty
 ```
@@ -264,8 +257,8 @@ ResourceDomain becomes empty
 > 现状（§5.2 的第一版实现）：quiesce = `begin_stop`（`Ready → Stopping`，任务
 > run 门禁 + publish 拒绝）、component-specific shutdown = 组件退出钩子
 > `kcomp_instance_destroy`（monitor `unload` 触发）、stop = `finish_stop`；Core 兜底与失败
-> 路径共用 `failure::revoke_authority_and_unbind`（剩余 MMIO claim 进
-> quarantine）。有未退出任务的实例在第一步就被拒绝（drain variant 未实现）。
+> 路径共用 `failure::revoke_authority_and_unbind`（剩余 device claim 进
+> quarantine，DMA backing 停车）。有未退出任务的实例在第一步就被拒绝（drain variant 未实现）。
 
 #### Forced containment（强制隔离）
 
@@ -278,12 +271,12 @@ Core containment               —— 阻止它继续访问资源
   ↓
 reset / isolate device（尽可能）
   ↓
-force revoke authority
+force revoke ownership
   ↓
-revoke_component_resources(id) —— 收回 authority-backed resources（handles）
+revoke_component_resources(id) —— 撤销归属记录（device / irq / dma）并做 quarantine
 ```
 
-> 强制隔离回收的是 **authority-backed 资源（handle）**。堆内存的清理走正常 Drop 路径；完整的内存回收属于 ExecutionDomain 的职责（见 §4）——phase 1 的 KernelNative 组件不承诺内存回收。
+> 强制隔离撤销的是**归属记录**（device / IRQ route / DMA mapping），并对可能仍被设备访问的 DMA backing 做 quarantine。堆内存的清理走正常 Drop 路径；完整的内存回收属于 ExecutionDomain 的职责（见 §4）——phase 1 的 KernelNative 组件不承诺内存回收。
 
 #### Teardown 是资源生命周期问题，不是 "free(stack) + done"
 
@@ -299,7 +292,7 @@ stop new work
   → unmap memory
   → wait / quarantine outstanding DMA
   → release resources
-  → revoke handles
+  → revoke ownership records
   → mark Failed / Destroyed
 ```
 
@@ -325,7 +318,7 @@ pub enum ExecutionDomain {
 }
 ```
 
-> **契约不能 ABI 锁定**：Interface 和 Handle 的定义必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
+> **契约不能 ABI 锁定**：Interface 和 device claim / IRQ / DMA 机制必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
 
 ### 4.1 不塞进 InstanceRecord
 
@@ -387,7 +380,7 @@ active binding）。停止链已落地（§5.2：`Ready → Stopping → Stopped
 
 > **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
 >
-> 规则：不要因为有了组件模型就把一切都组件化。Component 对应真正具备 lifecycle / identity / authority / execution / service-role 的实体（见 §1）。
+> 规则：不要因为有了组件模型就把一切都组件化。Component 对应真正具备 lifecycle / identity / ownership / execution / service-role 的实体（见 §1）。
 
 ### 4.3 KernelNative 具体是什么
 
@@ -403,7 +396,7 @@ M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地�
 **私有地址空间**时才引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），
 由 Core 的 AddressSpaceManager 统一管理。
 
-> **D2=A**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，靠逻辑 authority；
+> **D2=A**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，就是可信代码（无硬件访问强制，撤销协作式）；
 > `IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；
 > `SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。详见 `driver-model.md`。
 
@@ -419,11 +412,11 @@ Core AddressSpaceTable
 `ExecutionDomain` 只保存 `AddressSpaceId`，不拥有可以绕过 Core 修改映射的页表
 对象。Core 保存地址空间的语义真相；PTE 只是 backend 的硬件投影。
 
-Core 公开入口只接受 `AddressSpaceHandle`、虚拟/物理区域和抽象权限：
+Core 的 map/unmap 是**内部提交点**（不导出给组件）：调用者只表达"要把哪个资源映射进自己的域"，目标地址空间由 execution domain 推导，最终映射由 Core 提交。
 
 ```text
-map_range(caller, space_handle, virtual_range, physical_range, permission)
-  → validate space / region / overlap / permission
+map 提交（Core 内部）
+  → validate region / overlap / permission
   → install backend mapping
   → commit mapping record and trace
 ```
@@ -490,9 +483,9 @@ Component shutdown()
   ↓
 Rust Drop
   ↓
-绝大部分 Handle/Lease 自己释放
+绝大部分资源由组件自己释放
   ↓
-revoke_owner(id)   ← 只是保险："还有没释放的 authority？有就 Core 扫掉。"
+revoke_owner(id)   ← 只是保险："还有没释放的归属？有就 Core 扫掉（quarantine）。"
 ```
 
 ### 4.10 代码结构（目标形态）
@@ -531,11 +524,11 @@ execution/
   └── AddressSpaceManager / AddressSpaceSlot（未来 C10）
 
 
-irq/         —— IrqTable，record 带 owner: ComponentId（模块按概念拆子文件，不堆单文件）
-mmio.rs      —— MmioTable，record 带 owner: ComponentId
-dma.rs       —— DmaTable，record 带 owner: ComponentId
-
-handle/      —— 类型化 Handle<...> + Slot{generation, owner, object}
+resource/    —— 概念分文件，不堆单文件：
+  device.rs  —— DeviceTable{owner, quarantine}
+  irq.rs     —— IrqTable{routes}（锚点 = device_index）
+  dma.rs     —— DmaTable{allocations, mappings} + QUARANTINE
+  每张表 record 带 owner: ComponentId
 ```
 
 ownership 结构：
@@ -567,7 +560,7 @@ DMA table  ─ owner=A ─┘
 
 ### 4.11 落地顺序：现在只做两小步
 
-1. **先不要写 ResourceDomain**。等 MMIO/IRQ 真正开始做的时候，在每个 authority record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
+1. **先不要写 ResourceDomain**。等 device/IRQ 真正开始做的时候，在每个资源归属 record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
 2. **完成 region allocation contract 后、真正需要隔离执行时**，再引入 `AddressSpaceManager`。
   它维护 `AddressSpaceSlot`、generation、语义 mapping ledger，并通过 Core 控制的
   backend 完成 map/unmap/activate/destroy；不使用 RSW ownership，也不依赖 `Drop`
@@ -593,8 +586,8 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 | Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
 | Starting | 正在初始化（执行 `kcomp_instance_create`） |
 | Ready | 可以对外提供 Interface |
-| Stopping | 正在停止：`kcomp_instance_destroy` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有 authority 仍可 `release`） |
-| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余 authority 与接口已被 Core 兜底回收（记录保留；不回收段内存） |
+| Stopping | 正在停止：`kcomp_instance_destroy` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有归属记录仍可 `release`） |
+| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余归属与接口已被 Core 兜底撤销（device 进 quarantine；记录保留；不回收段内存） |
 | Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
 
 > **`kcomp_instance_destroy`（Linux `module_exit` 类比）是组件 ABI 的对称退出入口**
@@ -651,7 +644,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
    b. 实例必须存在且处于 Ready（规则表）      → 否则 NotFound / ENOENT 或 NotReady / EINVAL
 2. begin_stop                              Ready → Stopping：任务 run 门禁 + publish 拒绝
 3. kcomp_instance_destroy（必需入口）        Core-owned 隔离栈；ambient identity = 被停止实例
-4. Core 兜底                               revoke authority + 解绑 provider（与失败路径同序列）
+4. Core 兜底                               撤销归属（device quarantine / DMA 停车）+ 解绑 provider（与失败路径同序列）
 5. finish_stop                             Stopping → Stopped（记录保留）
 ```
 
@@ -662,9 +655,9 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
   `containment::call_component_destroy`），其 Core 调用身份是**被停止的实例**
   （`EscapeKind::Exit`），不是发起 stop 的 monitor / 其他组件；
   `kcore_interface_publish` 在 exit 边界被拒（publish 是 init 期操作）。
-- **authority**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
-  周期门禁限制）；钩子返回后 Core 仍兜底撤销一切**剩余** authority。剩余的
-  MMIO claim 会进失败 quarantine（revoke ≠ 设备可安全复用），组件自己
+- **归属**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
+  周期门禁限制）；钩子返回后 Core 仍兜底撤销一切**剩余**归属。剩余的
+  device claim 会进失败 quarantine（撤销 ≠ 设备可安全复用），组件自己
   `release` 的不会——兜底与失败路径共用 `failure::revoke_authority_and_unbind`。
 - **失败路径刻意不调用 exit**（Linux 类比：崩溃的模块不值得信任）：`Failed`
   只走 `fail_component`（mark + 兜底）。**未闭合**：组件侧的设备收尾
@@ -691,8 +684,8 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
    （地址空间销毁、真正停止任务）是各自 ExecutionDomain 的职责。
 5. **实例退役**：`Stopped` 记录保留（不回收段内存、`ComponentId` 不复用）；
    unload 记录 / 重新探测仍待定。
-6. **退出期间的新 authority 门禁**：现有 export 门禁只拦 `Failed`；钩子在
-   `Stopping` 期间仍可 `kcore_mmio_claim`（随后被兜底撤销）。硬拦需要把
+6. **退出期间的新资源认领门禁**：现有 export 门禁只拦 `Failed`；钩子在
+   `Stopping` 期间仍可 `kcore_device_claim`（随后被兜底撤销）。硬拦需要把
    acquiring 门禁从"非 `Failed`"改成生命周期判定（会同时影响 `Stopped`）。
 7. **退出钩子的阻塞 / 超时 / 看门狗**：钩子同步执行、无超时；挂死会挂住
    stop（KernelNative 协作式信任，与 `kcomp_instance_create` 同）。
@@ -809,7 +802,7 @@ Derived 状态（vruntime、LRU history、RTT 估计等）丢失后，系统必�
 - VFS 对外：`provides FileSystemService`；
 - Ext4：`requires BlockDevice, PageCache`，`provides FileSystem`；
 - Mount ≈ 把一个 FileSystem provider attach 到 VFS namespace；
-- 最底层 NVMe 是驱动组件：拿 Core 的 Handle，向上提供 BlockDevice。
+- 最底层 NVMe 是驱动组件：经 Core 认领设备（`kcore_device_claim`），向上提供 BlockDevice。
 
 这一张图浓缩了全部模型：分层依赖（DAG）、驱动作为组件、Interface 语义化、以及未来把任意节点换成不同实现/执行域的可能性。
 

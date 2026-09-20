@@ -6,7 +6,7 @@ use super::*;
 use crate::component::ComponentId;
 use crate::component::ComponentState;
 use crate::component::interface::{BindingId, InterfaceId};
-use crate::handle::{RawHandle, ResourceKind};
+use crate::resource::ResourceKind;
 use crate::task::TaskId;
 use crate::trace::RejectReason;
 use crate::trace::abi::TraceRecordAbi;
@@ -47,13 +47,13 @@ fn all_events() -> [TraceEvent; 12] {
         },
         TraceEvent::ResourceGrant {
             component,
-            kind: ResourceKind::Mmio,
-            handle: RawHandle::from_raw(1),
+            kind: ResourceKind::Device,
+            id: 1,
         },
         TraceEvent::ResourceRevoke {
             component,
             kind: ResourceKind::Dma,
-            handle: RawHandle::from_raw(2),
+            id: 2,
         },
         TraceEvent::InterfaceBind {
             consumer: None,
@@ -208,8 +208,8 @@ fn payload_survives_roundtrip() {
     reset_for_test();
     let event = TraceEvent::ResourceGrant {
         component: ComponentId::from_raw(9),
-        kind: ResourceKind::Mmio,
-        handle: RawHandle::from_raw(0x1234_5678_9abc_def0),
+        kind: ResourceKind::Device,
+        id: 0x1234_5678_9abc_def0,
     };
     emit(event);
     let mut seen = Vec::new();

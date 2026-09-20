@@ -7,7 +7,7 @@
 //! - 组件侧声明方式：`unsafe extern "C" { #[link_name = "kcore_..."] ... }`，
 //!   loader 重定位时按未 mangled 字节名精确匹配。
 //!
-//! # ABI 分类（v1 稳定 + v2 增量 + v3 资源 authority 起步）
+//! # ABI 分类（v1 稳定 + v2 增量 + v3 device/DMA mechanism）
 //!
 //! | 类别 | 符号 | 说明 |
 //! |---|---|---|
@@ -19,8 +19,9 @@
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
-//! | Resource authority（v3 起步） | `kcore_device_nth` `kcore_mmio_claim` `kcore_mmio_read_u32` `kcore_mmio_write_u32` `kcore_mmio_release` `kcore_mmio_lease` `kcore_irq_claim` `kcore_irq_register` `kcore_irq_enable` `kcore_irq_register_polled` `kcore_irq_poll` `kcore_irq_ack` `kcore_irq_release` | 设备身份/认领链（identity → root → derived）：`device_nth` = 纯发现（列候选，不授权，`DeviceId` 是 identity 不是 handle）；`mmio_claim` = 用 `DeviceId` 认领**确切设备**（不是"第一台匹配"）→ Core authorize → grant；`irq_claim` = 从 caller 已持有的 `MmioHandle` 派生**同一台设备**的中断线（`irq=None` → `-ENODEV`）；`dma_alloc` 同样从 `MmioHandle` 推导设备身份。`mmio_release` 在仍有 live IRQ/DMA 子 authority 时拒绝（`-EBUSY`）；`irq_release` 真的关断投递（撤销 slot + 关断控制器线）。IRQ 投递两态：`register` = trap 上下文回调；`register_polled` + `poll`/`ack` = 轮询（Core 计数并掩蔽，驱动任务读完计数后 `ack` 由 Core 重新放行）。常规访问组件拿到的只是 raw handle，**不是地址/中断号**；`kcore_mmio_lease` 额外派生 Core 校验过一次的 `(ptr, len)` + provenance（受信 KernelNative 直接访问，撤销为协作式，见 `handle/lease.rs`）。全部 `0 / -Errno`、值走 out 参数 |
-//! | DMA authority（v3 起步） | `kcore_dma_alloc` `kcore_dma_lease` `kcore_dma_release` | `alloc` = 用 caller **已持有的 `MmioHandle`** 推导设备身份（绝不接受自报设备号）→ Core 分配物理连续 backing → grant `DmaHandle`；`lease` = Core 校验后派生 backing `(ptr, len)` + **设备可见地址**（v1 identity：== 物理基址，无 IOMMU）+ provenance；`release` = backing lease 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `handle/dma.rs`。全部 `0 / -Errno`、值走 out 参数 |
+//! | Device ownership / MMIO | `kcore_device_nth` `kcore_device_claim` `kcore_device_release` | `device_nth` = 纯发现（列候选；`DeviceId` 是 identity 不是 handle）；`device_claim` = 认领**确切设备**：Core 记 owner 并返回本执行域下的可访问窗口（KernelNative = 寄存器裸指针，steady state 不再进 Core；Isolated 将来 = mapped VA）。**不做 per-access 鉴权**——KernelNative 是可信代码，硬访问限制来自执行域。`device_release` 在仍有 live IRQ/DMA 时拒绝（`-EBUSY`） |
+//! | IRQ routes | `kcore_irq_register` `kcore_irq_enable` `kcore_irq_disable` `kcore_irq_release` | 锚点是 **DeviceId**（`DeviceDescriptor.irq`）：register 记 route（handler + ctx），enable/disable 配置中断控制器，release 撤销 route 并关线。投递 = trap 上下文 native callback（Core 建立 line-owner 归属作用域）。无 poll/ack/event 层——那属于尚不存在的隔离域执行模型 |
+//! | DMA | `kcore_dma_alloc` `kcore_dma_free` `kcore_dma_map` `kcore_dma_unmap` | **allocation 与 mapping 分离**：`alloc` device-agnostic（给一块物理连续内存），`map(device_id, ptr, len, dir)` → 设备可见地址 + mapping id（No-IOMMU identity，未来 IOMMU/bounce buffer 在同一 seam）。`free`/`unmap` 撤销；backing 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `resource/dma.rs` |
 //!
 //! # ABI 错误约定（v3 起）
 //!
@@ -30,9 +31,9 @@
 //! ```
 //!
 //! `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）；
-//! 各子系统的内部错误（`TaskError` / `HandleError` / `ComponentLoadError` /
-//! `SchedError` / `InterfaceError` / `MmioError`）保持各自为政，只在导出边界
-//! 翻译成 `Errno`。
+//! 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
+//! `InterfaceError` / `DeviceClaimError` / `IrqError` / `DmaError`）保持各自为政，
+//! 只在导出边界翻译成 `Errno`。
 //!
 //! **返回值形状**（按"能否失败"分类）：
 //! - 可失败、无值 → `i32 status`（`0` / `-Errno`）；
@@ -41,8 +42,8 @@
 //!
 //! **宽度规则**：`usize` 只用于"语义就是指针宽"的量（地址 `entry`、
 //! `(ptr, len)` 长度、分配器 `size/align`）；counts/ids → `u32`（v3 起，v1 的
-//! `usize` 已迁移）；布尔/编码 → `i32`；不透明句柄 → `u64`，只经 `status + out`
-//! 回传。
+//! `usize` 已迁移）；布尔/编码 → `i32`；DMA mapping identity → `u64`，只经
+//! `status + out` 回传。
 //!
 //! 旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容，迁移单独评估。
 //!
@@ -54,16 +55,17 @@
 //!   返回/panic 后恢复上一层边界。
 //!   所有 authority / task / interface 入口统一走 `RequestContext::ambient()` /
 //!   `ambient_init()`，不再各自偏好当前任务 owner。
-//! - **Failed 实例门禁**：获取 authority / 创建 work 的入口
-//!   （`kcore_mmio_claim`、`kcore_irq_claim`、`kcore_dma_alloc`、`kcore_task_create`、
-//!   `kcore_interface_publish`）在 caller/provider 已 `Failed` 时返回 `-EPERM`；
-//!   `release` / `revoke` 及已持有 handle 的操作**不受此门禁限制**，teardown 仍可用。
+//! - **Failed 实例门禁**：获取资源 / 创建 work 的入口
+//!   （`kcore_device_claim`、`kcore_irq_register`、`kcore_dma_alloc`、`kcore_dma_map`、
+//!   `kcore_task_create`、`kcore_interface_publish`）在 caller/provider 已 `Failed`
+//!   时返回 `-EPERM`；`release` / `revoke` 及已持有资源（按 DeviceId 锚定）的
+//!   teardown 操作**不受此门禁限制**。
 //!
 //! # 明确不导出（未经 Core validation 的裸 authority mutation）
 //!
-//! 组件可以 **request** 资源（v3+ 的 `kcore_device_nth` + `kcore_mmio_claim` = discover + request → Core
-//! authorize → Core grant），但任何 Core truth 的 mutation 都必须由 Core
-//! 验证后提交并留 trace；裸 mutation 入口一律不导出：
+//! 组件可以 **request** 资源（`kcore_device_nth` + `kcore_device_claim` = discover
+//! + request → Core 记 owner → 返回可访问窗口），但任何 Core truth 的 mutation
+//!   都必须由 Core 验证后提交并留 trace；裸 mutation 入口一律不导出：
 //!
 //! - 物理内存：`memory::alloc_region` / `free_region` / `vm_page_alloc`——物理帧是
 //!   Core 内部机制（canonical），组件要内存走 `kcore_heap_alloc`（共享堆）。
@@ -92,12 +94,12 @@ use crate::component::containment::KcompCreateArgs;
 use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
-use crate::handle::{RequestContext, dma, irq, mmio};
 use crate::machine;
 use crate::memory;
+use crate::resource::{RequestContext, device, dma, irq};
 use crate::sched;
 use crate::task::{self, TaskId, TaskState};
-use arch::{Console, ConsoleImpl, InterruptController, InterruptImpl};
+use arch::{Console, ConsoleImpl};
 use core::alloc::GlobalAlloc;
 
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
@@ -637,7 +639,7 @@ extern "C" fn kcore_sched_run() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Category 8：Resource authority（v3 起步；request → authorize → grant → access）
+// Category 8：Device / IRQ / DMA（mechanism-first；ownership + 真实机制，无 per-access 鉴权）
 // ---------------------------------------------------------------------------
 
 /// 纯设备发现：按 compatible 取第 `ordinal` 个匹配描述符。
@@ -672,22 +674,23 @@ extern "C" fn kcore_device_nth(
     }
 }
 
-/// 认领**一台确切设备**的 MMIO root authority（v2）。
+/// 认领**一台确切设备**：Core 记 owner 并返回本执行域下的可访问 MMIO 窗口。
 ///
-/// 语义：`device_id`（发现阶段得到）→ Core 解析到设备记录 → authorize（phase 1 恒
-/// allow）→ 独占检查（该 `device_index` 已被认领或处于失败 quarantine 则拒绝）→
-/// grant `MmioHandle`。独占锚在**设备**上：同一设备的 IRQ / DMA 只能从这个 root 派生。
+/// **访问强制不在 Core 数据路径上**：KernelNative 与 Core 同特权，`*out_mmio`
+/// 直接是寄存器基址——driver 之后自己 volatile 读写，steady state 不再进 Core。
+/// 真正的访问强制来自执行域：Isolated（未来）在 claim 时把窗口映射进组件地址
+/// 空间，`*out_mmio` 返回 mapped VA，未映射访问由页表 fault。上层 driver 不变。
 ///
-/// 链接名沿用原名，签名直接替换（收 `device_id` 而非 compatible）；本阶段不提供
-/// ABI 兼容，所有内置组件一同重编，不保证陈旧 `.kcomp` 可加载。
-///
-/// 成功 = 0，raw handle（`to_raw` 编码：高 32 位 slot、低 32 位 generation；
-/// **不是地址**）写入 `*out_handle`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller、caller 已
-/// `Failed`、或 Core 策略拒绝 / `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO /
-/// `EBUSY` 设备已被认领或已 quarantine）。
-extern "C" fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32 {
-    if out_handle.is_null() {
+/// 成功 = 0，`*out_mmio`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
+/// `Failed` / `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO / `EBUSY` 设备已被认领
+/// 或已 quarantine）。
+extern "C" fn kcore_device_claim(
+    device_id: u32,
+    out_mmio: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_mmio.is_null() || out_len.is_null() {
         return Errno::EFAULT.code();
     }
     let Some(ctx) = RequestContext::ambient() else {
@@ -696,85 +699,12 @@ extern "C" fn kcore_mmio_claim(device_id: u32, out_handle: *mut u64) -> i32 {
     if let Some(denied) = deny_if_failed(ctx.component) {
         return denied;
     }
-    match mmio::claim_device(&ctx, machine::DeviceId::from_raw(device_id)) {
-        Ok(handle) => {
-            // SAFETY: `out_handle` 的可写性由调用方保证（C ABI 契约）；unaligned
-            // 写避免调用方指针未对齐 = UB。
-            unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
-            0
-        }
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 单次 32-bit MMIO 读（C6 起步）。每次调用 Core 都重新验证 handle，
-/// 过 bounds/对齐检查后由 Core 访问硬件；组件永远拿不到地址。
-///
-/// 成功 = 0，值写入 `*out_value`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
-/// `EBADF` slot 不存在 / `ESTALE` 过期 / `EACCES` 非 owner /
-/// `EKEYREVOKED` 已 revoke / `EALREADY` 已释放 / `EINVAL` 越界或未对齐）。
-extern "C" fn kcore_mmio_read_u32(handle: u64, offset: u32, out_value: *mut u32) -> i32 {
-    if out_value.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    match mmio::read_u32(&ctx, mmio::MmioHandle::from_raw(handle), offset) {
-        Ok(value) => {
-            // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
-            unsafe { core::ptr::write_unaligned(out_value, value) };
-            0
-        }
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 单次 32-bit MMIO 写。每次调用 Core 都重新验证 handle，组件永远拿不到地址。
-/// 返回 0 / `-Errno`。
-extern "C" fn kcore_mmio_write_u32(handle: u64, offset: u32, value: u32) -> i32 {
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(mmio::write_u32(
-        &ctx,
-        mmio::MmioHandle::from_raw(handle),
-        offset,
-        value,
-    ))
-}
-
-/// 主动释放 MMIO authority。返回 0 / `-Errno`。
-extern "C" fn kcore_mmio_release(handle: u64) -> i32 {
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(mmio::release(&ctx, mmio::MmioHandle::from_raw(handle)))
-}
-
-/// 派生 `MmioView`：Core 校验 handle 后一次性给出 `(ptr, len)`（KernelNative
-/// 直接 MMIO 快路径，C6 起步）。受信 KernelNative 驱动据此直接 volatile 访问，
-/// 稳态不再 per-access 进 Core；provenance 绑定 `source` handle。**撤销是协作
-/// 式的**：Core 撤销 authority 后不会追回已经派生出去的裸指针。
-///
-/// 成功 = 0，指针写入 `*out_ptr`、长度写入 `*out_len`（调用方保证可写，任意
-/// 对齐）；失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
-/// handle 类错误同 `kcore_mmio_read_u32`）。
-extern "C" fn kcore_mmio_lease(handle: u64, out_ptr: *mut usize, out_len: *mut usize) -> i32 {
-    if out_ptr.is_null() || out_len.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    match mmio::derive_lease(&ctx, mmio::MmioHandle::from_raw(handle)) {
-        Ok(lease) => {
-            // SAFETY: 两个 out 指针的可写性由调用方保证（C ABI 契约）；unaligned
-            // 写避免调用方指针未对齐 = UB。
+    match device::claim(&ctx, machine::DeviceId::from_raw(device_id)) {
+        Ok(mapping) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
             unsafe {
-                core::ptr::write_unaligned(out_ptr, lease.as_ptr() as usize);
-                core::ptr::write_unaligned(out_len, lease.len());
+                core::ptr::write_unaligned(out_mmio, mapping.mmio);
+                core::ptr::write_unaligned(out_len, mapping.mmio_len);
             }
             0
         }
@@ -782,41 +712,144 @@ extern "C" fn kcore_mmio_lease(handle: u64, out_ptr: *mut usize, out_len: *mut u
     }
 }
 
+/// 释放设备 ownership。
+///
+/// **拆机顺序**：仍有 live IRQ route / DMA mapping 时返回 `-EBUSY`——先静默设备、
+/// 释放 IRQ/DMA，再释放 device。返回 0 / `-Errno`（`EPERM` 无法解析 caller /
+/// `ENODEV` 设备不存在或未认领 / `EACCES` 非 owner / `EBUSY` 仍有子项）。
+extern "C" fn kcore_device_release(device_id: u32) -> i32 {
+    let Some(ctx) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    status(device::release(
+        &ctx,
+        machine::DeviceId::from_raw(device_id),
+    ))
+}
+
 // ---------------------------------------------------------------------------
-// Category 8（续）：DMA authority（v3 起步；alloc → lease → release）
+// Category 8（续）：IRQ routes（device-anchored；native callback only）
 // ---------------------------------------------------------------------------
 
-/// `DmaDirection` 的 ABI 编码（与枚举声明序一致：0=ToDevice 1=FromDevice
-/// 2=Bidirectional；改动枚举声明序 = ABI 破坏，必须同步 bump 文档）。
-fn dma_direction_from_i32(direction: i32) -> Option<dma::DmaDirection> {
-    match direction {
-        0 => Some(dma::DmaDirection::ToDevice),
-        1 => Some(dma::DmaDirection::FromDevice),
-        2 => Some(dma::DmaDirection::Bidirectional),
-        _ => None,
+/// 注册该设备的中断投递目标（组件处理函数 + opaque context）。
+///
+/// `handler` 是组件提供的 `extern "C" fn(ctx: *mut ())`；`ctx` 原样回传，Core
+/// 不解引用。route 随 device release / 组件失败一起消失——之后不会再有回调进
+/// 它的代码。单 IRQ 模型：一台设备一条线，被 claim 的 DeviceId 就是锚点。
+///
+/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
+/// `ENODEV` 设备不存在或无中断线 / `EACCES` caller 不是设备 owner）。
+extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
+    let Some(caller) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    if let Some(denied) = deny_if_failed(caller.component) {
+        return denied;
+    }
+    status(irq::register(
+        &caller,
+        machine::DeviceId::from_raw(device_id),
+        handler,
+        ctx,
+    ))
+}
+
+/// 使能该设备的中断线：Core 验证 route 后配置中断控制器。
+/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `ENODEV` 无中断线 /
+/// `EACCES` 非 owner / `EINVAL` 尚未注册 handler）。
+extern "C" fn kcore_irq_enable(device_id: u32) -> i32 {
+    let Some(caller) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    status(irq::enable(&caller, machine::DeviceId::from_raw(device_id)))
+}
+
+/// 关断该设备的中断线（控制器层）。返回 0 / `-Errno`。
+extern "C" fn kcore_irq_disable(device_id: u32) -> i32 {
+    let Some(caller) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    status(irq::disable(
+        &caller,
+        machine::DeviceId::from_raw(device_id),
+    ))
+}
+
+/// 释放该设备的 IRQ route：撤销 route（此后不再投递给已死 owner）并关断控制器线。
+/// 返回 0 / `-Errno`。
+extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
+    let Some(caller) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    status(irq::release(
+        &caller,
+        machine::DeviceId::from_raw(device_id),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Category 8（续）：DMA（allocation 与 mapping 分离）
+// ---------------------------------------------------------------------------
+
+/// 分配一段物理连续的 DMA 缓冲（CPU-visible）。**device-agnostic**：分配后端不
+/// 知道 VirtIO / NVMe / 具体 DeviceId，只负责给一块满足约束的内存。
+///
+/// 成功 = 0，`*out_ptr`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或已 Failed /
+/// `EINVAL` 尺寸非法 / `ENOMEM` 物理内存耗尽）。
+extern "C" fn kcore_dma_alloc(size: usize, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
+    if out_ptr.is_null() || out_len.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(ctx) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    if let Some(denied) = deny_if_failed(ctx.component) {
+        return denied;
+    }
+    match dma::alloc(ctx.component, size) {
+        Ok(buffer) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe {
+                core::ptr::write_unaligned(out_ptr, buffer.ptr);
+                core::ptr::write_unaligned(out_len, buffer.len);
+            }
+            0
+        }
+        Err(error) => Errno::from(error).code(),
     }
 }
 
-/// 分配一段 Core 拥有的物理连续 DMA 区域（driver-model step 3）。
+/// 释放一段 DMA 缓冲。backing lease 进 Core 私有 QUARANTINE（**不 free**，设备
+/// 可能仍在 DMA——DMA lifecycle safety，见 `resource::dma`）。返回 0 / `-Errno`。
+extern "C" fn kcore_dma_free(ptr: *mut u8) -> i32 {
+    let Some(ctx) = RequestContext::ambient() else {
+        return Errno::EPERM.code();
+    };
+    status(dma::free(ctx.component, ptr))
+}
+
+/// 把一个 buffer 映射给某台设备，返回**设备可见地址** + mapping identity。
 ///
-/// 语义：`mmio_handle` 必须是 caller **已经持有**的设备 MMIO authority；Core
-/// 从它推导 `device_index`（**不接受组件自报设备号**）→ `alloc_region` 分配
-/// backing → grant `DmaHandle`。组件只拿到 raw handle，拿不到地址。
-/// 成功 = 0，raw handle 写入 `*out_handle`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` direction 非法或尺寸非法 /
-/// `EPERM` 无法解析 caller 或 caller 已 `Failed` / `ENODEV` 无匹配设备 /
-/// `EBUSY` 设备已被认领 / `ENOMEM` 物理内存耗尽 / handle 类错误同
-/// `kcore_mmio_read_u32`）。
-extern "C" fn kcore_dma_alloc(
-    mmio_handle: u64,
-    size: usize,
+/// No-IOMMU：device address == buffer 地址（identity）；未来 IOMMU 只需在 Core
+/// 内部把 buffer PA → IOVA（或经 bounce buffer），driver 不变。只有设备 owner 能
+/// 把自己的 buffer 映射给该设备。
+///
+/// 成功 = 0，`*out_device_addr`（`u64`）与 `*out_mapping`（`u64`）写入；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` direction 非法或范围非法 /
+/// `EPERM` 无法解析 caller 或已 Failed / `ENODEV` 设备不存在 / `EACCES` 非 owner）。
+extern "C" fn kcore_dma_map(
+    device_id: u32,
+    ptr: *mut u8,
+    len: usize,
     direction: i32,
-    out_handle: *mut u64,
+    out_device_addr: *mut u64,
+    out_mapping: *mut u64,
 ) -> i32 {
-    if out_handle.is_null() {
+    if out_device_addr.is_null() || out_mapping.is_null() {
         return Errno::EFAULT.code();
     }
-    let Some(direction) = dma_direction_from_i32(direction) else {
+    let Some(direction) = dma::DmaDirection::from_i32(direction) else {
         return Errno::EINVAL.code();
     };
     let Some(ctx) = RequestContext::ambient() else {
@@ -825,50 +858,18 @@ extern "C" fn kcore_dma_alloc(
     if let Some(denied) = deny_if_failed(ctx.component) {
         return denied;
     }
-    match dma::alloc(
+    match dma::map(
         &ctx,
-        mmio::MmioHandle::from_raw(mmio_handle),
-        size,
+        machine::DeviceId::from_raw(device_id),
+        ptr,
+        len,
         direction,
     ) {
-        Ok(handle) => {
-            // SAFETY: `out_handle` 的可写性由调用方保证（C ABI 契约）；unaligned
-            // 写避免调用方指针未对齐 = UB。
-            unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
-            0
-        }
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 派生 `DmaView`：Core 校验 handle 后一次性给出 backing `(ptr, len)` +
-/// **设备可见地址**（v1 identity：等于物理基址，无 IOMMU）+ provenance
-/// （`source` handle）。受信 KernelNative 驱动据此直接 DMA；撤销是协作式，
-/// 且 backing 只进 quarantine（不 free）。
-///
-/// 成功 = 0，三个 out（调用方保证可写、任意对齐）分别写入 ptr / len /
-/// device_addr；失败 = `-Errno`（`EFAULT` 任一 out 为空 / `EPERM` 无法解析
-/// caller / handle 类错误同 `kcore_mmio_read_u32`）。
-extern "C" fn kcore_dma_lease(
-    handle: u64,
-    out_ptr: *mut usize,
-    out_len: *mut usize,
-    out_device_addr: *mut u64,
-) -> i32 {
-    if out_ptr.is_null() || out_len.is_null() || out_device_addr.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    match dma::derive_lease(&ctx, dma::DmaHandle::from_raw(handle)) {
-        Ok(lease) => {
-            // SAFETY: 三个 out 指针的可写性由调用方保证（C ABI 契约）；unaligned
-            // 写避免调用方指针未对齐 = UB。
+        Ok(mapping) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
             unsafe {
-                core::ptr::write_unaligned(out_ptr, lease.as_ptr() as usize);
-                core::ptr::write_unaligned(out_len, lease.len());
-                core::ptr::write_unaligned(out_device_addr, lease.device_addr() as u64);
+                core::ptr::write_unaligned(out_device_addr, mapping.device_addr as u64);
+                core::ptr::write_unaligned(out_mapping, mapping.id);
             }
             0
         }
@@ -876,163 +877,19 @@ extern "C" fn kcore_dma_lease(
     }
 }
 
-/// 主动释放 DMA authority。backing lease 进 Core 私有 QUARANTINE（**不 free**，
-/// 设备可能仍在 DMA）。返回 0 / `-Errno`。
-extern "C" fn kcore_dma_release(handle: u64) -> i32 {
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(dma::release(&ctx, dma::DmaHandle::from_raw(handle)))
-}
-
-// ---------------------------------------------------------------------------
-// Category 8（续）：IRQ authority（v3 起步；claim → register → enable）
-// ---------------------------------------------------------------------------
-
-/// 从 caller **已持有的 MMIO root** 派生同一台设备的中断线（v2）。
+/// 撤销一条 DMA mapping。返回 0 / `-Errno`（`ENOENT` mapping 不存在）。
 ///
-/// 语义：Core 校验 `mmio_handle`（slot/generation/owner/生命周期）→ 推出该设备的
-/// `device_index` → 取设备记录的 `irq`（PLIC global interrupt id）→ authorize
-/// （phase 1 恒 allow）→ 独占检查（该中断号已被认领则拒绝）→ grant `IrqHandle`。
-/// IRQ **不再**按 compatible 独立匹配，因此不可能与 MMIO 认领到不同设备。
-///
-/// 链接名沿用原名，签名直接替换（由 `(compatible)` 变为 `(mmio_handle)`）。
-///
-/// 成功 = 0，raw handle 写入 `*out_handle`（同 `kcore_mmio_claim` 的编码：
-/// 高 32 位 slot、低 32 位 generation；**不是中断号**）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
-/// `Failed` / `EBADF`/`ESTALE`/`EACCES`/`EKEYREVOKED` MMIO handle 无效 /
-/// `ENODEV` 设备无中断线 / `EBUSY` 中断线已被认领）。
-extern "C" fn kcore_irq_claim(mmio_handle: u64, out_handle: *mut u64) -> i32 {
-    if out_handle.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(ctx.component) {
-        return denied;
-    }
-    match irq::claim_derived(ctx.component, mmio::MmioHandle::from_raw(mmio_handle)) {
-        Ok(handle) => {
-            // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
-            unsafe { core::ptr::write_unaligned(out_handle, handle.to_raw()) };
-            0
-        }
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 主动释放一条 IRQ authority：**真的关断投递**（撤销 slot + 关断控制器线）。
-///
-/// 返回 0 / `-Errno`（`EPERM` 无法解析 caller / handle 类错误同 MMIO）。
-extern "C" fn kcore_irq_release(handle: u64) -> i32 {
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    status(irq::release(caller, irq::IrqHandle::from_raw(handle)))
-}
-
-/// 注册该 IRQ 线的投递目标（组件处理函数 + opaque context，C6 骨架）。
-///
-/// `handler` 是组件提供的 `extern "C" fn(ctx: *mut ())`；`ctx` 原样回传，
-/// Core 不解引用（同 interface vtable `ctx` 的生命周期契约）。delivery 存在
-/// IRQ 表的 slot 里，**随 revoke/release 一起消失**——组件失败/卸载后不会再
-/// 有回调进它的代码。
-/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `EBADF` / `ESTALE` /
-/// `EACCES` 非 owner / `EKEYREVOKED` / `EALREADY`）。
-extern "C" fn kcore_irq_register(handle: u64, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    let delivery = irq::IrqDelivery::new(handler, ctx);
-    let mut table = irq::get_table().lock();
-    match table.set_delivery(caller, irq::IrqHandle::from_raw(handle), delivery) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 使能该 IRQ 线：Core 验证 handle + delivery 后，才去配置中断控制器
-/// （PLIC enable；C6 骨架）。
-/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / handle 类错误 /
-/// `EINVAL` 尚未注册处理函数）。
-extern "C" fn kcore_irq_enable(handle: u64) -> i32 {
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    match irq::enable(caller, irq::IrqHandle::from_raw(handle)) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 把该 IRQ 线切成**轮询投递**（`delivery = Some(Polled)`，不装回调）。
-///
-/// Polled 线的事件由 Core 在顶半部计数并（首事件）掩蔽；owner 任务用
-/// `kcore_irq_poll` 读计数、处理设备后用 `kcore_irq_ack` 确认。组件拿不到
-/// 中断号，也拿不到掩蔽/放行中断的 authority——那些都在 Core。
-/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / handle 类错误）。
-extern "C" fn kcore_irq_register_polled(handle: u64) -> i32 {
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    let mut table = irq::get_table().lock();
-    match table.set_polled(caller, irq::IrqHandle::from_raw(handle)) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 读取该 Polled 线累计的事件数（不清零；驱动按 delta 判断新事件）。
-///
-/// 成功 = 0，计数写入 `*out_count`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
-/// handle 类错误 / `EINVAL` 该线不是 Polled）。
-extern "C" fn kcore_irq_poll(handle: u64, out_count: *mut u64) -> i32 {
-    if out_count.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    let table = irq::get_table().lock();
-    match table.poll(caller, irq::IrqHandle::from_raw(handle)) {
-        Ok(count) => {
-            // SAFETY: 同 `kcore_mmio_claim`（调用方保证可写；unaligned 写防未对齐 UB）。
-            unsafe { core::ptr::write_unaligned(out_count, count) };
-            0
-        }
-        Err(error) => Errno::from(error).code(),
-    }
-}
-
-/// 确认该 Polled 线的事件：清 `masked`，Core 在**锁外**重新放行该线
-/// （`InterruptImpl::enable`）——这是软件掩蔽协议的闭环（见 `irq::on_external`）。
-///
-/// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / handle 类错误 /
-/// `EINVAL` 该线不是 Polled）。
-extern "C" fn kcore_irq_ack(handle: u64) -> i32 {
-    let Some(caller) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    let number = {
-        let mut table = irq::get_table().lock();
-        match table.ack(caller, irq::IrqHandle::from_raw(handle)) {
-            Ok(number) => number,
-            Err(error) => return Errno::from(error).code(),
-        }
-    };
-    // 锁外放行：trap 可重入、MMIO 慢（同 `complete` 的纪律）。
-    InterruptImpl::enable(number);
-    0
+/// 不解析 ambient caller：mapping 归属 Core truth（device owner），而 unmap 可能
+/// 发生在 consumer 的任务上下文（provider 方法被直接调用）。
+extern "C" fn kcore_dma_unmap(mapping: u64) -> i32 {
+    status(dma::unmap(mapping))
 }
 
 // ---------------------------------------------------------------------------
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
 // ---------------------------------------------------------------------------
 
-static EXPORTS: [Export; 43] = [
+static EXPORTS: [Export; 38] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -1150,49 +1007,20 @@ static EXPORTS: [Export; 43] = [
         name: b"kcore_sched_run",
         address: ExportAddress(kcore_sched_run as *const ()),
     },
-    // Category 8：Resource authority（v3 起步）
+    // Category 8：Device ownership（mechanism-first）
     Export {
         name: b"kcore_device_nth",
         address: ExportAddress(kcore_device_nth as *const ()),
     },
     Export {
-        name: b"kcore_mmio_claim",
-        address: ExportAddress(kcore_mmio_claim as *const ()),
+        name: b"kcore_device_claim",
+        address: ExportAddress(kcore_device_claim as *const ()),
     },
     Export {
-        name: b"kcore_mmio_read_u32",
-        address: ExportAddress(kcore_mmio_read_u32 as *const ()),
+        name: b"kcore_device_release",
+        address: ExportAddress(kcore_device_release as *const ()),
     },
-    Export {
-        name: b"kcore_mmio_write_u32",
-        address: ExportAddress(kcore_mmio_write_u32 as *const ()),
-    },
-    Export {
-        name: b"kcore_mmio_release",
-        address: ExportAddress(kcore_mmio_release as *const ()),
-    },
-    Export {
-        name: b"kcore_mmio_lease",
-        address: ExportAddress(kcore_mmio_lease as *const ()),
-    },
-    // Category 8（续）：DMA authority（v3 起步）
-    Export {
-        name: b"kcore_dma_alloc",
-        address: ExportAddress(kcore_dma_alloc as *const ()),
-    },
-    Export {
-        name: b"kcore_dma_lease",
-        address: ExportAddress(kcore_dma_lease as *const ()),
-    },
-    Export {
-        name: b"kcore_dma_release",
-        address: ExportAddress(kcore_dma_release as *const ()),
-    },
-    // Category 8（续）：IRQ authority（v3 起步）
-    Export {
-        name: b"kcore_irq_claim",
-        address: ExportAddress(kcore_irq_claim as *const ()),
-    },
+    // Category 8（续）：IRQ routes
     Export {
         name: b"kcore_irq_register",
         address: ExportAddress(kcore_irq_register as *const ()),
@@ -1202,20 +1030,29 @@ static EXPORTS: [Export; 43] = [
         address: ExportAddress(kcore_irq_enable as *const ()),
     },
     Export {
-        name: b"kcore_irq_register_polled",
-        address: ExportAddress(kcore_irq_register_polled as *const ()),
-    },
-    Export {
-        name: b"kcore_irq_poll",
-        address: ExportAddress(kcore_irq_poll as *const ()),
-    },
-    Export {
-        name: b"kcore_irq_ack",
-        address: ExportAddress(kcore_irq_ack as *const ()),
+        name: b"kcore_irq_disable",
+        address: ExportAddress(kcore_irq_disable as *const ()),
     },
     Export {
         name: b"kcore_irq_release",
         address: ExportAddress(kcore_irq_release as *const ()),
+    },
+    // Category 8（续）：DMA（allocation / mapping 分离）
+    Export {
+        name: b"kcore_dma_alloc",
+        address: ExportAddress(kcore_dma_alloc as *const ()),
+    },
+    Export {
+        name: b"kcore_dma_free",
+        address: ExportAddress(kcore_dma_free as *const ()),
+    },
+    Export {
+        name: b"kcore_dma_map",
+        address: ExportAddress(kcore_dma_map as *const ()),
+    },
+    Export {
+        name: b"kcore_dma_unmap",
+        address: ExportAddress(kcore_dma_unmap as *const ()),
     },
 ];
 
@@ -1262,21 +1099,16 @@ mod tests {
             &b"kcore_panic_escape"[..],
             &b"kcore_sched_run"[..],
             &b"kcore_device_nth"[..],
-            &b"kcore_mmio_claim"[..],
-            &b"kcore_mmio_read_u32"[..],
-            &b"kcore_mmio_write_u32"[..],
-            &b"kcore_mmio_release"[..],
-            &b"kcore_mmio_lease"[..],
-            &b"kcore_dma_alloc"[..],
-            &b"kcore_dma_lease"[..],
-            &b"kcore_dma_release"[..],
-            &b"kcore_irq_claim"[..],
+            &b"kcore_device_claim"[..],
+            &b"kcore_device_release"[..],
             &b"kcore_irq_register"[..],
             &b"kcore_irq_enable"[..],
-            &b"kcore_irq_register_polled"[..],
-            &b"kcore_irq_poll"[..],
-            &b"kcore_irq_ack"[..],
+            &b"kcore_irq_disable"[..],
             &b"kcore_irq_release"[..],
+            &b"kcore_dma_alloc"[..],
+            &b"kcore_dma_free"[..],
+            &b"kcore_dma_map"[..],
+            &b"kcore_dma_unmap"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -1290,7 +1122,14 @@ mod tests {
         assert_eq!(resolve(b"kcore_task_table_create"), None);
         assert_eq!(resolve(b"kcore_registry_declare"), None);
         assert_eq!(resolve(b"kcore_context_switch"), None);
-        assert_eq!(resolve(b"kcore_mmio_grant"), None, "设备认领只能走 claim");
+        assert_eq!(resolve(b"kcore_mmio_grant"), None, "MMIO 中间层已删除");
+        assert_eq!(
+            resolve(b"kcore_mmio_claim"),
+            None,
+            "设备认领只能走 device_claim"
+        );
+        assert_eq!(resolve(b"kcore_irq_claim"), None, "IRQ 锚在 DeviceId");
+        assert_eq!(resolve(b"kcore_irq_poll"), None, "polled 模型已 defer");
         assert_eq!(resolve(b"kcore_"), None);
         assert_eq!(resolve(b""), None);
     }
@@ -1301,19 +1140,23 @@ mod tests {
         assert!(resolve(b"x?kcore_log_line").is_none(), "禁止后缀匹配");
     }
 
-    /// DMA 方向 ABI 编码锚定（`docs/driver-model.md` §6.2）：`as_i32` 与解码
-    /// `dma_direction_from_i32` 必须互为逆，且值固定为 0/1/2；`kcomp-sdk` 的镜像
+    /// DMA 方向 ABI 编码锚定（`docs/driver-model.md`）：`as_i32` 与
+    /// `DmaDirection::from_i32` 必须互为逆，且值固定为 0/1/2；`kcomp-sdk` 的镜像
     /// 枚举同值（SDK 侧有对应测试 `dma_direction_encoding_is_stable`）。
     #[test]
     fn dma_direction_encoding_is_stable() {
-        use crate::handle::dma::DmaDirection::{Bidirectional, FromDevice, ToDevice};
-        assert_eq!(ToDevice.as_i32(), 0);
-        assert_eq!(FromDevice.as_i32(), 1);
-        assert_eq!(Bidirectional.as_i32(), 2);
-        for direction in [ToDevice, FromDevice, Bidirectional] {
-            assert_eq!(dma_direction_from_i32(direction.as_i32()), Some(direction));
+        use crate::resource::dma::DmaDirection;
+        assert_eq!(DmaDirection::ToDevice.as_i32(), 0);
+        assert_eq!(DmaDirection::FromDevice.as_i32(), 1);
+        assert_eq!(DmaDirection::Bidirectional.as_i32(), 2);
+        for direction in [
+            DmaDirection::ToDevice,
+            DmaDirection::FromDevice,
+            DmaDirection::Bidirectional,
+        ] {
+            assert_eq!(DmaDirection::from_i32(direction.as_i32()), Some(direction));
         }
-        assert_eq!(dma_direction_from_i32(3), None, "越界编码必须被拒绝");
+        assert_eq!(DmaDirection::from_i32(3), None, "越界编码必须被拒绝");
     }
 
     /// `kcore_panic_escape`：host 无活动 containment 边界时安全地返回 `-EPERM`
@@ -1344,80 +1187,86 @@ mod tests {
         );
         assert_eq!(device_nth(core::ptr::null(), 0, 0, &mut device_id), -22);
 
-        let claim = resolve(b"kcore_mmio_claim").unwrap();
-        let claim: extern "C" fn(u32, *mut u64) -> i32 = unsafe { core::mem::transmute(claim) };
-        let read = resolve(b"kcore_mmio_read_u32").unwrap();
-        let read: extern "C" fn(u64, u32, *mut u32) -> i32 = unsafe { core::mem::transmute(read) };
-        let _write: extern "C" fn(u64, u32, u32) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_mmio_write_u32").unwrap()) };
-        let _release: extern "C" fn(u64) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_mmio_release").unwrap()) };
+        // kcore_device_claim：任一 out 为 null → EFAULT（早于 caller 解析）。
+        let claim = resolve(b"kcore_device_claim").unwrap();
+        let claim: extern "C" fn(u32, *mut *mut u8, *mut usize) -> i32 =
+            unsafe { core::mem::transmute(claim) };
+        let (mut mmio_ptr, mut mmio_len) = (core::ptr::null_mut(), 0usize);
+        assert_eq!(claim(0, core::ptr::null_mut(), &mut mmio_len), -14);
+        assert_eq!(claim(0, &mut mmio_ptr, core::ptr::null_mut()), -14);
 
-        let mut out = 0u64;
-        // out 为空 → EFAULT（早于设备/硬件逻辑，host 可安全断言）
-        assert_eq!(claim(0, core::ptr::null_mut()), -14);
-        assert_eq!(read(0, 0, core::ptr::null_mut()), -14);
+        // kcore_device_release：host 无 caller → EPERM（不是 panic）。
+        let _release: extern "C" fn(u32) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_device_release").unwrap()) };
 
-        // mmio lease：两个 out 任一为空 → EFAULT（早于 handle/caller 解析）
-        let lease: extern "C" fn(u64, *mut usize, *mut usize) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_mmio_lease").unwrap()) };
-        let (mut lease_ptr, mut lease_len) = (0usize, 0usize);
-        assert_eq!(lease(0, core::ptr::null_mut(), &mut lease_len), -14);
-        assert_eq!(lease(0, &mut lease_ptr, core::ptr::null_mut()), -14);
-
-        // IRQ claim：从 MMIO handle 派生；out 为空 → EFAULT（早于 caller 解析）。
-        let irq_claim = resolve(b"kcore_irq_claim").unwrap();
-        let irq_claim: extern "C" fn(u64, *mut u64) -> i32 =
-            unsafe { core::mem::transmute(irq_claim) };
-        assert_eq!(irq_claim(0, core::ptr::null_mut()), -14);
-
-        // IRQ release：host 无 caller → EPERM（不是 panic）。
-        let _irq_release: extern "C" fn(u64) -> i32 =
+        // IRQ register/enable/disable/release：host 无 caller → EPERM（不是 panic）。
+        let _irq_register: extern "C" fn(u32, extern "C" fn(*mut ()), *mut ()) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_irq_register").unwrap()) };
+        let _irq_enable: extern "C" fn(u32) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_irq_enable").unwrap()) };
+        let _irq_disable: extern "C" fn(u32) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_irq_disable").unwrap()) };
+        let _irq_release: extern "C" fn(u32) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_irq_release").unwrap()) };
 
-        // IRQ poll：out 为空 → EFAULT（早于 handle/caller 解析）
-        let irq_poll: extern "C" fn(u64, *mut u64) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_irq_poll").unwrap()) };
-        assert_eq!(irq_poll(0, core::ptr::null_mut()), -14);
-
-        // DMA alloc：out 为空 → EFAULT；direction 非法 → EINVAL（都早于 caller 解析）
-        let dma_alloc: extern "C" fn(u64, usize, i32, *mut u64) -> i32 =
+        // DMA alloc：out 为空 → EFAULT（早于 caller 解析）。
+        let dma_alloc: extern "C" fn(usize, *mut *mut u8, *mut usize) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_dma_alloc").unwrap()) };
-        assert_eq!(dma_alloc(0, 4096, 0, core::ptr::null_mut()), -14);
-        assert_eq!(dma_alloc(0, 4096, 3, &mut out), -22);
+        let mut dma_ptr = core::ptr::null_mut();
+        let mut dma_len = 0usize;
+        assert_eq!(dma_alloc(4096, core::ptr::null_mut(), &mut dma_len), -14);
+        assert_eq!(dma_alloc(4096, &mut dma_ptr, core::ptr::null_mut()), -14);
 
-        // DMA lease：三个 out 任一为空 → EFAULT（早于 handle/caller 解析）
-        let dma_lease: extern "C" fn(u64, *mut usize, *mut usize, *mut u64) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_dma_lease").unwrap()) };
-        let (mut dma_ptr, mut dma_len, mut dma_addr) = (0usize, 0usize, 0u64);
+        // DMA map：out 为空 → EFAULT；direction 非法 → EINVAL（都早于 caller 解析）。
+        let dma_map: extern "C" fn(u32, *mut u8, usize, i32, *mut u64, *mut u64) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_dma_map").unwrap()) };
+        let (mut dev_addr, mut mapping) = (0u64, 0u64);
         assert_eq!(
-            dma_lease(0, core::ptr::null_mut(), &mut dma_len, &mut dma_addr),
+            dma_map(
+                0,
+                core::ptr::null_mut(),
+                16,
+                0,
+                core::ptr::null_mut(),
+                &mut mapping
+            ),
             -14
         );
         assert_eq!(
-            dma_lease(0, &mut dma_ptr, core::ptr::null_mut(), &mut dma_addr),
+            dma_map(
+                0,
+                core::ptr::null_mut(),
+                16,
+                0,
+                &mut dev_addr,
+                core::ptr::null_mut()
+            ),
             -14
         );
         assert_eq!(
-            dma_lease(0, &mut dma_ptr, &mut dma_len, core::ptr::null_mut()),
-            -14
+            dma_map(0, core::ptr::null_mut(), 16, 9, &mut dev_addr, &mut mapping),
+            -22
         );
 
-        // DMA release 同形：host 无 caller → EPERM（不是 panic）
-        let _dma_release: extern "C" fn(u64) -> i32 =
-            unsafe { core::mem::transmute(resolve(b"kcore_dma_release").unwrap()) };
+        // DMA free / unmap：host 无 caller → EPERM（不是 panic）。
+        let _dma_free: extern "C" fn(*mut u8) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_dma_free").unwrap()) };
+        let _dma_unmap: extern "C" fn(u64) -> i32 =
+            unsafe { core::mem::transmute(resolve(b"kcore_dma_unmap").unwrap()) };
     }
 
-    /// Failed 实例门禁：获取 authority / 创建 work 的入口一律 `-EPERM`，但已持有
-    /// handle 的 `release` 仍可用（teardown 不被门禁挡住）。
+    /// Failed 实例门禁：获取资源 / 创建 work 的入口一律 `-EPERM`；teardown
+    /// （按 DeviceId 锚定的 release）不受门禁限制。
     #[test]
-    fn failed_component_is_denied_new_authority_but_may_release() {
+    fn failed_component_is_denied_new_resources() {
         use crate::component::{containment, registry};
+
+        extern "C" fn irq_stub(_ctx: *mut ()) {}
 
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
-        crate::handle::init();
+        crate::resource::init();
         let _boundary = containment::test_boundary_lock();
 
         // Given：一个被标记 Failed 的组件。
@@ -1433,13 +1282,26 @@ mod tests {
         };
 
         // When / Then：身份解析到该 Failed 组件（create 边界）；acquiring 入口
-        // 全部 `-EPERM`，但 release 一个已持有的 handle 仍然成功。
+        // 全部 `-EPERM`。
         containment::with_test_init_boundary(Some(id), || {
-            let mut out = 0u64;
+            let (mut ptr, mut len, mut mapping) = (core::ptr::null_mut(), 0usize, 0u64);
             let mut out_task = 0u32;
-            assert_eq!(kcore_mmio_claim(0, &mut out), Errno::EPERM.code());
-            assert_eq!(kcore_irq_claim(0, &mut out), Errno::EPERM.code());
-            assert_eq!(kcore_dma_alloc(0, 4096, 0, &mut out), Errno::EPERM.code());
+            assert_eq!(
+                kcore_device_claim(0, &mut ptr, &mut len),
+                Errno::EPERM.code()
+            );
+            assert_eq!(
+                kcore_irq_register(0, irq_stub, core::ptr::null_mut()),
+                Errno::EPERM.code()
+            );
+            assert_eq!(
+                kcore_dma_alloc(4096, &mut ptr, &mut len),
+                Errno::EPERM.code()
+            );
+            assert_eq!(
+                kcore_dma_map(0, core::ptr::null_mut(), 16, 0, &mut 0u64, &mut mapping),
+                Errno::EPERM.code()
+            );
             assert_eq!(
                 kcore_task_create(0x1000, core::ptr::null_mut(), &mut out_task),
                 Errno::EPERM.code()
@@ -1455,16 +1317,6 @@ mod tests {
                 ),
                 Errno::EPERM.code()
             );
-
-            let granted = mmio::get_table().lock().grant(
-                id,
-                mmio::MmioRegion {
-                    base: 0,
-                    size: 0x1000,
-                    device_index: 240,
-                },
-            );
-            assert_eq!(kcore_mmio_release(granted.to_raw()), 0);
         });
     }
 

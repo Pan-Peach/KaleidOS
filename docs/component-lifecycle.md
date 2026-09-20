@@ -14,7 +14,7 @@
 
 - 拆分**镜像身份**与**实例身份**；一份常驻镜像 → N 个独立实例。
 - 组件入口从 `kcomp_init`/`kcomp_exit` 协调替换为 `kcomp_instance_create`/`kcomp_instance_destroy` + 精确 ABI 指纹。
-- 每个实例拥有**自己的状态**、资源 authority 归属、任务、接口发布。
+- 每个实例拥有**自己的状态**、资源归属（device / IRQ route / DMA mapping）、任务、接口发布。
 - task entry 支持 opaque 参数（否则"从 statics 迁出"做不完整）。
 - 服务 endpoint 可按实例命名（多个实例不能都发 `block.device`）。
 
@@ -43,14 +43,14 @@ ComponentImageId     ← 新增：一份常驻加载的代码
 
 ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 ComponentInstanceId）
   ├─ 生命周期 state
-  ├─ 资源 authority 归属（MMIO/IRQ/DMA owner）
+  ├─ 资源归属（device / IRQ route / DMA owner）
   ├─ 任务归属（TaskRecord.owner）
   ├─ 接口发布归属（BindingRecord.provider）
   ├─ failure 状态 / containment 身份
   └─ opaque instance state 指针（由组件 create 返回）
 ```
 
-**关键点**：`ComponentId` 已经在承担实例身份（tasks/handles/publications/failure 全部按它归属）。**不要**引入第二个平行实例句柄；只新增 `ComponentImageId`。改名可有可无，功能价值很小。
+**关键点**：`ComponentId` 已经在承担实例身份（tasks/devices/routes/mappings/publications/failure 全部按它归属）。**不要**引入第二个平行实例句柄；只新增 `ComponentImageId`。改名可有可无，功能价值很小。
 
 ### 所有权划分（现状 → 目标）
 
@@ -59,7 +59,7 @@ ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 
 | `name` | **Image**（artifact 名；唯一性约束从"每名一实例"放宽） |
 | `base` / `entry` / `exit` / `memory`(MemoryLease) / `text_size` | **Image** |
 | `state` | **Instance** |
-| `id`（现为融合句柄） | **Instance** = `ComponentId` |
+| `id`（现为融合身份） | **Instance** = `ComponentId` |
 
 - `LoadedComponent`（`os/core/src/component/loader.rs:39-52`）的 `text_size` 现在被丢弃；拆到 image 记录后应保留。
 - 资源的授权表仍按 `ComponentId` 归属（`failure.rs:61-71`）——**不要**把 owner 改成 domain id。
@@ -83,7 +83,7 @@ declare instance → Resolved → Starting
 ```text
 拒绝存活任务 → Stopping
     → 在该实例身份下调用 kcomp_instance_destroy(state)
-    → Core 兜底 revoke authority / unbind
+    → Core 兜底撤销归属（device quarantine / DMA 停车）/ unbind
     → Stopped
 ```
 
@@ -139,9 +139,9 @@ struct VirtioBlkCreateConfig {
 ```
 
 - Core 视其为**不透明字节**。
-- 驱动校验 payload 指纹/布局后，**在自己的 create 边界内**调用 `kcore_mmio_claim(device_id, ...)`；IRQ / DMA authority 继续从该 MMIO handle 派生。
-- **`DeviceId` 是选择数据，不是 authority。**
-- **禁止**把 prober 持有的 handle 直接当 `ResourceGrant` 传递——那需要所有权转移，已明确推迟。预授予若将来需要，Core 必须**先为目的事实例建立所有权**再交付。
+- 驱动校验 payload 指纹/布局后，**在自己的 create 边界内**调用 `kcore_device_claim(device_id, ...)`；IRQ / DMA 都以该 `DeviceId` 为锚点（`kcore_irq_register` / `kcore_dma_map`）。
+- **`DeviceId` 是选择数据，不是权限。**
+- **禁止**把 prober 已认领的设备直接交给 driver——那需要跨组件所有权转移，已明确推迟。预授予若将来需要，Core 必须**先为目标实例建立所有权**再交付。
 
 ### Core 侧的创建操作（最小）
 
@@ -179,9 +179,9 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 ---
 
-## 7. authority identity 规则（重要陷阱）
+## 7. 资源归属 identity 规则（重要陷阱）
 
-`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/handle/context.rs:31-65`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。** 但 **IRQ 回调会安装一个 Core 拥有的归属边界**（`EscapeKind::Irq`，由 `containment::with_irq_scope` 在 `irq::dispatch_callback` 投递 `RouteOutcome::Callback` 时建立；`os/core/src/irq/mod.rs:121-123`）：principal = **该中断线的 owner**（Core 路由表的真相，不是被中断的执行），`task` 为 `None`；被中断执行的边界被保存，并在回调返回后**显式恢复**（嵌套按后进先出；`os/core/src/component/containment.rs:436-457`）。该作用域**同步、不可 yield**，是**受信 KernelNative 组件下的协作式记账，不是认证边界**：它记录 Core 这次投递为谁而做，但**不能证明**回调代码真的属于那个 owner。
+`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/resource/context.rs`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。** 但 **IRQ 回调会安装一个 Core 拥有的归属边界**（`EscapeKind::Irq`，由 `containment::with_irq_scope` 在 `irq::dispatch_callback` 投递 `RouteOutcome::Callback` 时建立；`os/core/src/irq/mod.rs:121-123`）：principal = **该中断线的 owner**（Core 路由表的真相，不是被中断的执行），`task` 为 `None`；被中断执行的边界被保存，并在回调返回后**显式恢复**（嵌套按后进先出；`os/core/src/component/containment.rs:436-457`）。该作用域**同步、不可 yield**，是**受信 KernelNative 组件下的协作式记账，不是认证边界**：它记录 Core 这次投递为谁而做，但**不能证明**回调代码真的属于那个 owner。
 
 在 IRQ 回调作用域内，调度类 Core 操作在 Core 机制层被拒绝并返回 `-EINVAL`（`SchedError::InvalidTransition` / `TaskError::InvalidTransition`，`os/core/src/errno.rs:86,99`）：`sched::run` / `yield_current` / `exit_current`（`os/core/src/sched.rs:340-361`，门禁 `:74-79`）与 `task::create_task` / `start_task`（`os/core/src/task/mod.rs:59-61,100-102`）；只读入口与资源访问不受影响。IRQ 回调内的 panic **不**被收敛，保持**致命**：`panic_escape()` 恢复被中断的 guard 后拒绝逃逸，因为 IRQ 回调没有 Core 拥有的上下文可恢复（`os/core/src/component/containment.rs:572-585`），这与 init / task 边界不同。
 
@@ -235,25 +235,25 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 
 | 组件 | 最小迁移 | 单例裁定 |
 |---|---|---|
-| `virtio_blk` | 每设备一份 state 分配：block 对象 + **全宽** MMIO handle + DMA 记账。在配置的 endpoint 上发布该 state。create 只探测**选中的一个**候选，不再消费整条 assignment 流 | 每个已 attach 设备一个实例 |
+| `virtio_blk` | 每设备一份 state 分配：block 对象 + claimed **DeviceId** + MMIO 基址 + DMA 记账。在配置的 endpoint 上发布该 state。create 只探测**选中的一个**候选，不再消费整条 assignment 流 | 每个已 attach 设备一个实例 |
 | `scheduler_rr` | `CURSOR` 移入实例状态（`scheduler_rr/src/lib.rs:36-60`）；表保持 static | 当前 profile 保留**一个活跃调度角色**，但允许用全新 cursor 的替换实例 |
 | `driver_prober` | `SET`/`CURSOR` 移入 state 并传给 dispatch（`runtime.rs:28-43,96-145`）；候选目录保持不可变全局 | 当前系统图保留**一个 prober** |
 | `core_test` | 保持串行诊断运行，**不是**每设备一实例（report state 已在入口局部） | 单例 |
 | `kbench` | 保持**一个**活跃 benchmark 运行（并发会破坏测量）；有意迁移/重置 run 相关全局，含 task/IRQ 状态（`lib.rs:68-74`、`sched.rs:52-67`、`irq.rs:83-87`） | 单例 |
 | `kcomp_smoke` / `kcomp_min` / `kcomp_panic` | 无状态 fixture 返回 null state；no-op / 日志 destroy；**保留 panic fixture 的失败行为** | 无状态 |
-| SDK / `logger` / `allocator_simple` | SDK 是库，不是实例。`logger` 是空脚手架；`allocator_simple` 是**违背 `AGENTS.md:20` 的废弃脚手架** | 不需要发明运行时生命周期机器 |
+| SDK / `logger` | SDK 是库，不是实例。`logger` 是空脚手架（可选组件） | 不需要发明运行时生命周期机器 |
 
 ### VirtIO 是非机械部分（启用多实例的 gate）
 
-当前 HAL 回调**没有 receiver/ctx**，直接读全局 `MMIO_HANDLE` 与 `DMA_MAP`（`virtio_blk/src/lib.rs:162-195`）。只把这些全局搬进 `State`，HAL **仍然找不到它们**。
+当前 HAL 回调**没有 receiver/ctx**，直接读全局 `DEVICE_ID` / `MMIO_BASE` 与 `DMA_MAP`（`virtio_blk/src/lib.rs`）。只把这些全局搬进 `State`，HAL **仍然找不到它们**。
 
 可接受方案：**驱动私有的 scoped HAL context**，但**仅在**满足以下条件时成立——所有入口路径显式建立它；HAL 执行**非 yield、非重入、不从 IRQ 回调进入**；panic escape **不会** unwind Rust guard，所以 stale context 必须**无害直到被显式替换/重置**，且**不得**只依赖 `Drop` 做恢复。
 
 **这是 gate：在适配器被证明正确之前，不要启用多个 VirtIO 实例。** 也**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖问题。
 
-### 迁移中必须一并修的既有 bug
+### 迁移中已一并修的既有 bug
 
-`virtio_blk/src/lib.rs:75-79` 的 `MMIO_HANDLE: AtomicUsize` 在 **RV32 上截断 u64 handle 的一半**（存取处 `:293-294`）。单实例下恰好未暴露，但与实例/重启语义不兼容。
+旧 `virtio_blk` 的 `MMIO_HANDLE: AtomicUsize` 在 **RV32 上截断 u64 handle 的一半**。mechanism-first 模型删除 u64 handle 后该问题消失：现在的驱动状态是 `DEVICE_ID: AtomicU32`（claim 锚点）+ `MMIO_BASE: AtomicUsize`（claim 返回的基址），都不需要 u64 handle。
 
 ---
 
@@ -266,7 +266,7 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 3. **写 host contract tests**，然后拆分 image/instance 记录。测试须覆盖：两实例共享一 image、独立 ctx/owner、不同 endpoint、发布失败保留既有 provider、stop/failure 只影响选中实例。
 4. **一起切换 loader / containment / SDK / packer**：保留嵌套调用者恢复，在现有 Core-owned 栈上传递 create/destroy 参数，更新 `tools/kcomp-link.sh` 的符号保留/校验；**重建每个组件**，不维护兼容。
 5. **迁移普通组件 + task 上下文**：在碰硬件之前，先验证"两个简单有状态实例 + 用全新 ID/ctx 重启"。scheduler/prober/诊断按组合策略保持单例。
-6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 handle、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
+6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 DeviceId / MMIO 基址、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
 7. **然后才加 C 生命周期/绑定 smoke 组件，再接 FatFs 胶水**：先测 C/Rust 布局与真实调用，再接文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或 `virtio-blk`。
 
 **停止点**：**从一份常驻镜像得到多个独立管理的 KernelNative 实例，且 C ABI 经过测试。** 不悄悄滑向已推迟的执行域里程碑。

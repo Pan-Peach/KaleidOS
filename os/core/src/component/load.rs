@@ -236,7 +236,7 @@ mod tests {
         image::init();
         registry::init();
         interface::init();
-        crate::handle::init();
+        crate::resource::init();
 
         // Given：没有实例正在创建。
         assert_eq!(current_component(), None, "create 之外没有当前实例");

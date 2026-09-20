@@ -4,7 +4,6 @@ members = [
     "os/core",
     "os/arch",
     "os/components/scheduler_rr",
-    "os/components/allocator_simple",
     "os/components/core_test",
     "os/components/logger",
 ]

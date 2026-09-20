@@ -214,14 +214,19 @@ fn read_abi(
 
 /// 顶部对齐：只支持 `sh_addralign` ∈ {0,1,2,4,8}（已加载段实测上限 8）；
 /// 更大的值显式失败，绝不静默按更小对齐放置。
+/// 向上对齐到 `align`（必须是 2 的幂；`0` / `1` 视为不对齐）。
+///
+/// 不把上限硬编码成 8：组件 BSS 里可能有更大对齐的静态（例如 VirtQueue 的
+/// `#[repr(C, align(16))]` Descriptor 数组），LLVM 的 merged-globals 段会带上
+/// 该最大对齐。任何 2 的幂都是合法的段对齐。
 fn align_up(value: usize, align: usize) -> Result<usize, LoaderError> {
-    let mask = match align {
-        0 | 1 => return Ok(value),
-        2 => 1,
-        4 => 3,
-        8 => 7,
-        _ => return Err(LoaderError::UnsupportedFormat),
-    };
+    if align <= 1 {
+        return Ok(value);
+    }
+    if !align.is_power_of_two() {
+        return Err(LoaderError::UnsupportedFormat);
+    }
+    let mask = align - 1;
     value
         .checked_add(mask)
         .map(|aligned| aligned & !mask)
@@ -495,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn align_up_supports_1_2_4_8_and_rejects_larger() {
+    fn align_up_supports_powers_of_two_and_rejects_others() {
         assert_eq!(align_up(0, 1), Ok(0));
         assert_eq!(align_up(3, 1), Ok(3));
         assert_eq!(align_up(3, 2), Ok(4));
@@ -504,8 +509,13 @@ mod tests {
         assert_eq!(align_up(8, 8), Ok(8));
         assert_eq!(align_up(9, 8), Ok(16));
         assert_eq!(align_up(0, 0), Ok(0), "align 0 等同不对齐");
-        assert_eq!(align_up(0, 16), Err(LoaderError::UnsupportedFormat));
+        // 组件 BSS 可有更大对齐（VirtQueue 的 align(16) Descriptor 数组）。
+        assert_eq!(align_up(0, 16), Ok(0));
+        assert_eq!(align_up(17, 16), Ok(32));
+        assert_eq!(align_up(0, 4096), Ok(0));
+        // 非 2 的幂 → 拒绝。
         assert_eq!(align_up(0, 3), Err(LoaderError::UnsupportedFormat));
+        assert_eq!(align_up(0, 24), Err(LoaderError::UnsupportedFormat));
     }
 
     #[test]

@@ -1288,7 +1288,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
-        crate::handle::init();
+        crate::resource::init();
         reset_cpu();
         containment::enter_anchor();
 

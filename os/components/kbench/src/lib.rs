@@ -97,11 +97,11 @@ pub(crate) struct State {
     // —— `irq.uart_trigger_to_handler` 的 per-run 状态 ——
     pub(crate) irq_entry_low: AtomicU32,
     pub(crate) irq_served: AtomicBool,
+    /// claim 返回的 MMIO 寄存器基址（KernelNative 直接访问；0 = 未认领）。
     pub(crate) irq_uart_lease: AtomicUsize,
-    // 认领中的 authority handle（仅锚点上下文读写，无需原子）：正常路径在
-    // `irq::run` 内同步释放并清零；destroy 用它兜底 quiesce 残留 authority。
-    pub(crate) irq_mmio_handle: u64,
-    pub(crate) irq_handle: u64,
+    /// 认领中的设备身份（仅锚点上下文读写）：正常路径在 `irq::run` 内同步释放并
+    /// 清零；destroy 用它兜底 quiesce。
+    pub(crate) irq_device: u32,
 }
 
 impl State {
@@ -121,8 +121,7 @@ impl State {
             irq_entry_low: AtomicU32::new(0),
             irq_served: AtomicBool::new(false),
             irq_uart_lease: AtomicUsize::new(0),
-            irq_mmio_handle: 0,
-            irq_handle: 0,
+            irq_device: 0,
         }
     }
 }

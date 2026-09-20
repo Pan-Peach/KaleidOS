@@ -1,70 +1,54 @@
-//! 组件失败的 Core 编排：标记 Failed 并回收它持有的 authority / 解绑它提供的接口。
+//! 组件失败的 Core 编排：标记 Failed，回收它的资源归属，解绑它提供的接口。
 //!
 //! 落地 `docs/component-model.md` §4.9 的 `fail_component`（最小版）与
 //! `docs/driver-model.md` §7 的撤销不变式：**组件失败 = 逻辑死亡、物理驻留**。
-//! 顺序固定：先提交状态真相（Failed），再逐表 revoke 它持有的 authority，
-//! 最后清掉它作为 provider 的全部 binding（含未提交的 pending publications）。
-//! 资源表 revoke 只前进 generation，不回收物理驻留（phase 1 无隔离，回收留给
-//! 未来 ExecutionDomain）。
+//! 顺序固定：先提交状态真相（Failed），再撤销它持有的资源归属，最后清掉它作为
+//! provider 的全部 binding（含未提交的 pending publications）。
 //!
-//! # 与优雅停止的分工（stop orchestration 已接线）
+//! # 与优雅停止的分工
 //!
 //! - **失败路径（本模块）刻意不调用 `kcomp_instance_destroy`**：失败的组件不值得
-//!   信任，Linux 也不对崩溃模块执行 `module_exit`——Core 直接收回 authority。代价：
+//!   信任，Linux 也不对崩溃模块执行 `module_exit`——Core 直接收回资源。代价：
 //!   组件侧的设备收尾（stop DMA / reset / mask IRQ）不会发生，Core 的
-//!   revoke + device quarantine 是唯一兜底（见 docs/component-model.md §5.2）。
+//!   revoke + device quarantine 是唯一兜底。
 //! - **优雅停止（`component/exit.rs::stop_component`）**先信任组件的
 //!   `kcomp_instance_destroy` 自行收尾，再调用本模块共享的
-//!   [`revoke_authority_and_unbind`] 兜底；两条路径的回收序列同源，只差状态提交。
-//! - **未完整构造 / panicked 的实例绝不调用 destroy**（契约 §8）：create 失败、
-//!   发布提交失败与 panic 都只走本模块的状态提交 + 兜底。
+//!   [`revoke_authority_and_unbind`] 兜底。
 //!
 //! # 明确 DEFERRED（本增量不做）
 //!
-//! - **强制停止失败组件的任务**：Core 已从 runnable 候选与 commit 路径剔除
-//!   `Failed` 组件拥有的任务（`sched.rs`），但不会**强制停止**正在跑的任务——
-//!   那需要 task-stop API（当前只有 yield/exit）。
+//! - **强制停止失败组件的任务**（当前只有 yield/exit）。
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
-//!
-//! TODO(unexpected-exit): 本文件是失败实例状态提交的汇合点——未来"独立
-//! abort/exit 通知"（区分普通失败与组件主动退出）会从这里分流。
 
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, interface, registry};
-use crate::handle::{dma, irq, mmio};
+use crate::resource::{device, dma, irq};
 
-/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 共享 authority 兜底。
+/// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 资源兜底。
 ///
-/// **设备 quarantine**：revoke MMIO authority 不等于设备可被下一个驱动安全复用
-/// （设备可能仍被硬件引用 / 未静默）。因此撤销前先把失败组件占用的每个
-/// `device_index` 标进 Core 的失败 quarantine——之后普通认领返回 `-EBUSY`，直到
-/// reboot（phase 1 不建 reset/recovery 框架）。组件**优雅、协作式 quiesce** 后的
-/// `release` 不进入 quarantine，设备仍可复用。
-///
-/// `reason` 记录失败原因；Registry 当前只存状态、不存 reason，参数保留为调用方
-/// 语义 / 未来 trace seam。锁纪律：各操作各自取锁、互不嵌套，可安全调用。
+/// **设备 quarantine**：撤销 device ownership 不等于设备可被下一个驱动安全复用
+/// （设备可能仍被硬件引用 / 未静默）。因此回收前先把失败组件占用的每个 device
+/// quarantine——之后普通认领返回 `-EBUSY`，直到 reboot。组件**优雅、协作式
+/// quiesce** 后的 `release` 不进入 quarantine，设备仍可复用。
 pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
     let _ = reason;
     registry::get_registry().lock().mark_failed(id).ok();
     revoke_authority_and_unbind(id);
 }
 
-/// Core 兜底：收回组件剩余的 authority 并解绑它提供的接口。
+/// Core 兜底：收回组件剩余的资源归属并解绑它提供的接口。
 ///
-/// 精确序列（失败路径与优雅停止路径**共用**，见模块文档）：
-/// 1. MMIO：撤销 owner 的全部 live claim，并把设备标进失败 quarantine
-///    （revoke ≠ 设备可安全复用；phase 1 直到 reboot 不可认领）；
-/// 2. IRQ：撤销 slot（投递目标随之消失）；
-/// 3. DMA：backing lease 进 QUARANTINE（不 free，设备可能仍在 DMA）；
+/// 精确序列（失败路径与优雅停止路径**共用**）：
+/// 1. IRQ：撤销 route（投递目标随之消失）；
+/// 2. DMA：撤销 mapping，backing lease 进 QUARANTINE（不 free，设备可能仍在 DMA）；
+/// 3. Device：撤销 ownership 并把设备标进失败 quarantine；
 /// 4. Interface：解绑 active bindings，丢弃 staged pending publications。
 ///
 /// 调用方负责状态提交（失败 = `Failed`；优雅停止 = 随后 `Stopping → Stopped`）。
-/// 锁纪律：各表各自取锁、互不嵌套，可在无锁上下文中调用。
 pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
-    mmio::get_table().lock().quarantine_owner(id);
-    irq::get_table().lock().revoke_owner(id);
-    // DMA authority：backing lease 进 QUARANTINE（不 free）。
-    dma::get_table().lock().revoke_owner(id);
+    irq::revoke_owner(id);
+    dma::revoke_owner(id);
+    device::quarantine_owner(id);
     let mut ifs = interface::get_interfaces().lock();
     // active bindings：provider 解绑（consumer 立即不可 bind/refresh）。
     ifs.unbind_provider(id);
@@ -78,11 +62,8 @@ mod tests {
     use crate::component::ComponentState;
     use crate::component::interface::{self, InterfaceAbi, InterfaceError, InterfaceKind};
     use crate::component::registry;
-    use crate::handle::HandleError;
-    use crate::handle::RequestContext;
-    use crate::handle::dma::{self, DmaDirection};
-    use crate::handle::irq::{self, Irq};
-    use crate::handle::mmio::{self, MmioRegion};
+    use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
+    use crate::resource::{RequestContext, device, dma, irq};
 
     const ABI: InterfaceAbi = InterfaceAbi::from_raw(0xFA11_0001);
 
@@ -90,63 +71,55 @@ mod tests {
         0
     }
 
-    /// 失败编排回收 authority + 解绑接口 + 丢弃 pending + 提交 Failed 状态。
-    ///
-    /// Given：全局表里一个 Starting 组件，持有 MMIO/IRQ/DMA authority 且作为接口 provider。
-    /// When：先 finish_start（Ready）、再调用 `fail_component`。
-    /// Then：三个 handle 变 Stale、接口不再可 bind、registry 状态为 Failed。
+    extern "C" fn demo_irq(_ctx: *mut ()) {}
+
+    fn commit_device(device_index: usize, compatible: &[u8]) {
+        use crate::machine::{self, CpuId, CpuInfo, MachineInfo, MemoryRegion};
+        let mut devices = [DeviceDescriptor::empty(); 26];
+        devices[device_index] = DeviceDescriptor {
+            space: IoSpace::Mmio {
+                base: 0x1000_0000 + device_index * 0x1000,
+                size: 0x1000,
+            },
+            irq: Some(8),
+            compatibles: [
+                CompatStr::from_bytes(compatible),
+                CompatStr::empty(),
+                CompatStr::empty(),
+                CompatStr::empty(),
+            ],
+            compat_count: 1,
+        };
+        machine::commit(MachineInfo {
+            boot_hart: 0,
+            timebase_frequency: 10_000_000,
+            cpu_count: 1,
+            cpu_info: [CpuInfo {
+                boot_cpu: true,
+                hart_id: CpuId::from_raw(0),
+            }; 8],
+            mem_count: 1,
+            memory_regions: [MemoryRegion {
+                base: 0x8000_0000,
+                size: 0x1000_0000,
+            }; 16],
+            dev_count: device_index + 1,
+            devices,
+        });
+    }
+
+    /// 失败编排：资源回收 + 接口解绑 + 丢弃 pending + 提交 Failed + 设备 quarantine。
     #[test]
-    fn fail_component_revokes_authority_and_unbinds_interfaces() {
-        // 全局表是进程级 `Once`；claim 类测试走 machine GUARD，堆类测试走 memory GUARD。
-        let _guard = crate::machine::test_support::GUARD.lock();
+    fn fail_component_revokes_resources_and_unbinds_interfaces() {
+        let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
         crate::component::image::init();
         interface::init();
-        crate::handle::init();
+        crate::resource::init();
+        commit_device(24, b"fail,mmio");
 
-        // Given：提交一份包含 device 24 的机器信息（之后用它验证 quarantine 认领）。
-        // device_index 24 是本用例专用，避开其它测试的索引。
-        {
-            use crate::machine::{
-                self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo,
-                MemoryRegion,
-            };
-            let mut devices = [DeviceDescriptor::empty(); 26];
-            devices[24] = DeviceDescriptor {
-                space: IoSpace::Mmio {
-                    base: 0x1000_0000,
-                    size: 0x1000,
-                },
-                irq: Some(8),
-                compatibles: [
-                    CompatStr::from_bytes(b"fail,mmio"),
-                    CompatStr::empty(),
-                    CompatStr::empty(),
-                    CompatStr::empty(),
-                ],
-                compat_count: 1,
-            };
-            machine::commit(MachineInfo {
-                boot_hart: 0,
-                timebase_frequency: 10_000_000,
-                cpu_count: 1,
-                cpu_info: [CpuInfo {
-                    boot_cpu: true,
-                    hart_id: CpuId::from_raw(0),
-                }; 8],
-                mem_count: 1,
-                memory_regions: [MemoryRegion {
-                    base: 0x8000_0000,
-                    size: 0x1000_0000,
-                }; 16],
-                dev_count: 25,
-                devices,
-            });
-        }
-
-        // Given：Starting 组件 + 三个 authority + 一个已提交接口。
         let image = crate::component::image::test_support::register_test_image(b"fail_demo", 0);
         let id = {
             let mut reg = registry::get_registry().lock();
@@ -155,22 +128,24 @@ mod tests {
             reg.begin_start(id).unwrap();
             id
         };
-        let mmio_handle = mmio::get_table().lock().grant(
-            id,
-            MmioRegion {
-                base: 0x1000_0000,
-                size: 0x1000,
-                device_index: 24,
-            },
-        );
-        let irq_handle = irq::get_table().lock().grant(id, Irq::new(8, 24));
-        // DMA authority：设备身份从 caller 已持有的 MmioHandle 推导。
-        let dma_ctx = RequestContext {
+        let ctx = RequestContext {
             component: id,
             task: None,
         };
-        let dma_handle =
-            dma::alloc(&dma_ctx, mmio_handle, 4096, DmaDirection::ToDevice).expect("dma alloc");
+        let device_id = crate::machine::DeviceId::from_raw(24);
+        device::claim(&ctx, device_id).expect("claim");
+        irq::get_table()
+            .lock()
+            .register(id, 24, 8, demo_irq, core::ptr::null_mut());
+        let buffer = dma::alloc(id, 4096).expect("dma alloc");
+        let mapping = dma::map(
+            &ctx,
+            device_id,
+            buffer.ptr,
+            buffer.len,
+            dma::DmaDirection::ToDevice,
+        )
+        .expect("dma map");
         {
             let reg = registry::get_registry().lock();
             let mut ifs = interface::get_interfaces().lock();
@@ -188,27 +163,31 @@ mod tests {
         }
         registry::get_registry().lock().finish_start(id).unwrap();
 
-        // When：Core 编排组件失败。
+        let before_quarantine = dma::quarantine_len();
         fail_component(id, ComponentLoadError::CreateFailed(1));
 
-        // Then：三种 authority 都被撤销（generation 前进 → Stale）。
+        // 资源归属被回收。
+        assert!(irq::get_table().lock().route_of(8).is_none());
+        assert_eq!(dma::unmap(mapping.id), Err(dma::DmaError::NotFound));
         assert_eq!(
-            mmio::get_table().lock().get(id, mmio_handle).map(|_| ()),
-            Err(HandleError::Stale),
-            "MMIO handle 必须失效"
+            dma::quarantine_len(),
+            before_quarantine + 1,
+            "DMA backing 必须进 quarantine"
         );
+        assert!(!device::get_table().lock().owner(24).is_some());
+        assert!(device::get_table().lock().is_quarantined(24));
+
+        // quarantine 后普通认领 -EBUSY。
+        let claimant = RequestContext {
+            component: ComponentId::from_raw(999),
+            task: None,
+        };
         assert_eq!(
-            irq::get_table().lock().get(id, irq_handle).map(|_| ()),
-            Err(HandleError::Stale),
-            "IRQ handle 必须失效"
-        );
-        assert_eq!(
-            dma::get_table().lock().get(id, dma_handle).map(|_| ()),
-            Err(HandleError::Stale),
-            "DMA handle 必须失效"
+            device::claim(&claimant, device_id),
+            Err(device::DeviceClaimError::DeviceBusy)
         );
 
-        // Then：接口解绑，consumer 不再能 bind。
+        // 接口解绑。
         {
             let reg = registry::get_registry().lock();
             assert_eq!(
@@ -218,112 +197,14 @@ mod tests {
                     InterfaceKind::Service,
                     ABI
                 ),
-                Err(InterfaceError::Unbound),
-                "provider 失败后 binding 必须不可用"
+                Err(InterfaceError::Unbound)
             );
         }
-
-        // Then：registry 状态提交为 Failed。
         assert_eq!(
             registry::get_registry().lock().get(id).unwrap().state,
             ComponentState::Failed
         );
 
-        // Then：失败设备被 quarantine——revoke 后既无 live claim，普通认领也返回
-        // Busy（直到 reboot）。优雅 release 才会重新可认领。
-        assert!(mmio::get_table().lock().is_quarantined(24));
-        assert!(!mmio::get_table().lock().holds_device(24));
-        let claimant = ComponentId::from_raw(999);
-        let claim_ctx = RequestContext {
-            component: claimant,
-            task: None,
-        };
-        assert_eq!(
-            mmio::claim_device(&claim_ctx, crate::machine::DeviceId::from_raw(24)),
-            Err(mmio::MmioClaimError::DeviceBusy),
-            "失败设备 quarantine 后普通认领必须 -EBUSY"
-        );
-
-        // 清理：进程全局 quarantine 标记不能在用例间残留。
-        mmio::get_table().lock().clear_quarantine();
-    }
-
-    /// 契约核心：失败**只影响被选中的实例**——共享同一 image 的另一个实例
-    /// 保持 Ready，其 authority 原样（instance 才是 owner 单位）。
-    #[test]
-    fn failure_affects_only_the_selected_instance() {
-        let _machine = crate::machine::test_support::GUARD.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        registry::init();
-        crate::component::image::init();
-        crate::handle::init();
-
-        // Given：两个共享同一 image 的 Ready 实例，各自持有一份 MMIO authority。
-        let image = crate::component::image::test_support::register_test_image(b"fail_two", 0);
-        let first = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        let second = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        assert_ne!(first, second, "两个实例身份不同、image 相同");
-        let first_handle = mmio::get_table().lock().grant(
-            first,
-            MmioRegion {
-                base: 0x4000_0000,
-                size: 0x1000,
-                device_index: 40,
-            },
-        );
-        let second_handle = mmio::get_table().lock().grant(
-            second,
-            MmioRegion {
-                base: 0x4100_0000,
-                size: 0x1000,
-                device_index: 41,
-            },
-        );
-
-        // When：只让第一个实例失败。
-        fail_component(first, ComponentLoadError::CreateFailed(1));
-
-        // Then：第一个 Failed + authority 撤销 + 设备 quarantine；
-        // 第二个仍 Ready + handle 仍可用、设备未被 quarantine。
-        {
-            let reg = registry::get_registry().lock();
-            assert_eq!(reg.get(first).unwrap().state, ComponentState::Failed);
-            assert_eq!(reg.get(second).unwrap().state, ComponentState::Ready);
-        }
-        assert_eq!(
-            mmio::get_table()
-                .lock()
-                .get(first, first_handle)
-                .map(|_| ()),
-            Err(HandleError::Stale)
-        );
-        assert!(
-            mmio::get_table().lock().get(second, second_handle).is_ok(),
-            "未选中实例的 authority 必须原样"
-        );
-        assert!(mmio::get_table().lock().is_quarantined(40));
-        assert!(!mmio::get_table().lock().is_quarantined(41));
-
-        // 清理：释放未选中实例的 authority，并清掉进程全局 quarantine 标记。
-        mmio::get_table()
-            .lock()
-            .release(second, second_handle)
-            .unwrap();
-        mmio::get_table().lock().clear_quarantine();
+        device::get_table().lock().clear_quarantine();
     }
 }

@@ -735,7 +735,7 @@ mod tests {
     // `TASK_TABLE: spin::Mutex`。
     //
     // 少数只读用例（sched::commit_gate_fails_closed_for_unknown_task 查固定幽灵 id、
-    // handle::context 解析 ambient 身份）不持 GUARD，但它们只读固定值，且本用例
+    // resource::context 解析 ambient 身份）不持 GUARD，但它们只读固定值，且本用例
     // 的 TaskId 由全局计数器唯一分配、跑完即 remove，不会与它们相撞。
     //
     // 加锁纪律：每个操作只取一次全局任务表锁（create / get / transition / remove

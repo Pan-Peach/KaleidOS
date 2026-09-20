@@ -46,7 +46,7 @@ const STATE_STARTING: u64 = 2;
 const STATE_READY: u64 = 3;
 
 /// `ResourceKind` 的编码（Core `trace::abi::kind_code` 的镜像）。
-const RESOURCE_MMIO: u64 = 0;
+const RESOURCE_DEVICE: u64 = 0;
 const RESOURCE_IRQ: u64 = 1;
 const RESOURCE_DMA: u64 = 2;
 
@@ -203,7 +203,7 @@ pub fn group(checks: &mut Checks, sched: &sched::Outcome, resource: &resource::O
         sched_trace(sched.run_cursor, sched.rr_id, sched.task_a, sched.task_b),
     );
     let handles = [
-        (RESOURCE_MMIO, resource.mmio),
+        (RESOURCE_DEVICE, resource.device),
         (RESOURCE_IRQ, resource.irq),
         (RESOURCE_DMA, resource.dma),
     ];

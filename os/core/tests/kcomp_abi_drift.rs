@@ -440,12 +440,12 @@ fn header_and_sdk_mirror_declare_the_same_kcore_symbols() {
     let names_c = only_kcore(extract_c_decls(&strip_comments(HEADER_SRC)));
     let names_sdk = only_kcore(extract_rust_decls(&strip_comments(SDK_ABI_SRC)));
     assert!(
-        names_c.len() >= 40,
+        names_c.len() >= 36,
         "kcomp.h 只解析出 {} 个 kcore_* 声明（解析器坏了或声明被删）",
         names_c.len()
     );
     assert!(
-        names_sdk.len() >= 40,
+        names_sdk.len() >= 36,
         "abi.rs 只解析出 {} 个 kcore_* 声明（解析器坏了或声明被删）",
         names_sdk.len()
     );

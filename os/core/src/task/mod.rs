@@ -44,7 +44,7 @@ pub fn get_task_table() -> &'static spin::Mutex<TaskTable> {
 /// 经 `transition(Created→Runnable)` 后进入调度）。
 ///
 /// # Seam
-/// caller 身份统一由 `handle::RequestContext::ambient()` 解析（最内层活动执行
+/// caller 身份统一由 `resource::RequestContext::ambient()` 解析（最内层活动执行
 /// 边界优先：组件任务 → task owner；`kcomp_instance_create` → 被创建的实例）。
 /// 真正的 per-execution-domain 凭证（TaskHandle 化）留给未来 ExecutionDomain 里程碑。
 pub fn create_task(

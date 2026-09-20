@@ -168,7 +168,7 @@ mod tests {
     use super::*;
     use crate::component::ComponentState;
     use crate::component::image::{self, ComponentImageId};
-    use crate::handle::RequestContext;
+    use crate::resource::RequestContext;
     use crate::task::TaskState;
 
     /// 登记一份测试 image（同名复用），带指定的 destroy 入口。
@@ -199,11 +199,53 @@ mod tests {
         registry::init();
         image::init();
         crate::task::init();
-        crate::handle::init();
+        crate::resource::init();
         crate::component::interface::init();
         let guard = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         guard
+    }
+
+    /// 提交一份含指定设备（MMIO + irq）的机器信息。
+    fn commit_devices(devices: &[(usize, &[u8])]) {
+        use crate::machine::{
+            self, CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
+        };
+        let mut table = [DeviceDescriptor::empty(); 26];
+        let mut dev_count = 0;
+        for (index, compatible) in devices {
+            table[*index] = DeviceDescriptor {
+                space: IoSpace::Mmio {
+                    base: 0x1000_0000 + *index * 0x1000,
+                    size: 0x1000,
+                },
+                irq: Some(8),
+                compatibles: [
+                    CompatStr::from_bytes(compatible),
+                    CompatStr::empty(),
+                    CompatStr::empty(),
+                    CompatStr::empty(),
+                ],
+                compat_count: 1,
+            };
+            dev_count = dev_count.max(*index + 1);
+        }
+        machine::commit(MachineInfo {
+            boot_hart: 0,
+            timebase_frequency: 10_000_000,
+            cpu_count: 1,
+            cpu_info: [CpuInfo {
+                boot_cpu: true,
+                hart_id: CpuId::from_raw(0),
+            }; 8],
+            mem_count: 1,
+            memory_regions: [MemoryRegion {
+                base: 0x8000_0000,
+                size: 0x1000_0000,
+            }; 16],
+            dev_count,
+            devices: table,
+        });
     }
 
     extern "C" fn destroy_hook_ok(_state: *mut ()) -> i32 {
@@ -349,45 +391,48 @@ mod tests {
     }
 
     #[test]
-    fn stop_backstop_revokes_leftover_mmio_authority() {
-        // Given：Ready 组件 + 一个它没来得及释放的 MMIO authority。
-        // machine GUARD 与 failure.rs 的 quarantine 用例串行。
+    fn stop_backstop_revokes_leftover_device() {
+        // Given：Ready 组件 + 一台它没来得及释放的设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
+        commit_devices(&[(23, b"exit,mmio")]);
         let id = ready_component(b"exit_leftover_mmio", destroy_hook_ok as *const () as usize);
-        let handle = crate::handle::mmio::get_table().lock().grant(
-            id,
-            crate::handle::mmio::MmioRegion {
-                base: 0x3000_0000,
-                size: 0x1000,
-                device_index: 23,
-            },
-        );
+        let ctx = RequestContext {
+            component: id,
+            task: None,
+        };
+        crate::resource::device::claim(&ctx, crate::machine::DeviceId::from_raw(23)).unwrap();
 
         // When：停止（销毁入口什么也没释放）。
         assert_eq!(stop_component(id), Ok(()));
 
-        // Then：Core 兜底撤销了剩余 authority（与 failure 路径同一序列）。
-        assert_eq!(
-            crate::handle::mmio::get_table()
+        // Then：Core 兜底撤销了剩余 ownership 并 quarantine（与 failure 路径同一序列）。
+        assert!(
+            crate::resource::device::get_table()
                 .lock()
-                .get(id, handle)
-                .map(|_| ()),
-            Err(crate::handle::HandleError::Stale)
+                .is_quarantined(23)
         );
-        assert!(crate::handle::mmio::get_table().lock().is_quarantined(23));
+        assert!(
+            !crate::resource::device::get_table()
+                .lock()
+                .owner(23)
+                .is_some()
+        );
 
         // 清理：进程全局 quarantine 标记不能在用例间残留。
-        crate::handle::mmio::get_table().lock().clear_quarantine();
+        crate::resource::device::get_table()
+            .lock()
+            .clear_quarantine();
     }
 
     /// 契约核心：停止**只影响被选中的实例**——共享同一 image 的另一个实例
-    /// 保持 Ready，其 authority 不受影响。
+    /// 保持 Ready，其设备 ownership 不受影响。
     #[test]
     fn stop_affects_only_the_selected_instance() {
-        // Given：两个共享同一 image 的 Ready 实例，各自持有一份 MMIO authority。
+        // Given：两个共享同一 image 的 Ready 实例，各自认领一台设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
+        commit_devices(&[(10, b"exit,mmio0"), (11, b"exit,mmio1")]);
         let image = test_image(b"exit_two_instances", destroy_hook_ok as *const () as usize);
         let (first, second) = {
             let mut reg = registry::get_registry().lock();
@@ -402,51 +447,39 @@ mod tests {
             (first, second)
         };
         assert_ne!(first, second, "两个实例身份不同");
-        let first_handle = crate::handle::mmio::get_table().lock().grant(
-            first,
-            crate::handle::mmio::MmioRegion {
-                base: 0x3100_0000,
-                size: 0x1000,
-                device_index: 30,
-            },
-        );
-        let second_handle = crate::handle::mmio::get_table().lock().grant(
-            second,
-            crate::handle::mmio::MmioRegion {
-                base: 0x3200_0000,
-                size: 0x1000,
-                device_index: 31,
-            },
-        );
+        let first_ctx = RequestContext {
+            component: first,
+            task: None,
+        };
+        crate::resource::device::claim(&first_ctx, crate::machine::DeviceId::from_raw(10)).unwrap();
+        let second_ctx = RequestContext {
+            component: second,
+            task: None,
+        };
+        crate::resource::device::claim(&second_ctx, crate::machine::DeviceId::from_raw(11))
+            .unwrap();
 
         // When：只停止第一个实例。
         assert_eq!(stop_component(first), Ok(()));
 
-        // Then：第一个 Stopped + authority 撤销；第二个仍 Ready + handle 仍可用。
+        // Then：第一个 Stopped + 设备 quarantine；第二个仍 Ready + 设备仍归它。
         let reg = registry::get_registry().lock();
         assert_eq!(reg.get(first).unwrap().state, ComponentState::Stopped);
         assert_eq!(reg.get(second).unwrap().state, ComponentState::Ready);
         drop(reg);
+        let table = crate::resource::device::get_table().lock();
+        assert!(table.is_quarantined(10));
+        assert!(!table.is_quarantined(11));
         assert_eq!(
-            crate::handle::mmio::get_table()
-                .lock()
-                .get(first, first_handle)
-                .map(|_| ()),
-            Err(crate::handle::HandleError::Stale)
+            table.owner(11),
+            Some(second),
+            "未选中实例的 ownership 必须原样"
         );
-        assert!(
-            crate::handle::mmio::get_table()
-                .lock()
-                .get(second, second_handle)
-                .is_ok(),
-            "未选中实例的 authority 必须原样"
-        );
+        drop(table);
 
-        // 清理：释放未选中实例的 authority，并清掉进程全局 quarantine 标记。
-        crate::handle::mmio::get_table()
+        // 清理：清掉进程全局 quarantine 标记。
+        crate::resource::device::get_table()
             .lock()
-            .release(second, second_handle)
-            .unwrap();
-        crate::handle::mmio::get_table().lock().clear_quarantine();
+            .clear_quarantine();
     }
 }
