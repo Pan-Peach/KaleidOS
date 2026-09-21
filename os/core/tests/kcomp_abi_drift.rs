@@ -626,3 +626,319 @@ fn classifiers_reject_unknown_types_and_accept_fn_aliases() {
     );
     assert_eq!(classify_rust_type("irq::IrqHandler"), Ok(Width::Ptr));
 }
+
+// ===========================================================================
+// 组件间契约（C ↔ Rust）：function table 布局与常量
+// ---------------------------------------------------------------------------
+// 契约不是 Core 导出（Core 只把 api/ctx 当不透明指针存着），所以 C 侧名字是
+// `kcomp_*`。但 provider（Rust，如 virtio_blk）与 consumer（可能是 C，如 FatFs）
+// 必须对同一份布局——布局错了就是跨组件 UB，比 kcore_* 签名漂移更致命。
+// ===========================================================================
+
+/// 组件间契约的 Rust 侧（function table + ABI 常量）。
+const SDK_BLOCK_SRC: &str = include_str!("../../components/kcomp-sdk/src/block.rs");
+/// `InterfaceKind` 的 ABI 编码（Rust 侧）。
+const SDK_BINDING_SRC: &str = include_str!("../../components/kcomp-sdk/src/binding.rs");
+
+/// 从 `open`（指向 `{`）找匹配的 `}`。
+fn matching_brace(bytes: &[u8], open: usize) -> Result<usize, String> {
+    assert_eq!(bytes[open], b'{');
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("花括号不配对".to_string())
+}
+
+/// 按顶层分隔符切分（括号 / 方括号 / 花括号内的分隔符不算）。与 `split_top_level`
+/// 同族，但分隔符可指定（结构体字段用 `;` / `,`）。
+fn split_top_level_on(raw: &str, delim: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            c if c == delim && depth == 0 => {
+                parts.push(raw[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(raw[start..].to_string());
+    parts
+}
+
+/// 取 `anchor` 之后第一个 `{ ... }` 的内容（注释需已剥离）。
+fn braced_body(stripped: &str, anchor: &str) -> String {
+    let start = stripped
+        .find(anchor)
+        .unwrap_or_else(|| panic!("找不到锚点 `{anchor}`"));
+    let brace = stripped[start..]
+        .find('{')
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("`{anchor}` 之后没有 `{{`"));
+    let end =
+        matching_brace(stripped.as_bytes(), brace).unwrap_or_else(|e| panic!("`{anchor}`: {e}"));
+    stripped[brace + 1..end].to_string()
+}
+
+/// C function table 的字段：`RET (*name)(PARAMS);` → `(name, Signature)`。
+/// 只接受函数指针字段（契约 table 就是函数指针数组）。
+fn parse_c_fn_table(stripped: &str, struct_name: &str) -> Vec<(String, Signature)> {
+    let body = braced_body(stripped, &format!("struct {struct_name}"));
+    let mut fields = Vec::new();
+    for raw in split_top_level_on(&body, ';') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let paren = raw
+            .find('(')
+            .unwrap_or_else(|| panic!("`{raw}` 不是函数指针字段"));
+        let ret = classify_c_type(raw[..paren].trim())
+            .unwrap_or_else(|e| panic!("C `{struct_name}` 返回类型: {e}"));
+        let close = matching_paren(raw.as_bytes(), paren).unwrap_or_else(|e| panic!("{e}"));
+        let name = raw[paren + 1..close]
+            .trim()
+            .strip_prefix('*')
+            .unwrap_or_else(|| panic!("`{raw}` 字段名前缺 `*`"))
+            .trim()
+            .to_string();
+        let after = close + 1;
+        let paren2 = raw[after..]
+            .find('(')
+            .map(|i| after + i)
+            .unwrap_or_else(|| panic!("`{raw}` 缺参数表"));
+        let close2 = matching_paren(raw.as_bytes(), paren2).unwrap_or_else(|e| panic!("{e}"));
+        let params = parse_c_params(&raw[paren2 + 1..close2]).unwrap_or_else(|e| panic!("{e}"));
+        fields.push((name, Signature { params, ret }));
+    }
+    fields
+}
+
+/// Rust `#[repr(C)]` function table 的字段：`pub name: unsafe extern "C" fn(PARAMS)
+/// -> RET,` → `(name, Signature)`。
+fn parse_rust_fn_table(stripped: &str, struct_name: &str) -> Vec<(String, Signature)> {
+    let body = braced_body(stripped, &format!("pub struct {struct_name} {{"));
+    let mut fields = Vec::new();
+    for raw in split_top_level_on(&body, ',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let raw = raw.strip_prefix("pub ").unwrap_or(raw);
+        let (name, ty) = raw
+            .split_once(':')
+            .unwrap_or_else(|| panic!("`{raw}` 缺 `:`"));
+        let fn_at = ty
+            .find("fn(")
+            .unwrap_or_else(|| panic!("`{raw}` 不是 fn 字段"));
+        let paren = ty[fn_at..].find('(').map(|i| fn_at + i).unwrap();
+        let close = matching_paren(ty.as_bytes(), paren).unwrap_or_else(|e| panic!("{e}"));
+        let params = parse_rust_params(&ty[paren + 1..close]).unwrap_or_else(|e| panic!("{e}"));
+        let ret = classify_rust_type(rust_return_type(&ty[close + 1..]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        fields.push((name.trim().to_string(), Signature { params, ret }));
+    }
+    fields
+}
+
+/// 取 C `#define <name> <expr>` 的 expr（名后必须是空白，避免前缀误匹配）。
+fn extract_c_define(stripped: &str, name: &str) -> Option<String> {
+    for line in stripped.lines() {
+        let Some(rest) = line.trim().strip_prefix("#define") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if let Some(value) = rest.strip_prefix(name)
+            && value.starts_with(char::is_whitespace)
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// 取第一个双引号字符串的内容（C `"x"` 与 Rust `b"x"` 通用）。
+fn extract_first_string(expr: &str) -> Option<String> {
+    let start = expr.find('"')?;
+    let rest = &expr[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// 取 Rust `const <name> ... = <expr>;` 的 expr。
+fn extract_rust_const_expr(stripped: &str, name: &str) -> Option<String> {
+    let needle = format!("const {name}");
+    let start = stripped.find(&needle)?;
+    let after = &stripped[start + needle.len()..];
+    let eq = after.find('=')?;
+    let rest = &after[eq + 1..];
+    let end = rest.find(';')?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// 解析字面量整数：优先十六进制（`0x...`，含 `UINT64_C(...)` / 下划线），
+/// 否则取最后一个十进制串（enum 判别值 `= 0`）。
+fn parse_u64_literal(text: &str) -> Option<u64> {
+    if let Some(pos) = text.find("0x").or_else(|| text.find("0X")) {
+        let bytes = text.as_bytes();
+        let mut j = pos + 2;
+        while j < bytes.len() && (bytes[j].is_ascii_hexdigit() || bytes[j] == b'_') {
+            j += 1;
+        }
+        let digits: String = text[pos + 2..j].chars().filter(|c| *c != '_').collect();
+        return u64::from_str_radix(&digits, 16).ok();
+    }
+    let bytes = text.as_bytes();
+    let mut best = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let digits: String = text[i..j].chars().filter(|c| *c != '_').collect();
+            best = digits.parse::<u64>().ok();
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// 取 `anchor` 处 enum 的 `Variant = N` 判别值表。
+fn extract_enum_values(stripped: &str, anchor: &str) -> BTreeMap<String, u64> {
+    let body = braced_body(stripped, anchor);
+    let mut out = BTreeMap::new();
+    for raw in split_top_level_on(&body, ',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = raw.split_once('=')
+            && let Some(n) = parse_u64_literal(value)
+        {
+            out.insert(key.trim().to_string(), n);
+        }
+    }
+    out
+}
+
+#[test]
+fn block_device_fn_table_layout_matches_across_c_and_rust() {
+    let c = parse_c_fn_table(&strip_comments(HEADER_SRC), "kcomp_block_device_api");
+    let r = parse_rust_fn_table(&strip_comments(SDK_BLOCK_SRC), "BlockDeviceApi");
+
+    let c_names: Vec<_> = c.iter().map(|(n, _)| n.clone()).collect();
+    let r_names: Vec<_> = r.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(c_names, r_names, "block.device 字段名 / 顺序漂移");
+
+    let c_map: BTreeMap<_, _> = c.into_iter().collect();
+    let r_map: BTreeMap<_, _> = r.into_iter().collect();
+    let mut problems = Vec::new();
+    compare_signatures("kcomp.h", &c_map, "block.rs", &r_map, &mut problems);
+    assert!(
+        problems.is_empty(),
+        "block.device function table 布局漂移：\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn block_device_constants_match_across_c_and_rust() {
+    let c = strip_comments(HEADER_SRC);
+    let r = strip_comments(SDK_BLOCK_SRC);
+    let b = strip_comments(SDK_BINDING_SRC);
+
+    let c_name = extract_first_string(
+        &extract_c_define(&c, "KCOMP_BLOCK_DEVICE_NAME")
+            .expect("kcomp.h 缺 KCOMP_BLOCK_DEVICE_NAME"),
+    );
+    let r_name = extract_first_string(
+        &extract_rust_const_expr(&r, "BLOCK_DEVICE_NAME").expect("block.rs 缺 BLOCK_DEVICE_NAME"),
+    );
+    assert_eq!(c_name, r_name, "block.device 名字漂移");
+
+    let c_abi = parse_u64_literal(
+        &extract_c_define(&c, "KCOMP_BLOCK_DEVICE_ABI").expect("kcomp.h 缺 KCOMP_BLOCK_DEVICE_ABI"),
+    );
+    let r_abi = parse_u64_literal(
+        &extract_rust_const_expr(&r, "BLOCK_DEVICE_ABI").expect("block.rs 缺 BLOCK_DEVICE_ABI"),
+    );
+    assert_eq!(c_abi, r_abi, "block.device ABI 指纹漂移");
+    assert_eq!(
+        c_abi,
+        Some(0x424C_4F43_4B44_4556),
+        "block.device ABI 指纹值漂移"
+    );
+
+    let c_enum = extract_enum_values(&c, "enum KcompInterfaceKind");
+    let r_enum = extract_enum_values(&b, "enum InterfaceKind");
+    for (c_key, r_key) in [
+        ("KCOMP_IFACE_DEVICE", "Device"),
+        ("KCOMP_IFACE_SERVICE", "Service"),
+        ("KCOMP_IFACE_POLICY", "Policy"),
+    ] {
+        assert_eq!(
+            c_enum.get(c_key),
+            r_enum.get(r_key),
+            "InterfaceKind::{r_key} 编码漂移"
+        );
+    }
+}
+
+#[test]
+fn c_fn_table_parser_reads_function_pointer_fields() {
+    let src = strip_comments(
+        "struct demo_api {\n    uint64_t (*cap)(void *ctx);\n    int32_t (*read)(void *ctx, uint64_t lba, uint8_t *buf, size_t len);\n};\n",
+    );
+    let fields = parse_c_fn_table(&src, "demo_api");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].0, "cap");
+    assert_eq!(fields[0].1.params, vec![Width::Ptr]);
+    assert_eq!(fields[0].1.ret, Width::W64);
+    assert_eq!(fields[1].0, "read");
+    assert_eq!(
+        fields[1].1.params,
+        vec![Width::Ptr, Width::W64, Width::Ptr, Width::Ptr]
+    );
+    assert_eq!(fields[1].1.ret, Width::W32);
+}
+
+#[test]
+fn rust_fn_table_parser_reads_fn_fields() {
+    let src = strip_comments(
+        r#"#[repr(C)]
+pub struct DemoApi {
+    pub cap: unsafe extern "C" fn(ctx: *mut ()) -> u64,
+    pub read: unsafe extern "C" fn(ctx: *mut (), lba: u64, buf: *mut u8, len: usize) -> i32,
+}
+"#,
+    );
+    let fields = parse_rust_fn_table(&src, "DemoApi");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].0, "cap");
+    assert_eq!(fields[0].1.params, vec![Width::Ptr]);
+    assert_eq!(fields[0].1.ret, Width::W64);
+    assert_eq!(fields[1].0, "read");
+    assert_eq!(
+        fields[1].1.params,
+        vec![Width::Ptr, Width::W64, Width::Ptr, Width::Ptr]
+    );
+    assert_eq!(fields[1].1.ret, Width::W32);
+}

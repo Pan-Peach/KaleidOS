@@ -144,7 +144,8 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
 KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
-KCOMP_C_SRCS :=
+# SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
+KCOMP_C_SRCS := kcomp_c_smoke
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -252,7 +253,7 @@ distclean: clean
 #   make bench        host release 性能基线（手动跑，不进 CI）
 #   make test-kconfig Kconfig / Makefile 胶水契约测试（host-only，快速）
 #   make check        CI 全量门禁 = fmt + clippy + test-kconfig + test-host + test-build
-.PHONY: fmt clippy check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+.PHONY: fmt clippy check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test -p logger
@@ -347,6 +348,21 @@ test-driver-prober-one: kernel
 	@python3 tests/qemu/driver_prober_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
 test-driver-prober: test-driver-prober-rv64 test-driver-prober-rv32
+
+# C 组件端到端：加载 kcomp_c_smoke（clang 编的 freestanding C + SDK C 运行时），
+# 断言 create 的 kcore_log_line 日志与 unload 时的 C destroy 证据。
+test-c-smoke-rv64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-c-smoke-one
+
+test-c-smoke-rv32:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-c-smoke-one
+
+test-c-smoke-one: kernel
+	@python3 tests/qemu/c_smoke_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
+
+test-c-smoke: test-c-smoke-rv64 test-c-smoke-rv32
 
 # White-box architectural selftests use a separate image: the private archtest
 # profile = the board defconfig + configs/selftest.fragment (CONFIG_SELFTEST=y),

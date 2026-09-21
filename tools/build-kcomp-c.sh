@@ -64,12 +64,17 @@ esac
 #   -fno-unwind-tables                   不生成 .eh_frame（省体积、少重定位面）
 #   -fno-pic                             不引 GOT 重定位
 #   -mno-relax                           不生成 R_RISCV_ALIGN（loader 不支持）
+#   -mcmodel=medany                      auipc/PCREL 相对寻址。**不要 medlow**：
+#                                        RV64 的 lui 会把 32 位结果符号扩展，组件
+#                                        加载地址若 bit31=1（如 0x81a00000）就变成
+#                                        0xffffffff8...，一取地址即 load page fault。
+#                                        Rust 组件走的就是 PCREL 路径。
 cflags=(
     -target "$clang_target" -march="$march" -mabi="$mabi"
     -ffreestanding -fno-builtin -fno-stack-protector
     -ffunction-sections -fdata-sections
     -fno-asynchronous-unwind-tables -fno-unwind-tables
-    -fno-pic -mno-relax -O2
+    -fno-pic -mno-relax -mcmodel=medany -O2
     # 组件 ABI 的 C 作者面：C 组件 `#include "kcomp.h"`（kcore_* 白名单 +
     # kcomp_* 生命周期入口声明；Rust 镜像在 kcomp-sdk/src/abi.rs）。
     -I"$repo_root/os/components/kcomp-sdk/include"
@@ -102,6 +107,20 @@ if [ "${#sources[@]}" -eq 0 ]; then
     echo "build-kcomp-c: no C sources (looked for $component_dir/*.c or $list)" >&2
     exit 1
 fi
+
+# 随组件私有携带 SDK 的 C 运行时：kcomp.h 只是声明，实现（freestanding weak
+# `mem*`）在 kcomp-sdk/c/。每个 C 组件都自带这一份（不建 shared runtime）；
+# Rust 组件的 compiler_builtins 已提供同一批原语，不走这条路径。
+sdk_c_dir="$repo_root/os/components/kcomp-sdk/c"
+shopt -s nullglob
+sdk_sources=("$sdk_c_dir"/*.c)
+shopt -u nullglob
+if [ "${#sdk_sources[@]}" -eq 0 ]; then
+    echo "build-kcomp-c: SDK C runtime not found in $sdk_c_dir" >&2
+    echo "build-kcomp-c: C 组件需要 freestanding mem*；缺失会导致链接失败" >&2
+    exit 1
+fi
+sources+=("${sdk_sources[@]}")
 
 mkdir -p "$obj_dir"
 objects=()

@@ -105,6 +105,11 @@ component wrapper
 > Makefile 与 `os/core/build.rs` 共用这些脚本，两条构建路径不再分叉；packer 在输出前
 > 校验「ET_REL + `kcomp_instance_create` / `kcomp_instance_destroy` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
 > 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
+> 两条语言路径消费**同一个 `kcomp.h`**：C 组件只有这一份声明 + SDK 的 C 运行时
+> （`os/components/kcomp-sdk/c/kcomp_rt.c` 的 weak `mem*`，随组件私有携带），
+> 直接调 `kcore_*`；Rust 组件在同一份声明上加 SDK 的 Rust adapter（入口宏 / 日志 /
+> panic / alloc）。`make test-c-smoke` 用最小 C 组件 `kcomp_c_smoke` 在 QEMU 上
+> 端到端验证这条路径（RV64 + RV32）。
 > （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
@@ -120,10 +125,16 @@ panic handler → component panic adapter     → kcore_log_line（打印诊断�
 > 这不是"每个组件自带一个堆"：每个组件有自己的 adapter（满足 Rust 类型/宏契约），但**底层资源仍由 Core 统一管理**。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带。
 
 > 现状（step 2）：`os/components/kcomp-sdk` 是这一层的落地——它是 `kcore_*` 导出白名单的
-> 单一来源，提供 `kcomp_instance_create!` / `kcomp_instance_destroy!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
+> 单一来源（C 头 `include/kcomp.h`，Rust 镜像 `src/abi.rs`，漂移由
+> `os/core/tests/kcomp_abi_drift.rs` 兜底），提供 `kcomp_instance_create!` / `kcomp_instance_destroy!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
 > `#[panic_handler]`（打印诊断后调 `kcore_panic_escape` 协作式逃逸），以及 feature `alloc`
 > 下的 `#[global_allocator]`（接 Core 共享堆，无 per-component 堆）。SDK 是普通 library，
 > 编译进每个 `.kcomp`，不是可加载组件、也不是 shared runtime。
+>
+> **C 组件没有这些 Rust adapter**：它只 `#include "kcomp.h"`（`kcore_*` 声明 + 入口契约），
+> 直接调 `kcore_*`；日志 / panic 也走 `kcore_log_line` / `kcore_panic_escape`。它额外需要
+> 的只有 freestanding `mem*`，由 SDK 的 C 运行时提供。C 运行时**不建 shared runtime**：
+> 由 `tools/build-kcomp-c.sh` 随每个 C 组件编入（与 Rust 组件的 adapter 私有携带同理）。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 

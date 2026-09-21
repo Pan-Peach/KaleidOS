@@ -267,7 +267,13 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 4. **一起切换 loader / containment / SDK / packer**：保留嵌套调用者恢复，在现有 Core-owned 栈上传递 create/destroy 参数，更新 `tools/kcomp-link.sh` 的符号保留/校验；**重建每个组件**，不维护兼容。
 5. **迁移普通组件 + task 上下文**：在碰硬件之前，先验证"两个简单有状态实例 + 用全新 ID/ctx 重启"。scheduler/prober/诊断按组合策略保持单例。
 6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 DeviceId / MMIO 基址、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
-7. **然后才加 C 生命周期/绑定 smoke 组件，再接 FatFs 胶水**：先测 C/Rust 布局与真实调用，再接文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或 `virtio-blk`。
+7. **C 生命周期 smoke 已落地，FatFs 胶水待接**：`os/components/kcomp_c_smoke` 是一个
+   clang 编的 freestanding C 组件，经 `tools/build-kcomp-c.sh` + SDK C 运行时
+   （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-c-smoke`
+   在 RV64/RV32 端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的
+   Interface binding smoke。之后才接 FatFs 胶水——先测 C/Rust 布局与真实调用，再接
+   文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或
+   `virtio-blk`。
 
 **停止点**：**从一份常驻镜像得到多个独立管理的 KernelNative 实例，且 C ABI 经过测试。** 不悄悄滑向已推迟的执行域里程碑。
 
@@ -275,5 +281,5 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 
 - `make check`（fmt + clippy `-D warnings`）全绿。
 - `make test-host` 全绿（含新增 contract tests）。
-- `make init.kpkg`：7 个组件全部通过 `.kcomp` 四项契约校验（ET_REL / 入口 DEFINED / UNDEF 仅 `kcore_*` / 重定位白名单）。
-- `make test-qemu` + `make test-arch` 在 **RV64 与 RV32** 双 profile 全绿。
+- `make init.kpkg`：所有组件（含 C 组件 `kcomp_c_smoke`）全部通过 `.kcomp` 四项契约校验（ET_REL / 入口 DEFINED / UNDEF 仅 `kcore_*` / 重定位白名单）。
+- `make test-qemu` + `make test-arch` + `make test-c-smoke` 在 **RV64 与 RV32** 双 profile 全绿。
