@@ -44,6 +44,16 @@ fn driver_prober_name_is_anchored() {
     assert_eq!(crate::binding::DRIVER_PROBER_NAME, b"driver.prober");
 }
 
+#[test]
+fn filesystem_abi_is_anchored() {
+    assert_eq!(
+        crate::binding::FILESYSTEM_ABI.raw(),
+        0x4649_4C45_5359_5354
+    );
+    assert_eq!(crate::binding::FILESYSTEM_NAME, b"filesystem");
+    assert_eq!(crate::binding::FILESYSTEM_OPEN_READ, 1);
+}
+
 /// `report_attempt` outcome 编码锚定（0 = Match，1 = NoMatch）。
 #[test]
 fn assign_outcome_encoding_is_stable() {
@@ -127,15 +137,16 @@ fn block_device_api_layout_is_anchored() {
 // ---------------------------------------------------------------------------
 
 use crate::block::{BlockDeviceProvider, BlockDeviceService};
+use crate::errno::{Errno, Result};
 
-/// wrapper 测试用 mock：`error == 0` → `Ok`（read 回填 0xA5），否则返回该 errno。
+/// wrapper 测试用 mock：`None` → `Ok`（read 回填 0xA5），`Some(e)` → `Err(e)`。
 struct BlockMock {
     capacity: u64,
-    error: i32,
+    error: Option<Errno>,
 }
 
 impl BlockMock {
-    const fn new(capacity: u64, error: i32) -> Self {
+    const fn new(capacity: u64, error: Option<Errno>) -> Self {
         Self { capacity, error }
     }
 }
@@ -145,17 +156,17 @@ impl BlockDeviceProvider for BlockMock {
         self.capacity
     }
 
-    fn read(&self, _lba: u64, buf: &mut [u8]) -> Result<(), i32> {
-        if self.error != 0 {
-            return Err(self.error);
+    fn read(&self, _lba: u64, buf: &mut [u8]) -> Result<()> {
+        if let Some(error) = self.error {
+            return Err(error);
         }
         buf.fill(0xA5);
         Ok(())
     }
 
-    fn write(&self, _lba: u64, _buf: &[u8]) -> Result<(), i32> {
-        if self.error != 0 {
-            return Err(self.error);
+    fn write(&self, _lba: u64, _buf: &[u8]) -> Result<()> {
+        if let Some(error) = self.error {
+            return Err(error);
         }
         Ok(())
     }
@@ -169,11 +180,11 @@ impl BlockDeviceProvider for NeverCalled {
         0
     }
 
-    fn read(&self, _lba: u64, _buf: &mut [u8]) -> Result<(), i32> {
+    fn read(&self, _lba: u64, _buf: &mut [u8]) -> Result<()> {
         panic!("read must not be called for invalid args")
     }
 
-    fn write(&self, _lba: u64, _buf: &[u8]) -> Result<(), i32> {
+    fn write(&self, _lba: u64, _buf: &[u8]) -> Result<()> {
         panic!("write must not be called for invalid args")
     }
 }
@@ -182,7 +193,7 @@ impl BlockDeviceProvider for NeverCalled {
 /// 三个 table 指针非空且互不相同 = adapter 已按 `P` 单态化、没有静默指错。
 #[test]
 fn block_provider_table_is_complete_and_distinct() {
-    static DEVICE: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(8, 0));
+    static DEVICE: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(8, None));
     let api = DEVICE.api();
     // capacity adapter 原样透传 provider 的值。
     assert_eq!(unsafe { (api.capacity_sectors)(DEVICE.ctx()) }, 8);
@@ -200,8 +211,9 @@ fn block_provider_table_is_complete_and_distinct() {
 /// read：`Ok` → `0`（数据写到调用方 buffer），`Err(e)` → `e`（`-Errno` 原样透传）。
 #[test]
 fn block_provider_read_maps_ok_and_errno() {
-    static OK: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, 0));
-    static ERR: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, -5));
+    static OK: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, None));
+    static ERR: BlockDeviceService<BlockMock> =
+        BlockDeviceService::new(BlockMock::new(2048, Some(Errno::EIO)));
 
     let mut buf = [0u8; 512];
     let rc = unsafe { (OK.api().read)(OK.ctx(), 1, buf.as_mut_ptr(), buf.len()) };
@@ -210,24 +222,25 @@ fn block_provider_read_maps_ok_and_errno() {
 
     let mut buf = [0u8; 512];
     let rc = unsafe { (ERR.api().read)(ERR.ctx(), 1, buf.as_mut_ptr(), buf.len()) };
-    assert_eq!(rc, -5);
+    assert_eq!(rc, Errno::EIO.code());
 }
 
 /// write：`Ok` → `0`，`Err(e)` → `e`。
 #[test]
 fn block_provider_write_maps_ok_and_errno() {
-    static OK: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, 0));
-    static ERR: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, -5));
+    static OK: BlockDeviceService<BlockMock> = BlockDeviceService::new(BlockMock::new(2048, None));
+    static ERR: BlockDeviceService<BlockMock> =
+        BlockDeviceService::new(BlockMock::new(2048, Some(Errno::EIO)));
 
     let buf = [0x5Au8; 512];
     let ok = unsafe { (OK.api().write)(OK.ctx(), 1, buf.as_ptr(), buf.len()) };
     assert_eq!(ok, 0);
     let err = unsafe { (ERR.api().write)(ERR.ctx(), 1, buf.as_ptr(), buf.len()) };
-    assert_eq!(err, -5);
+    assert_eq!(err, Errno::EIO.code());
 }
 
 /// 契约入参校验由 SDK 一次完成：null / `len == 0` / `len` 非 512 整数倍 →
-/// `-EINVAL`（-22，与 Core `errno.rs` 一致），provider 完全不会被调用。
+/// `-EINVAL`（`Errno::EINVAL.code()`，与 Core `errno.rs` 一致），provider 完全不会被调用。
 #[test]
 fn block_provider_adapter_rejects_invalid_args_with_einval() {
     static NEVER: BlockDeviceService<NeverCalled> = BlockDeviceService::new(NeverCalled);
@@ -237,11 +250,26 @@ fn block_provider_adapter_rejects_invalid_args_with_einval() {
 
     assert_eq!(
         unsafe { (api.read)(ctx, 0, core::ptr::null_mut(), 512) },
-        -22
+        Errno::EINVAL.code()
     );
-    assert_eq!(unsafe { (api.read)(ctx, 0, buf.as_mut_ptr(), 0) }, -22);
-    assert_eq!(unsafe { (api.read)(ctx, 0, buf.as_mut_ptr(), 513) }, -22);
-    assert_eq!(unsafe { (api.write)(ctx, 0, core::ptr::null(), 512) }, -22);
-    assert_eq!(unsafe { (api.write)(ctx, 0, buf.as_ptr(), 0) }, -22);
-    assert_eq!(unsafe { (api.write)(ctx, 0, buf.as_ptr(), 513) }, -22);
+    assert_eq!(
+        unsafe { (api.read)(ctx, 0, buf.as_mut_ptr(), 0) },
+        Errno::EINVAL.code()
+    );
+    assert_eq!(
+        unsafe { (api.read)(ctx, 0, buf.as_mut_ptr(), 513) },
+        Errno::EINVAL.code()
+    );
+    assert_eq!(
+        unsafe { (api.write)(ctx, 0, core::ptr::null(), 512) },
+        Errno::EINVAL.code()
+    );
+    assert_eq!(
+        unsafe { (api.write)(ctx, 0, buf.as_ptr(), 0) },
+        Errno::EINVAL.code()
+    );
+    assert_eq!(
+        unsafe { (api.write)(ctx, 0, buf.as_ptr(), 513) },
+        Errno::EINVAL.code()
+    );
 }

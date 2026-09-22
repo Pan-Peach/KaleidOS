@@ -23,6 +23,7 @@
 //! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish`] 的安全性论证见其文档。
 
 use crate::binding::{InterfaceAbi, InterfaceKind, Service, publish_service};
+use crate::errno::{Errno, Result};
 
 // -----------------------------------------------------------------------
 // 契约：block.device —— 驱动提供的 Device Interface（provider: virtio_blk）
@@ -98,9 +99,6 @@ impl Service for BlockDevice {
 /// 契约单位：1 sector = 512 字节（wrapper 校验入参用；不是对外 API）。
 const SECTOR_SIZE: usize = 512;
 
-/// Core errno 约定（`0` / `-errno`；`EINVAL = 22`，见 os/core/src/errno.rs）。
-const EINVAL: i32 = -22;
-
 /// block 设备的 provider 接口：驱动实现它，ABI table 由 SDK 生成。
 ///
 /// 纯 Rust：无 `unsafe` / 无 `extern "C"` / 无裸指针。`Err` 侧是 `-Errno` 形式
@@ -116,10 +114,10 @@ pub trait BlockDeviceProvider {
     ///
     /// adapter 已保证 `buf.len() > 0` 且是 512 的整数倍；不满足时调用方拿到
     /// `-EINVAL`，本方法**不会被调用**。
-    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), i32>;
+    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<()>;
 
     /// 从 `buf` 写 `buf.len()` 字节到 `lba`（入参保证同 [`BlockDeviceProvider::read`]）。
-    fn write(&self, lba: u64, buf: &[u8]) -> Result<(), i32>;
+    fn write(&self, lba: u64, buf: &[u8]) -> Result<()>;
 }
 
 /// provider 实现与生成的 `#[repr(C)]` table 的配对；放进 `static` 后
@@ -163,7 +161,7 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
     /// （布局就是 `BlockDeviceApi` 类型本身）；`ctx` 是 `'static` 实例里 provider
     /// 字段的地址（[`BlockDeviceService::ctx`]），在 `'static` 内不会失效。
     /// 两个 unsafe 前提都在本模块闭环，provider 作者因此永远不写 unsafe。
-    pub fn publish(&'static self) -> Result<(), i32> {
+    pub fn publish(&'static self) -> Result<()> {
         // SAFETY: api 由 new 从 P 原地生成（布局 = BlockDeviceApi，不是调用方数据）；
         // ctx = &'static self.provider（地址稳定性见 ctx()）。Core 只存指针、不解引用。
         unsafe { publish_service::<BlockDevice>(&self.api, self.ctx()) }
@@ -218,7 +216,7 @@ unsafe extern "C" fn read<P: BlockDeviceProvider>(
     // 契约入参在这里统一校验一次（provider 不重复校验）：
     // null / 空 / 非 512 整数倍 → -EINVAL。
     if buf.is_null() || len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
-        return EINVAL;
+        return Errno::EINVAL.code();
     }
     // SAFETY: ctx 由本模块生成（= &'static P，见 capacity_sectors 的 Safety）；
     // buf 非空、len 为 512 的整数倍，且按契约在调用期间位于 Core 可见 RAM、独占
@@ -228,7 +226,7 @@ unsafe extern "C" fn read<P: BlockDeviceProvider>(
     let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     match provider.read(lba, buf) {
         Ok(()) => 0,
-        Err(errno) => errno,
+        Err(errno) => errno.code(),
     }
 }
 
@@ -243,13 +241,13 @@ unsafe extern "C" fn write<P: BlockDeviceProvider>(
     len: usize,
 ) -> i32 {
     if buf.is_null() || len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
-        return EINVAL;
+        return Errno::EINVAL.code();
     }
     // SAFETY: 同 read 的 slice 构造；const 侧只读。
     let provider = unsafe { &*ctx.cast::<P>() };
     let buf = unsafe { core::slice::from_raw_parts(buf, len) };
     match provider.write(lba, buf) {
         Ok(()) => 0,
-        Err(errno) => errno,
+        Err(errno) => errno.code(),
     }
 }

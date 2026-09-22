@@ -121,6 +121,8 @@ int32_t kcomp_instance_destroy(void *state);
 
 约定：
 - **返回值统一 `0 / -errno`**。**废弃**旧的"非零 = 失败 bitmap"约定（`kcomp_init` 的约定不继承）。
+  组件侧不要手写 `const E*: i32`：Rust 用 `kcomp_sdk::Errno` / `Result<T>`，C 用 SDK 的
+  `<errno.h>` shim（`return -ENODEV;`）。线格式仍是裸 `i32`（`0 / -errno`），类型只活在语言边界。
 - Core 把 `*out_state` 初始化为 `NULL`；成功时组件写入自己完成的 state 指针；**无状态组件可成功返回 NULL**。
 - 状态经现有 shared heap 分配。**Core 只存/传指针，不解释、不通用释放。**
 - `kcomp_abi` 是手工维护的精确契约指纹；**不加版本后缀、不做兼容协商、不自动生成哈希**。

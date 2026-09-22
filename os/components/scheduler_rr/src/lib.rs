@@ -25,6 +25,7 @@ extern crate std;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcomp_sdk::abi;
 use kcomp_sdk::binding::{self, SchedulerPolicy, SchedulerPolicyApi};
+use kcomp_sdk::errno::Errno;
 
 /// RR 调度器**实例状态**：cursor 指向 runnable 列表中的下一个槽位。
 ///
@@ -35,10 +36,6 @@ use kcomp_sdk::binding::{self, SchedulerPolicy, SchedulerPolicyApi};
 struct SchedulerState {
     cursor: AtomicU32,
 }
-
-/// `-ENOMEM`（Linux errno 12，与 Core `errno.rs::Errno::ENOMEM` 一致）：
-/// 实例状态分配失败。create 统一 `0 / -errno`。
-const ENOMEM: i32 = -12;
 
 /// RR 提议：在 Core 传入的 runnable（id 升序）里轮流选择。
 ///
@@ -79,7 +76,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // SAFETY: 纯分配调用，无所有权语义；成功 = 对齐的 size 字节，失败 = NULL。
     let state = unsafe { abi::kcore_heap_alloc(size, align) };
     if state.is_null() {
-        return ENOMEM;
+        return Errno::ENOMEM.code();
     }
     // 新实例从 cursor 0 开始：替换实例拿到全新 cursor。
     // SAFETY: state 是刚分配、对齐满足、尚未初始化的 SchedulerState 存储。

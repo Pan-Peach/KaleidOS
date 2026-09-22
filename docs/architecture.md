@@ -339,7 +339,13 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 ```
 
 - `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）：
-  用到哪个加哪个，进入 public ABI 后数字不再变更。
+  **完整的 `asm-generic/errno` 集合**（1–133）。现成的 no_std errno crate 全部门控在
+  hosted / Linux（`libc` 的常量在 `#[cfg(target_os = "linux")]` 之类的模块里，裸机
+  取不到），所以编号由我们自己持有——但**数值照抄标准、不发明**。进入 public ABI 后
+  数字不再变更。
+- 组件面是同一套码：Rust 侧 `kcomp-sdk` 的 `Errno` / `Result<T>`（`src/errno.rs`），
+  C 侧 `<errno.h>` shim（`include/errno.h`；`-ffreestanding` 不提供）。三方数值由
+  `os/core/tests/kcomp_abi_drift.rs` 钉死。
 - 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
   `InterfaceError` / `DeviceClaimError` / `DeviceReleaseError` / `IrqError` /
   `DmaError` / `MemoryError` ...）保持丰富与类型安全，

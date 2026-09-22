@@ -11,7 +11,14 @@
  *   destroy → `[c-smoke] exit`         （Core 的卸载路径真的调用了 C 的析构入口）
  */
 #include "kcomp.h"
+#include <errno.h>
 #include <string.h>
+
+/* 顺带在编译期验证 SDK 的 <errno.h> shim 可用且数值与 Core/SDK 一致（值错了这里
+ * 编译失败；比运行期断言更早）。drift 哨兵另在 os/core/tests/kcomp_abi_drift.rs。 */
+_Static_assert(ENODEV == 19, "errno.h shim drift (ENODEV)");
+_Static_assert(EINVAL == 22, "errno.h shim drift (EINVAL)");
+_Static_assert(EKEYREVOKED == 128, "errno.h shim drift (EKEYREVOKED)");
 
 /* 精确契约指纹（值与 Rust 侧 KCOMP_ABI 一致：8 字节 ASCII "KCOMPABI"）。
  * 必须定义，Core 在调用组件代码前校验其 ELF 定义、边界与值。 */

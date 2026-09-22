@@ -52,6 +52,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use kcomp_sdk::binding::{ASSIGN_MATCH, ASSIGN_NO_MATCH, DriverProber, ServiceBinding};
 use kcomp_sdk::block::{BlockDeviceProvider, BlockDeviceService};
+use kcomp_sdk::errno::{Errno, Result};
 use kcomp_sdk::{DmaDirection, abi};
 use spin::Mutex;
 use virtio_drivers::{
@@ -65,9 +66,6 @@ use virtio_drivers::{
 // ---------------------------------------------------------------------------
 
 // 组件不能依赖 os/core 的 errno 模块：本地按数值镜像（与 os/core/src/errno.rs 一致）。
-const ENOENT: i32 = -2; // next_assignment 耗尽：没有更多分配
-const EIO: i32 = -5; // virtio 传输失败
-const ENODEV: i32 = -19; // 未 attach 就收到读写
 
 // virtio-mmio 寄存器 offset（4 字节访问）。
 const VIRTIO_MMIO_DEVICE_ID_OFFSET: u32 = 0x008;
@@ -130,17 +128,17 @@ impl BlockDeviceProvider for VirtioBlkProvider {
         BLK.lock().as_ref().map_or(0, |blk| blk.capacity())
     }
 
-    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<(), i32> {
+    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
         match BLK.lock().as_mut() {
-            Some(blk) => blk.read_blocks(lba as usize, buf).map_err(|_| EIO),
-            None => Err(ENODEV),
+            Some(blk) => blk.read_blocks(lba as usize, buf).map_err(|_| Errno::EIO),
+            None => Err(Errno::ENODEV),
         }
     }
 
-    fn write(&self, lba: u64, buf: &[u8]) -> Result<(), i32> {
+    fn write(&self, lba: u64, buf: &[u8]) -> Result<()> {
         match BLK.lock().as_mut() {
-            Some(blk) => blk.write_blocks(lba as usize, buf).map_err(|_| EIO),
-            None => Err(ENODEV),
+            Some(blk) => blk.write_blocks(lba as usize, buf).map_err(|_| Errno::EIO),
+            None => Err(Errno::ENODEV),
         }
     }
 }
@@ -279,7 +277,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
             &mut device_id,
         );
         if rc != 0 {
-            if rc != ENOENT {
+            if rc != Errno::ENOENT.code() {
                 kcomp_sdk::klog!("virtio_blk: next_assignment failed (rc={})", rc);
             }
             break; // 分配耗尽（或错误）：没有更多设备。
@@ -369,7 +367,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
         // staged publish：Core 在 `kcomp_instance_create` 返回 0 后提交；失败 = init 失败。
         if let Err(rc) = BLOCK_SERVICE.publish() {
             kcomp_sdk::klog!("virtio_blk: publish block.device failed (rc={})", rc);
-            return rc;
+            return rc.code();
         }
         kcomp_sdk::klog!("virtio_blk test passed");
         break;

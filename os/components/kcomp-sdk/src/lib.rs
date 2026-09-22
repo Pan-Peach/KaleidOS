@@ -37,6 +37,8 @@ extern crate std;
 pub mod abi;
 pub mod binding;
 pub mod block;
+pub mod errno;
+pub mod filesystem;
 
 mod dma;
 mod logging;
@@ -48,6 +50,7 @@ mod alloc;
 mod panic;
 
 pub use dma::DmaDirection;
+pub use errno::{Errno, Result};
 pub use logging::{console_write_byte, log};
 
 #[cfg(test)]

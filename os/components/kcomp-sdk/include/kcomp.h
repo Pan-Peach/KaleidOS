@@ -254,6 +254,31 @@ struct kcomp_block_device_api {
 _Static_assert(sizeof(struct kcomp_block_device_api) == 3 * sizeof(void *),
                "block.device 字段个数 / 顺序漂移（vs Rust BlockDeviceApi）");
 
+
+#define KCOMP_FILESYSTEM_NAME "filesystem"
+#define KCOMP_FILESYSTEM_ABI UINT64_C(0x46494C4553595354) /* ASCII "FILESYST" */
+
+/* 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。 */
+#define KCOMP_FILESYSTEM_OPEN_READ UINT32_C(0x00000001)
+
+/* Filesystem 的 function table */
+
+struct kcomp_filesystem_api {
+
+    int32_t (*mount)(void *ctx);
+
+    int32_t (*unmount)(void *ctx);
+
+    /* `path` 是以 NUL 结尾的、相对于该 filesystem root 的路径。 */
+    int32_t (*open)(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle);
+    int32_t (*close)(void *ctx, uint64_t handle);
+
+    int32_t (*read)(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read);
+};
+
+_Static_assert(sizeof(struct kcomp_filesystem_api) == 5 * sizeof(void *),
+               "filesystem api layout drift");
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,15 +10,13 @@ use kcomp_sdk::abi::{
     kcore_task_exit, kcore_task_start, kcore_task_state, kcore_task_yield,
 };
 use kcomp_sdk::binding::{self, InterfaceKind, SCHEDULER_POLICY_ABI};
+use kcomp_sdk::errno::Errno;
 
 use super::report::Checks;
 use super::trace;
 
 /// `TaskState::Exited` 的编码（Core `kcore_task_state` 契约）。
 const STATE_EXITED: i32 = 4;
-
-/// Core `errno.rs` 稳定数值的镜像（本组只断言，不解释）。
-const EFAULT: i32 = -14;
 
 /// 任务体迭代数：3 轮 yield 后各自计数必须为 3（host-testable 的纯常量）。
 const EXPECTED_ITERS: usize = 3;
@@ -122,7 +120,7 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     checks.check(
         29,
         "task-entry-out-of-image",
-        rogue == EFAULT && tasks_after == tasks_before,
+        rogue == Errno::EFAULT.code() && tasks_after == tasks_before,
     );
 
     // 调度器接口已发布/绑定且 provider 存活（发布发生在 scheduler_rr 的 init）。

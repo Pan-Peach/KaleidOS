@@ -22,10 +22,8 @@ mod sched;
 mod trace;
 
 use kcomp_sdk::abi;
+use kcomp_sdk::errno::Errno;
 use report::Checks;
-
-/// Core `errno.rs` 稳定数值的镜像（实例状态分配失败）。
-const ENOMEM: i32 = -12;
 
 // 实例创建入口（C ABI，`docs/component-lifecycle.md` §4）。
 //
@@ -40,7 +38,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // SAFETY: 纯分配调用，无所有权语义；成功 = 按 align 对齐的 size 字节，失败 = NULL。
     let raw = unsafe { abi::kcore_heap_alloc(size, align) };
     if raw.is_null() {
-        return ENOMEM;
+        return Errno::ENOMEM.code();
     }
     let state = raw.cast::<sched::State>();
     // 逐字段初始化而非 `ptr::write`：不产生任何 memcpy/memset libcall，保持

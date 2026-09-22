@@ -21,15 +21,10 @@ use kcomp_sdk::abi::{
     kcore_dma_map, kcore_dma_unmap, kcore_irq_disable, kcore_irq_enable, kcore_irq_register,
     kcore_irq_release,
 };
+use kcomp_sdk::errno::Errno;
 
 use super::report::Checks;
 use super::trace;
-
-/// Core `errno.rs` 稳定数值的镜像（本组只断言，不解释）。
-const ENOENT: i32 = -2;
-const EBUSY: i32 = -16;
-const ENODEV: i32 = -19;
-const EINVAL: i32 = -22;
 
 /// VirtIO MMIO transport 的 MagicValue（VirtIO 规范，设备身份而非平台事实）。
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
@@ -96,7 +91,9 @@ pub fn group(checks: &mut Checks) -> Outcome {
     checks.check(
         12,
         "device-double-claim",
-        claimed && unsafe { kcore_device_claim(virtio_device, &mut dup, &mut dup_len) } == EBUSY,
+        claimed
+            && unsafe { kcore_device_claim(virtio_device, &mut dup, &mut dup_len) }
+                == Errno::EBUSY.code(),
     );
 
     // --- UART：claim 后用于 IRQ / DMA ---
@@ -112,7 +109,7 @@ pub fn group(checks: &mut Checks) -> Outcome {
     checks.check(
         13,
         "irq-enable-order",
-        uart_claimed && unsafe { kcore_irq_enable(uart_device) } == EINVAL,
+        uart_claimed && unsafe { kcore_irq_enable(uart_device) } == Errno::EINVAL.code(),
     );
 
     let irq_registered = uart_claimed
@@ -129,12 +126,12 @@ pub fn group(checks: &mut Checks) -> Outcome {
     checks.check(
         15,
         "device-release-busy",
-        irq_registered && unsafe { kcore_device_release(uart_device) } == EBUSY,
+        irq_registered && unsafe { kcore_device_release(uart_device) } == Errno::EBUSY.code(),
     );
 
     // --- IRQ release：撤销 route 后重复释放 → -EINVAL（该设备已无 route）。 ---
     let irq_released = irq_registered && unsafe { kcore_irq_release(uart_device) } == 0;
-    let irq_double = unsafe { kcore_irq_release(uart_device) } == EINVAL;
+    let irq_double = unsafe { kcore_irq_release(uart_device) } == Errno::EINVAL.code();
     checks.check(16, "irq-release", irq_released && irq_double);
 
     // --- Device release：释放后同一设备可被再次认领（无 quarantine）。 ---
@@ -199,13 +196,14 @@ pub fn group(checks: &mut Checks) -> Outcome {
     checks.check(
         20,
         "dma-invalid-size",
-        unsafe { kcore_dma_alloc(0, &mut zero_ptr, &mut zero_len) } == EINVAL,
+        unsafe { kcore_dma_alloc(0, &mut zero_ptr, &mut zero_len) } == Errno::EINVAL.code(),
     );
 
     // 拒绝路径：不存在的 ordinal 是 discovery 的唯一终止信号 → -ENOENT。
     let mut missing = 0u32;
     let miss = unsafe {
-        kcore_device_nth(b"ns16550a".as_ptr(), b"ns16550a".len(), 1, &mut missing) == ENOENT
+        kcore_device_nth(b"ns16550a".as_ptr(), b"ns16550a".len(), 1, &mut missing)
+            == Errno::ENOENT.code()
     };
     checks.check(21, "device-ordinal-miss", miss);
 
@@ -213,7 +211,7 @@ pub fn group(checks: &mut Checks) -> Outcome {
     checks.check(
         22,
         "device-release-unclaimed",
-        unsafe { kcore_device_release(rtc_device) } == ENODEV,
+        unsafe { kcore_device_release(rtc_device) } == Errno::ENODEV.code(),
     );
 
     // 清理：释放 virtio claim（其 trace revoke 也在本组窗口内）。

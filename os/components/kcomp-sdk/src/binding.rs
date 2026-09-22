@@ -9,6 +9,7 @@
 //! 动态类型——KernelNative phase 1 就是 typed `#[repr(C)]` function table + direct call。
 
 use crate::abi;
+use crate::errno::{Errno, Result};
 
 /// Exact ABI fingerprint（`#[repr(transparent)] u64`，**无版本兼容语义**）。
 /// 与 Core `component::interface::InterfaceAbi` 镜像。
@@ -95,12 +96,12 @@ impl<S: Service> Copy for ServiceBinding<S> {}
 
 impl<S: Service> ServiceBinding<S> {
     /// 按 `S` 的契约绑定（Core exact-compare ABI + 验证 provider）。
-    pub fn bind() -> Result<Self, i32> {
+    pub fn bind() -> Result<Self> {
         Ok(Self::from_raw(bind(S::NAME, S::KIND, S::ABI)?))
     }
 
     /// 用已有 binding id refresh：Core 重新验证 provider 后返回最新快照。
-    pub fn refresh(&mut self) -> Result<(), i32> {
+    pub fn refresh(&mut self) -> Result<()> {
         let raw = refresh(self.binding, S::ABI)?;
         self.api = raw.api as *const S::Api;
         self.ctx = raw.ctx as *mut ();
@@ -153,7 +154,7 @@ pub unsafe fn publish(
     abi: InterfaceAbi,
     api: *const (),
     ctx: *mut (),
-) -> Result<(), i32> {
+) -> Result<()> {
     // SAFETY: 调用方保证 api/ctx 契约（见函数 Safety）。
     let status = unsafe {
         abi::kcore_interface_publish(
@@ -165,7 +166,11 @@ pub unsafe fn publish(
             ctx,
         )
     };
-    if status == 0 { Ok(()) } else { Err(status) }
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_code(status))
+    }
 }
 
 /// 类型化 publish：provider 发布 `S` 的 `#[repr(C)]` function table。
@@ -173,7 +178,7 @@ pub unsafe fn publish(
 /// # Safety
 /// 同 [`publish`]：`api` 必须指向 `'static` 且布局 = `S::Api` 的 function table，
 /// `ctx` 必须是 provider 存活期内有效的 opaque state。
-pub unsafe fn publish_service<S: Service>(api: *const S::Api, ctx: *mut ()) -> Result<(), i32> {
+pub unsafe fn publish_service<S: Service>(api: *const S::Api, ctx: *mut ()) -> Result<()> {
     // SAFETY: 调用方保证 `api` 布局 = `S::Api`（见 Safety）。
     unsafe { publish(S::NAME, S::KIND, S::ABI, api as *const (), ctx) }
 }
@@ -191,13 +196,13 @@ pub unsafe fn publish_named<S: Service>(
     name: &[u8],
     api: *const S::Api,
     ctx: *mut (),
-) -> Result<(), i32> {
+) -> Result<()> {
     // SAFETY: 调用方保证 `api` 布局 = `S::Api`（见 Safety）。
     unsafe { publish(name, S::KIND, S::ABI, api as *const (), ctx) }
 }
 
 /// consumer 按名 bind：Core exact-compare ABI + 验证 provider 后返回当前快照。
-pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBinding, i32> {
+pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBinding> {
     let (mut binding, mut api, mut ctx, mut generation) = (0u64, 0usize, 0usize, 0u64);
     // SAFETY: (name_ptr, len) 与四个 out 在本帧内有效；Core 写入 out。
     let status = unsafe {
@@ -220,7 +225,7 @@ pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBi
             generation,
         })
     } else {
-        Err(status)
+        Err(Errno::from_code(status))
     }
 }
 
@@ -228,13 +233,13 @@ pub fn bind(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> Result<RawBi
 ///
 /// 与 [`ServiceBinding::bind`] 的唯一区别是名字：单例角色用固定 `S::NAME`，
 /// 多实例场景用组合策略分配的 endpoint 名（provider 侧对应 [`publish_named`]）。
-pub fn bind_named<S: Service>(name: &[u8]) -> Result<ServiceBinding<S>, i32> {
+pub fn bind_named<S: Service>(name: &[u8]) -> Result<ServiceBinding<S>> {
     Ok(ServiceBinding::from_raw(bind(name, S::KIND, S::ABI)?))
 }
 
 /// consumer 用已有 binding id refresh：Core exact-compare ABI + 重新验证
 /// provider 后返回最新快照（provider replacement 后无需 ELF reload）。
-pub fn refresh(binding: u64, abi: InterfaceAbi) -> Result<RawBinding, i32> {
+pub fn refresh(binding: u64, abi: InterfaceAbi) -> Result<RawBinding> {
     let (mut api, mut ctx, mut generation) = (0usize, 0usize, 0u64);
     // SAFETY: 三个 out 在本帧内有效；Core 写入 out。
     let status = unsafe {
@@ -248,7 +253,7 @@ pub fn refresh(binding: u64, abi: InterfaceAbi) -> Result<RawBinding, i32> {
             generation,
         })
     } else {
-        Err(status)
+        Err(Errno::from_code(status))
     }
 }
 
@@ -367,3 +372,10 @@ impl Service for DriverProber {
 // `binding::BlockDeviceApi` 保持不变。
 
 pub use crate::block::{BLOCK_DEVICE_ABI, BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceApi};
+pub use crate::filesystem::{
+    FileSystem,
+    FileSystemApi,
+    FILESYSTEM_ABI,
+    FILESYSTEM_NAME,
+    FILESYSTEM_OPEN_READ,
+};

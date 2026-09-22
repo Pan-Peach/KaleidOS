@@ -637,6 +637,7 @@ fn classifiers_reject_unknown_types_and_accept_fn_aliases() {
 
 /// 组件间契约的 Rust 侧（function table + ABI 常量）。
 const SDK_BLOCK_SRC: &str = include_str!("../../components/kcomp-sdk/src/block.rs");
+const SDK_FILESYSTEM_SRC: &str = include_str!("../../components/kcomp-sdk/src/filesystem.rs");
 /// `InterfaceKind` 的 ABI 编码（Rust 侧）。
 const SDK_BINDING_SRC: &str = include_str!("../../components/kcomp-sdk/src/binding.rs");
 
@@ -903,6 +904,53 @@ fn block_device_constants_match_across_c_and_rust() {
 }
 
 #[test]
+fn filesystem_fn_table_layout_matches_across_c_and_rust() {
+    let c = parse_c_fn_table(&strip_comments(HEADER_SRC), "kcomp_filesystem_api");
+    let r = parse_rust_fn_table(&strip_comments(SDK_FILESYSTEM_SRC), "FileSystemApi");
+
+    let c_names: Vec<_> = c.iter().map(|(n, _)| n.clone()).collect();
+    let r_names: Vec<_> = r.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(c_names, r_names, "filesystem function table 字段名 / 顺序漂移");
+
+    let c_map: BTreeMap<_, _> = c.into_iter().collect();
+    let r_map: BTreeMap<_, _> = r.into_iter().collect();
+    let mut problems = Vec::new();
+    compare_signatures("kcomp.h", &c_map, "filesystem.rs", &r_map, &mut problems);
+    assert!(
+        problems.is_empty(),
+        "filesystem function table 布局漂移：\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn filesystem_constants_match_across_c_and_rust() {
+    let c = strip_comments(HEADER_SRC);
+    let r = strip_comments(SDK_FILESYSTEM_SRC);
+
+    let c_name = extract_first_string(
+        &extract_c_define(&c, "KCOMP_FILESYSTEM_NAME")
+            .expect("kcomp.h 缺 KCOMP_FILESYSTEM_NAME"),
+    );
+    let r_name = extract_first_string(
+        &extract_rust_const_expr(&r, "FILESYSTEM_NAME")
+            .expect("filesystem.rs 缺 FILESYSTEM_NAME"),
+    );
+    assert_eq!(c_name, r_name, "filesystem 名字漂移");
+
+    let c_abi = parse_u64_literal(
+        &extract_c_define(&c, "KCOMP_FILESYSTEM_ABI")
+            .expect("kcomp.h 缺 KCOMP_FILESYSTEM_ABI"),
+    );
+    let r_abi = parse_u64_literal(
+        &extract_rust_const_expr(&r, "FILESYSTEM_ABI")
+            .expect("filesystem.rs 缺 FILESYSTEM_ABI"),
+    );
+    assert_eq!(c_abi, r_abi, "filesystem ABI 指纹漂移");
+    assert_eq!(c_abi, Some(0x4649_4C45_5359_5354));
+}
+
+#[test]
 fn c_fn_table_parser_reads_function_pointer_fields() {
     let src = strip_comments(
         "struct demo_api {\n    uint64_t (*cap)(void *ctx);\n    int32_t (*read)(void *ctx, uint64_t lba, uint8_t *buf, size_t len);\n};\n",
@@ -941,4 +989,64 @@ pub struct DemoApi {
         vec![Width::Ptr, Width::W64, Width::Ptr, Width::Ptr]
     );
     assert_eq!(fields[1].1.ret, Width::W32);
+}
+
+// ===========================================================================
+// ABI 错误码（errno）：Core ↔ SDK ↔ C 三方同值
+// ---------------------------------------------------------------------------
+// 现成的 no_std errno crate 全部门控在 hosted/Linux，裸机没有可用实现，所以编号
+// 由我们自己持有——那就必须保证三份（Core 内部 / 组件 SDK / C shim）**逐值一致**，
+// 否则组件按 -Errno 判断会与 Core 实际返回对不上。
+// ===========================================================================
+
+const CORE_ERRNO_SRC: &str = include_str!("../src/errno.rs");
+const SDK_ERRNO_SRC: &str = include_str!("../../components/kcomp-sdk/src/errno.rs");
+const C_ERRNO_HEADER: &str = include_str!("../../components/kcomp-sdk/include/errno.h");
+
+/// 扫描 C 头里的 `#define E<NAME> <number>`（POSIX errno 常量；跳过 `KCOMP_*` 等）。
+fn extract_c_errno_defines(stripped: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in stripped.lines() {
+        let Some(rest) = line.trim().strip_prefix("#define") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let is_errno_name = name.starts_with('E')
+            && name[1..]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if is_errno_name && let Some(number) = parse_u64_literal(value) {
+            out.insert(name.to_string(), number);
+        }
+    }
+    out
+}
+
+#[test]
+fn errno_table_matches_across_core_sdk_and_c() {
+    let core = extract_enum_values(&strip_comments(CORE_ERRNO_SRC), "enum Errno");
+    let sdk = extract_enum_values(&strip_comments(SDK_ERRNO_SRC), "enum Errno");
+    let c = extract_c_errno_defines(&strip_comments(C_ERRNO_HEADER));
+
+    assert!(
+        core.len() >= 100,
+        "errno 表只解析出 {} 项（解析器坏了或表被截断）",
+        core.len()
+    );
+    assert_eq!(core, sdk, "Core ↔ SDK errno 表漂移");
+    assert_eq!(core, c, "Core ↔ C errno 表漂移");
+}
+
+#[test]
+fn c_errno_define_parser_reads_values() {
+    let src =
+        strip_comments("#define EINVAL 22\n#define ENOENT 2\n#define KCOMP_X 9\n#define EMPTY\n");
+    let m = extract_c_errno_defines(&src);
+    assert_eq!(m.get("EINVAL"), Some(&22));
+    assert_eq!(m.get("ENOENT"), Some(&2));
+    assert_eq!(m.get("KCOMP_X"), None);
+    assert_eq!(m.len(), 2);
 }

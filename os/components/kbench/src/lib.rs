@@ -36,6 +36,7 @@ mod trace;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 
 use kcomp_sdk::abi;
+use kcomp_sdk::errno::Errno;
 
 #[cfg(test)]
 extern crate std;
@@ -54,9 +55,6 @@ const WARMUP_BATCHES: u64 = 4;
 const CLOCK_PROBE_READS: u64 = 1024;
 /// bracket 开销估计用的空 batch 次数。
 const BRACKET_SAMPLES: u64 = 64;
-/// 共享堆分配失败（`kcore_heap_alloc` 返回空指针）时 create 的返回值。
-/// 与 Core `Errno::ENOMEM.code() == -12` 一致；create 失败走 Failed 路径。
-const ENOMEM: i32 = -12;
 
 /// 一次运行共享的环境/计划（所有 primitive 用同一份时钟刻画）。
 #[derive(Clone, Copy)]
@@ -272,7 +270,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // SAFETY: 纯分配调用，无所有权语义；成功 = 按 align 对齐的 size 字节，失败 = NULL。
     let state_ptr = unsafe { abi::kcore_heap_alloc(size, align) };
     if state_ptr.is_null() {
-        return ENOMEM;
+        return Errno::ENOMEM.code();
     }
     let state = state_ptr as *mut State;
     // SAFETY: 刚分配、独占、对齐满足 State；一次写入完成初始化。

@@ -10,15 +10,10 @@ use core::cell::UnsafeCell;
 
 use kcomp_sdk::abi;
 use kcomp_sdk::binding::{self, DriverProber, DriverProberApi};
+use kcomp_sdk::errno::Errno;
 
 use crate::cursor::{AssignmentCursor, ReportError};
 use crate::directory::{CANDIDATES, CandidateSet};
-
-/// Core errno 约定（`0` / `-errno`；见 os/core/src/errno.rs）。
-const ENOENT: i32 = -2;
-const ENOMEM: i32 = -12;
-const EFAULT: i32 = -14;
-const EINVAL: i32 = -22;
 
 /// 每实例状态：create 分配一次，实例存活期内地址稳定。
 ///
@@ -91,10 +86,10 @@ extern "C" fn next_assignment(
     out_device_id: *mut u32,
 ) -> i32 {
     if out_attempt.is_null() || out_device_id.is_null() {
-        return EFAULT;
+        return Errno::EFAULT.code();
     }
     if driver_name.is_null() {
-        return EINVAL;
+        return Errno::EINVAL.code();
     }
     let state = state_ptr(ctx);
     // SAFETY: 调用方保证 (ptr, len) 在调用期间有效（C ABI 契约）。
@@ -109,7 +104,7 @@ extern "C" fn next_assignment(
             }
             0
         }
-        None => ENOENT,
+        None => Errno::ENOENT.code(),
     }
 }
 
@@ -119,8 +114,8 @@ extern "C" fn report_attempt(ctx: *mut (), attempt: u32, outcome: i32, detail: u
     // SAFETY: ctx 是 create 发布的本实例 state；短借不跨 kcore_* 调用。
     match unsafe { cursor_mut(state) }.report(attempt, outcome, detail) {
         Ok(()) => 0,
-        Err(ReportError::UnknownAttempt) => ENOENT,
-        Err(ReportError::NotHanded | ReportError::AlreadyReported) => EINVAL,
+        Err(ReportError::UnknownAttempt) => Errno::ENOENT.code(),
+        Err(ReportError::NotHanded | ReportError::AlreadyReported) => Errno::EINVAL.code(),
     }
 }
 
@@ -209,7 +204,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     };
     if state.is_null() {
         kcomp_sdk::klog!("driver_prober: state allocation failed");
-        return ENOMEM;
+        return Errno::ENOMEM.code();
     }
     let state = state.cast::<ProberState>();
     // SAFETY: 刚分配、无别名；ptr::write 直接放置初始值（不读旧值）。
@@ -225,7 +220,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     if unsafe { set(state) }.is_empty() {
         kcomp_sdk::klog!("driver_prober: empty candidate directory");
         unsafe { free_state(state) };
-        return ENOENT;
+        return Errno::ENOENT.code();
     }
 
     // 2) staged publish assignment Service（Core 在 create 返回 0 后原子提交）；
@@ -239,9 +234,12 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         )
     };
     if let Err(status) = published {
-        kcomp_sdk::klog!("driver_prober: publish driver.prober failed");
+        kcomp_sdk::klog!(
+            "driver_prober: publish driver.prober failed (rc={})",
+            status
+        );
         unsafe { free_state(state) };
-        return status;
+        return status.code();
     }
 
     // 3) 有限 dispatch 任务：create 返回、接口 commit、prober Ready 之后才运行；
