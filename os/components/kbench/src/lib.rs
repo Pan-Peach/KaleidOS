@@ -16,7 +16,7 @@
 //! 诚实声明：批量计时修正的是"读钟粒度 + 计时开销占比"，**不能**把 QEMU TCG
 //! 变成真实 CPU。min 只是"观测到的最快 batch"，不是精度证明；五轮最小值相同
 //! 可能只是落在同一个量化格子里。真实上下文切换 / IRQ 延迟的绝对性能要在
-//! 真机测（见 docs/benchmark.md）。
+//! 真机测（见 docs/development/benchmark.md）。
 //!
 //! primitive 分两类：
 //! - **无额外 authority**：时钟 / 只读查询（锚点上下文直接跑）；
@@ -68,7 +68,7 @@ struct Context {
 
 /// 一次 benchmark 运行的 per-instance 可变状态（Core 共享堆分配）。
 ///
-/// 全部从 image-global `static` 迁入这里（`docs/component-lifecycle.md` §10）：
+/// 全部从 image-global `static` 迁入这里（`docs/architecture/component-lifecycle.md` §10）：
 /// 组件代码常驻，实例状态来自显式分配；create 返回本分配的不透明指针，
 /// destroy 释放。state 指针只经 task `arg` / IRQ handler `ctx` 传递，不落回
 /// image-global static。
@@ -258,7 +258,7 @@ fn run_primitive_observed<F: FnMut() -> u64>(
     report::key_str("status", tail());
 }
 
-// 实例创建入口（C ABI，`docs/component-lifecycle.md` §4）。
+// 实例创建入口（C ABI，`docs/architecture/component-lifecycle.md` §4）。
 //
 // `0` = 成功（`*out_state` = 本实例 state）；负 errno = 失败，Core 走 Failed 且
 // **不会**调用 destroy（构造期清理由本入口负责）。
@@ -279,7 +279,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     unsafe { *out_state = state as *mut () };
 
     // 组合策略：单例。并发 benchmark 会互相污染 CPU/时钟/调度器/UART 的测量
-    // （见 State 文档与 docs/component-lifecycle.md §10）；不实现多实例并发。
+    // （见 State 文档与 docs/architecture/component-lifecycle.md §10）；不实现多实例并发。
 
     let timebase_hz = unsafe { abi::kcore_timebase_hz() };
     // 1 ms 的批时长 cap（policy 参数，报告里写出）；换算不用除法：RV32 上
@@ -346,7 +346,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     0
 });
 
-// 实例析构入口（C ABI，`docs/component-lifecycle.md` §4）：Core 停止路径调用。
+// 实例析构入口（C ABI，`docs/architecture/component-lifecycle.md` §4）：Core 停止路径调用。
 //
 // 本组件在 create 内**同步**建立并释放所有任务 / IRQ / lease（见 `sched` / `irq`
 // 模块头）；destroy 先 [`irq::quiesce`] 兜底（释放残留 authority、清 handler 的

@@ -50,7 +50,7 @@ const VERIFY_NAME: &str = "sched.yield_roundtrip.verify";
 const STUCK_SLACK: usize = 8;
 
 // sched 的 per-run 状态已迁入 `crate::State`（任务 id / handoff 计数 / 测量
-// context），不再有 image-global static（docs/component-lifecycle.md §10）。
+// context），不再有 image-global static（docs/architecture/component-lifecycle.md §10）。
 // 单 CPU 也不构成放开 `&mut` 别名的理由：任务 A/B 与锚点共享同一地址空间，
 // 跨任务访问仍走原子字段 / state 指针。
 

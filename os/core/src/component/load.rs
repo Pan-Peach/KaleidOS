@@ -7,7 +7,7 @@
 //! 加载流程本身属于 Core（monitor 不是 ComponentManager）。完整依赖解析、
 //! kpkg manifest requires、失败回滚留给真正的 ComponentManager 里程碑。
 //!
-//! # 一份 image，N 个实例（`docs/component-lifecycle.md` §2/§3）
+//! # 一份 image，N 个实例（`docs/architecture/component-lifecycle.md` §2/§3）
 //!
 //! 同名 artifact 再次创建**复用已登记的 image**（新实例、新 `ComponentId`、新
 //! state），不再拒绝；image 登记进 `component/image.rs` 的 image 表并 pinned 到重启。

@@ -26,7 +26,7 @@ const uint64_t kcomp_abi = 0x4B434F4D50414249ULL;
 
 int32_t kcomp_instance_create(const struct KcompCreateArgs *args, void **out_state) {
     (void)args;
-    /* 无状态组件：成功返回且保持 Core 初始化的 NULL（见 docs/component-lifecycle.md）。 */
+    /* 无状态组件：成功返回且保持 Core 初始化的 NULL（见 docs/architecture/component-lifecycle.md）。 */
     *out_state = (void *)0;
 
     static const char hello[] = "[c-smoke] hello from C";

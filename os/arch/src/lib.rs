@@ -52,7 +52,7 @@ pub mod fake;
 // riscv 模块在所有目标都编译，但内部子模块按依赖门控：
 // - ISA/asm 子模块（cpu/context/trap/firmware/console）只在真实 RISC-V 目标；
 // - 纯算法子模块（elf 重定位、mmu 页表编码）host 也可编译 —— host 测试直接测
-//   生产实现，而不是一份复制算法（见 docs/testing.md）。
+//   生产实现，而不是一份复制算法（见 docs/development/testing.md）。
 // boot 期的内核页表策略（identity + high-half 双映射、段权限、临时 root）在
 // boot crate `vm/`，不属于 arch。
 pub mod riscv;
@@ -146,7 +146,7 @@ pub trait Timer {
 /// 外部中断控制器（PLIC）机制（C6 骨架）。
 ///
 /// 与 `Timer`/`Console`/`SystemReset` 同一模式：Core 只依赖本 trait 与
-/// `InterruptImpl`，不感知 PLIC 寄存器布局。`docs/architecture.md` §3 把中断
+/// `InterruptImpl`，不感知 PLIC 寄存器布局。`docs/architecture/overview.md` §3 把中断
 /// 控制器的长期定位写成「驱动（由 discovery 发现）」——现阶段先把机制放在
 /// arch（同 CLINT/timer 的处理方式），未来降级为 Driver Component 时 Core 侧
 /// 调用点不变，只换 backend 实现。

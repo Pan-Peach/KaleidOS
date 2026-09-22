@@ -49,7 +49,7 @@ CASES = (
     ("load-fault", 13, None),
     ("store-readonly", 15, None),
     ("execute-nx", 12, None),
-    # docs/testing.md §2: "TLB flush 是否正确" — a remap (and an invalidation)
+    # docs/development/testing.md §2: "TLB flush 是否正确" — a remap (and an invalidation)
     # must become visible only after sfence.vma; tlb-invalidate faults like
     # load-fault but fills the TLB first, so it additionally proves the stale
     # translation is gone.

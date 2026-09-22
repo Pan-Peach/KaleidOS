@@ -2,7 +2,7 @@
 **/target/
 /build/
 # Kconfig working state: `.config` and its generated fragment are build
-# artifacts.  The committed profiles are configs/*_defconfig (see docs/kconfig.md).
+# artifacts.  The committed profiles are configs/*_defconfig (see docs/architecture/kconfig.md).
 .config*
 kaleidos-*
 .omo/

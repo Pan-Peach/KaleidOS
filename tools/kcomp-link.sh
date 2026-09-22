@@ -20,7 +20,7 @@
 #   READELF   符号/重定位读取（默认 llvm-readelf）
 #
 # 入口契约（loader 侧见 os/core/src/component/loader.rs；坐标系：
-# docs/component-lifecycle.md §4）：
+# docs/architecture/component-lifecycle.md §4）：
 #   kcomp_instance_create   必须 DEFINED（STT_FUNC）
 #   kcomp_instance_destroy  必须 DEFINED（STT_FUNC）
 #   kcomp_abi               必须 DEFINED（8 字节 STT_OBJECT；Core 校验其值）
@@ -54,7 +54,7 @@ if [ ! -x "$lld" ]; then
 fi
 
 # -u 钉住组件生命周期入口：--gc-sections 会丢掉「未被引用」的入口段，三个符号
-# 都是**必需导出**（docs/component-lifecycle.md §4），缺失 = packer 立即失败。
+# 都是**必需导出**（docs/architecture/component-lifecycle.md §4），缺失 = packer 立即失败。
 force=(-u kcomp_instance_create -u kcomp_instance_destroy -u kcomp_abi)
 
 # partial link：只抽可达成员、GC 未引用段。--no-relax 避免 R_RISCV_ALIGN

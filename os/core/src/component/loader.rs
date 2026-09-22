@@ -4,7 +4,7 @@
 //! and linked-address handling live in the selected `arch` backend; this module owns the Core
 //! policy around memory, exports, and component entry points.
 //!
-//! # 必需符号（`docs/component-lifecycle.md` §4，协调替换）
+//! # 必需符号（`docs/architecture/component-lifecycle.md` §4，协调替换）
 //!
 //! ```text
 //! kcomp_instance_create(const struct KcompCreateArgs *args, void **out_state) -> i32
@@ -560,7 +560,7 @@ mod tests {
     ///   还回去，否则会耗尽测试堆 —— 因此它的数字里**含一次 region 释放**。
     ///
     /// 还缺 `kcomp_instance_create` 执行与 `registry.declare/resolve`（要全局
-    /// registry），与 target 侧一起做（见 docs/benchmark.md §6）。
+    /// registry），与 target 侧一起做（见 docs/development/benchmark.md §6）。
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
     fn bench_component_load_phases() {

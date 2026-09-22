@@ -406,7 +406,7 @@ fn execute_nx_fault() -> ! {
     fail("NX execute returned")
 }
 
-/// TLB flush ArchTest（docs/testing.md §2「TLB flush 是否正确」）。
+/// TLB flush ArchTest（docs/development/testing.md §2「TLB flush 是否正确」）。
 ///
 /// 在**活动** satp 页表里把同一个 VA 依次改指到两个不同的物理页，每次改完
 /// `sfence.vma`，然后读 VA：必须读到**新**后备页的标记。关键在中间那一步——

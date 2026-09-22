@@ -5,7 +5,7 @@
 //! 提议下一个 TaskId。**提议**是否被采纳由 Core 验证后决定——本组件永远
 //! 拿不到任务表、状态或任何 Core truth 的写权限。
 //!
-//! 实例生命周期（`docs/component-lifecycle.md` §3/§10）：cursor 是**实例状态**，
+//! 实例生命周期（`docs/architecture/component-lifecycle.md` §3/§10）：cursor 是**实例状态**，
 //! 在 `kcomp_instance_create` 里经 Core 共享堆分配，并作为服务 `ctx` 交给 Core；
 //! `choose_next` 经该 ctx 访问它。替换实例 = 全新分配 = 全新 cursor。
 //!

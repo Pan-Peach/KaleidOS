@@ -6,7 +6,7 @@
 
 /// DMA 传输方向。**这是 Component ABI 的一部分**：编码 `0/1/2`，与 Core
 /// `handle/dma.rs::DmaDirection::as_i32` 及 `kcore_dma_alloc` 的 `direction`
-/// 参数一致（见 `docs/driver-model.md` §6.2）。
+/// 参数一致（见 `docs/architecture/driver-model.md` §6.2）。
 ///
 /// 设备库的枚举（如 `virtio_drivers::BufferDirection`）到本枚举的映射写在**驱动
 /// 组件**里（纯类型匹配，不出现数字）。

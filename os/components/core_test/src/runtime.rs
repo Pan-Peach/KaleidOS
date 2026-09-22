@@ -1,6 +1,6 @@
 //! CoreTest 核内运行时：实例入口 + 报告分组编排。
 //!
-//! 入口契约见 `docs/component-lifecycle.md` §4：经 SDK 宏
+//! 入口契约见 `docs/architecture/component-lifecycle.md` §4：经 SDK 宏
 //! `kcomp_instance_create!` / `kcomp_instance_destroy!` 导出（参数标识符由调用点
 //! 给出，state 经 `*out_state` 交给 Core）。create 返回 `0`（core_test 的失败
 //! 位图作为返回值下发）/ `-errno`；destroy 释放本实例的状态分配，失败返回
@@ -25,10 +25,10 @@ use kcomp_sdk::abi;
 use kcomp_sdk::errno::Errno;
 use report::Checks;
 
-// 实例创建入口（C ABI，`docs/component-lifecycle.md` §4）。
+// 实例创建入口（C ABI，`docs/architecture/component-lifecycle.md` §4）。
 //
 // 返回值与旧的 `kcomp_init` 完全一致：`0` = 全部通过；非 0 = 失败位图。
-// 状态（`docs/component-lifecycle.md` §9）：`sched` 组的 A/B 迭代计数旧实现是
+// 状态（`docs/architecture/component-lifecycle.md` §9）：`sched` 组的 A/B 迭代计数旧实现是
 // `static mut`（image-global）；现在来自显式分配，指针经 `*out_state` 交 Core
 // 保管。分配失败 → `-ENOMEM`，走 Core 的 Failed 路径（构造期清理由本组件负责，
 // Core 不会调 destroy）。

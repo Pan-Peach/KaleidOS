@@ -1,10 +1,10 @@
 //! 组件**实例**注册表：已声明实例的真相 + 生命周期状态机。
 //!
-//! 身份模型（`docs/component-lifecycle.md` §2）：`ComponentId` 就是实例 ID
+//! 身份模型（`docs/architecture/component-lifecycle.md` §2）：`ComponentId` 就是实例 ID
 //! （不新增平行的 `ComponentInstanceId`）；常驻代码身份在 `component/image.rs`
 //! （`ComponentImageId`）。一个 image 可以有 N 个实例。
 //!
-//! 现行状态机（实现即契约，见 docs/component-model.md §5 全量生命周期）：
+//! 现行状态机（实现即契约，见 docs/architecture/component-model.md §5 全量生命周期）：
 //!
 //! ```text
 //! Declared --resolve--> Resolved --begin_start--> Starting --finish_start--> Ready
@@ -23,7 +23,7 @@
 //! 只记录 pending，不修改 active binding）。`finish_start` 由 Core 在 create 返回 0、
 //! Core 记录 `instance_state`、且 pending interfaces 原子提交后调用（见
 //! `component/interface.rs`）。id 单调递增、不回收：组件实例 = 身份——失败恢复 =
-//! 全新实例（新 id），`ComponentId` 永不复用（component-model.md）。
+//! 全新实例（新 id），`ComponentId` 永不复用（docs/architecture/component-model.md）。
 
 use alloc::vec::Vec;
 
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(fresh.raw(), failed.raw() + 1);
     }
 
-    // -- Property tests（生命周期状态机；docs/testing.md §2 / component-model.md §5）--
+    // -- Property tests（生命周期状态机；docs/development/testing.md §2 / docs/architecture/component-model.md §5）--
     //
     // 对随机 declare / resolve / begin_start / finish_start / begin_stop /
     // finish_stop / mark_failed 序列，逐操作验证：

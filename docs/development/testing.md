@@ -211,7 +211,7 @@ Core 内提供 invariant check 机制：在关键路径断言不变式（如"同
   overwritten_total / enabled_mask）。
 - **开关**：`CONFIG_TRACE`（默认 `y`）。关掉时 `trace::emit` 是内联空操作 ——
   事件参数是纯值构造，会被编译器连同调用一起消除，热路径零成本。
-  **跑 benchmark 前应当关掉**（见 `docs/benchmark.md`）。编译期支持与运行时使能
+  **跑 benchmark 前应当关掉**（见 `docs/development/benchmark.md`）。编译期支持与运行时使能
   分开发现：编译期关闭时 `kcore_trace_read` 恒 `-ENOENT`、`enabled_mask == 0`；
   运行时 `enabled_mask` 报告哪些事件 kind 会被记录 —— 12 位掩码，bit i ↔ ABI
   kind i+1（`u64` 视图高位恒 0），默认全开 = `0x0fff`。

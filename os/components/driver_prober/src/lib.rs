@@ -14,7 +14,7 @@
 //! - 不包含 VirtIO 偏移、DeviceID 取值，或任何 MMIO 读；
 //! - `compatible` 对它是**不透明路由键**——只按字节相等匹配，绝不解释；
 //! - 最后的硬件匹配必须在驱动代码运行、且驱动持有 authority 之后才能完成，
-//!   所以这里只做 coarse candidate match（见 docs/driver-model.md §9.1 / §12 Q1）。
+//!   所以这里只做 coarse candidate match（见 docs/architecture/driver-model.md §9.1 / §12 Q1）。
 //!
 //! # 唯一通道是 assignment Service
 //!

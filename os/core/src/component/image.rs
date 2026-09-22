@@ -1,6 +1,6 @@
 //! 组件镜像表：一份**常驻加载的组件代码**的 Core 真相。
 //!
-//! 身份模型（`docs/component-lifecycle.md` §2）：
+//! 身份模型（`docs/architecture/component-lifecycle.md` §2）：
 //!
 //! ```text
 //! ComponentImageId  → 一次加载的代码：name / base / create / destroy / text_size / MemoryLease

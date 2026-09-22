@@ -19,5 +19,5 @@ kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
 
 // 析构入口：create 必然 panic → 实例永不进入 Ready，destroy 路径不会到达这里；
 // 显式 no-op 只为保持 ABI 形状（Core 对 panic / 未完整构造的实例不调 destroy，
-// 见 docs/component-lifecycle.md §3）。
+// 见 docs/architecture/component-lifecycle.md §3）。
 kcomp_sdk::kcomp_instance_destroy!(|_state| { 0 });

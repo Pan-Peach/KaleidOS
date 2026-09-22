@@ -1,4 +1,4 @@
-//! 结构化 Trace —— 断言与未来确定性重放的证据基础（见 docs/testing.md）。
+//! 结构化 Trace —— 断言与未来确定性重放的证据基础（见 docs/development/testing.md）。
 //!
 //! 记录形态：`TraceRecord { seq, timestamp, event }`，
 //! `seq` 为 Core 分配的单调序号（**断言排序依据**；`timestamp` 只作元数据）；

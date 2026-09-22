@@ -1,6 +1,6 @@
 # 组件生命周期与实例契约（冻结）
 
-> **状态：已冻结，实施中。** 本文件是所有并行迁移实现的**唯一依据**；与 `docs/component-model.md` 冲突时以本文件为准。
+> **状态：已冻结，实施中。** 本文件是所有并行迁移实现的**唯一依据**；与 `docs/architecture/component-model.md` 冲突时以本文件为准。
 > 决策来源：Oracle 架构评审（image/instance/domain 拆分）。**人类已确认接受评审版本**（含对原始提案的三处否决）。
 
 本文件只解决一件事：**把"一份加载的组件代码"与"一个跑起来的组件实例"分开**，并把组件 ABI 从"一次性 `kcomp_init`"改成"实例化"。
@@ -22,7 +22,7 @@
 
 | 拒绝项 | 原因 |
 |---|---|
-| 私有地址空间、域切换、syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 执行域是推迟的里程碑（`docs/roadmap.md`）；phase 1 只有 KernelNative |
+| 私有地址空间、域切换、syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 执行域是推迟的里程碑（`docs/development/roadmap.md`）；phase 1 只有 KernelNative |
 | 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
 | 通用资源转移/授予图、ResourceDomain 容器、per-component heap、内存计费 | 违反 `AGENTS.md`；所有权转移是推迟项 |
 | loader 复制 `.data/.bss`、跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | **见 §9：当前共享地址空间下，globals 仍是 image-global，per-instance 状态来自显式分配**。复制 BSS 不会重定向已按原 globals 完成重定位的指令 |

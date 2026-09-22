@@ -77,7 +77,7 @@ const MAX_DISCARDS: u64 = 64;
 const TIMEOUT_MS: u64 = 20;
 
 // handler 的入口戳 / SERVED 标记 / lease 基址已迁入 `crate::State` 的
-// `irq_entry_low`/`irq_served`/`irq_uart_lease` 字段（docs/component-lifecycle.md
+// `irq_entry_low`/`irq_served`/`irq_uart_lease` 字段（docs/architecture/component-lifecycle.md
 // §10）。handler 经 `kcore_irq_register` 的 `ctx` 拿到 state 指针读取它们——
 // 不再读 image-global static。区间远小于半程 2^31 tick，低位 wrapping 差值正确
 // （见 [`classify`]）；RV32/RV64 都只有 32 位原子，入口戳仍存低 32 位。

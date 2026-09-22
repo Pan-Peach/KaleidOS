@@ -4,7 +4,7 @@
 >
 > 本文件是**旧 Handle / Slot / ResourceTable / Lease / authority 资源模型**的审查记录（基线 commit `c833863`）。该模型已被**整块删除**，本文件中的 `Handle` / `Slot` / `ResourceTable` / `MmioHandle` / `IrqHandle` / `DmaHandle` / `MmioLease` / `DmaLease` / `HandleError` / `authority` / `handle/` 等词汇**全部属于已废弃模型**，不代表现状。
 >
-> 现行机制见 `docs/driver-model.md`：
+> 现行机制见 `docs/architecture/driver-model.md`：
 > - `DeviceId`（identity，非 handle）→ `kcore_device_claim`（记 owner + 返回本执行域 MMIO 窗口）；
 > - IRQ 锚点是已认领 `DeviceId`（`kcore_irq_register/enable/disable/release`，只走 native callback）；
 > - DMA `kcore_dma_alloc/free` 与 `kcore_dma_map/unmap` **分离**，mapping id 单调递增，撤销 backing 进 `QUARANTINE`。
@@ -13,7 +13,7 @@
 
 > 对象：`os/core/` 的数据结构、资源模型、鉴权模型、生命周期模型。
 > 依据：5 份代码盘点（handle/slot 表、鉴权与调用上下文、ResourceDomain 与 teardown、docs-vs-code、interface lease 与生命周期）+ Oracle 独立评审。
-> 基线：commit `c833863`（image/instance 拆分，`docs/component-lifecycle.md` 为已冻结的组件生命周期契约）。
+> 基线：commit `c833863`（image/instance 拆分，`docs/architecture/component-lifecycle.md` 为已冻结的组件生命周期契约）。
 > 结论：**提案的方向大体成立，但它的目标多半已经是现状；真正要做的三件事与提案的排序不同。**
 
 ---
@@ -22,10 +22,10 @@
 
 | 提案 | 裁定 | 依据 |
 |---|---|---|
-| §11「ResourceDomain 重复 truth，应降级」 | **已经是现状**：`ResourceDomain` 不是类型。文档写明"实现决策：第一版没有 struct"，并给了 `// ✗ 不要这样` 的反例 | `docs/component-model.md:128-180`、`handle/mod.rs:18`；代码零命中 |
+| §11「ResourceDomain 重复 truth，应降级」 | **已经是现状**：`ResourceDomain` 不是类型。文档写明"实现决策：第一版没有 struct"，并给了 `// ✗ 不要这样` 的反例 | `docs/architecture/component-model.md:128-180`、`handle/mod.rs:18`；代码零命中 |
 | §11「owner 存两份」 | **不成立**：所有权只存一处 `Slot.owner`。任务/地址空间各有自己的 owner——那是**不同对象**的 owner，不是重复记账 | `handle/generic.rs:78-82`、`task/record.rs:14`、`memory/address_space.rs:80` |
 | §12「Scheduler 不该拥有 TaskHandle / FrameHandle」 | **已满足，应表述为"保持"**：`TaskHandle`/`FrameHandle` 在代码里**不存在**；调度器已只收候选 ID 并提议，由 Core 验证 | `handle/mod.rs:17-18`、`sched.rs:152-182` |
-| §3「每个 Authority 必须是 XxxHandle 是错的」 | **需要修正的是文档措辞，不是结构**。handle 本身不携带 owner、也不是 authority，但**移除它不会带来安全收益**：typed ID 可以保住 generation/类型/O(1)。真正的错误是文档仍称 handle"不可伪造" | `handle/generic.rs:10-17,38-48`、`docs/core-philosophy.md:152-175` |
+| §3「每个 Authority 必须是 XxxHandle 是错的」 | **需要修正的是文档措辞，不是结构**。handle 本身不携带 owner、也不是 authority，但**移除它不会带来安全收益**：typed ID 可以保住 generation/类型/O(1)。真正的错误是文档仍称 handle"不可伪造" | `handle/generic.rs:10-17,38-48`、`docs/philosophy/core-philosophy.md:152-175` |
 | §10「Slot 泄漏成架构概念」 | **已经是现状**：`Slot` 是 `pub(crate)`，组件只见不透明 `u64` | `handle/generic.rs:78`、`handle/mod.rs:47-48` |
 | §4「CallContext 缺失」 | **方向对，但「没有 principal 机制」是错的**。create/destroy/task 执行**都**有 Core 建立的身份；缺的是**普通直调**与**IRQ 回调**的归属 | 见 §C.1 |
 | §8「需要 Grant」 | **净新增**，代码里完全没有跨 owner 授权 | `handle/table.rs:29-48`、`driver-model.md:403` |
@@ -88,7 +88,7 @@
 
 现状：create / destroy / task 执行**都有** Core 建立并恢复的归属（`containment.rs:299-336,376-390`）。**IRQ 回调这一半已由 §G step 3 关闭**（**不改任何 ABI**：无签名 / 布局 / 导出变更）；仍缺的是：
 
-- **普通直调**：A 调 B 的函数表，不安装任何边界 → `ambient()` 在 B 内解析为 **A**。这是**已冻结契约的有意选择**（`docs/component-lifecycle.md:182-191`：provider 应在自己的生命周期/任务上下文里获取资源）。
+- **普通直调**：A 调 B 的函数表，不安装任何边界 → `ambient()` 在 B 内解析为 **A**。这是**已冻结契约的有意选择**（`docs/architecture/component-lifecycle.md:182-191`：provider 应在自己的生命周期/任务上下文里获取资源）。
 - **IRQ 回调（已落地，step 3）**：`RouteOutcome::Callback` 的 `owner`（`irq/mod.rs:121-133`）现在经 `with_irq_scope` 安装归属 → 回调内 `ambient()` 解析为该线 owner、`task = None`，被中断的边界在回调返回后恢复；作用域内调度类调用返回 `-EINVAL`，回调 panic 保持致命。
 - **调度器策略回调**仍没有 provider scope（`sched.rs:177`）——盘点漏了这条，是 **step 4 的职责**。
 
@@ -225,7 +225,7 @@ Grant 会**打破**"设备 owner == IRQ owner == DMA owner"这个等式，于是
 | 6 | **MMIO Grant + 真实交接工作流 + 依赖清理同批**：attach 引导、owner/grantee 失败、子对象授权、root-release 检查、grant/resource generation 测试 | **协调替换** |
 | 7 | **停在休眠域工作之前**：跑完 host/构建/打包 + RV32/RV64 QEMU/ArchTest 门；地址空间激活、物理 unload、通用 delegation 继续推迟 | 无 |
 
-**每个改动 ABI 的单元**：`kcomp.h` + Rust 声明 + Core 导出 + 受影响指纹 + 组件**一起**改；拒绝陈旧产物、重建包（`kcomp.h` 已确立该契约，验证门见 `docs/component-lifecycle.md` 末节）。
+**每个改动 ABI 的单元**：`kcomp.h` + Rust 声明 + Core 导出 + 受影响指纹 + 组件**一起**改；拒绝陈旧产物、重建包（`kcomp.h` 已确立该契约，验证门见 `docs/architecture/component-lifecycle.md` 末节）。
 
 ### 明确拒绝
 

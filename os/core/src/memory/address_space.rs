@@ -519,7 +519,7 @@ mod tests {
         let _ = s.handle();
     }
 
-    // -- Property tests（Invariant A–D，docs/testing.md §5）---------------------
+    // -- Property tests（Invariant A–D，docs/development/testing.md §5）---------------------
     //
     // A: 任意时刻 ledger 中不存在 VA overlap
     // B: 失败操作后 Core truth == 操作前 Core truth（ledger 与 backend 都不变）
@@ -743,7 +743,7 @@ mod tests {
     ///
     /// `validate` 是私有的，只有 crate 内的 benchmark 能单独测到它 —— 这正是
     /// "先测 ledger、再测 backend" 的前提。真实页表 backend 的成本必须用 arch
-    /// 后端在目标端测（见 docs/benchmark.md §6）。
+    /// 后端在目标端测（见 docs/development/benchmark.md §6）。
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
     fn bench_address_space_paths() {

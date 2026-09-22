@@ -29,7 +29,7 @@ use crate::errno::{Errno, Result};
 // 契约：block.device —— 驱动提供的 Device Interface（provider: virtio_blk）
 // -----------------------------------------------------------------------
 //
-// docs/driver-model.md §9.1 ⑤：驱动 claim 完 MmioHandle / IrqHandle / DmaHandle
+// docs/architecture/driver-model.md §9.1 ⑤：驱动 claim 完 MmioHandle / IrqHandle / DmaHandle
 // 后向 Component Interface Registry provides 本接口，供上层 Service（未来的
 // FS 等）bind 消费。契约只在本 SDK 定义（provider 是驱动组件，KIND = Device）；
 // Core 不认识该接口语义，只存 api/ctx 指针 + exact ABI，与 `driver.prober` 同类。

@@ -115,7 +115,7 @@ fn transport_trace_capacity(out: &Path) {
         Ok(capacity) => capacity,
         Err(error) => panic!(
             "CONFIG_TRACE_CAPACITY={raw:?} is not a valid resolved Kconfig value: \
-             {error:?} (bare-metal builds get it from `make kernel`; see docs/kconfig.md)"
+             {error:?} (bare-metal builds get it from `make kernel`; see docs/architecture/kconfig.md)"
         ),
     };
     fs::write(

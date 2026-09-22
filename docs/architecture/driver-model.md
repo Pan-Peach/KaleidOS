@@ -415,7 +415,7 @@ runtime:
 - 多 MSI-X vector / shared IRQ line 的身份表示（真实需求出现再加 `irq_index` 或动态 IRQ 身份）；
 - `RequestContext.task` 在非任务上下文的 IRQ / 设备路径上恒为 `None` 的精确契约；
 - **组件间设备 ownership 转移 —— 仍然刻意 deferred**：让一个总线组件把已认领的设备交给另一个 driver，需要 Core 支持跨组件所有权转移 + 组件寻址（组件彼此拿不到 `ComponentId`）。当前用"prober 交选择数据（`DeviceId`）、driver 在自己的执行上下文里 claim 同一设备"解决设备选择；真正的 ownership 转移属"完整 capability 系统"，语义未定（move / copy、能否降权、能否再传递、撤销如何传播）；
-- **动态驱动更换 / 更新 —— 刻意 deferred（独立里程碑）**：re-probe 只是"detach → 退休旧实例 → attach 新实例"事务的后半段。优雅停**已落地**（入口 `kcomp_instance_destroy`，见 `docs/component-lifecycle.md`）；旧实例退休后 image 仍 **pinned-until-reboot**。真正缺的是**更换事务本身**：re-probe 编排、driver 受控排空 / 静默 / 释放子资源，且失败路径把设备 quarantine 到 reboot。hot-plug、多实例加载、竞争驱动优先级、Core match table / 运行期 driver registration 同样 deferred；
+- **动态驱动更换 / 更新 —— 刻意 deferred（独立里程碑）**：re-probe 只是"detach → 退休旧实例 → attach 新实例"事务的后半段。优雅停**已落地**（入口 `kcomp_instance_destroy`，见 `docs/architecture/component-lifecycle.md`）；旧实例退休后 image 仍 **pinned-until-reboot**。真正缺的是**更换事务本身**：re-probe 编排、driver 受控排空 / 静默 / 释放子资源，且失败路径把设备 quarantine 到 reboot。hot-plug、多实例加载、竞争驱动优先级、Core match table / 运行期 driver registration 同样 deferred；
 - 阶段 5 中 timer 控制、H·PMP、IOMMU 的具体接口。
 
 ### 12.1 已决：设备选择（原 Q1）

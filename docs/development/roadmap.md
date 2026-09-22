@@ -54,7 +54,7 @@ Component Interface Registry（os/core/src/component/interface.rs）：
      symbol 全局符号表；provider 替换后 consumer 只需 refresh，无需 ELF reload
 内存粒度定案：ALLOC_GRANULE（物理分配）与 AddressSpaceBackend::GRANULE（VM 映射）解耦
 RISC-V trap 按特权级拆分：trap/supervisor.rs（S-mode 机制）/ trap/machine.rs（M-mode 骨架）
-测试体系（自动化，见 docs/testing.md）：
+测试体系（自动化，见 docs/development/testing.md）：
   make check（fmt/clippy/host 单测/RV64 构建/RV32 check）
   make test-qemu（RV64+RV32 boot smoke + 自动执行 core_test 组件并判定 PASS）
   make test-arch（ArchTest 白盒 selftest：mapping / context switch / illegal instr /

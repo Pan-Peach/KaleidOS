@@ -39,7 +39,7 @@
 //! - **失败路径刻意不调用本入口**（Linux 类比：崩溃的模块不值得信任）：
 //!   [`super::failure::fail_component`] 直接 `mark_failed` + 同一兜底，不经过
 //!   本文件。代价：组件侧的设备收尾（stop DMA / reset / mask IRQ）在失败路径上
-//!   不会发生，Core 的 revoke + quarantine 是唯一兜底（见 docs/component-model.md
+//!   不会发生，Core 的 revoke + quarantine 是唯一兜底（见 docs/architecture/component-model.md
 //!   §5.2）。
 //!
 //! # destroy 失败语义（契约 §8，已定稿）

@@ -1,7 +1,7 @@
 //! 组件失败的 Core 编排：标记 Failed，回收它的资源归属，解绑它提供的接口。
 //!
-//! 落地 `docs/component-model.md` §4.9 的 `fail_component`（最小版）与
-//! `docs/driver-model.md` §7 的撤销不变式：**组件失败 = 逻辑死亡、物理驻留**。
+//! 落地 `docs/architecture/component-model.md` §4.9 的 `fail_component`（最小版）与
+//! `docs/architecture/driver-model.md` §7 的撤销不变式：**组件失败 = 逻辑死亡、物理驻留**。
 //! 顺序固定：先提交状态真相（Failed），再撤销它持有的资源归属，最后清掉它作为
 //! provider 的全部 binding（含未提交的 pending publications）。
 //!

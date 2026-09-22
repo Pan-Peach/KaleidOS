@@ -373,7 +373,7 @@ mod tests {
         assert!(!t.has_live_tasks(OWNER), "Exited does not block stop");
     }
 
-    // -- Property tests（task 状态机真相，docs/testing.md §2 / §5）------------
+    // -- Property tests（task 状态机真相，docs/development/testing.md §2 / §5）------------
     //
     // 对同一张 TaskTable 施加随机长序列的 transition / start，逐操作验证：
     // 1. 合法性精确：transition 成功 <=> (from, to) 属于文档化的合法边
@@ -725,7 +725,7 @@ mod tests {
         }
     }
 
-    // -- 并发探索（docs/testing.md §2）：全局 TASK_TABLE 多线程压力 ---------------
+    // -- 并发探索（docs/development/testing.md §2）：全局 TASK_TABLE 多线程压力 ---------------
     //
     // 守卫分析：**所有会改动全局任务表的测试都持有 `memory::test_support::GUARD`**
     // （task/mod.rs 与本文件的 setup、sched.rs 绝大多数用例、exit.rs / failure.rs /

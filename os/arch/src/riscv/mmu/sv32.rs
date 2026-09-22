@@ -325,7 +325,7 @@ mod tests {
     //! PTE（32 位）/ VPN（10 位 × 2 级）/ permission 在任何 host 可测；
     //! 完整动态 walk 需要"PTE 物理地址 == 真实地址 < 2^34"（22 位 PPN 不截断），
     //! 只有 Linux 能把页池 mmap 到 0x8000_0000 低地址 —— 其余平台走
-    //! RV32 QEMU ArchTest 覆盖动态 walk（docs/testing.md §5）。
+    //! RV32 QEMU ArchTest 覆盖动态 walk（docs/development/testing.md §5）。
 
     use super::*;
 

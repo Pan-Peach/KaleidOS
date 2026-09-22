@@ -25,7 +25,7 @@ const EXPECTED_ITERS: usize = 3;
 /// 在调度返回后读取）。
 ///
 /// 旧实现是 `static mut A_COUNT` / `B_COUNT`（image-global）。按
-/// `docs/component-lifecycle.md` §9，共享地址空间下 globals 仍是 image-global，
+/// `docs/architecture/component-lifecycle.md` §9，共享地址空间下 globals 仍是 image-global，
 /// per-instance 状态必须来自显式分配：`kcomp_instance_create` 用
 /// `kcore_heap_alloc` 分配本结构，指针经 `*out_state` 交 Core 保管，任务经
 /// `kcore_task_create` 的 `arg` 拿回同一份。KernelNative 单 CPU，无并发。

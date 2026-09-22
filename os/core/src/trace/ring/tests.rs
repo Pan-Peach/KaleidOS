@@ -354,7 +354,7 @@ fn disabled_event_touches_neither_clock_nor_ring() {
 
 // —— Property tests：随机 emit / visit / clear 序列上的 ring 记账不变量 ——
 //
-// 把 ring 模块文档承诺的语义（docs/testing.md §4）编码成影子模型，逐操作核对：
+// 把 ring 模块文档承诺的语义（docs/development/testing.md §4）编码成影子模型，逐操作核对：
 //   1. `seq` 由 Core 分配、从 1 起严格单调（`next_seq == 1 + 成功 emit 次数`）。
 //   2. `overwritten_total` 精确 == `max(0, emitted - capacity)`，无静默丢失。
 //   3. ring 绝不超过 `capacity()` 条，且保留的总是**最新**记录。

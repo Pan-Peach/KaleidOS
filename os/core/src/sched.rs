@@ -33,7 +33,7 @@ use arch::{ContextImpl, CpuArch, CpuImpl};
 use spin::{Mutex, Once};
 
 /// SchedulerPolicy 的 function table（与组件 scheduler_rr 重复定义——A/B 双侧
-/// ABI 契约，见 docs/component-model.md；组件替换 = 换 provider 实现同一 layout）。
+/// ABI 契约，见 docs/architecture/component-model.md；组件替换 = 换 provider 实现同一 layout）。
 ///
 /// `api` 指向本 struct；`ctx`（provider opaque state）由 Core 从 binding 单独取出
 /// 后原样传入 `choose_next`，**不再放在 vtable 内**。
@@ -759,7 +759,7 @@ mod tests {
     ///
     /// 只测到 `pick_next` 为止。commit（`TaskTable::transition`）单独测；
     /// 真正的 context switch 必须在目标端测 —— host 的 `context_switch` 是
-    /// Fake no-op（见 docs/benchmark.md §6）。
+    /// Fake no-op（见 docs/development/benchmark.md §6）。
     #[test]
     #[ignore = "性能基线：make bench 手动跑"]
     fn bench_scheduler_propose_and_validate() {

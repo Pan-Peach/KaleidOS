@@ -5,7 +5,7 @@
 //
 // 关键事实（曾漂移过，勿删）：
 // - /soc/pci@30000000 带 `dma-coherent`；virtio_mmio / uart 节点不带任何 DMA 属性
-//   —— core_test 的 DMA 授权模型据此不建模“设备是否 DMA master”（docs/testing.md §3）。
+//   —— core_test 的 DMA 授权模型据此不建模“设备是否 DMA master”（docs/development/testing.md §3）。
 // - plic 的 compatible 是 "riscv,plic0"、reg 大小 0x210000；8 个 virtio_mmio 在
 //   0x10001000..0x10008000（irq 1..8），uart 在 0x10000000（irq 10）。
 // - cpus 节点的 riscv,isa / mmu-type 来自本次转储的 RV64 目标（DTS 描述机器，

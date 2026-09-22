@@ -13,7 +13,7 @@ test = false   # 裸机 riscv 目标无 test crate，禁止 rust-analyzer 跑 --
 
 [features]
 # No `default` on purpose: a kernel build must always state its profile, and
-# `.config` is that profile's single source of truth (see docs/kconfig.md).
+# `.config` is that profile's single source of truth (see docs/architecture/kconfig.md).
 # Building this crate directly without features is a loud compile_error in
 # arch/core rather than a silent supervisor+MMU default.
 supervisor = ["arch/supervisor", "kernel/supervisor"]

@@ -192,7 +192,7 @@ struct Mapping {               // DMA mapping（device-related）
 >
 > `ComponentId` 是 identity（不是权限），`DeviceId` 也是 identity。所有权记录只存在于各资源表，两者已经明确分离。
 
-> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报设备号），并把 mapping 记在 device owner 名下；`kcore_dma_alloc` 本身是 device-agnostic 的，所以**不需要**也不接受"设备身份证明"。**不建模**“设备是不是 DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标 `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个边界还没有人回答；记录见 `docs/testing.md` §3。
+> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报设备号），并把 mapping 记在 device owner 名下；`kcore_dma_alloc` 本身是 device-agnostic 的，所以**不需要**也不接受"设备身份证明"。**不建模**“设备是不是 DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标 `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个边界还没有人回答；记录见 `docs/development/testing.md` §3。
 
 ### 3.1 归属表可以非常普通
 
@@ -336,7 +336,7 @@ pub enum ExecutionDomain {
 
 ### 4.1 不塞进 InstanceRecord
 
-组件记录（**现状**：`InstanceRecord`，见 `docs/component-lifecycle.md`；旧的 `ComponentRecord` 已随 image/instance 拆分删除）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
+组件记录（**现状**：`InstanceRecord`，见 `docs/architecture/component-lifecycle.md`；旧的 `ComponentRecord` 已随 image/instance 拆分删除）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
 
 ```rust
 pub struct InstanceRecord {
@@ -583,7 +583,7 @@ DMA table  ─ owner=A ─┘
 ## 5. 生命周期
 
 > **本节已被取代（superseded）：组件生命周期与组件 ABI 的冻结契约在
-> `docs/component-lifecycle.md`。** 该文件定义 instance-aware 入口
+> `docs/architecture/component-lifecycle.md`。** 该文件定义 instance-aware 入口
 > `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定与
 > `ComponentImageId` + `InstanceRecord` 身份模型；本节保留原设计叙述，仅就地
 > 更新事实性的 ABI 名称与签名。两者冲突时以冻结契约为准。

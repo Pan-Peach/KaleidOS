@@ -1,7 +1,7 @@
 //! 批量计时的公共 policy：时钟刻画、K 校准、batch 统计。
 //!
 //! 这里的函数只依赖**注入的时钟读数 / pilot 闭包**，不碰 Console、trace 或
-//! 具体被测体，所以可以在 host test 里用合成数据直接验证（testing.md §1）。
+//! 具体被测体，所以可以在 host test 里用合成数据直接验证（docs/development/testing.md §1）。
 
 use super::{ClockUnit, clock_unit, now};
 use alloc::vec::Vec;

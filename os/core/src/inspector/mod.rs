@@ -1,4 +1,4 @@
-//! TestInspector —— Core 对外暴露的**只读**测试观察口（见 docs/testing.md）。
+//! TestInspector —— Core 对外暴露的**只读**测试观察口（见 docs/development/testing.md）。
 //!
 //! 约束（Oracle 审查结论）：只能读取 Core 状态用于断言，不能修改任何状态（无 god-mode）；
 //! 返回**快照副本**而非内部引用；构造器仅 Core 私有，测试组合收到已建好的只读门面。

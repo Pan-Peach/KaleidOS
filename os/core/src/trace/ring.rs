@@ -262,7 +262,7 @@ std::thread_local! {
 // ⚠️ **host 测试不覆盖生产的锁 / 并发语义**：这个 thread_local 替身换掉了全局
 // `Mutex<TraceRing>`（也没有 `IrqSaveGuard`），所以 `cargo test` 的通过结果**不能**
 // 当作 SMP / 中断重入行为的证据；那部分由 QEMU / 真机与未来的并发探索工具承担
-// （见 docs/testing.md §4 的 trace 说明）。
+// （见 docs/development/testing.md §4 的 trace 说明）。
 
 /// 独占 ring（读侧 / 管理路径）。
 ///

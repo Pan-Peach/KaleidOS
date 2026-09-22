@@ -2,7 +2,7 @@
 
 > 本阶段是 **measurement phase**：先拿到可靠、低侵入、可测量的数据，再决定优化。
 > 与 correctness test 严格分离：正确性看断言，性能看趋势。
-> 相关：`docs/testing.md`（测试策略 / Trace）、`os/core/src/bench/`（host harness）、
+> 相关：`docs/development/testing.md`（测试策略 / Trace）、`os/core/src/bench/`（host harness）、
 > `os/components/kbench/`（目标端组件，monitor `load kbench` 触发）。
 
 ## 1. 运行

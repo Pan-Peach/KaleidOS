@@ -2,7 +2,7 @@
 //!
 //! # 定位
 //!
-//! `docs/architecture.md` §3：中断控制器（PLIC）的长期定位是**驱动**，由
+//! `docs/architecture/overview.md` §3：中断控制器（PLIC）的长期定位是**驱动**，由
 //! Machine Discovery 发现后作为 Driver Component 运行。现阶段（C6 起步）先把
 //! 寄存器机制放在 arch，由 boot 从 discovery 拿到的基址配置；Core 只经
 //! `InterruptController` trait 依赖。未来降级为驱动时 Core 侧调用点不变。

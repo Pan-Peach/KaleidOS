@@ -3,7 +3,7 @@
 //! `build.rs` 与 kernel lib 的 host test 共用本文件（build script 侧用
 //! `#[path]` 引入）：build.rs 只做"读环境变量 → 校验 → 写 OUT_DIR 常量"，
 //! **不读 `.config`**，也不重新实现 Kconfig 的默认 / `range` 语义（这里的
-//! 范围只是防御性再校验，Kconfig 仍是唯一真相，见 docs/kconfig.md）。
+//! 范围只是防御性再校验，Kconfig 仍是唯一真相，见 docs/architecture/kconfig.md）。
 //!
 //! 值由 Makefile 从生成的片段里的 `CONFIG_TRACE_CAPACITY` 传入；映射只在
 //! genmk.py 一处。

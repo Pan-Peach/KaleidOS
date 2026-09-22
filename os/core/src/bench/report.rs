@@ -5,7 +5,7 @@
 //! `ns/op = d * 10^9 / (K * f)` —— **先乘后除**，不在测量端截断。
 //!
 //! 报告里的统计对象是 **batch 总时长**（分母 `operations_per_batch`）：
-//! batch p95 **不是**单次操作 p95（见 docs/benchmark.md）。
+//! batch p95 **不是**单次操作 p95（见 docs/development/benchmark.md）。
 
 use super::{BatchStats, MeasurementPlan, ROUNDS, clock_source, clock_unit};
 use core::fmt;

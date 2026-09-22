@@ -5,7 +5,7 @@
 //!
 //! 每个子模块独立门控：asm/ISA 部分只在真实 RISC-V 目标编译；
 //! 纯算法部分（`elf` 重定位、`mmu` 页表编码）在 host 的 test profile 下
-//! 也编译，让 host 测试直接驱动生产实现（docs/testing.md §3/§5）。
+//! 也编译，让 host 测试直接驱动生产实现（docs/development/testing.md §3/§5）。
 //!
 //! boot 期的内核页表策略（identity + high-half 双映射、段权限、临时 root）
 //! 已移至 boot crate 的 `vm::{layout, bootstrap, runtime}`（boot policy 不

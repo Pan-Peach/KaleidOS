@@ -34,7 +34,7 @@ OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重
 ## 目录
 
 ```
-Kconfig        构建配置顶层入口；`.config`（gitignored）是配置唯一真相，configs/*_defconfig 是具名 profile（见 docs/kconfig.md）
+Kconfig        构建配置顶层入口；`.config`（gitignored）是配置唯一真相，configs/*_defconfig 是具名 profile（见 docs/architecture/kconfig.md）
 configs/       具名 profile（defconfig）：qemu_rv64 / qemu_rv32 / qemu_rv32_nommu
 scripts/       Kconfig 胶水脚本：kconfig/configure.py（创建/归一化 .config）+ kconfig/genmk.py（生成 Make 片段）
 os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
@@ -48,7 +48,7 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）——workspace exclude，clippy 不检索
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，QEMU virt 真实 DTB 转储；供未来 parser 测试与人工对照）
-docs/          设计文档（架构/哲学/组件模型/测试/路线图/参考）
+docs/          设计文档（索引 docs/README.md）：philosophy/（为什么）architecture/（是什么）interfaces/（契约）modules/（各模块现状）development/（怎么干活）notes/（历史归档）
 tools/         构建辅助脚本（build-kcomp.sh 等）
 ```
 
@@ -74,7 +74,7 @@ core> load kcomp_smoke
 !load kcomp_smoke: OK (id=1, entry=0x81a00000)
 ```
 
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认 profile 为 RV64；切换架构 / VM 走 Kconfig：`make qemu_rv32_defconfig` 或 `make qemu_rv32_nommu_defconfig`，再 `make qemu`（见 `docs/kconfig.md`）。
+日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认 profile 为 RV64；切换架构 / VM 走 Kconfig：`make qemu_rv32_defconfig` 或 `make qemu_rv32_nommu_defconfig`，再 `make qemu`（见 `docs/architecture/kconfig.md`）。
 
 ## 构建
 
@@ -85,7 +85,7 @@ git submodule update --init --recursive
 cargo check
 ```
 
-配置走 Linux Kconfig 风格：`.config` 是唯一配置真相，先选 profile 再构建（详见 `docs/kconfig.md`）：
+配置走 Linux Kconfig 风格：`.config` 是唯一配置真相，先选 profile 再构建（详见 `docs/architecture/kconfig.md`）：
 
 ```sh
 make qemu_rv64_defconfig        # RV64 / supervisor / MMU（默认 profile）
@@ -101,14 +101,19 @@ make olddefconfig               # 用新默认值刷新 .config
 
 ## 文档
 
+索引与权威归属见 [`docs/README.md`](docs/README.md)（先看这个）。
+
 | 文档 | 内容 |
 |---|---|
-| `docs/architecture.md` | 架构总览（分层 / Core / Component / ExecutionDomain / Profile） |
-| `docs/core-philosophy.md` | 核心哲学与判断标准 |
-| `docs/component-model.md` | 组件模型（生命周期 / ResourceDomain / 依赖图） |
-| `docs/driver-model.md` | 驱动与执行域模型（device claim / MMIO·IRQ·DMA / teardown 安全） |
-| `docs/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
-| `docs/testing.md` | 测试策略（host test / CoreTest / trace） |
-| `docs/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
-| `docs/roadmap.md` | 路线图（M0–M4 与后续方向） |
-| `docs/references.md` | 参考资料与借鉴方向 |
+| `docs/README.md` | 文档索引：每个文件夹/文件干嘛、冲突时谁赢 |
+| `docs/philosophy/core-philosophy.md` | 核心哲学与判断标准 |
+| `docs/architecture/overview.md` | 架构总览（分层 / Core / Component / ExecutionDomain / Profile） |
+| `docs/architecture/component-model.md` | 组件模型（Interface / ResourceDomain / 依赖图） |
+| `docs/architecture/component-lifecycle.md` | 组件生命周期与实例契约（已冻结） |
+| `docs/architecture/driver-model.md` | 驱动与执行域模型（device claim / MMIO·IRQ·DMA / teardown 安全） |
+| `docs/architecture/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
+| `docs/modules/README.md` | 模块地图：每个 Core 模块 owns 什么真相、代码在哪 |
+| `docs/development/testing.md` | 测试策略（host test / CoreTest / trace） |
+| `docs/development/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
+| `docs/development/roadmap.md` | 路线图（M0–M4 与后续方向） |
+| `docs/philosophy/references.md` | 参考资料与借鉴方向 |
