@@ -92,28 +92,10 @@ const STACK_ALIGNMENT: usize = 16;
 const STACK_ALLOCATION_FAILED: i32 = -12;
 
 // ---------------------------------------------------------------------------
-// 组件实例 ABI（C 是根，见 `docs/component-lifecycle.md` §4）
+// 组件实例 ABI（C 是根，见 `docs/architecture/component-lifecycle.md` §4）
 // ---------------------------------------------------------------------------
 
-/// 精确契约指纹（**手工维护，非版本号**；A/B 双侧锚定，Core 与 `kcomp.h` /
-/// `kcomp-sdk` 必须写入同一数值）。无兼容协商、不自动生成哈希。
-///
-/// 值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；loader 在放段后读取组件
-/// `kcomp_abi` 符号并与本值精确比对，不一致 = 拒绝加载。
-pub const KCOMP_ABI: u64 = 0x4B43_4F4D_5041_4249;
-
-/// `kcomp_instance_create` 参数：仅在调用期间借用；payload 必须拷贝后才能持久化。
-///
-/// C 声明见 `kcomp.h` 的 `struct KcompCreateArgs`；字段布局逐字节一致。
-/// `config_abi` 是 config 负载的精确指纹，`0` = 无负载。
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct KcompCreateArgs {
-    pub config_abi: u64,
-    /// Core 视为不透明字节；从不解释、不持久化引用。
-    pub config: *const (),
-    pub config_len: usize,
-}
+pub use crate::generated::abi::{KCOMP_ABI, KcompCreateArgs};
 
 impl KcompCreateArgs {
     /// 无配置负载（`kcore_component_load` 的默认配置）。
@@ -723,8 +705,8 @@ mod tests {
 
     #[test]
     fn kcomp_abi_is_the_manual_anchor() {
-        // 手工锚定值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；与 SDK
-        // `abi.rs::KCOMP_ABI` / `kcomp.h` 三处必须同值（drift test 交叉校验）。
+        // 手工锚定值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；单一来源是
+        // `abi/component.toml`（生成到 generated/abi.rs），这里独立钉死数值。
         assert_eq!(KCOMP_ABI, 0x4B43_4F4D_5041_4249);
         assert_eq!(&KCOMP_ABI.to_be_bytes(), b"KCOMPABI");
     }

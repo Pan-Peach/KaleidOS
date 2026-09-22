@@ -1,4 +1,4 @@
-//! host 锚定测试：钉住 ABI 编码（`docs/driver-model.md` §6.2）。
+//! host 锚定测试：钉住 ABI 编码（`docs/architecture/driver-model.md` §6.2）。
 //! Core 侧有对应测试 `component::export::tests::dma_direction_encoding_is_stable`。
 
 #[test]
@@ -46,10 +46,7 @@ fn driver_prober_name_is_anchored() {
 
 #[test]
 fn filesystem_abi_is_anchored() {
-    assert_eq!(
-        crate::binding::FILESYSTEM_ABI.raw(),
-        0x4649_4C45_5359_5354
-    );
+    assert_eq!(crate::binding::FILESYSTEM_ABI.raw(), 0x4649_4C45_5359_5354);
     assert_eq!(crate::binding::FILESYSTEM_NAME, b"filesystem");
     assert_eq!(crate::binding::FILESYSTEM_OPEN_READ, 1);
 }
@@ -272,4 +269,22 @@ fn block_provider_adapter_rejects_invalid_args_with_einval() {
         unsafe { (api.write)(ctx, 0, buf.as_ptr(), 513) },
         Errno::EINVAL.code()
     );
+}
+
+/// errno 数值的编译器级 pin。与 Core `kcomp_abi_drift.rs` 的抽查分工：Core 侧只有
+/// `code()`，`from_code()` / `name()` 是 SDK 侧的解码路径，在这里独立钉死。
+#[test]
+fn errno_literals_are_pinned_to_stable_numbers() {
+    assert_eq!(Errno::ENOENT as i32, 2);
+    assert_eq!(Errno::EIO as i32, 5);
+    assert_eq!(Errno::EBUSY as i32, 16);
+    assert_eq!(Errno::ENODEV as i32, 19);
+    assert_eq!(Errno::EINVAL as i32, 22);
+    assert_eq!(Errno::EKEYREVOKED as i32, 128);
+    // `from_code` 的输入是 ABI 返回形状（`0` / `-errno`）；正数不是合法输入，
+    // 落回 EIO 兜底（与生成前行为逐位一致）。
+    assert_eq!(Errno::from_code(-22), Errno::EINVAL);
+    assert_eq!(Errno::from_code(22), Errno::EIO);
+    assert_eq!(Errno::EINVAL.code(), -22);
+    assert_eq!(Errno::EINVAL.name(), "EINVAL");
 }

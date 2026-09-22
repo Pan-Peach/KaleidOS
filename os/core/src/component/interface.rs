@@ -70,13 +70,7 @@ use crate::component::registry::Registry;
 use crate::component::{ComponentId, ComponentState};
 use spin::{Mutex, Once};
 
-/// 接口领域分类（与 docs/component-model.md §2 一致）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterfaceKind {
-    Device,
-    Service,
-    Policy,
-}
+pub use crate::generated::abi::InterfaceKind;
 
 /// Exact ABI fingerprint（`#[repr(transparent)]`，无版本兼容语义）。
 ///

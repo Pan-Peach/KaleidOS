@@ -42,7 +42,7 @@ use spin::{Mutex, Once};
 ///
 /// `ctx` 原样回传，Core 不解引用——与 interface registry 的 vtable `ctx` 同一
 /// 生命周期契约（provider Ready 期间有效）。
-pub type IrqHandler = extern "C" fn(ctx: *mut ());
+pub use crate::generated::abi::IrqHandler;
 
 /// 一条 IRQ route 的 Core 真相。
 #[derive(Clone, Copy)]

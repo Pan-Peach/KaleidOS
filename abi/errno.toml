@@ -1,0 +1,676 @@
+# KABI schema — errno：ABI 错误码的唯一来源。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/errno.h   C（#define）
+#   os/components/kcomp-sdk/src/generated/errno.rs      SDK-Rust（enum + code/from_code/name）
+#   os/core/src/generated/errno.rs                      Core-Rust（enum）
+#
+# 手写部分（facade / umbrella / Display / From 映射 / status）不在本文件范围内。
+
+[[enum]]
+name = "Errno"
+repr = "i32"
+c_style = "defines"
+# 未知负码（Core 新加、SDK 未同步）在 SDK 侧解码回退到的变体。
+decode_fallback = "EIO"
+doc = """
+稳定、Linux/POSIX 风格的 ABI 错误码。**完整的 `asm-generic/errno` 集合**
+（1–133；未使用的 41 / 58 留空；95 的 POSIX 别名 `EOPNOTSUPP` 与
+`ENOTSUP` 同码，不再单列）。进入 public ABI 后数字不再变更。
+本文件是唯一来源：Core / SDK / C 三份错误码由此生成（tools/kabi/kabi_gen.py）。
+"""
+
+[[enum.variant]]
+name = "EPERM"
+value = 1
+doc = "Operation not permitted"
+
+[[enum.variant]]
+name = "ENOENT"
+value = 2
+doc = "No such file or directory"
+
+[[enum.variant]]
+name = "ESRCH"
+value = 3
+doc = "No such process"
+
+[[enum.variant]]
+name = "EINTR"
+value = 4
+doc = "Interrupted system call"
+
+[[enum.variant]]
+name = "EIO"
+value = 5
+doc = "I/O error"
+
+[[enum.variant]]
+name = "ENXIO"
+value = 6
+doc = "No such device or address"
+
+[[enum.variant]]
+name = "E2BIG"
+value = 7
+doc = "Argument list too long"
+
+[[enum.variant]]
+name = "ENOEXEC"
+value = 8
+doc = "Exec format error"
+
+[[enum.variant]]
+name = "EBADF"
+value = 9
+doc = "Bad file number"
+
+[[enum.variant]]
+name = "ECHILD"
+value = 10
+doc = "No child processes"
+
+[[enum.variant]]
+name = "EAGAIN"
+value = 11
+doc = "Try again"
+
+[[enum.variant]]
+name = "ENOMEM"
+value = 12
+doc = "Out of memory"
+
+[[enum.variant]]
+name = "EACCES"
+value = 13
+doc = "Permission denied"
+
+[[enum.variant]]
+name = "EFAULT"
+value = 14
+doc = "Bad address"
+
+[[enum.variant]]
+name = "ENOTBLK"
+value = 15
+doc = "Block device required"
+
+[[enum.variant]]
+name = "EBUSY"
+value = 16
+doc = "Device or resource busy"
+
+[[enum.variant]]
+name = "EEXIST"
+value = 17
+doc = "File exists"
+
+[[enum.variant]]
+name = "EXDEV"
+value = 18
+doc = "Cross-device link"
+
+[[enum.variant]]
+name = "ENODEV"
+value = 19
+doc = "No such device"
+
+[[enum.variant]]
+name = "ENOTDIR"
+value = 20
+doc = "Not a directory"
+
+[[enum.variant]]
+name = "EISDIR"
+value = 21
+doc = "Is a directory"
+
+[[enum.variant]]
+name = "EINVAL"
+value = 22
+doc = "Invalid argument"
+
+[[enum.variant]]
+name = "ENFILE"
+value = 23
+doc = "File table overflow"
+
+[[enum.variant]]
+name = "EMFILE"
+value = 24
+doc = "Too many open files"
+
+[[enum.variant]]
+name = "ENOTTY"
+value = 25
+doc = "Not a typewriter"
+
+[[enum.variant]]
+name = "ETXTBSY"
+value = 26
+doc = "Text file busy"
+
+[[enum.variant]]
+name = "EFBIG"
+value = 27
+doc = "File too large"
+
+[[enum.variant]]
+name = "ENOSPC"
+value = 28
+doc = "No space left on device"
+
+[[enum.variant]]
+name = "ESPIPE"
+value = 29
+doc = "Illegal seek"
+
+[[enum.variant]]
+name = "EROFS"
+value = 30
+doc = "Read-only file system"
+
+[[enum.variant]]
+name = "EMLINK"
+value = 31
+doc = "Too many links"
+
+[[enum.variant]]
+name = "EPIPE"
+value = 32
+doc = "Broken pipe"
+
+[[enum.variant]]
+name = "EDOM"
+value = 33
+doc = "Math argument out of domain of func"
+
+[[enum.variant]]
+name = "ERANGE"
+value = 34
+doc = "Math result not representable"
+
+[[enum.variant]]
+name = "EDEADLK"
+value = 35
+doc = "Resource deadlock would occur"
+
+[[enum.variant]]
+name = "ENAMETOOLONG"
+value = 36
+doc = "File name too long"
+
+[[enum.variant]]
+name = "ENOLCK"
+value = 37
+doc = "No record locks available"
+
+[[enum.variant]]
+name = "ENOSYS"
+value = 38
+doc = "Invalid system call number"
+
+[[enum.variant]]
+name = "ENOTEMPTY"
+value = 39
+doc = "Directory not empty"
+
+[[enum.variant]]
+name = "ELOOP"
+value = 40
+doc = "Too many symbolic links encountered"
+
+[[enum.variant]]
+name = "ENOMSG"
+value = 42
+doc = "No message of desired type"
+
+[[enum.variant]]
+name = "EIDRM"
+value = 43
+doc = "Identifier removed"
+
+[[enum.variant]]
+name = "ECHRNG"
+value = 44
+doc = "Channel number out of range"
+
+[[enum.variant]]
+name = "EL2NSYNC"
+value = 45
+doc = "Level 2 not synchronized"
+
+[[enum.variant]]
+name = "EL3HLT"
+value = 46
+doc = "Level 3 halted"
+
+[[enum.variant]]
+name = "EL3RST"
+value = 47
+doc = "Level 3 reset"
+
+[[enum.variant]]
+name = "ELNRNG"
+value = 48
+doc = "Link number out of range"
+
+[[enum.variant]]
+name = "EUNATCH"
+value = 49
+doc = "Protocol driver not attached"
+
+[[enum.variant]]
+name = "ENOCSI"
+value = 50
+doc = "No CSI structure available"
+
+[[enum.variant]]
+name = "EL2HLT"
+value = 51
+doc = "Level 2 halted"
+
+[[enum.variant]]
+name = "EBADE"
+value = 52
+doc = "Invalid exchange"
+
+[[enum.variant]]
+name = "EBADR"
+value = 53
+doc = "Invalid request descriptor"
+
+[[enum.variant]]
+name = "EXFULL"
+value = 54
+doc = "Exchange full"
+
+[[enum.variant]]
+name = "ENOANO"
+value = 55
+doc = "No anode"
+
+[[enum.variant]]
+name = "EBADRQC"
+value = 56
+doc = "Invalid request code"
+
+[[enum.variant]]
+name = "EBADSLT"
+value = 57
+doc = "Invalid slot"
+
+[[enum.variant]]
+name = "EBFONT"
+value = 59
+doc = "Bad font file format"
+
+[[enum.variant]]
+name = "ENOSTR"
+value = 60
+doc = "Device not a stream"
+
+[[enum.variant]]
+name = "ENODATA"
+value = 61
+doc = "No data available"
+
+[[enum.variant]]
+name = "ETIME"
+value = 62
+doc = "Timer expired"
+
+[[enum.variant]]
+name = "ENOSR"
+value = 63
+doc = "Out of streams resources"
+
+[[enum.variant]]
+name = "ENONET"
+value = 64
+doc = "Machine is not on the network"
+
+[[enum.variant]]
+name = "ENOPKG"
+value = 65
+doc = "Package not installed"
+
+[[enum.variant]]
+name = "EREMOTE"
+value = 66
+doc = "Object is remote"
+
+[[enum.variant]]
+name = "ENOLINK"
+value = 67
+doc = "Link has been severed"
+
+[[enum.variant]]
+name = "EADV"
+value = 68
+doc = "Advertise error"
+
+[[enum.variant]]
+name = "ESRMNT"
+value = 69
+doc = "Srmount error"
+
+[[enum.variant]]
+name = "ECOMM"
+value = 70
+doc = "Communication error on send"
+
+[[enum.variant]]
+name = "EPROTO"
+value = 71
+doc = "Protocol error"
+
+[[enum.variant]]
+name = "EMULTIHOP"
+value = 72
+doc = "Multihop attempted"
+
+[[enum.variant]]
+name = "EDOTDOT"
+value = 73
+doc = "RFS specific error"
+
+[[enum.variant]]
+name = "EBADMSG"
+value = 74
+doc = "Not a data message"
+
+[[enum.variant]]
+name = "EOVERFLOW"
+value = 75
+doc = "Value too large for defined data type"
+
+[[enum.variant]]
+name = "ENOTUNIQ"
+value = 76
+doc = "Name not unique on network"
+
+[[enum.variant]]
+name = "EBADFD"
+value = 77
+doc = "File descriptor in bad state"
+
+[[enum.variant]]
+name = "EREMCHG"
+value = 78
+doc = "Remote address changed"
+
+[[enum.variant]]
+name = "ELIBACC"
+value = 79
+doc = "Can not access a needed shared library"
+
+[[enum.variant]]
+name = "ELIBBAD"
+value = 80
+doc = "Accessing a corrupted shared library"
+
+[[enum.variant]]
+name = "ELIBSCN"
+value = 81
+doc = ".lib section in a.out corrupted"
+
+[[enum.variant]]
+name = "ELIBMAX"
+value = 82
+doc = "Attempting to link in too many shared libraries"
+
+[[enum.variant]]
+name = "ELIBEXEC"
+value = 83
+doc = "Cannot exec a shared library directly"
+
+[[enum.variant]]
+name = "EILSEQ"
+value = 84
+doc = "Illegal byte sequence"
+
+[[enum.variant]]
+name = "ERESTART"
+value = 85
+doc = "Interrupted system call should be restarted"
+
+[[enum.variant]]
+name = "ESTRPIPE"
+value = 86
+doc = "Streams pipe error"
+
+[[enum.variant]]
+name = "EUSERS"
+value = 87
+doc = "Too many users"
+
+[[enum.variant]]
+name = "ENOTSOCK"
+value = 88
+doc = "Socket operation on non-socket"
+
+[[enum.variant]]
+name = "EDESTADDRREQ"
+value = 89
+doc = "Destination address required"
+
+[[enum.variant]]
+name = "EMSGSIZE"
+value = 90
+doc = "Message too long"
+
+[[enum.variant]]
+name = "EPROTOTYPE"
+value = 91
+doc = "Protocol wrong type for socket"
+
+[[enum.variant]]
+name = "ENOPROTOOPT"
+value = 92
+doc = "Protocol not available"
+
+[[enum.variant]]
+name = "EPROTONOSUPPORT"
+value = 93
+doc = "Protocol not supported"
+
+[[enum.variant]]
+name = "ESOCKTNOSUPPORT"
+value = 94
+doc = "Socket type not supported"
+
+[[enum.variant]]
+name = "ENOTSUP"
+value = 95
+doc = "Operation not supported"
+
+[[enum.variant]]
+name = "EPFNOSUPPORT"
+value = 96
+doc = "Protocol family not supported"
+
+[[enum.variant]]
+name = "EAFNOSUPPORT"
+value = 97
+doc = "Address family not supported by protocol"
+
+[[enum.variant]]
+name = "EADDRINUSE"
+value = 98
+doc = "Address already in use"
+
+[[enum.variant]]
+name = "EADDRNOTAVAIL"
+value = 99
+doc = "Cannot assign requested address"
+
+[[enum.variant]]
+name = "ENETDOWN"
+value = 100
+doc = "Network is down"
+
+[[enum.variant]]
+name = "ENETUNREACH"
+value = 101
+doc = "Network is unreachable"
+
+[[enum.variant]]
+name = "ENETRESET"
+value = 102
+doc = "Network dropped connection because of reset"
+
+[[enum.variant]]
+name = "ECONNABORTED"
+value = 103
+doc = "Software caused connection abort"
+
+[[enum.variant]]
+name = "ECONNRESET"
+value = 104
+doc = "Connection reset by peer"
+
+[[enum.variant]]
+name = "ENOBUFS"
+value = 105
+doc = "No buffer space available"
+
+[[enum.variant]]
+name = "EISCONN"
+value = 106
+doc = "Transport endpoint is already connected"
+
+[[enum.variant]]
+name = "ENOTCONN"
+value = 107
+doc = "Transport endpoint is not connected"
+
+[[enum.variant]]
+name = "ESHUTDOWN"
+value = 108
+doc = "Cannot send after transport endpoint shutdown"
+
+[[enum.variant]]
+name = "ETOOMANYREFS"
+value = 109
+doc = "Too many references: cannot splice"
+
+[[enum.variant]]
+name = "ETIMEDOUT"
+value = 110
+doc = "Connection timed out"
+
+[[enum.variant]]
+name = "ECONNREFUSED"
+value = 111
+doc = "Connection refused"
+
+[[enum.variant]]
+name = "EHOSTDOWN"
+value = 112
+doc = "Host is down"
+
+[[enum.variant]]
+name = "EHOSTUNREACH"
+value = 113
+doc = "No route to host"
+
+[[enum.variant]]
+name = "EALREADY"
+value = 114
+doc = "Operation already in progress"
+
+[[enum.variant]]
+name = "EINPROGRESS"
+value = 115
+doc = "Operation now in progress"
+
+[[enum.variant]]
+name = "ESTALE"
+value = 116
+doc = "Stale file handle"
+
+[[enum.variant]]
+name = "EUCLEAN"
+value = 117
+doc = "Structure needs cleaning"
+
+[[enum.variant]]
+name = "ENOTNAM"
+value = 118
+doc = "Not a XENIX named type file"
+
+[[enum.variant]]
+name = "ENAVAIL"
+value = 119
+doc = "No XENIX semaphores available"
+
+[[enum.variant]]
+name = "EISNAM"
+value = 120
+doc = "Is a named type file"
+
+[[enum.variant]]
+name = "EREMOTEIO"
+value = 121
+doc = "Remote I/O error"
+
+[[enum.variant]]
+name = "EDQUOT"
+value = 122
+doc = "Quota exceeded"
+
+[[enum.variant]]
+name = "ENOMEDIUM"
+value = 123
+doc = "No medium found"
+
+[[enum.variant]]
+name = "EMEDIUMTYPE"
+value = 124
+doc = "Wrong medium type"
+
+[[enum.variant]]
+name = "ECANCELED"
+value = 125
+doc = "Operation Canceled"
+
+[[enum.variant]]
+name = "ENOKEY"
+value = 126
+doc = "Required key not available"
+
+[[enum.variant]]
+name = "EKEYEXPIRED"
+value = 127
+doc = "Key has expired"
+
+[[enum.variant]]
+name = "EKEYREVOKED"
+value = 128
+doc = "Key has been revoked"
+
+[[enum.variant]]
+name = "EKEYREJECTED"
+value = 129
+doc = "Key was rejected by service"
+
+[[enum.variant]]
+name = "EOWNERDEAD"
+value = 130
+doc = "Owner died"
+
+[[enum.variant]]
+name = "ENOTRECOVERABLE"
+value = 131
+doc = "State not recoverable"
+
+[[enum.variant]]
+name = "ERFKILL"
+value = 132
+doc = "Operation not possible due to RF-kill"
+
+[[enum.variant]]
+name = "EHWPOISON"
+value = 133
+doc = "Memory page has hardware error"

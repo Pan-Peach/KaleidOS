@@ -33,72 +33,12 @@ use super::{RejectReason, TraceEvent, TraceRecord, TraceStats, capacity};
 use crate::component::ComponentState;
 use crate::resource::ResourceKind;
 
-/// payload 词里的"该字段不存在"哨兵。
-pub const ABSENT: u64 = u64::MAX;
-
-/// `TaskSwitch`：当前任务发生切换。
-pub const KIND_TASK_SWITCH: u32 = 1;
-/// `PolicyProposal`：调度策略提议。
-pub const KIND_POLICY_PROPOSAL: u32 = 2;
-/// `PolicyAccepted`：Core 采纳提议。
-pub const KIND_POLICY_ACCEPTED: u32 = 3;
-/// `PolicyRejected`：Core 拒绝提议。
-pub const KIND_POLICY_REJECTED: u32 = 4;
-/// `ComponentState`：组件生命周期状态提交。
-pub const KIND_COMPONENT_STATE: u32 = 5;
-/// `ResourceGrant`：授予 authority。
-pub const KIND_RESOURCE_GRANT: u32 = 6;
-/// `ResourceRevoke`：回收 authority。
-pub const KIND_RESOURCE_REVOKE: u32 = 7;
-/// `InterfaceBind`：一次成功的 interface 绑定解析。
-pub const KIND_INTERFACE_BIND: u32 = 8;
-/// `InterfaceRefresh`：provider/generation 刷新。
-pub const KIND_INTERFACE_REFRESH: u32 = 9;
-/// `IrqEnter`：外部中断进入 Core。
-pub const KIND_IRQ_ENTER: u32 = 10;
-/// `IrqDispatch`：Core 把 IRQ 路由给某组件。
-pub const KIND_IRQ_DISPATCH: u32 = 11;
-/// `IrqAck`：IRQ 线完成 ack。
-pub const KIND_IRQ_ACK: u32 = 12;
-
-/// 一条 trace 记录的稳定 ABI 形态。
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TraceRecordAbi {
-    /// Core 分配的单调序号（**排序与断言的唯一依据**）。
-    pub seq: u64,
-    /// 平台时钟原始值（单位/来源见 `BENCH-ENV` 风格的环境描述）。
-    pub timestamp: u64,
-    /// 事件标签（见上方分配表）。
-    pub kind: u32,
-    /// 保留；必须为 0。
-    pub flags: u32,
-    pub a: u64,
-    pub b: u64,
-    pub c: u64,
-}
-
-/// Trace 子系统状态的稳定 ABI 形态（`kcore_trace_stats` 的 out 结构）。
-///
-/// 字段全部显式编码。`overwritten_total` 是**因 ring 满被逐出保留区**的记录
-/// 总数（saturating），不是"某个 reader 漏掉的条数"——reader 的真实缺口是
-/// `returned_seq - requested_seq`。
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TraceStatsAbi {
-    /// ring 容量（records）——见 [`capacity`]。
-    pub capacity: u64,
-    /// 最旧存活记录的 `seq`；ring 为空时 == `next_seq`。
-    pub oldest_seq: u64,
-    /// 下一条记录将拿到的 `seq`。
-    pub next_seq: u64,
-    /// 因 ring 满被逐出保留区的记录总数。
-    pub overwritten_total: u64,
-    /// 已使能事件掩码：bit i ↔ 事件 kind i+1（上方 `KIND_*` 分配表），高位保留
-    /// 恒 0；默认全开（`ENABLED_MASK_ALL`），`CONFIG_TRACE=n` 时恒 0。
-    /// 过滤只决定采集与否：不记录、不消耗 `seq`，不算丢失。
-    pub enabled_mask: u64,
-}
+pub use crate::generated::abi::{
+    ABSENT, KIND_COMPONENT_STATE, KIND_INTERFACE_BIND, KIND_INTERFACE_REFRESH, KIND_IRQ_ACK,
+    KIND_IRQ_DISPATCH, KIND_IRQ_ENTER, KIND_POLICY_ACCEPTED, KIND_POLICY_PROPOSAL,
+    KIND_POLICY_REJECTED, KIND_RESOURCE_GRANT, KIND_RESOURCE_REVOKE, KIND_TASK_SWITCH,
+    TraceRecordAbi, TraceStatsAbi,
+};
 
 impl From<&TraceStats> for TraceStatsAbi {
     fn from(stats: &TraceStats) -> Self {

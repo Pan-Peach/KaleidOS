@@ -1,0 +1,133 @@
+# KABI schema — component：组件**导出**的生命周期入口面 + 契约指纹 + 接口分类。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 声明（extern 函数 / 对象 / typedef / enum）
+#   os/components/kcomp-sdk/src/generated/abi.rs            SDK-Rust 镜像（type alias / const / enum）
+#   os/core/src/generated/abi.rs                            Core 边界结构 / 常量
+#
+# 组件侧的 `kcomp_abi` **定义**仍由 SDK 的 `kcomp_instance_create!` 宏发出
+# （本 schema 只声明 extern 符号，绝不生成定义）。
+
+[[struct]]
+name = "KcompCreateArgs"
+c_name = "KcompCreateArgs"
+doc = """
+`kcomp_instance_create` 的参数：仅在调用期间借用。
+`config` 必须拷贝后才能持久化；Core 视其为不透明字节。
+"""
+size64 = 24
+size32 = 16
+align = 8
+
+[[struct.field]]
+name = "config_abi"
+type = "u64"
+doc = "config 负载的精确指纹；0 = 无负载。"
+offset = 0
+
+[[struct.field]]
+name = "config"
+type = "*const void"
+doc = "Core 视为不透明字节。"
+offset = 8
+
+[[struct.field]]
+name = "config_len"
+type = "usize"
+offset64 = 16
+offset32 = 12
+
+[[entry]]
+name = "kcomp_instance_create"
+alias = "KcompInstanceCreate"
+doc = """
+组件实例创建入口（组件导出，Core 调用）。返回 0 / `-errno`。
+Core 调用前把 `*out_state` 初始化为 NULL；成功时组件写入自己完成的 state 指针，
+**无状态组件可以成功返回 NULL**（保持 NULL）。失败 / panic 走 Core 的 Failed
+路径，且**不会**调用 destroy（构造期清理由组件自己负责）。
+"""
+ret = "i32"
+targets = "c,sdk-rust"
+
+[[entry.param]]
+name = "args"
+type = "*const KcompCreateArgs"
+
+[[entry.param]]
+name = "out_state"
+type = "*mut *mut void"
+
+[[entry]]
+name = "kcomp_instance_destroy"
+alias = "KcompInstanceDestroy"
+doc = """
+组件实例析构入口（组件导出，Core 调用）。返回 0 / `-errno`。
+Core 对未完整构造 / panic 的实例不调用本入口；destroy 只做组件自己的
+quiesce / 私有资源清理，Core 仍会兜底 revoke authority / unbind。
+"""
+ret = "i32"
+targets = "c,sdk-rust"
+
+[[entry.param]]
+name = "state"
+type = "*mut void"
+
+[[object]]
+name = "kcomp_abi"
+type = "u64"
+const = true
+doc = """
+精确契约指纹（手工维护，非版本号）。Core 在调用组件代码前校验其 ELF 定义、
+边界与值。组件必须定义 `const uint64_t kcomp_abi = ...;`——SDK 的
+`kcomp_instance_create!` 宏会发出该定义（值 = Rust 镜像的 `KCOMP_ABI`）。
+"""
+targets = "c"
+
+[[alias]]
+name = "KcompTaskEntry"
+c_name = "KcompTaskEntry"
+doc = """
+任务入口：`arg` 由 `kcore_task_create` 原样回传。
+契约：entry 必须经 Core 退出（kcore_task_exit）；任务归属来自 Core 的执行
+边界，**不是**来自 `arg`。
+"""
+ret = "void"
+targets = "c,sdk-rust"
+
+[[alias.param]]
+name = "arg"
+type = "*mut void"
+
+[[enum]]
+name = "InterfaceKind"
+c_name = "KcompInterfaceKind"
+repr = "u32"
+c_style = "enum"
+doc = "接口领域分类（与 docs/architecture/component-model.md §2 一致；ABI 编码 0/1/2）。"
+
+[[enum.variant]]
+name = "Device"
+c_name = "KCOMP_IFACE_DEVICE"
+value = 0
+
+[[enum.variant]]
+name = "Service"
+c_name = "KCOMP_IFACE_SERVICE"
+value = 1
+
+[[enum.variant]]
+name = "Policy"
+c_name = "KCOMP_IFACE_POLICY"
+value = 2
+
+[[const]]
+name = "KCOMP_ABI"
+type = "u64"
+value = "0x4B43_4F4D_5041_4249"
+doc = """
+精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
+边界与值。数值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；组件里的
+`kcomp_abi` 符号由入口宏发出。
+"""
+targets = "sdk-rust,core-rust"
+

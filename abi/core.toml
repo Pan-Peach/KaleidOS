@@ -1,0 +1,716 @@
+# KABI schema — core：`kcore_*` 导出面 + Core 侧边界结构 / 常量。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 声明 + _Static_assert
+#   os/components/kcomp-sdk/src/generated/abi.rs            SDK-Rust 镜像（extern 块）
+#   os/core/src/generated/abi.rs                            Core 边界结构 / 常量
+#   os/core/src/component/generated/exports.rs              Core 导出注册表（typed refs）
+#
+# 手写部分（facade / umbrella / Core 实现 / 语义转换）不在本文件范围内。
+# 结构布局断言是编译器背书的：C `_Static_assert` + Rust `const _: () = assert!(...)`。
+
+[[struct]]
+name = "TraceRecordAbi"
+c_name = "kcore_trace_record"
+doc = """
+一条 trace 记录的**稳定编码**（Core `trace::abi::TraceRecordAbi`）。
+`kind` 决定 `a` / `b` / `c` 的含义，缺省字段写成 `ABSENT`（**不是** 0）。
+"""
+size = 48
+align = 8
+
+[[struct.field]]
+name = "seq"
+type = "u64"
+doc = "Core 分配的单调序号（**排序与断言的唯一依据**）。"
+offset = 0
+
+[[struct.field]]
+name = "timestamp"
+type = "u64"
+doc = "平台时钟原始值（单位 / 来源见 `BENCH-ENV` 风格的环境描述）。"
+offset = 8
+
+[[struct.field]]
+name = "kind"
+type = "u32"
+doc = "事件标签（见 trace 模块的 payload 分配表）。"
+offset = 16
+
+[[struct.field]]
+name = "flags"
+type = "u32"
+doc = "保留；必须为 0。"
+offset = 20
+
+[[struct.field]]
+name = "a"
+type = "u64"
+offset = 24
+
+[[struct.field]]
+name = "b"
+type = "u64"
+offset = 32
+
+[[struct.field]]
+name = "c"
+type = "u64"
+offset = 40
+
+[[struct]]
+name = "TraceStatsAbi"
+c_name = "kcore_trace_stats"
+doc = """
+Trace 子系统状态的稳定编码（`kcore_trace_stats` 的 out 结构）。
+`overwritten_total` 是**因 ring 满被逐出保留区**的记录总数（saturating），
+不是"某个 reader 漏掉的条数"——reader 的真实缺口是 `returned_seq - requested_seq`。
+"""
+size = 40
+align = 8
+
+[[struct.field]]
+name = "capacity"
+type = "u64"
+doc = "ring 容量（records）。"
+offset = 0
+
+[[struct.field]]
+name = "oldest_seq"
+type = "u64"
+doc = "最旧存活记录的 `seq`；ring 为空时 == `next_seq`。"
+offset = 8
+
+[[struct.field]]
+name = "next_seq"
+type = "u64"
+doc = "下一条记录将拿到的 `seq`。"
+offset = 16
+
+[[struct.field]]
+name = "overwritten_total"
+type = "u64"
+doc = "因 ring 满被逐出保留区的记录总数。"
+offset = 24
+
+[[struct.field]]
+name = "enabled_mask"
+type = "u64"
+doc = """
+已使能事件掩码：bit i ↔ 事件 kind i+1；高位保留恒 0；默认全开，
+`CONFIG_TRACE=n` 时恒 0。过滤只决定采集与否：不记录、不消耗 `seq`，不算丢失。
+"""
+offset = 32
+
+[[alias]]
+name = "IrqHandler"
+c_name = "IrqHandler"
+doc = "IRQ 投递回调：`ctx` 原样回传，Core 不解引用。"
+ret = "void"
+
+[[alias.param]]
+name = "ctx"
+type = "*mut void"
+
+[[const]]
+name = "ABSENT"
+type = "u64"
+value = "0xFFFF_FFFF_FFFF_FFFF"
+doc = """
+payload 词里的"该字段不存在"哨兵。
+"""
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_TASK_SWITCH"
+type = "u32"
+value = "1"
+doc = "`TaskSwitch`：当前任务发生切换。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_POLICY_PROPOSAL"
+type = "u32"
+value = "2"
+doc = "`PolicyProposal`：调度策略提议。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_POLICY_ACCEPTED"
+type = "u32"
+value = "3"
+doc = "`PolicyAccepted`：Core 采纳提议。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_POLICY_REJECTED"
+type = "u32"
+value = "4"
+doc = "`PolicyRejected`：Core 拒绝提议。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_COMPONENT_STATE"
+type = "u32"
+value = "5"
+doc = "`ComponentState`：组件生命周期状态提交。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_RESOURCE_GRANT"
+type = "u32"
+value = "6"
+doc = "`ResourceGrant`：授予 authority。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_RESOURCE_REVOKE"
+type = "u32"
+value = "7"
+doc = "`ResourceRevoke`：回收 authority。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_INTERFACE_BIND"
+type = "u32"
+value = "8"
+doc = "`InterfaceBind`：一次成功的 interface 绑定解析。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_INTERFACE_REFRESH"
+type = "u32"
+value = "9"
+doc = "`InterfaceRefresh`：provider / generation 刷新。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_IRQ_ENTER"
+type = "u32"
+value = "10"
+doc = "`IrqEnter`：外部中断进入 Core。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_IRQ_DISPATCH"
+type = "u32"
+value = "11"
+doc = "`IrqDispatch`：Core 把 IRQ 路由给某组件。"
+targets = "sdk-rust,core-rust"
+
+[[const]]
+name = "KIND_IRQ_ACK"
+type = "u32"
+value = "12"
+doc = "`IrqAck`：IRQ 线完成 ack。"
+targets = "sdk-rust,core-rust"
+
+[[function]]
+name = "kcore_trace_read"
+ret = "i32"
+category = "Trace / 时钟（只读观察面）"
+c_category = "Trace（只读观察面；无写入口）"
+doc = """
+读 `seq >= since` 的第一条记录到 `out`，`out_next` 回写下一次应传的
+`seq`。没有更多记录时返回 `-ENOENT`（**不返回 0**）。
+"""
+c_doc = """
+读 `seq >= since` 的第一条记录；没有更多时返回 -ENOENT（不返回 0）。
+"""
+[[function.param]]
+name = "since"
+type = "u64"
+[[function.param]]
+name = "out"
+type = "*mut TraceRecordAbi"
+[[function.param]]
+name = "out_next"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_trace_stats"
+ret = "i32"
+category = "Trace / 时钟（只读观察面）"
+c_category = "Trace（只读观察面；无写入口）"
+doc = """
+读 Trace 子系统状态到 `out`。成功 = 0，失败 = `-Errno`（`EFAULT` 空指针）。
+字段语义见 [`TraceStatsAbi`]。
+"""
+[[function.param]]
+name = "out"
+type = "*mut TraceStatsAbi"
+
+[[function]]
+name = "kcore_now"
+ret = "u64"
+category = "Trace / 时钟（只读观察面）"
+c_category = "Clock（只读；无 authority 语义）"
+doc = """
+单调时钟（`rdtime` 的原始 tick）；频率见 [`kcore_timebase_hz`]。
+真机 timebase 常是 10 MHz（1 tick = 100 ns）——测很短的操作要累积多次。
+"""
+
+[[function]]
+name = "kcore_timebase_hz"
+ret = "u64"
+category = "Trace / 时钟（只读观察面）"
+c_category = "Clock（只读；无 authority 语义）"
+doc = """
+时钟频率（Hz），用于把 tick 换算成时间。
+"""
+
+[[function]]
+name = "kcore_heap_alloc"
+ret = "*mut u8"
+category = "Runtime / shared heap"
+c_category = "Runtime / shared heap（Core 共享堆，非 per-component 堆）"
+[[function.param]]
+name = "size"
+type = "usize"
+[[function.param]]
+name = "align"
+type = "usize"
+
+[[function]]
+name = "kcore_heap_dealloc"
+ret = "i32"
+category = "Runtime / shared heap"
+c_category = "Runtime / shared heap（Core 共享堆，非 per-component 堆）"
+[[function.param]]
+name = "ptr"
+type = "*mut u8"
+[[function.param]]
+name = "size"
+type = "usize"
+[[function.param]]
+name = "align"
+type = "usize"
+
+[[function]]
+name = "kcore_console_write_byte"
+ret = "void"
+category = "Logging / diagnostics"
+c_category = "Logging / diagnostics"
+[[function.param]]
+name = "byte"
+type = "u8"
+
+[[function]]
+name = "kcore_log_line"
+ret = "i32"
+category = "Logging / diagnostics"
+c_category = "Logging / diagnostics"
+[[function.param]]
+name = "ptr"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_machine_boot_hart"
+ret = "u32"
+category = "Machine query"
+c_category = "Machine query"
+
+[[function]]
+name = "kcore_machine_cpu_count"
+ret = "u32"
+category = "Machine query"
+c_category = "Machine query"
+
+[[function]]
+name = "kcore_machine_has_hart"
+ret = "i32"
+category = "Machine query"
+c_category = "Machine query"
+[[function.param]]
+name = "hart_id"
+type = "u32"
+
+[[function]]
+name = "kcore_free_page_count"
+ret = "u32"
+category = "System query"
+c_category = "System query"
+
+[[function]]
+name = "kcore_task_count"
+ret = "u32"
+category = "System query"
+c_category = "System query"
+
+[[function]]
+name = "kcore_component_count"
+ret = "u32"
+category = "System query"
+c_category = "System query"
+
+[[function]]
+name = "kcore_component_create"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+doc = """
+按 artifact 名创建新实例（同一 image 允许多实例）。成功 = `0` 且
+`*out_instance` 写 instance id（`ComponentId` raw）；失败 = `-Errno`。
+"""
+c_doc = """
+Core 侧的最小创建操作：按 artifact 名创建新实例（同一 image 允许多实例）。
+"""
+[[function.param]]
+name = "image_name"
+type = "*const u8"
+[[function.param]]
+name = "image_name_len"
+type = "usize"
+[[function.param]]
+name = "args"
+type = "*const KcompCreateArgs"
+[[function.param]]
+name = "out_instance"
+type = "*mut u32"
+
+[[function]]
+name = "kcore_component_load"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+[[function.param]]
+name = "name"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_interface_publish"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+[[function.param]]
+name = "name"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "kind"
+type = "u32"
+[[function.param]]
+name = "abi"
+type = "u64"
+[[function.param]]
+name = "api"
+type = "*const void"
+[[function.param]]
+name = "ctx"
+type = "*mut void"
+
+[[function]]
+name = "kcore_interface_available"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+[[function.param]]
+name = "name"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "kind"
+type = "u32"
+[[function.param]]
+name = "abi"
+type = "u64"
+
+[[function]]
+name = "kcore_interface_bind"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+[[function.param]]
+name = "name"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "kind"
+type = "u32"
+[[function.param]]
+name = "abi"
+type = "u64"
+[[function.param]]
+name = "out_binding"
+type = "*mut u64"
+[[function.param]]
+name = "out_api"
+type = "*mut usize"
+[[function.param]]
+name = "out_ctx"
+type = "*mut usize"
+[[function.param]]
+name = "out_generation"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_interface_refresh"
+ret = "i32"
+category = "Component lifecycle（v2）"
+c_category = "Component lifecycle"
+[[function.param]]
+name = "binding"
+type = "u64"
+[[function.param]]
+name = "abi"
+type = "u64"
+[[function.param]]
+name = "out_api"
+type = "*mut usize"
+[[function.param]]
+name = "out_ctx"
+type = "*mut usize"
+[[function.param]]
+name = "out_generation"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_task_create"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+doc = """
+创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
+（归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入
+`*out_task`；失败 = `-Errno`。
+"""
+[[function.param]]
+name = "entry"
+type = "KcompTaskEntry"
+[[function.param]]
+name = "arg"
+type = "*mut void"
+[[function.param]]
+name = "out_task"
+type = "*mut u32"
+[[function.core_param]]
+name = "entry"
+type = "usize"
+[[function.core_param]]
+name = "arg"
+type = "*mut void"
+[[function.core_param]]
+name = "out_task"
+type = "*mut u32"
+
+[[function]]
+name = "kcore_task_start"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+[[function.param]]
+name = "id"
+type = "u32"
+
+[[function]]
+name = "kcore_task_yield"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+
+[[function]]
+name = "kcore_task_exit"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+
+[[function]]
+name = "kcore_task_state"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+[[function.param]]
+name = "id"
+type = "u32"
+
+[[function]]
+name = "kcore_panic_escape"
+ret = "i32"
+category = "Panic containment（v2）"
+c_category = "Panic containment"
+category_group = "Task control（v2）"
+
+[[function]]
+name = "kcore_sched_run"
+ret = "i32"
+category = "Scheduler（v2）"
+c_category = "Scheduler"
+
+[[function]]
+name = "kcore_device_nth"
+ret = "i32"
+category = "Device ownership（mechanism-first）"
+c_category = "Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）"
+[[function.param]]
+name = "compatible"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "ordinal"
+type = "u32"
+[[function.param]]
+name = "out_device_id"
+type = "*mut u32"
+
+[[function]]
+name = "kcore_device_claim"
+ret = "i32"
+category = "Device ownership（mechanism-first）"
+c_category = "Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）"
+doc = """
+认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。
+KernelNative 下就是寄存器基址；driver 之后自己 volatile 读写。
+"""
+c_doc = """
+认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。
+"""
+[[function.param]]
+name = "device_id"
+type = "u32"
+[[function.param]]
+name = "out_mmio"
+type = "*mut *mut u8"
+[[function.param]]
+name = "out_len"
+type = "*mut usize"
+
+[[function]]
+name = "kcore_device_release"
+ret = "i32"
+category = "Device ownership（mechanism-first）"
+c_category = "Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）"
+[[function.param]]
+name = "device_id"
+type = "u32"
+
+[[function]]
+name = "kcore_irq_register"
+ret = "i32"
+category = "IRQ routes"
+c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+category_group = "Device ownership（mechanism-first）"
+[[function.param]]
+name = "device_id"
+type = "u32"
+[[function.param]]
+name = "handler"
+type = "IrqHandler"
+[[function.param]]
+name = "ctx"
+type = "*mut void"
+
+[[function]]
+name = "kcore_irq_enable"
+ret = "i32"
+category = "IRQ routes"
+c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+category_group = "Device ownership（mechanism-first）"
+[[function.param]]
+name = "device_id"
+type = "u32"
+
+[[function]]
+name = "kcore_irq_disable"
+ret = "i32"
+category = "IRQ routes"
+c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+category_group = "Device ownership（mechanism-first）"
+[[function.param]]
+name = "device_id"
+type = "u32"
+
+[[function]]
+name = "kcore_irq_release"
+ret = "i32"
+category = "IRQ routes"
+c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+category_group = "Device ownership（mechanism-first）"
+[[function.param]]
+name = "device_id"
+type = "u32"
+
+[[function]]
+name = "kcore_dma_alloc"
+ret = "i32"
+category = "DMA（allocation / mapping 分离）"
+c_category = "DMA（allocation 与 mapping 分离）"
+category_group = "Device ownership（mechanism-first）"
+doc = """
+分配 CPU-visible、物理连续的 DMA 缓冲（device-agnostic）。
+"""
+[[function.param]]
+name = "size"
+type = "usize"
+[[function.param]]
+name = "out_ptr"
+type = "*mut *mut u8"
+[[function.param]]
+name = "out_len"
+type = "*mut usize"
+
+[[function]]
+name = "kcore_dma_free"
+ret = "i32"
+category = "DMA（allocation / mapping 分离）"
+c_category = "DMA（allocation 与 mapping 分离）"
+category_group = "Device ownership（mechanism-first）"
+doc = """
+释放一段 DMA 缓冲（backing 进 Core quarantine，不立即 free）。
+"""
+[[function.param]]
+name = "ptr"
+type = "*mut u8"
+
+[[function]]
+name = "kcore_dma_map"
+ret = "i32"
+category = "DMA（allocation / mapping 分离）"
+c_category = "DMA（allocation 与 mapping 分离）"
+category_group = "Device ownership（mechanism-first）"
+doc = """
+把 buffer 映射给设备：设备可见地址 + mapping id（No-IOMMU identity）。
+"""
+[[function.param]]
+name = "device_id"
+type = "u32"
+[[function.param]]
+name = "ptr"
+type = "*mut u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "direction"
+type = "i32"
+[[function.param]]
+name = "out_device_addr"
+type = "*mut u64"
+[[function.param]]
+name = "out_mapping"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_dma_unmap"
+ret = "i32"
+category = "DMA（allocation / mapping 分离）"
+c_category = "DMA（allocation 与 mapping 分离）"
+category_group = "Device ownership（mechanism-first）"
+[[function.param]]
+name = "mapping"
+type = "u64"
+
+# overrides: ['kcore_task_create']

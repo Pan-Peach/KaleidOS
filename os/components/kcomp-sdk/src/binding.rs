@@ -27,14 +27,7 @@ impl InterfaceAbi {
     }
 }
 
-/// Interface 领域分类（ABI 编码 0/1/2，与 Core `InterfaceKind` 一致）。
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InterfaceKind {
-    Device = 0,
-    Service = 1,
-    Policy = 2,
-}
+pub use crate::generated::abi::InterfaceKind;
 
 impl InterfaceKind {
     /// ABI 编码（`#[repr(u32)]`，恒等于判别值）。
@@ -300,7 +293,7 @@ impl Service for SchedulerPolicy {
 // 这是 prober→driver 的**唯一**通道，只传**数据**（device id / attempt），
 // 绝不携带 authority：prober 不 claim MMIO、不读任何寄存器；驱动在**自己的
 // init 上下文**里 `kcore_mmio_claim` 那个 DeviceId，并自己做协议级 fine match
-// （见 docs/driver-model.md §9.1 / §12 Q1）。
+// （见 docs/architecture/driver-model.md §9.1 / §12 Q1）。
 //
 // 分工不可合并：coarse candidate match（prober，只认 compatible 这个 opaque
 // 键）→ 请求 Core 加载候选驱动代码 → fine protocol match（driver，需要协议知识
@@ -373,9 +366,5 @@ impl Service for DriverProber {
 
 pub use crate::block::{BLOCK_DEVICE_ABI, BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceApi};
 pub use crate::filesystem::{
-    FileSystem,
-    FileSystemApi,
-    FILESYSTEM_ABI,
-    FILESYSTEM_NAME,
-    FILESYSTEM_OPEN_READ,
+    FILESYSTEM_ABI, FILESYSTEM_NAME, FILESYSTEM_OPEN_READ, FileSystem, FileSystemApi,
 };

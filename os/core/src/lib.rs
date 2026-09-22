@@ -5,9 +5,9 @@
 //! MachineInfo（`machine::MachineInfo`），
 //! 不知道 FDT / ACPI / QEMU / 板子，也不知道加载器是谁。
 //! 本 crate 是 host-testable 的 library（`cargo test` 专用）；运行时常与 bootstrap 阶段
-//! 一起链接成 `kaleidos.elf`（单镜像，职责分离装载合一，见 `docs/architecture.md` §3）。
+//! 一起链接成 `kaleidos.elf`（单镜像，职责分离装载合一，见 `docs/architecture/overview.md` §3）。
 //! ISA backend（`os/arch`）与 FDT 解析（`third_party/fdt` 子模块）由 bootstrap 组合。
-//! 设计契约见 `docs/architecture.md` 与 `docs/core-philosophy.md`。
+//! 设计契约见 `docs/architecture/overview.md` 与 `docs/philosophy/core-philosophy.md`。
 
 #![no_std]
 extern crate alloc;
@@ -23,6 +23,7 @@ mod build_config;
 pub mod bench;
 pub mod component;
 pub mod errno;
+pub mod generated;
 pub mod inspector;
 pub mod irq;
 pub mod machine;

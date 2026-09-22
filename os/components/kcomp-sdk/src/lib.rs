@@ -1,7 +1,7 @@
 //! kcomp-sdk —— 组件 SDK / CRT（step 2）。
 //!
 //! 这个 crate 解决三件互相独立的事，全部**随 `.kcomp` 私有携带**（不建 shared
-//! Rust runtime，见 docs/component-model.md §2.2）：
+//! Rust runtime，见 docs/architecture/component-model.md §2.2）：
 //!
 //! 1. [`abi`]：`kcore_*` 导出白名单的**单一来源**（组件不再各自复制 extern 块）；
 //! 2. 入口 / 日志 / panic adapter：`kcomp_instance_create!` /
@@ -39,6 +39,7 @@ pub mod binding;
 pub mod block;
 pub mod errno;
 pub mod filesystem;
+pub mod generated;
 
 mod dma;
 mod logging;
@@ -57,7 +58,7 @@ pub use logging::{console_write_byte, log};
 mod tests;
 
 // ---------------------------------------------------------------------------
-// 组件生命周期入口约定（docs/component-lifecycle.md §4）
+// 组件生命周期入口约定（docs/architecture/component-lifecycle.md §4）
 // ---------------------------------------------------------------------------
 
 /// 定义组件实例创建入口 `kcomp_instance_create`，并发出契约指纹 `kcomp_abi`。

@@ -102,6 +102,16 @@ use crate::task::{self, TaskId, TaskState};
 use arch::{Console, ConsoleImpl};
 use core::alloc::GlobalAlloc;
 
+// ---------------------------------------------------------------------------
+// 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
+// ---------------------------------------------------------------------------
+// 表本体由 tools/kabi/kabi_gen.py 从 `abi/core.toml` 生成到
+// `generated/exports.rs`：typed 引用锚定实现签名（缺实现 / 签名变了 = 编译错误）。
+#[path = "generated/exports.rs"]
+mod exports;
+
+use exports::EXPORTS;
+
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
 /// 无需 build script / 运行时注册。
@@ -342,7 +352,7 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
     }
 }
 
-/// 用指定 config 负载创建一个新实例（`docs/component-lifecycle.md` §4）。
+/// 用指定 config 负载创建一个新实例（`docs/architecture/component-lifecycle.md` §4）。
 ///
 /// 同名 artifact 复用已登记的常驻 image（新实例、新 id、新 state）；否则
 /// store → loader → image 登记。`args` 是组件自定义的 C 布局小结构，Core 视为
@@ -885,177 +895,6 @@ extern "C" fn kcore_dma_unmap(mapping: u64) -> i32 {
     status(dma::unmap(mapping))
 }
 
-// ---------------------------------------------------------------------------
-// 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
-// ---------------------------------------------------------------------------
-
-static EXPORTS: [Export; 38] = [
-    // Category 0：Trace / 时钟（只读观察面）
-    Export {
-        name: b"kcore_trace_read",
-        address: ExportAddress(kcore_trace_read as *const ()),
-    },
-    Export {
-        name: b"kcore_trace_stats",
-        address: ExportAddress(kcore_trace_stats as *const ()),
-    },
-    Export {
-        name: b"kcore_now",
-        address: ExportAddress(kcore_now as *const ()),
-    },
-    Export {
-        name: b"kcore_timebase_hz",
-        address: ExportAddress(kcore_timebase_hz as *const ()),
-    },
-    // Category 1：Runtime / shared heap
-    Export {
-        name: b"kcore_heap_alloc",
-        address: ExportAddress(kcore_heap_alloc as *const ()),
-    },
-    Export {
-        name: b"kcore_heap_dealloc",
-        address: ExportAddress(kcore_heap_dealloc as *const ()),
-    },
-    // Category 2：Logging / diagnostics
-    Export {
-        name: b"kcore_console_write_byte",
-        address: ExportAddress(kcore_console_write_byte as *const ()),
-    },
-    Export {
-        name: b"kcore_log_line",
-        address: ExportAddress(kcore_log_line as *const ()),
-    },
-    // Category 3：Machine query
-    Export {
-        name: b"kcore_machine_boot_hart",
-        address: ExportAddress(kcore_machine_boot_hart as *const ()),
-    },
-    Export {
-        name: b"kcore_machine_cpu_count",
-        address: ExportAddress(kcore_machine_cpu_count as *const ()),
-    },
-    Export {
-        name: b"kcore_machine_has_hart",
-        address: ExportAddress(kcore_machine_has_hart as *const ()),
-    },
-    // Category 4：System query
-    Export {
-        name: b"kcore_free_page_count",
-        address: ExportAddress(kcore_free_page_count as *const ()),
-    },
-    Export {
-        name: b"kcore_task_count",
-        address: ExportAddress(kcore_task_count as *const ()),
-    },
-    Export {
-        name: b"kcore_component_count",
-        address: ExportAddress(kcore_component_count as *const ()),
-    },
-    // Category 5：Component lifecycle（v2）
-    Export {
-        name: b"kcore_component_create",
-        address: ExportAddress(kcore_component_create as *const ()),
-    },
-    Export {
-        name: b"kcore_component_load",
-        address: ExportAddress(kcore_component_load as *const ()),
-    },
-    Export {
-        name: b"kcore_interface_publish",
-        address: ExportAddress(kcore_interface_publish as *const ()),
-    },
-    Export {
-        name: b"kcore_interface_available",
-        address: ExportAddress(kcore_interface_available as *const ()),
-    },
-    Export {
-        name: b"kcore_interface_bind",
-        address: ExportAddress(kcore_interface_bind as *const ()),
-    },
-    Export {
-        name: b"kcore_interface_refresh",
-        address: ExportAddress(kcore_interface_refresh as *const ()),
-    },
-    // Category 6：Task control（v2）
-    Export {
-        name: b"kcore_task_create",
-        address: ExportAddress(kcore_task_create as *const ()),
-    },
-    Export {
-        name: b"kcore_task_start",
-        address: ExportAddress(kcore_task_start as *const ()),
-    },
-    Export {
-        name: b"kcore_task_yield",
-        address: ExportAddress(kcore_task_yield as *const ()),
-    },
-    Export {
-        name: b"kcore_task_exit",
-        address: ExportAddress(kcore_task_exit as *const ()),
-    },
-    Export {
-        name: b"kcore_task_state",
-        address: ExportAddress(kcore_task_state as *const ()),
-    },
-    // Category 6（续）：Panic containment（v2）
-    Export {
-        name: b"kcore_panic_escape",
-        address: ExportAddress(kcore_panic_escape as *const ()),
-    },
-    // Category 7：Scheduler（v2）
-    Export {
-        name: b"kcore_sched_run",
-        address: ExportAddress(kcore_sched_run as *const ()),
-    },
-    // Category 8：Device ownership（mechanism-first）
-    Export {
-        name: b"kcore_device_nth",
-        address: ExportAddress(kcore_device_nth as *const ()),
-    },
-    Export {
-        name: b"kcore_device_claim",
-        address: ExportAddress(kcore_device_claim as *const ()),
-    },
-    Export {
-        name: b"kcore_device_release",
-        address: ExportAddress(kcore_device_release as *const ()),
-    },
-    // Category 8（续）：IRQ routes
-    Export {
-        name: b"kcore_irq_register",
-        address: ExportAddress(kcore_irq_register as *const ()),
-    },
-    Export {
-        name: b"kcore_irq_enable",
-        address: ExportAddress(kcore_irq_enable as *const ()),
-    },
-    Export {
-        name: b"kcore_irq_disable",
-        address: ExportAddress(kcore_irq_disable as *const ()),
-    },
-    Export {
-        name: b"kcore_irq_release",
-        address: ExportAddress(kcore_irq_release as *const ()),
-    },
-    // Category 8（续）：DMA（allocation / mapping 分离）
-    Export {
-        name: b"kcore_dma_alloc",
-        address: ExportAddress(kcore_dma_alloc as *const ()),
-    },
-    Export {
-        name: b"kcore_dma_free",
-        address: ExportAddress(kcore_dma_free as *const ()),
-    },
-    Export {
-        name: b"kcore_dma_map",
-        address: ExportAddress(kcore_dma_map as *const ()),
-    },
-    Export {
-        name: b"kcore_dma_unmap",
-        address: ExportAddress(kcore_dma_unmap as *const ()),
-    },
-];
-
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
 /// 返回的内核地址由 loader 作为 ELF 重定位的 `S` 使用。
 pub fn resolve(name: &[u8]) -> Option<usize> {
@@ -1140,7 +979,7 @@ mod tests {
         assert!(resolve(b"x?kcore_log_line").is_none(), "禁止后缀匹配");
     }
 
-    /// DMA 方向 ABI 编码锚定（`docs/driver-model.md`）：`as_i32` 与
+    /// DMA 方向 ABI 编码锚定（`docs/architecture/driver-model.md`）：`as_i32` 与
     /// `DmaDirection::from_i32` 必须互为逆，且值固定为 0/1/2；`kcomp-sdk` 的镜像
     /// 枚举同值（SDK 侧有对应测试 `dma_direction_encoding_is_stable`）。
     #[test]
@@ -1163,6 +1002,9 @@ mod tests {
     /// （不触发 context switch）。活动边界下永不返回，只能由 QEMU/ArchTest 验证。
     #[test]
     fn panic_escape_without_boundary_returns_eperm() {
+        // 与安装 test boundary 的测试互斥：否则 `active_escape()` 检查与调用之间
+        // 可能被别的测试装上边界，escape 会切到那个边界上（host 并行测试竞态）。
+        let _boundary = crate::component::containment::test_boundary_lock();
         // 其它测试会短暂安装 task guard；仅在确认无活动边界时断言，避免把并行
         // 测试的 guard 当成真实边界而触发一次 context switch。
         if crate::component::containment::active_escape().is_some() {
@@ -1323,7 +1165,7 @@ mod tests {
     /// 锁定 `deny_if_failed` 的**已知范围**：只拒绝 `Failed`（逻辑死亡）实例；
     /// 已 `Stopped` 的实例**不在**其内。
     ///
-    /// review `docs/resource-model-review.md` §C.5 明确记录这是 known gap：
+    /// review `docs/notes/resource-model-review.md` §C.5 明确记录这是 known gap：
     /// 其它"不应获得新权威"的状态（`Stopping` / `Stopped`）未被该门禁覆盖。
     /// 本步骤只 documenting + 锁定现状，**不修改行为**。
     #[test]

@@ -18,8 +18,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// C 侧作者面（`AGENTS.md`：C 是根）。路径相对本文件：`os/core/tests/`。
 const HEADER_SRC: &str = include_str!("../../components/kcomp-sdk/include/kcomp.h");
-/// SDK 的 Rust 镜像。
+/// C 侧生成物（`abi/*.toml` → `kcore_*` / 生命周期 / 稳定结构的声明本体）。
+const GENERATED_HEADER_SRC: &str =
+    include_str!("../../components/kcomp-sdk/include/generated/kcomp_abi.h");
+/// SDK 的 Rust 镜像（手写 facade）。
 const SDK_ABI_SRC: &str = include_str!("../../components/kcomp-sdk/src/abi.rs");
+/// SDK 的 Rust 生成物（结构 / 常量 / 入口别名 / extern 块）。
+const SDK_GENERATED_ABI_SRC: &str = include_str!("../../components/kcomp-sdk/src/generated/abi.rs");
 /// Core 的强制点（EXPORT_SYMBOL 白名单表 + 真实函数签名）。
 const CORE_EXPORT_SRC: &str = include_str!("../src/component/export.rs");
 
@@ -157,7 +162,9 @@ fn classify_c_type(raw: &str) -> Result<Width, String> {
         return Ok(Width::Ptr);
     }
     match t {
-        "size_t" | "uintptr_t" | "intptr_t" | "ptrdiff_t" | "KcompTaskEntry" => Ok(Width::Ptr),
+        "size_t" | "uintptr_t" | "intptr_t" | "ptrdiff_t" | "KcompTaskEntry" | "IrqHandler" => {
+            Ok(Width::Ptr)
+        }
         "uint64_t" | "int64_t" => Ok(Width::W64),
         "uint32_t" | "int32_t" => Ok(Width::W32),
         "uint16_t" | "int16_t" => Ok(Width::W16),
@@ -387,29 +394,9 @@ fn contains_ident(src: &str, ident: &str) -> bool {
     })
 }
 
-fn only_kcore(map: BTreeMap<String, Signature>) -> BTreeMap<String, Signature> {
-    map.into_iter()
-        .filter(|(name, _)| name.starts_with("kcore_"))
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // 断言
 // ---------------------------------------------------------------------------
-
-fn assert_name_sets_equal(
-    label_a: &str,
-    a: &BTreeSet<String>,
-    label_b: &str,
-    b: &BTreeSet<String>,
-) {
-    let only_a: Vec<_> = a.difference(b).cloned().collect();
-    let only_b: Vec<_> = b.difference(a).cloned().collect();
-    assert!(
-        only_a.is_empty() && only_b.is_empty(),
-        "kcore_* 名字集合漂移：\n  只在 {label_a}：{only_a:?}\n  只在 {label_b}：{only_b:?}"
-    );
-}
 
 fn compare_signatures(
     label_a: &str,
@@ -432,86 +419,24 @@ fn compare_signatures(
 }
 
 // ---------------------------------------------------------------------------
-// 三方交叉校验
+// 生命周期入口面（冻结契约）
 // ---------------------------------------------------------------------------
-
-#[test]
-fn header_and_sdk_mirror_declare_the_same_kcore_symbols() {
-    let names_c = only_kcore(extract_c_decls(&strip_comments(HEADER_SRC)));
-    let names_sdk = only_kcore(extract_rust_decls(&strip_comments(SDK_ABI_SRC)));
-    assert!(
-        names_c.len() >= 36,
-        "kcomp.h 只解析出 {} 个 kcore_* 声明（解析器坏了或声明被删）",
-        names_c.len()
-    );
-    assert!(
-        names_sdk.len() >= 36,
-        "abi.rs 只解析出 {} 个 kcore_* 声明（解析器坏了或声明被删）",
-        names_sdk.len()
-    );
-    assert_name_sets_equal(
-        "kcomp.h",
-        &names_c.keys().cloned().collect(),
-        "abi.rs",
-        &names_sdk.keys().cloned().collect(),
-    );
-}
-
-#[test]
-fn header_and_core_export_table_declare_the_same_kcore_symbols() {
-    let header = strip_comments(HEADER_SRC);
-    let core = strip_comments(CORE_EXPORT_SRC);
-    let names_c: BTreeSet<String> = only_kcore(extract_c_decls(&header)).into_keys().collect();
-    let names_core = extract_export_table_names(&core);
-    assert!(
-        !names_core.is_empty(),
-        "export.rs 的 EXPORTS 表解析出 0 个名字（表被改写成了 drift test 不认识的形式？）"
-    );
-    assert_name_sets_equal("kcomp.h", &names_c, "export.rs", &names_core);
-
-    // 表里的每个名字必须有函数体；每个 `fn kcore_*` 必须登记进表。
-    let core_fns = extract_rust_decls(&core);
-    let table_without_body: Vec<_> = names_core
-        .iter()
-        .filter(|name| !core_fns.contains_key(*name))
-        .collect();
-    assert!(
-        table_without_body.is_empty(),
-        "export.rs 导出表缺少函数定义：{table_without_body:?}"
-    );
-    let body_not_in_table: Vec<_> = core_fns
-        .keys()
-        .filter(|name| !names_core.contains(*name))
-        .collect();
-    assert!(
-        body_not_in_table.is_empty(),
-        "export.rs `fn kcore_*` 未登记导出表（组件永远解析不到）：{body_not_in_table:?}"
-    );
-}
-
-#[test]
-fn kcore_signature_shapes_match_across_all_three_files() {
-    let c = only_kcore(extract_c_decls(&strip_comments(HEADER_SRC)));
-    let r = extract_rust_decls(&strip_comments(SDK_ABI_SRC));
-    let e = extract_rust_decls(&strip_comments(CORE_EXPORT_SRC));
-    let mut problems = Vec::new();
-    compare_signatures("kcomp.h", &c, "abi.rs", &r, &mut problems);
-    compare_signatures("kcomp.h", &c, "export.rs", &e, &mut problems);
-    compare_signatures("abi.rs", &r, "export.rs", &e, &mut problems);
-    assert!(
-        problems.is_empty(),
-        "kcore_* 签名漂移（参数个数 / 宽度类别 / 返回类别）：\n{}",
-        problems.join("\n")
-    );
-}
+//
+// 旧的 `kcore_*` 三方文本交叉校验已删除：名字 / 签名 / 布局现在由 abi/*.toml
+// 单源生成 —— C `_Static_assert`（generated/kcomp_abi.h）、Rust `const _: ()`
+// 布局断言（generated/abi.rs）、以及 `component/generated/exports.rs` 的 typed
+// 导出注册表（缺实现 / 签名变了 = 编译错误）在编译期覆盖原来的检查。
+// 本测试只钉住"生命周期入口面存在且形状正确"。
 
 #[test]
 fn lifecycle_entry_surface_is_frozen() {
-    let header = strip_comments(HEADER_SRC);
-    let sdk = strip_comments(SDK_ABI_SRC);
+    // Phase 2 起声明本体在生成物里（umbrella / facade 只 include / re-export），
+    // 因此把两份文本拼起来做"作者面"检查。
+    let header = strip_comments(&[HEADER_SRC, GENERATED_HEADER_SRC].concat());
+    let sdk = strip_comments(&[SDK_ABI_SRC, SDK_GENERATED_ABI_SRC].concat());
     let core = strip_comments(CORE_EXPORT_SRC);
 
-    // C 侧必需声明与形状（docs/component-lifecycle.md §4/§6）。
+    // C 侧必需声明与形状（docs/architecture/component-lifecycle.md §4/§6）。
     let c = extract_c_decls(&header);
     let create = c
         .get("kcomp_instance_create")
@@ -862,9 +787,8 @@ fn block_device_fn_table_layout_matches_across_c_and_rust() {
 
 #[test]
 fn block_device_constants_match_across_c_and_rust() {
-    let c = strip_comments(HEADER_SRC);
+    let c = strip_comments(&[HEADER_SRC, GENERATED_HEADER_SRC].concat());
     let r = strip_comments(SDK_BLOCK_SRC);
-    let b = strip_comments(SDK_BINDING_SRC);
 
     let c_name = extract_first_string(
         &extract_c_define(&c, "KCOMP_BLOCK_DEVICE_NAME")
@@ -889,7 +813,11 @@ fn block_device_constants_match_across_c_and_rust() {
     );
 
     let c_enum = extract_enum_values(&c, "enum KcompInterfaceKind");
-    let r_enum = extract_enum_values(&b, "enum InterfaceKind");
+    // `InterfaceKind` 的 Rust 本体在生成物里（binding.rs 只 re-export）。
+    let r_enum = extract_enum_values(
+        &strip_comments(&[SDK_BINDING_SRC, SDK_GENERATED_ABI_SRC].concat()),
+        "enum InterfaceKind",
+    );
     for (c_key, r_key) in [
         ("KCOMP_IFACE_DEVICE", "Device"),
         ("KCOMP_IFACE_SERVICE", "Service"),
@@ -910,7 +838,10 @@ fn filesystem_fn_table_layout_matches_across_c_and_rust() {
 
     let c_names: Vec<_> = c.iter().map(|(n, _)| n.clone()).collect();
     let r_names: Vec<_> = r.iter().map(|(n, _)| n.clone()).collect();
-    assert_eq!(c_names, r_names, "filesystem function table 字段名 / 顺序漂移");
+    assert_eq!(
+        c_names, r_names,
+        "filesystem function table 字段名 / 顺序漂移"
+    );
 
     let c_map: BTreeMap<_, _> = c.into_iter().collect();
     let r_map: BTreeMap<_, _> = r.into_iter().collect();
@@ -929,22 +860,18 @@ fn filesystem_constants_match_across_c_and_rust() {
     let r = strip_comments(SDK_FILESYSTEM_SRC);
 
     let c_name = extract_first_string(
-        &extract_c_define(&c, "KCOMP_FILESYSTEM_NAME")
-            .expect("kcomp.h 缺 KCOMP_FILESYSTEM_NAME"),
+        &extract_c_define(&c, "KCOMP_FILESYSTEM_NAME").expect("kcomp.h 缺 KCOMP_FILESYSTEM_NAME"),
     );
     let r_name = extract_first_string(
-        &extract_rust_const_expr(&r, "FILESYSTEM_NAME")
-            .expect("filesystem.rs 缺 FILESYSTEM_NAME"),
+        &extract_rust_const_expr(&r, "FILESYSTEM_NAME").expect("filesystem.rs 缺 FILESYSTEM_NAME"),
     );
     assert_eq!(c_name, r_name, "filesystem 名字漂移");
 
     let c_abi = parse_u64_literal(
-        &extract_c_define(&c, "KCOMP_FILESYSTEM_ABI")
-            .expect("kcomp.h 缺 KCOMP_FILESYSTEM_ABI"),
+        &extract_c_define(&c, "KCOMP_FILESYSTEM_ABI").expect("kcomp.h 缺 KCOMP_FILESYSTEM_ABI"),
     );
     let r_abi = parse_u64_literal(
-        &extract_rust_const_expr(&r, "FILESYSTEM_ABI")
-            .expect("filesystem.rs 缺 FILESYSTEM_ABI"),
+        &extract_rust_const_expr(&r, "FILESYSTEM_ABI").expect("filesystem.rs 缺 FILESYSTEM_ABI"),
     );
     assert_eq!(c_abi, r_abi, "filesystem ABI 指纹漂移");
     assert_eq!(c_abi, Some(0x4649_4C45_5359_5354));
@@ -992,61 +919,23 @@ pub struct DemoApi {
 }
 
 // ===========================================================================
-// ABI 错误码（errno）：Core ↔ SDK ↔ C 三方同值
+// ABI 错误码（errno）：编译器锚定的数值 pin
 // ---------------------------------------------------------------------------
-// 现成的 no_std errno crate 全部门控在 hosted/Linux，裸机没有可用实现，所以编号
-// 由我们自己持有——那就必须保证三份（Core 内部 / 组件 SDK / C shim）**逐值一致**，
-// 否则组件按 -Errno 判断会与 Core 实际返回对不上。
+// errno 数值的单一来源是 abi/errno.toml（tools/kabi/kabi_gen.py 生成 Core / SDK /
+// C 三份哑 ABI；`make abi-check` 保证三份同源）。这里不再跨源文本比对，只做
+// **编译器级**抽查：直接对枚举判别式取 `as i32`，与生成流程解耦——生成器即使
+// 整体失灵，这些稳定契约值也必须顶着。
 // ===========================================================================
 
-const CORE_ERRNO_SRC: &str = include_str!("../src/errno.rs");
-const SDK_ERRNO_SRC: &str = include_str!("../../components/kcomp-sdk/src/errno.rs");
-const C_ERRNO_HEADER: &str = include_str!("../../components/kcomp-sdk/include/errno.h");
-
-/// 扫描 C 头里的 `#define E<NAME> <number>`（POSIX errno 常量；跳过 `KCOMP_*` 等）。
-fn extract_c_errno_defines(stripped: &str) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    for line in stripped.lines() {
-        let Some(rest) = line.trim().strip_prefix("#define") else {
-            continue;
-        };
-        let mut parts = rest.split_whitespace();
-        let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let is_errno_name = name.starts_with('E')
-            && name[1..]
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        if is_errno_name && let Some(number) = parse_u64_literal(value) {
-            out.insert(name.to_string(), number);
-        }
-    }
-    out
-}
-
 #[test]
-fn errno_table_matches_across_core_sdk_and_c() {
-    let core = extract_enum_values(&strip_comments(CORE_ERRNO_SRC), "enum Errno");
-    let sdk = extract_enum_values(&strip_comments(SDK_ERRNO_SRC), "enum Errno");
-    let c = extract_c_errno_defines(&strip_comments(C_ERRNO_HEADER));
+fn errno_literals_are_pinned_to_stable_numbers() {
+    use kernel::errno::Errno;
 
-    assert!(
-        core.len() >= 100,
-        "errno 表只解析出 {} 项（解析器坏了或表被截断）",
-        core.len()
-    );
-    assert_eq!(core, sdk, "Core ↔ SDK errno 表漂移");
-    assert_eq!(core, c, "Core ↔ C errno 表漂移");
-}
-
-#[test]
-fn c_errno_define_parser_reads_values() {
-    let src =
-        strip_comments("#define EINVAL 22\n#define ENOENT 2\n#define KCOMP_X 9\n#define EMPTY\n");
-    let m = extract_c_errno_defines(&src);
-    assert_eq!(m.get("EINVAL"), Some(&22));
-    assert_eq!(m.get("ENOENT"), Some(&2));
-    assert_eq!(m.get("KCOMP_X"), None);
-    assert_eq!(m.len(), 2);
+    assert_eq!(Errno::ENOENT as i32, 2);
+    assert_eq!(Errno::EIO as i32, 5);
+    assert_eq!(Errno::EBUSY as i32, 16);
+    assert_eq!(Errno::ENODEV as i32, 19);
+    assert_eq!(Errno::EINVAL as i32, 22);
+    assert_eq!(Errno::EKEYREVOKED as i32, 128);
+    assert_eq!(Errno::EINVAL.code(), -22);
 }

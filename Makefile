@@ -1,7 +1,7 @@
 # KaleidOS build entry (Linux Kbuild style: root Makefile drives, tools/ holds helpers).
 #
 # Configuration is Linux Kconfig style — `.config` is the single configuration
-# truth (see docs/kconfig.md).  Pick a profile, then build:
+# truth (see docs/architecture/kconfig.md).  Pick a profile, then build:
 #
 #   make qemu_rv64_defconfig        # RV64 / supervisor / MMU
 #   make qemu_rv32_defconfig        # RV32 / supervisor / MMU
@@ -42,7 +42,8 @@ KCONFIG_MK := $(KCONFIG_CONFIG).mk
 # Goals that must NOT create or parse a configuration: host-only tools, and
 # `clean` / `rootfs` (both have to work on a fresh checkout where no .config
 # exists yet — the FAT image is built by mkfs.vfat/mtools, not by Kconfig).
-CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig rootfs
+# `abi-gen` / `abi-check` are pure source transformations (abi/*.toml → C/Rust).
+CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig rootfs abi-gen abi-check
 
 # Goals that CREATE a configuration: they must not generate/parse one, and they
 # cannot be combined with build goals in a single invocation.
@@ -124,6 +125,7 @@ help:
 	@echo "  make qemu-core                   run the Core-only dev image (no rootfs drive)"
 	@echo "  make rootfs                      build the small FAT image attached to make qemu"
 	@echo "  make check | test-host | test-build | test-kconfig | test-qemu | test-arch | test-driver-prober"
+	@echo "  make abi-gen | abi-check         ABI 单一来源：abi/*.toml → 生成 C/Rust（check 只校验）"
 
 # Materialise a configuration on first use.
 $(KCONFIG_CONFIG):
@@ -182,7 +184,7 @@ init.kpkg:
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
 # CONFIG_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 由生成的片段镜像成
 # CONFIG_TRACE_CAPACITY；这不是 Cargo feature，作为环境变量传给 os/core/build.rs
-# 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/kconfig.md）。
+# 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/architecture/kconfig.md）。
 kernel: init.kpkg
 	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
@@ -251,7 +253,7 @@ distclean: clean
 	rm -f .config .config.old .config.mk
 
 # —— 质量工具链（fmt / clippy / check / 测试通道）——
-# 测试入口显式分层（testing.md 金字塔落地）：
+# 测试入口显式分层（docs/development/testing.md 金字塔落地）：
 #   make test-host    host 单测（快速，日常主力，与 .config 无关）
 #   make test-build   两个架构的交叉构建门禁
 #   make test-qemu-rv64 / test-qemu-rv32   自动 QEMU（boot smoke + 自动 CoreTest）
@@ -260,7 +262,7 @@ distclean: clean
 #   make bench        host release 性能基线（手动跑，不进 CI）
 #   make test-kconfig Kconfig / Makefile 胶水契约测试（host-only，快速）
 #   make check        CI 全量门禁 = fmt + clippy + test-kconfig + test-host + test-build
-.PHONY: fmt clippy check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+.PHONY: fmt clippy check abi-gen abi-check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test -p logger
@@ -293,6 +295,20 @@ test-host:
 # Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
 test-kconfig:
 	python3 tests/kconfig/test_glue.py
+
+# —— KABI：ABI 单一来源生成（abi/*.toml → C / SDK-Rust / Core-Rust）——
+# 生成物是**提交物**：普通构建只消费它们，绝不在 build 期生成。
+# abi-gen 重生成（幂等）；abi-check 重生成到临时目录并逐文件 diff —— 内容漂移、
+# 生成文件缺失、生成目录里出现计划外文件都会响失败（`make check` 已并入）。
+KABI_GEN := python3 tools/kabi/kabi_gen.py
+KABI_SCHEMAS := --schema abi/component.toml --schema abi/core.toml --schema abi/errno.toml
+
+abi-gen:
+	$(KABI_GEN) generate $(KABI_SCHEMAS) --out-root .
+
+abi-check:
+	$(KABI_GEN) selftest
+	$(KABI_GEN) check $(KABI_SCHEMAS) --out-root .
 
 # 性能基线（host release，手动跑）：统一走 kernel::bench harness（见 os/core/src/bench）。
 # - trace 关掉：CONFIG_TRACE 的探针正好落在被测路径上，开着会污染数字
@@ -402,6 +418,7 @@ check: init.kpkg
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	$(MAKE) test-kconfig
+	$(MAKE) abi-check
 	$(MAKE) test-host
 	$(MAKE) test-build
 
