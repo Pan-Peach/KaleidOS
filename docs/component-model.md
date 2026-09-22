@@ -106,9 +106,9 @@ component wrapper
 > 校验「ET_REL + `kcomp_instance_create` / `kcomp_instance_destroy` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
 > 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
 > 两条语言路径消费**同一个 `kcomp.h`**：C 组件只有这一份声明 + SDK 的 C 运行时
-> （`os/components/kcomp-sdk/c/kcomp_rt.c` 的 weak `mem*`，随组件私有携带），
-> 直接调 `kcore_*`；Rust 组件在同一份声明上加 SDK 的 Rust adapter（入口宏 / 日志 /
-> panic / alloc）。`make test-c-smoke` 用最小 C 组件 `kcomp_c_smoke` 在 QEMU 上
+> （`os/components/kcomp-sdk/c/kcomp_rt.c` 的 weak `mem*` / `strlen` / `strchr`，随组件
+> 私有携带），直接调 `kcore_*`；Rust 组件在同一份声明上加 SDK 的 Rust adapter（入口宏 /
+> 日志 / panic / alloc）。`make test-c-smoke` 用最小 C 组件 `kcomp_c_smoke` 在 QEMU 上
 > 端到端验证这条路径（RV64 + RV32）。
 > （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
@@ -133,8 +133,11 @@ panic handler → component panic adapter     → kcore_log_line（打印诊断�
 >
 > **C 组件没有这些 Rust adapter**：它只 `#include "kcomp.h"`（`kcore_*` 声明 + 入口契约），
 > 直接调 `kcore_*`；日志 / panic 也走 `kcore_log_line` / `kcore_panic_escape`。它额外需要
-> 的只有 freestanding `mem*`，由 SDK 的 C 运行时提供。C 运行时**不建 shared runtime**：
-> 由 `tools/build-kcomp-c.sh` 随每个 C 组件编入（与 Rust 组件的 adapter 私有携带同理）。
+> 的只有 freestanding `mem*` / `strlen` / `strchr`，由 SDK 的 C 运行时提供；`#include
+> <string.h>` 解析到 SDK 的 freestanding shim（clang `-ffreestanding` 不提供它，而 FatFs
+> 的 `ff.c` 会 include）。C 运行时**不建 shared runtime**：由 `tools/build-kcomp-c.sh`
+> 随每个 C 组件编入（与 Rust 组件的 adapter 私有携带同理）。边界刻意收紧——只实现组件
+> 真正引用到的原语，**不朝 libc 扩张**。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 

@@ -76,7 +76,8 @@ cflags=(
     -fno-asynchronous-unwind-tables -fno-unwind-tables
     -fno-pic -mno-relax -mcmodel=medany -O2
     # 组件 ABI 的 C 作者面：C 组件 `#include "kcomp.h"`（kcore_* 白名单 +
-    # kcomp_* 生命周期入口声明；Rust 镜像在 kcomp-sdk/src/abi.rs）。
+    # kcomp_* 生命周期入口 / 组件间契约；Rust 镜像在 kcomp-sdk/src/abi.rs）。
+    # 同目录还有 freestanding `<string.h>` shim（ff.c 会 #include 它）。
     -I"$repo_root/os/components/kcomp-sdk/include"
 )
 if [ -n "${CFLAGS:-}" ]; then
@@ -109,8 +110,9 @@ if [ "${#sources[@]}" -eq 0 ]; then
 fi
 
 # 随组件私有携带 SDK 的 C 运行时：kcomp.h 只是声明，实现（freestanding weak
-# `mem*`）在 kcomp-sdk/c/。每个 C 组件都自带这一份（不建 shared runtime）；
-# Rust 组件的 compiler_builtins 已提供同一批原语，不走这条路径。
+# `mem*` / `strlen` / `strchr`）在 kcomp-sdk/c/。每个 C 组件都自带这一份（不建
+# shared runtime）；Rust 组件的 compiler_builtins 已提供 mem*，不走这条路径。
+# 同目录的 `<string.h>` shim 由 -I 暴露给组件源码。
 sdk_c_dir="$repo_root/os/components/kcomp-sdk/c"
 shopt -s nullglob
 sdk_sources=("$sdk_c_dir"/*.c)
