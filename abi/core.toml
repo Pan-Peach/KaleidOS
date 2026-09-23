@@ -171,37 +171,34 @@ doc = "`ResourceRevoke`：回收 authority。"
 targets = "sdk-rust,core-rust"
 
 [[const]]
-name = "KIND_INTERFACE_BIND"
+name = "KIND_ENDPOINT_BIND"
 type = "u32"
 value = "8"
-doc = "`InterfaceBind`：一次成功的 interface 绑定解析。"
-targets = "sdk-rust,core-rust"
-
-[[const]]
-name = "KIND_INTERFACE_REFRESH"
-type = "u32"
-value = "9"
-doc = "`InterfaceRefresh`：provider / generation 刷新。"
+doc = """
+`EndpointBind`：一次成功的 endpoint 绑定解析——Core 在此刻选定调用机制
+（Direct / Gate）。payload：endpoint（EndpointId）/ provider（ComponentId）/
+mechanism（0 = Direct，1 = Gate）。
+"""
 targets = "sdk-rust,core-rust"
 
 [[const]]
 name = "KIND_IRQ_ENTER"
 type = "u32"
-value = "10"
+value = "9"
 doc = "`IrqEnter`：外部中断进入 Core。"
 targets = "sdk-rust,core-rust"
 
 [[const]]
 name = "KIND_IRQ_DISPATCH"
 type = "u32"
-value = "11"
+value = "10"
 doc = "`IrqDispatch`：Core 把 IRQ 路由给某组件。"
 targets = "sdk-rust,core-rust"
 
 [[const]]
 name = "KIND_IRQ_ACK"
 type = "u32"
-value = "12"
+value = "11"
 doc = "`IrqAck`：IRQ 线完成 ack。"
 targets = "sdk-rust,core-rust"
 
@@ -403,99 +400,6 @@ type = "*const u8"
 [[function.param]]
 name = "len"
 type = "usize"
-
-[[function]]
-name = "kcore_interface_publish"
-ret = "i32"
-category = "Component lifecycle（v2）"
-c_category = "Component lifecycle"
-[[function.param]]
-name = "name"
-type = "*const u8"
-[[function.param]]
-name = "len"
-type = "usize"
-[[function.param]]
-name = "kind"
-type = "u32"
-[[function.param]]
-name = "abi"
-type = "u64"
-[[function.param]]
-name = "api"
-type = "*const void"
-[[function.param]]
-name = "ctx"
-type = "*mut void"
-
-[[function]]
-name = "kcore_interface_available"
-ret = "i32"
-category = "Component lifecycle（v2）"
-c_category = "Component lifecycle"
-[[function.param]]
-name = "name"
-type = "*const u8"
-[[function.param]]
-name = "len"
-type = "usize"
-[[function.param]]
-name = "kind"
-type = "u32"
-[[function.param]]
-name = "abi"
-type = "u64"
-
-[[function]]
-name = "kcore_interface_bind"
-ret = "i32"
-category = "Component lifecycle（v2）"
-c_category = "Component lifecycle"
-[[function.param]]
-name = "name"
-type = "*const u8"
-[[function.param]]
-name = "len"
-type = "usize"
-[[function.param]]
-name = "kind"
-type = "u32"
-[[function.param]]
-name = "abi"
-type = "u64"
-[[function.param]]
-name = "out_binding"
-type = "*mut u64"
-[[function.param]]
-name = "out_api"
-type = "*mut usize"
-[[function.param]]
-name = "out_ctx"
-type = "*mut usize"
-[[function.param]]
-name = "out_generation"
-type = "*mut u64"
-
-[[function]]
-name = "kcore_interface_refresh"
-ret = "i32"
-category = "Component lifecycle（v2）"
-c_category = "Component lifecycle"
-[[function.param]]
-name = "binding"
-type = "u64"
-[[function.param]]
-name = "abi"
-type = "u64"
-[[function.param]]
-name = "out_api"
-type = "*mut usize"
-[[function.param]]
-name = "out_ctx"
-type = "*mut usize"
-[[function.param]]
-name = "out_generation"
-type = "*mut u64"
 
 [[function]]
 name = "kcore_task_create"

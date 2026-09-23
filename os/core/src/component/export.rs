@@ -15,8 +15,8 @@
 //! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
-//! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
-//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_bind` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在；provider 交付 `api`/`ctx`（Direct）+ `port`（Gate），Core 只存不解引用）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；**bind 在绑定时刻按 (caller 域, provider 域) 一次性选定机制**（同域 KernelNative → Direct 并交付 api/ctx；跨域 → Gate 只给 opaque id；不支持组合显式 `-ENOTSUP`，**绝不静默降级**）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
+//! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` | 组件实例创建的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口 |
+//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_bind` `kcore_endpoint_call` | 组件→组件依赖的**唯一**真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在；provider 交付 `api`/`ctx`（Direct）+ `port`（Gate），Core 只存不解引用）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；**bind 在绑定时刻按 (caller 域, provider 域) 一次性选定机制**（同域 KernelNative → Direct 并交付 api/ctx；跨域 → Gate 只给 opaque id；不支持组合显式 `-ENOTSUP`，**绝不静默降级**）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。契约用 **exact ABI fingerprint**（`u64`，无版本兼容语义） |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` `kcore_sched_set_policy` | `sched_run` 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core）；`sched_set_policy` 把 `scheduler.policy` endpoint **提交为调度配置**（只记 EndpointId + 准备好的执行栈，不发布；组合方在 provider create 之后显式发现 + 选择，Core 不按名字发现） |
@@ -33,7 +33,7 @@
 //!
 //! `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）；
 //! 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
-//! `InterfaceError` / `DeviceClaimError` / `IrqError` / `DmaError`）保持各自为政，
+//! `EndpointError` / `DeviceClaimError` / `IrqError` / `DmaError`）保持各自为政，
 //! 只在导出边界翻译成 `Errno`。
 //!
 //! **返回值形状**（按"能否失败"分类）：
@@ -67,11 +67,11 @@
 //!   `kcomp_instance_create`（含**嵌套创建**）→ 被创建的实例；service call
 //!   （`kcore_endpoint_call`）→ **provider**（caller task 只作执行来源）；
 //!   嵌套 create / service call 返回或 panic 后恢复上一层边界。
-//!   所有 authority / task / interface 入口统一走 `RequestContext::ambient()` /
+//!   所有 authority / task / endpoint 入口统一走 `RequestContext::ambient()` /
 //!   `ambient_init()`，不再各自偏好当前任务 owner。
 //! - **Failed 实例门禁**：获取资源 / 创建 work 的入口
 //!   （`kcore_device_claim`、`kcore_irq_register`、`kcore_dma_alloc`、`kcore_dma_map`、
-//!   `kcore_task_create`、`kcore_interface_publish`、`kcore_endpoint_publish`、
+//!   `kcore_task_create`、`kcore_endpoint_publish`、
 //!   `kcore_endpoint_call`）在 caller/provider 已 `Failed` 时返回 `-EPERM`；
 //!   `release` / `revoke` 及已持有资源（按 DeviceId 锚定）的 teardown 操作
 //!   **不受此门禁限制**。
@@ -106,10 +106,10 @@
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
 use crate::component::ComponentId;
+use crate::component::abi::{InterfaceAbi, InterfaceKind};
 use crate::component::call;
 use crate::component::containment::{KcompCreateArgs, with_core_critical};
 use crate::component::endpoint::{self, ContractId, EndpointId};
-use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
 use crate::machine;
@@ -420,167 +420,6 @@ extern "C" fn kcore_component_create(
                 0
             }
             Err(error) => error.abi_status(),
-        }
-    })
-}
-
-/// 发布接口（**staged**：`kcomp_instance_create` 期间只记录 pending，不修改
-/// active binding）。provider = 当前正在创建的实例（Core 记录，**不信任组件自报身份**）。
-///
-/// `abi` 是 exact ABI fingerprint（`u64`，无版本兼容语义）：provider 与 consumer
-/// 必须由完全相同的 Service ABI contract 编译。`api` 指向 provider 的 `#[repr(C)]`
-/// function table，`ctx` 是 provider opaque state；Core 只存指针、永不解引用。
-///
-/// create 返回 0 后 Core 原子提交该实例的 pending interfaces；ABI 冲突的
-/// replacement 在提交时被拒绝。因此本函数返回 `0` 只表示"已记录 pending"。
-/// provider 由最内层活动 create 边界解析（嵌套创建 = 被创建的实例），不信任组件
-/// 自报身份；`Failed` provider → `-EPERM`。
-/// 返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在 create 上下文或
-/// provider 已 `Failed`；其余见 `Errno::from(InterfaceError)`）。
-extern "C" fn kcore_interface_publish(
-    name_ptr: *const u8,
-    name_len: usize,
-    kind: u32,
-    abi: u64,
-    api: *const (),
-    ctx: *mut (),
-) -> i32 {
-    with_core_critical(|| {
-        let Some(name) = checked_name(name_ptr, name_len) else {
-            return Errno::EINVAL.code();
-        };
-        let Some(kind) = kind_from_u32(kind) else {
-            return Errno::EINVAL.code();
-        };
-        let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
-            return Errno::EPERM.code();
-        };
-        if let Some(denied) = deny_if_failed(provider) {
-            return denied;
-        }
-        let reg = registry::get_registry().lock();
-        let mut ifs = get_interfaces().lock();
-        match ifs.stage_publish(
-            &reg,
-            provider,
-            name,
-            kind,
-            InterfaceAbi::from_raw(abi),
-            api,
-            ctx,
-        ) {
-            Ok(()) => 0,
-            Err(error) => Errno::from(error).code(),
-        }
-    })
-}
-
-/// 只读查询：`(name, kind, abi)` 是否已绑定且 provider 存活（Ready）。
-/// 1 = 可用（可 bind），0 = 不可用。
-extern "C" fn kcore_interface_available(
-    name_ptr: *const u8,
-    name_len: usize,
-    kind: u32,
-    abi: u64,
-) -> i32 {
-    with_core_critical(|| {
-        let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind))
-        else {
-            return 0;
-        };
-        let reg = registry::get_registry().lock();
-        let ifs = get_interfaces().lock();
-        ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi))
-            .is_ok() as i32
-    })
-}
-
-/// consumer 按名 bind：Core 查找接口 → exact-compare ABI fingerprint → 验证当前
-/// provider 存在且 Ready → 返回稳定 `BindingId` + 当前 `api/ctx/generation`。
-///
-/// 成功 = 0，`*out_binding`（`u64`）、`*out_api` / `*out_ctx`（指针宽 `usize`）、
-/// `*out_generation`（`u64`）写入（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` 任一 out 为空 / `EINVAL` 名字/kind 非法 /
-/// `ENOENT` 接口未知·Unbound / ABI mismatch 等见 `Errno::from(InterfaceError)`）。
-#[allow(clippy::too_many_arguments)]
-extern "C" fn kcore_interface_bind(
-    name_ptr: *const u8,
-    name_len: usize,
-    kind: u32,
-    abi: u64,
-    out_binding: *mut u64,
-    out_api: *mut usize,
-    out_ctx: *mut usize,
-    out_generation: *mut u64,
-) -> i32 {
-    with_core_critical(|| {
-        if out_binding.is_null()
-            || out_api.is_null()
-            || out_ctx.is_null()
-            || out_generation.is_null()
-        {
-            return Errno::EFAULT.code();
-        }
-        let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind))
-        else {
-            return Errno::EINVAL.code();
-        };
-        let reg = registry::get_registry().lock();
-        let ifs = get_interfaces().lock();
-        match ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi)) {
-            Ok(view) => {
-                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-                unsafe {
-                    core::ptr::write_unaligned(out_binding, view.id.raw() as u64);
-                    core::ptr::write_unaligned(out_api, view.api as usize);
-                    core::ptr::write_unaligned(out_ctx, view.ctx as usize);
-                    core::ptr::write_unaligned(out_generation, view.generation);
-                }
-                0
-            }
-            Err(error) => Errno::from(error).code(),
-        }
-    })
-}
-
-/// consumer 用已有 `BindingId` refresh：exact-compare 期望 ABI → 重新验证 provider →
-/// 返回最新 `api/ctx/generation`（provider 替换后无需 ELF reload）。
-///
-/// 成功 = 0，三个 out 写入（调用方保证可写，任意对齐）；失败 = `-Errno`
-/// （`EFAULT` 任一 out 为空 / ABI mismatch / Unbound / BindingNotFound）。
-extern "C" fn kcore_interface_refresh(
-    binding: u64,
-    abi: u64,
-    out_api: *mut usize,
-    out_ctx: *mut usize,
-    out_generation: *mut u64,
-) -> i32 {
-    with_core_critical(|| {
-        if out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
-            return Errno::EFAULT.code();
-        }
-        // `binding` 是 u64 ABI 宽度；BindingId 是 u32。超范围直接拒绝（不得截断后
-        // 命中一个无关的槽）。
-        let Ok(binding) = u32::try_from(binding) else {
-            return Errno::ENOENT.code();
-        };
-        let reg = registry::get_registry().lock();
-        let ifs = get_interfaces().lock();
-        match ifs.refresh(
-            &reg,
-            crate::component::interface::BindingId::from_raw(binding),
-            InterfaceAbi::from_raw(abi),
-        ) {
-            Ok(view) => {
-                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-                unsafe {
-                    core::ptr::write_unaligned(out_api, view.api as usize);
-                    core::ptr::write_unaligned(out_ctx, view.ctx as usize);
-                    core::ptr::write_unaligned(out_generation, view.generation);
-                }
-                0
-            }
-            Err(error) => Errno::from(error).code(),
         }
     })
 }
@@ -1298,10 +1137,6 @@ mod tests {
             &b"kcore_component_count"[..],
             &b"kcore_component_create"[..],
             &b"kcore_component_load"[..],
-            &b"kcore_interface_publish"[..],
-            &b"kcore_interface_available"[..],
-            &b"kcore_interface_bind"[..],
-            &b"kcore_interface_refresh"[..],
             &b"kcore_task_create"[..],
             &b"kcore_task_start"[..],
             &b"kcore_task_yield"[..],
@@ -1552,11 +1387,13 @@ mod tests {
                 Errno::EPERM.code()
             );
             assert_eq!(
-                kcore_interface_publish(
+                kcore_endpoint_publish(
                     b"svc".as_ptr(),
                     3,
-                    1,
                     0xAB,
+                    1,
+                    0xCD,
+                    7,
                     core::ptr::null(),
                     core::ptr::null_mut(),
                 ),
@@ -1606,107 +1443,6 @@ mod tests {
             deny_if_failed(stopped),
             None,
             "Stopped 实例当前不被 deny_if_failed 拒绝（已知 gap，仅锁定现状）"
-        );
-    }
-
-    /// 接口 ABI（exact fingerprint）：bind/refresh 的早期错误约定
-    /// （`EFAULT` out 为空 / `EINVAL` 名字非法），host 可在不触碰 registry 前断言。
-    #[test]
-    fn interface_bind_and_refresh_reject_null_outputs() {
-        let bind = resolve(b"kcore_interface_bind").unwrap();
-        let bind: extern "C" fn(
-            *const u8,
-            usize,
-            u32,
-            u64,
-            *mut u64,
-            *mut usize,
-            *mut usize,
-            *mut u64,
-        ) -> i32 = unsafe { core::mem::transmute(bind) };
-        let (mut b, mut api, mut ctx, mut generation) = (0u64, 0usize, 0usize, 0u64);
-        // 任一 out 为空 → EFAULT（早于 registry 解析）
-        assert_eq!(
-            bind(
-                b"x".as_ptr(),
-                1,
-                1,
-                0,
-                core::ptr::null_mut(),
-                &mut api,
-                &mut ctx,
-                &mut generation
-            ),
-            -14
-        );
-        assert_eq!(
-            bind(
-                b"x".as_ptr(),
-                1,
-                1,
-                0,
-                &mut b,
-                core::ptr::null_mut(),
-                &mut ctx,
-                &mut generation
-            ),
-            -14
-        );
-        assert_eq!(
-            bind(
-                b"x".as_ptr(),
-                1,
-                1,
-                0,
-                &mut b,
-                &mut api,
-                core::ptr::null_mut(),
-                &mut generation
-            ),
-            -14
-        );
-        assert_eq!(
-            bind(
-                b"x".as_ptr(),
-                1,
-                1,
-                0,
-                &mut b,
-                &mut api,
-                &mut ctx,
-                core::ptr::null_mut()
-            ),
-            -14
-        );
-        // 名字非法 → EINVAL（早于 registry 解析）
-        assert_eq!(
-            bind(
-                core::ptr::null(),
-                0,
-                1,
-                0,
-                &mut b,
-                &mut api,
-                &mut ctx,
-                &mut generation
-            ),
-            -22
-        );
-
-        let refresh = resolve(b"kcore_interface_refresh").unwrap();
-        let refresh: extern "C" fn(u64, u64, *mut usize, *mut usize, *mut u64) -> i32 =
-            unsafe { core::mem::transmute(refresh) };
-        assert_eq!(
-            refresh(0, 0, core::ptr::null_mut(), &mut ctx, &mut generation),
-            -14
-        );
-        assert_eq!(
-            refresh(0, 0, &mut api, core::ptr::null_mut(), &mut generation),
-            -14
-        );
-        assert_eq!(
-            refresh(0, 0, &mut api, &mut ctx, core::ptr::null_mut()),
-            -14
         );
     }
 
@@ -1892,8 +1628,7 @@ mod tests {
     }
 
     /// Endpoint 发布是 create-time 操作：普通任务边界与 destroy（exit）边界都
-    /// 不是合法 principal → `-EPERM`（与 `kcore_interface_publish` 同一
-    /// `ambient_init` 门禁）。
+    /// 不是合法 principal → `-EPERM`（`ambient_init` 门禁）。
     #[test]
     fn endpoint_publish_without_init_principal_is_rejected() {
         use crate::component::containment;

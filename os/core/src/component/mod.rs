@@ -13,7 +13,6 @@ pub mod exit;
 pub mod export;
 pub mod failure;
 pub mod image;
-pub mod interface;
 pub mod load;
 pub mod loader;
 pub mod registry;
@@ -60,7 +59,7 @@ impl ComponentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComponentState {
     Declared,
-    /// 所有 required Interfaces 都已成功绑定（见 `component/interface.rs`）。
+    /// 所有 required Endpoints 都已成功绑定。
     /// 语义：Resolved = 依赖已就位，可以进入初始化。
     Resolved,
     Starting,
@@ -69,12 +68,12 @@ pub enum ComponentState {
     /// `module_exit` 类比）执行期，由 `component/exit.rs::stop_component` 驱动
     /// （`Ready → Stopping`）。
     ///
-    /// 此状态下 `may_run` 不再放行该实例的任务，`kcore_interface_publish` 也
+    /// 此状态下 `may_run` 不再放行该实例的任务，`kcore_endpoint_publish` 也
     /// 不再接受（destroy 边界不是 publish principal）；已有 authority 仍可由钩子
     /// 自行 `release`（teardown 不受生命周期门禁限制，见 `export.rs`）。
     Stopping,
-    /// 已停止：`kcomp_instance_destroy` 已返回 0、剩余 authority 与接口已由 Core
-    /// 兜底回收（`Stopping → Stopped`，由 `stop_component` 提交）。
+    /// 已停止：`kcomp_instance_destroy` 已返回 0、剩余 authority 与 endpoint 已由
+    /// Core 兜底回收（`Stopping → Stopped`，由 `stop_component` 提交）。
     ///
     /// phase 1 保留记录：不回收段内存、不退役实例、`ComponentId` 不复用。
     Stopped,

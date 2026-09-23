@@ -40,7 +40,7 @@ use spin::{Mutex, Once};
 
 /// 组件提供的中断处理函数（phase 1 KernelNative：direct call）。
 ///
-/// `ctx` 原样回传，Core 不解引用——与 interface registry 的 vtable `ctx` 同一
+/// `ctx` 原样回传，Core 不解引用——与 endpoint 的 provider `ctx` 同一
 /// 生命周期契约（provider Ready 期间有效）。
 pub use crate::generated::abi::IrqHandler;
 

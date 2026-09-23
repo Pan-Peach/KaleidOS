@@ -8,7 +8,7 @@
 //! ```
 //!
 //! - **内部保持丰富**：`TaskError` / `ComponentLoadError` /
-//!   `SchedError` / `InterfaceError` / `DeviceClaimError` / `IrqError` / `DmaError`
+//!   `SchedError` / `EndpointError` / `DeviceClaimError` / `IrqError` / `DmaError`
 //!   等继续各自为政（强类型、可重构），只在 Core ABI 边界翻译成 `Errno`——
 //!   本文件是唯一映射表。
 //! - **数值稳定**：Linux/POSIX 风格；枚举本体由 `tools/kabi/kabi_gen.py` 从
@@ -22,7 +22,6 @@
 use crate::component::call::CallError;
 use crate::component::endpoint::EndpointError;
 use crate::component::exit::ComponentStopError;
-use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
 use crate::machine;
 use crate::resource::{device, dma, irq};
@@ -74,21 +73,6 @@ impl From<SchedError> for Errno {
             SchedError::NoDispatcher => Errno::ENOSYS,
             // Core 无法准备策略执行栈：资源耗尽，策略配置不变。
             SchedError::NoPolicyStack => Errno::ENOMEM,
-        }
-    }
-}
-
-impl From<InterfaceError> for Errno {
-    fn from(error: InterfaceError) -> Self {
-        match error {
-            InterfaceError::ProviderNotFound => Errno::ESRCH,
-            InterfaceError::ProviderNotReady => Errno::EAGAIN,
-            InterfaceError::UnknownInterface => Errno::ENOENT,
-            InterfaceError::KindMismatch => Errno::EINVAL,
-            InterfaceError::AbiMismatch => Errno::EINVAL,
-            InterfaceError::Unbound => Errno::ENOENT,
-            InterfaceError::BindingNotFound => Errno::ENOENT,
-            InterfaceError::IdExhausted => Errno::EOVERFLOW,
         }
     }
 }
@@ -178,7 +162,6 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::CreatePanicked => Errno::EIO,
             ComponentLoadError::DestroyFailed(_) => Errno::EIO,
             ComponentLoadError::DestroyPanicked => Errno::EIO,
-            ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
             ComponentLoadError::EndpointCommitFailed(error) => Errno::from(error),
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
             ComponentLoadError::ServicePanicked => Errno::EIO,
@@ -276,7 +259,6 @@ mod tests {
         assert_eq!(Errno::from(TaskError::NoMemory), Errno::ENOMEM);
         assert_eq!(Errno::from(TaskError::InvalidTransition), Errno::EINVAL);
         assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
-        assert_eq!(Errno::from(InterfaceError::ProviderNotReady), Errno::EAGAIN);
         assert_eq!(Errno::from(EndpointError::EndpointDead), Errno::ENOENT);
         assert_eq!(Errno::from(EndpointError::ProviderNotReady), Errno::EBUSY);
         assert_eq!(Errno::from(ComponentLoadError::NotFound), Errno::ENOENT);
@@ -509,32 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn every_interface_error_arm_maps_to_its_pinned_errno() {
-        for error in [
-            InterfaceError::ProviderNotFound,
-            InterfaceError::ProviderNotReady,
-            InterfaceError::UnknownInterface,
-            InterfaceError::KindMismatch,
-            InterfaceError::AbiMismatch,
-            InterfaceError::Unbound,
-            InterfaceError::BindingNotFound,
-            InterfaceError::IdExhausted,
-        ] {
-            let expected = match error {
-                InterfaceError::ProviderNotFound => Errno::ESRCH,
-                InterfaceError::ProviderNotReady => Errno::EAGAIN,
-                InterfaceError::UnknownInterface => Errno::ENOENT,
-                InterfaceError::KindMismatch => Errno::EINVAL,
-                InterfaceError::AbiMismatch => Errno::EINVAL,
-                InterfaceError::Unbound => Errno::ENOENT,
-                InterfaceError::BindingNotFound => Errno::ENOENT,
-                InterfaceError::IdExhausted => Errno::EOVERFLOW,
-            };
-            assert_eq!(Errno::from(error), expected, "InterfaceError {error:?}");
-        }
-    }
-
-    #[test]
     fn every_component_load_error_arm_maps_to_its_pinned_errno() {
         use crate::component::loader::LoaderError;
         for error in [
@@ -549,7 +505,6 @@ mod tests {
             ComponentLoadError::CreatePanicked,
             ComponentLoadError::DestroyFailed(1),
             ComponentLoadError::DestroyPanicked,
-            ComponentLoadError::InterfaceCommitFailed(InterfaceError::ProviderNotFound),
             ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort),
             ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
             ComponentLoadError::ServicePanicked,
@@ -570,7 +525,6 @@ mod tests {
                 ComponentLoadError::CreatePanicked => Errno::EIO,
                 ComponentLoadError::DestroyFailed(_) => Errno::EIO,
                 ComponentLoadError::DestroyPanicked => Errno::EIO,
-                ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
                 ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort) => {
                     Errno::EEXIST
                 }

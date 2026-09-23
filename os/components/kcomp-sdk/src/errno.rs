@@ -16,7 +16,7 @@
 //! ```
 //!
 //! 组件调 `kcore_*`（裸 `i32`）后用 [`Errno::from_code`] 解码；SDK 的人体工学层
-//! （[`crate::binding`] / [`crate::block`]）直接用 [`Result`]。
+//! （[`crate::block`] / [`crate::filesystem`] / [`crate::scheduler`]）直接用 [`Result`]。
 
 pub use crate::generated::errno::Errno;
 

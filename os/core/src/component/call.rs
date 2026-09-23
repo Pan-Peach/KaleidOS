@@ -85,7 +85,6 @@
 //!
 //! - **escape-eligibility scope**：Core 临界区内的 provider panic 保持致命（不是
 //!   本次范围）。
-//! - **consumer 迁移 / 移除 `kcore_interface_*`**：`component/interface.rs` 语义不变。
 //! - **stack pool / 异步调用 / 取消 / drain / 超时**：都不做；service stack 每次
 //!   调用现分配（panic 时保守驻留，见 `containment`）。
 //!
@@ -97,10 +96,10 @@
 //! 验证（后续步骤）；host 用例只覆盖边界记账（re-entry / panic 收尾 / 祖先门禁 /
 //! 状态分离），经 test-only 边界辅助函数。
 
+use crate::component::abi::InterfaceAbi;
 use crate::component::containment::{self, CallOutcome, ServiceDispatch};
 use crate::component::endpoint::{ContractId, EndpointError, EndpointId, EndpointRegistry};
 use crate::component::image::ImageTable;
-use crate::component::interface::InterfaceAbi;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::Registry;
 use crate::component::{ComponentId, endpoint, image, registry};
@@ -500,9 +499,9 @@ fn handle_provider_panic(provider: ComponentId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::abi::{InterfaceAbi, InterfaceKind};
     use crate::component::containment;
     use crate::component::endpoint::{ContractId, EndpointError};
-    use crate::component::interface::{InterfaceAbi, InterfaceKind};
     use crate::component::registry;
     use crate::errno::Errno;
     use crate::task::TaskId;
@@ -1131,7 +1130,6 @@ mod tests {
         let _serial = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
-        crate::component::interface::init();
         crate::resource::init();
         let provider = ready_provider(
             b"call_panic_provider",
@@ -1201,7 +1199,6 @@ mod tests {
         let _serial = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
-        crate::component::interface::init();
         crate::resource::init();
         let provider = ready_provider(
             b"call_panicked_provider",

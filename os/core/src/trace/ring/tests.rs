@@ -5,7 +5,7 @@
 use super::*;
 use crate::component::ComponentId;
 use crate::component::ComponentState;
-use crate::component::interface::{BindingId, InterfaceId};
+use crate::component::endpoint::{EndpointId, Mechanism};
 use crate::resource::ResourceKind;
 use crate::task::TaskId;
 use crate::trace::RejectReason;
@@ -28,8 +28,8 @@ fn collect(since: u64) -> Vec<u64> {
     seqs
 }
 
-/// 12 种事件的样本各一个（逐位开关测试用）。
-fn all_events() -> [TraceEvent; 12] {
+/// 11 种事件的样本各一个（逐位开关测试用）。
+fn all_events() -> [TraceEvent; 11] {
     let component = ComponentId::from_raw(3);
     let task = TaskId::from_raw(9);
     [
@@ -55,14 +55,10 @@ fn all_events() -> [TraceEvent; 12] {
             kind: ResourceKind::Dma,
             id: 2,
         },
-        TraceEvent::InterfaceBind {
-            consumer: None,
+        TraceEvent::EndpointBind {
+            endpoint: EndpointId::from_raw(1),
             provider: component,
-            interface: InterfaceId::from_raw(1),
-        },
-        TraceEvent::InterfaceRefresh {
-            binding: BindingId::from_raw(1),
-            generation: 2,
+            mechanism: Mechanism::Direct,
         },
         TraceEvent::IrqEnter { irq: 5 },
         TraceEvent::IrqDispatch {
@@ -272,7 +268,7 @@ fn default_mask_is_all_on_and_matches_abi_kinds() {
     reset_for_test();
     assert_eq!(enabled_mask(), ENABLED_MASK_ALL, "默认必须全开");
     assert_eq!(
-        MASK_TASK | MASK_POLICY | MASK_COMPONENT | MASK_RESOURCE | MASK_INTERFACE | MASK_IRQ,
+        MASK_TASK | MASK_POLICY | MASK_COMPONENT | MASK_RESOURCE | MASK_ENDPOINT | MASK_IRQ,
         ENABLED_MASK_ALL as u32,
         "类别掩码必须恰好覆盖全部事件位（不多不少）"
     );
@@ -291,7 +287,7 @@ fn default_mask_is_all_on_and_matches_abi_kinds() {
     }
 }
 
-/// setter 返回旧掩码、写入值可读回；12 位之外的保留位写入前被钳掉。
+/// setter 返回旧掩码、写入值可读回；11 位之外的保留位写入前被钳掉。
 #[test]
 fn mask_round_trips_through_the_setter() {
     let _serial = TEST_LOCK.lock();
@@ -539,7 +535,7 @@ fn check_visit(model: &Model, back: u32) {
 }
 
 /// 施加一次批量 emit，模型与实现同构（耗尽时停止，见不变式 6）。
-fn apply_emit(model: &mut Model, which: u8, count: u16, events: &[TraceEvent; 12]) {
+fn apply_emit(model: &mut Model, which: u8, count: u16, events: &[TraceEvent; 11]) {
     for _ in 0..count {
         // bounded 序列不可达 `u64::MAX`；守卫只为与实现同构。
         if model.next_seq.checked_add(1).is_none() {

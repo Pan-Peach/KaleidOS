@@ -30,7 +30,7 @@
 //!
 //! # 生命周期
 //!
-//! 本组件 create 期间**不发布** endpoint（旧 `driver.prober` 服务已删除）；它创建
+//! 本组件 create 期间**不发布** endpoint（旧的 assignment 回调服务已删除）；它创建
 //! 一个**有限** dispatch 任务：monitor 在 load 提交后 `sched::run()` 运行它——
 //! 枚举候选 → 逐台 create + pull，直到首个 `Match`（成功 attach）后停止；全部
 //! NoMatch / 创建失败则自然结束（无后台循环；热插拔明确 deferred）。实例状态

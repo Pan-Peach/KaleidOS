@@ -41,7 +41,7 @@ harness 会把 git commit 带进报告（`KALEIDOS_GIT_COMMIT`，由 Makefile �
 
 ```text
 BENCH-ENV arch=host xlen=64 platform=undetected timebase_hz=0 privilege=supervisor vm=mmu trace=off preempt=off clock=std::time::Instant mode=release commit=f00a5eba82a9
-BENCH interface.direct_call
+BENCH loader.elf_parse
 method=batch
 unit=ns
 sample_unit=batch_total
@@ -186,8 +186,9 @@ bias —— 这四项要分开说，不能拿一个 min 全包了。
 
 **协议**（全部走既有导出，无 benchmark 特权）：
 
-1. `kcore_interface_available("scheduler", Policy, ABI)` 确认调度配置；没有就正常
-   加载 `scheduler_rr`（与 core_test 同一条链）；两者都不可用 → `scheduler_unavailable`。
+1. 确认调度配置：加载参考实现 `scheduler_rr`（与 core_test 同一条链），再显式
+   `Endpoint::<SchedulerPolicy>::lookup(provider, "scheduler.policy")` + `select`
+   （`kcore_sched_set_policy`）提交；不可用 → `scheduler_unavailable`。
 2. `kcore_task_create` 建两个组件自有任务 A/B（entry 必须落在本组件镜像内），
    `kcore_task_start` 启动，`kcore_sched_run` 从锚点进入调度。
 3. **body = 一次 A→B→A 往返**：A `kcore_task_yield()` → Core propose→validate→
@@ -270,10 +271,6 @@ claim 指针做字节写（KernelNative 快路径）。设备窗口长度取 FDT
 
 | 名称 | 测什么 |
 |---|---|
-| `interface.direct_call` | 直接 Rust 调用（基线） |
-| `interface.table_call` | 经 `#[repr(C)]` function table 调用（Interface 的 steady-state 成本） |
-| `interface.bind` / `interface.refresh` / `interface.publish` | control path |
-| `registry.bind.n1/n8/n32/n128` | Interface Registry 规模趋势（线性扫描是否成为问题） |
 | `task.lookup.n1/n32/n256` | task 数量增长（`BTreeMap` lookup） |
 | `component.lookup.n1/n32/n256` | component 数量增长（`Vec` 线性扫描） |
 | `alloc_free.order0..3` | buddy alloc/free 往返，按 order 分档 |
@@ -344,7 +341,7 @@ claim 指针做字节写（KernelNative 快路径）。设备窗口长度取 FDT
 
 **可以在 host 做、尚未做**：
 - **`pick_next` 内部再分段**：目前是整体一个数（`resolve_policy` + 提议 + 验证），
-  还没有把 "scheduler interface call" 与 "Core validation" 分成两个数字。
+  还没有把 "scheduler endpoint call" 与 "Core validation" 分成两个数字。
 - **create / destroy 的 scaling**：当前 scaling 只测了 lookup 与 `revoke_owner`
   往返，`create` / `destroy` / proposal validation 随 N 的趋势还没测。
 - **fragmentation**：allocator 的碎片化基准。

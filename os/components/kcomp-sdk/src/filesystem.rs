@@ -4,8 +4,7 @@
 //! 包装（[`FileSystemProvider`] / [`FileSystemService`]）放在一起；
 //! `#[repr(C)]` function table（[`FileSystemApi`]）与名字 / 指纹 / contract 身份 /
 //! 扁平方法常量由 `tools/kabi/kabi_gen.py` 从 `abi/filesystem.toml` 生成
-//! （[`crate::generated::filesystem`]），这里 re-export；[`crate::binding`] 只
-//! re-export，保持 `binding::FileSystem` 等既有路径不变。
+//! （[`crate::generated::filesystem`]），这里 re-export。
 //!
 //! # 同一 ABI 指纹，两种 transport（与 block.device 同构）
 //!
@@ -29,7 +28,7 @@
 
 use core::ffi::CStr;
 
-use crate::binding::{InterfaceAbi, InterfaceKind, Service};
+use crate::abi::{InterfaceAbi, InterfaceKind};
 use crate::endpoint::Contract;
 use crate::errno::Result;
 
@@ -58,7 +57,7 @@ use crate::generated::filesystem::{KCOMP_FILESYSTEM_ABI, KCOMP_FILESYSTEM_CONTRA
 /// 扁平编码的逐位布局，transport 的选择是 Core 在 bind 时的机制决定。
 ///
 /// raw `u64` 本体在生成物（[`KCOMP_FILESYSTEM_ABI`]，schema 单一来源）；
-/// [`InterfaceAbi`] newtype 由手写 `binding.rs` 定义，这里做包装。
+/// [`InterfaceAbi`] newtype 由手写 `abi.rs` 定义，这里做包装。
 pub const FILESYSTEM_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_FILESYSTEM_ABI);
 
 /// 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 `FA_*`。
@@ -73,18 +72,7 @@ pub use crate::generated::filesystem::FileSystemApi;
 /// filesystem 契约（KIND = Service）。
 pub struct FileSystem;
 
-impl Service for FileSystem {
-    const NAME: &'static [u8] = FILESYSTEM_NAME;
-    const KIND: InterfaceKind = InterfaceKind::Service;
-    const ABI: InterfaceAbi = FILESYSTEM_ABI;
-    type Api = FileSystemApi;
-}
-
 /// Endpoint 模型的契约身份（contract id + exact ABI + 领域分类）。
-///
-/// 与 [`Service`] 并存：`Service` 是旧 binding（全局名字 → 单槽）的契约表达，
-/// [`Contract`] 是 Endpoint（typed `Endpoint<FileSystem>`）的表达；两者数值同源
-/// （`abi/filesystem.toml`），迁移期不强制二选一。
 ///
 /// `ID` 与 `ABI` 是**两个不同的值**：`ID` = `KCOMP_FILESYSTEM_CONTRACT`
 /// （契约身份，ASCII `"VFSCONTR"`），`ABI` = `KCOMP_FILESYSTEM_ABI`

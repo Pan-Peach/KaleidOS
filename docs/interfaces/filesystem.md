@@ -205,7 +205,7 @@ FsInstance + FsNode + 同一份 storage
 
 这是目标形态，不是现状。要让一个底层实例同时被多个 personality 通过不同"入口"访问，需要 namespace 把多条路径映射到同一个实例/节点身份，而不是复制实例。
 
-**诚实的依赖**：当前 Interface Registry 对每个接口**名字**只保留一个 provider 槽位（按名字匹配记录，见 `os/core/src/component/interface.rs` 的接口记录查找）。因此"多个同类型 FS 实例同时发布、并各自被 bind"这件事**现在做不到**，需要先做 endpoint / instance 模型。在实例模型落地之前，多实例只能作为设计目标记录，不能宣称已支持。
+**诚实的依赖**：endpoint 模型已落地——endpoint 身份 = `(provider, port_name, contract)`，端口名只在 provider 实例内唯一，因此"多个同类型 FS 实例各自发布、各自被 bind"**已经可以做到**（组合方显式 `kcore_endpoint_lookup(provider, port_name)` 发现，`bind` 由 Core 选定机制）。namespace / 多 personality 路由仍属目标形态，未实现。
 
 ## 11. 现状 vs 目标
 

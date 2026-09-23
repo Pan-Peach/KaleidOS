@@ -12,7 +12,7 @@
 //!
 //! 第一阶段只实现一条链：
 //! `Core event producer → fixed-size TraceRing → Inspector / Benchmark / CoreTest reader`。
-//! 运行时过滤是最小的 12 位事件使能掩码（Core 管理路径 / Monitor 控制，见
+//! 运行时过滤是最小的 11 位事件使能掩码（Core 管理路径 / Monitor 控制，见
 //! [`ring`]）；不做动态订阅系统、filter engine、磁盘 trace、用户态 daemon。
 //! ring 容量由 Kconfig `TRACE_CAPACITY` 决定（见 [`capacity`]）。
 //!
@@ -36,7 +36,7 @@ pub use ring::{ENABLED_MASK_ALL, TraceStats, capacity, clear, emit, next_seq, st
 
 /// 运行时使能掩码的管理面（Core 内部：Monitor；不跨 ABI 导出写入口）。
 pub(crate) use ring::{
-    MASK_COMPONENT, MASK_INTERFACE, MASK_IRQ, MASK_POLICY, MASK_RESOURCE, MASK_TASK, enabled_mask,
+    MASK_COMPONENT, MASK_ENDPOINT, MASK_IRQ, MASK_POLICY, MASK_RESOURCE, MASK_TASK, enabled_mask,
     set_enabled_mask,
 };
 

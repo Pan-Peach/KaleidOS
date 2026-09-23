@@ -37,10 +37,10 @@
 //! 不可重入）。决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
 //! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
 
+use crate::component::abi::InterfaceAbi;
 use crate::component::call;
 use crate::component::containment::CallOutcome;
 use crate::component::endpoint::{self, EndpointError, EndpointId};
-use crate::component::interface::InterfaceAbi;
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, containment, registry};
 use crate::generated::abi::{
@@ -630,7 +630,6 @@ mod tests {
         crate::task::init();
         init();
         registry::init();
-        crate::component::interface::init();
         endpoint::init();
         image::init();
         crate::resource::init();
@@ -693,7 +692,7 @@ mod tests {
 
     /// 发布并提交一个名为 `scheduler.policy` 的 endpoint（contract / abi 由调用方
     /// 给定，discover 也按同一 contract）。
-    fn publish_named_endpoint(
+    fn publish_policy_endpoint_at(
         provider: ComponentId,
         port: u32,
         contract: ContractId,
@@ -720,7 +719,7 @@ mod tests {
 
     /// 发布并提交 `scheduler.policy` endpoint（contract + abi 精确匹配）。
     fn publish_policy_endpoint(provider: ComponentId, port: u32) -> EndpointId {
-        publish_named_endpoint(
+        publish_policy_endpoint_at(
             provider,
             port,
             ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
@@ -950,7 +949,7 @@ mod tests {
             Some(first_runnable as *const () as usize),
             ptr::null_mut(),
         );
-        publish_named_endpoint(
+        publish_policy_endpoint_at(
             wrong,
             0,
             ContractId::from_raw(0xDEAD_BEEF),

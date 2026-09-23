@@ -10,7 +10,7 @@
 
 ## 暴露什么机制
 
-- `generated/abi.rs`：`InterfaceKind`（`#[repr(u32)]`：Device=0 / Service=1 / Policy=2）、`KcompCreateArgs`（`#[repr(C)]` + static 尺寸 / 偏移断言）、`KCOMP_ABI`（`b"KCOMPABI"`）、`TraceRecordAbi`（48B）、`TraceStatsAbi`（40B）、`IrqHandler`、`ABSENT`、`KIND_*`（1–12）。
+- `generated/abi.rs`：`InterfaceKind`（`#[repr(u32)]`：Device=0 / Service=1 / Policy=2）、`KcompCreateArgs`（`#[repr(C)]` + static 尺寸 / 偏移断言）、`KCOMP_ABI`（`b"KCOMPABI"`）、`TraceRecordAbi`（48B）、`TraceStatsAbi`（40B）、`IrqHandler`、`ABSENT`、`KIND_*`（1–11，连续编号）。
 - `generated/errno.rs`：完整 `Errno`（`#[repr(i32)]`，1–133；41 与 58 未用；`ENOTSUP`=95 与 `EOPNOTSUPP` 同值）。
 - `component/generated/exports.rs`：`EXPORTS: [Export; 38]`——`kcore_*` 名字到函数地址的绑定表。**注意它在 `component/generated/`，不在本目录。**
 

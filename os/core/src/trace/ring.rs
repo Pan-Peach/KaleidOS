@@ -43,7 +43,7 @@ include!(concat!(env!("OUT_DIR"), "/trace_capacity.rs"));
 
 // —— 运行时事件使能位 ——
 //
-// 每个事件一位，bit i ↔ ABI kind i+1（`trace::abi` 的稳定标签 1..=12）。
+// 每个事件一位，bit i ↔ ABI kind i+1（`trace::abi` 的稳定标签 1..=11）。
 // 类别掩码（`MASK_*`）只是若干位的并集：Monitor 用它做粗粒度开关。
 // 位定义、`event_bit` 映射与 ABI 标签的一致性由 host test 锚定。
 
@@ -61,16 +61,14 @@ const BIT_COMPONENT_STATE: u32 = 1 << 4;
 const BIT_RESOURCE_GRANT: u32 = 1 << 5;
 /// `ResourceRevoke`（ABI kind 7）。
 const BIT_RESOURCE_REVOKE: u32 = 1 << 6;
-/// `InterfaceBind`（ABI kind 8）。
-const BIT_INTERFACE_BIND: u32 = 1 << 7;
-/// `InterfaceRefresh`（ABI kind 9）。
-const BIT_INTERFACE_REFRESH: u32 = 1 << 8;
-/// `IrqEnter`（ABI kind 10）。
-const BIT_IRQ_ENTER: u32 = 1 << 9;
-/// `IrqDispatch`（ABI kind 11）。
-const BIT_IRQ_DISPATCH: u32 = 1 << 10;
-/// `IrqAck`（ABI kind 12）。
-const BIT_IRQ_ACK: u32 = 1 << 11;
+/// `EndpointBind`（ABI kind 8）。
+const BIT_ENDPOINT_BIND: u32 = 1 << 7;
+/// `IrqEnter`（ABI kind 9）。
+const BIT_IRQ_ENTER: u32 = 1 << 8;
+/// `IrqDispatch`（ABI kind 10）。
+const BIT_IRQ_DISPATCH: u32 = 1 << 9;
+/// `IrqAck`（ABI kind 11）。
+const BIT_IRQ_ACK: u32 = 1 << 10;
 
 /// 任务切换类别（Monitor `trace task on|off`）。
 pub(crate) const MASK_TASK: u32 = BIT_TASK_SWITCH;
@@ -80,19 +78,19 @@ pub(crate) const MASK_POLICY: u32 = BIT_POLICY_PROPOSAL | BIT_POLICY_ACCEPTED | 
 pub(crate) const MASK_COMPONENT: u32 = BIT_COMPONENT_STATE;
 /// authority 授予 / 回收类别。
 pub(crate) const MASK_RESOURCE: u32 = BIT_RESOURCE_GRANT | BIT_RESOURCE_REVOKE;
-/// interface 绑定 / 刷新类别。
-pub(crate) const MASK_INTERFACE: u32 = BIT_INTERFACE_BIND | BIT_INTERFACE_REFRESH;
+/// endpoint 绑定类别。
+pub(crate) const MASK_ENDPOINT: u32 = BIT_ENDPOINT_BIND;
 /// 外部中断 enter / dispatch / ack 类别。
 pub(crate) const MASK_IRQ: u32 = BIT_IRQ_ENTER | BIT_IRQ_DISPATCH | BIT_IRQ_ACK;
 
 /// 全部事件位（默认掩码：全开）。`TraceStats::enabled_mask` 是它的 `u64` 视图
 /// （高位恒 0）；`CONFIG_TRACE=n` 时为 0。
 pub const ENABLED_MASK_ALL: u64 =
-    (MASK_TASK | MASK_POLICY | MASK_COMPONENT | MASK_RESOURCE | MASK_INTERFACE | MASK_IRQ) as u64;
+    (MASK_TASK | MASK_POLICY | MASK_COMPONENT | MASK_RESOURCE | MASK_ENDPOINT | MASK_IRQ) as u64;
 
 // —— 运行时使能掩码 ——
 //
-// 生产端：一个 `AtomicU32`（12 个事件位，默认全开）。host 测试：线程本地，
+// 生产端：一个 `AtomicU32`（11 个事件位，默认全开）。host 测试：线程本地，
 // 与 ring 同理——`cargo test` 每个测试跑在自己的线程上，全局掩码会让"关掉
 // 某事件"的测试干扰并行发射事件的其他测试。
 #[cfg(all(feature = "trace", not(test)))]
@@ -246,7 +244,7 @@ impl TraceRing {
 // 目标端：单核全局 ring（生产实现）。
 //
 // host 测试：**线程本地** ring。`cargo test` 每个测试跑在自己的线程上，而 Core
-// 的关键路径（sched / registry / handle / irq / interface）现在几乎都有探针，
+// 的关键路径（sched / registry / handle / irq / endpoint）现在几乎都有探针，
 // 并发测试会互相看到、甚至覆盖对方的事件 —— 任何"断言 ring 内容"或"断言丢失
 // 计数"的测试都会变成 flaky。线程本地让每个测试只看到自己的事件，
 // 生产实现完全不受影响。
@@ -301,8 +299,7 @@ const fn event_bit(event: TraceEvent) -> u32 {
         TraceEvent::ComponentState { .. } => BIT_COMPONENT_STATE,
         TraceEvent::ResourceGrant { .. } => BIT_RESOURCE_GRANT,
         TraceEvent::ResourceRevoke { .. } => BIT_RESOURCE_REVOKE,
-        TraceEvent::InterfaceBind { .. } => BIT_INTERFACE_BIND,
-        TraceEvent::InterfaceRefresh { .. } => BIT_INTERFACE_REFRESH,
+        TraceEvent::EndpointBind { .. } => BIT_ENDPOINT_BIND,
         TraceEvent::IrqEnter { .. } => BIT_IRQ_ENTER,
         TraceEvent::IrqDispatch { .. } => BIT_IRQ_DISPATCH,
         TraceEvent::IrqAck { .. } => BIT_IRQ_ACK,

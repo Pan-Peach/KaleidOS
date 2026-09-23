@@ -51,7 +51,7 @@
 | `ComponentId` | `component/mod.rs:40` | **实例身份** | ✅ | — | 保持；**不要**再加平行 `ComponentInstanceId` |
 | `ComponentImageId` | `component/image.rs` | 镜像身份 + `MemoryLease` | ✅ | — | pinned-until-reboot，无 refcount（刻意） |
 | `TaskId` / `TaskRecord.owner` | `task/id.rs:7` / `task/record.rs:14` | 任务身份 / 任务 owner | ✅ | — | `TaskId` 无 generation（单调，wrap 后才可能 ABA） |
-| `BindingRecord` | `component/interface.rs:191` | 接口 provider 槽 | ✅ | — | **无 consumer 边**；`generation` 是发布计数器，**不是存活 epoch** |
+| 旧接口绑定记录（随 endpoint 迁移删除） | 已删除模块 | 接口 provider 槽 | ✅ | — | **无 consumer 边**；`generation` 是发布计数器，**不是存活 epoch** |
 | `AddressSpaceHandle` / `KernelAddressSpace` | `memory/address_space.rs:26,77` | 第二套平行 handle 设计 | ⚠**休眠** | — | `owner` 存了**从不检查**；`generation` 恒为 1；manager **生产路径从未实例化**、ABI 未导出 |
 | `ResourceDomain` | — | 文档视图 | ❌不存在 | — | 无 |
 | `TaskHandle` / `TimerHandle` / `FrameHandle` | — | 文档枚举 | ❌不存在 | — | 文档承诺了代码没有的东西 |
@@ -71,7 +71,7 @@
 | `MmioLease`/`DmaLease` | ✓来源 | | | | (快照) | ✗ **什么都不 pin** | | | |
 | `MemoryLease` | | | ✓ 分配属主 | | | ✓ RAII | | | |
 | `RequestContext` | ✓ | | | | | | ✓ | | |
-| `BindingRecord` | ✓ | | (provider 归属) | ✓ provider 槽 | | ✗ | | | |
+| 旧接口绑定记录（已删除） | ✓ | | (provider 归属) | ✓ provider 槽 | | ✗ | | | |
 | `ComponentId` | ✓ | | | | | | | | |
 | `ComponentImageId` | ✓ | | ✓ `MemoryLease` | | | | | | |
 | `TaskRecord.owner` | | | ✓ | | | | | | |
@@ -108,7 +108,7 @@
 | `MemoryLease` | **独占 RAII 分配属主**（区域占用） | 语义正确，名字偏弱；可留 |
 | `MmioLease` / `DmaLease` | `Copy` 的指针+provenance **快照**，无 `Drop`、不 pin | 内部改名为 **`MmioView` / `DmaView`**（不要用泛化的 "Capability"）。**导出名 `_lease` 的改动 = ABI 改动** |
 
-interface binding **根本不是 lease**：无 consumer 边、无 refcount、`generation` 只在替换时递增；`BindingView` 是 `Copy`，SDK 直接把缓存指针给消费者（`binding.rs:102-120`）。今天不出事靠的是 **image/state 常驻**，不是引用计数。
+旧的 interface binding（已随 endpoint 模型删除）**根本不是 lease**：无 consumer 边、无 refcount、`generation` 只在替换时递增；绑定视图是 `Copy`，SDK 直接把缓存指针给消费者。今天不出事靠的是 **image/state 常驻**，不是引用计数。
 
 ### C.4 DMA：拆分**必须保留**"设备权威证明"
 

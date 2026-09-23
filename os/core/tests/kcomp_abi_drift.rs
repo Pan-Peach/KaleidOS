@@ -425,7 +425,7 @@ mod generated_filesystem {
 
 #[test]
 fn component_contract_literals_are_pinned() {
-    use kernel::component::interface::InterfaceKind;
+    use kernel::component::abi::InterfaceKind;
 
     // block.device：名字 + 指纹（数值可当 8 字节大端 ASCII 读出来）+ sector 单位。
     assert_eq!(

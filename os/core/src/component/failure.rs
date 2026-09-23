@@ -1,9 +1,9 @@
-//! 组件失败的 Core 编排：标记 Failed，回收它的资源归属，解绑它提供的接口。
+//! 组件失败的 Core 编排：标记 Failed，回收它的资源归属，失效它提供的 endpoint。
 //!
 //! 落地 `docs/architecture/component-model.md` §4.9 的 `fail_component`（最小版）与
 //! `docs/architecture/driver-model.md` §7 的撤销不变式：**组件失败 = 逻辑死亡、物理驻留**。
 //! 顺序固定：先提交状态真相（Failed），再撤销它持有的资源归属，最后清掉它作为
-//! provider 的全部 binding / endpoint（含未提交的 pending publications）。
+//! provider 的全部 endpoint（含未提交的 pending publications）。
 //!
 //! # 与优雅停止的分工
 //!
@@ -21,7 +21,7 @@
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
 
 use crate::component::load::ComponentLoadError;
-use crate::component::{ComponentId, endpoint, interface, registry};
+use crate::component::{ComponentId, endpoint, registry};
 use crate::resource::{device, dma, irq};
 
 /// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 资源兜底。
@@ -36,14 +36,13 @@ pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
     revoke_authority_and_unbind(id);
 }
 
-/// Core 兜底：收回组件剩余的资源归属并解绑它提供的接口。
+/// Core 兜底：收回组件剩余的资源归属并失效它提供的 endpoint。
 ///
 /// 精确序列（失败路径与优雅停止路径**共用**）：
 /// 1. IRQ：撤销 route（投递目标随之消失）；
 /// 2. DMA：撤销 mapping，backing lease 进 QUARANTINE（不 free，设备可能仍在 DMA）；
 /// 3. Device：撤销 ownership 并把设备标进失败 quarantine；
-/// 4. Interface：解绑 active bindings，丢弃 staged pending publications；
-/// 5. Endpoint：provider 的全部 endpoint 永久失效（tombstone，id 不复用），
+/// 4. Endpoint：provider 的全部 endpoint 永久失效（tombstone，id 不复用），
 ///    丢弃 staged pending publications。
 ///
 /// 调用方负责状态提交（失败 = `Failed`；优雅停止 = 随后 `Stopping → Stopped`）。
@@ -51,13 +50,6 @@ pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
     irq::revoke_owner(id);
     dma::revoke_owner(id);
     device::quarantine_owner(id);
-    {
-        let mut ifs = interface::get_interfaces().lock();
-        // active bindings：provider 解绑（consumer 立即不可 bind/refresh）。
-        ifs.unbind_provider(id);
-        // staged publish：pending 全丢弃，旧 provider 完全不受影响。
-        ifs.discard_pending(id);
-    }
     let mut endpoints = endpoint::get_endpoints().lock();
     // endpoint 真相：provider 的全部 endpoint 永久失效（绝不重定向到新实例）。
     endpoints.invalidate_provider(id);
@@ -69,18 +61,12 @@ pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
 mod tests {
     use super::*;
     use crate::component::ComponentState;
+    use crate::component::abi::{InterfaceAbi, InterfaceKind};
     use crate::component::endpoint::{ContractId, EndpointError, EndpointState};
     use crate::component::image::ComponentImageId;
-    use crate::component::interface::{self, InterfaceAbi, InterfaceError, InterfaceKind};
     use crate::component::registry;
     use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
     use crate::resource::{RequestContext, device, dma, irq};
-
-    const ABI: InterfaceAbi = InterfaceAbi::from_raw(0xFA11_0001);
-
-    extern "C" fn demo_impl(_ctx: *mut (), _input: u32) -> u32 {
-        0
-    }
 
     extern "C" fn demo_irq(_ctx: *mut ()) {}
 
@@ -119,15 +105,14 @@ mod tests {
         });
     }
 
-    /// 失败编排：资源回收 + 接口解绑 + 丢弃 pending + 提交 Failed + 设备 quarantine。
+    /// 失败编排：资源回收 + 提交 Failed + 设备 quarantine。
     #[test]
-    fn fail_component_revokes_resources_and_unbinds_interfaces() {
+    fn fail_component_revokes_resources() {
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
         crate::component::image::init();
-        interface::init();
         endpoint::init();
         crate::resource::init();
         commit_device(24, b"fail,mmio");
@@ -158,21 +143,6 @@ mod tests {
             dma::DmaDirection::ToDevice,
         )
         .expect("dma map");
-        {
-            let reg = registry::get_registry().lock();
-            let mut ifs = interface::get_interfaces().lock();
-            ifs.stage_publish(
-                &reg,
-                id,
-                b"fail_demo_iface",
-                InterfaceKind::Service,
-                ABI,
-                demo_impl as *const (),
-                core::ptr::null_mut(),
-            )
-            .unwrap();
-            ifs.commit_pending(&reg, id).unwrap();
-        }
         registry::get_registry().lock().finish_start(id).unwrap();
 
         let before_quarantine = dma::quarantine_len();
@@ -199,19 +169,6 @@ mod tests {
             Err(device::DeviceClaimError::DeviceBusy)
         );
 
-        // 接口解绑。
-        {
-            let reg = registry::get_registry().lock();
-            assert_eq!(
-                interface::get_interfaces().lock().bind(
-                    &reg,
-                    b"fail_demo_iface",
-                    InterfaceKind::Service,
-                    ABI
-                ),
-                Err(InterfaceError::Unbound)
-            );
-        }
         assert_eq!(
             registry::get_registry().lock().get(id).unwrap().state,
             ComponentState::Failed
@@ -238,7 +195,6 @@ mod tests {
         crate::memory::test_support::ensure_init();
         registry::init();
         crate::component::image::init();
-        interface::init();
         endpoint::init();
         crate::resource::init();
 
@@ -340,7 +296,6 @@ mod tests {
         crate::memory::test_support::ensure_init();
         registry::init();
         crate::component::image::init();
-        interface::init();
         endpoint::init();
         crate::resource::init();
 

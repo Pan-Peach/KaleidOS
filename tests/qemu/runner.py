@@ -44,7 +44,7 @@ the selected profile.  Select a profile first, e.g.
        `outcome=0 (Match)`, after which the prober stops
        (`attempt=1 Match; stopping after first attachment`, exactly one create);
      * NO re-entrancy / EBUSY rejection marker anywhere (`Reentrant`, `re-entr`,
-       `EBUSY`) -> the flow is acyclic; the old `driver.prober` callback cycle is
+       `EBUSY`) -> the flow is acyclic; the old prober callback cycle is
        gone rather than the re-entry gate being weakened.
 3. shutdown —— type `shutdown`, expect QEMU to exit.
 

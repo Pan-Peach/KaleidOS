@@ -43,15 +43,16 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
   错误约定（v3 起）：0 = 成功 / -Errno（os/core/src/errno.rs，Linux/POSIX 风格稳定编码；
     内部错误只在 ABI 边界统一翻译；值型 action 用 status + out 参数）
   —— 组件只能调白名单；未导出符号（含组件间 flat ELF 符号）→ UnresolvedSymbol 整次加载失败
-Component Interface Registry（os/core/src/component/interface.rs）：
-  InterfaceId / InterfaceAbi（exact fingerprint，无版本语义）/ InterfaceKind
-  （Device/Service/Policy）/ BindingId / BindingRecord{api, ctx, generation}
-  staged publish（commit_pending / discard_pending）/ bind / refresh / unbind /
-  unbind_provider
-  —— 组件→组件 依赖只走 Interface binding（逻辑 binding + typed #[repr(C)]
-     function table）；publish 在 kcomp_instance_create 期间只记 pending，create 成功后原子
-     提交；同 ABI replacement 保留 BindingId、generation++；不建立 flat ELF
-     symbol 全局符号表；provider 替换后 consumer 只需 refresh，无需 ELF reload
+Component Endpoint Registry（os/core/src/component/endpoint.rs）：
+  ContractId / InterfaceAbi（exact fingerprint，无版本语义）/ InterfaceKind
+  （Device/Service/Policy）/ EndpointId（opaque，单调、绝不回收 / 重定向）
+  staged publish（commit_pending / discard_pending）/ lookup / discover / validate /
+  bind / call
+  —— 组件→组件 依赖只走 endpoint（opaque EndpointId + typed #[repr(C)]
+     function table 或 Core call gate）；publish 在 kcomp_instance_create 期间只记 pending，
+     create 成功后原子提交；bind 由 Core 按两端执行域一次性选定机制（同域 Direct /
+     跨域 Gate，不支持组合显式拒绝、绝不静默降级）；provider 停止 / 失败 → 它的全部
+     endpoint 永久 Invalid；不建立 flat ELF symbol 全局符号表
 内存粒度定案：ALLOC_GRANULE（物理分配）与 AddressSpaceBackend::GRANULE（VM 映射）解耦
 RISC-V trap 按特权级拆分：trap/supervisor.rs（S-mode 机制）/ trap/machine.rs（M-mode 骨架）
 测试体系（自动化，见 docs/development/testing.md）：
@@ -59,7 +60,7 @@ RISC-V trap 按特权级拆分：trap/supervisor.rs（S-mode 机制）/ trap/mac
   make test-qemu（RV64+RV32 boot smoke + 自动执行 core_test 组件并判定 PASS）
   make test-arch（ArchTest 白盒 selftest：mapping / context switch / illegal instr /
     load fault / store-readonly fault / execute-NX fault，每 case 独立 QEMU，精确 scause 判定）
-  180+ 个 host 单测（含 proptest 属性测试、parser 对抗测试与 Interface Registry 状态测试）
+  400+ 个 host 单测（含 proptest 属性测试、parser 对抗测试与 endpoint registry 状态测试）
 ```
 
 QEMU 验证输出（真实）：
@@ -114,7 +115,7 @@ DeviceTable / device claim / IRQ / DMA → 第一个 Driver Component
                              → 真实 MCU
 ```
 
-- Interface Registry 已为驱动/服务提供 binding 机制；`DeviceTable` 已含独占
+- Endpoint Registry 已为驱动/服务提供 binding 机制；`DeviceTable` 已含独占
   owner + 失败 quarantine，并支持 `revoke_owner(ComponentId)`
   （见 component-model.md §3.2）。
 - 设备发现链：FDT/board description → DeviceRecord → DeviceId（identity）→

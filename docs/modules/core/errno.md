@@ -13,7 +13,7 @@
 - `pub use crate::generated::errno::Errno`。
 - `Errno::code(self) -> i32`（= `-(self as i32)`）。
 - `pub(crate) fn status<E: Into<Errno>>(Result<(), E>) -> i32`。
-- `From<...> for Errno` 覆盖：`TaskError`、`SchedError`、`InterfaceError`、`ComponentLoadError`、`ComponentStopError`、`machine::DeviceLookupError`、`DeviceClaimError`、`DeviceReleaseError`、`DmaError`、`IrqError`。
+- `From<...> for Errno` 覆盖：`TaskError`、`SchedError`、`EndpointError`、`CallError`、`ComponentLoadError`、`ComponentStopError`、`machine::DeviceLookupError`、`DeviceClaimError`、`DeviceReleaseError`、`DmaError`、`IrqError`。
 - host 测试用穷尽 match 把每个映射钉到一个数字：新增枚举变体会直接编译失败（防漏映射）。
 
 ## 明确不做

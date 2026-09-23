@@ -14,7 +14,7 @@
 //! 2. registry.begin_stop(id)      Ready → Stopping：提交"不再接受新 work"
 //! 3. 调用组件销毁入口 kcomp_instance_destroy(state)
 //!                                必需导出；Core-owned 隔离栈
-//! 4. Core 兜底                     revoke authority + 解绑 provider interfaces +
+//! 4. Core 兜底                     revoke authority + 失效 provider endpoints +
 //!                                  使 provider endpoints 永久失效
 //!                                  （与 failure 路径共用同一序列，见 `failure.rs`）
 //! 5. registry.finish_stop(id)     Stopping → Stopped（终态）
@@ -208,7 +208,6 @@ mod tests {
         image::init();
         crate::task::init();
         crate::resource::init();
-        crate::component::interface::init();
         crate::component::endpoint::init();
         let guard = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
@@ -496,8 +495,8 @@ mod tests {
     /// 共享同一 image 的其它实例的 endpoint 不受影响。
     #[test]
     fn stop_invalidates_only_the_stopped_instances_endpoints() {
+        use crate::component::abi::{InterfaceAbi, InterfaceKind};
         use crate::component::endpoint::{self, ContractId, EndpointError, EndpointState};
-        use crate::component::interface::{InterfaceAbi, InterfaceKind};
 
         let _heap = setup();
         const CONTRACT: ContractId = ContractId::from_raw(0xE0D0_5001);

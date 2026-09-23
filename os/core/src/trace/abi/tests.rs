@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::component::ComponentId;
+use crate::component::endpoint::{EndpointId, Mechanism};
 use crate::resource::ResourceKind;
 use crate::task::TaskId;
 
@@ -48,14 +49,10 @@ fn every_event_has_a_distinct_stable_tag() {
             kind: ResourceKind::Dma,
             id: 2,
         },
-        TraceEvent::InterfaceBind {
-            consumer: Some(component),
+        TraceEvent::EndpointBind {
+            endpoint: EndpointId::from_raw(1),
             provider: component,
-            interface: crate::component::interface::InterfaceId::from_raw(1),
-        },
-        TraceEvent::InterfaceRefresh {
-            binding: crate::component::interface::BindingId::from_raw(1),
-            generation: 2,
+            mechanism: Mechanism::Direct,
         },
         TraceEvent::IrqEnter { irq: 5 },
         TraceEvent::IrqDispatch {
@@ -65,7 +62,7 @@ fn every_event_has_a_distinct_stable_tag() {
         TraceEvent::IrqAck { irq: 5 },
     ];
     let tags: alloc::vec::Vec<u32> = events.iter().map(|event| encode(*event).kind).collect();
-    assert_eq!(tags, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(tags, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     for event in events {
         let abi = encode(event);
         assert_eq!(abi.flags, 0, "flags 必须为 0");
@@ -111,6 +108,27 @@ fn enum_values_map_to_stable_codes() {
     });
     assert_eq!(abi.b, 2, "Starting = 2");
     assert_eq!(abi.c, 3, "Ready = 3");
+}
+
+/// `EndpointBind` payload：endpoint id（u64）/ provider（u32）/ 机制码（0=Direct 1=Gate）。
+#[test]
+fn endpoint_bind_payload_is_anchored() {
+    let abi = encode(TraceEvent::EndpointBind {
+        endpoint: EndpointId::from_raw(0x1234_5678_9abc_def0),
+        provider: ComponentId::from_raw(7),
+        mechanism: Mechanism::Gate,
+    });
+    assert_eq!(abi.kind, KIND_ENDPOINT_BIND);
+    assert_eq!(abi.a, 0x1234_5678_9abc_def0, "EndpointId 原样透传");
+    assert_eq!(abi.b, 7, "provider ComponentId 原样透传");
+    assert_eq!(abi.c, 1, "Gate = 1");
+
+    let direct = encode(TraceEvent::EndpointBind {
+        endpoint: EndpointId::from_raw(1),
+        provider: ComponentId::from_raw(1),
+        mechanism: Mechanism::Direct,
+    });
+    assert_eq!(direct.c, 0, "Direct = 0");
 }
 
 /// `TraceStatsAbi` 布局锚定（kcomp-sdk 侧有同一断言，改了字段必须双侧同步）。

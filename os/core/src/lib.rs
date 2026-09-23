@@ -110,7 +110,6 @@ pub fn init(
     timer::init().map_err(|_| "timer init failed")?;
     component::image::init();
     component::registry::init();
-    component::interface::init();
     component::endpoint::init();
     resource::init();
     irq::init();

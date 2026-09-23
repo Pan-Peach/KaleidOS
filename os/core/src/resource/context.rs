@@ -20,7 +20,7 @@
 //! Only when no boundary is active (Core anchor / host tests) does resolution
 //! fall back to the running task's owner and then the loader-recorded
 //! `call_create` identity. This is the single source of identity for every
-//! authority / task / interface entry point: no entry point may prefer one
+//! authority / task / endpoint entry point: no entry point may prefer one
 //! source over the other.
 
 use crate::component::ComponentId;
@@ -73,7 +73,7 @@ impl RequestContext {
     /// Like [`Self::ambient`] but restricted to an active `kcomp_instance_create`
     /// boundary.
     ///
-    /// Interface publication is a create-time operation: a component task, a
+    /// Endpoint publication is a create-time operation: a component task, a
     /// `kcomp_instance_destroy` hook, an **IRQ callback scope**, a **service
     /// call**, and a **policy call** are active boundaries but are not valid
     /// publication principals.  In particular, a service call must never confer

@@ -179,10 +179,6 @@ uint32_t kcore_component_count(void);
 /* Core 侧的最小创建操作：按 artifact 名创建新实例（同一 image 允许多实例）。 */
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, const struct KcompCreateArgs *args, uint32_t *out_instance);
 int32_t kcore_component_load(const uint8_t *name, size_t len);
-int32_t kcore_interface_publish(const uint8_t *name, size_t len, uint32_t kind, uint64_t abi, const void *api, void *ctx);
-int32_t kcore_interface_available(const uint8_t *name, size_t len, uint32_t kind, uint64_t abi);
-int32_t kcore_interface_bind(const uint8_t *name, size_t len, uint32_t kind, uint64_t abi, uint64_t *out_binding, size_t *out_api, size_t *out_ctx, uint64_t *out_generation);
-int32_t kcore_interface_refresh(uint64_t binding, uint64_t abi, size_t *out_api, size_t *out_ctx, uint64_t *out_generation);
 /* -- Task control -- */
 /* 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
  * （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入

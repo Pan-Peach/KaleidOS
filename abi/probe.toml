@@ -1,7 +1,7 @@
 # KABI schema — probe：**无环的 prober → driver 分发**（step 4）。
 #
-# 旧模型里 driver 在**自己的 create 中回调 prober**（`driver.prober` 服务：
-# `next_assignment` / `report_attempt`）——那形成同步重入环，与 endpoint 调用模型
+# 旧模型里 driver 在**自己的 create 中回调 prober**（assignment 回调 Service）——
+# 那形成同步重入环，与 endpoint 调用模型
 # 的 re-entry 门禁直接冲突。本文件定义取代它的两个无环契约面：
 #
 #   1. `DriverCreateConfig`：**flat bytes，无嵌套指针**——assignment 数据经

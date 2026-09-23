@@ -18,11 +18,11 @@
 //! 不再各自硬编码 `state != X`。非法转换返回 Err（Core 验证后才提交状态，
 //! Policy proposes 原则）。
 //!
-//! `Resolved` = 所有 required Interfaces 都已找到 provider。`Starting` =
-//! 正在执行 `kcomp_instance_create(args, &out_state)`（此期间 `kcore_interface_publish`
-//! 只记录 pending，不修改 active binding）。`finish_start` 由 Core 在 create 返回 0、
-//! Core 记录 `instance_state`、且 pending interfaces 原子提交后调用（见
-//! `component/interface.rs`）。id 单调递增、不回收：组件实例 = 身份——失败恢复 =
+//! `Resolved` = 所有 required Endpoints 都已找到 provider。`Starting` =
+//! 正在执行 `kcomp_instance_create(args, &out_state)`（此期间 `kcore_endpoint_publish`
+//! 只记录 pending，不创建 endpoint）。`finish_start` 由 Core 在 create 返回 0、
+//! Core 记录 `instance_state`、且 pending endpoints 原子提交后调用（见
+//! `component/load.rs`）。id 单调递增、不回收：组件实例 = 身份——失败恢复 =
 //! 全新实例（新 id），`ComponentId` 永不复用（docs/architecture/component-model.md）。
 //!
 //! In-flight call 记账：`InstanceRecord::inflight` 记录该实例尚未返回的调用数
@@ -54,7 +54,7 @@ pub struct InstanceRecord {
 }
 
 // `instance_state` 是组件 opaque 指针：Registry 只存取、永不解引用。
-// 跨线程使用由外层 `Mutex` 串行化（与 interface.rs 的 BindingRecord 同一理由）。
+// 跨线程使用由外层 `Mutex` 串行化（与 endpoint.rs 的 EndpointRecord 同一理由）。
 unsafe impl Send for InstanceRecord {}
 unsafe impl Sync for InstanceRecord {}
 
@@ -119,7 +119,7 @@ impl Registry {
     /// 记录 `kcomp_instance_create` 写回的 opaque state 指针（Core 只存）。
     ///
     /// 生产调用方是 `component/load.rs`：create 返回 0 后、提交 pending
-    /// interfaces 之前调用。失败/未完整构造的实例不经此路径（不调用 create）。
+    /// endpoints 之前调用。失败/未完整构造的实例不经此路径（不调用 create）。
     pub fn record_instance_state(
         &mut self,
         id: ComponentId,
@@ -129,21 +129,21 @@ impl Registry {
         Ok(())
     }
 
-    /// Declared → Resolved：所有 required Interfaces 已成功绑定。
+    /// Declared → Resolved：所有 required Endpoints 已成功绑定。
     /// 无 requires 的组件同样经过此步（vacuous truth：零依赖 = 已满足）。
     pub fn resolve(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Resolved)
     }
 
     /// Resolved → Starting：开始执行 `kcomp_instance_create`。
-    /// `Starting` 期间组件可以 publish 接口（记录为 pending）与创建任务；
+    /// `Starting` 期间组件可以 publish endpoint（记录为 pending）与创建任务；
     /// 只有 `finish_start`（或失败路径）能离开该状态。
     pub fn begin_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Starting)
     }
 
     /// Starting → Ready：create 返回 0、`instance_state` 已记录且 pending
-    /// interfaces 已提交，组件可以对外提供 Interface。
+    /// endpoints 已提交，组件可以对外提供 endpoint。
     pub fn finish_start(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Ready)
     }

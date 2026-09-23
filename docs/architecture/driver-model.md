@@ -370,7 +370,7 @@ boot:  FDT → MachineInfo → DeviceDescriptor（设备发现）
 runtime:
   ① 先挂上一个 driver component（总线 / probe 角色，如 virtio-mmio bus）做初始化
   ② 它枚举 / 探测设备（compatible、device_id）
-  ③ 通过 Component Interface Registry（requires / bind）解析并启动匹配的
+  ③ 通过 Component Endpoint Registry（lookup / bind）解析并启动匹配的
      设备驱动 component（如 virtio_blk）
   ④ 设备驱动 component 向 Core `kcore_device_claim` / `kcore_irq_register` /
      `kcore_dma_alloc`（device_id 就是认领锚点）
@@ -428,7 +428,7 @@ runtime:
 - `kcore_device_release` 在仍有 live IRQ route / DMA mapping 时 `-EBUSY`；`kcore_irq_release` 撤销 route 并关断控制器线；
 - 失败 containment：`fail_component` 把失败组件占用的每台设备标进 Core 的 quarantine（phase 1 保持到 reboot；优雅 `release` 不标记）。
 
-读 virtio-mmio `DeviceID` 本身需要 claim 后的 MMIO 访问：探测是"**独占 claim → 识别 → release → 下一个 ordinal**"，不做无副作用的只读探测 claim（generic MMIO 读可能清状态 / 弹 FIFO，Core 不学协议语义）。组件级 **prober**：`os/components/driver_prober` 是**协议无关**的总线角色——只有一张 opaque 候选目录（`compatible → 候选组件`）+ prober-owned assignment cursor，**不 claim MMIO、不读任何寄存器、不解释 compatible**。流程（**无环**，step 4）：prober 粗匹配（`kcore_device_nth`）→ 逐台把 `(device_id, 结果端口名)` 编码成**扁平 create config**（`abi/probe.toml` 的 `DriverCreateConfig`）→ `kcore_component_create` 候选组件 → driver 在**自己的 create 上下文**读 config、claim + 读协议识别寄存器做**细匹配**，把 `Match` / `NoMatch` staged publish 到 `probe.result` endpoint（不匹配 = 正常，release 后 create 成功返回）→ prober 在 create 返回 0 后**拉取**该 endpoint、用自己的本地调用更新 cursor。driver **绝不回调 prober**：旧的 `driver.prober` assignment Service（`next_assignment` / `report_attempt`）形成 `Task(prober) → Driver create → Service(prober)` 同步重入环，已被 create config + 结果 pull 取代。
+读 virtio-mmio `DeviceID` 本身需要 claim 后的 MMIO 访问：探测是"**独占 claim → 识别 → release → 下一个 ordinal**"，不做无副作用的只读探测 claim（generic MMIO 读可能清状态 / 弹 FIFO，Core 不学协议语义）。组件级 **prober**：`os/components/driver_prober` 是**协议无关**的总线角色——只有一张 opaque 候选目录（`compatible → 候选组件`）+ prober-owned assignment cursor，**不 claim MMIO、不读任何寄存器、不解释 compatible**。流程（**无环**，step 4）：prober 粗匹配（`kcore_device_nth`）→ 逐台把 `(device_id, 结果端口名)` 编码成**扁平 create config**（`abi/probe.toml` 的 `DriverCreateConfig`）→ `kcore_component_create` 候选组件 → driver 在**自己的 create 上下文**读 config、claim + 读协议识别寄存器做**细匹配**，把 `Match` / `NoMatch` staged publish 到 `probe.result` endpoint（不匹配 = 正常，release 后 create 成功返回）→ prober 在 create 返回 0 后**拉取**该 endpoint、用自己的本地调用更新 cursor。driver **绝不回调 prober**：旧的 assignment 回调 Service（prober 暴露回调、driver 在 create 中调用）形成 `Task(prober) → Driver create → Service(prober)` 同步重入环，已被 create config + 结果 pull 取代。
 
 ## 13. 已决
 

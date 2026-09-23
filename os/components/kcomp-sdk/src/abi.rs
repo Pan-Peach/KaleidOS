@@ -20,7 +20,7 @@
 //!   `kcore_trace_stats` 的 `enabled_mask == 0`。这是"这台机器没带 trace"，
 //!   不是"事件被过滤"。
 //! - **运行时**：`enabled_mask` 报告哪些事件 kind 会被记录（bit i ↔ kind i+1，
-//!   即生成物里的 `KIND_*` 常量；12 位掩码，默认全开 = `0x0fff`，高位保留恒 0）。
+//!   即生成物里的 `KIND_*` 常量；11 位掩码，默认全开 = `0x07ff`，高位保留恒 0）。
 //!   被过滤的事件不记录、**不消耗 `seq`**。掩码由 Core 管理路径（Monitor）
 //!   控制：组件只能**读**（`kcore_trace_stats`），没有写入口。
 //!
@@ -30,3 +30,28 @@
 //! 逐出了多少条，不等于某个 reader 漏掉的条数）。
 
 pub use crate::generated::abi::*;
+
+/// Exact ABI fingerprint（`#[repr(transparent)] u64`，**无版本兼容语义**）。
+///
+/// 只回答："provider 与 consumer 是否由**完全相同**的契约编译？" 不一致 →
+/// Core 拒绝 validate / bind。数值来自 `abi/*.toml` 生成物，不要手写。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterfaceAbi(u64);
+
+impl InterfaceAbi {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl InterfaceKind {
+    /// ABI 编码（`#[repr(u32)]`，恒等于判别值）。
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}

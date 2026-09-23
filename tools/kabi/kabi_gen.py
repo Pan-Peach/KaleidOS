@@ -2161,7 +2161,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 44
+    assert len(core.functions) == 40
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
         "kcore_trace_stats",
@@ -2190,7 +2190,7 @@ doc = "I/O error"
     kcomp_abi = [const for const in component.constants if const.name == "KCOMP_ABI"][0]
     assert kcomp_abi.value == 0x4B43_4F4D_5041_4249
     kinds = [const for const in core.constants if const.name.startswith("KIND_")]
-    assert [const.value for const in kinds] == list(range(1, 13))
+    assert [const.value for const in kinds] == list(range(1, 12))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]
     assert absent.value == 2 ** 64 - 1
 

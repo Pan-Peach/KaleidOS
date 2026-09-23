@@ -45,7 +45,7 @@ ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 
   ├─ 生命周期 state
   ├─ 资源归属（device / IRQ route / DMA owner）
   ├─ 任务归属（TaskRecord.owner）
-  ├─ 接口发布归属（BindingRecord.provider）
+  ├─ endpoint 发布归属（EndpointRecord.owner）
   ├─ failure 状态 / containment 身份
   └─ opaque instance state 指针（由组件 create 返回）
 ```
@@ -92,7 +92,7 @@ declare instance → Resolved → Starting
 - **panicked 或未完整构造的实例，不要调用 destroy**。构造函数内部的错误清理由组件自己负责。
 - create 成功后的 commit 失败：按现有"物理驻留"原则保守保留状态。
 - destroy 失败 / panic → 实例置 **Failed**，保留内存，走 Core containment。**绝不自动重试析构**。
-- 生命周期顺序沿用现有 staged publication（`interface.rs`），不要改成"先发布后初始化"。
+- 生命周期顺序沿用现有 staged publication（`endpoint.rs`），不要改成"先发布后初始化"。
 
 ---
 
@@ -162,10 +162,13 @@ int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len,
 
 ## 5. 服务 endpoint 命名
 
-**多个实例不能都发布 `block.device`**：现在一个 name 只有一个 provider 槽，同 ABI 的再次发布是**覆盖**（`interface.rs` 的 `apply_publish`）。
+**多个实例可以各自发布 `block.device`**：endpoint 身份 = `(provider, port_name, contract)`
+（`EndpointId`），端口名只要求在 provider 实例内唯一；同 ABI 的再次发布**绝不覆盖**任何
+已有 endpoint，provider 停止 / 失败即其全部 endpoint 永久失效、绝不重定向。
 
-- 引入**由组合策略提供**的不同 endpoint 名，**ABI 指纹不变**。
-- SDK 增加 `publish_named` / `bind_named`；单例角色继续用现有固定名 helper。
+- **由组合策略提供**端口名（多实例场景），**ABI 指纹不变**。
+- SDK 的 provider wrapper 提供 `publish_endpoint(port_name, port)`；consumer 侧显式
+  `Endpoint::lookup(provider, port_name)` + `bind`。
 - **不引入服务发现框架。**
 
 ---
@@ -286,7 +289,7 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
    clang 编的 freestanding C 组件，经 `tools/build-kcomp-c.sh` + SDK C 运行时
    （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-c-smoke`
    在 RV64/RV32 端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的
-   Interface binding smoke。之后才接 FatFs 胶水——先测 C/Rust 布局与真实调用，再接
+   endpoint binding smoke。之后才接 FatFs 胶水——先测 C/Rust 布局与真实调用，再接
    文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或
    `virtio-blk`。
 

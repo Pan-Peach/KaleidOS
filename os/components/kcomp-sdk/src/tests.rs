@@ -14,7 +14,7 @@ fn dma_direction_encoding_is_stable() {
 /// InterfaceKind ABI 编码锚定（与 Core `export.rs::kind_from_u32` 一致）。
 #[test]
 fn interface_kind_encoding_is_stable() {
-    use crate::binding::InterfaceKind::{Device, Policy, Service};
+    use crate::abi::InterfaceKind::{Device, Policy, Service};
     assert_eq!(Device.as_u32(), 0);
     assert_eq!(Service.as_u32(), 1);
     assert_eq!(Policy.as_u32(), 2);
@@ -36,34 +36,14 @@ fn scheduler_policy_identity_is_anchored() {
     assert_eq!(SCHEDULER_NONE, u32::MAX);
 }
 
-/// driver.prober ABI fingerprint 锚定（ASCII "DRVPROBE"）：prober 与 driver
-/// 由完全相同的契约编译——数值漂移会让 bind 直接拒绝，这里把它钉死。
-#[test]
-fn driver_prober_abi_is_anchored() {
-    assert_eq!(
-        crate::binding::DRIVER_PROBER_ABI.raw(),
-        0x4452_5650_524F_4245
-    );
-}
-
-/// 分配接口名字锚定：publish / bind 两侧必须逐字节一致。
-#[test]
-fn driver_prober_name_is_anchored() {
-    assert_eq!(crate::binding::DRIVER_PROBER_NAME, b"driver.prober");
-}
-
 #[test]
 fn filesystem_abi_is_anchored() {
-    assert_eq!(crate::binding::FILESYSTEM_ABI.raw(), 0x4649_4C45_5359_5354);
-    assert_eq!(crate::binding::FILESYSTEM_NAME, b"filesystem");
-    assert_eq!(crate::binding::FILESYSTEM_OPEN_READ, 1);
-}
-
-/// `report_attempt` outcome 编码锚定（0 = Match，1 = NoMatch）。
-#[test]
-fn assign_outcome_encoding_is_stable() {
-    assert_eq!(crate::binding::ASSIGN_MATCH, 0);
-    assert_eq!(crate::binding::ASSIGN_NO_MATCH, 1);
+    assert_eq!(
+        crate::filesystem::FILESYSTEM_ABI.raw(),
+        0x4649_4C45_5359_5354
+    );
+    assert_eq!(crate::filesystem::FILESYSTEM_NAME, b"filesystem");
+    assert_eq!(crate::filesystem::FILESYSTEM_OPEN_READ, 1);
 }
 
 /// `probe.result` 契约身份 / ABI 指纹 / create config 布局锚定（ASCII tag 的
@@ -132,21 +112,18 @@ fn kcomp_abi_fingerprint_is_anchored() {
 /// 必须为 Device（Core 拒绝同名不同 kind）；改动必须是一次刻意的测试修改。
 #[test]
 fn block_device_name_and_kind_are_anchored() {
-    use crate::binding::InterfaceKind::Device;
-    use crate::binding::{BLOCK_DEVICE_NAME, BlockDevice};
+    use crate::abi::InterfaceKind::Device;
+    use crate::block::{BLOCK_DEVICE_NAME, BlockDevice};
+    use crate::endpoint::Contract;
     assert_eq!(BLOCK_DEVICE_NAME, b"block.device");
-    assert_eq!(
-        <BlockDevice as crate::binding::Service>::NAME,
-        b"block.device"
-    );
-    assert_eq!(<BlockDevice as crate::binding::Service>::KIND, Device);
+    assert_eq!(<BlockDevice as Contract>::KIND, Device);
 }
 
 /// BlockDevice ABI fingerprint 锚定（ASCII "BLOCKDEV"）：数值本身可当 8 字节
 /// 大端 ASCII 读出来——两个断言同时钉死数值与"它真的是那个 tag"。
 #[test]
 fn block_device_abi_is_anchored() {
-    let abi = crate::binding::BLOCK_DEVICE_ABI.raw();
+    let abi = crate::block::BLOCK_DEVICE_ABI.raw();
     assert_eq!(abi, 0x424C_4F43_4B44_4556);
     assert_eq!(&abi.to_be_bytes(), b"BLOCKDEV");
 }
@@ -155,8 +132,8 @@ fn block_device_abi_is_anchored() {
 /// exact ABI fingerprint 认的就是这份布局——字段增删必须同步改测试。
 #[test]
 fn block_device_api_layout_is_anchored() {
-    assert_eq!(core::mem::size_of::<crate::binding::BlockDeviceApi>(), 24);
-    assert_eq!(core::mem::align_of::<crate::binding::BlockDeviceApi>(), 8);
+    assert_eq!(core::mem::size_of::<crate::block::BlockDeviceApi>(), 24);
+    assert_eq!(core::mem::align_of::<crate::block::BlockDeviceApi>(), 8);
 }
 
 // ---------------------------------------------------------------------------

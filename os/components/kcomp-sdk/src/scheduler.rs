@@ -29,7 +29,7 @@
 //! endpoint 调用 / 嵌套创建 / 策略替换在边界内一律被 Core 拒绝。
 
 use crate::abi;
-use crate::binding::InterfaceAbi;
+use crate::abi::InterfaceAbi;
 use crate::endpoint::{Contract, Endpoint};
 use crate::errno::{Errno, Result};
 use crate::generated::abi::InterfaceKind;
@@ -58,8 +58,7 @@ pub const SCHEDULER_TASK_ID_LEN: usize = KCOMP_SCHEDULER_TASK_ID_LEN;
 
 /// `scheduler.policy` 契约（KIND = Policy）。
 ///
-/// 只实现 [`Contract`]（Endpoint 模型）：调度策略没有 Direct function table，
-/// 不存在旧 `Service` 表达（全局名字 → 单 binding 已删除）。
+/// 只实现 [`Contract`]（Endpoint 模型）：调度策略没有 Direct function table。
 pub struct SchedulerPolicy;
 
 impl Contract for SchedulerPolicy {

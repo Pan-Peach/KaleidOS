@@ -306,26 +306,26 @@ Rust enum layout、编译器私有 runtime 结构。KernelNative 边界使用窄
 C ABI：`extern "C"`、定宽整数、pointer + length、显式 status code、opaque handle、
 explicit-layout struct（Core Export ABI 即此形状）；U-mode 另行定义自己的 syscall wire ABI。
 
-### 两条机制边界（Core ABI ≠ Interface Registry）
+### 两条机制边界（Core ABI ≠ Endpoint Registry）
 
 ```text
 Component → Core          = Core Export ABI（export.rs：kcore_* 白名单，
                             稳定 C ABI、exact-name resolution、未导出 → UnresolvedSymbol）
-Component → Component     = Interface binding（interface.rs：publish/bind/refresh/unbind，
-                            逻辑 binding + exact ABI fingerprint + typed #[repr(C)] function table，
-                            禁止 flat ELF symbol 互链）
+Component → Component     = Endpoint binding（endpoint.rs：publish/lookup/discover/bind，
+                            opaque EndpointId + exact ABI fingerprint + typed #[repr(C)]
+                            function table 或 Core call gate，禁止 flat ELF symbol 互链）
 ```
 
 - Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
   （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
-  Core 处理的**语义入口**（组件加载 / 接口发布 / 任务控制 / 设备与 IRQ 与 DMA：
+  Core 处理的**语义入口**（组件加载 / endpoint 发布 / 任务控制 / 设备与 IRQ 与 DMA：
   `kcore_device_nth` + `kcore_device_claim/release`、
   `kcore_irq_register/enable/disable/release`、
   `kcore_dma_alloc/free/map/unmap`）。**不导出未经 Core 提交的裸 mutation**：
   物理帧分配的最终提交、地址空间变更、裸任务表改动仍是 Core 内部提交点——
   组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。
-- Component Interface Registry 是 **Core 的组件依赖真相**：谁提供什么接口、
-  当前绑到谁。两者是独立概念，互不替代。
+- Component Endpoint Registry 是 **Core 的组件依赖真相**：谁在哪个端口发布了哪个
+  契约、endpoint 是否存活。两者是独立概念，互不替代。
 - 内存粒度定案：`ALLOC_GRANULE`（物理分配）与 `AddressSpaceBackend::GRANULE`
   （VM 映射）语义解耦；RISC-V trap 按特权级拆分（`trap/supervisor.rs` =
   S-mode 机制，`trap/machine.rs` = M-mode 骨架，共享解码在 `trap/mod.rs`），
@@ -347,7 +347,7 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
   C 侧 `<errno.h>` shim（`include/errno.h`；`-ffreestanding` 不提供）。三方数值由
   `os/core/tests/kcomp_abi_drift.rs` 钉死。
 - 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
-  `InterfaceError` / `DeviceClaimError` / `DeviceReleaseError` / `IrqError` /
+  `EndpointError` / `CallError` / `DeviceClaimError` / `DeviceReleaseError` / `IrqError` /
   `DmaError` / `MemoryError` ...）保持丰富与类型安全，
   只在 Core ABI 边界翻译成 `Errno`——映射表集中在 `errno.rs`。
 - 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
@@ -366,8 +366,8 @@ Component → Component     = Interface binding（interface.rs：publish/bind/re
 |---|---|
 | `usize` | 仅"语义就是指针宽"的量：地址（`entry`）、`(ptr, len)`、分配器 `size/align` |
 | `u32` | counts / ids（hart / cpu / page / task / component ...） |
-| `i32` | 布尔与编码（`has_hart` / `task_state` / `interface_available`） |
-| `u64` | 不透明 id（`BindingId` / DMA mapping id），只经 `status + out` 回传 |
+| `i32` | 布尔与编码（`has_hart` / `task_state`） |
+| `u64` | 不透明 id（`EndpointId` / DMA mapping id），只经 `status + out` 回传 |
 
 KernelNative 下组件与 Core 同 target 编译，宽度天然一致；跨 transport（IPC / Wasm）
 不复用本签名，宽度另行定义。旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容；

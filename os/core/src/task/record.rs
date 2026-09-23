@@ -27,7 +27,7 @@ pub struct TaskRecord {
 }
 
 // `arg` 是组件 opaque 指针：Core 只存/透传、永不解引用。跨线程使用由
-// `TASK_TABLE` 的 Mutex 串行化（与 interface.rs 的 BindingRecord 同一理由）。
+// `TASK_TABLE` 的 Mutex 串行化（与 endpoint.rs 的 EndpointRecord 同一理由）。
 unsafe impl Send for TaskRecord {}
 unsafe impl Sync for TaskRecord {}
 

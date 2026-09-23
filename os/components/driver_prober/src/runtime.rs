@@ -2,8 +2,7 @@
 //!
 //! # 无环分发（step 4）
 //!
-//! 旧流程里驱动在**自己的 create 中回调 prober**（`driver.prober` 的
-//! `next_assignment` / `report_attempt`），形成
+//! 旧流程里驱动在**自己的 create 中回调 prober**（assignment 回调 Service），形成
 //! `Task(prober) → Driver create → Service(prober)` 同步重入环。现在流程改为
 //! **数据进 create、结果走出来**，prober 组件不再发布任何 endpoint：
 //!

@@ -3,8 +3,8 @@
 //!
 //! # 为什么需要它
 //!
-//! 旧流程里 driver 在自己的 create 中回调 prober（`driver.prober` 的
-//! `next_assignment` / `report_attempt`），形成
+//! 旧流程里 driver 在自己的 create 中回调 prober（prober→driver 的 assignment
+//! 回调 Service），形成
 //! `Task(prober) → Driver create → Service(prober)` 同步重入环——endpoint 调用模型
 //! 的 re-entry 门禁必须拒绝它。本模块把流程拆成两半，环即消失：
 //!

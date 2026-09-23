@@ -179,20 +179,19 @@ pub const KIND_RESOURCE_GRANT: u32 = 6;
 /// `ResourceRevoke`：回收 authority。
 pub const KIND_RESOURCE_REVOKE: u32 = 7;
 
-/// `InterfaceBind`：一次成功的 interface 绑定解析。
-pub const KIND_INTERFACE_BIND: u32 = 8;
-
-/// `InterfaceRefresh`：provider / generation 刷新。
-pub const KIND_INTERFACE_REFRESH: u32 = 9;
+/// `EndpointBind`：一次成功的 endpoint 绑定解析——Core 在此刻选定调用机制
+/// （Direct / Gate）。payload：endpoint（EndpointId）/ provider（ComponentId）/
+/// mechanism（0 = Direct，1 = Gate）。
+pub const KIND_ENDPOINT_BIND: u32 = 8;
 
 /// `IrqEnter`：外部中断进入 Core。
-pub const KIND_IRQ_ENTER: u32 = 10;
+pub const KIND_IRQ_ENTER: u32 = 9;
 
 /// `IrqDispatch`：Core 把 IRQ 路由给某组件。
-pub const KIND_IRQ_DISPATCH: u32 = 11;
+pub const KIND_IRQ_DISPATCH: u32 = 10;
 
 /// `IrqAck`：IRQ 线完成 ack。
-pub const KIND_IRQ_ACK: u32 = 12;
+pub const KIND_IRQ_ACK: u32 = 11;
 
 /// `kcore_endpoint_bind` 的机制编码：**Direct**（同域 KernelNative，provider 的
 /// `#[repr(C)]` function table 直接调用；稳态零 Core 介入）。SDK / 组件只**执行**
@@ -257,36 +256,6 @@ unsafe extern "C" {
     ) -> i32;
     #[link_name = "kcore_component_load"]
     pub fn kcore_component_load(name: *const u8, len: usize) -> i32;
-    #[link_name = "kcore_interface_publish"]
-    pub fn kcore_interface_publish(
-        name: *const u8,
-        len: usize,
-        kind: u32,
-        abi: u64,
-        api: *const (),
-        ctx: *mut (),
-    ) -> i32;
-    #[link_name = "kcore_interface_available"]
-    pub fn kcore_interface_available(name: *const u8, len: usize, kind: u32, abi: u64) -> i32;
-    #[link_name = "kcore_interface_bind"]
-    pub fn kcore_interface_bind(
-        name: *const u8,
-        len: usize,
-        kind: u32,
-        abi: u64,
-        out_binding: *mut u64,
-        out_api: *mut usize,
-        out_ctx: *mut usize,
-        out_generation: *mut u64,
-    ) -> i32;
-    #[link_name = "kcore_interface_refresh"]
-    pub fn kcore_interface_refresh(
-        binding: u64,
-        abi: u64,
-        out_api: *mut usize,
-        out_ctx: *mut usize,
-        out_generation: *mut u64,
-    ) -> i32;
     // -- Task control --
     /// 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
     /// （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入

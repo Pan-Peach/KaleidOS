@@ -4,8 +4,7 @@
 //! （[`BlockDeviceProvider`] / [`BlockDeviceService`]）放在一起；`#[repr(C)]`
 //! function table（[`BlockDeviceApi`]）与名字 / 指纹 / sector 常量由
 //! `tools/kabi/kabi_gen.py` 从 `abi/block.toml` 生成（[`crate::generated::block`]），
-//! 这里 re-export；[`crate::binding`] 只 re-export，保持 `binding::BlockDevice`
-//! 等既有路径不变。
+//! 这里 re-export。
 //!
 //! # provider 不写 `unsafe extern "C"`
 //!
@@ -18,17 +17,14 @@
 //! static DEVICE: BlockDeviceService<MyDevice> =
 //!     BlockDeviceService::new(MyDevice { ... });
 //! DEVICE.publish_endpoint(b"block.device", PORT)?;  // endpoint 模型（Direct + Gate）
-//! DEVICE.publish()?;                                // 旧 Interface 模型（迁移期保留）
 //! ```
 //!
 //! [`BlockDeviceService::new`] 用单态化 adapter 从 `P` 生成 table；adapter 统一执行
 //! 契约的入参校验（null / 空 / 非 512 倍数 → `-EINVAL`）并把裸指针收窄成
-//! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish`] /
-//! [`BlockDeviceService::publish_endpoint`] 的安全性论证见各自文档。
-//! consumer 侧见 [`client::BlockBinding`]（Core 在 bind 时选定机制）。
+//! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish_endpoint`] 的安全性论证见
+//! 其文档。consumer 侧见 [`client::BlockBinding`]（Core 在 bind 时选定机制）。
 
-use crate::abi;
-use crate::binding::{InterfaceAbi, InterfaceKind, Service, publish_service};
+use crate::abi::{InterfaceAbi, InterfaceKind};
 use crate::endpoint::Contract;
 use crate::errno::{Errno, Result};
 
@@ -52,9 +48,9 @@ pub(crate) mod tests_support;
 // -----------------------------------------------------------------------
 //
 // docs/architecture/driver-model.md §9.1 ⑤：驱动 claim 完 MmioHandle / IrqHandle / DmaHandle
-// 后向 Component Interface Registry provides 本接口，供上层 Service（未来的
+// 后向 Component Endpoint Registry 发布本接口，供上层 Service（未来的
 // FS 等）bind 消费。契约只在本 SDK 定义（provider 是驱动组件，KIND = Device）；
-// Core 不认识该接口语义，只存 api/ctx 指针 + exact ABI，与 `driver.prober` 同类。
+// Core 不认识该接口语义，只存 api/ctx 指针 + exact ABI。
 
 // 声明本体（`#[repr(C)]` function table + 名字 / 指纹 / sector 常量）由
 // `tools/kabi/kabi_gen.py` 从 `abi/block.toml` 生成到 [`crate::generated::block`]：
@@ -74,31 +70,20 @@ use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRAC
 /// 钉死，任何改动必须是一次刻意的测试修改（数值漂移 = Core 直接拒绝 bind）。
 ///
 /// raw `u64` 本体在生成物（[`KCOMP_BLOCK_DEVICE_ABI`]，schema 单一来源）；
-/// [`InterfaceAbi`] newtype 由手写 `binding.rs` 定义，这里做包装——生成物不会
+/// [`InterfaceAbi`] newtype 由手写 `abi.rs` 定义，这里做包装——生成物不会
 /// 改变公开类型。
 pub const BLOCK_DEVICE_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_BLOCK_DEVICE_ABI);
 
 /// BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
 ///
 /// 定义与布局断言在生成物 [`crate::generated::block`]（schema = `abi/block.toml`）；
-/// 这里 re-export 以保持 `block::BlockDeviceApi` / `binding::BlockDeviceApi` 路径。
+/// 这里 re-export 以保持 `block::BlockDeviceApi` 路径。
 pub use crate::generated::block::BlockDeviceApi;
 
 /// `block.device` 契约（KIND = Device）。
 pub struct BlockDevice;
 
-impl Service for BlockDevice {
-    const NAME: &'static [u8] = BLOCK_DEVICE_NAME;
-    const KIND: InterfaceKind = InterfaceKind::Device;
-    const ABI: InterfaceAbi = BLOCK_DEVICE_ABI;
-    type Api = BlockDeviceApi;
-}
-
 /// Endpoint 模型的契约身份（contract id + exact ABI + 领域分类）。
-///
-/// 与 [`Service`] 并存：`Service` 是旧 binding（全局名字 → 单槽）的契约表达，
-/// [`Contract`] 是 Endpoint（typed `Endpoint<BlockDevice>`）的表达；两者数值同源
-/// （`abi/block.toml`），迁移期不强制二选一。
 impl Contract for BlockDevice {
     const ID: u64 = KCOMP_BLOCK_DEVICE_CONTRACT;
     const ABI: u64 = KCOMP_BLOCK_DEVICE_ABI;
@@ -163,23 +148,6 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
         }
     }
 
-    /// 发布 `block.device`（staged：只在 `kcomp_instance_create` 期间有效，
-    /// Core 在 `kcomp_instance_create` 返回 0 后原子提交）。
-    ///
-    /// # 为什么这是安全 fn
-    ///
-    /// [`publish_service`] 带 `unsafe`，是因为**它的调用方**可以递出一张与
-    /// `S::Api` 布局不匹配的 table——那个不变量它无法自证。这里不成立：
-    /// `self.api` 不是外部数据，而是 [`BlockDeviceService::new`] 从 `P` 生成的值
-    /// （布局就是 `BlockDeviceApi` 类型本身）；`ctx` 是 `'static` 实例里 provider
-    /// 字段的地址（[`BlockDeviceService::ctx`]），在 `'static` 内不会失效。
-    /// 两个 unsafe 前提都在本模块闭环，provider 作者因此永远不写 unsafe。
-    pub fn publish(&'static self) -> Result<()> {
-        // SAFETY: api 由 new 从 P 原地生成（布局 = BlockDeviceApi，不是调用方数据）；
-        // ctx = &'static self.provider（地址稳定性见 ctx()）。Core 只存指针、不解引用。
-        unsafe { publish_service::<BlockDevice>(&self.api, self.ctx()) }
-    }
-
     /// 发布 `block.device` **endpoint**（staged：只在 `kcomp_instance_create`
     /// 期间有效；Core 在 create 返回 0 后原子提交）。
     ///
@@ -189,13 +157,19 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
     /// `api` / `ctx`；**机制由 Core 在 bind 时按两端执行域选定**，provider 两种
     /// transport 都提供、**不选择**（`docs/architecture/deployment.md` §2）。
     ///
-    /// 安全性论证与 [`Self::publish`] 相同：`api` 由 `new` 从 `P` 原地生成，
-    /// `ctx` 是 `'static` provider 字段地址，两个 unsafe 前提都在本模块闭环。
+    /// # 为什么这是安全 fn
+    ///
+    /// `kcore_endpoint_publish` 是 `unsafe` extern：调用方可以递出一张与契约布局
+    /// 不匹配的 table。这里不成立：`self.api` 不是外部数据，而是
+    /// [`BlockDeviceService::new`] 从 `P` 生成的值（布局就是 `BlockDeviceApi` 类型
+    /// 本身）；`ctx` 是 `'static` 实例里 provider 字段的地址（[`BlockDeviceService::ctx`]），
+    /// 在 `'static` 内不会失效。两个 unsafe 前提都在本模块闭环，provider 作者因此
+    /// 永远不写 unsafe。
     pub fn publish_endpoint(&'static self, port_name: &[u8], port: u32) -> Result<()> {
         // SAFETY: api 布局 = BlockDeviceApi（new 从 P 生成）；ctx = &'static
         // self.provider（地址稳定）；Core 只存指针、不解引用。
         let status = unsafe {
-            abi::kcore_endpoint_publish(
+            crate::abi::kcore_endpoint_publish(
                 port_name.as_ptr(),
                 port_name.len(),
                 <BlockDevice as Contract>::ID,
@@ -241,7 +215,7 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
 ///
 /// # Safety
 /// `ctx` 必须是 [`BlockDeviceService::publish`] 交付的 `&'static P` —— 本模块是
-/// 该指针的唯一构造者，Core 只按 binding 原样回传。
+/// 该指针的唯一构造者，Core 只按 endpoint 记录原样回传。
 unsafe extern "C" fn capacity_sectors<P: BlockDeviceProvider>(ctx: *mut ()) -> u64 {
     // SAFETY: 见 Safety；ctx 恒为有效的 &'static P。
     let provider = unsafe { &*ctx.cast::<P>() };

@@ -85,7 +85,7 @@
 ④ Core 提交绑定记录（记录 trace）
      binding 携带：
        - Direct：provider 的 repr(C) function table 指针 + opaque ctx
-                 （即今天 `InterfaceRegistry` 的 api / ctx 形状）
+                 （endpoint 记录上的 `api` / `ctx`，Core 只存不解引用）
        - Gate  ：Core call-gate handle（不透明 EndpointId；provider principal +
                  per-call service stack + panic containment 由 Core 拥有）
        - 另记：caller domain / callee domain / mechanism（Core 真相）
@@ -176,7 +176,7 @@ provider local entry（按部署的本地入口 / adapter）
 
 **关键不变量：** 从 consumer 业务代码到业务后端的**语义路径**在三种部署下**完全相同**；变的只有中间那段"调用后端 + 本地入口"。**同一份 consumer 代码不得出现 `if mode == ...`**。
 
-> **API / ctx 保留为 Native Direct transport。** 同域 Direct 的 binding 仍然携带 `api`（`#[repr(C)]` function table）+ `ctx`（provider opaque state），与今天的 `InterfaceRegistry` 绑定形状一致。旧的"全局名字 → 单一 binding"由 **Endpoint 身份**取代（后续步骤，§8）：一个 endpoint 名不再对应唯一一个 provider 槽，而是 `EndpointId`（provider + port_name + contract）。
+> **API / ctx 保留为 Native Direct transport。** 同域 Direct 的 binding 携带 `api`（`#[repr(C)]` function table）+ `ctx`（provider opaque state），由 `EndpointRegistry::bind` 在选定 Direct 时交付。绑定身份是 **`EndpointId`**（provider + port_name + contract）：一个端口名不再对应"全局唯一的 provider 槽"，provider 停止 / 失败即永久失效、绝不重定向。
 
 ---
 
@@ -372,15 +372,14 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 文件 | 现状 | 目标动作 |
 |---|---|---|
-| `os/core/src/component/endpoint.rs` | Endpoint 真相（publish / discover / lookup / invalidate） | 补齐 `lookup` 的 C ABI 可达路径 + abi 校验（消费路径） |
-| `os/core/src/component/export.rs` | 导出 `kcore_endpoint_*` **与旧 `kcore_interface_*`** | 修 `kcore_endpoint_lookup` 增加 abi 校验；删 `kcore_interface_*`（最后） |
-| `os/core/src/component/interface.rs` | 旧 `InterfaceRegistry`（name → 单 binding，`BindingId` / `InterfaceId`） | 被 Endpoint 模型取代；**最后删除** |
+| `os/core/src/component/endpoint.rs` | Endpoint 真相（publish / discover / lookup / bind / invalidate）；`bind` 落 `TraceEvent::EndpointBind` | 补齐 `lookup` 的 C ABI 可达路径 + abi 校验（消费路径） |
+| `os/core/src/component/export.rs` | 导出 `kcore_endpoint_*`（旧的 interface 导出面已删除） | 修 `kcore_endpoint_lookup` 增加 abi 校验 |
 | `os/core/src/component/call.rs` | service-call 边界（per-call stack + principal + panic containment） | Gate 机制的落点；补嵌套深度策略（可选） |
-| `os/core/src/trace/event.rs` | 导入 `BindingId` / `InterfaceId`（`:21`） | 迁移到 Endpoint 事件——**这是删除旧接口模型的硬阻塞点** |
-| `abi/core.toml` | 含 `kcore_interface_*`（`:387-459`）；`kcore_endpoint_lookup` 无 abi；`:797-802` 过时 | 加 abi 参数、更新文档、删旧接口条目 |
-| `os/components/kcomp-sdk/src/binding.rs` | `publish_service` / `Service` / `InterfaceAbi` | typed 前端 + 调用后端（Direct / Gate） |
+| `os/core/src/trace/event.rs` | `EndpointBind` 事件（endpoint / provider / mechanism） | **已完成**：旧 interface 绑定事件已随模型一起删除 |
+| `abi/core.toml` | `KIND_ENDPOINT_BIND` + 其余 10 个 kind（连续编号）；`kcore_endpoint_lookup` 无 abi；`:797-802` 过时 | 加 abi 参数、更新文档 |
+| `os/components/kcomp-sdk/src/abi.rs` | 共享 ABI 值类型（`InterfaceAbi` / `InterfaceKind`）；旧 `Service` / binding 层已删除 | typed 前端 + 调用后端（Direct / Gate） |
 | `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
-| `os/components/scheduler_rr/src/lib.rs` | `publish_named::<SchedulerPolicy>(b"scheduler", ...)` | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
+| `os/components/scheduler_rr/src/lib.rs` | 旧的全局名字绑定已删除 | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
 | `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础 | 跨域需真实 AS 切换（未实现） |
 | `os/core/src/component/loader.rs` | 单 base 放段 + 单次 import 重定位 | 按域放段 / 按域 import 解析（未实现） |
 | `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/` | `activate()` 无人调用；无 satp 切换；无 U-mode | 私有 AS / U-mode / `ecall`（未实现） |
@@ -395,8 +394,9 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 阶段 2  converge identity（收敛身份）
         Endpoint 取代"全局名字 → 单 binding"；
         kcore_endpoint_lookup 增加 exact ABI 校验；
-        trace 事件从 BindingId/InterfaceId 迁到 Endpoint（**先做，才能删**）；
-        最后删 kcore_interface_*、component/interface.rs、scheduler 名字绑定。
+        trace 事件迁到 Endpoint（EndpointBind：endpoint / provider / mechanism）；
+        **已完成**：旧的"全局名字 → 单 binding"模型（Core 模块、C ABI 导出面、
+        SDK 层、scheduler 名字绑定）已全部删除（协调替换，无 legacy alias）。
 
 阶段 3  Native path（唯一真实存在的部署）
         typed 前端 + 调用后端（Direct）落地；
@@ -407,7 +407,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
         私有 AS / satp 切换 / U-mode / ecall / 按域 loader / 支持范围元数据。
 ```
 
-**必须最后删除的：** `kcore_interface_*`（`abi/core.toml:387-459`）、`os/core/src/component/interface.rs`。**先删它们会打断 trace**：`os/core/src/trace/event.rs:21` 直接 import `BindingId` / `InterfaceId`。删除顺序 = **先迁 trace，再删接口模型**。（scheduler 的名字绑定已随 step 5 删除，见 §8.1；`kcore_interface_*` 与 `component/interface.rs` 仍是最后一步。）
+**最后一步已完成：** 旧的"全局名字 → 单 binding"模型——Core 的 interface 模块、`abi/core.toml` 的对应导出面、SDK 的类型化 Service / publish / bind / refresh / available 层——已随本次协调替换全部删除（不保留 legacy alias，不保留旧 ABI 编号）。删除顺序遵守了"**先迁 trace，再删接口模型**"：`TraceEvent::EndpointBind` 由 `EndpointRegistry::bind` 在 Core 选定机制后发射（kind 重新编号保持连续，见 `os/core/src/trace/abi.rs` 的 payload 分配表）。
 
 ---
 

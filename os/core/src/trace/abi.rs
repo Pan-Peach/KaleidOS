@@ -6,7 +6,8 @@
 //! 而不是依赖 `Option` 的 niche / 布局（那是 Rust 的实现细节，不是契约）。
 //!
 //! `kind` 取值与 payload 分配是 **ABI 契约的一部分**：只增不改。本阶段不维护
-//! 兼容，契约变了就原地替换（不保留旧编号）。
+//! 兼容，契约变了就原地替换（不保留旧编号）：删除事件后**重新编号**，编号保持
+//! 连续——`enabled_mask` 的 `bit i ↔ kind i+1` 契约不允许空洞。
 //!
 //! # payload 分配表
 //!
@@ -19,11 +20,10 @@
 //! 5  COMPONENT_STATE           component          from(State|ABSENT)   to(State)
 //! 6  RESOURCE_GRANT            component          ResourceKind         id
 //! 7  RESOURCE_REVOKE           component          ResourceKind         id
-//! 8  INTERFACE_BIND            consumer|ABSENT    provider             interface
-//! 9  INTERFACE_REFRESH         binding            generation           -
-//! 10 IRQ_ENTER                 irq                -                    -
-//! 11 IRQ_DISPATCH              irq                component|ABSENT     -
-//! 12 IRQ_ACK                   irq                -                    -
+//! 8  ENDPOINT_BIND             endpoint           provider             mechanism
+//! 9  IRQ_ENTER                 irq                -                    -
+//! 10 IRQ_DISPATCH              irq                component|ABSENT     -
+//! 11 IRQ_ACK                   irq                -                    -
 //! ```
 //!
 //! 未使用的词一律填 0（不是"缺省"），`flags` 必须为 0（留给未来扩展，
@@ -31,13 +31,13 @@
 
 use super::{RejectReason, TraceEvent, TraceRecord, TraceStats, capacity};
 use crate::component::ComponentState;
+use crate::component::endpoint::Mechanism;
 use crate::resource::ResourceKind;
 
 pub use crate::generated::abi::{
-    ABSENT, KIND_COMPONENT_STATE, KIND_INTERFACE_BIND, KIND_INTERFACE_REFRESH, KIND_IRQ_ACK,
-    KIND_IRQ_DISPATCH, KIND_IRQ_ENTER, KIND_POLICY_ACCEPTED, KIND_POLICY_PROPOSAL,
-    KIND_POLICY_REJECTED, KIND_RESOURCE_GRANT, KIND_RESOURCE_REVOKE, KIND_TASK_SWITCH,
-    TraceRecordAbi, TraceStatsAbi,
+    ABSENT, KIND_COMPONENT_STATE, KIND_ENDPOINT_BIND, KIND_IRQ_ACK, KIND_IRQ_DISPATCH,
+    KIND_IRQ_ENTER, KIND_POLICY_ACCEPTED, KIND_POLICY_PROPOSAL, KIND_POLICY_REJECTED,
+    KIND_RESOURCE_GRANT, KIND_RESOURCE_REVOKE, KIND_TASK_SWITCH, TraceRecordAbi, TraceStatsAbi,
 };
 
 impl From<&TraceStats> for TraceStatsAbi {
@@ -83,6 +83,14 @@ const fn reason_code(reason: RejectReason) -> u64 {
     match reason {
         RejectReason::NotRunnable => 0,
         RejectReason::OwnerNotRunnable => 1,
+    }
+}
+
+/// Core 在 bind 时选定的调用机制（`endpoint::Mechanism`）的稳定编码。
+const fn mechanism_code(mechanism: Mechanism) -> u64 {
+    match mechanism {
+        Mechanism::Direct => 0,
+        Mechanism::Gate => 1,
     }
 }
 
@@ -143,24 +151,15 @@ impl From<&TraceRecord> for TraceRecordAbi {
                 kind_code(kind),
                 id,
             ),
-            TraceEvent::InterfaceBind {
-                consumer,
+            TraceEvent::EndpointBind {
+                endpoint,
                 provider,
-                interface,
+                mechanism,
             } => (
-                KIND_INTERFACE_BIND,
-                opt(consumer.map(|id| u64::from(id.raw()))),
+                KIND_ENDPOINT_BIND,
+                endpoint.raw(),
                 u64::from(provider.raw()),
-                u64::from(interface.raw()),
-            ),
-            TraceEvent::InterfaceRefresh {
-                binding,
-                generation,
-            } => (
-                KIND_INTERFACE_REFRESH,
-                u64::from(binding.raw()),
-                generation,
-                0,
+                mechanism_code(mechanism),
             ),
             TraceEvent::IrqEnter { irq } => (KIND_IRQ_ENTER, u64::from(irq), 0, 0),
             TraceEvent::IrqDispatch { irq, component } => (

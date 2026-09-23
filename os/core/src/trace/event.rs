@@ -1,13 +1,13 @@
 //! Trace 事件类型与 payload。
 //!
-//! 事件只携带**类型化 ID 与理由**（`TaskId` / `ComponentId` / `InterfaceId` /
-//! `BindingId` / `ResourceKind` / opaque resource id / `RejectReason`…），
+//! 事件只携带**类型化 ID 与理由**（`TaskId` / `ComponentId` / `EndpointId` /
+//! `ResourceKind` / opaque resource id / `RejectReason`…），
 //! 不携带格式化字符串或裸指针。Trace 面向机器、测试与性能分析，
 //! 不是给人读的 log：绝不能靠反向解析字符串来还原系统行为。
 //!
 //! 第一阶段刻意只覆盖真正存在 chokepoint 的集合：
 //! task switch / scheduler policy / component lifecycle / authority grant·revoke /
-//! interface binding / IRQ。
+//! endpoint binding / IRQ。
 //!
 //! **未定义**：`TaskBlock` / `TaskWake` —— Core 目前没有 block/wake 路径
 //! （`TaskState::Blocked` 不可达，状态机的合法边里也没有它）。等 block/wake
@@ -18,7 +18,7 @@
 
 use crate::component::ComponentId;
 use crate::component::ComponentState;
-use crate::component::interface::{BindingId, InterfaceId};
+use crate::component::endpoint::{EndpointId, Mechanism};
 use crate::resource::ResourceKind;
 use crate::task::TaskId;
 
@@ -76,18 +76,21 @@ pub enum TraceEvent {
         id: u64,
     },
 
-    /// consumer 完成一次 interface 绑定解析（`InterfaceRegistry::bind`）。
+    /// consumer 完成一次 endpoint 绑定解析（`EndpointRegistry::bind`）：Core 在
+    /// 此刻按 `(caller 域, provider 域)` 选定调用机制（Direct / Gate）。
     ///
-    /// `consumer` 为 `None` 是**如实**的：Core 不记录 consumer→provider 边
-    /// （`bind` 是无状态查询，只证明"此刻能拿到 provider"）。consumer 身份只
-    /// 存在于 ABI 边界（`RequestContext::ambient`），不在这份绑定真相里。
-    InterfaceBind {
-        consumer: Option<ComponentId>,
+    /// 三个 payload 词都是 Core 真相：`endpoint` 是绑定身份（`EndpointId` 只在
+    /// commit 后存在、永不重定向）；`provider` 是 endpoint owner（用于与组件
+    /// 生命周期 / 资源事件关联）；`mechanism` 是 Core 在 bind 时做出的机制决定
+    /// ——它是该决定的**唯一可观测点**（运行期不再重决策，`docs/architecture/
+    /// deployment.md` §2）。consumer 身份不在本事件里：bind 需要 caller 边界，
+    /// 但绑定真相只记 endpoint / provider / mechanism（与旧事件如实不记 consumer
+    /// 边同理）。
+    EndpointBind {
+        endpoint: EndpointId,
         provider: ComponentId,
-        interface: InterfaceId,
+        mechanism: Mechanism,
     },
-    /// 已绑定 interface 的 provider/generation 刷新（热替换后重新解析）。
-    InterfaceRefresh { binding: BindingId, generation: u64 },
 
     /// 外部中断进入 Core（trap 交接边界）。
     IrqEnter { irq: u32 },

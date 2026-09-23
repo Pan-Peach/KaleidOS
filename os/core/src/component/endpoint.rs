@@ -1,15 +1,14 @@
-//! Component Endpoint Registry —— Contract / Endpoint 模型（**Phase A：Core 侧真相骨架**）。
+//! Component Endpoint Registry —— Contract / Endpoint 模型（**唯一绑定真相**）。
 //!
 //! # 定位
 //!
-//! `component/interface.rs` 是上一代模型：**一个全局接口名 → 一个 provider 绑定槽**
-//! （`api` / `ctx` function table），同 ABI 重发布是**覆盖**。本模块是它的替代真相模型：
+//! 本模块是组件→组件依赖的**唯一**真相模型（旧的"全局接口名 → 单 provider
+//! 绑定槽"模型已删除，见 `AGENTS.md`：契约演进 = 原地替换，不保留 legacy）：
 //! Core 数据模型 + 导出面（`kcore_endpoint_publish` / `kcore_endpoint_lookup` /
 //! `kcore_endpoint_validate` / `kcore_endpoint_bind` / `kcore_endpoint_call`，call
 //! 实现见 `component/call.rs`）+ 生命周期接线（create 提交 / failure·stop 失效）
 //! 已落地。`bind` 是 **Direct / Gate 的唯一选择点**；第一条完整链（Rust provider →
-//! C consumer）走 Direct。旧模型仍在并行运行（scheduler / core_test 等消费方尚未
-//! 迁移），下一阶段整体替换。
+//! C consumer）走 Direct。
 //!
 //! ```text
 //! Contract：契约身份（kind + exact ABI fingerprint + 诊断名）—— 语义
@@ -59,7 +58,7 @@
 //!   单独成表，`lookup` 不被名字检索拖慢；只有 `discover` 查它。
 //! - `pending`：staged publish 暂存。
 //!
-//! # Staged publish（与 `interface.rs` 同形）
+//! # Staged publish
 //!
 //! `kcomp_instance_create()` 执行期间发布**不立即创建 endpoint**：
 //! [`EndpointRegistry::stage_publish`] 只记录 pending（此时校验 provider 存在且
@@ -83,9 +82,8 @@
 //!   （下一阶段）；
 //! - **部署 / 域字段仍不存在**：`instance_domain` 恒返回 KernelNative（唯一真实
 //!   存在的部署）；跨域臂已在 `select_mechanism` 里显式拒绝，不是"假装支持"；
-//! - 旧模型消费方（scheduler / core_test）未迁移，仍走 `kcore_interface_*`；
-//! - 不新增 `TraceEvent`（bind 的 caller/callee 域与机制暂不落 trace——事件 kind
-//!   是 ABI 编码，留给下一阶段）；
+//! - **bind 落 trace**：成功的 bind 发射 `TraceEvent::EndpointBind`
+//!   （endpoint / provider / Core 选定的机制），见 [`EndpointRegistry::bind`]；
 //! - 不做 endpoint 回收（`Invalid` 记录保留为 tombstone，id 不复用）。
 
 use alloc::vec::Vec;
@@ -169,7 +167,7 @@ pub struct EndpointRecord {
 }
 
 // `api` / `ctx` 是 opaque provider 指针：Registry 只存取、永不解引用。Send/Sync
-// 安全（与 `interface.rs` 的 `BindingRecord` 同一理由；跨线程使用由外层 Mutex 串行化）。
+// 安全（指针本身只是字节；跨线程使用由外层 Mutex 串行化）。
 unsafe impl Send for EndpointRecord {}
 unsafe impl Sync for EndpointRecord {}
 
@@ -211,8 +209,7 @@ struct PendingPublication {
 unsafe impl Send for PendingPublication {}
 unsafe impl Sync for PendingPublication {}
 
-/// Endpoint 模型的拒绝原因（独立于 [`crate::component::interface::InterfaceError`]：
-/// 两代模型的概念不同，不共用错误类型）。
+/// Endpoint 模型的拒绝原因（各子系统错误类型保持各自为政，不共用错误类型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointError {
     /// lookup / discover：endpoint id 未知。
@@ -554,6 +551,12 @@ impl EndpointRegistry {
         if mechanism == Mechanism::Direct && record.api.is_null() {
             return Err(BindError::DirectWithoutApi);
         }
+        // Trace：一次成功的绑定解析（Core 在此选定机制；payload 见 TraceEvent 文档）。
+        crate::trace::emit(crate::trace::TraceEvent::EndpointBind {
+            endpoint: record.id,
+            provider: record.owner,
+            mechanism,
+        });
         Ok(BoundEndpoint { record, mechanism })
     }
 
@@ -1212,6 +1215,51 @@ mod tests {
         assert_eq!(bound.record.api, api);
         assert_eq!(bound.record.ctx, ctx);
         assert_eq!(bound.record.owner, ids[0]);
+    }
+
+    /// bind 成功发射 `TraceEvent::EndpointBind`（endpoint / provider / Core 在
+    /// bind 时选定的机制）——该事件是机制决定的**唯一可观测点**。
+    ///
+    /// 用子序列断言（`assert_subsequence` 的文档：ring 是进程全局的，并行测试
+    /// 会插入无关事件）；provider 用 `ids[2]` 让期望 payload 与本模块其它 bind
+    /// 用例区分开。
+    #[test]
+    #[cfg(feature = "trace")]
+    fn bind_emits_endpoint_bind_trace_with_selected_mechanism() {
+        use crate::trace::{TraceEvent, test_support};
+
+        let _trace = test_support::GUARD.lock();
+        crate::trace::reset_for_test();
+
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let endpoint = publish_ready_with_table(
+            &mut er,
+            &reg,
+            ids[2],
+            b"blk2",
+            9,
+            &TABLE as *const u8 as *const (),
+            core::ptr::null_mut(),
+        );
+
+        er.bind(
+            &reg,
+            endpoint,
+            CONTRACT,
+            ABI_A,
+            ExecutionDomain::KernelNative,
+        )
+        .unwrap();
+
+        test_support::assert_subsequence(
+            &[TraceEvent::EndpointBind {
+                endpoint,
+                provider: ids[2],
+                mechanism: Mechanism::Direct,
+            }],
+            &test_support::events(),
+        );
     }
 
     /// bind 的校验与 validate 同源：contract / abi **exact-match** + 存活。

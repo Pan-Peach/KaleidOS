@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 44] = [
+pub(super) static EXPORTS: [Export; 40] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -127,52 +127,6 @@ pub(super) static EXPORTS: [Export; 44] = [
         address: ExportAddress({
             let implementation: extern "C" fn(*const u8, usize) -> i32 =
                 super::kcore_component_load;
-            implementation as *const ()
-        }),
-    },
-    Export {
-        name: b"kcore_interface_publish",
-        address: ExportAddress({
-            let implementation: extern "C" fn(
-                *const u8,
-                usize,
-                u32,
-                u64,
-                *const (),
-                *mut (),
-            ) -> i32 = super::kcore_interface_publish;
-            implementation as *const ()
-        }),
-    },
-    Export {
-        name: b"kcore_interface_available",
-        address: ExportAddress({
-            let implementation: extern "C" fn(*const u8, usize, u32, u64) -> i32 =
-                super::kcore_interface_available;
-            implementation as *const ()
-        }),
-    },
-    Export {
-        name: b"kcore_interface_bind",
-        address: ExportAddress({
-            let implementation: extern "C" fn(
-                *const u8,
-                usize,
-                u32,
-                u64,
-                *mut u64,
-                *mut usize,
-                *mut usize,
-                *mut u64,
-            ) -> i32 = super::kcore_interface_bind;
-            implementation as *const ()
-        }),
-    },
-    Export {
-        name: b"kcore_interface_refresh",
-        address: ExportAddress({
-            let implementation: extern "C" fn(u64, u64, *mut usize, *mut usize, *mut u64) -> i32 =
-                super::kcore_interface_refresh;
             implementation as *const ()
         }),
     },

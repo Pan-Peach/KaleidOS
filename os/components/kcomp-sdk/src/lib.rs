@@ -8,10 +8,11 @@
 //!    `kcomp_instance_destroy!`、[`log`]/`klog!`、`#[panic_handler]`；
 //! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → Core 共享堆。
 //!
-//! 模块划分与 crate 外部路径一一对应（`abi` / `binding` / `DmaDirection` / `log`
-//! / `console_write_byte` 保持原路径不变）：
-//! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、[`endpoint`] typed
-//! `Endpoint<C>`（Contract / Endpoint 模型）、[`frame`] flat frame 的借用视图、
+//! 模块划分与 crate 外部路径一一对应（`abi` / `DmaDirection` / `log` /
+//! `console_write_byte` 保持原路径不变）：
+//! [`abi`] 原始 extern + 共享 ABI 值类型（`InterfaceAbi` / `InterfaceKind`）、
+//! [`endpoint`] typed `Endpoint<C>`（Contract / Endpoint 模型）、
+//! [`frame`] flat frame 的借用视图、
 //! [`block`] block.device 契约 + provider wrapper + **调用后端**（Core 在 bind 时
 //! 选定的 Direct / Gate，`BlockBinding` typed 前端）+ Gate 适配器、
 //! [`scheduler`] `scheduler.policy` 契约（Gate-only；consumer = Core）、
@@ -42,7 +43,6 @@
 extern crate std;
 
 pub mod abi;
-pub mod binding;
 pub mod block;
 pub mod call;
 pub mod endpoint;
@@ -128,8 +128,8 @@ macro_rules! kcomp_instance_create {
 /// 内存（**绝不自动重试**）。Core 对未完整构造 / panic 的实例不调用本入口。
 ///
 /// destroy 只做组件自己的 quiesce / 私有资源清理；Core 仍会兜底
-/// revoke authority / unbind。已交给外部（`'static` SDK 引用）的 state 存储
-/// 本轮保留——consumer 可能持有拷贝过的 binding。
+/// revoke authority / 失效 endpoint。已交给外部（`'static` SDK 引用）的 state 存储
+/// 本轮保留——consumer 可能持有拷贝过的 typed 前端句柄。
 #[macro_export]
 macro_rules! kcomp_instance_destroy {
     (|$state:ident| $body:block) => {

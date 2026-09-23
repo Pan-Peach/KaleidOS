@@ -44,30 +44,32 @@ provides:  FileSystemService
 > Interface 是语义，传输是绑定策略。第一阶段用 Rust trait + direct call；
 > 未来可换 IPC stub / Wasm host call。接口文档里写"契约"（方法、语义、错误），不写"怎么调用"。
 
-### 2.1 绑定机制定案：Interface Registry（已落地骨架）
+### 2.1 绑定机制定案：Endpoint Registry（唯一绑定真相）
 
 ```text
 Component → Core          = Core Export ABI（export.rs，ELF undefined symbol 白名单）
-Component → Component     = Interface binding（interface.rs）——禁止 flat ELF symbol 互链
+Component → Component     = Endpoint binding（endpoint.rs）——禁止 flat ELF symbol 互链
 ```
 
 - 已加载组件的 exported ELF symbols **不组成全局符号表**：KaleidOS Component 是
   replaceable 的，直接 relocation 到 provider 函数地址会让替换非常困难。
-- consumer 拿到的是**逻辑 binding**（`BindingId` + 当前 `api`/`ctx`/`generation`，
-  其中 `api` 指向 provider 的 `#[repr(C)]` function table，`ctx` 是 provider opaque
-  state），不是"永不变更的 provider ELF 符号地址"。provider 更换后 consumer 只需
-  `refresh` 重新获取，**不需要 ELF reload**。
+- consumer 拿到的是 **opaque `EndpointId`**（组合期 `lookup` / `discover` 交付），
+  不是"永不变更的 provider ELF 符号地址"。`bind` 时 Core 按两端执行域一次性选定
+  机制：同域 Direct 交付 provider 的 `api` / `ctx`（`#[repr(C)]` function table +
+  opaque state），跨域 Gate 只给 call-gate handle。endpoint **永不重定向**：
+  provider 停止 / 失败 → 它的全部 endpoint 永久失效，**不需要 ELF reload**。
 - **exact ABI fingerprint（`InterfaceAbi`，`#[repr(transparent)] u64`）取代
   version**：它没有版本兼容语义，只回答"provider 与 consumer 是否由完全相同的
-  Service ABI contract 编译"。不一致必须拒绝 binding/replacement，绝不能把布局
+  Service ABI contract 编译"。不一致必须拒绝 publish / validate / bind，绝不能把布局
   不同的 function table 交给 consumer。自动 ABI hash 生成器 / compatible range /
   ABI-changing coordinated update 属下一阶段（只留 seam）。
-- Core 真相：`InterfaceRegistry` 记录 谁提供了什么接口（InterfaceId / abi /
-  kind / provider / api / ctx / generation）；`publish` 在 `kcomp_instance_create()` 期间
-  只记录 pending（**staged**），create 成功后 Core 原子提交；consumer `bind` /
-  `refresh` 时 Core 再次校验 provider 存活（组件卸载/失败后 binding 立即不可用）。
+- Core 真相：`EndpointRegistry` 记录 谁在哪个端口发布了哪个契约（ContractId /
+  EndpointId / kind / abi / provider / port / api / ctx）；`publish` 在
+  `kcomp_instance_create()` 期间只记录 pending（**staged**），create 成功后 Core
+  原子提交；consumer `bind` 时 Core 再次校验 contract + abi + 存活（组件卸载/失败后
+  endpoint 立即永久失效）。
 - 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
-  call）不改 binding 数据模型。
+  call）不改 endpoint 数据模型。
 
 ### 2.2 `.kcomp` = 链接后的组件程序（目标：step 2-3）
 
@@ -386,10 +388,10 @@ impl ComponentManager {
 
 （概念代码；落地时按现有 Registry 状态机接轨。当前 load 链是
 `Declared → resolve → Resolved → begin_start → Starting → call kcomp_instance_create →
-{ failure → Failed | success → 提交 pending interfaces → finish_start → Ready }`：
+{ failure → Failed | success → 提交 pending endpoints → finish_start → Ready }`：
 `resolve()` 已落地（语义 = requires 全部绑定成功）；`Starting` 已接线为
-`kcomp_instance_create()` 执行期（此期间 `kcore_interface_publish` 只记录 pending，不修改
-active binding）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，monitor
+`kcomp_instance_create()` 执行期（此期间 `kcore_endpoint_publish` 只记录 pending，不创建
+endpoint）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，monitor
 `unload` 驱动）；`Stopped` 记录保留、段内存不回收（phase 1）。）
 
 > **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
@@ -597,11 +599,11 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 | 状态 | 含义 |
 |---|---|
 | Declared | 系统知道这个组件存在 |
-| Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Interface Registry，无 requires 时 vacuous 成立） |
+| Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Endpoint Registry，无 requires 时 vacuous 成立） |
 | Starting | 正在初始化（执行 `kcomp_instance_create`） |
 | Ready | 可以对外提供 Interface |
 | Stopping | 正在停止：`kcomp_instance_destroy` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有归属记录仍可 `release`） |
-| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余归属与接口已被 Core 兜底撤销（device 进 quarantine；记录保留；不回收段内存） |
+| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余归属与 endpoint 已被 Core 兜底撤销（device 进 quarantine；记录保留；不回收段内存） |
 | Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
 
 > **`kcomp_instance_destroy`（Linux `module_exit` 类比）是组件 ABI 的对称退出入口**
@@ -614,17 +616,17 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 > **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
 >
 > **"阻断过期访问"的实际边界（重要，勿高估）**：它只对 **Core 经手的路径**成立
-> —— `bind` / `refresh` / `claim` / IRQ 投递 / 调度都会查生命周期（provider 必须
-> `Ready`，见 `component/interface.rs`；Core 每次调度决策都重新 `resolve_policy()`，
+> —— `bind` / `claim` / IRQ 投递 / 调度都会查生命周期（provider 必须
+> `Ready`，见 `component/endpoint.rs`；Core 每次调度决策都重新 `resolve_policy()`，
 > 见 `os/core/src/sched.rs`）。它**不覆盖"consumer 手里已经拿到的裸函数表指针"**：
 > 接口交付的是 `api: *const ()` / `ctx: *mut ()`，且 Core 明确"永不解引用"
-> （`component/interface.rs` 顶部文档）—— 因此 consumer 若缓存了这张表，
+> （`component/endpoint.rs` 顶部文档）—— 因此 consumer 若缓存了这张表，
 > **组件 `Stopped`（甚至 `Failed`）之后调用仍会成功**，因为段内存未被释放。
 > 这是"物理驻留 + KernelNative 无隔离"的直接后果，不是 bug。
 >
-> 收口方案（按代价）：①约定 consumer 每次调用前 `refresh(binding_id)` 重新取表
+> 收口方案（按代价）：①约定 consumer 每次调用前重新 `bind` 取表
 > （Core 内部已是此模式，但对外只是约定、非强制）；②Core 受控间接层
-> （per-binding trampoline，唯一能在不换架构的前提下强制的做法）；③真回收 +
+> （per-endpoint trampoline，唯一能在不换架构的前提下强制的做法）；③真回收 +
 > per-domain 地址空间（`ExecutionDomain`，旧指针直接 fault）。三条的取舍与
 > "热插拔到底做到哪一步"绑定，Linux 对照见 `references.md` 第 17 条。
 
@@ -658,7 +660,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
    b. 实例必须存在且处于 Ready（规则表）      → 否则 NotFound / ENOENT 或 NotReady / EINVAL
 2. begin_stop                              Ready → Stopping：任务 run 门禁 + publish 拒绝
 3. kcomp_instance_destroy（必需入口）        Core-owned 隔离栈；ambient identity = 被停止实例
-4. Core 兜底                               撤销归属（device quarantine / DMA 停车）+ 解绑 provider（与失败路径同序列）
+4. Core 兜底                               撤销归属（device quarantine / DMA 停车）+ 失效 provider endpoint（与失败路径同序列）
 5. finish_stop                             Stopping → Stopped（记录保留）
 ```
 
@@ -668,7 +670,7 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 - **身份**：退出钩子跑在 Core-owned 临时栈上（与 `kcomp_instance_create` 对称，
   `containment::call_component_destroy`），其 Core 调用身份是**被停止的实例**
   （`EscapeKind::Exit`），不是发起 stop 的 monitor / 其他组件；
-  `kcore_interface_publish` 在 exit 边界被拒（publish 是 init 期操作）。
+  `kcore_endpoint_publish` 在 exit 边界被拒（publish 是 init 期操作）。
 - **归属**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
   周期门禁限制）；钩子返回后 Core 仍兜底撤销一切**剩余**归属。剩余的
   device claim 会进失败 quarantine（撤销 ≠ 设备可安全复用），组件自己

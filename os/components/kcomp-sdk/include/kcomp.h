@@ -31,13 +31,15 @@
 #include "generated/kcomp_abi.h"
 
 /* ===========================================================================
- * 组件间契约（C）—— Interface Registry 的 function table
+ * 组件间契约（C）—— endpoint 模型的 function table
  * ===========================================================================
  *
  * 这些**不是** Core 导出：Core 只把 publish 进来的 `api` / `ctx` 当不透明指针
  * 存着，不认识契约语义。所以名字是 `kcomp_*`（组件面），不是 `kcore_*`。
- * 机制本身用已有导出即可：consumer 调 `kcore_interface_bind` 拿 api/ctx，
- * provider 调 `kcore_interface_publish` 交付 function table。
+ * 机制本身用已有导出即可：provider 调 `kcore_endpoint_publish` 交付 function
+ * table（Direct）与 dispatch token（Gate）；consumer 经 `kcore_endpoint_lookup`
+ * 发现、`kcore_endpoint_bind` 拿 **Core 在 bind 时选定**的机制（Direct 交付
+ * api/ctx；Gate 只给 opaque EndpointId，调用走 `kcore_endpoint_call`）。
  *
  * 声明本体（`struct kcomp_block_device_api` / `struct kcomp_filesystem_api` +
  * 名字 / 指纹 / sector / open-read 常量）在 `generated/kcomp_abi.h`；provider 与

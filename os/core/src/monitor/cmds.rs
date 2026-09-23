@@ -301,8 +301,8 @@ const TRACE_CATEGORIES: &[TraceCategory] = &[
         mask: crate::trace::MASK_RESOURCE,
     },
     TraceCategory {
-        name: "interface",
-        mask: crate::trace::MASK_INTERFACE,
+        name: "endpoint",
+        mask: crate::trace::MASK_ENDPOINT,
     },
     TraceCategory {
         name: "irq",
@@ -338,7 +338,7 @@ pub fn trace(line: &[u8]) {
         Some(b"on") => current | mask,
         Some(b"off") => current & !mask,
         _ => {
-            printk!("usage: trace <all|task|policy|component|resource|interface|irq> on|off\n");
+            printk!("usage: trace <all|task|policy|component|resource|endpoint|irq> on|off\n");
             return;
         }
     };

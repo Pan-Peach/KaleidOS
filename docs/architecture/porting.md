@@ -121,7 +121,7 @@ lfs_t #1 / #2 / #3     →     FsInstance #1 / #2 / #3
 
 这解释了为什么"实例模型"值得先做：`lfs_t` 这种"状态由调用者拥有"的设计，正是多实例 FS 想要的形状。
 
-> **诚实的前提**：当前 Interface Registry 对每个接口**名字**只保留一个 provider 槽位，所以"多个同类型 FS 实例同时发布并各自被 bind"**现在做不到**，需要先做 endpoint / instance 模型。见 `docs/interfaces/filesystem.md` §10 及其未决问题（第 3、4 条）。在实例模型落地之前，多实例只是设计目标，**不得宣称已支持**。
+> **诚实的前提**：endpoint 模型已落地——endpoint 身份 = `(provider, port_name, contract)`，端口名只在 provider 实例内唯一，所以"多个同类型 FS 实例各自发布并各自被 bind"**已经可以做到**（组合方显式 `kcore_endpoint_lookup(provider, port_name)` 发现 + `bind`）。见 `docs/interfaces/filesystem.md` §10 及其未决问题（第 3、4 条）；namespace / 多 personality 路由仍属设计目标。
 
 ## 6. C runtime：不要手写 libc
 

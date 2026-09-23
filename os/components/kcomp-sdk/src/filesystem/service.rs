@@ -122,7 +122,7 @@ fn map(result: crate::errno::Result<()>) -> i32 {
 ///
 /// # Safety
 /// `ctx` 必须是 [`FileSystemService::publish_endpoint`] 交付的 `&'static P`——
-/// 本模块是该指针的唯一构造者，Core 只按 binding 原样回传。
+/// 本模块是该指针的唯一构造者，Core 只按 endpoint 记录原样回传。
 unsafe extern "C" fn mount<P: FileSystemProvider>(ctx: *mut ()) -> i32 {
     // SAFETY: 见 Safety；ctx 恒为有效的 &'static P。
     let provider = unsafe { &*ctx.cast::<P>() };
