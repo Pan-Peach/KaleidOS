@@ -9,8 +9,9 @@ use kcomp_sdk::abi::{
     KcompTaskEntry, kcore_component_load, kcore_sched_run, kcore_task_count, kcore_task_create,
     kcore_task_exit, kcore_task_start, kcore_task_state, kcore_task_yield,
 };
-use kcomp_sdk::binding::{self, InterfaceKind, SCHEDULER_POLICY_ABI};
+use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME, SchedulerPolicy};
 
 use super::report::Checks;
 use super::trace;
@@ -123,9 +124,18 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
         rogue == Errno::EFAULT.code() && tasks_after == tasks_before,
     );
 
-    // 调度器接口已发布/绑定且 provider 存活（发布发生在 scheduler_rr 的 init）。
-    let bound = binding::available(b"scheduler", InterfaceKind::Policy, SCHEDULER_POLICY_ABI);
-    checks.check(6, "scheduler-bind", bound);
+    // 组合动作（step 5）：**显式**发现 scheduler_rr 的 `scheduler.policy`
+    // endpoint 并把它选成活动策略（Core 只记 EndpointId；调度路径不按名字发现）。
+    // 必须在 create 返回 0 之后——endpoint 只在 staged publish 原子提交后存在。
+    let selected = if rr_id >= 0 {
+        match Endpoint::<SchedulerPolicy>::lookup(rr_id as u32, SCHEDULER_POLICY_NAME) {
+            Ok(endpoint) => scheduler::select(&endpoint).is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    checks.check(6, "scheduler-select", selected);
 
     // 启动（Created → Runnable），游标取样后进入调度：trace 窗口只含本次 run。
     unsafe {
@@ -146,9 +156,11 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
         unsafe { kcore_task_state(a) == STATE_EXITED && kcore_task_state(b) == STATE_EXITED };
     checks.check(8, "task-exit", exited);
 
-    // scheduler_rr 仍 Ready（resolve 会做 provider 存活二次校验）。
-    let rr_ready = binding::available(b"scheduler", InterfaceKind::Policy, SCHEDULER_POLICY_ABI);
-    checks.check(9, "scheduler-rr", rr_ready && rr_id >= 0);
+    // 策略 provider 仍 Ready：Core 每次调度都会重新解析存活，这里做一次只读复核
+    // （discover + validate 都成功 = endpoint 仍 Live、provider 仍 Ready）。
+    let rr_ready = rr_id >= 0
+        && Endpoint::<SchedulerPolicy>::lookup(rr_id as u32, SCHEDULER_POLICY_NAME).is_ok();
+    checks.check(9, "scheduler-rr", rr_ready);
 
     // TODO(C5): 抢占链用例——两个"不 yield 的忙循环"任务被时钟强行切出
     //   （当前调度是协作式；timer 实现 + sched::on_timer_tick 接线后，

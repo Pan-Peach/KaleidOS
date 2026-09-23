@@ -37,7 +37,8 @@
 use core::sync::atomic::Ordering;
 
 use kcomp_sdk::abi;
-use kcomp_sdk::binding::{self, InterfaceKind};
+use kcomp_sdk::endpoint::Endpoint;
+use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME, SchedulerPolicy};
 
 use crate::{Context, State, report, trace as traceview};
 
@@ -163,27 +164,23 @@ extern "C" fn task_b(arg: *mut ()) {
     }
 }
 
-/// `scheduler` Policy 接口是否可用（exact ABI fingerprint）。
-fn scheduler_available() -> bool {
-    unsafe {
-        abi::kcore_interface_available(
-            b"scheduler".as_ptr(),
-            b"scheduler".len(),
-            InterfaceKind::Policy.as_u32(),
-            binding::SCHEDULER_POLICY_ABI.raw(),
-        ) == 1
-    }
-}
-
-/// 确认/建立调度配置：优先用已绑定的 scheduler；没有就正常加载参考实现
-/// `scheduler_rr`（与 core_test 同一条加载链，无 benchmark 特权）。
+/// 确认/建立调度配置：加载参考实现 `scheduler_rr`（与 core_test 同一条加载链，
+/// 无 benchmark 特权），再**显式**发现它的 `scheduler.policy` endpoint 并选择。
+///
+/// Core 的调度路径不按名字发现；kbench 需要的是"可选择的 provider id"，因此用
+/// `kcore_component_load` 的返回值（一份 image、新实例）而不是猜全局状态。
+/// 选择只提交 EndpointId（Core 准备策略执行栈）。
 fn ensure_scheduler() -> bool {
-    if scheduler_available() {
-        return true;
-    }
     let name = b"scheduler_rr";
-    let _ = unsafe { abi::kcore_component_load(name.as_ptr(), name.len()) };
-    scheduler_available()
+    let provider = unsafe { abi::kcore_component_load(name.as_ptr(), name.len()) };
+    if provider < 0 {
+        return false;
+    }
+    let Ok(endpoint) = Endpoint::<SchedulerPolicy>::lookup(provider as u32, SCHEDULER_POLICY_NAME)
+    else {
+        return false;
+    };
+    scheduler::select(&endpoint).is_ok()
 }
 
 fn reset_counters(state: *mut State) {

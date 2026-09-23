@@ -68,6 +68,12 @@ impl From<SchedError> for Errno {
             SchedError::InvalidTransition => Errno::EINVAL,
             SchedError::NotFound => Errno::ESRCH,
             SchedError::NoCurrent => Errno::ESRCH,
+            // 选择策略时 endpoint 校验失败：沿用 EndpointError 档位。
+            SchedError::PolicyEndpoint(error) => Errno::from(error),
+            // provider 没有 dispatcher：能力缺失（不是 I/O 错误）。
+            SchedError::NoDispatcher => Errno::ENOSYS,
+            // Core 无法准备策略执行栈：资源耗尽，策略配置不变。
+            SchedError::NoPolicyStack => Errno::ENOMEM,
         }
     }
 }
@@ -142,6 +148,10 @@ impl From<CallError> for Errno {
             CallError::Reentrant => Errno::EBUSY,
             // 上下文种类拒绝：IRQ 回调不得发起通用服务调用（与 IRQ 内调度同档）。
             CallError::InIrqContext => Errno::EINVAL,
+            // 上下文种类拒绝：policy 回调内不得发起通用 endpoint 调用。
+            CallError::InPolicyContext => Errno::EINVAL,
+            // 保留契约（scheduler.policy）：调度策略不是普通服务，Core 拒绝。
+            CallError::ReservedContract => Errno::EPERM,
             // Core 侧资源耗尽（per-call service stack）：provider 从未执行。
             CallError::NoServiceStack => Errno::ENOMEM,
             // provider 已逻辑死亡（panic containment 已提交 Failed + 失效 endpoint）。
@@ -172,6 +182,11 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::EndpointCommitFailed(error) => Errno::from(error),
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
             ComponentLoadError::ServicePanicked => Errno::EIO,
+            // 调度策略失败（panic / 非法提议 / 非 0 返回）：与其它组件失败同档。
+            ComponentLoadError::PolicyPanicked => Errno::EIO,
+            ComponentLoadError::PolicyRejected => Errno::EIO,
+            // 上下文种类拒绝：policy 回调内不得创建组件（与调度拒绝同档）。
+            ComponentLoadError::InPolicyContext => Errno::EINVAL,
         }
     }
 }
@@ -352,17 +367,53 @@ mod tests {
 
     #[test]
     fn every_sched_error_arm_maps_to_its_pinned_errno() {
+        // endpoint 臂展开到 `EndpointError` 的**全部**变体（无通配臂：新增变体 =
+        // 编译错误；策略选择的失败沿用 endpoint 档位）。
+        for endpoint_error in [
+            EndpointError::EndpointNotFound,
+            EndpointError::EndpointDead,
+            EndpointError::ProviderNotFound,
+            EndpointError::ProviderNotReady,
+            EndpointError::ContractMismatch,
+            EndpointError::KindMismatch,
+            EndpointError::AbiMismatch,
+            EndpointError::DuplicatePort,
+            EndpointError::IdExhausted,
+        ] {
+            let expected = match endpoint_error {
+                EndpointError::EndpointNotFound | EndpointError::EndpointDead => Errno::ENOENT,
+                EndpointError::ProviderNotFound => Errno::ENODEV,
+                EndpointError::ProviderNotReady => Errno::EBUSY,
+                EndpointError::ContractMismatch
+                | EndpointError::KindMismatch
+                | EndpointError::AbiMismatch => Errno::EINVAL,
+                EndpointError::DuplicatePort => Errno::EEXIST,
+                EndpointError::IdExhausted => Errno::ENOSPC,
+            };
+            assert_eq!(
+                Errno::from(SchedError::PolicyEndpoint(endpoint_error)),
+                expected,
+                "SchedError::PolicyEndpoint({endpoint_error:?})"
+            );
+        }
+
         for error in [
             SchedError::NoPolicy,
             SchedError::InvalidTransition,
             SchedError::NotFound,
             SchedError::NoCurrent,
+            SchedError::NoDispatcher,
+            SchedError::NoPolicyStack,
         ] {
             let expected = match error {
                 SchedError::NoPolicy => Errno::ENOTSUP,
                 SchedError::InvalidTransition => Errno::EINVAL,
                 SchedError::NotFound => Errno::ESRCH,
                 SchedError::NoCurrent => Errno::ESRCH,
+                SchedError::NoDispatcher => Errno::ENOSYS,
+                SchedError::NoPolicyStack => Errno::ENOMEM,
+                // endpoint 臂已在上面的循环里逐变体覆盖。
+                SchedError::PolicyEndpoint(_) => unreachable!("covered above"),
             };
             assert_eq!(Errno::from(error), expected, "SchedError {error:?}");
         }
@@ -417,6 +468,8 @@ mod tests {
             CallError::NoDispatcher,
             CallError::Reentrant,
             CallError::InIrqContext,
+            CallError::InPolicyContext,
+            CallError::ReservedContract,
             CallError::NoServiceStack,
             CallError::ProviderFailed,
         ] {
@@ -440,6 +493,8 @@ mod tests {
                 CallError::NoDispatcher => Errno::ENOSYS,
                 CallError::Reentrant => Errno::EBUSY,
                 CallError::InIrqContext => Errno::EINVAL,
+                CallError::InPolicyContext => Errno::EINVAL,
+                CallError::ReservedContract => Errno::EPERM,
                 CallError::NoServiceStack => Errno::ENOMEM,
                 CallError::ProviderFailed => Errno::EIO,
             };
@@ -498,6 +553,9 @@ mod tests {
             ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort),
             ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
             ComponentLoadError::ServicePanicked,
+            ComponentLoadError::PolicyPanicked,
+            ComponentLoadError::PolicyRejected,
+            ComponentLoadError::InPolicyContext,
         ] {
             let expected = match error {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
@@ -519,6 +577,9 @@ mod tests {
                 ComponentLoadError::EndpointCommitFailed(_) => Errno::EINVAL,
                 ComponentLoadError::TaskPanicked(_) => Errno::EIO,
                 ComponentLoadError::ServicePanicked => Errno::EIO,
+                ComponentLoadError::PolicyPanicked => Errno::EIO,
+                ComponentLoadError::PolicyRejected => Errno::EIO,
+                ComponentLoadError::InPolicyContext => Errno::EINVAL,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }

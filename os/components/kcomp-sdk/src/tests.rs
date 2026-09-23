@@ -20,14 +20,20 @@ fn interface_kind_encoding_is_stable() {
     assert_eq!(Policy.as_u32(), 2);
 }
 
-/// SchedulerPolicy ABI fingerprint 锚定：与 Core `sched::SCHEDULER_POLICY_ABI`
-/// 必须是同一数值（A/B 双侧手工锚定）。
+/// SchedulerPolicy 身份锚定：`scheduler.policy` 契约的 name / ABI / contract /
+/// method 数值漂移 = Core 选择直接拒绝（生成物是单一来源，这里钉死数值与拼写）。
+/// 更完整的 wire 编解码锚定在 `crate::scheduler::tests`。
 #[test]
-fn scheduler_policy_abi_is_anchored() {
-    assert_eq!(
-        crate::binding::SCHEDULER_POLICY_ABI.raw(),
-        0x5343_4845_4455_4C52
-    );
+fn scheduler_policy_identity_is_anchored() {
+    use crate::scheduler::{
+        SCHEDULER_METHOD_CHOOSE_NEXT, SCHEDULER_NONE, SCHEDULER_POLICY_ABI, SCHEDULER_POLICY_NAME,
+        SCHEDULER_TASK_ID_LEN,
+    };
+    assert_eq!(SCHEDULER_POLICY_NAME, b"scheduler.policy");
+    assert_eq!(SCHEDULER_POLICY_ABI.raw(), 0x5343_4845_4455_4C52);
+    assert_eq!(SCHEDULER_METHOD_CHOOSE_NEXT, 0);
+    assert_eq!(SCHEDULER_TASK_ID_LEN, 4);
+    assert_eq!(SCHEDULER_NONE, u32::MAX);
 }
 
 /// driver.prober ABI fingerprint 锚定（ASCII "DRVPROBE"）：prober 与 driver

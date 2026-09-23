@@ -154,6 +154,18 @@ pub fn load(args: &[u8]) {
                 image.raw(),
                 create
             );
+            // 组合动作：该实例若发布了调度策略 endpoint，**显式**发现 + 选择它
+            // （Core 的调度路径不按名字发现；选择只提交 EndpointId）。不是策略
+            // provider 的组件自然没有这个端口，静默跳过。
+            match crate::sched::select_provider(id) {
+                Ok(()) => printk!("load {name}: scheduler policy selected (id={})\n", id.raw()),
+                Err(crate::sched::SchedError::PolicyEndpoint(
+                    crate::component::endpoint::EndpointError::EndpointNotFound,
+                )) => {}
+                Err(error) => {
+                    printk!("load {name}: scheduler selection failed: {error:?}\n");
+                }
+            }
             // 组件可能在 `kcomp_instance_create` 期间创建了任务（例如
             // driver_prober 的 post-init dispatch 任务）。create 期间 publish 是
             // staged：消费者必须等 provider `Ready`，所以这类任务只能在 create

@@ -74,10 +74,11 @@ impl RequestContext {
     /// boundary.
     ///
     /// Interface publication is a create-time operation: a component task, a
-    /// `kcomp_instance_destroy` hook, an **IRQ callback scope**, and a **service
-    /// call** are active boundaries but are not valid publication principals.  In
-    /// particular, a service call must never confer create-time publication
-    /// permission even though it establishes a principal for resource requests.
+    /// `kcomp_instance_destroy` hook, an **IRQ callback scope**, a **service
+    /// call**, and a **policy call** are active boundaries but are not valid
+    /// publication principals.  In particular, a service call must never confer
+    /// create-time publication permission even though it establishes a principal
+    /// for resource requests, and a policy callback must never publish at all.
     pub(crate) fn ambient_init() -> Option<Self> {
         match containment::active_escape()?.kind {
             EscapeKind::Init { owner } => owner.map(|component| Self {
@@ -87,7 +88,8 @@ impl RequestContext {
             EscapeKind::Exit { .. }
             | EscapeKind::Task { .. }
             | EscapeKind::Irq { .. }
-            | EscapeKind::ServiceCall { .. } => None,
+            | EscapeKind::ServiceCall { .. }
+            | EscapeKind::PolicyCall { .. } => None,
         }
     }
 }

@@ -1793,7 +1793,14 @@ OUTPUTS: Tuple[Output, ...] = (
     Output(
         "c",
         "os/components/kcomp-sdk/include/generated/kcomp_abi.h",
-        ("component.toml", "core.toml", "block.toml", "filesystem.toml", "probe.toml"),
+        (
+            "component.toml",
+            "core.toml",
+            "block.toml",
+            "filesystem.toml",
+            "probe.toml",
+            "scheduler.toml",
+        ),
         guard="KCOMP_GENERATED_ABI_H",
     ),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/abi.rs", ("component.toml", "core.toml")),
@@ -1806,7 +1813,16 @@ OUTPUTS: Tuple[Output, ...] = (
         ("filesystem.toml",),
     ),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/probe.rs", ("probe.toml",)),
-    Output("core-rust", "os/core/src/generated/abi.rs", ("component.toml", "core.toml")),
+    Output(
+        "sdk-rust",
+        "os/components/kcomp-sdk/src/generated/scheduler.rs",
+        ("scheduler.toml",),
+    ),
+    Output(
+        "core-rust",
+        "os/core/src/generated/abi.rs",
+        ("component.toml", "core.toml", "scheduler.toml"),
+    ),
     Output(
         "core-exports",
         "os/core/src/component/generated/exports.rs",
@@ -2145,7 +2161,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 43
+    assert len(core.functions) == 44
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
         "kcore_trace_stats",
@@ -2218,6 +2234,19 @@ doc = "I/O error"
     assert filesystem_consts["KCOMP_FILESYSTEM_FLAGS_LEN"] == 4
     assert filesystem_consts["KCOMP_FILESYSTEM_READ_HEADER_LEN"] == 8
     assert filesystem_consts["KCOMP_FILESYSTEM_PATH_MAX"] == 256
+
+    # —— scheduler schema：Gate-only 组件间契约（无 function table / 无结构）——
+    scheduler = load_schema("abi/scheduler.toml")
+    assert not scheduler.structs and not scheduler.aliases and not scheduler.entries
+    assert not scheduler.functions
+    scheduler_consts = {const.name: const.value for const in scheduler.constants}
+    scheduler_literals = {const.name: const.literal for const in scheduler.constants}
+    assert scheduler_literals["KCOMP_SCHEDULER_POLICY_NAME"] == "scheduler.policy"
+    assert scheduler_consts["KCOMP_SCHEDULER_POLICY_ABI"] == 0x5343_4845_4455_4C52
+    assert scheduler_consts["KCOMP_SCHEDULER_POLICY_CONTRACT"] == 0x5343_4845_4450_4F4C
+    assert scheduler_consts["KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT"] == 0
+    assert scheduler_consts["KCOMP_SCHEDULER_TASK_ID_LEN"] == 4
+    assert scheduler_consts["KCOMP_SCHEDULER_NONE"] == 0xFFFF_FFFF
 
 
 # ===========================================================================

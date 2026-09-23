@@ -63,6 +63,15 @@ pub enum ComponentLoadError {
     /// panic，已切回 caller 的 Core 帧；`component/call.rs` 据此把 provider 提交
     /// 为 `Failed`（caller 不受影响）。
     ServicePanicked,
+    /// 调度策略 provider 在 **PolicyCall 边界**内 panic，已逃逸回挂起的调度帧；
+    /// `component/call.rs` 据此把 provider 提交为 `Failed`（调度继续用确定性回退）。
+    PolicyPanicked,
+    /// 调度策略 provider 的提议不可用（不在 Core 的 runnable 快照内 / 返回非 0）：
+    /// provider 被隔离（逻辑死亡），Core 退役该策略并用确定性回退继续调度。
+    PolicyRejected,
+    /// 在 **policy 回调**（`PolicyCall` 边界，含其下的嵌套边界）内请求创建组件：
+    /// 策略回调有界（不得阻塞 / 不得分配 / 不得创建组件），Core 拒绝 → `-EINVAL`。
+    InPolicyContext,
 }
 
 impl ComponentLoadError {
@@ -116,6 +125,12 @@ pub fn create_component(
     name: &[u8],
     args: &KcompCreateArgs,
 ) -> Result<ComponentId, ComponentLoadError> {
+    // 上下文门禁：调度策略回调有界——嵌套组件创建（含藏在嵌套生命周期边界
+    // 之下）一律拒绝，绝不把组件加载链伸进策略执行。
+    if containment::policy_call_in_chain() {
+        return Err(ComponentLoadError::InPolicyContext);
+    }
+
     let image = get_or_load_image(name)?;
     let create_entry = image::get_images()
         .lock()

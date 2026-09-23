@@ -19,7 +19,7 @@
 //! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_bind` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在；provider 交付 `api`/`ctx`（Direct）+ `port`（Gate），Core 只存不解引用）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；**bind 在绑定时刻按 (caller 域, provider 域) 一次性选定机制**（同域 KernelNative → Direct 并交付 api/ctx；跨域 → Gate 只给 opaque id；不支持组合显式 `-ENOTSUP`，**绝不静默降级**）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
-//! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
+//! | Scheduler（v2） | `kcore_sched_run` `kcore_sched_set_policy` | `sched_run` 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core）；`sched_set_policy` 把 `scheduler.policy` endpoint **提交为调度配置**（只记 EndpointId + 准备好的执行栈，不发布；组合方在 provider create 之后显式发现 + 选择，Core 不按名字发现） |
 //! | Device ownership / MMIO | `kcore_device_nth` `kcore_device_claim` `kcore_device_release` | `device_nth` = 纯发现（列候选；`DeviceId` 是 identity 不是 handle）；`device_claim` = 认领**确切设备**：Core 记 owner 并返回本执行域下的可访问窗口（KernelNative = 寄存器裸指针，steady state 不再进 Core；Isolated 将来 = mapped VA）。**不做 per-access 鉴权**——KernelNative 是可信代码，硬访问限制来自执行域。`device_release` 在仍有 live IRQ/DMA 时拒绝（`-EBUSY`） |
 //! | IRQ routes | `kcore_irq_register` `kcore_irq_enable` `kcore_irq_disable` `kcore_irq_release` | 锚点是 **DeviceId**（`DeviceDescriptor.irq`）：register 记 route（handler + ctx），enable/disable 配置中断控制器，release 撤销 route 并关线。投递 = trap 上下文 native callback（Core 建立 line-owner 归属作用域）。无 poll/ack/event 层——那属于尚不存在的隔离域执行模型 |
 //! | DMA | `kcore_dma_alloc` `kcore_dma_free` `kcore_dma_map` `kcore_dma_unmap` | **allocation 与 mapping 分离**：`alloc` device-agnostic（给一块物理连续内存），`map(device_id, ptr, len, dir)` → 设备可见地址 + mapping id（No-IOMMU identity，未来 IOMMU/bounce buffer 在同一 seam）。`free`/`unmap` 撤销；backing 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `resource/dma.rs` |
@@ -986,6 +986,17 @@ extern "C" fn kcore_sched_run() -> i32 {
     with_core_critical(|| status(sched::run()))
 }
 
+/// 选择调度策略：把 `endpoint`（`scheduler.policy` 契约）提交为 Core 的调度配置。
+///
+/// 只记 `EndpointId`（+ 为策略执行准备的 Core 栈）——**不发布任何东西**；组合方
+/// （core_test / kbench / monitor）在 provider 的 create 返回 0 之后显式发现 +
+/// 选择，Core 的调度路径不按名字发现。校验 contract + abi + 存活 + provider 有
+/// `kcomp_service_dispatch`；IRQ / service-call / policy 执行内拒绝（`-EINVAL`）。
+/// 返回 0 / `-Errno`（见 [`SchedError`] 的映射）。
+extern "C" fn kcore_sched_set_policy(endpoint: u64) -> i32 {
+    with_core_critical(|| status(sched::set_policy(EndpointId::from_raw(endpoint))))
+}
+
 // ---------------------------------------------------------------------------
 // Category 8：Device / IRQ / DMA（mechanism-first；ownership + 真实机制，无 per-access 鉴权）
 // ---------------------------------------------------------------------------
@@ -1298,6 +1309,7 @@ mod tests {
             &b"kcore_task_state"[..],
             &b"kcore_panic_escape"[..],
             &b"kcore_sched_run"[..],
+            &b"kcore_sched_set_policy"[..],
             &b"kcore_device_nth"[..],
             &b"kcore_device_claim"[..],
             &b"kcore_device_release"[..],

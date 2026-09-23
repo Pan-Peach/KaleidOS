@@ -305,8 +305,26 @@ unsafe extern "C" {
     #[link_name = "kcore_panic_escape"]
     pub fn kcore_panic_escape() -> i32;
     // -- Scheduler --
+    /// 把 CPU 交给调度器：propose（调用已选择的策略）→ validate → commit → switch 全在
+    /// Core；跑完所有 Runnable 任务后返回（锚点上下文）。无 Runnable 任务时为 no-op。
+    /// **从未选择过策略** → `-ENOTSUP`（`NoPolicy`，绝不退化到内置调度器）；已安装策略
+    /// 失败 / 失效后 Core 用确定性回退（id 序首项）继续调度，不会变成 `NoPolicy`。
     #[link_name = "kcore_sched_run"]
     pub fn kcore_sched_run() -> i32;
+    /// 选择调度策略：把 `endpoint`（`scheduler.policy` 契约）提交为 Core 的调度配置。
+    /// 它**不发布任何东西**：Core 校验 endpoint 存活 + contract + abi exact-match、
+    /// provider image 真的有 `kcomp_service_dispatch`，然后只提交 EndpointId（provider
+    /// 的 Direct `api` / `ctx` 不参与——策略执行走 Core 的专用 PolicyCall 边界，
+    /// provider 只需要 image 级 dispatcher）。
+    /// 必须在 provider 的 create 返回 0 **之后**调用（endpoint 只在原子提交后存在）；
+    /// 组合方（core_test / kbench / monitor）显式发现 + 选择，Core 不按名字发现调度器。
+    /// IRQ / service-call / policy 执行上下文内拒绝（`-EINVAL`）。
+    /// 成功 = `0`；失败 = `-Errno`（`EFAULT` 无此语义 / `EINVAL` endpoint 契约不符或
+    /// 上下文拒绝 / `ENOENT` 未发布或已死 / `ENODEV` provider 已不存在 /
+    /// `EBUSY` provider 不在 Ready / `ENOSYS` provider 没有 dispatcher /
+    /// `ENOMEM` Core 无法准备策略执行栈）。
+    #[link_name = "kcore_sched_set_policy"]
+    pub fn kcore_sched_set_policy(endpoint: u64) -> i32;
     // -- Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针） --
     #[link_name = "kcore_device_nth"]
     pub fn kcore_device_nth(
@@ -435,6 +453,9 @@ unsafe extern "C" {
     /// 结构校验（长度非零时指针不得为空），**不解析其中的字节**。
     /// provider = 当前 provider 实例：Core 校验其 `Ready` 并记 inflight；provider 停止 /
     /// 失败后 endpoint 永久死亡，绝不重定向到新实例。
+    /// **保留契约**：`SchedulerPolicy`（`scheduler.policy`）的 endpoint 不得经本入口调用
+    /// （`-EPERM`）——调度策略只能由 Core 的调度路径经专用 PolicyCall 边界执行，
+    /// 组件不能把选中的调度算法当普通服务跑。
     /// **执行边界已落地**：dispatcher 跑在 Core 拥有的 per-call service stack 上、处于
     /// provider principal 之下，带 re-entry 检测与 provider panic containment（见
     /// `component/call.rs` 模块文档）。

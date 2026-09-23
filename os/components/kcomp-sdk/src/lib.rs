@@ -14,6 +14,7 @@
 //! `Endpoint<C>`（Contract / Endpoint 模型）、[`frame`] flat frame 的借用视图、
 //! [`block`] block.device 契约 + provider wrapper + **调用后端**（Core 在 bind 时
 //! 选定的 Direct / Gate，`BlockBinding` typed 前端）+ Gate 适配器、
+//! [`scheduler`] `scheduler.policy` 契约（Gate-only；consumer = Core）、
 //! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、`alloc`。
 //!
 //! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；
@@ -50,6 +51,7 @@ pub mod filesystem;
 pub mod frame;
 pub mod generated;
 pub mod probe;
+pub mod scheduler;
 
 mod dma;
 mod logging;

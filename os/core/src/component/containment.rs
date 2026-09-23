@@ -25,6 +25,13 @@
 //!    A normal return and a panic both switch back to the calling Core frame,
 //!    which classifies the outcome; a panicked provider is failed by
 //!    `component/call.rs`, never the caller.
+//! 5. **Policy-call boundary** (`crate::sched::pick_next`): the selected
+//!    scheduler policy's `kcomp_service_dispatch` runs on the Core-owned stack
+//!    prepared at selection time ([`call_component_policy`]) under
+//!    [`EscapeKind::PolicyCall`].  **Core is the caller** (no principal, no
+//!    caller task); a panic returns to the suspended scheduler frame, which
+//!    still owns its `IrqSaveGuard`, and the panicked stack is retained and
+//!    retired, never reused.
 //!
 //! Because control never returns through the panicking frame this is **not**
 //! Rust unwinding and remains compatible with `panic = "abort"`.
@@ -144,7 +151,10 @@
 //!   task's kernel stack is **not** reclaimed.
 //! - A panicked service call's Core-owned service stack is **not** reclaimed
 //!   either (explicit `mem::forget`; see [`call_component_service`]).  A service
-//!   stack is freed only on the normal-return path.
+//!   stack is freed only on the normal-return path.  A panicked **policy** call
+//!   retains its stack the same way and the scheduler retires it: it is never
+//!   reused, and a fresh stack is prepared only by an explicit new policy
+//!   selection.
 //! - Other tasks owned by the failed component are **not** force-stopped:
 //!   `may_run` excludes them from runnable candidates (they never run again),
 //!   but their records stay non-`Exited` because Core has no task-stop API yet.
@@ -228,8 +238,9 @@ enum IsolatedCall {
         entry: usize,
         state: *mut (),
     },
-    /// 一次 component→component 服务调用（provider 的
-    /// `kcomp_service_dispatch`，参数全部来自 `component/call.rs` 的锁内拷贝）。
+    /// 一次组件 dispatcher 调用（provider 的 `kcomp_service_dispatch`）：service
+    /// call 与 policy call 共用同一调用形状，参数全部来自 `component/call.rs`
+    /// （service）或 `sched` 的锁内快照（policy）的拷贝。
     Service {
         dispatcher: ServiceDispatch,
         instance_state: *mut (),
@@ -290,6 +301,21 @@ pub enum EscapeKind {
         endpoint: EndpointId,
         caller_task: Option<TaskId>,
     },
+    /// One **scheduler policy call** running on the policy stack Core prepared
+    /// when the policy endpoint was selected ([`call_component_policy`]).
+    ///
+    /// The caller is **Core itself** (the scheduling commit path), so there is
+    /// no caller task: the owner is the policy provider (Core truth from the
+    /// resolved endpoint) and the boundary carries no task provenance — a
+    /// policy panic must not inherit the boundary of the task that yielded.
+    /// The boundary is escapable (a panic returns to the suspended scheduler
+    /// frame, which still owns its `IrqSaveGuard`), scheduling-forbidden, and
+    /// additionally forbids generic endpoint calls, nested component creation,
+    /// and policy replacement ([`policy_call_in_chain`]).
+    PolicyCall {
+        owner: ComponentId,
+        endpoint: EndpointId,
+    },
 }
 
 impl EscapeKind {
@@ -297,8 +323,9 @@ impl EscapeKind {
     /// recorded in the guard ([`panic_escape`]).
     ///
     /// An IRQ attribution scope has no Core-owned context to resume and must
-    /// stay fatal; every other boundary (init / exit / task / service call) was
-    /// entered through a saved Core context and can escape to it.
+    /// stay fatal; every other boundary (init / exit / task / service call /
+    /// policy call) was entered through a saved Core context and can escape to
+    /// it.
     pub(crate) const fn is_escapable(self) -> bool {
         !matches!(self, Self::Irq { .. })
     }
@@ -311,8 +338,8 @@ pub struct EscapeInfo {
 }
 
 impl EscapeInfo {
-    /// Owning component, when known (`Task` / `Exit` / `Irq` / `ServiceCall`
-    /// always, `Init` only inside a load).
+    /// Owning component, when known (`Task` / `Exit` / `Irq` / `ServiceCall` /
+    /// `PolicyCall` always, `Init` only inside a load).
     pub fn owner(self) -> Option<ComponentId> {
         match self.kind {
             EscapeKind::Init { owner } => owner,
@@ -320,18 +347,22 @@ impl EscapeInfo {
             EscapeKind::Task { owner, .. } => Some(owner),
             EscapeKind::Irq { owner } => Some(owner),
             EscapeKind::ServiceCall { owner, .. } => Some(owner),
+            EscapeKind::PolicyCall { owner, .. } => Some(owner),
         }
     }
 
     /// Running task id, or `None` at the init, exit, and IRQ boundaries.
     ///
     /// A service call reports the **caller task it originated from** (execution
-    /// provenance); it does not make the provider that task's owner.
+    /// provenance); it does not make the provider that task's owner.  A policy
+    /// call has **no** task: Core is the caller, and the boundary must not
+    /// inherit the yielding task's identity.
     pub fn task(self) -> Option<TaskId> {
         match self.kind {
             EscapeKind::Init { .. } | EscapeKind::Exit { .. } | EscapeKind::Irq { .. } => None,
             EscapeKind::Task { task, .. } => Some(task),
             EscapeKind::ServiceCall { caller_task, .. } => caller_task,
+            EscapeKind::PolicyCall { .. } => None,
         }
     }
 }
@@ -572,9 +603,11 @@ pub(crate) fn irq_in_chain() -> bool {
 }
 
 /// Whether **any** boundary in the active chain forbids scheduling: an IRQ scope
-/// (synchronous, non-yielding top half) or a service call (the provider runs on
+/// (synchronous, non-yielding top half), a service call (the provider runs on
 /// a Core-owned service stack under its own principal — there is no
-/// scheduler-visible task, and switching away would abandon the service stack).
+/// scheduler-visible task, and switching away would abandon the service stack),
+/// or a policy call (the scheduler frame itself is suspended; re-entering the
+/// scheduler from a policy callback would corrupt that frame).
 ///
 /// Ancestor-aware by design: a nested init / exit / task boundary on top of an
 /// IRQ or service boundary must not re-open the scheduler
@@ -585,14 +618,28 @@ pub(crate) fn scheduling_forbidden() -> bool {
     chain_any(|guard| {
         matches!(
             guard.kind,
-            EscapeKind::Irq { .. } | EscapeKind::ServiceCall { .. }
+            EscapeKind::Irq { .. } | EscapeKind::ServiceCall { .. } | EscapeKind::PolicyCall { .. }
         )
     })
 }
 
+/// Whether **any** boundary in the active chain is a policy call
+/// ([`EscapeKind::PolicyCall`]) — including one hidden beneath nested lifecycle
+/// boundaries.
+///
+/// The policy callback is bounded Core-side: while it runs (or anywhere beneath
+/// it), the generic endpoint call path, nested component creation, and policy
+/// replacement are all rejected.  Ancestor-aware for the same reason as
+/// [`scheduling_forbidden`]: a nested boundary must not hide the policy
+/// execution.
+pub(crate) fn policy_call_in_chain() -> bool {
+    chain_any(|guard| matches!(guard.kind, EscapeKind::PolicyCall { .. }))
+}
+
 /// Whether `provider` already runs in the active synchronous chain: as the owner
-/// of a task guard, as the owner of any service-call guard, or as the instance
-/// being created / destroyed by an enclosing init / exit guard.
+/// of a task guard, as the owner of any service-call guard, as the policy
+/// provider of a policy call, or as the instance being created / destroyed by an
+/// enclosing init / exit guard.
 ///
 /// `component/call.rs` consults this before dispatching: a synchronous call back
 /// into an instance that is already on the current chain is re-entry, not a
@@ -601,7 +648,9 @@ pub(crate) fn scheduling_forbidden() -> bool {
 /// first).
 pub(crate) fn provider_in_active_chain(provider: ComponentId) -> bool {
     chain_any(|guard| match guard.kind {
-        EscapeKind::Task { owner, .. } | EscapeKind::ServiceCall { owner, .. } => owner == provider,
+        EscapeKind::Task { owner, .. }
+        | EscapeKind::ServiceCall { owner, .. }
+        | EscapeKind::PolicyCall { owner, .. } => owner == provider,
         EscapeKind::Init { owner: Some(owner) } | EscapeKind::Exit { owner } => owner == provider,
         EscapeKind::Init { owner: None } | EscapeKind::Irq { .. } => false,
     })
@@ -720,6 +769,93 @@ pub(crate) fn call_component_service(
     }
 }
 
+/// Allocates the Core-owned stack used for **policy execution**: prepared when a
+/// policy endpoint is selected (outside policy execution), kept in the
+/// scheduler's policy slot, and reused across policy calls.
+///
+/// A panic retains it (retired, never reused); a fresh explicit selection
+/// prepares a fresh stack.
+pub(crate) fn alloc_policy_stack() -> Option<MemoryLease> {
+    memory::alloc_region(COMPONENT_STACK_BYTES).ok()
+}
+
+/// Calls the **selected scheduler policy** (`kcomp_service_dispatch`) on the
+/// Core-owned stack prepared when the policy endpoint was selected, under
+/// [`EscapeKind::PolicyCall`].
+///
+/// This is the execution boundary of the scheduling commit path
+/// (`crate::sched::pick_next`).  It differs from [`call_component_service`]:
+///
+/// - **Core is the caller**: no caller principal and no caller task; the
+///   boundary carries no task provenance (a policy panic must not inherit the
+///   yielding task's identity);
+/// - the stack is **prepared outside policy execution** (at selection), so the
+///   hot path performs no allocation;
+/// - a panic returns to the **suspended scheduler frame**, which still owns its
+///   `IrqSaveGuard` — the boundary is escapable, and the stack is retained
+///   (`mem::forget`, no allocator lock on the panic path) and retired by the
+///   scheduler; it is never reused.
+///
+/// Returns the outcome plus the stack lease: `None` = the stack was retained
+/// (panic); `Some` = the lease goes back to the policy slot for reuse.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_component_policy(
+    owner: ComponentId,
+    endpoint: EndpointId,
+    dispatcher: ServiceDispatch,
+    instance_state: *mut (),
+    port: u32,
+    method: u32,
+    frame: *const KcompCallFrame,
+    stack: MemoryLease,
+) -> (CallOutcome, Option<MemoryLease>) {
+    #[cfg(test)]
+    if let Some(simulated) = test_simulated_policy() {
+        // host fake 后端不执行组件入口体：测试用模拟执行走**同一个** PolicyCall
+        // 边界（门禁 / 记账与生产路径一致；真实栈切换由 QEMU 证明）。
+        return match simulated {
+            TestPolicySim::Dispatch(dispatch) => {
+                let outcome = with_test_policy_boundary(owner, endpoint, || {
+                    CallOutcome::Returned(dispatch(instance_state, port, method, frame))
+                });
+                (outcome, Some(stack))
+            }
+            TestPolicySim::Panicked => {
+                // 与生产 panic 路径同一纪律：保留 lease（绝不复用），不碰分配器锁。
+                core::mem::forget(stack);
+                (CallOutcome::Panicked, None)
+            }
+        };
+    }
+
+    let stack_top = (stack.base() + stack.size()) & !(STACK_ALIGNMENT - 1);
+    // 与 service call 相同的 irq-save 纪律：RISC-V context record 不携带
+    // `sstatus.SIE`，Core 显式保存 / 恢复调用者的中断使能状态。
+    let irq_flags = CpuImpl::disable_irq();
+    let outcome = run_isolated_on(
+        stack_top,
+        IsolatedCall::Service {
+            dispatcher,
+            instance_state,
+            port,
+            method,
+            frame,
+        },
+        EscapeKind::PolicyCall { owner, endpoint },
+    );
+    CpuImpl::restore_irq(irq_flags);
+
+    match outcome {
+        CallOutcome::Panicked => {
+            // 保守驻留（phase 1，与 service call 的 panic 路径同一纪律）：
+            // 保留 lease、绝不复用这块栈，且 panic 路径上不碰分配器锁。
+            core::mem::forget(stack);
+            (CallOutcome::Panicked, None)
+        }
+        outcome => (outcome, Some(stack)),
+    }
+}
+
 /// Shared body of the create / destroy boundaries: allocate a Core-owned stack,
 /// install `kind` as the active escape guard, switch, and collect the outcome.
 fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutcome {
@@ -754,6 +890,20 @@ fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
         }
     };
     let stack_top = (stack.base() + stack.size()) & !(STACK_ALIGNMENT - 1);
+    let outcome = run_isolated_on(stack_top, call, kind);
+    IsolatedRun {
+        outcome,
+        stack: Some(stack),
+    }
+}
+
+/// [`run_isolated`] on an **already allocated** Core-owned stack: install `kind`
+/// as the active escape guard, switch, and collect the outcome.
+///
+/// `stack_top` must be the (aligned) one-past-end address of a live Core-owned
+/// stack region.  The policy path uses this with the stack prepared at
+/// selection; create / destroy / service calls allocate a fresh one per call.
+fn run_isolated_on(stack_top: usize, call: IsolatedCall, kind: EscapeKind) -> CallOutcome {
     let mut core_context = CpuImpl::new_context(0, 0);
     let mut component_context = CpuImpl::new_context(trampoline as *const () as usize, stack_top);
     let mut guard = EscapeGuard {
@@ -781,13 +931,9 @@ fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
         None => core::ptr::null_mut(),
     };
     let _ = replace_active(previous);
-    let outcome = match guard.state.panicked() {
+    match guard.state.panicked() {
         true => CallOutcome::Panicked,
         false => CallOutcome::Returned(guard.returned),
-    };
-    IsolatedRun {
-        outcome,
-        stack: Some(stack),
     }
 }
 
@@ -1189,6 +1335,95 @@ pub(crate) fn with_test_service_boundary<R>(
     };
     let _ = replace_active(previous);
     result
+}
+
+/// Runs `f` with a **policy-call** escape boundary installed over the current
+/// one, without a context switch.  Mirrors the guard installed by
+/// [`call_component_policy`], so host tests can exercise the policy-context
+/// gates (generic endpoint calls / nested creation / policy replacement) and the
+/// nesting behavior that the fake context backend cannot reach.
+#[cfg(test)]
+pub(crate) fn with_test_policy_boundary<R>(
+    owner: ComponentId,
+    endpoint: EndpointId,
+    f: impl FnOnce() -> R,
+) -> R {
+    let mut from_context = CpuImpl::new_context(0, 0);
+    let mut to_context = CpuImpl::new_context(0, 0);
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::PolicyCall { owner, endpoint },
+        from_context: &mut from_context,
+        to_context: &mut to_context,
+        call: IsolatedCall::None,
+        returned: 0,
+        state: GuardState::new(None),
+        // Mirrors `call_component_policy`: the policy dispatcher runs escapable.
+        saved_depth: suspend_core_abi_depth(),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    resume_core_abi_depth(guard.saved_depth);
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
+}
+
+/// Test-only **simulated policy execution** (thread-local; host fake context
+/// backend does not execute component entry bodies).
+///
+/// When installed, [`call_component_policy`] does not perform a real stack
+/// switch: [`TestPolicySim::Dispatch`] runs the simulated dispatcher
+/// synchronously inside the same [`EscapeKind::PolicyCall`] boundary (gates and
+/// bookkeeping stay identical), [`TestPolicySim::Panicked`] reports the panic
+/// outcome with the stack retained / retired.  The production path is
+/// untouched: real policy execution and stack switching are proven on QEMU.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestPolicySim {
+    /// Run this dispatcher inside the PolicyCall boundary.
+    Dispatch(ServiceDispatch),
+    /// Report `CallOutcome::Panicked` (stack retained and retired).
+    Panicked,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_POLICY_SIM: core::cell::Cell<Option<TestPolicySim>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// The installed simulated policy execution, if any (see [`TestPolicySim`]).
+#[cfg(test)]
+fn test_simulated_policy() -> Option<TestPolicySim> {
+    TEST_POLICY_SIM.with(core::cell::Cell::get)
+}
+
+/// Installs a simulated policy execution for the duration of `f`.
+#[cfg(test)]
+fn with_test_policy_simulation<R>(sim: TestPolicySim, f: impl FnOnce() -> R) -> R {
+    TEST_POLICY_SIM.with(|slot| {
+        let previous = slot.replace(Some(sim));
+        let result = f();
+        slot.set(previous);
+        result
+    })
+}
+
+/// Runs `f` with `dispatch` installed as the simulated policy dispatcher
+/// (test-only; see [`TestPolicySim`]).
+#[cfg(test)]
+pub(crate) fn with_test_policy_dispatch<R>(dispatch: ServiceDispatch, f: impl FnOnce() -> R) -> R {
+    with_test_policy_simulation(TestPolicySim::Dispatch(dispatch), f)
+}
+
+/// Runs `f` with a simulated policy **panic** installed (test-only; the stack is
+/// retained / retired exactly like the production panic path).
+#[cfg(test)]
+pub(crate) fn with_test_policy_panic<R>(f: impl FnOnce() -> R) -> R {
+    with_test_policy_simulation(TestPolicySim::Panicked, f)
 }
 
 /// Marks the active escape as panicked, as the boot panic handler does before

@@ -3,8 +3,9 @@
 //! 这一层把 ABI 编码（kind / fingerprint）变成类型、把 `0/-errno` 变成
 //! `Result`、把裸指针收窄成 [`RawBinding`] / [`ServiceBinding`]。
 //! 契约由实现 [`Service`] 的类型表达（provider 与 consumer 共享），本模块
-//! 随附 `SchedulerPolicy` / `DriverProber` 两个契约；`BlockDevice` 的契约与
-//! provider wrapper 在 [`crate::block`]（这里只 re-export）。
+//! 随附 `DriverProber` 契约；`BlockDevice` / `FileSystem` 的契约与 provider
+//! wrapper 在 [`crate::block`] / [`crate::filesystem`]（这里只 re-export），
+//! `SchedulerPolicy`（**Gate-only**，consumer = Core）在 [`crate::scheduler`]。
 //! **不做**字符串函数查找 / 反射 /
 //! 动态类型——KernelNative phase 1 就是 typed `#[repr(C)]` function table + direct call。
 
@@ -129,12 +130,6 @@ impl<S: Service> ServiceBinding<S> {
     }
 }
 
-/// SchedulerPolicy 的 exact ABI fingerprint。
-///
-/// 必须与 Core `sched::SCHEDULER_POLICY_ABI` 完全一致（A/B 双侧手工锚定，
-/// 两侧各有锚定测试钉死数值）。
-pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_4845_4455_4C52);
-
 /// 发布接口（**只在 `kcomp_instance_create` 期间有效**）：Core 记录 pending，
 /// `kcomp_instance_create` 返回 0 后原子提交。返回 `Ok(())` = 已记录 pending。
 ///
@@ -256,34 +251,6 @@ pub fn available(name: &[u8], kind: InterfaceKind, abi: InterfaceAbi) -> bool {
     unsafe {
         abi::kcore_interface_available(name.as_ptr(), name.len(), kind.as_u32(), abi.raw()) == 1
     }
-}
-
-// -----------------------------------------------------------------------
-// scheduler —— SchedulerPolicy 契约（provider: scheduler_rr 等策略组件）
-// -----------------------------------------------------------------------
-
-/// `scheduler` 接口名字（publish / bind 必须逐字节一致）。
-pub const SCHEDULER_POLICY_NAME: &[u8] = b"scheduler";
-
-/// SchedulerPolicy 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
-///
-/// `ctx` 由 Core 从 binding 单独取出后原样传入 `choose_next`，不在 table 内。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SchedulerPolicyApi {
-    /// 提议下一个 TaskId；Core 会验证它落在传入的 runnable 列表内。
-    pub choose_next:
-        extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
-}
-
-/// SchedulerPolicy 契约（KIND = Policy）。
-pub struct SchedulerPolicy;
-
-impl Service for SchedulerPolicy {
-    const NAME: &'static [u8] = SCHEDULER_POLICY_NAME;
-    const KIND: InterfaceKind = InterfaceKind::Policy;
-    const ABI: InterfaceAbi = SCHEDULER_POLICY_ABI;
-    type Api = SchedulerPolicyApi;
 }
 
 // -----------------------------------------------------------------------

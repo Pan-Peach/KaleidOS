@@ -380,7 +380,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | `abi/core.toml` | 含 `kcore_interface_*`（`:387-459`）；`kcore_endpoint_lookup` 无 abi；`:797-802` 过时 | 加 abi 参数、更新文档、删旧接口条目 |
 | `os/components/kcomp-sdk/src/binding.rs` | `publish_service` / `Service` / `InterfaceAbi` | typed 前端 + 调用后端（Direct / Gate） |
 | `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
-| `os/components/scheduler_rr/src/lib.rs` | `publish_named::<SchedulerPolicy>(b"scheduler", ...)` | 名字绑定 → Endpoint 身份 |
+| `os/components/scheduler_rr/src/lib.rs` | `publish_named::<SchedulerPolicy>(b"scheduler", ...)` | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
 | `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础 | 跨域需真实 AS 切换（未实现） |
 | `os/core/src/component/loader.rs` | 单 base 放段 + 单次 import 重定位 | 按域放段 / 按域 import 解析（未实现） |
 | `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/` | `activate()` 无人调用；无 satp 切换；无 U-mode | 私有 AS / U-mode / `ecall`（未实现） |
@@ -407,7 +407,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
         私有 AS / satp 切换 / U-mode / ecall / 按域 loader / 支持范围元数据。
 ```
 
-**必须最后删除的：** `kcore_interface_*`（`abi/core.toml:387-459`）、`os/core/src/component/interface.rs`、scheduler 的名字绑定（`scheduler_rr/src/lib.rs`）。**先删它们会打断 trace**：`os/core/src/trace/event.rs:21` 直接 import `BindingId` / `InterfaceId`。删除顺序 = **先迁 trace，再删接口模型**。
+**必须最后删除的：** `kcore_interface_*`（`abi/core.toml:387-459`）、`os/core/src/component/interface.rs`。**先删它们会打断 trace**：`os/core/src/trace/event.rs:21` 直接 import `BindingId` / `InterfaceId`。删除顺序 = **先迁 trace，再删接口模型**。（scheduler 的名字绑定已随 step 5 删除，见 §8.1；`kcore_interface_*` 与 `component/interface.rs` 仍是最后一步。）
 
 ---
 
@@ -460,6 +460,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | ComponentImage / ComponentInstance 分离 | **已实现** | `image.rs:52-71`、`registry.rs` |
 | Endpoint 真相（publish / discover / invalidate） | **已实现** | `endpoint.rs` |
 | Gate 调用边界（per-call stack + principal + panic containment） | **已实现** | `call.rs`、`containment.rs` |
+| SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现（step 5）** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
 | `kcore_endpoint_call` 文档与代码一致 | **未做**（文档过时） | `abi/core.toml:797-802` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
 | 部署 / 模式字段 | **未开始** | `deployment\|deploy` 零匹配；`ExecutionDomain` 只在注释 |

@@ -39,6 +39,23 @@
 //!   `yield_current` / `exit_current` / task 创建一律拒绝
 //!   （`containment::scheduling_forbidden`）——provider 没有调度可见的任务。
 //!
+//! # 调度策略的专用路径（`sched::pick_next`）
+//!
+//! `SchedulerPolicy` 契约**不**经本模块的通用 `endpoint_call`：Core 自己是
+//! 消费者（`os/core/src/sched.rs`），策略在调度 commit 路径上被调用，执行边界是
+//! [`containment::call_component_policy`] + [`EscapeKind::PolicyCall`]。本模块为它
+//! 提供与 [`prepare`] 同形的锁内准备（[`prepare_policy`]：contract + abi + 存活
+//! → `begin_call` → image dispatcher）与无锁调用（[`call_policy`]）。
+//!
+//! 三条门禁把这条路径与通用服务调用隔开：
+//!
+//! - 通用路径**拒绝** `scheduler.policy` 契约（[`CallError::ReservedContract`]）：
+//!   组件不能把选中的调度算法当普通服务跑；
+//! - policy 回调内（含嵌套边界之下）通用 endpoint 调用被拒
+//!   （[`CallError::InPolicyContext`]）；
+//! - policy 回调内不得创建组件 / 替换策略（`load.rs` / `sched.rs` 各自的上下文
+//!   门禁）。
+//!
 //! # 传输状态 ≠ 方法状态
 //!
 //! [`endpoint_call`] 的返回值是 Core 的**传输状态**（`Ok` / `Err(CallError)`）；
@@ -81,12 +98,17 @@
 //! 状态分离），经 test-only 边界辅助函数。
 
 use crate::component::containment::{self, CallOutcome, ServiceDispatch};
-use crate::component::endpoint::{EndpointError, EndpointId, EndpointRegistry};
+use crate::component::endpoint::{ContractId, EndpointError, EndpointId, EndpointRegistry};
 use crate::component::image::ImageTable;
+use crate::component::interface::InterfaceAbi;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::Registry;
 use crate::component::{ComponentId, endpoint, image, registry};
-use crate::generated::abi::KcompCallFrame;
+use crate::generated::abi::{
+    KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT, KCOMP_SCHEDULER_POLICY_ABI,
+    KCOMP_SCHEDULER_POLICY_CONTRACT, KcompCallFrame,
+};
+use crate::memory::MemoryLease;
 use crate::resource::RequestContext;
 use crate::task::TaskId;
 
@@ -115,6 +137,14 @@ pub enum CallError {
     /// 回调是同步、不可 yield 的顶半部，不得发起通用服务调用 → `EINVAL`
     /// （与 IRQ 上下文中的调度拒绝同档）。
     InIrqContext,
+    /// 当前调用链上存在 **policy-call** 边界（即使藏在嵌套生命周期边界之下）：
+    /// 调度策略回调是 Core 调度 commit 路径的内部执行，调度帧正挂起，不得发起
+    /// 通用 endpoint 调用 → `EINVAL`（与 IRQ 上下文同档）。
+    InPolicyContext,
+    /// endpoint 的契约是 Core **保留**的（`scheduler.policy`）：调度策略只能由
+    /// Core 的调度路径经专用 PolicyCall 边界执行，组件不能把选中的调度算法当
+    /// 普通服务跑 → `EPERM`。
+    ReservedContract,
     /// Core 无法分配 per-call service stack（`-ENOMEM`）：provider 入口从未执行，
     /// 传输失败，绝不写 `*out_status`。
     NoServiceStack,
@@ -150,6 +180,12 @@ fn prepare(
     // (1) 存活解析：死 endpoint / 死 owner 绝不派发（`resolve` 只查存活，
     //     contract / abi 已在组合期交付 id 之前校验）。
     let record = endpoints.resolve(components, id)?;
+
+    // (1b) 保留契约：`scheduler.policy` 不得经通用调用路径执行——调度策略只能
+    //      由 Core 的调度路径经专用 PolicyCall 边界调用（`sched::pick_next`）。
+    if record.contract == ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT) {
+        return Err(CallError::ReservedContract);
+    }
 
     // (2) re-entry 门禁：provider 已在当前同步链上（它自己的 task / 外层 service
     //     call / 外层 init 或 exit）→ 重入，不是服务请求。在 `begin_call` 之前
@@ -261,6 +297,12 @@ fn dispatch(
         return Err(CallError::InIrqContext);
     }
 
+    // (2b) policy-call 祖先门禁：策略回调内（含嵌套边界之下）不得发起通用
+    //      endpoint 调用——调度帧正挂起，Core 没有可恢复的调用点。
+    if containment::policy_call_in_chain() {
+        return Err(CallError::InPolicyContext);
+    }
+
     // (3) 锁内准备（含 re-entry 门禁）：三个 guard 在本块结束时全部释放——
     //     之后才允许执行组件代码。
     let target = {
@@ -285,6 +327,126 @@ fn dispatch(
 
     // (5) 边界返回后的收尾（panic / 无栈 / 正常三条分类）。
     complete_call(target.provider, outcome, out_status)
+}
+
+// ---------------------------------------------------------------------------
+// 调度策略调用（`sched::pick_next` 的专用执行路径；不是通用 service call）
+// ---------------------------------------------------------------------------
+//
+// 与 [`dispatch`] 的三点不同（`docs/architecture/deployment.md` §3 "Gate" 的
+// 调度特例，见 `containment::call_component_policy`）：
+//
+// 1. **Core 是 caller**：没有 caller principal / caller task——策略回调不是
+//    "某个组件请求的服务"，而是 Core 调度 commit 路径的内部执行；
+// 2. **契约固定**：endpoint 必须逐位匹配 `scheduler.policy` 的 contract + abi；
+// 3. **无 re-entry 门禁**：策略 provider 自己的任务可以 yield（那时它的 task
+//    帧挂起、代码不在执行），Core 仍需向它提议——重入只对通用 service call
+//    成立。
+
+/// 锁内拷贝出的**策略调用目标**：锁外调用只碰这里的数据（+ Core 构造的 frame）。
+///
+/// 全部字段在锁释放后仍然有效：`dispatch` 是 loader 校验 + 重定位后的 image 入口
+/// （image 常驻 pinned-until-reboot）；`state` 是 provider 的 opaque instance state
+/// （组件持有，Core 只传）；`port` 是 provider 发布时定义的不透明 dispatch token。
+pub(crate) struct PolicyTarget {
+    pub(crate) endpoint: EndpointId,
+    pub(crate) owner: ComponentId,
+    /// provider 的 opaque instance state（`kcomp_service_dispatch` 的第一个参数）。
+    pub(crate) state: *mut (),
+    pub(crate) port: u32,
+    pub(crate) dispatch: ServiceDispatch,
+}
+
+/// 锁内准备一次策略调用：endpoint 校验（**contract + abi exact-match** + 存活）
+/// → `begin_call` 记账 → 取 image dispatcher。
+///
+/// 锁序与 [`prepare`] 相同（`registry → endpoints → images`），三个 guard 在返回前
+/// 全部释放；`begin_call` 之后的任何失败路径都归还 inflight。返回的目标交给
+/// [`call_policy`] 在无锁状态下调用。
+pub(crate) fn prepare_policy(id: EndpointId) -> Result<PolicyTarget, CallError> {
+    let mut components = registry::get_registry().lock();
+    let endpoints = endpoint::get_endpoints().lock();
+    let images = image::get_images().lock();
+
+    // (1) 契约 + abi + 存活：选择时已校验，每次调用重新核对（死 endpoint /
+    //     provider 离开 Ready 一律拒绝；绝不重定向到新实例）。
+    let record = endpoints.lookup(
+        &components,
+        id,
+        ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
+        InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI),
+    )?;
+
+    // (2) owner 的 image / opaque state（`lookup` 刚校验过 owner 存在且 Ready）。
+    let Some(instance) = components.get(record.owner) else {
+        return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
+    };
+    let image_id = instance.image;
+    let state = instance.instance_state;
+
+    // (3) inflight 记账门禁：只有 Ready provider 可以开始策略调用。
+    components
+        .begin_call(record.owner)
+        .map_err(|_| CallError::ProviderBusy)?;
+
+    // (4) image + **必需** dispatcher：策略 provider 必须提供 image 级入口
+    //     （选择时已校验，这里是每次调用的存活复验）。
+    let Some(image) = images.get(image_id) else {
+        components.finish_call(record.owner);
+        return Err(CallError::ImageMissing);
+    };
+    let Some(dispatcher) = image.service_dispatch else {
+        components.finish_call(record.owner);
+        return Err(CallError::NoDispatcher);
+    };
+
+    Ok(PolicyTarget {
+        endpoint: id,
+        owner: record.owner,
+        state,
+        port: record.port,
+        // SAFETY: 同 `prepare`：`service_dispatch` 只由 loader 写入（放段后解析
+        // `STT_FUNC` 符号 + 已执行段边界校验），组件无法伪造；image 常驻。
+        dispatch: unsafe { core::mem::transmute::<usize, ServiceDispatch>(dispatcher) },
+    })
+}
+
+/// 一次策略调用的结果：边界 outcome + 栈 lease。
+pub(crate) struct PolicyCallOutcome {
+    pub(crate) outcome: CallOutcome,
+    /// `None` = provider panic，栈已保留并退役（绝不复用）。
+    pub(crate) stack: Option<MemoryLease>,
+}
+
+/// 无锁调用已选择的策略（Core 是 caller；`method` 固定 `CHOOSE_NEXT`）。
+///
+/// 边界是 [`EscapeKind::PolicyCall`]：panic 时逃逸回**挂起的调度帧**（它仍持有
+/// `IrqSaveGuard`），provider 被标记 `Failed`（逻辑死亡 + authority 回收 + 全部
+/// endpoint 永久失效），inflight 归还；栈被保留、退役。**调用方负责**锁外构造
+/// frame、以及失败后的确定性回退（见 `sched::pick_next`）。
+pub(crate) fn call_policy(
+    target: &PolicyTarget,
+    frame: &KcompCallFrame,
+    stack: MemoryLease,
+) -> PolicyCallOutcome {
+    let (outcome, stack) = containment::call_component_policy(
+        target.owner,
+        target.endpoint,
+        target.dispatch,
+        target.state,
+        target.port,
+        KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT,
+        frame,
+        stack,
+    );
+    // 归还 inflight（正常 / panic / 无栈三条路径都归还）。
+    registry::get_registry().lock().finish_call(target.owner);
+    if outcome == CallOutcome::Panicked {
+        // endpoint-aware 失败收尾（不是裸 `mark_failed`）：逻辑死亡 + 撤销
+        // authority + provider 全部 endpoint 永久失效。
+        crate::component::fail_component(target.owner, ComponentLoadError::PolicyPanicked);
+    }
+    PolicyCallOutcome { outcome, stack }
 }
 
 /// 服务边界返回后的收尾（[`dispatch`] 的尾段）。
@@ -1164,6 +1326,77 @@ mod tests {
         // Then：传输成功、inflight 归还（provider 入口由 host fake 记账，不真实执行）。
         assert_eq!(transport, Ok(()));
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+
+        containment::enter_anchor();
+    }
+
+    // -- 12. 保留契约：调度策略不得经通用调用路径执行 -----------------------------
+
+    /// 验收：`scheduler.policy` 契约的 endpoint 经通用 `kcore_endpoint_call` 被拒
+    /// （`ReservedContract` → EPERM）——调度策略只能由 Core 的调度路径经专用
+    /// PolicyCall 边界执行，组件不能把选中的调度算法当普通服务跑。
+    #[test]
+    fn scheduler_policy_contract_is_reserved_from_generic_calls() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_reserved_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+
+        // Given：一个发布 `scheduler.policy` 契约的 endpoint（contract / abi 用
+        // 生成常量，与 Core 的保留判定同源）。
+        let contract = ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT);
+        let abi = InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI);
+        let endpoint = {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                provider,
+                b"scheduler.policy",
+                contract,
+                InterfaceKind::Policy,
+                abi,
+                0,
+                core::ptr::null(),
+                core::ptr::null_mut(),
+            )
+            .unwrap();
+            eps.commit_pending(&reg, provider).unwrap();
+            eps.discover(&reg, provider, b"scheduler.policy", contract)
+                .unwrap()
+        };
+        enter_caller(41);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+
+        // When：caller 经通用调用路径调用它。
+        let error = endpoint_call(
+            endpoint,
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut out_status,
+        )
+        .unwrap_err();
+
+        // Then：保留契约拒绝（EPERM）；provider 从未被调用、inflight 未泄漏。
+        assert_eq!(error, CallError::ReservedContract);
+        assert_eq!(Errno::from(error), Errno::EPERM);
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "provider 从未被调用"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0, "失败调用不写 out_status");
 
         containment::enter_anchor();
     }

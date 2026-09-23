@@ -1,0 +1,101 @@
+# KABI schema — scheduler：`scheduler.policy` 组件间契约（provider: scheduler_rr
+# 一类策略组件；consumer: **Core 自己**）。
+#
+# 这个契约与 block / filesystem / probe 不同：它**没有 Direct function table**。
+# 调度策略由 Core 在调度 commit 路径上调用（`os/core/src/sched.rs`），执行机制是
+# 专用执行边界（`containment::call_component_policy`，`EscapeKind::PolicyCall`）：
+# provider 只需要提供 image 级统一入口 `kcomp_service_dispatch`，`PolicyTarget`
+# 就是 Core 私有的可调用快照。因此：
+#
+#   - provider publish 时 `api` 允许为空（Gate-only；任何 Direct 绑定都会被 Core
+#     以 `-ENOTSUP` 显式拒绝，绝不静默降级）；
+#   - Core 的通用调用路径（`kcore_endpoint_call`）**拒绝**本契约：组件不能把
+#     选中的调度算法当普通服务跑（见 `component/call.rs` 的 ReservedContract）；
+#   - 选择 = `kcore_sched_set_policy(endpoint)`：Core 校验存活 + contract + abi +
+#     provider 真的有 dispatcher，然后**只提交 EndpointId** 作为调度配置；它不是
+#     publish，也不做全局名字发现。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 常量
+#   os/components/kcomp-sdk/src/generated/scheduler.rs      SDK-Rust 镜像
+#   os/core/src/generated/abi.rs                            Core 侧契约常量
+#
+# 手写部分（facade，不在本文件范围）：SDK 的 `SchedulerPolicy` 契约类型、
+# wire 编解码 helper、`select` / `publish_endpoint`（`kcomp-sdk/src/scheduler.rs`）。
+#
+# ---------------------------------------------------------------------------
+# CHOOSE_NEXT(0)：扁平 frame 的 wire 格式（**Core 编码 / provider 解码**）
+# ---------------------------------------------------------------------------
+#
+# `args`  : 恰好 `KCOMP_SCHEDULER_TASK_ID_LEN` 字节 —— 当前 TaskId（u32 LE；
+#           `KCOMP_SCHEDULER_NONE` = 当前没有任务，即从锚点进入调度）。
+# `input` : 非空，长度是 `KCOMP_SCHEDULER_TASK_ID_LEN` 的整数倍 —— Core 裁剪过的
+#           runnable TaskId 列表，逐个 u32 LE 连接（id 升序）。
+# `output`: 恰好 `KCOMP_SCHEDULER_TASK_ID_LEN` 字节 —— provider 提议的 TaskId
+#           （u32 LE）。Core 验证它落在 `input` 列表内才提交；不在 → 提议被拒绝，
+#           provider 被隔离（逻辑死亡）。
+# 返回    : `0` / `-errno`（方法状态；传输状态由 Core 的 PolicyCall 边界决定）。
+#
+# 边界约束（provider 侧必须遵守）：回调**不得阻塞、不得分配**；`task run / yield /
+# exit / create / start`、通用 endpoint 调用、嵌套组件创建与策略替换在
+# `PolicyCall` 边界内一律被 Core 拒绝。
+#
+# 身份数值约定与 block / probe 相同：8 字节 ASCII tag 的大端读数。
+
+[[const]]
+name = "KCOMP_SCHEDULER_POLICY_NAME"
+type = "string"
+value = "scheduler.policy"
+targets = "c,sdk-rust,core-rust"
+doc = """
+`scheduler.policy` 契约的 endpoint 端口名（组合期 discover 用；provider 实例内唯一）。
+名字不是全局身份：Core 只按 `(provider, port_name, contract)` 发现，绝不按名字
+解析"当前调度器"。
+"""
+
+[[const]]
+name = "KCOMP_SCHEDULER_POLICY_ABI"
+type = "u64"
+value = "0x5343_4845_4455_4C52"
+targets = "c,sdk-rust,core-rust"
+doc = """
+exact ABI fingerprint（8 字节 ASCII "SCHEDULR" 的大端读数）。`kcore_sched_set_policy`
+要求 endpoint 记录的 abi 与它逐位相等，否则拒绝选择。
+"""
+
+[[const]]
+name = "KCOMP_SCHEDULER_POLICY_CONTRACT"
+type = "u64"
+value = "0x5343_4845_4450_4F4C"
+targets = "c,sdk-rust,core-rust"
+doc = """
+`scheduler.policy` 的 endpoint 契约身份（`kcore_endpoint_*` 的 `contract` 参数）。
+数值 = 8 字节 ASCII tag `b"SCHEDPOL"` 的大端读数（与 `BLKCONTR` / `PRBCONTR` 同一约定）。
+"""
+
+[[const]]
+name = "KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust,core-rust"
+doc = "`CHOOSE_NEXT` 的方法号：见本文件顶部的 wire 格式。"
+
+[[const]]
+name = "KCOMP_SCHEDULER_TASK_ID_LEN"
+type = "usize"
+value = "4"
+targets = "c,sdk-rust,core-rust"
+doc = """
+一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`args` 与 `output` 恰好这么长；
+`input` 是它的整数倍。
+"""
+
+[[const]]
+name = "KCOMP_SCHEDULER_NONE"
+type = "u32"
+value = "0xFFFF_FFFF"
+targets = "c,sdk-rust,core-rust"
+doc = """
+`args` 里的"当前无任务"哨兵（`UINT32_MAX`）：从锚点（monitor / 组件 init）进入
+调度时没有 current task。它是**编码值**，不是 TaskId。
+"""

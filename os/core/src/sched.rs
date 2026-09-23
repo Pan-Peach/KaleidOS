@@ -6,6 +6,22 @@
 //! 提供的、经过裁剪的输入），只能"提议"下一个 TaskId；存在性、状态、
 //! 切换由 Core 验证后生效。
 //!
+//! # 策略选择与专用执行路径（step 5）
+//!
+//! - **选择**（`kcore_sched_set_policy` / [`set_policy`]）：组合方在 provider 的
+//!   create 返回 0 之后**显式**发现 `scheduler.policy` endpoint 并提交它；Core
+//!   只记 `EndpointId`（+ 为策略执行准备的 Core 栈）。没有全局名字发现，
+//!   `NoPolicy` 只表示"从未选择过"。
+//! - **执行**（[`pick_next`]）：每次调度经 `call::prepare_policy` 在锁内解析存活
+//!   endpoint，再经专用 [`containment::call_component_policy`] 边界
+//!   （[`EscapeKind::PolicyCall`]）调用 provider 的 `kcomp_service_dispatch`。
+//!   **Core 是 caller**（无 principal / 无 caller task）；`IrqSaveGuard` 横跨
+//!   策略执行，但 CPU / task 表锁在之后才取。
+//! - **失败**：非法提议 / 非 0 返回 → provider endpoint-aware 失败（逻辑死亡 +
+//!   全部 endpoint 永久失效）+ 配置退役；panic → 逃逸回**本调度帧**（栈保留、
+//!   退役，绝不复用）。退役后 Core 用确定性回退（id 序首项，提交前验证 owner）
+//!   继续调度，绝不退化成 `NoPolicy`。
+//!
 //! # 执行流（单 CPU，phase 1）
 //!
 //! 组件 init（或 monitor）在**锚点栈**上运行；`run()` 首次进入调度时，
@@ -15,57 +31,55 @@
 //!
 //! # 锁纪律（关键）
 //!
-//! `cpu` / `task_table` / `interfaces`+`registry` 三把锁只在**决定阶段**
-//! 短暂持有；`context_switch` 必须在全部锁释放后执行——否则切过去的任务
-//! 第一次调 yield 就会自死锁（spin::Mutex 不可重入）。
-//! 决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
+//! `cpu` / `task_table` / `registry`+`endpoints`+`images` 只在**决定阶段**
+//! 短暂持有；`context_switch`（以及任何组件代码，包括策略回调）必须在全部锁
+//! 释放后执行——否则切过去的任务第一次调 yield 就会自死锁（spin::Mutex
+//! 不可重入）。决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
 //! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
 
-use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
+use crate::component::call;
+use crate::component::containment::CallOutcome;
+use crate::component::endpoint::{self, EndpointError, EndpointId};
+use crate::component::interface::InterfaceAbi;
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, containment, registry};
+use crate::generated::abi::{
+    KCOMP_SCHEDULER_NONE, KCOMP_SCHEDULER_POLICY_ABI, KCOMP_SCHEDULER_POLICY_CONTRACT,
+    KCOMP_SCHEDULER_POLICY_NAME, KCOMP_SCHEDULER_TASK_ID_LEN, KcompCallFrame,
+};
 use crate::irq::IrqSaveGuard;
 use crate::machine::CpuId;
+use crate::memory::MemoryLease;
 use crate::task::{self, TaskId, TaskState};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arch::{ContextImpl, CpuArch, CpuImpl};
 use spin::{Mutex, Once};
 
-/// SchedulerPolicy 的 function table（与组件 scheduler_rr 重复定义——A/B 双侧
-/// ABI 契约，见 docs/architecture/component-model.md；组件替换 = 换 provider 实现同一 layout）。
-///
-/// `api` 指向本 struct；`ctx`（provider opaque state）由 Core 从 binding 单独取出
-/// 后原样传入 `choose_next`，**不再放在 vtable 内**。
-#[repr(C)]
-pub struct SchedulerPolicyApi {
-    pub choose_next:
-        extern "C" fn(ctx: *mut (), runnable: *const u32, count: usize, current: u32) -> u32,
-}
-
-/// SchedulerPolicy 的 exact ABI fingerprint。provider 与 consumer 必须使用完全
-/// 相同的值（不一致 → `bind` 拒绝）。
-///
-/// TODO(service-abi): 未来由 `kcomp-sdk` 统一定义具体 Service contract 的
-/// fingerprint；当前为占位值。组件侧镜像定义见
-/// `kcomp-sdk::binding::SCHEDULER_POLICY_ABI`（A/B 双侧手工锚定）。
-pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x5343_4845_4455_4C52);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedError {
-    /// 没有绑定的 SchedulerPolicy（`scheduler`/Policy 未 publish 或 provider 已 Failed）。
+    /// 从未选择过 SchedulerPolicy（`kcore_sched_set_policy` 尚未成功）。已安装
+    /// 策略失败 / 失效**不**是 `NoPolicy`：那时 Core 用确定性回退继续调度。
     NoPolicy,
     /// 任务表状态机拒绝推进（yield/exit 时当前任务不是 Running 等）。
     ///
-    /// 也用于**上下文种类拒绝**：调度操作不得在 IRQ 回调作用域或 service-call
-    /// 边界内（含其下的嵌套边界）执行（`containment::scheduling_forbidden`，见
-    /// [`deny_scheduling_forbidden`]），ABI 上是 `-EINVAL`。复用本变体是为了不改
-    /// 内部错误枚举与唯一的 errno 映射表。
+    /// 也用于**上下文种类拒绝**：调度操作（含策略选择）不得在 IRQ 回调作用域、
+    /// service-call 边界或 policy 执行内（含其下的嵌套边界）执行
+    /// （`containment::scheduling_forbidden`，见 [`deny_scheduling_forbidden`]），
+    /// ABI 上是 `-EINVAL`。复用本变体是为了不改内部错误枚举与唯一的 errno 映射表。
     InvalidTransition,
     /// 当前任务从表中消失（Core 不变式被破坏，不应发生）。
     NotFound,
     /// yield/exit 调用时本 CPU 没有在跑任务（只有任务能 yield/exit）。
     NoCurrent,
+    /// `kcore_sched_set_policy` 的 endpoint 校验失败：未发布 / 已死 / owner 非
+    /// `Ready` / contract·abi 不符。
+    PolicyEndpoint(EndpointError),
+    /// 策略 provider 的 image 没有 `kcomp_service_dispatch`：它不能作为策略
+    /// provider（选择时与每次调用前都复验）。
+    NoDispatcher,
+    /// Core 无法为策略执行准备栈（`-ENOMEM`）；策略配置不变。
+    NoPolicyStack,
 }
 
 /// 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
@@ -93,6 +107,23 @@ struct CpuState {
 
 static CPU: Once<Mutex<CpuState>> = Once::new();
 
+/// 调度策略配置（Core truth）：**只记 EndpointId** + 选择时为策略执行准备的
+/// Core-owned 栈。
+///
+/// - `endpoint == None` = 从未配置：`pick_next` 返回 `NoPolicy`（绝不退化到内置
+///   调度器）；
+/// - `retired == true` = 已安装策略失败 / 失效：确定性回退（id 序首项）生效，
+///   直到显式重新选择——不会在下次调度时退化成 `NoPolicy`；
+/// - `stack` 只在 Armed 状态下非空。panic 的栈被保留（`mem::forget`，退役、
+///   绝不复用）；正常返回的栈留在槽里复用；退役时立即释放。重新选择 = 准备新栈。
+struct PolicySlot {
+    endpoint: Option<EndpointId>,
+    stack: Option<MemoryLease>,
+    retired: bool,
+}
+
+static POLICY: Once<Mutex<PolicySlot>> = Once::new();
+
 pub fn init() {
     CPU.call_once(|| {
         Mutex::new(CpuState {
@@ -100,10 +131,21 @@ pub fn init() {
             current: None,
         })
     });
+    POLICY.call_once(|| {
+        Mutex::new(PolicySlot {
+            endpoint: None,
+            stack: None,
+            retired: false,
+        })
+    });
 }
 
 fn cpu() -> &'static Mutex<CpuState> {
     CPU.get().expect("sched not initialized")
+}
+
+fn policy() -> &'static Mutex<PolicySlot> {
+    POLICY.get().expect("sched not initialized")
 }
 
 /// 当前 CPU 正在运行的任务。没有进入任务执行流时返回 `None`（锚点上下文）。
@@ -146,58 +188,218 @@ fn owner_still_runnable(id: TaskId) -> bool {
     owner.is_some_and(crate::component::may_run)
 }
 
-/// 解析绑定的 SchedulerPolicy。锁序 registry → interfaces（与 publish
-/// 路径一致，见 component/load.rs）。返回 provider + `api`/`ctx`（Core 不解引用）。
-fn resolve_policy() -> Result<(ComponentId, *const (), *mut ()), SchedError> {
-    let reg = registry::get_registry().lock();
-    let ifs = get_interfaces().lock();
-    let view = ifs
-        .bind(
-            &reg,
-            b"scheduler",
-            InterfaceKind::Policy,
-            SCHEDULER_POLICY_ABI,
-        )
-        .map_err(|_| SchedError::NoPolicy)?;
-    Ok((view.provider, view.api, view.ctx))
+/// 选择调度策略（`kcore_sched_set_policy` 的 Core 实现）：把 `endpoint` 提交为
+/// 调度配置，**只记 EndpointId**——它不是 publish，也不做全局名字发现。
+///
+/// 校验（`registry → endpoints → images` 锁内，全部释放后才准备执行栈）：
+/// endpoint 存活 + contract + abi exact-match + provider 有
+/// `kcomp_service_dispatch`（策略 provider 只提供 image 级入口；Direct 的
+/// `api` / `ctx` 不参与策略执行）。
+///
+/// 上下文门禁：IRQ / service-call / policy 执行内拒绝（`-EINVAL`）——普通组合 /
+/// create 上下文可以选择一个已经 `Ready` 的 provider。选择必须在 provider 的
+/// create 返回 0 **之后**（endpoint 只在 staged publish 原子提交后存在）。
+pub fn set_policy(endpoint: EndpointId) -> Result<(), SchedError> {
+    // (1) 上下文门禁：调度 commit 路径内部 / IRQ / service call 不得改配置。
+    deny_scheduling_forbidden()?;
+
+    // (2) 锁内校验：contract + abi + 存活 + provider 必须有 dispatcher。
+    {
+        let components = registry::get_registry().lock();
+        let endpoints = endpoint::get_endpoints().lock();
+        let images = crate::component::image::get_images().lock();
+        let record = endpoints
+            .lookup(
+                &components,
+                endpoint,
+                crate::component::endpoint::ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
+                InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI),
+            )
+            .map_err(SchedError::PolicyEndpoint)?;
+        let instance = components
+            .get(record.owner)
+            .ok_or(SchedError::PolicyEndpoint(EndpointError::ProviderNotFound))?;
+        let image = images.get(instance.image).ok_or(SchedError::NoDispatcher)?;
+        if image.service_dispatch.is_none() {
+            return Err(SchedError::NoDispatcher);
+        }
+    }
+
+    // (3) 策略执行栈在**策略执行之外**准备（锁已全部释放）。
+    let stack = containment::alloc_policy_stack().ok_or(SchedError::NoPolicyStack)?;
+
+    // (4) 提交配置：只记 EndpointId + 准备好的栈。旧栈（若有）随替换释放——
+    //     策略调用是同步的，且 policy 执行内拒绝替换，故旧栈不在使用中。
+    let mut slot = policy().lock();
+    slot.endpoint = Some(endpoint);
+    slot.stack = Some(stack);
+    slot.retired = false;
+    Ok(())
 }
 
-/// 请求策略提议下一个任务。返回 None = 没有可运行任务（回锚点）。
+/// 组合辅助（monitor / ArchTest）：在 `provider` 实例上发现 `scheduler.policy`
+/// endpoint 并选择它。
 ///
-/// 提议非法（契约不符 / 提议 id 不在 runnable 列表）→ provider 被标
-/// `Failed`（隔离错误组件），Core 退化到确定性回退（id 序首项）——
-/// 一个完全错误的调度器组件不能挂起调度，也不能把 CPU 交给不存在的任务。
+/// 组合方**显式**做这一步（look up + select）；Core 的调度路径绝不按名字发现。
+pub fn select_provider(provider: ComponentId) -> Result<(), SchedError> {
+    let endpoint = {
+        let components = registry::get_registry().lock();
+        let endpoints = endpoint::get_endpoints().lock();
+        endpoints
+            .discover(
+                &components,
+                provider,
+                KCOMP_SCHEDULER_POLICY_NAME,
+                crate::component::endpoint::ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
+            )
+            .map_err(SchedError::PolicyEndpoint)?
+    };
+    set_policy(endpoint)
+}
+
+/// 确定性回退：id 序首项，且**提交前验证**它的 owner 仍允许运行。
+///
+/// 回退任务恰好属于刚失败的策略 provider 时返回 `None`（回锚点）——绝不把 CPU
+/// 交给已死实例的任务，也绝不把"已安装策略失败"退化成 `NoPolicy`。
+fn fallback_task(runnable: &[TaskId]) -> Option<TaskId> {
+    runnable
+        .first()
+        .copied()
+        .filter(|id| owner_still_runnable(*id))
+}
+
+/// 策略配置退役（失败 / 失效）：确定性回退生效，直到显式重新选择。
+///
+/// 栈的处理：`Some`（正常返回 / 准备失败，未被 panic 污染）立即释放——策略已
+/// 退役、不会再被调用；`None` 是 panic 路径保留的栈（边界内已 `mem::forget`），
+/// 既不能释放也绝不复用。
+fn retire_policy(stack: Option<MemoryLease>) {
+    drop(stack);
+    let mut slot = policy().lock();
+    slot.retired = true;
+    slot.stack = None;
+}
+
+/// 策略调用正常返回：把准备好的栈放回槽里复用（配置保持 Armed）。
+fn restore_policy_stack(stack: Option<MemoryLease>) {
+    let mut slot = policy().lock();
+    slot.stack = stack;
+}
+
+/// 请求策略提议下一个任务。返回 `None` = 没有可运行任务（回锚点）。
+///
+/// - **从未配置** → `NoPolicy`（绝不猜、绝不内置调度器）；
+/// - **已安装策略失效 / 失败** → 确定性回退（[`fallback_task`]），不再调用组件；
+/// - **提议非法**（提议 id 不在 Core 裁剪过的 runnable 列表内）或 provider 返回
+///   非 0 → provider **endpoint-aware 失败**（逻辑死亡 + authority 回收 + 全部
+///   endpoint 永久失效）+ 配置退役 + 确定性回退——一个完全错误的调度器组件不能
+///   挂起调度，也不能把 CPU 交给不存在的任务；
+/// - **provider panic** → panic 收尾已在 `call::call_policy` 内完成（含 inflight
+///   归还）；这里只退役配置 + 回退。panic 逃逸回**本调度帧**（它仍持有
+///   `IrqSaveGuard`），绝不穿越它，也不继承让出 CPU 的任务的边界。
 fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
     if runnable.is_empty() {
         return Ok(None);
     }
-    let (provider, api, ctx) = resolve_policy()?;
-    // SAFETY: api 由 provider 的 staged publish 写入（组件的静态 function table），
-    // provider Ready 与 exact ABI 校验已在 bind 内完成；table 在其组件存活期内有效。
-    let vtable = unsafe { &*(api as *const SchedulerPolicyApi) };
-    let ids: Vec<u32> = runnable.iter().map(|id| id.raw()).collect();
-    let current = cpu().lock().current.map_or(u32::MAX, |id| id.raw());
-    let proposed = (vtable.choose_next)(ctx, ids.as_ptr(), ids.len(), current);
 
-    let proposed = TaskId::from_raw(proposed);
-    crate::trace::emit(crate::trace::TraceEvent::PolicyProposal {
-        component: provider,
-        task: proposed,
-    });
-    if runnable.contains(&proposed) {
-        crate::trace::emit(crate::trace::TraceEvent::PolicyAccepted {
-            component: provider,
-            task: proposed,
-        });
-        return Ok(Some(proposed));
+    // (1) 配置快照：endpoint + 选择时准备好的栈（锁只在这一小段持有）。
+    let (endpoint, stack) = {
+        let mut slot = policy().lock();
+        let Some(endpoint) = slot.endpoint else {
+            return Err(SchedError::NoPolicy);
+        };
+        if slot.retired {
+            return Ok(fallback_task(runnable));
+        }
+        match slot.stack.take() {
+            Some(stack) => (endpoint, stack),
+            None => {
+                // 配置损坏（Armed 却没有栈）：退役 + 回退，绝不 panic。
+                slot.retired = true;
+                return Ok(fallback_task(runnable));
+            }
+        }
+    };
+
+    // (2) 锁内准备（registry → endpoints → images），全部释放后才调用组件。
+    let target = match call::prepare_policy(endpoint) {
+        Ok(target) => target,
+        Err(_) => {
+            // 已安装策略的 endpoint 失效 / provider 离开 Ready：退役 + 回退。
+            retire_policy(Some(stack));
+            return Ok(fallback_task(runnable));
+        }
+    };
+
+    // (3) 构造 wire frame（Core 编码；分配在这里，不在回调内——见
+    //     `abi/scheduler.toml` 的 CHOOSE_NEXT 格式）。
+    let current = cpu()
+        .lock()
+        .current
+        .map_or(KCOMP_SCHEDULER_NONE, |id| id.raw());
+    let args = current.to_le_bytes();
+    let mut input = Vec::with_capacity(runnable.len() * KCOMP_SCHEDULER_TASK_ID_LEN);
+    for id in runnable {
+        input.extend_from_slice(&id.raw().to_le_bytes());
     }
-    // 组件提出非法提议：隔离 + 回退（Core 不被错误组件挂起）。
-    crate::trace::emit(crate::trace::TraceEvent::PolicyRejected {
-        component: provider,
-        reason: crate::trace::RejectReason::NotRunnable,
-    });
-    registry::get_registry().lock().mark_failed(provider).ok();
-    Ok(Some(runnable[0]))
+    let mut output = [0u8; KCOMP_SCHEDULER_TASK_ID_LEN];
+    let frame = KcompCallFrame {
+        args: args.as_ptr(),
+        args_len: args.len(),
+        input: input.as_ptr(),
+        input_len: input.len(),
+        output: output.as_mut_ptr(),
+        output_len: output.len(),
+    };
+
+    // (4) 无锁调用：专用 PolicyCall 边界（Core 是 caller；panic 逃逸回本帧）。
+    let call::PolicyCallOutcome { outcome, stack } = call::call_policy(&target, &frame, stack);
+
+    match outcome {
+        CallOutcome::Returned(0) => {
+            let proposed = TaskId::from_raw(u32::from_le_bytes(output));
+            crate::trace::emit(crate::trace::TraceEvent::PolicyProposal {
+                component: target.owner,
+                task: proposed,
+            });
+            if runnable.contains(&proposed) {
+                crate::trace::emit(crate::trace::TraceEvent::PolicyAccepted {
+                    component: target.owner,
+                    task: proposed,
+                });
+                restore_policy_stack(stack);
+                return Ok(Some(proposed));
+            }
+            // 组件提出非法提议：endpoint-aware 隔离 + 退役 + 回退。
+            crate::trace::emit(crate::trace::TraceEvent::PolicyRejected {
+                component: target.owner,
+                reason: crate::trace::RejectReason::NotRunnable,
+            });
+            crate::component::fail_component(target.owner, ComponentLoadError::PolicyRejected);
+            retire_policy(stack);
+            Ok(fallback_task(runnable))
+        }
+        // provider 返回非 0（契约违约 / 内部错误）：提议不可用 → 同一档失败。
+        // 不发 trace 事件：`RejectReason` 的词表只描述"提议被 Core 拒绝"，
+        // 没有描述"provider 自己报告失败"的语义（新增 reason = ABI 变更，留给
+        // 下一阶段）；失败本身仍可从 `ComponentState{Failed}` 事件观察到。
+        CallOutcome::Returned(_) => {
+            crate::component::fail_component(target.owner, ComponentLoadError::PolicyRejected);
+            retire_policy(stack);
+            Ok(fallback_task(runnable))
+        }
+        // panic 收尾（Failed + endpoint 失效 + inflight 归还）已在 `call_policy`
+        // 内完成；`stack == None`（保留、退役）。这里只退役配置 + 回退。
+        CallOutcome::Panicked => {
+            retire_policy(stack);
+            Ok(fallback_task(runnable))
+        }
+        // 不可能：栈是选择时准备好的。防御性退役 + 回退，绝不 panic。
+        CallOutcome::NoStack => {
+            retire_policy(stack);
+            Ok(fallback_task(runnable))
+        }
+    }
 }
 
 /// 核心切换：from（当前任务或锚点）→ to（策略提议或锚点）。
@@ -223,7 +425,8 @@ fn schedule_next(
     abort: Option<(TaskId, ComponentId)>,
 ) -> Result<(), SchedError> {
     let guard = IrqSaveGuard::new();
-    // Phase 0：收集 + 提议（interfaces/registry 锁在 resolve_policy 内，短暂）
+    // Phase 0：收集 + 提议（策略调用的准备锁在 `call::prepare_policy` 内，短暂；
+    // 组件调用本身在 PolicyCall 边界内、无锁）。
     let runnable = collect_runnable();
     let mut next = pick_next(&runnable)?;
 
@@ -390,22 +593,59 @@ pub fn on_timer_tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::image::ComponentImageId;
-    use crate::component::interface::InterfaceRegistry;
-    use crate::component::registry::Registry;
+    use crate::component::ComponentState;
+    use crate::component::abi::InterfaceKind;
+    use crate::component::call::CallError;
+    use crate::component::containment;
+    use crate::component::endpoint::{ContractId, EndpointError};
+    use crate::component::image::{self, ComponentImageId};
+    use crate::component::registry;
+    use crate::errno::Errno;
+    use crate::generated::abi::KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT;
+    use crate::task::TaskError;
     use crate::test_support::{Rank, TestLock};
-    use alloc::vec;
     use core::ptr;
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
     const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
-    /// 串行化触碰进程全局 task table / registry 的调度测试。
+    /// 串行化触碰进程全局 task table / registry / 调度策略配置的调度测试。
     ///
     /// rank = SCHED（模块本地、最外层；见 [`crate::test_support`]）。
     static SCHED_TEST_LOCK: TestLock = TestLock::new(Rank::Sched);
 
     const ENTRY: usize = 0x8000_0000;
+
+    // ------------------------------------------------------------------
+    // 全局真相初始化 / 复位
+    // ------------------------------------------------------------------
+
+    /// 初始化本模块测试需要的进程级真相（幂等），清空策略配置并回到锚点边界。
+    ///
+    /// 策略配置是进程级 `Once`：一次选择会残留到后续用例，因此每个用例显式
+    /// 清空（调度用例由 [`SCHED_TEST_LOCK`] 串行化）。
+    fn init_world() {
+        crate::memory::test_support::ensure_init();
+        crate::task::init();
+        init();
+        registry::init();
+        crate::component::interface::init();
+        endpoint::init();
+        image::init();
+        crate::resource::init();
+        clear_policy();
+        reset_cpu();
+        containment::enter_anchor();
+    }
+
+    /// 清空调度策略配置（丢弃准备好的执行栈）。
+    fn clear_policy() {
+        let mut slot = policy().lock();
+        slot.endpoint = None;
+        slot.stack = None;
+        slot.retired = false;
+    }
 
     /// 全局 CPU 真相是进程级 `Once`：`run()` / `yield` / `exit` 会留下
     /// `current` / `anchor`，用例结束必须复位，否则污染后续用例（例如 handle
@@ -420,6 +660,10 @@ mod tests {
         cpu().lock().current = id;
     }
 
+    // ------------------------------------------------------------------
+    // 实例 / endpoint / 任务
+    // ------------------------------------------------------------------
+
     /// 全局 registry 里的一个 `Ready` 活实例（同一 image 可无限复用，id 跨用例累积）。
     fn ready_component(_name: &[u8]) -> ComponentId {
         let mut reg = registry::get_registry().lock();
@@ -428,6 +672,68 @@ mod tests {
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
         id
+    }
+
+    /// 一个 Ready 的策略 provider：image 表登记（可选）dispatcher，registry 记录
+    /// opaque instance state。
+    fn ready_policy_provider(
+        name: &[u8],
+        dispatcher: Option<usize>,
+        state: *mut (),
+    ) -> ComponentId {
+        let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
+        let mut reg = registry::get_registry().lock();
+        let id = reg.declare(image).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        reg.record_instance_state(id, state).unwrap();
+        id
+    }
+
+    /// 发布并提交一个名为 `scheduler.policy` 的 endpoint（contract / abi 由调用方
+    /// 给定，discover 也按同一 contract）。
+    fn publish_named_endpoint(
+        provider: ComponentId,
+        port: u32,
+        contract: ContractId,
+        abi: InterfaceAbi,
+    ) -> EndpointId {
+        let reg = registry::get_registry().lock();
+        let mut eps = endpoint::get_endpoints().lock();
+        eps.stage_publish(
+            &reg,
+            provider,
+            KCOMP_SCHEDULER_POLICY_NAME,
+            contract,
+            InterfaceKind::Policy,
+            abi,
+            port,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+        .unwrap();
+        eps.commit_pending(&reg, provider).unwrap();
+        eps.discover(&reg, provider, KCOMP_SCHEDULER_POLICY_NAME, contract)
+            .unwrap()
+    }
+
+    /// 发布并提交 `scheduler.policy` endpoint（contract + abi 精确匹配）。
+    fn publish_policy_endpoint(provider: ComponentId, port: u32) -> EndpointId {
+        publish_named_endpoint(
+            provider,
+            port,
+            ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
+            InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI),
+        )
+    }
+
+    /// 完整组合：Ready provider + endpoint + `set_policy`（成功即 Armed）。
+    fn install_policy(name: &[u8], dispatcher: usize, state: *mut ()) -> (ComponentId, EndpointId) {
+        let provider = ready_policy_provider(name, Some(dispatcher), state);
+        let endpoint = publish_policy_endpoint(provider, 0);
+        set_policy(endpoint).expect("policy selection must succeed");
+        (provider, endpoint)
     }
 
     /// 全局 task 表里的一个 `Runnable` 任务（owner 是否存活由调用方决定）。
@@ -443,45 +749,6 @@ mod tests {
         task
     }
 
-    /// 向全局 interfaces 发布一个 `scheduler` policy（provider 走到 `Ready`）。
-    ///
-    /// `vtable` 只以指针存入 binding，调用方的局部 vtable 必须活到用例结束。
-    fn publish_policy(_name: &[u8], vtable: &SchedulerPolicyApi) -> ComponentId {
-        let provider = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            id
-        };
-        {
-            let reg = registry::get_registry().lock();
-            let mut ifs = crate::component::interface::get_interfaces().lock();
-            ifs.stage_publish(
-                &reg,
-                provider,
-                b"scheduler",
-                InterfaceKind::Policy,
-                SCHEDULER_POLICY_ABI,
-                vtable as *const SchedulerPolicyApi as *const (),
-                ptr::null_mut(),
-            )
-            .unwrap();
-            ifs.commit_pending(&reg, provider).unwrap();
-        }
-        registry::get_registry()
-            .lock()
-            .finish_start(provider)
-            .unwrap();
-        provider
-    }
-
-    /// 隔离一个不再可信的 policy provider：`bind` 的存活复验从此失败
-    /// （`resolve_policy` → `NoPolicy`）。让"无 policy"用例与执行顺序无关。
-    fn retire_policy(provider: ComponentId) {
-        registry::get_registry().lock().mark_failed(provider).ok();
-    }
-
     fn state_of(task: TaskId) -> TaskState {
         crate::task::get_task_table()
             .lock()
@@ -494,263 +761,277 @@ mod tests {
         assert!(crate::task::get_task_table().lock().remove(task).is_ok());
     }
 
-    /// 纯逻辑：任务耗尽后 run() 不再切换（无锚点捕获、无 state 变更）。
-    #[test]
-    fn run_with_no_runnable_tasks_is_noop() {
-        let _sched = SCHED_TEST_LOCK.lock();
-        let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
-        let _guard = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        // 空表：run 直接返回，不 panic、不切换。
-        assert_eq!(run(), Ok(()));
-    }
-
-    /// `Failed` 组件拥有的 Runnable 任务既不进入候选，也不通过 commit 门禁；
-    /// `run()` 安全返回 no-op（不挂起、不误调度）。
-    #[test]
-    fn failed_component_tasks_are_not_scheduled() {
-        let _sched = SCHED_TEST_LOCK.lock();
-        let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-
-        // Given：一个 Ready 组件 + 一个 Runnable 任务（直接进全局 task 表）。
-        let owner = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        let task = crate::task::get_task_table()
-            .lock()
-            .create(owner, 0x8000_0000, ptr::null_mut())
-            .unwrap();
-        crate::task::get_task_table()
-            .lock()
-            .transition(task, TaskState::Runnable)
-            .unwrap();
-
-        // 活实例：候选包含它，commit 门禁放行。
-        assert!(collect_runnable().contains(&task));
-        assert!(owner_still_runnable(task));
-
-        // When：组件失败。
-        registry::get_registry().lock().mark_failed(owner).unwrap();
-
-        // Then：候选剔除、commit 门禁拒绝、run() no-op。
-        assert!(!collect_runnable().contains(&task));
-        assert!(!owner_still_runnable(task));
-        assert_eq!(run(), Ok(()));
-
-        // 清理：移除任务，避免污染其它调度测试。
-        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
-    }
-
-    /// 提议验证：不在 runnable 列表里的 id 一律拒绝——回退到 id 序首项，
-    /// 且 provider 被标 Failed（隔离错误组件，Core 不被挂起）。
-    #[test]
-    fn invalid_proposal_falls_back_and_isolates_provider() {
-        crate::memory::test_support::ensure_init();
-        let _guard = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-
-        // 直接构造 registry + interfaces（不经过全局）：host 可测的生产类型。
-        let mut reg = Registry::new();
-        let mut ifs = InterfaceRegistry::new();
-
-        // 两个 Runnable 任务（id 0、1）。
-        let mut table = crate::task::TaskTable::new();
-        const ENTRY: usize = 0x8000_0000;
-        let owner = ComponentId::from_raw(1);
-        let a = table.create(owner, ENTRY, ptr::null_mut()).unwrap();
-        let b = table.create(owner, ENTRY, ptr::null_mut()).unwrap();
-        table.transition(a, TaskState::Runnable).unwrap();
-        table.transition(b, TaskState::Runnable).unwrap();
-
-        // 一个 Ready 的"调度器"组件，发布坏策略（提议 999，不在列表里）。
-        extern "C" fn bad_choose(
-            _ctx: *mut (),
-            _runnable: *const u32,
-            _count: usize,
-            _current: u32,
-        ) -> u32 {
-            999
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: bad_choose,
-        };
-        let provider = reg.declare(IMAGE).unwrap();
-        reg.resolve(provider).unwrap();
-        reg.begin_start(provider).unwrap();
-        ifs.stage_publish(
+    /// endpoint 是否已永久失效（`EndpointDead`）。
+    fn endpoint_is_dead(endpoint: EndpointId) -> bool {
+        let reg = registry::get_registry().lock();
+        endpoint::get_endpoints().lock().lookup(
             &reg,
-            provider,
-            b"scheduler",
-            InterfaceKind::Policy,
-            SCHEDULER_POLICY_ABI,
-            &vtable as *const SchedulerPolicyApi as *const (),
-            ptr::null_mut(),
-        )
-        .unwrap();
-        ifs.commit_pending(&reg, provider).unwrap();
-        reg.finish_start(provider).unwrap();
-
-        // 走 resolve_policy 的局部版本：直接对局部 registry 解析（不碰全局）。
-        let view = ifs
-            .bind(
-                &reg,
-                b"scheduler",
-                InterfaceKind::Policy,
-                SCHEDULER_POLICY_ABI,
-            )
-            .unwrap();
-        let vtable = unsafe { &*(view.api as *const SchedulerPolicyApi) };
-        let ids: Vec<u32> = vec![a.raw(), b.raw()];
-        let proposed = (vtable.choose_next)(view.ctx, ids.as_ptr(), ids.len(), u32::MAX);
-        let proposed = TaskId::from_raw(proposed);
-        assert_eq!(
-            proposed,
-            TaskId::from_raw(999),
-            "坏策略确实提议了不存在的任务"
-        );
-
-        // Core 侧验证逻辑：非法提议 → 回退 + 隔离（等价于 pick_next 的内部路径）。
-        assert!(![a, b].contains(&proposed));
-        reg.mark_failed(provider).unwrap();
-        let fallback = vec![a, b][0];
-        assert_eq!(fallback, a, "回退 = id 序首项（确定性）");
-        assert_eq!(
-            reg.get(provider).unwrap().state,
-            crate::component::ComponentState::Failed
-        );
+            endpoint,
+            ContractId::from_raw(KCOMP_SCHEDULER_POLICY_CONTRACT),
+            InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI),
+        ) == Err(EndpointError::EndpointDead)
     }
 
-    /// 对抗（**真实全局路径**，非局部复刻）：坏调度器提议不存在的任务。
-    ///
-    /// 断言三件事：
-    /// 1. Core 真相没有被错误组件改写 —— 退回确定性回退（id 序首项），
-    ///    绝不把 CPU 交给那个不存在的 TaskId(999)；
-    /// 2. 错误 provider 被隔离（`Failed`）；
-    /// 3. **真实事件序列**（只看 provider 自己的事件，因此与并行测试互不干扰）：
-    ///    `出生 → Ready → 坏提议 → Core 拒绝 → 隔离`。
+    // ------------------------------------------------------------------
+    // 测试用 dispatcher（host fake 不执行组件入口体；模拟执行由
+    // `containment::with_test_policy_dispatch` / `with_test_policy_panic` 安装）
+    // ------------------------------------------------------------------
+
+    /// frame 的 `args` = current TaskId（u32 LE；`KCOMP_SCHEDULER_NONE` = 无）。
+    fn frame_current(frame: &KcompCallFrame) -> u32 {
+        assert_eq!(
+            frame.args_len, KCOMP_SCHEDULER_TASK_ID_LEN,
+            "CHOOSE_NEXT 的 args = current TaskId"
+        );
+        // SAFETY: Core 构造的 frame；args_len = 4，本调用期间有效。
+        let bytes = unsafe { core::slice::from_raw_parts(frame.args, KCOMP_SCHEDULER_TASK_ID_LEN) };
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// frame 的 `input` = runnable 列表（逐个 u32 LE，非空）。
+    fn frame_runnable_count(frame: &KcompCallFrame) -> usize {
+        assert!(
+            frame.input_len > 0 && frame.input_len.is_multiple_of(KCOMP_SCHEDULER_TASK_ID_LEN),
+            "CHOOSE_NEXT 的 input = 非空 u32 列表"
+        );
+        frame.input_len / KCOMP_SCHEDULER_TASK_ID_LEN
+    }
+
+    /// 读 input 里第 `slot` 个 TaskId。
+    fn frame_runnable_at(frame: &KcompCallFrame, slot: usize) -> u32 {
+        let offset = slot * KCOMP_SCHEDULER_TASK_ID_LEN;
+        // SAFETY: 调用方保证 slot < count；input_len = count * 4，本调用期间有效。
+        let bytes = unsafe {
+            core::slice::from_raw_parts(frame.input.add(offset), KCOMP_SCHEDULER_TASK_ID_LEN)
+        };
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// 把提议写进 output。
+    fn write_proposal(frame: &KcompCallFrame, task: u32) {
+        assert_eq!(frame.output_len, KCOMP_SCHEDULER_TASK_ID_LEN);
+        // SAFETY: output_len = 4（Core 构造），output 可写。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                task.to_le_bytes().as_ptr(),
+                frame.output,
+                KCOMP_SCHEDULER_TASK_ID_LEN,
+            );
+        }
+    }
+
+    /// 提议 runnable 首项（Core 会验证它落在列表内）。
+    extern "C" fn first_runnable(
+        _state: *mut (),
+        _port: u32,
+        method: u32,
+        frame: *const KcompCallFrame,
+    ) -> i32 {
+        if method != KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT {
+            return Errno::EINVAL.code();
+        }
+        // SAFETY: Core 构造的 frame 在本调用期间有效。
+        let frame = unsafe { &*frame };
+        let first = frame_runnable_at(frame, 0);
+        write_proposal(frame, first);
+        0
+    }
+
+    /// 观察 frame 的 dispatcher：记录 current 与 runnable 数量，再提议首项。
+    static SEEN_CURRENT: AtomicU32 = AtomicU32::new(u32::MAX);
+    static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn first_runnable_observed(
+        _state: *mut (),
+        port: u32,
+        method: u32,
+        frame: *const KcompCallFrame,
+    ) -> i32 {
+        // SAFETY: Core 构造的 frame 在本调用期间有效。
+        let frame = unsafe { &*frame };
+        SEEN_CURRENT.store(frame_current(frame), Ordering::SeqCst);
+        SEEN_COUNT.store(frame_runnable_count(frame), Ordering::SeqCst);
+        first_runnable(
+            ptr::null_mut(),
+            port,
+            method,
+            frame as *const KcompCallFrame,
+        )
+    }
+
+    /// 提议一个**不存在**的 TaskId(999)：Core 必须拒绝并隔离 provider。
+    extern "C" fn propose_ghost(
+        _state: *mut (),
+        _port: u32,
+        _method: u32,
+        frame: *const KcompCallFrame,
+    ) -> i32 {
+        // SAFETY: Core 构造的 frame 在本调用期间有效。
+        write_proposal(unsafe { &*frame }, 999);
+        0
+    }
+
+    /// 返回非 0 方法状态：提议不可用（Core 必须隔离 provider + 回退）。
+    extern "C" fn choose_fails(
+        _state: *mut (),
+        _port: u32,
+        _method: u32,
+        _frame: *const KcompCallFrame,
+    ) -> i32 {
+        Errno::EIO.code()
+    }
+
+    // ------------------------------------------------------------------
+    // 选择（`kcore_sched_set_policy`）：校验、上下文、契约作用域
+    // ------------------------------------------------------------------
+
+    /// 验收：选择只接受**活**的 `scheduler.policy` endpoint，且 provider 必须真的
+    /// 有 `kcomp_service_dispatch`；被拒绝的选择不写入配置。
+    #[test]
+    fn set_policy_rejects_dead_endpoint_and_provider_without_dispatcher() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        // (a) provider 没有 dispatcher：能力缺失 → ENOSYS，配置不变。
+        let no_dispatch = ready_policy_provider(b"sched_select_no_dispatch", None, ptr::null_mut());
+        let endpoint = publish_policy_endpoint(no_dispatch, 0);
+        assert_eq!(set_policy(endpoint), Err(SchedError::NoDispatcher));
+        assert_eq!(Errno::from(SchedError::NoDispatcher), Errno::ENOSYS);
+        assert!(policy().lock().endpoint.is_none(), "拒绝的选择不得写入配置");
+
+        // (b) endpoint 已永久失效（provider 停止 / 失败等价终态）→ ENOENT。
+        let provider = ready_policy_provider(
+            b"sched_select_dead",
+            Some(first_runnable as *const () as usize),
+            ptr::null_mut(),
+        );
+        let dead = publish_policy_endpoint(provider, 0);
+        endpoint::get_endpoints().lock().invalidate_endpoint(dead);
+        assert_eq!(
+            set_policy(dead),
+            Err(SchedError::PolicyEndpoint(EndpointError::EndpointDead))
+        );
+        assert_eq!(
+            Errno::from(SchedError::PolicyEndpoint(EndpointError::EndpointDead)),
+            Errno::ENOENT
+        );
+        assert!(policy().lock().endpoint.is_none());
+
+        // (c) provider 离开 Ready（Failed）→ 同样拒绝（死 endpoint）。
+        let failed = ready_policy_provider(
+            b"sched_select_failed",
+            Some(first_runnable as *const () as usize),
+            ptr::null_mut(),
+        );
+        let failed_endpoint = publish_policy_endpoint(failed, 0);
+        registry::get_registry().lock().mark_failed(failed).unwrap();
+        assert_eq!(
+            set_policy(failed_endpoint),
+            Err(SchedError::PolicyEndpoint(EndpointError::EndpointDead))
+        );
+        assert!(policy().lock().endpoint.is_none());
+        assert!(!policy().lock().retired, "从未选择过 = 未退役");
+    }
+
+    /// 验收：组合发现按 **(provider, port_name, contract)**，不是按名字——同名
+    /// 端口发布别的契约不会被误选；IRQ / service-call 上下文内选择被拒（`-EINVAL`）。
+    #[test]
+    fn policy_discovery_is_contract_scoped_and_selection_is_context_gated() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        // 同名端口 + 不同契约：select_provider 绝不误选"名字像调度器"的 endpoint。
+        let wrong = ready_policy_provider(
+            b"sched_wrong_contract",
+            Some(first_runnable as *const () as usize),
+            ptr::null_mut(),
+        );
+        publish_named_endpoint(
+            wrong,
+            0,
+            ContractId::from_raw(0xDEAD_BEEF),
+            InterfaceAbi::from_raw(0xDEAD_BEEF),
+        );
+        assert_eq!(
+            select_provider(wrong),
+            Err(SchedError::PolicyEndpoint(EndpointError::ContractMismatch))
+        );
+        assert!(policy().lock().endpoint.is_none());
+
+        // 正确契约：发现 + 选择成功，配置只记 EndpointId。
+        let good = ready_policy_provider(
+            b"sched_good_contract",
+            Some(first_runnable as *const () as usize),
+            ptr::null_mut(),
+        );
+        let endpoint = publish_policy_endpoint(good, 0);
+        assert_eq!(select_provider(good), Ok(()));
+        assert_eq!(policy().lock().endpoint, Some(endpoint));
+
+        // 上下文门禁：IRQ / service call 内不得改调度配置（-EINVAL）。
+        containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+            assert_eq!(set_policy(endpoint), Err(SchedError::InvalidTransition));
+        });
+        containment::with_test_service_boundary(good, endpoint, None, || {
+            assert_eq!(set_policy(endpoint), Err(SchedError::InvalidTransition));
+        });
+        // 门禁恢复后选择照常（同一 endpoint 重新提交是幂等的）。
+        assert_eq!(set_policy(endpoint), Ok(()));
+    }
+
+    // ------------------------------------------------------------------
+    // 提议验证 / 失败处理 / 确定性回退
+    // ------------------------------------------------------------------
+
+    /// 验收：非法提议 → provider **endpoint-aware** 失败（逻辑死亡 + 全部
+    /// endpoint 永久失效）+ 配置退役 + 确定性回退（id 序首项）。
     #[test]
     #[cfg(feature = "trace")]
-    fn invalid_proposal_emits_real_event_sequence_and_keeps_truth() {
+    fn invalid_proposal_fails_provider_endpoint_aware_and_falls_back() {
         let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let _trace = crate::trace::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
+        init_world();
 
-        // Given：一个 Ready 的坏调度器组件 —— 永远提议 TaskId(999)。
-        extern "C" fn bad_choose(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
-            999
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: bad_choose,
-        };
-        let provider = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            id
-        };
-        {
-            let reg = registry::get_registry().lock();
-            let mut ifs = crate::component::interface::get_interfaces().lock();
-            ifs.stage_publish(
-                &reg,
-                provider,
-                b"scheduler",
-                InterfaceKind::Policy,
-                SCHEDULER_POLICY_ABI,
-                &vtable as *const SchedulerPolicyApi as *const (),
-                ptr::null_mut(),
-            )
-            .unwrap();
-            ifs.commit_pending(&reg, provider).unwrap();
-        }
-        registry::get_registry()
-            .lock()
-            .finish_start(provider)
-            .unwrap();
-
-        // 一个 Ready 的 task owner + 一个 Runnable 任务（真实全局 task 表）。
-        let owner = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        let task = crate::task::get_task_table()
-            .lock()
-            .create(owner, 0x8000_0000, ptr::null_mut())
-            .unwrap();
-        crate::task::get_task_table()
-            .lock()
-            .transition(task, TaskState::Runnable)
-            .unwrap();
-
-        // When：走**真实** pick_next（resolve_policy → bind → 提议 → Core 验证）。
+        // Given：已安装的策略永远提议不存在的 TaskId(999) + 一个活 owner 的任务。
+        let (provider, endpoint) = install_policy(
+            b"sched_bad_proposal",
+            propose_ghost as *const () as usize,
+            ptr::null_mut(),
+        );
+        let owner = ready_component(b"sched_bad_proposal_owner");
+        let task = runnable_task(owner);
         let runnable = collect_runnable();
-        assert!(runnable.contains(&task), "活实例的任务应在候选里");
-        let picked = pick_next(&runnable).unwrap();
+        assert!(runnable.contains(&task));
 
-        // Then 1：真相未被改写 —— 回退到 id 序首项，而不是那个不存在的 999。
-        assert_ne!(picked, Some(TaskId::from_raw(999)));
-        assert_eq!(
-            picked,
-            runnable.first().copied(),
-            "回退 = id 序首项（确定性）"
-        );
+        // When：走真实 pick_next（锁内准备 → PolicyCall 边界 → Core 验证提议）。
+        let picked = containment::with_test_policy_dispatch(propose_ghost, || pick_next(&runnable));
 
-        // Then 2：错误 provider 被隔离。
-        assert_eq!(
-            registry::get_registry().lock().get(provider).unwrap().state,
-            crate::component::ComponentState::Failed
-        );
+        // Then 1：真相未被改写——回退到 id 序首项，而不是不存在的 999。
+        assert_eq!(picked, Ok(Some(task)));
 
-        // Then 3：真实事件序列（子序列匹配，对并行测试插入的事件免疫）。
-        use crate::component::ComponentState;
+        // Then 2：provider 逻辑死亡；endpoint 永久失效；inflight 已归还。
+        let reg = registry::get_registry().lock();
+        assert_eq!(reg.get(provider).unwrap().state, ComponentState::Failed);
+        assert_eq!(reg.active_calls(provider), 0);
+        drop(reg);
+        assert!(endpoint_is_dead(endpoint));
+
+        // Then 3：配置退役；后续调度仍是确定性回退，绝不退化成 NoPolicy。
+        assert!(policy().lock().retired);
+        assert_eq!(pick_next(&runnable), Ok(Some(task)));
+        assert_eq!(pick_next(&runnable), Ok(Some(task)));
+
+        // Then 4：真实事件序列：坏提议 → Core 拒绝 → provider 隔离。
         use crate::trace::{RejectReason, TraceEvent};
         crate::trace::test_support::assert_subsequence(
             &[
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: None,
-                    to: ComponentState::Declared,
-                },
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: Some(ComponentState::Declared),
-                    to: ComponentState::Resolved,
-                },
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: Some(ComponentState::Resolved),
-                    to: ComponentState::Starting,
-                },
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: Some(ComponentState::Starting),
-                    to: ComponentState::Ready,
-                },
                 TraceEvent::PolicyProposal {
                     component: provider,
                     task: TaskId::from_raw(999),
@@ -768,235 +1049,121 @@ mod tests {
             &crate::trace::test_support::events(),
         );
 
-        // 清理：移除任务，避免污染其它调度测试。
-        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
-    }
-
-    /// 性能基线（`make bench`）：**调度 proposal + Core 验证** 的成本。
-    ///
-    /// 只测到 `pick_next` 为止。commit（`TaskTable::transition`）单独测；
-    /// 真正的 context switch 必须在目标端测 —— host 的 `context_switch` 是
-    /// Fake no-op（见 docs/development/benchmark.md §6）。
-    #[test]
-    #[ignore = "性能基线：make bench 手动跑"]
-    fn bench_scheduler_propose_and_validate() {
-        let _sched = SCHED_TEST_LOCK.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-
-        // 好调度器：永远提议 runnable[0]（合法 → 走 accept 路径）。
-        extern "C" fn good_choose(_: *mut (), runnable: *const u32, count: usize, _: u32) -> u32 {
-            if count == 0 {
-                u32::MAX
-            } else {
-                unsafe { *runnable }
-            }
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: good_choose,
-        };
-        let provider = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            id
-        };
-        {
-            let reg = registry::get_registry().lock();
-            let mut ifs = crate::component::interface::get_interfaces().lock();
-            ifs.stage_publish(
-                &reg,
-                provider,
-                b"scheduler",
-                InterfaceKind::Policy,
-                SCHEDULER_POLICY_ABI,
-                &vtable as *const SchedulerPolicyApi as *const (),
-                ptr::null_mut(),
-            )
-            .unwrap();
-            ifs.commit_pending(&reg, provider).unwrap();
-        }
-        registry::get_registry()
-            .lock()
-            .finish_start(provider)
-            .unwrap();
-
-        let owner = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(IMAGE).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        let task = crate::task::get_task_table()
-            .lock()
-            .create(owner, 0x8000_0000, ptr::null_mut())
-            .unwrap();
-        crate::task::get_task_table()
-            .lock()
-            .transition(task, TaskState::Runnable)
-            .unwrap();
-        let runnable = collect_runnable();
-
-        crate::bench::report_environment();
-
-        // 全路径：resolve_policy（锁 + bind）+ 提议 + Core 验证。
-        crate::bench::run("sched.pick_next", 1_000, || pick_next(&runnable).unwrap()).report();
-
-        // commit：状态转移的验证 + 落笔（不含真正切换）。
-        let mut table = crate::task::TaskTable::new();
-        let local_owner = ComponentId::from_raw(0x7b);
-        let local = table
-            .create(local_owner, 0x8000_0000, ptr::null_mut())
-            .unwrap();
-        table.transition(local, TaskState::Runnable).unwrap();
-        let mut commit = crate::bench::Bench::new("sched.task_transition");
-        commit.run(1_000, || {
-            table
-                .transition(local, TaskState::Running(CpuId(0)))
-                .unwrap();
-            table.transition(local, TaskState::Runnable).unwrap();
-        });
-        commit.finish().report();
-
-        // 清理：移除任务，避免污染其它调度测试。
-        assert!(crate::task::get_task_table().lock().remove(task).is_ok());
-    }
-
-    /// 对抗：提议一个**存在但不可运行**的任务（`Created`，不在 Core 裁剪过的
-    /// runnable 列表里）——与"提议不存在的 id"同等拒绝：Core 回退 id 序首项、
-    /// 隔离坏 provider、发 `NotRunnable` 事件；被提议任务的状态不被改写。
-    #[test]
-    #[cfg(feature = "trace")]
-    fn proposal_of_existing_but_not_runnable_task_is_rejected() {
-        let _sched = SCHED_TEST_LOCK.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        let _trace = crate::trace::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-
-        // Given：一个 Created 任务（存在但不在候选里）+ 一个 Runnable 任务。
-        let owner = ready_component(b"sched_created_owner");
-        let created = crate::task::get_task_table()
-            .lock()
-            .create(owner, ENTRY, ptr::null_mut())
-            .unwrap();
-        let live = runnable_task(owner);
-        assert_eq!(state_of(created), TaskState::Created);
-
-        // Given：一个坏策略，永远提议那个 Created 任务。
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static PROPOSED: AtomicU32 = AtomicU32::new(0);
-        PROPOSED.store(created.raw(), Ordering::SeqCst);
-        extern "C" fn propose_created(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
-            PROPOSED.load(Ordering::SeqCst)
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: propose_created,
-        };
-        let provider = publish_policy(b"sched_created_policy", &vtable);
-
-        // When：走真实提议验证路径（Core 自己裁剪候选 → 验证 → 拒绝）。
-        let runnable = collect_runnable();
-        assert!(runnable.contains(&live), "活任务应在候选里");
-        assert!(!runnable.contains(&created), "Created 不进候选");
-        let picked = pick_next(&runnable).unwrap();
-
-        // Then：拒绝 + 确定性回退；被提议任务状态不变。
-        assert_eq!(picked, Some(live));
-        assert_eq!(
-            state_of(created),
-            TaskState::Created,
-            "被拒绝的提议不得改写真相"
-        );
-        assert_eq!(
-            registry::get_registry().lock().get(provider).unwrap().state,
-            crate::component::ComponentState::Failed,
-            "坏 provider 被隔离"
-        );
-
-        // Then：真实事件序列：坏提议 → Core 拒绝 → provider 隔离。
-        use crate::component::ComponentState;
-        use crate::trace::{RejectReason, TraceEvent};
-        crate::trace::test_support::assert_subsequence(
-            &[
-                TraceEvent::PolicyProposal {
-                    component: provider,
-                    task: created,
-                },
-                TraceEvent::PolicyRejected {
-                    component: provider,
-                    reason: RejectReason::NotRunnable,
-                },
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: Some(ComponentState::Ready),
-                    to: ComponentState::Failed,
-                },
-            ],
-            &crate::trace::test_support::events(),
-        );
-
         // 清理。
-        remove_task(created);
-        remove_task(live);
-        retire_policy(provider);
+        remove_task(task);
     }
 
-    /// 对抗（**真实 commit 门禁**）：scheduler provider 恰好是唯一 Runnable
-    /// 任务的 owner。坏提议触发 provider 隔离，随后回退任务过不了 commit-time
-    /// `owner_still_runnable` 复验 —— Core 退回锚点，绝不把 CPU 交给已死实例
-    /// 的任务；全程不挂起、不改写任务状态。
-    ///
-    /// 记录一个契约缺口：`RejectReason::OwnerNotRunnable` 目前是**未发射**的
-    /// 词汇（Commit 门禁静默回退），本用例显式断言它没有出现——未来该门禁若
-    /// 开始发事件，这条断言会失败并提醒更新事件契约。
+    /// 验收：provider 返回非 0（契约违约）与非法提议同档——隔离 + 退役 + 回退。
     #[test]
-    #[cfg(feature = "trace")]
-    fn dead_owner_gate_blocks_dispatch_of_isolated_providers_task() {
+    fn non_zero_policy_status_is_isolated_and_falls_back() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        let _trace = crate::trace::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：同一实例既是 policy provider，又是唯一 Runnable 任务的 owner。
-        extern "C" fn propose_ghost(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
-            0xDEAD
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: propose_ghost,
-        };
-        let provider = publish_policy(b"sched_owner_gate", &vtable);
-        let task = runnable_task(provider);
-        assert!(
-            collect_runnable().contains(&task),
-            "活 owner 的任务应在候选里"
+        let (provider, endpoint) = install_policy(
+            b"sched_status_fail",
+            choose_fails as *const () as usize,
+            ptr::null_mut(),
         );
+        let owner = ready_component(b"sched_status_fail_owner");
+        let task = runnable_task(owner);
+        let runnable = collect_runnable();
 
-        // When：从锚点进入调度（真实 run → pick_next → commit 门禁）。
-        let result = run();
+        let picked = containment::with_test_policy_dispatch(choose_fails, || pick_next(&runnable));
+        assert_eq!(picked, Ok(Some(task)), "非 0 返回 → 确定性回退");
+        assert!(registry::get_registry().lock().is_failed(provider));
+        assert!(endpoint_is_dead(endpoint));
+        assert!(policy().lock().retired);
+        assert_eq!(pick_next(&runnable), Ok(Some(task)));
 
-        // Then 1：不挂起、不 commit —— 任务保持 Runnable，CPU 无 current。
-        assert_eq!(result, Ok(()));
+        remove_task(task);
+    }
+
+    /// 验收：**策略 panic 的完整收尾**——逃逸回挂起的调度帧（不继承让出 CPU 的
+    /// 任务边界、不穿越它），provider 被标 `Failed`、全部 endpoint 永久失效、
+    /// inflight 归还；配置退役后确定性回退生效（不是 `NoPolicy`）。
+    ///
+    /// host fake 不执行组件入口体，真实 escape 由 QEMU 证明；这里用
+    /// `with_test_policy_panic` 走**同一**失败收尾路径（pick_next → prepare_policy
+    /// → call_policy → Panicked → fail_component + 退役 + 回退）。
+    #[test]
+    fn policy_panic_returns_to_the_scheduler_frame_and_retires_to_fallback() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        // Given：已安装策略 + 一个正在运行（让出 CPU）的任务边界 + 另一个候选。
+        let (provider, endpoint) = install_policy(
+            b"sched_panic",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
+        let owner = ready_component(b"sched_panic_owner");
+        let yielding = runnable_task(owner);
+        let other = runnable_task(owner);
+        set_current(Some(yielding));
+        containment::enter_task(yielding, owner);
+
+        // When：策略在边界内 panic（模拟；真实栈切换 / escape 由 QEMU 证明）。
+        let runnable = collect_runnable();
+        let picked = containment::with_test_policy_panic(|| pick_next(&runnable));
+
+        // Then 1：Core 没被挂起——确定性回退（id 序首项）且提交前已验证 owner。
+        assert_eq!(picked, Ok(Some(yielding)));
+
+        // Then 2：provider 逻辑死亡 + endpoint 永久失效 + inflight 归还。
+        let reg = registry::get_registry().lock();
+        assert_eq!(reg.get(provider).unwrap().state, ComponentState::Failed);
+        assert_eq!(reg.active_calls(provider), 0, "panic 路径必须归还 inflight");
+        drop(reg);
+        assert!(endpoint_is_dead(endpoint));
+
+        // Then 3：panic **没有**继承 / 穿越让出 CPU 的任务边界——边界原样恢复。
+        let info = containment::active_escape().expect("yielding task boundary intact");
+        assert_eq!(info.task(), Some(yielding));
+        assert_eq!(info.owner(), Some(owner));
+
+        // Then 4：配置退役；下一次调度仍是确定性回退（不退化 NoPolicy），且不再
+        //         调用任何组件（栈已保留、退役，绝不复用）。
+        assert!(policy().lock().retired);
+        assert!(policy().lock().stack.is_none(), "panic 的栈必须退役");
+        assert_eq!(pick_next(&runnable), Ok(Some(yielding)));
+        assert_eq!(pick_next(&runnable), Ok(Some(yielding)));
+
+        // 清理。
+        containment::enter_anchor();
+        reset_cpu();
+        remove_task(yielding);
+        remove_task(other);
+    }
+
+    /// 验收：失败策略的回退任务恰好属于**刚失败的 provider** 时，回退在提交前
+    /// 被验证拒绝（owner 已死）→ 回锚点，绝不把 CPU 交给已死实例的任务。
+    #[test]
+    fn failed_provider_owning_the_only_task_falls_back_to_the_anchor() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        // Given：provider 自己拥有唯一 Runnable 任务，策略 panic。
+        let (provider, _endpoint) = install_policy(
+            b"sched_owner_gate",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
+        let task = runnable_task(provider);
+        let runnable = collect_runnable();
+        assert!(runnable.contains(&task));
+
+        // When
+        let picked = containment::with_test_policy_panic(|| pick_next(&runnable));
+
+        // Then：回退被提交前验证拒绝 → 回锚点；任务保持 Runnable、无 current。
+        assert_eq!(picked, Ok(None), "回退任务属于刚失败的 provider → 回锚点");
+        assert_eq!(run(), Ok(()));
         assert_eq!(
             state_of(task),
             TaskState::Runnable,
@@ -1004,81 +1171,136 @@ mod tests {
         );
         assert_eq!(current_task(), None);
 
-        // Then 2：坏提议被拒绝、provider 被隔离。
-        assert_eq!(
-            registry::get_registry().lock().get(provider).unwrap().state,
-            crate::component::ComponentState::Failed
-        );
-        use crate::component::ComponentState;
-        use crate::trace::{RejectReason, TraceEvent};
-        let events = crate::trace::test_support::events();
-        crate::trace::test_support::assert_subsequence(
-            &[
-                TraceEvent::PolicyProposal {
-                    component: provider,
-                    task: TaskId::from_raw(0xDEAD),
-                },
-                TraceEvent::PolicyRejected {
-                    component: provider,
-                    reason: RejectReason::NotRunnable,
-                },
-                TraceEvent::ComponentState {
-                    component: provider,
-                    from: Some(ComponentState::Ready),
-                    to: ComponentState::Failed,
-                },
-            ],
-            &events,
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, TraceEvent::TaskSwitch { to, .. } if *to == task)),
-            "Core 不得把 CPU 交给已死实例的任务（无 TaskSwitch）"
-        );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                TraceEvent::PolicyRejected {
-                    component,
-                    reason: RejectReason::OwnerNotRunnable,
-                } if *component == provider
-            )),
-            "commit 门禁当前是静默回退，不发射 OwnerNotRunnable"
-        );
-
-        // 清理。
         remove_task(task);
-        retire_policy(provider);
-        reset_cpu();
     }
 
-    /// 未绑定 SchedulerPolicy 时 Core 不猜、不退化成内置调度器：`run()` 返回
+    // ------------------------------------------------------------------
+    // PolicyCall 边界：调度 / 通用调用 / 嵌套创建 / 策略替换全部拒绝
+    // ------------------------------------------------------------------
+
+    /// 验收：policy 回调有界——`task run / yield / exit / create / start`、通用
+    /// endpoint 调用、嵌套组件创建、策略替换全部拒绝（含嵌套边界之下）。
+    #[test]
+    fn policy_boundary_rejects_scheduling_endpoint_calls_and_nested_creation() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        let provider = ready_component(b"sched_gate_provider");
+        let endpoint = EndpointId::from_raw(1);
+        let nested_owner = ComponentId::from_raw(0x00C0_FFEE);
+
+        containment::with_test_policy_boundary(provider, endpoint, || {
+            // 调度操作：run / yield / exit 一律拒绝（调度帧正挂起）。
+            assert_eq!(run(), Err(SchedError::InvalidTransition));
+            assert_eq!(yield_current(), Err(SchedError::InvalidTransition));
+            assert_eq!(exit_current(), Err(SchedError::InvalidTransition));
+            // task create / start：同一门禁（`task::create_task` / `start_task`）。
+            assert_eq!(
+                crate::task::create_task(provider, ENTRY, ptr::null_mut()),
+                Err(TaskError::InvalidTransition)
+            );
+            assert_eq!(
+                crate::task::start_task(provider, TaskId::from_raw(0)),
+                Err(TaskError::InvalidTransition)
+            );
+            // 通用 endpoint 调用：拒绝（Core 是 caller，但策略执行内不得再调组件）。
+            let mut out_status = 0i32;
+            assert_eq!(
+                call::endpoint_call(
+                    endpoint,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut out_status,
+                ),
+                Err(CallError::InPolicyContext)
+            );
+            // 嵌套组件创建：拒绝。
+            assert_eq!(
+                crate::component::load::create_component(
+                    b"sched_gate_missing",
+                    &containment::KcompCreateArgs::empty(),
+                ),
+                Err(ComponentLoadError::InPolicyContext)
+            );
+            // 策略替换：拒绝（策略执行内不得改配置）。
+            assert_eq!(set_policy(endpoint), Err(SchedError::InvalidTransition));
+
+            // 藏在嵌套生命周期边界之下同样拒绝（祖先遍历，不是 top-guard-only）。
+            containment::with_test_init_boundary(Some(nested_owner), || {
+                assert_eq!(run(), Err(SchedError::InvalidTransition));
+                assert_eq!(
+                    call::endpoint_call(
+                        endpoint,
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null_mut(),
+                        0,
+                        &mut out_status,
+                    ),
+                    Err(CallError::InPolicyContext)
+                );
+                assert_eq!(
+                    crate::component::load::create_component(
+                        b"sched_gate_missing",
+                        &containment::KcompCreateArgs::empty(),
+                    ),
+                    Err(ComponentLoadError::InPolicyContext)
+                );
+            });
+        });
+
+        // 边界弹出：门禁恢复，且没有 stale 边界残留。
+        assert!(!containment::policy_call_in_chain());
+        assert!(!containment::scheduling_forbidden());
+        containment::enter_anchor();
+    }
+
+    // ------------------------------------------------------------------
+    // 无策略 / 锚点 / 任务耗尽
+    // ------------------------------------------------------------------
+
+    /// 纯逻辑：任务耗尽后 run() 不再切换（无锚点捕获、无 state 变更）。
+    #[test]
+    fn run_with_no_runnable_tasks_is_noop() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+        // 空表：run 直接返回，不 panic、不切换。
+        assert_eq!(run(), Ok(()));
+    }
+
+    /// **从未选择**策略时 Core 不猜、不退化成内置调度器：`run()` 返回
     /// `NoPolicy`，任务保持 Runnable、无 current、无状态推进。
     #[test]
     fn dispatch_without_policy_is_rejected_and_changes_nothing() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：活 owner + Runnable 任务，全程没有发布任何 policy。
+        // Given：活 owner + Runnable 任务，全程没有选择任何策略。
         let owner = ready_component(b"sched_no_policy_owner");
         let task = runnable_task(owner);
         assert!(collect_runnable().contains(&task));
+        assert!(policy().lock().endpoint.is_none());
 
         // When
         let result = run();
 
         // Then
         assert_eq!(result, Err(SchedError::NoPolicy));
+        assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
         assert_eq!(
             state_of(task),
             TaskState::Runnable,
@@ -1086,50 +1308,36 @@ mod tests {
         );
         assert_eq!(current_task(), None);
 
-        // 清理。
         remove_task(task);
-        reset_cpu();
     }
 
-    /// provider 已死（Failed）的 policy 等价于没有 policy：解析在 bind 的存活
-    /// 复验处失败 → `NoPolicy`；Core 不会静默换用其它 provider。
+    /// `Failed` 组件拥有的 Runnable 任务既不进入候选，也不通过 commit 门禁；
+    /// `run()` 安全返回 no-op（不挂起、不误调度）。
     #[test]
-    fn failed_policy_provider_resolves_to_no_policy() {
+    fn failed_component_tasks_are_not_scheduled() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：一个发布过 policy 的 provider + 一个无关的活 owner 与任务。
-        extern "C" fn propose_ghost(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
-            0xDEAD
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: propose_ghost,
-        };
-        let provider = publish_policy(b"sched_dead_policy", &vtable);
-        let owner = ready_component(b"sched_dead_policy_owner");
+        // Given：一个 Ready 组件 + 一个 Runnable 任务（直接进全局 task 表）。
+        let owner = ready_component(b"sched_failed_owner");
         let task = runnable_task(owner);
 
-        // When：provider 在调度请求之前死亡（隔离）。
-        retire_policy(provider);
-        let result = run();
+        // 活实例：候选包含它，commit 门禁放行。
+        assert!(collect_runnable().contains(&task));
+        assert!(owner_still_runnable(task));
 
-        // Then：binding 的存活复验失败 = 没有可用 policy。
-        assert_eq!(result, Err(SchedError::NoPolicy));
-        assert_eq!(state_of(task), TaskState::Runnable);
-        assert_eq!(current_task(), None);
+        // When：组件失败。
+        registry::get_registry().lock().mark_failed(owner).unwrap();
 
-        // 清理。
+        // Then：候选剔除、commit 门禁拒绝、run() no-op。
+        assert!(!collect_runnable().contains(&task));
+        assert!(!owner_still_runnable(task));
+        assert_eq!(run(), Ok(()));
+
+        // 清理：移除任务，避免污染其它调度测试。
         remove_task(task);
-        reset_cpu();
     }
 
     /// `yield` / `exit` 只属于正在运行的任务：本 CPU 无 current 时两个入口都
@@ -1138,9 +1346,7 @@ mod tests {
     fn yield_and_exit_without_current_task_are_rejected() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::task::init();
-        init();
-        reset_cpu();
+        init_world();
 
         assert_eq!(current_task(), None);
         assert_eq!(yield_current(), Err(SchedError::NoCurrent));
@@ -1155,11 +1361,7 @@ mod tests {
     fn scheduler_operations_are_rejected_in_irq_context() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
         containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
             assert_eq!(run(), Err(SchedError::InvalidTransition));
@@ -1186,15 +1388,11 @@ mod tests {
     fn scheduler_operations_are_rejected_under_a_service_call_ancestor() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
         containment::with_test_service_boundary(
             ComponentId::from_raw(0xB),
-            crate::component::endpoint::EndpointId::from_raw(1),
+            EndpointId::from_raw(1),
             None,
             || {
                 assert_eq!(run(), Err(SchedError::InvalidTransition));
@@ -1225,13 +1423,8 @@ mod tests {
     fn yield_of_exited_current_is_invalid_transition() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
         // Given：一个已走完生命周期（Exited）的任务被错记为本 CPU 的 current。
         let owner = ready_component(b"sched_stale_exited_owner");
@@ -1264,13 +1457,8 @@ mod tests {
     fn exit_of_created_current_is_invalid_transition() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
         // Given：一个 Created 任务被错记为本 CPU 的 current。
         let owner = ready_component(b"sched_stale_created_owner");
@@ -1300,13 +1488,8 @@ mod tests {
     fn advance_without_target_state_is_rejected() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
         // Given：一个任务被记为本 CPU 的 current，但没有给出目标状态。
         let owner = ready_component(b"sched_no_after_owner");
@@ -1329,13 +1512,24 @@ mod tests {
         reset_cpu();
     }
 
+    /// commit 门禁对"表里不存在的任务"必须 fail-closed：未知 id 不能被当作
+    /// 可运行（`None` 不是 `Some`——不会误调度幽灵任务，也不会 panic）。
+    #[test]
+    fn commit_gate_fails_closed_for_unknown_task() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        init_world();
+
+        assert!(!owner_still_runnable(TaskId::from_raw(0x0BAD_F00D)));
+    }
+
+    // ------------------------------------------------------------------
+    // 完整 commit 链（host 侧模拟策略执行；真实执行由 QEMU 证明）
+    // ------------------------------------------------------------------
+
     /// Abort 交接（**bookkeeping 部分**；栈抛弃 / 永不返回是 QEMU 契约）：
     /// 任务 panic 后 Core 在同一次 commit 里把死任务标 `Exited`、选好后继、
     /// 再 `fail_component` 撤销 owner 的 authority——`ComponentState{Failed}`
     /// 事件先于 `TaskSwitch` 落账，Core 不被失败组件挂起。
-    ///
-    /// 直接调用私有 `schedule_next`：生产入口 `abort_current_task` 在 host 上
-    /// 会落入永不返回的自旋（见该函数），真实 trampoline 由 QEMU ArchTest 覆盖。
     #[test]
     #[cfg(feature = "trace")]
     fn abort_handoff_commits_exit_fails_owner_and_switches_to_successor() {
@@ -1344,33 +1538,16 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let _trace = crate::trace::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        crate::resource::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：活 owner 与活后继 owner；一个 Running 的"panicking"任务 +
-        // 一个 Runnable 后继（后继必须在 owner 死亡前完成选择）。
-        extern "C" fn first_runnable(
-            _: *mut (),
-            runnable: *const u32,
-            count: usize,
-            _: u32,
-        ) -> u32 {
-            if count == 0 {
-                u32::MAX
-            } else {
-                unsafe { *runnable }
-            }
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: first_runnable,
-        };
-        let provider = publish_policy(b"sched_abort_policy", &vtable);
+        // Given：已安装策略（提议 id 序首项）+ 活 owner 与活后继 owner；一个
+        // Running 的"panicking"任务 + 一个 Runnable 后继（后继必须在 owner 死亡前
+        // 完成选择）。
+        let (provider, _endpoint) = install_policy(
+            b"sched_abort_policy",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
         let owner = ready_component(b"sched_abort_owner");
         let succ_owner = ready_component(b"sched_abort_successor_owner");
         let dying = runnable_task(owner);
@@ -1382,7 +1559,9 @@ mod tests {
         set_current(Some(dying));
 
         // When：abort 交接（等价于 abort_current_task 里的 schedule_next 调用）。
-        let result = schedule_next(Some(dying), Some(TaskState::Exited), Some((dying, owner)));
+        let result = containment::with_test_policy_dispatch(first_runnable, || {
+            schedule_next(Some(dying), Some(TaskState::Exited), Some((dying, owner)))
+        });
 
         // Then 1：死任务 Exited、后继 Running、current = 后继。
         assert_eq!(result, Ok(()));
@@ -1393,7 +1572,7 @@ mod tests {
         // Then 2：owner 逻辑死亡；后继 owner 不受影响。
         assert_eq!(
             registry::get_registry().lock().get(owner).unwrap().state,
-            crate::component::ComponentState::Failed
+            ComponentState::Failed
         );
         assert_eq!(
             registry::get_registry()
@@ -1401,11 +1580,15 @@ mod tests {
                 .get(succ_owner)
                 .unwrap()
                 .state,
-            crate::component::ComponentState::Ready
+            ComponentState::Ready
+        );
+        // 策略 provider 保持 Ready（失败的是任务 owner，不是调度器）。
+        assert_eq!(
+            registry::get_registry().lock().get(provider).unwrap().state,
+            ComponentState::Ready
         );
 
         // Then 3：事件顺序——先落 owner 的 Failed 账，再 TaskSwitch。
-        use crate::component::ComponentState;
         use crate::trace::TraceEvent;
         crate::trace::test_support::assert_subsequence(
             &[
@@ -1427,16 +1610,17 @@ mod tests {
         containment::enter_anchor();
         remove_task(dying);
         remove_task(successor);
-        retire_policy(provider);
         reset_cpu();
     }
 
-    /// 完整接受链（host 侧，`context_switch` 为 no-op）：run → yield → exit ×2。
+    /// 完整接受链（host 侧模拟策略执行）：run → yield → exit ×2。
     ///
-    /// 断言三件事：
+    /// 断言四件事：
     /// 1. commit 真相：任务状态与 `current_task()` 的每次推进；
-    /// 2. policy 输入契约：裁剪后的 runnable 数量与 current 参数按 Core 真相传入；
-    /// 3. 真实事件序列 `PolicyProposal → PolicyAccepted → TaskSwitch`（子序列匹配）。
+    /// 2. policy **wire 输入契约**：`args` = current（锚点为 `KCOMP_SCHEDULER_NONE`）、
+    ///    `input` = Core 裁剪过的 runnable 列表（数量随候选收缩）；
+    /// 3. 真实事件序列 `PolicyProposal → PolicyAccepted → TaskSwitch`（子序列匹配）；
+    /// 4. 正常返回后策略栈留在槽里复用（配置保持 Armed）。
     #[test]
     #[cfg(feature = "trace")]
     fn run_yield_exit_commit_sequence_is_observable_in_truth_and_trace() {
@@ -1445,43 +1629,24 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let _trace = crate::trace::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：好策略（提议 id 序首项）+ 一个活 owner + 两个 Runnable 任务。
-        use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-        static SEEN_CURRENT: AtomicU32 = AtomicU32::new(u32::MAX);
-        static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
-        extern "C" fn first_runnable(
-            _: *mut (),
-            runnable: *const u32,
-            count: usize,
-            current: u32,
-        ) -> u32 {
-            SEEN_CURRENT.store(current, Ordering::SeqCst);
-            SEEN_COUNT.store(count, Ordering::SeqCst);
-            if count == 0 {
-                u32::MAX
-            } else {
-                unsafe { *runnable }
-            }
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: first_runnable,
-        };
-        let provider = publish_policy(b"sched_commit_policy", &vtable);
+        // Given：已安装策略（提议 id 序首项）+ 一个活 owner + 两个 Runnable 任务。
+        let (provider, _endpoint) = install_policy(
+            b"sched_commit_policy",
+            first_runnable_observed as *const () as usize,
+            ptr::null_mut(),
+        );
         let owner = ready_component(b"sched_commit_owner");
         let a = runnable_task(owner);
         let b = runnable_task(owner);
         assert!(a.raw() < b.raw(), "BTreeMap 迭代序 = id 升序");
 
         // When 1：锚点 → 调度。A 拿到 CPU（id 序首项）。
-        assert_eq!(run(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, run),
+            Ok(())
+        );
         assert_eq!(
             SEEN_COUNT.load(Ordering::SeqCst),
             2,
@@ -1489,7 +1654,7 @@ mod tests {
         );
         assert_eq!(
             SEEN_CURRENT.load(Ordering::SeqCst),
-            u32::MAX,
+            KCOMP_SCHEDULER_NONE,
             "从锚点进入时无 current"
         );
         assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
@@ -1497,7 +1662,10 @@ mod tests {
         assert_eq!(current_task(), Some(a));
 
         // When 2：A 让出 → 只剩 B 是候选；policy 看到的 current 是 A。
-        assert_eq!(yield_current(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, yield_current),
+            Ok(())
+        );
         assert_eq!(SEEN_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(SEEN_CURRENT.load(Ordering::SeqCst), a.raw());
         assert_eq!(state_of(a), TaskState::Runnable);
@@ -1505,14 +1673,20 @@ mod tests {
         assert_eq!(current_task(), Some(b));
 
         // When 3：B 退出 → A 接管（Runnable 里还有 A）。
-        assert_eq!(exit_current(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, exit_current),
+            Ok(())
+        );
         assert_eq!(SEEN_CURRENT.load(Ordering::SeqCst), b.raw());
         assert_eq!(state_of(b), TaskState::Exited);
         assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
         assert_eq!(current_task(), Some(a));
 
         // When 4：A 退出 → 候选为空，policy 不再被咨询，控制权回锚点。
-        assert_eq!(exit_current(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, exit_current),
+            Ok(())
+        );
         assert_eq!(
             SEEN_CURRENT.load(Ordering::SeqCst),
             b.raw(),
@@ -1562,10 +1736,15 @@ mod tests {
             &crate::trace::test_support::events(),
         );
 
+        // 正常返回：策略栈留在槽里复用（配置仍 Armed、未退役）。
+        let slot = policy().lock();
+        assert!(!slot.retired);
+        assert!(slot.stack.is_some(), "正常返回的栈必须回到槽里复用");
+        drop(slot);
+
         // 清理。
         remove_task(a);
         remove_task(b);
-        retire_policy(provider);
         reset_cpu();
     }
 
@@ -1575,36 +1754,15 @@ mod tests {
     fn dispatch_skips_dead_owner_and_runs_live_owner_task() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
-        crate::component::interface::init();
-        crate::component::endpoint::init();
-        reset_cpu();
-        containment::enter_anchor();
+        init_world();
 
-        // Given：一个活 owner 的任务 + 一个 Failed owner 的任务；policy 提议首项。
-        use core::sync::atomic::{AtomicUsize, Ordering};
-        static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
-        extern "C" fn count_and_first(
-            _: *mut (),
-            runnable: *const u32,
-            count: usize,
-            _: u32,
-        ) -> u32 {
-            SEEN_COUNT.store(count, Ordering::SeqCst);
-            if count == 0 {
-                u32::MAX
-            } else {
-                unsafe { *runnable }
-            }
-        }
-        let vtable = SchedulerPolicyApi {
-            choose_next: count_and_first,
-        };
-        let provider = publish_policy(b"sched_mixed_policy", &vtable);
+        // Given：一个活 owner 的任务 + 一个 Failed owner 的任务；策略提议首项。
+        let (_provider, _endpoint) = install_policy(
+            b"sched_mixed_policy",
+            first_runnable_observed as *const () as usize,
+            ptr::null_mut(),
+        );
         let live_owner = ready_component(b"sched_mixed_live_owner");
         let dead_owner = ready_component(b"sched_mixed_dead_owner");
         let live = runnable_task(live_owner);
@@ -1615,7 +1773,10 @@ mod tests {
             .unwrap();
 
         // When
-        assert_eq!(run(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, run),
+            Ok(())
+        );
 
         // Then：policy 只看到活任务（1 个），被 dispatch 的也是它；死任务不动。
         assert_eq!(
@@ -1629,22 +1790,63 @@ mod tests {
         assert!(!collect_runnable().contains(&dead));
 
         // 清理：让 live 退出（无候选时回锚点），再摘除两个任务。
-        assert_eq!(exit_current(), Ok(()));
+        assert_eq!(
+            containment::with_test_policy_dispatch(first_runnable_observed, exit_current),
+            Ok(())
+        );
         remove_task(live);
         remove_task(dead);
-        retire_policy(provider);
         reset_cpu();
     }
 
-    /// commit 门禁对"表里不存在的任务"必须 fail-closed：未知 id 不能被当作
-    /// 可运行（`None` 不是 `Some`——不会误调度幽灵任务，也不会 panic）。
+    /// 性能基线（`make bench`）：**策略选择 + 提议 + Core 验证** 的成本。
+    ///
+    /// 只测到 `pick_next` 为止（host 侧策略执行是模拟的，不含真实栈切换 /
+    /// context switch）。commit（`TaskTable::transition`）单独测；真正的
+    /// context switch 必须在目标端测 —— host 的 `context_switch` 是 Fake no-op
+    /// （见 docs/development/benchmark.md §6）。
     #[test]
-    fn commit_gate_fails_closed_for_unknown_task() {
+    #[ignore = "性能基线：make bench 手动跑"]
+    fn bench_scheduler_propose_and_validate() {
         let _sched = SCHED_TEST_LOCK.lock();
-        crate::task::init();
-        init();
-        crate::component::registry::init();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
 
-        assert!(!owner_still_runnable(TaskId::from_raw(0x0BAD_F00D)));
+        let (_provider, _endpoint) = install_policy(
+            b"sched_bench_policy",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
+        let owner = ready_component(b"sched_bench_owner");
+        let task = runnable_task(owner);
+        let runnable = collect_runnable();
+
+        crate::bench::report_environment();
+
+        // 全路径：配置快照（锁）+ prepare_policy（锁 + begin_call）+ 模拟边界调用
+        // + Core 验证 + 归还 inflight。
+        containment::with_test_policy_dispatch(first_runnable, || {
+            crate::bench::run("sched.pick_next", 1_000, || pick_next(&runnable).unwrap()).report();
+        });
+
+        // commit：状态转移的验证 + 落笔（不含真正切换）。
+        let mut table = crate::task::TaskTable::new();
+        let local_owner = ComponentId::from_raw(0x7b);
+        let local = table
+            .create(local_owner, 0x8000_0000, ptr::null_mut())
+            .unwrap();
+        table.transition(local, TaskState::Runnable).unwrap();
+        let mut commit = crate::bench::Bench::new("sched.task_transition");
+        commit.run(1_000, || {
+            table
+                .transition(local, TaskState::Running(CpuId(0)))
+                .unwrap();
+            table.transition(local, TaskState::Runnable).unwrap();
+        });
+        commit.finish().report();
+
+        // 清理：移除任务，避免污染其它调度测试。
+        remove_task(task);
     }
 }
