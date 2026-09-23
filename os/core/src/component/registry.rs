@@ -24,6 +24,11 @@
 //! Core 记录 `instance_state`、且 pending interfaces 原子提交后调用（见
 //! `component/interface.rs`）。id 单调递增、不回收：组件实例 = 身份——失败恢复 =
 //! 全新实例（新 id），`ComponentId` 永不复用（docs/architecture/component-model.md）。
+//!
+//! In-flight call 记账：`InstanceRecord::inflight` 记录该实例尚未返回的调用数
+//! （`begin_call` / `finish_call` / `active_calls`）。只有 `Ready` 实例可以
+//! `begin_call`；`finish_call` 不设门禁——实例离开 `Ready`（停止 / 失败）时
+//! 已在飞行的调用仍须能归还计数。
 
 use alloc::vec::Vec;
 
@@ -44,6 +49,8 @@ pub struct InstanceRecord {
     pub state: ComponentState,
     pub image: ComponentImageId,
     pub instance_state: *mut (),
+    /// 未完成的 consumer→provider 调用计数（`begin_call` / `finish_call`）。
+    pub inflight: u32,
 }
 
 // `instance_state` 是组件 opaque 指针：Registry 只存取、永不解引用。
@@ -57,6 +64,10 @@ pub enum RegistryError {
     NotFound,
     /// 状态机非法转换（如 Ready 再 start）。
     InvalidTransition,
+    /// `begin_call`：实例存在但不在 `Ready`（只有 Ready 可开始服务调用）。
+    NotReady,
+    /// `begin_call`：`inflight` 计数溢出（u32）；拒绝且不改计数。
+    CallOverflow,
     /// id 空间耗尽（单调递增）。
     IdExhausted,
 }
@@ -93,6 +104,7 @@ impl Registry {
             state: ComponentState::Declared,
             image,
             instance_state: core::ptr::null_mut(),
+            inflight: 0,
         });
         // 出生也入 trace：否则"只声明未 resolve"的实例在事件流里不可见，
         // 而"失败组件是否被回收"这类断言需要看到它从哪来。
@@ -197,6 +209,37 @@ impl Registry {
     pub fn may_run(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))
+    }
+
+    /// 开始一次 consumer→provider 调用记账（checked increment）。
+    ///
+    /// 只放行 `Ready` 实例（只有完整、已提交初始化的实例可服务调用；
+    /// `Starting` = create 执行期，尚不可被消费）。溢出拒绝且不改计数。
+    pub fn begin_call(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let record = self.record_mut(id)?;
+        if record.state != ComponentState::Ready {
+            return Err(RegistryError::NotReady);
+        }
+        record.inflight = record
+            .inflight
+            .checked_add(1)
+            .ok_or(RegistryError::CallOverflow)?;
+        Ok(())
+    }
+
+    /// 结束一次调用记账（decrement）。
+    ///
+    /// **不设生命周期门禁**：实例开始停止 / 失败后，已在飞行的调用仍须能归还
+    /// 计数。未知 id 是 no-op；未配对的 finish 不下溢（记账错误不得变成 panic）。
+    pub fn finish_call(&mut self, id: ComponentId) {
+        if let Ok(record) = self.record_mut(id) {
+            record.inflight = record.inflight.saturating_sub(1);
+        }
+    }
+
+    /// 该实例当前在飞行的调用数；未知实例为 0。
+    pub fn active_calls(&self, id: ComponentId) -> u32 {
+        self.get(id).map_or(0, |record| record.inflight)
     }
 
     pub fn get(&self, id: ComponentId) -> Option<&InstanceRecord> {
@@ -616,6 +659,23 @@ mod tests {
         assert_ne!(fresh, stopped);
         assert_ne!(fresh, failed);
         assert_eq!(fresh.raw(), failed.raw() + 1);
+    }
+
+    /// `begin_call` 溢出必须拒绝且不改计数。
+    ///
+    /// `inflight` 是 Registry 私有字段：同模块测试直接置位，避免 2^32 次真实调用。
+    #[test]
+    fn begin_call_overflow_is_rejected_without_changing_count() {
+        let mut reg = r();
+        let id = ready(&mut reg);
+        reg.records
+            .iter_mut()
+            .find(|rec| rec.id == id)
+            .unwrap()
+            .inflight = u32::MAX;
+
+        assert_eq!(reg.begin_call(id), Err(RegistryError::CallOverflow));
+        assert_eq!(reg.active_calls(id), u32::MAX, "溢出拒绝不得改变计数");
     }
 
     // -- Property tests（生命周期状态机；docs/development/testing.md §2 / docs/architecture/component-model.md §5）--

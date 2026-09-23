@@ -6,6 +6,7 @@
 
 pub mod containment;
 mod elf;
+pub mod endpoint;
 pub mod exit;
 pub mod export;
 pub mod failure;
