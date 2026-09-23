@@ -16,6 +16,7 @@
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
 //! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
+//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现，Core 校验存活后交付；call 用 opaque EndpointId 做**存活解析** + inflight 记账后分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**，见 `component/call.rs`）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
@@ -57,9 +58,10 @@
 //!   `ambient_init()`，不再各自偏好当前任务 owner。
 //! - **Failed 实例门禁**：获取资源 / 创建 work 的入口
 //!   （`kcore_device_claim`、`kcore_irq_register`、`kcore_dma_alloc`、`kcore_dma_map`、
-//!   `kcore_task_create`、`kcore_interface_publish`）在 caller/provider 已 `Failed`
-//!   时返回 `-EPERM`；`release` / `revoke` 及已持有资源（按 DeviceId 锚定）的
-//!   teardown 操作**不受此门禁限制**。
+//!   `kcore_task_create`、`kcore_interface_publish`、`kcore_endpoint_publish`、
+//!   `kcore_endpoint_call`）在 caller/provider 已 `Failed` 时返回 `-EPERM`；
+//!   `release` / `revoke` 及已持有资源（按 DeviceId 锚定）的 teardown 操作
+//!   **不受此门禁限制**。
 //!
 //! # 明确不导出（未经 Core validation 的裸 authority mutation）
 //!
@@ -90,7 +92,10 @@
 //! 严格匹配，违反 = UB（与 C `malloc/free` 错配同类）。组件失败后的泄漏在 phase 1
 //! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
+use crate::component::ComponentId;
+use crate::component::call;
 use crate::component::containment::KcompCreateArgs;
+use crate::component::endpoint::{self, ContractId, EndpointId};
 use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
 use crate::errno::{Errno, status};
@@ -534,6 +539,147 @@ extern "C" fn kcore_interface_refresh(
 }
 
 // ---------------------------------------------------------------------------
+// Category 9：Component endpoints（Contract / Endpoint）
+// ---------------------------------------------------------------------------
+
+/// 发布 endpoint（**staged**：`kcomp_instance_create` 期间只记录 pending，不创建
+/// endpoint）。provider = 当前正在创建的实例（Core 记录，**不信任组件自报身份**）。
+///
+/// `contract` 是组合策略提供的契约身份（不透明 `u64`）；`kind` / `abi` 由**首次
+/// 发布**建立契约真相，后续发布不一致在 commit 时拒绝；`port` 是 provider 定义的
+/// 不透明 dispatch token（Core 从不解释）。端口名只要求在 provider 实例内唯一。
+///
+/// create 返回 0 后 Core 原子提交该实例的 pending endpoints，因此本函数返回 `0`
+/// 只表示"已记录 pending"——**不返回 EndpointId**（id 只在 commit 成功后存在，
+/// 由 [`kcore_endpoint_lookup`] 发现）。
+/// provider 由最内层活动 create 边界解析（嵌套创建 = 被创建的实例）；`Failed`
+/// provider → `-EPERM`。返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在
+/// create 上下文或 provider 已 `Failed`；其余见 `Errno::from(EndpointError)`）。
+extern "C" fn kcore_endpoint_publish(
+    port_name: *const u8,
+    port_name_len: usize,
+    contract: u64,
+    kind: u32,
+    abi: u64,
+    port: u32,
+) -> i32 {
+    let Some(port_name) = checked_name(port_name, port_name_len) else {
+        return Errno::EINVAL.code();
+    };
+    let Some(kind) = kind_from_u32(kind) else {
+        return Errno::EINVAL.code();
+    };
+    let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
+        return Errno::EPERM.code();
+    };
+    if let Some(denied) = deny_if_failed(provider) {
+        return denied;
+    }
+    let reg = registry::get_registry().lock();
+    let mut endpoints = endpoint::get_endpoints().lock();
+    match endpoints.stage_publish(
+        &reg,
+        provider,
+        port_name,
+        ContractId::from_raw(contract),
+        kind,
+        InterfaceAbi::from_raw(abi),
+        port,
+    ) {
+        Ok(()) => 0,
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付；
+/// 绝不交付死 endpoint）。`provider` 是 consumer 显式给出的实例身份——身份不是
+/// 权限，Core 只按真相解析。
+///
+/// 成功 = 0，EndpointId（`u64`）写入 `*out_endpoint`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法或契约不符 /
+/// `ENOENT` 未发布或 endpoint 已死 / `ENODEV` provider 已不存在）。
+extern "C" fn kcore_endpoint_lookup(
+    provider: u32,
+    port_name: *const u8,
+    port_name_len: usize,
+    contract: u64,
+    out_endpoint: *mut u64,
+) -> i32 {
+    if out_endpoint.is_null() {
+        return Errno::EFAULT.code();
+    }
+    let Some(port_name) = checked_name(port_name, port_name_len) else {
+        return Errno::EINVAL.code();
+    };
+    let reg = registry::get_registry().lock();
+    let endpoints = endpoint::get_endpoints().lock();
+    match endpoints.discover(
+        &reg,
+        ComponentId::from_raw(provider),
+        port_name,
+        ContractId::from_raw(contract),
+    ) {
+        Ok(id) => {
+            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+            unsafe { core::ptr::write_unaligned(out_endpoint, id.raw()) };
+            0
+        }
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+/// 调用一个 endpoint（KernelNative **直接分派**；执行边界 / service stack /
+/// principal 切换 / re-entry 检测 / provider panic containment 是下一阶段，
+/// 见 `component/call.rs` 模块文档）。
+///
+/// **传输状态 ≠ 方法状态**：返回值是本函数的**传输状态**（`0` / `-Errno`）；
+/// provider 自己的 `i32` 返回写入 `*out_status`，**只在传输返回 `0` 时有意义**。
+/// provider 返回的负 errno 绝不与 Core 生成的失败混淆。
+///
+/// `endpoint` 是组合期经 [`kcore_endpoint_lookup`] 交付的 opaque `EndpointId`
+/// （contract / abi 已在交付前 exact-match 校验；调用只重新做**存活解析**）。
+/// `args` / `input` / `output` 只在本次调用期间借用：Core 只做结构校验
+/// （长度非零时指针不得为空），**不解析其中的字节**。
+///
+/// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`
+/// （`EFAULT` `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或
+/// caller 已 `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image
+/// 已不存在；`EBUSY` provider 不在 `Ready` 或 inflight 溢出；`ENOSYS` image
+/// 没有 `kcomp_service_dispatch`）。
+#[allow(clippy::too_many_arguments)]
+extern "C" fn kcore_endpoint_call(
+    endpoint: u64,
+    method: u32,
+    args: *const u8,
+    args_len: usize,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_len: usize,
+    out_status: *mut i32,
+) -> i32 {
+    // out 指针校验在 ABI 边界（与其它导出同序；`call` 内部另有同一检查，
+    // 服务直接调用者）。
+    if out_status.is_null() {
+        return Errno::EFAULT.code();
+    }
+    match call::endpoint_call(
+        EndpointId::from_raw(endpoint),
+        method,
+        args,
+        args_len,
+        input,
+        input_len,
+        output,
+        output_len,
+        out_status,
+    ) {
+        Ok(()) => 0,
+        Err(error) => Errno::from(error).code(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Category 6：Task control（v2；语义入口，authority 校验在 Core）
 // ---------------------------------------------------------------------------
 
@@ -948,6 +1094,9 @@ mod tests {
             &b"kcore_dma_free"[..],
             &b"kcore_dma_map"[..],
             &b"kcore_dma_unmap"[..],
+            &b"kcore_endpoint_publish"[..],
+            &b"kcore_endpoint_lookup"[..],
+            &b"kcore_endpoint_call"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
@@ -1416,6 +1565,261 @@ mod tests {
         assert_eq!(
             kcore_trace_stats(core::ptr::null_mut()),
             Errno::EFAULT.code()
+        );
+    }
+
+    // —— Component endpoints（Contract / Endpoint）导出面 ——
+
+    /// Contract / Endpoint 导出面：create 期间 staged publish（返回 0，无 id）→
+    /// create 返回 0 后 Core 提交 → `kcore_endpoint_lookup` 按
+    /// `(provider, port_name, contract)` 解析到 EndpointId。
+    #[test]
+    fn endpoint_publish_stages_and_lookup_resolves_after_commit() {
+        use crate::component::{containment, endpoint, registry};
+
+        let _heap = crate::memory::test_support::GUARD.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        endpoint::init();
+
+        const CONTRACT: u64 = 0xE0D0_1001;
+        const ABI: u64 = 0xE0D0_1002;
+
+        // Given：一个正在 create（Starting）的实例。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(crate::component::image::ComponentImageId::from_raw(1))
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+
+        // When：create 执行期间经导出发布（staged）。
+        let staged = containment::with_test_init_boundary(Some(id), || {
+            kcore_endpoint_publish(b"blk0".as_ptr(), 4, CONTRACT, 0, ABI, 7)
+        });
+        assert_eq!(staged, 0, "staged publish 返回 0（id 只在 commit 后存在）");
+
+        // Then：commit 之前 lookup 不可见（不交付半成品）。
+        let mut out = 0u64;
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            Errno::ENOENT.code()
+        );
+
+        // When：Core 在 create 返回 0 后提交 pending endpoints 并 finish_start。
+        {
+            let mut reg = registry::get_registry().lock();
+            endpoint::get_endpoints()
+                .lock()
+                .commit_pending(&reg, id)
+                .unwrap();
+            reg.finish_start(id).unwrap();
+        }
+
+        // Then：lookup 解析到单调 EndpointId（从 1 起）。
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            0
+        );
+        assert!(out >= 1, "EndpointId 从 1 起且单调");
+    }
+
+    /// Endpoint 发布是 create-time 操作：普通任务边界与 destroy（exit）边界都
+    /// 不是合法 principal → `-EPERM`（与 `kcore_interface_publish` 同一
+    /// `ambient_init` 门禁）。
+    #[test]
+    fn endpoint_publish_without_init_principal_is_rejected() {
+        use crate::component::containment;
+        use crate::task::TaskId;
+
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        containment::enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        // When / Then：任务边界（非 init）→ EPERM。
+        assert_eq!(
+            kcore_endpoint_publish(b"blk0".as_ptr(), 4, 1, 0, 1, 0),
+            Errno::EPERM.code()
+        );
+        // destroy 钩子（Exit 边界）同样不是 publish principal。
+        containment::with_test_exit_boundary(ComponentId::from_raw(9), || {
+            assert_eq!(
+                kcore_endpoint_publish(b"blk0".as_ptr(), 4, 1, 0, 1, 0),
+                Errno::EPERM.code()
+            );
+        });
+
+        containment::enter_anchor();
+    }
+
+    /// `kcore_endpoint_call` 的 ABI 边界：frame 结构非法（空 `out_status` /
+    /// 长度非零配空指针）→ `-EFAULT`，且在 caller 解析之前（与其它导出的 out
+    /// 指针检查同一顺序；因此不需要任何执行边界）。
+    #[test]
+    fn endpoint_call_export_maps_invalid_frame_to_efault() {
+        // out_status 为空。
+        assert_eq!(
+            kcore_endpoint_call(
+                1,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+            ),
+            Errno::EFAULT.code()
+        );
+        // 非空长度配空指针（args）。
+        let mut status = 0i32;
+        assert_eq!(
+            kcore_endpoint_call(
+                1,
+                0,
+                core::ptr::null(),
+                3,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut status,
+            ),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(status, 0, "失败调用不写 out_status");
+    }
+
+    /// `kcore_endpoint_lookup` 的错误约定：out 为空 `EFAULT`；名字非法 `EINVAL`；
+    /// 未发布的名字 / 未知 provider `ENOENT`；契约不符 `EINVAL`。
+    #[test]
+    fn endpoint_lookup_maps_missing_name_and_contract_to_errno() {
+        use crate::component::{endpoint, registry};
+
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        endpoint::init();
+
+        const CONTRACT: u64 = 0xE0D0_2001;
+        const OTHER_CONTRACT: u64 = 0xE0D0_2002;
+        const ABI: u64 = 0xE0D0_2003;
+
+        // Given：一个 Ready provider 已发布 blk0。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(crate::component::image::ComponentImageId::from_raw(2))
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                id,
+                b"blk0",
+                ContractId::from_raw(CONTRACT),
+                InterfaceKind::Device,
+                InterfaceAbi::from_raw(ABI),
+                7,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, id).unwrap();
+        }
+
+        let mut out = 0u64;
+        // 空 out → EFAULT（早于解析）。
+        assert_eq!(
+            kcore_endpoint_lookup(
+                id.raw(),
+                b"blk0".as_ptr(),
+                4,
+                CONTRACT,
+                core::ptr::null_mut()
+            ),
+            Errno::EFAULT.code()
+        );
+        // 名字非法 → EINVAL（早于解析）。
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), core::ptr::null(), 0, CONTRACT, &mut out),
+            Errno::EINVAL.code()
+        );
+        // 未发布的名字 → ENOENT。
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"missing".as_ptr(), 7, CONTRACT, &mut out),
+            Errno::ENOENT.code()
+        );
+        // 契约不符 → EINVAL。
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"blk0".as_ptr(), 4, OTHER_CONTRACT, &mut out),
+            Errno::EINVAL.code()
+        );
+        // 未知 provider → ENOENT（名字表按 provider 隔离 = 未发布）。
+        assert_eq!(
+            kcore_endpoint_lookup(0xDEAD, b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            Errno::ENOENT.code()
+        );
+    }
+
+    /// create 失败 / panic（load.rs 共用的 `fail_component` 清理路径）：pending
+    /// endpoint 被丢弃，`kcore_endpoint_lookup` 找不到任何东西——半成品绝不浮出，
+    /// 事后提交也不可能产出（provider 已 `Failed`）。
+    #[test]
+    fn failed_create_discards_staged_endpoint_and_lookup_finds_nothing() {
+        use crate::component::{containment, endpoint, registry};
+
+        let _heap = crate::memory::test_support::GUARD.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        endpoint::init();
+
+        const CONTRACT: u64 = 0xE0D0_3001;
+        const ABI: u64 = 0xE0D0_3002;
+
+        // Given：一个正在 create 的实例，已在 create 期间 staged publish。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(crate::component::image::ComponentImageId::from_raw(3))
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        assert_eq!(
+            containment::with_test_init_boundary(Some(id), || {
+                kcore_endpoint_publish(b"blk0".as_ptr(), 4, CONTRACT, 0, ABI, 7)
+            }),
+            0
+        );
+
+        // When：create 失败（失败返回与 panic 分支共用这条清理）。
+        crate::component::failure::fail_component(
+            id,
+            crate::component::load::ComponentLoadError::CreateFailed(1),
+        );
+
+        // Then：lookup 找不到；事后提交被 `ProviderNotReady` 拒绝。
+        let mut out = 0u64;
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            Errno::ENOENT.code()
+        );
+        let reg = registry::get_registry().lock();
+        assert_eq!(
+            endpoint::get_endpoints().lock().commit_pending(&reg, id),
+            Err(crate::component::endpoint::EndpointError::ProviderNotReady)
         );
     }
 }

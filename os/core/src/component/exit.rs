@@ -14,7 +14,8 @@
 //! 2. registry.begin_stop(id)      Ready → Stopping：提交"不再接受新 work"
 //! 3. 调用组件销毁入口 kcomp_instance_destroy(state)
 //!                                必需导出；Core-owned 隔离栈
-//! 4. Core 兜底                     revoke authority + 解绑 provider interfaces
+//! 4. Core 兜底                     revoke authority + 解绑 provider interfaces +
+//!                                  使 provider endpoints 永久失效
 //!                                  （与 failure 路径共用同一序列，见 `failure.rs`）
 //! 5. registry.finish_stop(id)     Stopping → Stopped（终态）
 //! ```
@@ -153,7 +154,8 @@ fn complete_stop(id: ComponentId, outcome: CallOutcome) -> Result<(), ComponentS
             return Err(ComponentStopError::DestroyPanicked);
         }
     }
-    // 组件自行收尾之后，Core 仍然兜底收回剩余 authority / 解绑 provider。
+    // 组件自行收尾之后，Core 仍然兜底收回剩余 authority / 解绑 provider /
+    // 使 provider endpoints 永久失效。
     failure::revoke_authority_and_unbind(id);
     // 不变式：begin_stop 已提交 Stopping，本转换只可能被并发 stop/fail 拒绝
     // （phase 1 单核不可达）；失败不静默。
@@ -201,6 +203,7 @@ mod tests {
         crate::task::init();
         crate::resource::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         let guard = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         guard
@@ -481,5 +484,78 @@ mod tests {
         crate::resource::device::get_table()
             .lock()
             .clear_quarantine();
+    }
+
+    /// 停止路径（与失败路径共用 Core 兜底）使被停实例的 endpoint 永久失效；
+    /// 共享同一 image 的其它实例的 endpoint 不受影响。
+    #[test]
+    fn stop_invalidates_only_the_stopped_instances_endpoints() {
+        use crate::component::endpoint::{self, ContractId, EndpointError, EndpointState};
+        use crate::component::interface::{InterfaceAbi, InterfaceKind};
+
+        let _heap = setup();
+        const CONTRACT: ContractId = ContractId::from_raw(0xE0D0_5001);
+        const ENDPOINT_ABI: InterfaceAbi = InterfaceAbi::from_raw(0xE0D0_5002);
+
+        // Given：两个 Ready 实例各自发布一条 endpoint。
+        let first = ready_component(
+            b"exit_endpoint_first",
+            destroy_hook_ok as *const () as usize,
+        );
+        let second = ready_component(
+            b"exit_endpoint_second",
+            destroy_hook_ok as *const () as usize,
+        );
+        let (first_endpoint, second_endpoint) = {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                first,
+                b"blk0",
+                CONTRACT,
+                InterfaceKind::Device,
+                ENDPOINT_ABI,
+                1,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, first).unwrap();
+            eps.stage_publish(
+                &reg,
+                second,
+                b"blk1",
+                CONTRACT,
+                InterfaceKind::Device,
+                ENDPOINT_ABI,
+                2,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, second).unwrap();
+            (
+                eps.discover(&reg, first, b"blk0", CONTRACT).unwrap(),
+                eps.discover(&reg, second, b"blk1", CONTRACT).unwrap(),
+            )
+        };
+
+        // When：只停止第一个实例。
+        assert_eq!(stop_component(first), Ok(()));
+
+        // Then：第一个的 endpoint 永久 dead；第二个仍 Live。
+        let reg = registry::get_registry().lock();
+        let eps = endpoint::get_endpoints().lock();
+        assert_eq!(
+            eps.lookup(&reg, first_endpoint, CONTRACT, ENDPOINT_ABI),
+            Err(EndpointError::EndpointDead)
+        );
+        assert_eq!(
+            eps.discover(&reg, first, b"blk0", CONTRACT),
+            Err(EndpointError::EndpointDead)
+        );
+        assert_eq!(
+            eps.lookup(&reg, second_endpoint, CONTRACT, ENDPOINT_ABI)
+                .unwrap()
+                .state,
+            EndpointState::Live
+        );
     }
 }

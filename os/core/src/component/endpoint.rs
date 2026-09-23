@@ -3,9 +3,12 @@
 //! # 定位
 //!
 //! `component/interface.rs` 是上一代模型：**一个全局接口名 → 一个 provider 绑定槽**
-//! （`api` / `ctx` function table），同 ABI 重发布是**覆盖**。本模块是它的替代真相模型；
-//! 本阶段只落地 Core 侧数据模型，**不改 ABI、不导出、不迁 consumer**——
-//! `interface.rs` 保持原样（scheduler / core_test 仍在用），下一阶段整体替换。
+//! （`api` / `ctx` function table），同 ABI 重发布是**覆盖**。本模块是它的替代真相模型：
+//! Core 数据模型 + 导出面（`kcore_endpoint_publish` / `kcore_endpoint_lookup` /
+//! `kcore_endpoint_call`，call 实现见 `component/call.rs`）+ 生命周期接线
+//! （create 提交 / failure·stop 失效）已落地；consumer **尚未迁移**——
+//! `interface.rs` 与 `kcore_interface_*` 并行运行（scheduler / core_test 仍在用），
+//! 下一阶段整体替换。
 //!
 //! ```text
 //! Contract：契约身份（kind + exact ABI fingerprint + 诊断名）—— 语义
@@ -51,11 +54,15 @@
 //!
 //! # 本阶段不做（seam / TODO）
 //!
-//! - 不导出 `kcore_*`、不改组件 ABI、不迁 consumer；
+//! - **不做执行边界**：`kcore_endpoint_call` 当前是 KernelNative 直接分派（无
+//!   service stack / principal 切换 / re-entry 检测 / provider panic containment，
+//!   见 `component/call.rs` 模块文档）；
+//! - 不迁 consumer（scheduler / core_test 仍走 `kcore_interface_*`）；
 //! - 不新增 `TraceEvent`（事件 kind 是 ABI 编码，留给下一阶段）；
 //! - 不做 endpoint 回收（`Invalid` 记录保留为 tombstone，id 不复用）。
 
 use alloc::vec::Vec;
+use spin::{Mutex, Once};
 
 use crate::component::interface::InterfaceAbi;
 use crate::component::registry::Registry;
@@ -318,14 +325,17 @@ impl EndpointRegistry {
         self.pending.retain(|p| p.provider != provider);
     }
 
-    /// consumer 按 `EndpointId` 解析：校验 endpoint 存活 + owner 存活 + contract / abi
-    /// 精确匹配，返回 `Copy` 记录（Core 验证后才交付；绝不交付死 endpoint）。
-    pub fn lookup(
+    /// **纯存活解析**：endpoint 存在 + `Live` + owner 存在且 `Ready`。
+    ///
+    /// `kcore_endpoint_call` 的调用路径：call ABI 不携带 contract / abi，因为
+    /// [`EndpointId`] 是 consumer 经 [`Self::lookup`] / [`Self::discover`] 拿到的
+    /// **opaque capability**——contract / abi 已在组合期、交付 id 之前由 Core
+    /// exact-match 校验过。这里只回答"现在还能不能调用"：死 endpoint、死 owner
+    /// 一律拒绝（绝不把调用派发到已失效的实例）。
+    pub fn resolve(
         &self,
         components: &Registry,
         id: EndpointId,
-        contract: ContractId,
-        abi: InterfaceAbi,
     ) -> Result<EndpointRecord, EndpointError> {
         let record = *self
             .endpoints
@@ -335,13 +345,26 @@ impl EndpointRegistry {
         if record.state != EndpointState::Live {
             return Err(EndpointError::EndpointDead);
         }
+        check_owner_live(components, record.owner)?;
+        Ok(record)
+    }
+
+    /// consumer 按 `EndpointId` 解析：存活校验（[`Self::resolve`]）+ contract / abi
+    /// 精确匹配，返回 `Copy` 记录（Core 验证后才交付；绝不交付死 endpoint）。
+    pub fn lookup(
+        &self,
+        components: &Registry,
+        id: EndpointId,
+        contract: ContractId,
+        abi: InterfaceAbi,
+    ) -> Result<EndpointRecord, EndpointError> {
+        let record = self.resolve(components, id)?;
         if record.contract != contract {
             return Err(EndpointError::ContractMismatch);
         }
         if record.abi != abi {
             return Err(EndpointError::AbiMismatch);
         }
-        check_owner_live(components, record.owner)?;
         Ok(record)
     }
 
@@ -455,6 +478,20 @@ impl Default for EndpointRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// —— 全局（boot/core::init 初始化；导出面 / 生命周期接线使用全局，测试用 new()）——
+
+static ENDPOINTS: Once<Mutex<EndpointRegistry>> = Once::new();
+
+/// 初始化全局 endpoint 注册表（core::init 调用一次）。
+pub fn init() {
+    ENDPOINTS.call_once(|| Mutex::new(EndpointRegistry::new()));
+}
+
+/// 取全局 endpoint 注册表（init 后可用）。
+pub fn get_endpoints() -> &'static Mutex<EndpointRegistry> {
+    ENDPOINTS.get().expect("endpoint registry not initialized")
 }
 
 /// owner 存活二次校验（Core 验证后才交付；`lookup` / `discover` 共用）。
@@ -858,6 +895,40 @@ mod tests {
         let empty = Registry::new();
         assert_eq!(
             er.lookup(&empty, endpoint, CONTRACT, ABI_A),
+            Err(EndpointError::ProviderNotFound)
+        );
+    }
+
+    /// `resolve` 是 call ABI 的纯存活解析：不携带 contract / abi（id 本身是
+    /// 组合期经 lookup / discover 交付的 opaque capability），只回答"还能不能调用"。
+    #[test]
+    fn resolve_is_liveness_only() {
+        let (mut reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let endpoint = publish_ready(&mut er, &reg, ids[0], b"blk0", CONTRACT, 7);
+
+        // 活 endpoint + Ready owner：resolve 返回记录（无需再传 contract / abi）。
+        let record = er.resolve(&reg, endpoint).unwrap();
+        assert_eq!(record.owner, ids[0]);
+        assert_eq!(record.port, 7);
+
+        // 未知 id → EndpointNotFound。
+        assert_eq!(
+            er.resolve(&reg, EndpointId::from_raw(999)),
+            Err(EndpointError::EndpointNotFound)
+        );
+
+        // endpoint 永久失效 → EndpointDead。
+        er.invalidate_endpoint(endpoint);
+        assert_eq!(er.resolve(&reg, endpoint), Err(EndpointError::EndpointDead));
+
+        // owner 离开 Ready（停止 / 失败）→ EndpointDead；身份消失 → ProviderNotFound。
+        let other = publish_ready(&mut er, &reg, ids[1], b"blk1", CONTRACT, 8);
+        reg.begin_stop(ids[1]).unwrap();
+        assert_eq!(er.resolve(&reg, other), Err(EndpointError::EndpointDead));
+        let empty = Registry::new();
+        assert_eq!(
+            er.resolve(&empty, other),
             Err(EndpointError::ProviderNotFound)
         );
     }

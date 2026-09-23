@@ -34,6 +34,30 @@ const _: () = {
     assert!(core::mem::offset_of!(KcompCreateArgs, config) == 8);
 };
 
+/// 一次服务调用的**扁平 frame**：三个 `(ptr, len)` 对，六个字段全部指针宽
+/// （`size_ptrs = 6`），因此 32/64 位布局一致、可跨执行域搬运；**没有嵌套
+/// raw pointer** —— 标量参数编码在 `args` 的扁平字节区里，由 SDK 编解码。
+/// `args` / `input` / `output` 指向调用方内存，仅在**本次调用期间**借用；Core
+/// 只做结构校验（长度非零时指针不得为空），**从不解析**其中的字节。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcompCallFrame {
+    /// 标量参数区（字段布局 / 序号由契约的 SDK 侧定义，Core 视为不透明字节）。
+    pub args: *const u8,
+    pub args_len: usize,
+    /// 输入负载（只读）；无负载时指针可空、长度为 0。
+    pub input: *const u8,
+    pub input_len: usize,
+    /// 输出负载（可写）；provider 写入量不得超过 `output_len`。
+    pub output: *mut u8,
+    pub output_len: usize,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<KcompCallFrame>() == 6 * core::mem::size_of::<usize>());
+    assert!(core::mem::align_of::<KcompCallFrame>() == core::mem::align_of::<usize>());
+};
+
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。数值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；组件里的
 /// `kcomp_abi` 符号由入口宏发出。

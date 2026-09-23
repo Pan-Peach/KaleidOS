@@ -11,6 +11,7 @@ const SHT_RELA: u32 = 4;
 const SHT_NOBITS: u32 = 8;
 const SHT_REL: u32 = 9;
 const SHF_ALLOC: u64 = 0x2;
+const SHF_EXECINSTR: u64 = 0x4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ElfError {
@@ -53,6 +54,11 @@ impl Section {
 
     pub(crate) const fn is_alloc_content(self) -> bool {
         (self.ty == SHT_PROGBITS || self.ty == SHT_NOBITS) && self.is_alloc()
+    }
+
+    /// 可执行段（`SHF_EXECINSTR`）：入口地址只允许落在这里。
+    pub(crate) const fn is_exec(self) -> bool {
+        self.flags & SHF_EXECINSTR != 0
     }
 
     /// BSS 段（NOBITS）：无文件数据，放段时零填充。

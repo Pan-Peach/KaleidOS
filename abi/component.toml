@@ -37,6 +37,45 @@ type = "usize"
 offset64 = 16
 offset32 = 12
 
+[[struct]]
+name = "KcompCallFrame"
+c_name = "kcomp_call_frame"
+doc = """
+一次服务调用的**扁平 frame**：三个 `(ptr, len)` 对，六个字段全部指针宽
+（`size_ptrs = 6`），因此 32/64 位布局一致、可跨执行域搬运；**没有嵌套
+raw pointer** —— 标量参数编码在 `args` 的扁平字节区里，由 SDK 编解码。
+`args` / `input` / `output` 指向调用方内存，仅在**本次调用期间**借用；Core
+只做结构校验（长度非零时指针不得为空），**从不解析**其中的字节。
+"""
+size_ptrs = 6
+
+[[struct.field]]
+name = "args"
+type = "*const u8"
+doc = "标量参数区（字段布局 / 序号由契约的 SDK 侧定义，Core 视为不透明字节）。"
+
+[[struct.field]]
+name = "args_len"
+type = "usize"
+
+[[struct.field]]
+name = "input"
+type = "*const u8"
+doc = "输入负载（只读）；无负载时指针可空、长度为 0。"
+
+[[struct.field]]
+name = "input_len"
+type = "usize"
+
+[[struct.field]]
+name = "output"
+type = "*mut u8"
+doc = "输出负载（可写）；provider 写入量不得超过 `output_len`。"
+
+[[struct.field]]
+name = "output_len"
+type = "usize"
+
 [[entry]]
 name = "kcomp_instance_create"
 alias = "KcompInstanceCreate"
@@ -71,6 +110,36 @@ targets = "c,sdk-rust"
 [[entry.param]]
 name = "state"
 type = "*mut void"
+
+[[entry]]
+name = "kcomp_service_dispatch"
+alias = "KcompServiceDispatch"
+doc = """
+**可选**的组件服务 dispatcher（组件导出，Core 调用）：image 级统一入口，
+`port` 选中 provider 的哪个 endpoint，`method` 由 provider 定义。
+`instance_state` 是 `kcomp_instance_create` 写回的 opaque state（可为 NULL）；
+`frame` 是扁平 call frame，仅在本次调用期间借用。返回 provider 自己的
+`0 / -errno` —— 它**不是** Core 的传输状态（见 `kcore_endpoint_call`）。
+缺失该符号 = 组件不提供任何 endpoint 服务：加载不失败，调用返回 `-ENOSYS`。
+"""
+ret = "i32"
+targets = "c,sdk-rust"
+
+[[entry.param]]
+name = "instance_state"
+type = "*mut void"
+
+[[entry.param]]
+name = "port"
+type = "u32"
+
+[[entry.param]]
+name = "method"
+type = "u32"
+
+[[entry.param]]
+name = "frame"
+type = "*const KcompCallFrame"
 
 [[object]]
 name = "kcomp_abi"

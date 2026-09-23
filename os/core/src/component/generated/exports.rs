@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 38] = [
+pub(super) static EXPORTS: [Export; 41] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -311,6 +311,40 @@ pub(super) static EXPORTS: [Export; 38] = [
         name: b"kcore_dma_unmap",
         address: ExportAddress({
             let implementation: extern "C" fn(u64) -> i32 = super::kcore_dma_unmap;
+            implementation as *const ()
+        }),
+    },
+    // Category 9：Component endpoints（Contract / Endpoint）
+    Export {
+        name: b"kcore_endpoint_publish",
+        address: ExportAddress({
+            let implementation: extern "C" fn(*const u8, usize, u64, u32, u64, u32) -> i32 =
+                super::kcore_endpoint_publish;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_endpoint_lookup",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, *const u8, usize, u64, *mut u64) -> i32 =
+                super::kcore_endpoint_lookup;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_endpoint_call",
+        address: ExportAddress({
+            let implementation: extern "C" fn(
+                u64,
+                u32,
+                *const u8,
+                usize,
+                *const u8,
+                usize,
+                *mut u8,
+                usize,
+                *mut i32,
+            ) -> i32 = super::kcore_endpoint_call;
             implementation as *const ()
         }),
     },

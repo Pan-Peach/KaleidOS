@@ -17,6 +17,18 @@
 //! `kcomp_abi` 的**ELF 定义、边界与值**在放段后校验：定义（STT_OBJECT 且已定义）、
 //! 边界（8 字节落在装载镜像内）、值（等于 Core 手工锚定的 [`KCOMP_ABI`] 指纹）。
 //!
+//! # 可选符号（`kcomp_service_dispatch`）
+//!
+//! ```text
+//! kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t method,
+//!                        const struct kcomp_call_frame *frame) -> i32
+//! ```
+//!
+//! **缺失 = 组件不提供 endpoint 服务**：加载成功，`service_dispatch = None`
+//! （调用时 Core 返回 `-ENOSYS`）。**存在**时（STT_FUNC 且 DEFINED）必须落在
+//! 其所属的**已分配 executable 段**内，否则整个加载失败
+//! （[`LoaderError::DispatcherOutOfBounds`]——损坏的镜像不进入系统）。
+//!
 //! `LoadedComponent` 是一次加载的**未登记**结果；登记进镜像表（`component/image.rs`）
 //! 后由 `ComponentImage` 持有常驻 lease 与入口地址。
 
@@ -50,6 +62,9 @@ pub enum LoaderError {
     MissingAbi,
     /// `kcomp_abi` 的值与 Core 手工锚定的契约指纹不一致（协调替换）。
     AbiMismatch,
+    /// 可选的 `kcomp_service_dispatch` 已定义，但不在其所属的**已分配
+    /// executable 段**内（损坏的镜像；缺失本身合法，不报错）。
+    DispatcherOutOfBounds,
     UnsupportedRelocation,
     UnresolvedSymbol,
     OutOfMemory,
@@ -75,6 +90,9 @@ pub struct LoadedComponent {
     pub create: usize,
     /// `kcomp_instance_destroy` 的已重定位地址。
     pub destroy: usize,
+    /// **可选**的 `kcomp_service_dispatch` 已重定位地址（组件不提供 endpoint
+    /// 服务时为 `None`；加载不因此失败）。
+    pub service_dispatch: Option<usize>,
     /// 装载镜像大小（放段结果）。
     pub text_size: usize,
     /// 已校验的 `kcomp_abi` 值（必等于 [`KCOMP_ABI`]）。
@@ -111,6 +129,9 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
         .ok_or(LoaderError::MissingDestroy)?;
     let abi_offset = symbol_offset(&object, symbol_table, b"kcomp_abi", STT_OBJECT)?
         .ok_or(LoaderError::MissingAbi)?;
+    // 可选入口：缺失合法（组件不提供 endpoint 服务）。
+    let dispatch_offset =
+        symbol_offset(&object, symbol_table, b"kcomp_service_dispatch", STT_FUNC)?;
 
     let image_memory = memory::alloc_region(image_size).map_err(|_| LoaderError::OutOfMemory)?;
     let base = image_memory.region().base;
@@ -137,11 +158,13 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let create = resolve_symbol_address(&seg_place, base, create_offset)?;
     let destroy = resolve_symbol_address(&seg_place, base, destroy_offset)?;
     let abi = read_abi(image, base, &seg_place, abi_offset)?;
+    let service_dispatch = resolve_optional_dispatch(&object, &seg_place, base, dispatch_offset)?;
 
     Ok(LoadedComponent {
         base,
         create,
         destroy,
+        service_dispatch,
         text_size: image_size,
         abi,
         memory: Some(image_memory),
@@ -184,6 +207,46 @@ fn resolve_symbol_address(
     base.checked_add(image_offset)
         .and_then(|address| address.checked_add(value))
         .ok_or(LoaderError::UnsupportedFormat)
+}
+
+/// **可选**入口的解析 + 边界校验：`Some((shndx, st_value))` 必须落在其所属的
+/// **已分配 executable 段**内；`None` 原样返回（可选符号缺失不是错误）。
+fn resolve_optional_dispatch(
+    object: &ElfObject<'_>,
+    seg_place: &[(usize, usize)],
+    base: usize,
+    symbol: Option<(usize, usize)>,
+) -> Result<Option<usize>, LoaderError> {
+    let Some((section_index, value)) = symbol else {
+        return Ok(None);
+    };
+    let section = object.section(section_index)?;
+    let image_offset = seg_place
+        .iter()
+        .find(|(index, _)| *index == section_index)
+        .map(|(_, offset)| *offset)
+        .ok_or(LoaderError::DispatcherOutOfBounds)?;
+    let offset = checked_dispatch_offset(section, image_offset, value)?;
+    let address = base
+        .checked_add(offset)
+        .ok_or(LoaderError::DispatcherOutOfBounds)?;
+    Ok(Some(address))
+}
+
+/// 入口边界校验（纯函数，host-testable）：段必须**已分配且可执行**
+/// （`SHF_ALLOC | SHF_EXECINSTR`），且 `st_value` 落在段内（`value < size`；
+/// 段尾不是合法入口）。返回镜像内偏移（相对 `base`）。
+fn checked_dispatch_offset(
+    section: Section,
+    image_offset: usize,
+    value: usize,
+) -> Result<usize, LoaderError> {
+    if !section.is_alloc() || !section.is_exec() || value >= section.size {
+        return Err(LoaderError::DispatcherOutOfBounds);
+    }
+    image_offset
+        .checked_add(value)
+        .ok_or(LoaderError::DispatcherOutOfBounds)
 }
 
 /// 校验 `kcomp_abi` 的边界与值：8 字节必须落在装载镜像内，且等于 [`KCOMP_ABI`]。
@@ -348,6 +411,117 @@ mod tests {
             comp.abi, KCOMP_ABI,
             "装载镜像的 kcomp_abi 必须与 Core 指纹一致"
         );
+        assert_eq!(
+            comp.service_dispatch, None,
+            "core_test 不提供 endpoint 服务：可选符号缺失不是错误"
+        );
+    }
+
+    /// 可选入口（`kcomp_service_dispatch`）：fixture 里没有该符号时 `None`；
+    /// 存在时必须被解析成镜像内的地址。
+    ///
+    /// 做法：把一个已定义 FUNC 符号在 strtab 里的**名字**改成
+    /// `kcomp_service_dispatch`——只改名字，不动符号索引 / 重定位 / 段内容，
+    /// 因此镜像语义不变，只有可选入口解析结果改变。
+    #[test]
+    fn resolves_optional_service_dispatcher_when_present() {
+        let _g = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        // Given：fixture 本身没有 dispatcher（缺失 = 合法，见上一条用例）。
+        let baseline = load_component(CORETEST_KCOMP).expect("load core_test.kcomp");
+        assert_eq!(baseline.service_dispatch, None);
+
+        // When：改名出一个 kcomp_service_dispatch。
+        let mut patched = CORETEST_KCOMP.to_vec();
+        rename_a_func_to_dispatch(&mut patched).expect("fixture 里必须有可改名的 FUNC 符号");
+        let comp = load_component(&patched).expect("改名不影响其余契约");
+
+        // Then：可选入口被解析，且落在装载镜像区间内。
+        let dispatch = comp
+            .service_dispatch
+            .expect("kcomp_service_dispatch 应被解析");
+        assert!(
+            dispatch >= comp.base && dispatch < comp.base + comp.text_size,
+            "dispatcher 必须落在镜像内"
+        );
+    }
+
+    /// 可选入口的边界规则（纯函数）：已分配 + executable + 段内偏移。
+    #[test]
+    fn dispatcher_must_lie_inside_an_allocated_executable_section() {
+        const ALLOC_EXEC: u64 = 0x2 | 0x4;
+        let exec = Section {
+            ty: PROGBITS,
+            offset: 0,
+            size: 16,
+            link: 0,
+            flags: ALLOC_EXEC,
+            info: 0,
+            align: 1,
+        };
+        assert_eq!(checked_dispatch_offset(exec, 0, 0), Ok(0));
+        assert_eq!(checked_dispatch_offset(exec, 8, 15), Ok(23));
+        // 段尾（value == size）不是合法入口。
+        assert_eq!(
+            checked_dispatch_offset(exec, 0, 16),
+            Err(LoaderError::DispatcherOutOfBounds)
+        );
+        // 非 executable（纯数据段）拒绝。
+        let data = Section { flags: 0x2, ..exec };
+        assert_eq!(
+            checked_dispatch_offset(data, 0, 0),
+            Err(LoaderError::DispatcherOutOfBounds)
+        );
+        // 非 alloc（文件元数据段）拒绝。
+        let raw = Section { flags: 0, ..exec };
+        assert_eq!(
+            checked_dispatch_offset(raw, 0, 0),
+            Err(LoaderError::DispatcherOutOfBounds)
+        );
+        // 偏移溢出拒绝。
+        assert_eq!(
+            checked_dispatch_offset(exec, usize::MAX, 1),
+            Err(LoaderError::DispatcherOutOfBounds)
+        );
+    }
+
+    /// 把一个已定义 FUNC 符号改名为 `kcomp_service_dispatch`（测试专用）。
+    ///
+    /// 要求原名字不短于新名字（新名字 + NUL 必须落在原名字的空间里）。
+    /// 找不到合适的符号（无 exec FUNC / 名字太短）时返回 `None`。
+    fn rename_a_func_to_dispatch(blob: &mut [u8]) -> Option<()> {
+        let new_name = b"kcomp_service_dispatch";
+        let (at, _) = {
+            let object = ElfObject::parse(blob).ok()?;
+            let symtab = object.symbol_table_index().ok()?;
+            let strtab = object.section(symtab).ok()?.link;
+            let strtab_offset = object.section(strtab).ok()?.offset;
+            let mut found = None;
+            for index in 0..object.symbol_count(symtab).ok()? {
+                let symbol = object.symbol(symtab, index).ok()?;
+                if symbol.kind != STT_FUNC || symbol.shndx == 0 {
+                    continue;
+                }
+                let section = object.section(symbol.shndx).ok()?;
+                if !section.is_alloc()
+                    || !section.is_exec()
+                    || symbol.value as usize >= section.size
+                {
+                    continue;
+                }
+                let name = object.symbol_name(symtab, symbol).ok()?;
+                if name.len() < new_name.len() {
+                    continue;
+                }
+                found = Some((strtab_offset + symbol.name, symbol.shndx));
+                break;
+            }
+            found?
+        };
+        blob[at..at + new_name.len()].copy_from_slice(new_name);
+        blob[at + new_name.len()] = 0;
+        Some(())
     }
 
     #[test]

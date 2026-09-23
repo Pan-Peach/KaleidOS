@@ -59,6 +59,9 @@ pub struct ComponentImage {
     pub create: usize,
     /// `kcomp_instance_destroy` 入口地址（停止路径在 Core-owned 栈上调用）。
     pub destroy: usize,
+    /// **可选**的 `kcomp_service_dispatch` 入口地址（loader 解析 + 已分配
+    /// executable 段边界校验）。`None` = 组件不提供 endpoint 服务。
+    pub service_dispatch: Option<usize>,
     /// 装载镜像大小（loader 的放段结果；曾在此处被丢弃，拆分后保留）。
     pub text_size: usize,
     /// 组件 `kcomp_abi` 的已校验值（loader 放段后读取，见 loader.rs）。
@@ -106,6 +109,7 @@ impl ImageTable {
             base: loaded.base,
             create: loaded.create,
             destroy: loaded.destroy,
+            service_dispatch: loaded.service_dispatch,
             text_size: loaded.text_size,
             abi: loaded.abi,
             // loader 成功返回必然携带 lease（放段 = 一次 region 分配）。
@@ -168,6 +172,16 @@ pub(crate) mod test_support {
     use crate::component::loader::LoadedComponent;
 
     pub(crate) fn register_test_image(name: &[u8], destroy: usize) -> ComponentImageId {
+        register_test_image_with_dispatch(name, destroy, None)
+    }
+
+    /// 带**可选** `kcomp_service_dispatch` 的测试 image：endpoint call 用例用它
+    /// 区分"有 dispatcher"与"没有 dispatcher"两条路径。
+    pub(crate) fn register_test_image_with_dispatch(
+        name: &[u8],
+        destroy: usize,
+        service_dispatch: Option<usize>,
+    ) -> ComponentImageId {
         let lease = crate::memory::alloc_region(crate::memory::ALLOC_GRANULE).unwrap();
         let base = lease.region().base;
         get_images()
@@ -178,6 +192,7 @@ pub(crate) mod test_support {
                     base,
                     create: base + 8,
                     destroy,
+                    service_dispatch,
                     text_size: 64,
                     abi: KCOMP_ABI,
                     memory: Some(lease),
@@ -200,6 +215,7 @@ mod tests {
             base,
             create: base + 8,
             destroy: base + 16,
+            service_dispatch: None,
             text_size: 64,
             abi: KCOMP_ABI,
             memory: Some(lease),
@@ -250,9 +266,25 @@ mod tests {
         let image = table.get(id).unwrap();
         assert_eq!(image.base + 8, image.create);
         assert_eq!(image.base + 16, image.destroy);
+        assert_eq!(image.service_dispatch, None, "可选入口缺省不携带");
         assert_eq!(image.text_size, 64);
         assert_eq!(image.abi, KCOMP_ABI);
         assert!(image.memory.size() >= crate::memory::ALLOC_GRANULE);
+    }
+
+    /// `service_dispatch` 是可选入口：loader 解析到就原样带进 image 真相
+    /// （`None` / `Some` 都是合法形态）。
+    #[test]
+    fn optional_service_dispatch_is_carried_through_registration() {
+        let _guard = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        let mut table = ImageTable::new();
+        let mut loaded = loaded();
+        loaded.service_dispatch = Some(loaded.base + 32);
+        let expected = loaded.service_dispatch;
+        let id = table.register(b"dispatch", loaded).unwrap();
+        assert_eq!(table.get(id).unwrap().service_dispatch, expected);
     }
 
     #[test]

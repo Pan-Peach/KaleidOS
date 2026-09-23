@@ -713,4 +713,131 @@ category_group = "Device ownership（mechanism-first）"
 name = "mapping"
 type = "u64"
 
+[[function]]
+name = "kcore_endpoint_publish"
+ret = "i32"
+category = "Component endpoints（Contract / Endpoint）"
+c_category = "Component endpoints（Contract / Endpoint）"
+doc = """
+发布一条 endpoint（**staged**：`kcomp_instance_create` 执行期间只记录 pending）。
+provider = 当前正在创建的实例（Core 从 init 边界解析，**不信任组件自报身份**）。
+`contract` 是组合策略提供的契约身份（不透明 `u64`）；`kind` / `abi` 由**首次发布**
+建立契约真相，后续发布不一致在 commit 时拒绝；`port` 是 provider 定义的不透明
+dispatch token（Core 从不解释）。端口名只要求在 **provider 实例内唯一**。
+create 返回 0 后 Core 原子提交；本函数返回 `0` 只表示"已记录 pending"，
+**不返回 EndpointId**（id 只在 commit 成功后存在，由 `kcore_endpoint_lookup` 发现）。
+`Failed` provider / 不在 create 边界 → `-EPERM`；返回 `0 / -Errno`。
+"""
+c_doc = """
+发布 endpoint（staged：init 期间只记录 pending；create 返回 0 后 Core 原子提交）。
+provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。
+"""
+[[function.param]]
+name = "port_name"
+type = "*const u8"
+[[function.param]]
+name = "port_name_len"
+type = "usize"
+[[function.param]]
+name = "contract"
+type = "u64"
+[[function.param]]
+name = "kind"
+type = "u32"
+[[function.param]]
+name = "abi"
+type = "u64"
+[[function.param]]
+name = "port"
+type = "u32"
+
+[[function]]
+name = "kcore_endpoint_lookup"
+ret = "i32"
+category = "Component endpoints（Contract / Endpoint）"
+c_category = "Component endpoints（Contract / Endpoint）"
+doc = """
+组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付）。
+成功 = `0`，EndpointId（`u64`）写入 `*out_endpoint`（调用方保证可写，任意对齐）；
+失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法·契约不符 /
+`ENOENT` 未发布或 endpoint 已死 / `ENODEV` provider 已不存在）。
+"""
+c_doc = """
+按 (provider, port_name, contract) 发现 endpoint：成功写 EndpointId 到
+*out_endpoint；失败返回 -Errno。
+"""
+[[function.param]]
+name = "provider"
+type = "u32"
+[[function.param]]
+name = "port_name"
+type = "*const u8"
+[[function.param]]
+name = "port_name_len"
+type = "usize"
+[[function.param]]
+name = "contract"
+type = "u64"
+[[function.param]]
+name = "out_endpoint"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_endpoint_call"
+ret = "i32"
+category = "Component endpoints（Contract / Endpoint）"
+c_category = "Component endpoints（Contract / Endpoint）"
+doc = """
+调用一个 endpoint。**传输状态 ≠ 方法状态**：返回值是 Core 的**传输状态**
+（`0` / `-Errno`）；provider 自己的 `i32` 返回写入 `*out_status`——**只在传输
+返回 `0` 时有意义**。provider 返回的负 errno 绝不与 Core 生成的失败混淆。
+`endpoint` 是组合期经 `kcore_endpoint_lookup` 取得的 opaque EndpointId
+（contract / abi 已在交付前校验，调用只重新校验存活）；`method` / `port` 语义
+由 provider 定义，Core 从不解释。`args` / `input` / `output` 是调用方的内存，
+只在本次调用期间借用：Core 只做结构校验（长度非零时指针不得为空），**不解析
+其中的字节**。
+provider = 当前 provider 实例：Core 校验其 `Ready` 并记 inflight；provider 停止 /
+失败后 endpoint 永久死亡，绝不重定向到新实例。
+**本阶段（Phase B）是 KernelNative 直接分派**：没有执行边界 / service stack /
+principal 切换 / re-entry 检测 / provider panic containment（下一阶段，见
+`component/call.rs` 模块文档）。
+成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`（`EFAULT`
+`*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或 caller 已
+`Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image 已不存在；
+`EBUSY` provider 不在 `Ready` 或 inflight 溢出；`ENOSYS` image 没有
+`kcomp_service_dispatch`）。
+"""
+c_doc = """
+调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
+*out_status（仅传输返回 0 时有意义）。当前是 KernelNative 直接分派（无执行
+边界 / panic containment）。
+"""
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "method"
+type = "u32"
+[[function.param]]
+name = "args"
+type = "*const u8"
+[[function.param]]
+name = "args_len"
+type = "usize"
+[[function.param]]
+name = "input"
+type = "*const u8"
+[[function.param]]
+name = "input_len"
+type = "usize"
+[[function.param]]
+name = "output"
+type = "*mut u8"
+[[function.param]]
+name = "output_len"
+type = "usize"
+[[function.param]]
+name = "out_status"
+type = "*mut i32"
+
 # overrides: ['kcore_task_create']

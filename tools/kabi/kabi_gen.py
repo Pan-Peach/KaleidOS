@@ -24,7 +24,8 @@
 声明形状（`[[struct]]` 等）由 schema 决定，emitter 只做机械渲染：
 
 * ``[[struct]]`` 可带 ``size`` / ``size64``+``size32`` / ``align``（字面布局断言），
-  也可带 ``size_ptrs = N``——"N 个指针宽字段"的函数表：C 断言
+  也可带 ``size_ptrs = N``——"N 个指针宽字段"的结构（函数表 / 扁平 frame）：字段
+  必须是指针、fn 指针或 ``usize``；C 断言
   ``sizeof(struct X) == N * sizeof(void *)``，Rust 断言
   ``size_of::<X>() == N * size_of::<usize>()``（外加指针对齐），
   字段个数 / 顺序漂移 = 编译错误；
@@ -1020,6 +1021,10 @@ def _build_struct(table: dict, path: str, known: Set[str]) -> Struct:
                 % (path, name)
             )
         for field in fields:
+            # 指针宽 = 指针 / fn 指针 / `usize`（`size_t`）。`usize` 是"语义就是
+            # 指针宽"的长度量（AGENTS.md 宽度规则），与 `*const void` 同宽。
+            if isinstance(field.type, Prim) and field.type.name == "usize":
+                continue
             if not isinstance(field.type, (Ptr, Fn)):
                 raise KabiError(
                     "%s: struct %s size_ptrs requires pointer-sized fields (%s is not)"
@@ -2097,22 +2102,25 @@ doc = "I/O error"
     demo = _build_schema(
         _parse_toml_subset(
             '[[const]]\nname = "DEMO_NAME"\ntype = "string"\nvalue = "demo.name"\n'
-            '[[struct]]\nname = "DemoApi"\nc_name = "demo_api"\nsize_ptrs = 2\n'
+            '[[struct]]\nname = "DemoApi"\nc_name = "demo_api"\nsize_ptrs = 3\n'
             '[[struct.field]]\nname = "a"\ntype = "fn(ctx: *mut void) -> u32"\n'
             '[[struct.field]]\nname = "b"\ntype = "fn(ctx: *mut void, x: u64) -> i32"\n'
+            '[[struct.field]]\nname = "n"\ntype = "usize"\n'
         ),
         "abi/demo.toml",
         "abi/demo.toml",
     )
     assert demo.constants[0].type == Str() and demo.constants[0].value is None
-    assert demo.structs[0].size_ptrs == 2
+    assert demo.structs[0].size_ptrs == 3
     c_struct = CEmitter()._struct(demo.structs[0], {})
-    assert "sizeof(struct demo_api) == 2 * sizeof(void *)" in c_struct
+    assert "sizeof(struct demo_api) == 3 * sizeof(void *)" in c_struct
     assert "_Alignof(struct demo_api) == _Alignof(void *)" in c_struct
     assert "uint32_t (*a)(void *ctx);" in c_struct
+    assert "size_t n;" in c_struct
     rust_struct = RustEmitter()._struct(demo.structs[0])
-    assert "size_of::<DemoApi>() == 2 * core::mem::size_of::<usize>()" in rust_struct
+    assert "size_of::<DemoApi>() == 3 * core::mem::size_of::<usize>()" in rust_struct
     assert 'pub a: unsafe extern "C" fn(ctx: *mut ()) -> u32,' in rust_struct
+    assert "pub n: usize," in rust_struct
     # 函数指针不可比较：不派生 PartialEq / Eq（否则 unpredictable_function_pointer_comparisons）。
     assert "#[derive(Debug, Clone, Copy)]" in rust_struct
     assert "PartialEq" not in rust_struct
@@ -2136,7 +2144,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 38
+    assert len(core.functions) == 41
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
         "kcore_trace_stats",
@@ -2145,8 +2153,20 @@ doc = "I/O error"
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
     assert len([func for func in core.functions if func.core_params != func.params]) == 1
-    assert len(core.structs) == 2 and len(component.structs) == 1
+    assert len(core.structs) == 2 and len(component.structs) == 2
+    frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
+    assert frame.c_name == "kcomp_call_frame" and frame.size_ptrs == 6
+    assert [field.name for field in frame.fields] == [
+        "args",
+        "args_len",
+        "input",
+        "input_len",
+        "output",
+        "output_len",
+    ]
     assert component.entries[0].alias == "KcompInstanceCreate"
+    assert component.entries[2].name == "kcomp_service_dispatch"
+    assert component.entries[2].alias == "KcompServiceDispatch"
     assert component.aliases[0].name == "KcompTaskEntry"
     assert component.objects[0].name == "kcomp_abi" and component.objects[0].is_const
     assert component.enums[0].c_name == "KcompInterfaceKind"

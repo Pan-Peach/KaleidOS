@@ -19,6 +19,8 @@
 //!   不再新增"正数成功 / 负数错误"协议；纯 query 与 allocator 风格 API
 //!   不强制（见 `component/export.rs`）。
 
+use crate::component::call::CallError;
+use crate::component::endpoint::EndpointError;
 use crate::component::exit::ComponentStopError;
 use crate::component::interface::InterfaceError;
 use crate::component::load::ComponentLoadError;
@@ -85,6 +87,46 @@ impl From<InterfaceError> for Errno {
     }
 }
 
+impl From<EndpointError> for Errno {
+    fn from(error: EndpointError) -> Self {
+        match error {
+            // 未发布 / 已死：不交付死 endpoint（与 `Unbound` 同一档）。
+            EndpointError::EndpointNotFound | EndpointError::EndpointDead => Errno::ENOENT,
+            // provider 记录本身不存在（身份消失）——与设备缺席同档。
+            EndpointError::ProviderNotFound => Errno::ENODEV,
+            // provider 存在但不在可发布状态（create 之外 / 已停止）。
+            EndpointError::ProviderNotReady => Errno::EBUSY,
+            // 契约 / ABI 是 exact match，对不上就是参数非法。
+            EndpointError::ContractMismatch
+            | EndpointError::KindMismatch
+            | EndpointError::AbiMismatch => Errno::EINVAL,
+            // 端口名在 provider 实例内唯一：重复发布拒绝，不重定向。
+            EndpointError::DuplicatePort => Errno::EEXIST,
+            // EndpointId 空间耗尽（u64 单调）。
+            EndpointError::IdExhausted => Errno::ENOSPC,
+        }
+    }
+}
+
+impl From<CallError> for Errno {
+    fn from(error: CallError) -> Self {
+        match error {
+            // 身份门禁：无 principal / caller 已 Failed（与其它 acquiring 入口同档）。
+            CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
+            // frame 结构非法（out_status 为空 / 长度非零配空指针）。
+            CallError::InvalidFrame => Errno::EFAULT,
+            // endpoint 存活解析失败（未发布 / 已死 / owner 消失）——沿用 EndpointError 档位。
+            CallError::Endpoint(error) => Errno::from(error),
+            // provider 不在 Ready / inflight 溢出：当前拒绝，稍后可能可用。
+            CallError::ProviderBusy => Errno::EBUSY,
+            // owner → image 引用断了（Core 不变式破坏，不应发生）：与设备缺席同档。
+            CallError::ImageMissing => Errno::ENODEV,
+            // provider 没有 dispatcher：组件不提供 endpoint 服务（能力缺失）。
+            CallError::NoDispatcher => Errno::ENOSYS,
+        }
+    }
+}
+
 impl From<ComponentLoadError> for Errno {
     fn from(error: ComponentLoadError) -> Self {
         match error {
@@ -101,6 +143,7 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::DestroyFailed(_) => Errno::EIO,
             ComponentLoadError::DestroyPanicked => Errno::EIO,
             ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
+            ComponentLoadError::EndpointCommitFailed(error) => Errno::from(error),
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
         }
     }
@@ -192,6 +235,8 @@ mod tests {
         assert_eq!(Errno::from(TaskError::InvalidTransition), Errno::EINVAL);
         assert_eq!(Errno::from(SchedError::NoPolicy), Errno::ENOTSUP);
         assert_eq!(Errno::from(InterfaceError::ProviderNotReady), Errno::EAGAIN);
+        assert_eq!(Errno::from(EndpointError::EndpointDead), Errno::ENOENT);
+        assert_eq!(Errno::from(EndpointError::ProviderNotReady), Errno::EBUSY);
         assert_eq!(Errno::from(ComponentLoadError::NotFound), Errno::ENOENT);
         assert_eq!(
             Errno::from(ComponentLoadError::DestroyFailed(1)),
@@ -297,6 +342,83 @@ mod tests {
     }
 
     #[test]
+    fn every_endpoint_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            EndpointError::EndpointNotFound,
+            EndpointError::EndpointDead,
+            EndpointError::ProviderNotFound,
+            EndpointError::ProviderNotReady,
+            EndpointError::ContractMismatch,
+            EndpointError::KindMismatch,
+            EndpointError::AbiMismatch,
+            EndpointError::DuplicatePort,
+            EndpointError::IdExhausted,
+        ] {
+            let expected = match error {
+                EndpointError::EndpointNotFound | EndpointError::EndpointDead => Errno::ENOENT,
+                EndpointError::ProviderNotFound => Errno::ENODEV,
+                EndpointError::ProviderNotReady => Errno::EBUSY,
+                EndpointError::ContractMismatch
+                | EndpointError::KindMismatch
+                | EndpointError::AbiMismatch => Errno::EINVAL,
+                EndpointError::DuplicatePort => Errno::EEXIST,
+                EndpointError::IdExhausted => Errno::ENOSPC,
+            };
+            assert_eq!(Errno::from(error), expected, "EndpointError {error:?}");
+        }
+    }
+
+    /// `CallError` 的**全部**臂 → Errno（endpoint 臂展开到 `EndpointError` 的全部
+    /// 变体：两边都不带通配臂，新增变体 = 编译错误）。
+    #[test]
+    fn every_call_error_arm_maps_to_its_pinned_errno() {
+        for error in [
+            CallError::NoCaller,
+            CallError::CallerFailed,
+            CallError::InvalidFrame,
+            CallError::Endpoint(EndpointError::EndpointNotFound),
+            CallError::Endpoint(EndpointError::EndpointDead),
+            CallError::Endpoint(EndpointError::ProviderNotFound),
+            CallError::Endpoint(EndpointError::ProviderNotReady),
+            CallError::Endpoint(EndpointError::ContractMismatch),
+            CallError::Endpoint(EndpointError::KindMismatch),
+            CallError::Endpoint(EndpointError::AbiMismatch),
+            CallError::Endpoint(EndpointError::DuplicatePort),
+            CallError::Endpoint(EndpointError::IdExhausted),
+            CallError::ProviderBusy,
+            CallError::ImageMissing,
+            CallError::NoDispatcher,
+        ] {
+            let expected = match error {
+                CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
+                CallError::InvalidFrame => Errno::EFAULT,
+                CallError::Endpoint(
+                    EndpointError::EndpointNotFound | EndpointError::EndpointDead,
+                ) => Errno::ENOENT,
+                CallError::Endpoint(EndpointError::ProviderNotFound) => Errno::ENODEV,
+                CallError::Endpoint(EndpointError::ProviderNotReady) => Errno::EBUSY,
+                CallError::Endpoint(
+                    EndpointError::ContractMismatch
+                    | EndpointError::KindMismatch
+                    | EndpointError::AbiMismatch,
+                ) => Errno::EINVAL,
+                CallError::Endpoint(EndpointError::DuplicatePort) => Errno::EEXIST,
+                CallError::Endpoint(EndpointError::IdExhausted) => Errno::ENOSPC,
+                CallError::ProviderBusy => Errno::EBUSY,
+                CallError::ImageMissing => Errno::ENODEV,
+                CallError::NoDispatcher => Errno::ENOSYS,
+            };
+            assert_eq!(Errno::from(error), expected, "CallError {error:?}");
+        }
+        // "image 没有 dispatcher" 的文档化 errno：能力缺失 → ENOSYS（不是 EIO）。
+        assert_eq!(
+            Errno::from(CallError::NoDispatcher),
+            Errno::ENOSYS,
+            "无 dispatcher = 能力缺失，用 ENOSYS 而不是 I/O 错误"
+        );
+    }
+
+    #[test]
     fn every_interface_error_arm_maps_to_its_pinned_errno() {
         for error in [
             InterfaceError::ProviderNotFound,
@@ -338,6 +460,7 @@ mod tests {
             ComponentLoadError::DestroyFailed(1),
             ComponentLoadError::DestroyPanicked,
             ComponentLoadError::InterfaceCommitFailed(InterfaceError::ProviderNotFound),
+            ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort),
             ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
         ] {
             let expected = match error {
@@ -354,6 +477,10 @@ mod tests {
                 ComponentLoadError::DestroyFailed(_) => Errno::EIO,
                 ComponentLoadError::DestroyPanicked => Errno::EIO,
                 ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
+                ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort) => {
+                    Errno::EEXIST
+                }
+                ComponentLoadError::EndpointCommitFailed(_) => Errno::EINVAL,
                 ComponentLoadError::TaskPanicked(_) => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");

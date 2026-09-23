@@ -3,7 +3,7 @@
 //! 落地 `docs/architecture/component-model.md` §4.9 的 `fail_component`（最小版）与
 //! `docs/architecture/driver-model.md` §7 的撤销不变式：**组件失败 = 逻辑死亡、物理驻留**。
 //! 顺序固定：先提交状态真相（Failed），再撤销它持有的资源归属，最后清掉它作为
-//! provider 的全部 binding（含未提交的 pending publications）。
+//! provider 的全部 binding / endpoint（含未提交的 pending publications）。
 //!
 //! # 与优雅停止的分工
 //!
@@ -21,7 +21,7 @@
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
 
 use crate::component::load::ComponentLoadError;
-use crate::component::{ComponentId, interface, registry};
+use crate::component::{ComponentId, endpoint, interface, registry};
 use crate::resource::{device, dma, irq};
 
 /// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 资源兜底。
@@ -42,24 +42,35 @@ pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
 /// 1. IRQ：撤销 route（投递目标随之消失）；
 /// 2. DMA：撤销 mapping，backing lease 进 QUARANTINE（不 free，设备可能仍在 DMA）；
 /// 3. Device：撤销 ownership 并把设备标进失败 quarantine；
-/// 4. Interface：解绑 active bindings，丢弃 staged pending publications。
+/// 4. Interface：解绑 active bindings，丢弃 staged pending publications；
+/// 5. Endpoint：provider 的全部 endpoint 永久失效（tombstone，id 不复用），
+///    丢弃 staged pending publications。
 ///
 /// 调用方负责状态提交（失败 = `Failed`；优雅停止 = 随后 `Stopping → Stopped`）。
 pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
     irq::revoke_owner(id);
     dma::revoke_owner(id);
     device::quarantine_owner(id);
-    let mut ifs = interface::get_interfaces().lock();
-    // active bindings：provider 解绑（consumer 立即不可 bind/refresh）。
-    ifs.unbind_provider(id);
-    // staged publish：pending 全丢弃，旧 provider 完全不受影响。
-    ifs.discard_pending(id);
+    {
+        let mut ifs = interface::get_interfaces().lock();
+        // active bindings：provider 解绑（consumer 立即不可 bind/refresh）。
+        ifs.unbind_provider(id);
+        // staged publish：pending 全丢弃，旧 provider 完全不受影响。
+        ifs.discard_pending(id);
+    }
+    let mut endpoints = endpoint::get_endpoints().lock();
+    // endpoint 真相：provider 的全部 endpoint 永久失效（绝不重定向到新实例）。
+    endpoints.invalidate_provider(id);
+    // staged endpoint publish：pending 全丢弃，旧 provider 完全不受影响。
+    endpoints.discard_pending(id);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::component::ComponentState;
+    use crate::component::endpoint::{ContractId, EndpointError, EndpointState};
+    use crate::component::image::ComponentImageId;
     use crate::component::interface::{self, InterfaceAbi, InterfaceError, InterfaceKind};
     use crate::component::registry;
     use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
@@ -117,6 +128,7 @@ mod tests {
         registry::init();
         crate::component::image::init();
         interface::init();
+        endpoint::init();
         crate::resource::init();
         commit_device(24, b"fail,mmio");
 
@@ -206,5 +218,161 @@ mod tests {
         );
 
         device::get_table().lock().clear_quarantine();
+    }
+
+    /// 声明一个 Ready 实例（endpoint 测试只把 image 当身份键，不需要真实 image）。
+    fn ready_instance(reg: &mut registry::Registry) -> ComponentId {
+        let id = reg.declare(ComponentImageId::from_raw(0xFA11)).unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        id
+    }
+
+    /// 失败路径的 endpoint 兜底：`fail_component` 使失败组件的 endpoint 永久
+    /// `Invalid`（dead），未提交的 pending publication 不会在事后浮出；
+    /// 其它 provider 的 endpoint 完全不受影响。
+    #[test]
+    fn fail_component_invalidates_endpoints_permanently() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::component::image::init();
+        interface::init();
+        endpoint::init();
+        crate::resource::init();
+
+        const CONTRACT: ContractId = ContractId::from_raw(0xFA11_1001);
+        const OTHER_CONTRACT: ContractId = ContractId::from_raw(0xFA11_1002);
+        const ENDPOINT_ABI: InterfaceAbi = InterfaceAbi::from_raw(0xFA11_1003);
+
+        // Given：两个 Ready provider；第一个有一条已提交 endpoint + 一条未提交
+        // pending，第二个有一条已提交 endpoint。
+        let (id, other) = {
+            let mut reg = registry::get_registry().lock();
+            (ready_instance(&mut reg), ready_instance(&mut reg))
+        };
+        let (live, other_live) = {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                id,
+                b"blk0",
+                CONTRACT,
+                InterfaceKind::Device,
+                ENDPOINT_ABI,
+                7,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, id).unwrap();
+            // 未提交的 pending：create 失败时必须被丢弃。
+            eps.stage_publish(
+                &reg,
+                id,
+                b"pending0",
+                OTHER_CONTRACT,
+                InterfaceKind::Device,
+                ENDPOINT_ABI,
+                9,
+            )
+            .unwrap();
+            eps.stage_publish(
+                &reg,
+                other,
+                b"blk0",
+                CONTRACT,
+                InterfaceKind::Device,
+                ENDPOINT_ABI,
+                10,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, other).unwrap();
+            (
+                eps.discover(&reg, id, b"blk0", CONTRACT).unwrap(),
+                eps.discover(&reg, other, b"blk0", CONTRACT).unwrap(),
+            )
+        };
+
+        // When：组件失败（create 失败 / panic / 运行失败共用这条兜底）。
+        fail_component(id, ComponentLoadError::CreateFailed(1));
+
+        // Then：失败组件的 endpoint 永久 dead；pending 不可能事后浮出
+        // （provider Failed → commit 被 NotReady 拒绝）。
+        let reg = registry::get_registry().lock();
+        let mut eps = endpoint::get_endpoints().lock();
+        assert_eq!(
+            eps.lookup(&reg, live, CONTRACT, ENDPOINT_ABI),
+            Err(EndpointError::EndpointDead)
+        );
+        assert_eq!(
+            eps.discover(&reg, id, b"blk0", CONTRACT),
+            Err(EndpointError::EndpointDead)
+        );
+        assert_eq!(
+            eps.commit_pending(&reg, id),
+            Err(EndpointError::ProviderNotReady)
+        );
+        assert_eq!(
+            eps.discover(&reg, id, b"pending0", OTHER_CONTRACT),
+            Err(EndpointError::EndpointNotFound)
+        );
+        // 其它 provider 完全不受影响。
+        assert_eq!(
+            eps.lookup(&reg, other_live, CONTRACT, ENDPOINT_ABI)
+                .unwrap()
+                .state,
+            EndpointState::Live
+        );
+    }
+
+    /// Core 兜底（failure / stop 共用）确实**丢弃** staged pending，而不只是让
+    /// provider 不可用：provider 仍 Ready 时提交空批不会产出 endpoint。
+    #[test]
+    fn revoke_backstop_discards_staged_endpoint_publications() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::component::image::init();
+        interface::init();
+        endpoint::init();
+        crate::resource::init();
+
+        const CONTRACT: ContractId = ContractId::from_raw(0xFA11_2001);
+        const ENDPOINT_ABI: InterfaceAbi = InterfaceAbi::from_raw(0xFA11_2002);
+
+        // Given：一个 Ready provider + 一条 staged pending。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            ready_instance(&mut reg)
+        };
+        {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints()
+                .lock()
+                .stage_publish(
+                    &reg,
+                    id,
+                    b"pending0",
+                    CONTRACT,
+                    InterfaceKind::Device,
+                    ENDPOINT_ABI,
+                    7,
+                )
+                .unwrap();
+        }
+
+        // When：Core 兜底序列（failure / stop 路径共用）。
+        revoke_authority_and_unbind(id);
+
+        // Then：provider 仍 Ready，但 pending 已丢弃——commit 空批是 no-op，
+        // discover 找不到（若 pending 残留，commit 会产出 endpoint）。
+        let reg = registry::get_registry().lock();
+        let mut eps = endpoint::get_endpoints().lock();
+        assert_eq!(eps.commit_pending(&reg, id), Ok(()));
+        assert_eq!(
+            eps.discover(&reg, id, b"pending0", CONTRACT),
+            Err(EndpointError::EndpointNotFound)
+        );
     }
 }

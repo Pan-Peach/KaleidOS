@@ -34,6 +34,30 @@ const _: () = {
     assert!(core::mem::offset_of!(KcompCreateArgs, config) == 8);
 };
 
+/// 一次服务调用的**扁平 frame**：三个 `(ptr, len)` 对，六个字段全部指针宽
+/// （`size_ptrs = 6`），因此 32/64 位布局一致、可跨执行域搬运；**没有嵌套
+/// raw pointer** —— 标量参数编码在 `args` 的扁平字节区里，由 SDK 编解码。
+/// `args` / `input` / `output` 指向调用方内存，仅在**本次调用期间**借用；Core
+/// 只做结构校验（长度非零时指针不得为空），**从不解析**其中的字节。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcompCallFrame {
+    /// 标量参数区（字段布局 / 序号由契约的 SDK 侧定义，Core 视为不透明字节）。
+    pub args: *const u8,
+    pub args_len: usize,
+    /// 输入负载（只读）；无负载时指针可空、长度为 0。
+    pub input: *const u8,
+    pub input_len: usize,
+    /// 输出负载（可写）；provider 写入量不得超过 `output_len`。
+    pub output: *mut u8,
+    pub output_len: usize,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<KcompCallFrame>() == 6 * core::mem::size_of::<usize>());
+    assert!(core::mem::align_of::<KcompCallFrame>() == core::mem::align_of::<usize>());
+};
+
 /// 任务入口：`arg` 由 `kcore_task_create` 原样回传。
 /// 契约：entry 必须经 Core 退出（kcore_task_exit）；任务归属来自 Core 的执行
 /// 边界，**不是**来自 `arg`。
@@ -50,6 +74,19 @@ pub type KcompInstanceCreate =
 /// Core 对未完整构造 / panic 的实例不调用本入口；destroy 只做组件自己的
 /// quiesce / 私有资源清理，Core 仍会兜底 revoke authority / unbind。
 pub type KcompInstanceDestroy = extern "C" fn(state: *mut ()) -> i32;
+
+/// **可选**的组件服务 dispatcher（组件导出，Core 调用）：image 级统一入口，
+/// `port` 选中 provider 的哪个 endpoint，`method` 由 provider 定义。
+/// `instance_state` 是 `kcomp_instance_create` 写回的 opaque state（可为 NULL）；
+/// `frame` 是扁平 call frame，仅在本次调用期间借用。返回 provider 自己的
+/// `0 / -errno` —— 它**不是** Core 的传输状态（见 `kcore_endpoint_call`）。
+/// 缺失该符号 = 组件不提供任何 endpoint 服务：加载不失败，调用返回 `-ENOSYS`。
+pub type KcompServiceDispatch = extern "C" fn(
+    instance_state: *mut (),
+    port: u32,
+    method: u32,
+    frame: *const KcompCallFrame,
+) -> i32;
 
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。数值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；组件里的
@@ -303,4 +340,64 @@ unsafe extern "C" {
     ) -> i32;
     #[link_name = "kcore_dma_unmap"]
     pub fn kcore_dma_unmap(mapping: u64) -> i32;
+    // -- Component endpoints（Contract / Endpoint） --
+    /// 发布一条 endpoint（**staged**：`kcomp_instance_create` 执行期间只记录 pending）。
+    /// provider = 当前正在创建的实例（Core 从 init 边界解析，**不信任组件自报身份**）。
+    /// `contract` 是组合策略提供的契约身份（不透明 `u64`）；`kind` / `abi` 由**首次发布**
+    /// 建立契约真相，后续发布不一致在 commit 时拒绝；`port` 是 provider 定义的不透明
+    /// dispatch token（Core 从不解释）。端口名只要求在 **provider 实例内唯一**。
+    /// create 返回 0 后 Core 原子提交；本函数返回 `0` 只表示"已记录 pending"，
+    /// **不返回 EndpointId**（id 只在 commit 成功后存在，由 `kcore_endpoint_lookup` 发现）。
+    /// `Failed` provider / 不在 create 边界 → `-EPERM`；返回 `0 / -Errno`。
+    #[link_name = "kcore_endpoint_publish"]
+    pub fn kcore_endpoint_publish(
+        port_name: *const u8,
+        port_name_len: usize,
+        contract: u64,
+        kind: u32,
+        abi: u64,
+        port: u32,
+    ) -> i32;
+    /// 组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付）。
+    /// 成功 = `0`，EndpointId（`u64`）写入 `*out_endpoint`（调用方保证可写，任意对齐）；
+    /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法·契约不符 /
+    /// `ENOENT` 未发布或 endpoint 已死 / `ENODEV` provider 已不存在）。
+    #[link_name = "kcore_endpoint_lookup"]
+    pub fn kcore_endpoint_lookup(
+        provider: u32,
+        port_name: *const u8,
+        port_name_len: usize,
+        contract: u64,
+        out_endpoint: *mut u64,
+    ) -> i32;
+    /// 调用一个 endpoint。**传输状态 ≠ 方法状态**：返回值是 Core 的**传输状态**
+    /// （`0` / `-Errno`）；provider 自己的 `i32` 返回写入 `*out_status`——**只在传输
+    /// 返回 `0` 时有意义**。provider 返回的负 errno 绝不与 Core 生成的失败混淆。
+    /// `endpoint` 是组合期经 `kcore_endpoint_lookup` 取得的 opaque EndpointId
+    /// （contract / abi 已在交付前校验，调用只重新校验存活）；`method` / `port` 语义
+    /// 由 provider 定义，Core 从不解释。`args` / `input` / `output` 是调用方的内存，
+    /// 只在本次调用期间借用：Core 只做结构校验（长度非零时指针不得为空），**不解析
+    /// 其中的字节**。
+    /// provider = 当前 provider 实例：Core 校验其 `Ready` 并记 inflight；provider 停止 /
+    /// 失败后 endpoint 永久死亡，绝不重定向到新实例。
+    /// **本阶段（Phase B）是 KernelNative 直接分派**：没有执行边界 / service stack /
+    /// principal 切换 / re-entry 检测 / provider panic containment（下一阶段，见
+    /// `component/call.rs` 模块文档）。
+    /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`（`EFAULT`
+    /// `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或 caller 已
+    /// `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image 已不存在；
+    /// `EBUSY` provider 不在 `Ready` 或 inflight 溢出；`ENOSYS` image 没有
+    /// `kcomp_service_dispatch`）。
+    #[link_name = "kcore_endpoint_call"]
+    pub fn kcore_endpoint_call(
+        endpoint: u64,
+        method: u32,
+        args: *const u8,
+        args_len: usize,
+        input: *const u8,
+        input_len: usize,
+        output: *mut u8,
+        output_len: usize,
+        out_status: *mut i32,
+    ) -> i32;
 }

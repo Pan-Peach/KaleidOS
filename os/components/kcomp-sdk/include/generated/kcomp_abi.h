@@ -33,6 +33,25 @@ _Static_assert(offsetof(struct KcompCreateArgs, config_len) == 16, "KcompCreateA
 _Static_assert(offsetof(struct KcompCreateArgs, config_len) == 12, "KcompCreateArgs.config_len offset drift on RV32");
 #endif
 
+/* 一次服务调用的**扁平 frame**：三个 `(ptr, len)` 对，六个字段全部指针宽
+ * （`size_ptrs = 6`），因此 32/64 位布局一致、可跨执行域搬运；**没有嵌套
+ * raw pointer** —— 标量参数编码在 `args` 的扁平字节区里，由 SDK 编解码。
+ * `args` / `input` / `output` 指向调用方内存，仅在**本次调用期间**借用；Core
+ * 只做结构校验（长度非零时指针不得为空），**从不解析**其中的字节。 */
+struct kcomp_call_frame {
+    /* 标量参数区（字段布局 / 序号由契约的 SDK 侧定义，Core 视为不透明字节）。 */
+    const uint8_t *args;
+    size_t args_len;
+    /* 输入负载（只读）；无负载时指针可空、长度为 0。 */
+    const uint8_t *input;
+    size_t input_len;
+    /* 输出负载（可写）；provider 写入量不得超过 `output_len`。 */
+    uint8_t *output;
+    size_t output_len;
+};
+_Static_assert(sizeof(struct kcomp_call_frame) == 6 * sizeof(void *), "kcomp_call_frame layout drift");
+_Static_assert(_Alignof(struct kcomp_call_frame) == _Alignof(void *), "kcomp_call_frame alignment drift");
+
 /* 任务入口：`arg` 由 `kcore_task_create` 原样回传。
  * 契约：entry 必须经 Core 退出（kcore_task_exit）；任务归属来自 Core 的执行
  * 边界，**不是**来自 `arg`。 */
@@ -60,6 +79,14 @@ int32_t kcomp_instance_create(const struct KcompCreateArgs *args, void **out_sta
  * Core 对未完整构造 / panic 的实例不调用本入口；destroy 只做组件自己的
  * quiesce / 私有资源清理，Core 仍会兜底 revoke authority / unbind。 */
 int32_t kcomp_instance_destroy(void *state);
+
+/* **可选**的组件服务 dispatcher（组件导出，Core 调用）：image 级统一入口，
+ * `port` 选中 provider 的哪个 endpoint，`method` 由 provider 定义。
+ * `instance_state` 是 `kcomp_instance_create` 写回的 opaque state（可为 NULL）；
+ * `frame` 是扁平 call frame，仅在本次调用期间借用。返回 provider 自己的
+ * `0 / -errno` —— 它**不是** Core 的传输状态（见 `kcore_endpoint_call`）。
+ * 缺失该符号 = 组件不提供任何 endpoint 服务：加载不失败，调用返回 `-ENOSYS`。 */
+int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t method, const struct kcomp_call_frame *frame);
 
 /* 一条 trace 记录的**稳定编码**（Core `trace::abi::TraceRecordAbi`）。
  * `kind` 决定 `a` / `b` / `c` 的含义，缺省字段写成 `ABSENT`（**不是** 0）。 */
@@ -178,6 +205,17 @@ int32_t kcore_dma_free(uint8_t *ptr);
 /* 把 buffer 映射给设备：设备可见地址 + mapping id（No-IOMMU identity）。 */
 int32_t kcore_dma_map(uint32_t device_id, uint8_t *ptr, size_t len, int32_t direction, uint64_t *out_device_addr, uint64_t *out_mapping);
 int32_t kcore_dma_unmap(uint64_t mapping);
+/* -- Component endpoints（Contract / Endpoint） -- */
+/* 发布 endpoint（staged：init 期间只记录 pending；create 返回 0 后 Core 原子提交）。
+ * provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。 */
+int32_t kcore_endpoint_publish(const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint32_t kind, uint64_t abi, uint32_t port);
+/* 按 (provider, port_name, contract) 发现 endpoint：成功写 EndpointId 到
+ * *out_endpoint；失败返回 -Errno。 */
+int32_t kcore_endpoint_lookup(uint32_t provider, const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint64_t *out_endpoint);
+/* 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
+ * *out_status（仅传输返回 0 时有意义）。当前是 KernelNative 直接分派（无执行
+ * 边界 / panic containment）。 */
+int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args, size_t args_len, const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len, int32_t *out_status);
 
 /* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
  * 

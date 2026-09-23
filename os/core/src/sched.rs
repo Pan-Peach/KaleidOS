@@ -637,6 +637,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
 
         // Given：一个 Ready 的坏调度器组件 —— 永远提议 TaskId(999)。
         extern "C" fn bad_choose(_: *mut (), _: *const u32, _: usize, _: u32) -> u32 {
@@ -770,6 +771,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
 
         // 好调度器：永远提议 runnable[0]（合法 → 走 accept 路径）。
         extern "C" fn good_choose(_: *mut (), runnable: *const u32, count: usize, _: u32) -> u32 {
@@ -866,6 +868,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
 
         // Given：一个 Created 任务（存在但不在候选里）+ 一个 Runnable 任务。
         let owner = ready_component(b"sched_created_owner");
@@ -955,6 +958,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         reset_cpu();
         containment::enter_anchor();
 
@@ -1045,6 +1049,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         reset_cpu();
         containment::enter_anchor();
 
@@ -1082,6 +1087,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         reset_cpu();
         containment::enter_anchor();
 
@@ -1288,6 +1294,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         crate::resource::init();
         reset_cpu();
         containment::enter_anchor();
@@ -1388,6 +1395,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         reset_cpu();
         containment::enter_anchor();
 
@@ -1519,6 +1527,7 @@ mod tests {
         init();
         crate::component::registry::init();
         crate::component::interface::init();
+        crate::component::endpoint::init();
         reset_cpu();
         containment::enter_anchor();
 

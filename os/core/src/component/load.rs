@@ -1,7 +1,7 @@
 //! 组件实例创建语义入口（ComponentManager 教学版占位）：仓库读取 → image 复用或
 //! loader 放段 → image 登记 → registry 声明实例 → resolve → begin_start（Starting）→
 //! 调用 `kcomp_instance_create(args, &out_state)` → 记录 state → 原子提交 pending
-//! interfaces → finish_start（Ready）。
+//! endpoints（新模型）与 pending interfaces（旧模型）→ finish_start（Ready）。
 //!
 //! `monitor load <name>` 与组件 ABI `kcore_component_load` 都是这里的**薄 caller**——
 //! 加载流程本身属于 Core（monitor 不是 ComponentManager）。完整依赖解析、
@@ -13,6 +13,7 @@
 //! state），不再拒绝；image 登记进 `component/image.rs` 的 image 表并 pinned 到重启。
 
 use crate::component::containment::{self, CallOutcome, KcompCreateArgs};
+use crate::component::endpoint::{self, EndpointError};
 use crate::component::image::{self, ComponentImageId};
 use crate::component::interface::{self, InterfaceError};
 use crate::component::loader::{self, LoaderError};
@@ -50,6 +51,10 @@ pub enum ComponentLoadError {
     /// create 返回 0，但 pending interfaces 提交冲突（ABI mismatch /
     /// kind mismatch）——实例被提交为 Failed，旧 binding 不受影响。
     InterfaceCommitFailed(InterfaceError),
+    /// create 返回 0，但 pending endpoints 提交冲突（契约 kind / abi、
+    /// 端口名重复、id 容量）——实例被提交为 Failed；已提交的 interfaces 由
+    /// failure 兜底解绑，旧 endpoint 不受影响。
+    EndpointCommitFailed(EndpointError),
     /// 组件拥有的任务 panic，已由 task-abort 上下文提交为 `Exited`；
     /// 组件的 authority 由 abort 路径撤销（仅作 reason 语义）。
     TaskPanicked(TaskId),
@@ -80,8 +85,8 @@ pub fn load_and_start(name: &[u8]) -> Result<ComponentId, ComponentLoadError> {
 ///
 /// 生命周期：`Declared → resolve → Resolved → begin_start → Starting →
 /// kcomp_instance_create → { failure → Failed | success → record state →
-/// commit pending interfaces → Ready }`。同名 artifact 复用已登记的 image；
-/// 不存在则先走 store → loader → image 登记。
+/// commit pending endpoints + interfaces → Ready }`。同名 artifact 复用已登记的
+/// image；不存在则先走 store → loader → image 登记。
 ///
 /// 锁纪律：registry / image 锁只覆盖各自的查询与提交；`kcomp_instance_create`
 /// 在**无锁**状态下调用（组件 create 可能再创建别的组件、publish 接口、创建任务，
@@ -131,14 +136,28 @@ pub fn create_component(
                 failure::fail_component(id, error);
                 return Err(error);
             }
-            // create 成功：原子提交 pending interfaces，成功才进入 Ready。
-            let committed = {
+            // create 成功：先原子提交 pending endpoints（新模型），再提交 pending
+            // interfaces（旧模型）——两者都成功才进入 Ready。endpoint 提交失败时
+            // 不再碰 interface；任一失败都交给 fail_component 兜底（已提交的另一半
+            // 会被解绑 / 永久失效），旧 provider 的真相不受影响。
+            let endpoint_commit = {
                 let reg = registry::get_registry().lock();
-                let mut ifs = interface::get_interfaces().lock();
-                ifs.commit_pending(&reg, id)
+                endpoint::get_endpoints().lock().commit_pending(&reg, id)
             };
-            match committed {
+            let commit_error = match endpoint_commit {
+                Err(error) => Some(ComponentLoadError::EndpointCommitFailed(error)),
                 Ok(()) => {
+                    let committed = {
+                        let reg = registry::get_registry().lock();
+                        interface::get_interfaces().lock().commit_pending(&reg, id)
+                    };
+                    committed
+                        .err()
+                        .map(ComponentLoadError::InterfaceCommitFailed)
+                }
+            };
+            match commit_error {
+                None => {
                     let ready = registry::get_registry().lock().finish_start(id).is_ok();
                     if ready {
                         Ok(id)
@@ -149,10 +168,9 @@ pub fn create_component(
                         Err(error)
                     }
                 }
-                Err(interface_error) => {
+                Some(error) => {
                     // create 成功但 commit 失败：按"物理驻留"原则保守保留 state，
                     // 不调用 destroy（组件未完整进入 Ready）。
-                    let error = ComponentLoadError::InterfaceCommitFailed(interface_error);
                     failure::fail_component(id, error);
                     Err(error)
                 }
@@ -236,6 +254,7 @@ mod tests {
         image::init();
         registry::init();
         interface::init();
+        endpoint::init();
         crate::resource::init();
 
         // Given：没有实例正在创建。
