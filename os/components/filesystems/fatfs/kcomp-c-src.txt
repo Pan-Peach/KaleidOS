@@ -1,3 +1,5 @@
 os/components/filesystems/fatfs/fatfs.c
+os/components/filesystems/fatfs/fatfs_backend.c
+os/components/filesystems/fatfs/fatfs_service.c
 os/components/filesystems/fatfs/diskio_kaleidos.c
 third_party/fatfs/source/ff.c

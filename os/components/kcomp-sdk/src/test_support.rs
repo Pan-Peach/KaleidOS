@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use std::vec::Vec;
 
 static CALL_SCRIPT: Mutex<(i32, i32)> = Mutex::new((0, 0));
+/// 下一次 `kcore_endpoint_call` 成功时要写进 output 的脚本回复（消费一次）。
+static CALL_REPLY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static LAST_CALL: Mutex<Option<CallRecord>> = Mutex::new(None);
 /// `kcore_endpoint_bind` 的脚本回复：`(status, mechanism, api, ctx)`。
 static BIND_SCRIPT: Mutex<(i32, u32, usize, usize)> = Mutex::new((0, 0, 0, 0));
@@ -49,6 +51,7 @@ pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
 /// `(status = 0, mechanism = 0, api = 0, ctx = 0)`，并清空记录。
 pub(crate) fn reset_script() {
     *CALL_SCRIPT.lock().unwrap() = (0, 0);
+    *CALL_REPLY.lock().unwrap() = None;
     *LAST_CALL.lock().unwrap() = None;
     *BIND_SCRIPT.lock().unwrap() = (0, 0, 0, 0);
     *LAST_BIND.lock().unwrap() = None;
@@ -57,6 +60,11 @@ pub(crate) fn reset_script() {
 /// 设置下一次 `kcore_endpoint_call` 的 `(transport, method)` 返回。
 pub(crate) fn script_call(transport: i32, method: i32) {
     *CALL_SCRIPT.lock().unwrap() = (transport, method);
+}
+
+/// 设置下一次成功调用要写进 `output` 的字节（不足补零、超出截断，消费一次）。
+pub(crate) fn script_call_reply(reply: &[u8]) {
+    *CALL_REPLY.lock().unwrap() = Some(reply.to_vec());
 }
 
 /// 设置下一次 `kcore_endpoint_bind` 的成功回复（`status = 0`）。
@@ -88,22 +96,31 @@ fn copy_region(ptr: *const u8, len: usize) -> Vec<u8> {
     }
 }
 
-/// Core `kcore_endpoint_validate` 的替身：contract + abi 与 block 契约一致且
-/// id != 0 → 0；否則 -ENOENT / -EINVAL（与 Core 档位一致）。
+/// Core `kcore_endpoint_validate` 的替身：contract + abi 与**已知契约**
+/// （block.device / filesystem）一致且 id != 0 → 0；否則 -ENOENT / -EINVAL
+/// （与 Core 档位一致）。
 #[unsafe(no_mangle)]
 pub extern "C" fn kcore_endpoint_validate(id: u64, contract: u64, abi: u64) -> i32 {
     use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRACT};
+    use crate::generated::filesystem::{KCOMP_FILESYSTEM_ABI, KCOMP_FILESYSTEM_CONTRACT};
     if id == 0 {
         return -2; // ENOENT
     }
-    if contract != KCOMP_BLOCK_DEVICE_CONTRACT || abi != KCOMP_BLOCK_DEVICE_ABI {
+    let expected = if contract == KCOMP_BLOCK_DEVICE_CONTRACT {
+        KCOMP_BLOCK_DEVICE_ABI
+    } else if contract == KCOMP_FILESYSTEM_CONTRACT {
+        KCOMP_FILESYSTEM_ABI
+    } else {
+        return -22; // EINVAL
+    };
+    if abi != expected {
         return -22; // EINVAL
     }
     0
 }
 
-/// Core `kcore_endpoint_lookup` 的替身：contract 匹配且 provider != 0 → 写入
-/// 可预测的 id（`provider * 100 + name_len`）；否则 -Errno。
+/// Core `kcore_endpoint_lookup` 的替身：contract 是已知契约且 provider != 0 →
+/// 写入可预测的 id（`provider * 100 + name_len`）；否则 -Errno。
 #[unsafe(no_mangle)]
 pub extern "C" fn kcore_endpoint_lookup(
     provider: u32,
@@ -113,10 +130,11 @@ pub extern "C" fn kcore_endpoint_lookup(
     out_endpoint: *mut u64,
 ) -> i32 {
     use crate::generated::block::KCOMP_BLOCK_DEVICE_CONTRACT;
+    use crate::generated::filesystem::KCOMP_FILESYSTEM_CONTRACT;
     if out_endpoint.is_null() {
         return -14; // EFAULT
     }
-    if contract != KCOMP_BLOCK_DEVICE_CONTRACT {
+    if contract != KCOMP_BLOCK_DEVICE_CONTRACT && contract != KCOMP_FILESYSTEM_CONTRACT {
         return -22; // EINVAL
     }
     if provider == 0 {
@@ -165,7 +183,8 @@ pub extern "C" fn kcore_endpoint_bind(
 }
 
 /// Core `kcore_endpoint_call` 的替身：按脚本返回传输状态；transport == 0 时把
-/// method status 写入 `*out_status`，并在 capacity 调用里模拟 provider 写回复。
+/// method status 写入 `*out_status`，并按脚本把回复写进 `output`（没有脚本回复时，
+/// block capacity 调用回填固定值——那是 block 测试既有的契约）。
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn kcore_endpoint_call(
@@ -188,16 +207,21 @@ pub extern "C" fn kcore_endpoint_call(
         input: copy_region(input, input_len),
         output_len,
     });
-    if transport == 0
-        && status == 0
-        && method == KCOMP_BLOCK_METHOD_CAPACITY
-        && output_len == KCOMP_BLOCK_CAPACITY_LEN
-        && !output.is_null()
-    {
-        // 模拟 provider 回填 capacity = 0x0102_0304_0506_0708（LE）。
-        let reply = 0x0102_0304_0506_0708u64.to_le_bytes();
-        // SAFETY: 输出窗口由调用方保证长度 = CAPACITY_LEN 且可写。
-        unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), output, KCOMP_BLOCK_CAPACITY_LEN) };
+    if transport == 0 && status == 0 && !output.is_null() {
+        let scripted = CALL_REPLY.lock().unwrap().take();
+        if let Some(reply) = scripted {
+            // 截断到 output 容量（与 Core 的窗口语义一致）。
+            let len = reply.len().min(output_len);
+            // SAFETY: output 非空、调用方保证 output_len 字节可写。
+            unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), output, len) };
+        } else if method == KCOMP_BLOCK_METHOD_CAPACITY && output_len == KCOMP_BLOCK_CAPACITY_LEN {
+            // 模拟 provider 回填 capacity = 0x0102_0304_0506_0708（LE）。
+            let reply = 0x0102_0304_0506_0708u64.to_le_bytes();
+            // SAFETY: 输出窗口由调用方保证长度 = CAPACITY_LEN 且可写。
+            unsafe {
+                core::ptr::copy_nonoverlapping(reply.as_ptr(), output, KCOMP_BLOCK_CAPACITY_LEN)
+            };
+        }
     }
     if transport == 0 && !out_status.is_null() {
         // SAFETY: out_status 非空；调用方保证可写。

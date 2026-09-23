@@ -22,15 +22,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Core 传输状态 ≠ provider 方法状态：provider 自己的 `0 / -errno` 在 method 里，
- * 只有 transport == 0 时有意义（与 `kcore_endpoint_call` 的 ABI 契约一致）。
- * Direct 绑定没有传输层：transport 恒 0，method 就是 function table 的返回。 */
-struct kcomp_call_result {
-    /* Core 的传输状态：0 = provider 已被调用；<0 = -errno（method 无意义）。 */
-    int32_t transport;
-    /* provider 自己的 0 / -errno；仅当 transport == 0 时有意义。 */
-    int32_t method;
-};
+/* Core 传输状态 ≠ provider 方法状态（共享类型，见 kcomp_call.h）：provider 自己的
+ * `0 / -errno` 在 method 里，只有 transport == 0 时有意义（与
+ * `kcore_endpoint_call` 的 ABI 契约一致）。Direct 绑定没有传输层：transport 恒 0，
+ * method 就是 function table 的返回。 */
+#include "kcomp_call.h"
 
 /* 不透明调用绑定（内部表示）。组件只声明它、把它原样传回 `kcomp_block_*`——
  * 字段是实现细节（Core 选定的机制藏在里面），不要在组件代码里解释。 */

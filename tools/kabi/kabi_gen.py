@@ -2206,6 +2206,17 @@ doc = "I/O error"
         const for const in filesystem.constants if const.name == "KCOMP_FILESYSTEM_ABI"
     ][0]
     assert filesystem_abi.value == 0x4649_4C45_5359_5354
+    filesystem_consts = {const.name: const.value for const in filesystem.constants}
+    assert filesystem_consts["KCOMP_FILESYSTEM_CONTRACT"] == 0x5646_5343_4F4E_5452
+    assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_MOUNT"] == 0
+    assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_UNMOUNT"] == 1
+    assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_OPEN"] == 2
+    assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_CLOSE"] == 3
+    assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_READ"] == 4
+    assert filesystem_consts["KCOMP_FILESYSTEM_HANDLE_LEN"] == 8
+    assert filesystem_consts["KCOMP_FILESYSTEM_FLAGS_LEN"] == 4
+    assert filesystem_consts["KCOMP_FILESYSTEM_READ_HEADER_LEN"] == 8
+    assert filesystem_consts["KCOMP_FILESYSTEM_PATH_MAX"] == 256
 
 
 # ===========================================================================

@@ -147,7 +147,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench drivers/ram_blk block_chain
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
-KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs
+KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs filesystems/fs_consumer
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -167,7 +167,7 @@ init.kpkg:
 	@for src in $(KCOMP_C_SRCS); do \
 		n=$$(basename $$src); \
 		if [ "$$n" = "fatfs" ]; then \
-			CFLAGS="$${CFLAGS:-} -DFATFS_SELFTEST -I$(CURDIR)/third_party/fatfs/source -include $(CURDIR)/os/components/filesystems/fatfs/ffconf.h" \
+			CFLAGS="$${CFLAGS:-} -I$(CURDIR)/third_party/fatfs/source -include $(CURDIR)/os/components/filesystems/fatfs/ffconf.h" \
 			tools/build-kcomp-c.sh \
 				$(CURDIR)/os/components/$$src $(KCFG_TARGET) \
 				$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD_C) || exit 1; \

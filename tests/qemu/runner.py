@@ -14,13 +14,21 @@ the selected profile.  Select a profile first, e.g.
 2b. first complete chain —— type `load block_chain`: the composer creates the
    Rust RAM block provider (`ram_blk`), resolves its endpoint, probes the Gate
    transport once, and creates the C consumer (`fatfs`) with that EndpointId as
-   create config. FatFs binds (Core picks the mechanism) and reads HELLO.TXT
-   through the uniform wrapper. Evidence required:
-     * provider business read (`ram_blk: read lba=4`) + FatFs content line
-       (`KALEIDOS BLOCK CHAIN OK`)  -> correct bytes over the chain;
-     * exactly one `ram_blk: gate dispatch` line and it must be `method=0`
-       (the composer's capacity probe)  -> every business read is Direct: no
-       `kcore_endpoint_call`, no per-call service stack.
+   create config. FatFs binds (Core picks the mechanism). FatFs then publishes
+   its **filesystem endpoint**; the composer resolves it, probes the Gate
+   transport once (`mount`), and creates the C filesystem test consumer
+   (`fs_consumer`) with that EndpointId as create config. The consumer binds,
+   mounts, opens and reads `HELLO.TXT` through the uniform wrapper and verifies
+   the exact bytes. Evidence required:
+     * provider business reads (`ram_blk: read lba=4`) + FatFs business log
+       (`[fatfs] read`) + consumer success lines (`[fs_consumer] read ok` /
+       `close ok` / `unmount ok`) + the exact content line
+       (`KALEIDOS BLOCK CHAIN OK`) -> correct bytes over the chain, and the
+       consumer task ran to completion before shutdown;
+     * exactly one `ram_blk: gate dispatch` line, `method=0` (the composer's
+       capacity probe) and exactly one `[fatfs] gate dispatch` line, `method=0`
+       (the composer's filesystem mount probe)  -> every business read in both
+       chains is Direct: no `kcore_endpoint_call`, no per-call service stack.
 3. shutdown —— type `shutdown`, expect QEMU to exit.
 
 Failure contract (any of these fails the run):
@@ -64,14 +72,22 @@ MONITOR_BANNER = "KaleidOS Core Monitor"
 CORE_TEST_CMD = "load core_test\n"
 CORE_TEST_OK = "load core_test: OK"
 CORE_TEST_ALL_PASS = "[core-test] all: PASS"
-# First complete chain: Rust BlockDevice provider -> C consumer (FatFs glue).
+# First complete chain: Rust BlockDevice provider -> C FatFs -> filesystem
+# endpoint -> C filesystem consumer.
 CHAIN_CMD = "load block_chain\n"
 CHAIN_LOAD_OK = "load block_chain: OK"
 CHAIN_GATE_PROBE = "block_chain: gate probe ok"
 CHAIN_PROVIDER_READ = "ram_blk: read lba=4"
-CHAIN_CONSUMER_OK = "[fatfs] selftest: read ok"
 CHAIN_CONTENT = "KALEIDOS BLOCK CHAIN OK"
 CHAIN_GATE_DISPATCH = "ram_blk: gate dispatch"
+# filesystem chain (FatFs publishes a filesystem endpoint; fs_consumer reads
+# HELLO.TXT through the uniform wrapper).
+FS_CHAIN_GATE_PROBE = "block_chain: fs gate probe ok"
+FS_PROVIDER_READ = "[fatfs] read"
+FS_CONSUMER_OK = "[fs_consumer] read ok"
+FS_CONSUMER_CLOSE_OK = "[fs_consumer] close ok"
+FS_CONSUMER_UNMOUNT_OK = "[fs_consumer] unmount ok"
+FS_GATE_DISPATCH = "[fatfs] gate dispatch"
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
@@ -203,7 +219,7 @@ def main() -> int:
             f"core_test: PASS ({len(core_test_lines)} report lines, all: PASS)"
         )
 
-        # -- 2b) first complete chain: Rust provider -> C consumer (Direct) --
+        # -- 2b) first complete chain: Rust provider -> C FatFs -> FS consumer --
         send(proc, CHAIN_CMD)
         output3, ok = collect(
             proc,
@@ -212,19 +228,30 @@ def main() -> int:
                 CHAIN_LOAD_OK,
                 CHAIN_GATE_PROBE,
                 CHAIN_PROVIDER_READ,
-                CHAIN_CONSUMER_OK,
                 CHAIN_CONTENT,
+                FS_CHAIN_GATE_PROBE,
+                FS_PROVIDER_READ,
+                FS_CONSUMER_OK,
+                FS_CONSUMER_CLOSE_OK,
+                FS_CONSUMER_UNMOUNT_OK,
             ],
             FATAL_MARKERS,
         )
         output += "\n" + output3
         if not ok:
             raise RunFailure(
-                "block chain did not complete: missing load OK / gate probe / "
-                "provider read / FatFs read / HELLO.TXT content"
+                "block chain did not complete: missing load OK / block gate "
+                "probe / provider read / HELLO.TXT content / filesystem gate "
+                "probe / FatFs read / fs_consumer read/close/unmount"
             )
-        # 差分证据：唯一一条 gate dispatch 必须是 composer 的 capacity 探针
-        # （method=0）。任何 method=1 的 gate dispatch 都意味着业务 read 走了
+        # 内容断言：consumer 读到的字节必须**恰好**是合成卷里 HELLO.TXT 的内容
+        # （行尾逐字节比对，不是"日志里出现过这个词"）。
+        if not any(line.endswith(CHAIN_CONTENT) for line in output3.splitlines()):
+            raise RunFailure(
+                f"no line ends with the exact HELLO.TXT content {CHAIN_CONTENT!r}"
+            )
+        # 差分证据（block）：唯一一条 gate dispatch 必须是 composer 的 capacity
+        # 探针（method=0）。任何 method=1 的 gate dispatch 都意味着业务 read 走了
         # Core call gate —— 那就不再是 Direct，也意味着每次 read 都会分配
         # per-call service stack。
         gate_lines = [
@@ -232,16 +259,32 @@ def main() -> int:
         ]
         if len(gate_lines) != 1 or "method=0" not in gate_lines[0]:
             raise RunFailure(
-                "expected exactly one gate dispatch (composer capacity probe, "
-                f"method=0); got {gate_lines!r}"
+                "expected exactly one block gate dispatch (composer capacity "
+                f"probe, method=0); got {gate_lines!r}"
             )
         if f"{CHAIN_GATE_DISPATCH} method=1" in output3:
             raise RunFailure(
-                "a business read went through the Core call gate (not Direct)"
+                "a block business read went through the Core call gate (not Direct)"
+            )
+        # 差分证据（filesystem）：唯一一条 `[fatfs] gate dispatch` 必须是 composer
+        # 的 mount 探针（method=0）。任何 method=4 的行都意味着消费者的 read 走了
+        # Core call gate（不再是 Direct）。
+        fs_gate_lines = [
+            line for line in output3.splitlines() if FS_GATE_DISPATCH in line
+        ]
+        if len(fs_gate_lines) != 1 or "method=0" not in fs_gate_lines[0]:
+            raise RunFailure(
+                "expected exactly one filesystem gate dispatch (composer mount "
+                f"probe, method=0); got {fs_gate_lines!r}"
+            )
+        if f"{FS_GATE_DISPATCH} method=4" in output3:
+            raise RunFailure(
+                "a filesystem business read went through the Core call gate "
+                "(not Direct)"
             )
         summary.append(
-            "block chain: PASS (Rust provider -> C consumer, Direct read, "
-            "1 gate probe, 0 gate reads)"
+            "block chain: PASS (Rust provider -> C FatFs -> FS consumer, "
+            "Direct reads in both chains, 2 gate probes, 0 gate reads)"
         )
 
         # -- 3) shutdown ---------------------------------------------------

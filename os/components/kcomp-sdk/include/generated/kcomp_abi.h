@@ -292,7 +292,11 @@ _Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kco
 /* `capacity` 的 `output` 区长度：一个 LE `u64`（sector 数）。 */
 #define KCOMP_BLOCK_CAPACITY_LEN 8
 
-/* `filesystem` provider/consumer function table（共享布局）。
+/* `filesystem` provider/consumer function table（**Direct** transport 的共享布局）。
+ * 
+ * 同一个 ABI 指纹下的另一种 transport（Gate / 扁平方法编码）见 `abi/filesystem.toml`
+ * 头部的 Endpoint 调用路径说明：provider 的 `kcomp_service_dispatch` 按 `method`
+ * 分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
  * 
  * 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
  * u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。 */
@@ -319,6 +323,40 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 
 /* 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。 */
 #define KCOMP_FILESYSTEM_OPEN_READ UINT32_C(0x00000001)
+
+/* `filesystem` 的 endpoint 契约身份（组合策略提供的不透明 `u64`；
+ * `kcore_endpoint_lookup` / `kcore_endpoint_validate` / `kcore_endpoint_bind` 的
+ * `contract` 参数）。数值 = 8 字节 ASCII tag `b"VFSCONTR"` 的大端读数（与 block 的
+ * `BLKCONTR` 同一约定）。**契约身份与 ABI 指纹是两个不同的值**：前者标识"哪个
+ * endpoint 契约"，后者标识"function table / 扁平编码的逐位布局"。 */
+#define KCOMP_FILESYSTEM_CONTRACT UINT64_C(0x564653434F4E5452)
+
+/* `mount` 的方法号：args 空 / input 空 / output 空。 */
+#define KCOMP_FILESYSTEM_METHOD_MOUNT UINT32_C(0)
+
+/* `unmount` 的方法号：args 空 / input 空 / output 空。 */
+#define KCOMP_FILESYSTEM_METHOD_UNMOUNT UINT32_C(1)
+
+/* `open` 的方法号：args = 4 字节 LE `u32` flags / input = NUL 结尾路径（含结尾 NUL）/ output = 8 字节 LE `u64` handle。 */
+#define KCOMP_FILESYSTEM_METHOD_OPEN UINT32_C(2)
+
+/* `close` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output 空。 */
+#define KCOMP_FILESYSTEM_METHOD_CLOSE UINT32_C(3)
+
+/* `read` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output ≥ 8 字节（8 字节 LE 实际长度头 + 数据）。 */
+#define KCOMP_FILESYSTEM_METHOD_READ UINT32_C(4)
+
+/* `read` / `close` 的 `args` 区与 `open` 的 `output` 区长度：一个 LE `u64` handle（没有其它编码）。 */
+#define KCOMP_FILESYSTEM_HANDLE_LEN 8
+
+/* `open` 的 `args` 区长度：一个 LE `u32` flags（没有其它编码）。 */
+#define KCOMP_FILESYSTEM_FLAGS_LEN 4
+
+/* `read` 的 `output` 头部长度：一个 LE `u64` 实际读取长度；数据从 offset 8 开始。 */
+#define KCOMP_FILESYSTEM_READ_HEADER_LEN 8
+
+/* `open` 的 `input` 上限（**含**结尾 NUL）：provider 用定长 scratch 拷贝路径，超过即 `-EINVAL`。 */
+#define KCOMP_FILESYSTEM_PATH_MAX 256
 
 #ifdef __cplusplus
 }

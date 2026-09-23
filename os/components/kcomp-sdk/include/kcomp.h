@@ -46,8 +46,11 @@
  * 编译器背书，不再靠文本交叉校验。
  */
 
-/* Endpoint 调用路径的 C 包装（手写草案）：`kcomp_block_read` 等。
- * 与 SDK-Rust typed 前端同线格式（`abi/block.toml` 单源常量）。 */
+/* Endpoint 调用路径的 C 包装（手写）：`kcomp_block_read` / `kcomp_filesystem_read`
+ * 等，与 SDK-Rust typed 前端同线格式（`abi/block.toml` / `abi/filesystem.toml`
+ * 单源常量）。公共结果类型 `struct kcomp_call_result` 在 `kcomp_call.h`。 */
+#include "kcomp_call.h"
 #include "kcomp_block.h"
+#include "kcomp_filesystem.h"
 
 #endif /* KCOMP_H */

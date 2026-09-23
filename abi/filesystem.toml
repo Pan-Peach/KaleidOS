@@ -5,15 +5,54 @@
 #   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 结构 / 常量 + 布局 _Static_assert
 #   os/components/kcomp-sdk/src/generated/filesystem.rs     SDK-Rust 镜像 + `const _` 布局断言
 #
-# 手写部分（facade，不在本文件范围）：契约类型 `FileSystem`（`kcomp-sdk/src/filesystem.rs`）。
-# 组件间契约**不是** Core 导出：Core 只把 publish 进来的 api / ctx 当不透明指针存着。
+# 手写部分（facade，不在本文件范围）：契约类型 `FileSystem` / provider wrapper
+# （`kcomp-sdk/src/filesystem.rs` + `filesystem/`）、C 前端
+# （`include/kcomp_filesystem.h` + `c/kcomp_filesystem.c`）、`InterfaceAbi`
+# newtype（`binding.rs`）。
+# 组件间契约**不是** Core 导出：Core 只把 publish 进来的 api / ctx 当不透明指针
+# 存着，不认识契约语义，所以名字是 `kcomp_*`（组件面），不是 `kcore_*`。
+#
+# 与 block.device 同构：**同一个 ABI 指纹下两种 transport**。
+#   - Direct：`FileSystemApi`（`#[repr(C)]` function table）——endpoint 发布时
+#     作为 api / ctx 交付，同域调用方直接调 table（机制见
+#     os/components/kcomp-sdk/src/filesystem/service.rs）；
+#   - Gate  ：本文件定义的**扁平方法编码**——跨域 / 受控绑定经
+#     `kcore_endpoint_call` 调用 provider 的 `kcomp_service_dispatch`。
+# **机制由 Core 在 bind 时按两端执行域选定**；provider 两种都提供、不选择。
+#
+# Endpoint 调用路径（`kcore_endpoint_call`，method 语义由本契约定义）：
+#
+#   mount(0)  ：args 空、input 空、output 空 → 0 / -errno
+#   unmount(1)：args 空、input 空、output 空 → 0 / -errno
+#   open(2)   ：args 恰好 4 字节（LE `u32` flags）、input = NUL 结尾的路径字节
+#               （**含**结尾 NUL；长度 1..=PATH_MAX；结尾 NUL 必须是路径中唯一的
+#               NUL）、output 恰好 8 字节（LE `u64` handle）
+#   close(3)  ：args 恰好 8 字节（LE `u64` handle）、input 空、output 空
+#   read(4)   ：args 恰好 8 字节（LE `u64` handle）、input 空、output ≥ 8 字节：
+#               前 8 字节 = LE `u64` 实际读取长度（**仅当方法返回 0 时有效**），
+#               随后是数据区（容量 = `output_len` - 8；`output_len` **含** 8 字节头）
+#
+# 为什么 `read` 需要一个 8 字节头：扁平 frame 的 `output` 是**一个** caller 数据
+# 区，无法同时表达"数据 buffer"与"out 参数"（旧 table 的 `out_read`）；实际长度
+# 因此编码在数据前面。Direct 路径不用 frame（参数就是普通 C 参数），语义逐方法一致。
+#
+# 路径字节是**有界的**：provider 把 input 拷进自己的定长 scratch
+# （`KCOMP_FILESYSTEM_PATH_MAX`）再交给业务后端，**绝不保留、绝不改写** caller
+# 内存。框外的路径（空 / 超长 / 结尾无 NUL / 内部 NUL）→ `-EINVAL`，业务后端不被
+# 调用。
+#
+# 方法号 / 长度 / contract 身份都是本文件生成的常量（C / SDK-Rust 同源）。
 
 [[struct]]
 name = "FileSystemApi"
 c_name = "kcomp_filesystem_api"
 size_ptrs = 5
 doc = """
-`filesystem` provider/consumer function table（共享布局）。
+`filesystem` provider/consumer function table（**Direct** transport 的共享布局）。
+
+同一个 ABI 指纹下的另一种 transport（Gate / 扁平方法编码）见 `abi/filesystem.toml`
+头部的 Endpoint 调用路径说明：provider 的 `kcomp_service_dispatch` 按 `method`
+分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
 
 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
 u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。
@@ -64,3 +103,75 @@ type = "u32"
 value = "0x00000001"
 targets = "c,sdk-rust"
 doc = "第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_CONTRACT"
+type = "u64"
+value = "0x5646_5343_4F4E_5452"
+targets = "c,sdk-rust"
+doc = """
+`filesystem` 的 endpoint 契约身份（组合策略提供的不透明 `u64`；
+`kcore_endpoint_lookup` / `kcore_endpoint_validate` / `kcore_endpoint_bind` 的
+`contract` 参数）。数值 = 8 字节 ASCII tag `b"VFSCONTR"` 的大端读数（与 block 的
+`BLKCONTR` 同一约定）。**契约身份与 ABI 指纹是两个不同的值**：前者标识"哪个
+endpoint 契约"，后者标识"function table / 扁平编码的逐位布局"。
+"""
+
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_MOUNT"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust"
+doc = "`mount` 的方法号：args 空 / input 空 / output 空。"
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_UNMOUNT"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "`unmount` 的方法号：args 空 / input 空 / output 空。"
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_OPEN"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "`open` 的方法号：args = 4 字节 LE `u32` flags / input = NUL 结尾路径（含结尾 NUL）/ output = 8 字节 LE `u64` handle。"
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_CLOSE"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "`close` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output 空。"
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_READ"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "`read` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output ≥ 8 字节（8 字节 LE 实际长度头 + 数据）。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_HANDLE_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust"
+doc = "`read` / `close` 的 `args` 区与 `open` 的 `output` 区长度：一个 LE `u64` handle（没有其它编码）。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_FLAGS_LEN"
+type = "usize"
+value = "4"
+targets = "c,sdk-rust"
+doc = "`open` 的 `args` 区长度：一个 LE `u32` flags（没有其它编码）。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_READ_HEADER_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust"
+doc = "`read` 的 `output` 头部长度：一个 LE `u64` 实际读取长度；数据从 offset 8 开始。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_PATH_MAX"
+type = "usize"
+value = "256"
+targets = "c,sdk-rust"
+doc = "`open` 的 `input` 上限（**含**结尾 NUL）：provider 用定长 scratch 拷贝路径，超过即 `-EINVAL`。"

@@ -476,6 +476,29 @@ fn component_contract_literals_are_pinned() {
         0x0000_0001
     );
 
+    // filesystem endpoint 调用契约（wire 常量）：contract 身份 + 方法号 + 长度。
+    // 与 block 同一约定：ABI 指纹（"FILESYST"）标识 function table / 扁平编码的
+    // 逐位布局，contract 身份（"VFSCONTR"）标识 endpoint 契约——**两个不同的值**。
+    assert_eq!(
+        generated_filesystem::KCOMP_FILESYSTEM_CONTRACT,
+        0x5646_5343_4F4E_5452,
+        "filesystem contract id 漂移"
+    );
+    assert_eq!(
+        &generated_filesystem::KCOMP_FILESYSTEM_CONTRACT.to_be_bytes(),
+        b"VFSCONTR",
+        "filesystem contract id 不再是 ASCII tag"
+    );
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_MOUNT, 0);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_UNMOUNT, 1);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_OPEN, 2);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_CLOSE, 3);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_READ, 4);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_HANDLE_LEN, 8);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_FLAGS_LEN, 4);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_READ_HEADER_LEN, 8);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_PATH_MAX, 256);
+
     // InterfaceKind 编码（Core 侧真实类型，来自 component.toml 生成物）：
     // ABI 编码 0/1/2，与 docs/architecture/component-model.md §2 一致。
     assert_eq!(InterfaceKind::Device as u32, 0);

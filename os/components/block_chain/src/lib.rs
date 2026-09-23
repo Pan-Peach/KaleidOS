@@ -1,23 +1,37 @@
 //! block_chain —— **第一条完整链的组合策略**（composer）：Rust BlockDevice
-//! provider → C consumer（FatFs 胶水）。
+//! provider → C FatFs → filesystem endpoint → C 测试消费者。
 //!
-//! 它只做组合策略该做的四件事（`docs/architecture/deployment.md` §2 ①）：
+//! 它只做组合策略该做的事（`docs/architecture/deployment.md` §2 ①）：
 //!
 //! 1. 创建 provider 实例（`ram_blk`，create config 为空——它自己发布 endpoint）；
 //! 2. **组合期发现**：把 `(provider, port_name, contract)` 解析成 opaque
 //!    `EndpointId`（Core 校验 contract + abi + 存活）；
-//! 3. Gate 探针（诊断）：显式经 `kcore_endpoint_call` 调一次 capacity，证明
+//! 3. Gate 探针（诊断）：显式经 `kcore_endpoint_call` 调一次 block capacity，证明
 //!    provider 的 `kcomp_service_dispatch` 端到端可用——**不**影响消费者绑定；
-//! 4. 创建 C consumer（`fatfs`），create config **只带 EndpointId**：consumer
-//!    自己 `kcomp_block_bind`（Core 在 bind 时选定机制），**绝不做全局名字发现**。
+//! 4. 创建 C consumer（`fatfs`），create config **只带 block EndpointId**：consumer
+//!    自己 `kcomp_block_bind`（Core 在 bind 时选定机制），**绝不做全局名字发现**；
+//! 5. FatFs 在 create 里发布 **filesystem endpoint**（Direct 的 function table +
+//!    Gate 的 port token），组合策略再次发现它（`FILESYSTEM_NAME` +
+//!    `KCOMP_FILESYSTEM_CONTRACT`）；
+//! 6. filesystem Gate 探针：经 Core call gate `mount` 一次，证明 FatFs 的
+//!    `kcomp_service_dispatch` 端到端可用；
+//! 7. 创建测试消费者（`fs_consumer`），create config **只带 filesystem
+//!    EndpointId**：consumer 自己 `kcomp_filesystem_bind` 并 mount/open/read
+//!    `HELLO.TXT`，逐字节校验内容。
 //!
 //! 本组件**不选择调用机制**：机制由 Core 在 consumer 的 bind 时按两端执行域选定。
 //!
 //! # QEMU 证据
 //!
-//! `tests/qemu/runner.py` 加载本组件后断言：provider 的 `read` 业务日志 + FatFs
-//! 读到的 `HELLO.TXT` 内容逐字节一致，且**业务 read 不伴随任何 gate dispatch**
-//! （唯一一条 gate dispatch 是第 3 步的探针，method = capacity）。
+//! `tests/qemu/runner.py` 加载本组件后断言：
+//!
+//! - 块链：provider 的业务日志（`ram_blk: read lba=...`）与 FatFs 读到的内容；
+//! - 文件系统链：`fs_consumer` 的原始内容行是 `KALEIDOS BLOCK CHAIN OK`；
+//! - **差分证据**：`ram_blk: gate dispatch` 恰好一条（method=0，组合器的块探针）、
+//!   `[fatfs] gate dispatch` 恰好一条（method=0，组合器的文件系统探针）——随后
+//!   所有业务调用都伴随业务日志（`[fatfs] read` 等）而**没有**第二条 gate dispatch，
+//!   证明稳态 read 全部走 Direct：不调用 `kcore_endpoint_call`，不分配 per-call
+//!   service stack。
 
 #![no_std]
 
@@ -32,12 +46,15 @@ use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDevice};
 use kcomp_sdk::call;
 use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::filesystem::{FILESYSTEM_NAME, FileSystem};
 use kcomp_sdk::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
+use kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_METHOD_MOUNT;
 use kcomp_sdk::{kcomp_instance_create, kcomp_instance_destroy, klog};
 
-/// 组合策略创建的两个组件镜像名（= `os/components` 下的目录名，`load` 用同名）。
+/// 组合策略创建的组件镜像名（= `os/components` 下的目录名，`load` 用同名）。
 const PROVIDER_IMAGE: &[u8] = b"ram_blk";
 const CONSUMER_IMAGE: &[u8] = b"fatfs";
+const FS_CONSUMER_IMAGE: &[u8] = b"fs_consumer";
 
 /// `fatfs` 的 create config：只交付组合期解析出的 opaque `EndpointId`。
 ///
@@ -50,6 +67,18 @@ struct FatfsCreateConfig {
 }
 
 const FATFS_CREATE_CONFIG_ABI: u64 = 0x4641_5446_5343_4647;
+
+/// `fs_consumer` 的 create config：只交付 FatFs 的 filesystem `EndpointId`。
+///
+/// 布局必须与 `os/components/filesystems/fs_consumer/fs_consumer.c` 的
+/// `struct fs_consumer_create_config` 逐字节一致；`config_abi` 是布局指纹（8 字节
+/// ASCII "FSCONSUM" 的大端读数）。
+#[repr(C)]
+struct FsConsumerCreateConfig {
+    endpoint: u64,
+}
+
+const FS_CONSUMER_CREATE_CONFIG_ABI: u64 = 0x4653_434F_4E53_554D;
 
 /// 无 config 负载的 create args（`ram_blk` 不需要配置）。
 fn empty_args() -> abi::KcompCreateArgs {
@@ -109,8 +138,8 @@ kcomp_instance_create!(|_args, _out_state| {
         u64::from_le_bytes(reply)
     );
 
-    // (4) C consumer：create config 只带 EndpointId——FatFs 用 `kcomp_block_bind`
-    //     绑定（Core 选定机制），之后经统一包装读盘。
+    // (4) C consumer：create config 只带 block EndpointId——FatFs 用
+    //     `kcomp_block_bind` 绑定（Core 选定机制），之后经统一包装读盘。
     let config = FatfsCreateConfig {
         endpoint: endpoint.id(),
     };
@@ -133,11 +162,68 @@ kcomp_instance_create!(|_args, _out_state| {
         return status;
     }
 
+    // (5) filesystem endpoint 组合期发现：FatFs 在 create 里发布（api/ctx =
+    //     Direct 的 function table + state；port = Gate token）。
+    let fs_endpoint = match Endpoint::<FileSystem>::lookup(consumer, FILESYSTEM_NAME) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            klog!(
+                "block_chain: filesystem endpoint lookup failed: {:?}",
+                error
+            );
+            return error.code();
+        }
+    };
+
+    // (6) filesystem Gate 探针：显式经 Core call gate mount 一次，证明 FatFs 的
+    //     `kcomp_service_dispatch` 真实可用（扁平 open/read/... 与它共用同一份
+    //     method switch；消费者的绑定另行由 Core 选定机制）。
+    match call::endpoint_call(
+        fs_endpoint.id(),
+        KCOMP_FILESYSTEM_METHOD_MOUNT,
+        &[],
+        &[],
+        &mut [],
+    ) {
+        Ok(0) => {}
+        other => {
+            klog!("block_chain: filesystem gate probe failed: {:?}", other);
+            return Errno::EIO.code();
+        }
+    }
+    klog!("block_chain: fs gate probe ok");
+
+    // (7) C 测试消费者：create config 只带 filesystem EndpointId——它用
+    //     `kcomp_filesystem_bind` 绑定，再 mount/open/read 并校验内容。
+    let fs_config = FsConsumerCreateConfig {
+        endpoint: fs_endpoint.id(),
+    };
+    let fs_consumer_args = abi::KcompCreateArgs {
+        config_abi: FS_CONSUMER_CREATE_CONFIG_ABI,
+        config: (&fs_config as *const FsConsumerCreateConfig).cast(),
+        config_len: core::mem::size_of::<FsConsumerCreateConfig>(),
+    };
+    let mut fs_consumer = 0u32;
+    let status = unsafe {
+        abi::kcore_component_create(
+            FS_CONSUMER_IMAGE.as_ptr(),
+            FS_CONSUMER_IMAGE.len(),
+            &fs_consumer_args,
+            &mut fs_consumer,
+        )
+    };
+    if status != 0 {
+        klog!("block_chain: create fs_consumer failed: {}", status);
+        return status;
+    }
+
     klog!(
-        "block_chain: chain wired (provider={} endpoint={} consumer={})",
+        "block_chain: chain wired (provider={} block_endpoint={} fatfs={} fs_endpoint={} consumer={})",
         provider,
         endpoint.id(),
-        consumer
+        consumer,
+        fs_endpoint.id(),
+        fs_consumer
     );
     // 无状态组合器：`*out_state` 保持 Core 初始化的 NULL。
     0
