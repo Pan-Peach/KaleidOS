@@ -236,6 +236,8 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 结论：**共享 text 是未来的 loader 优化，不是"一个链接好的 KernelNative 二进制能在任何执行域原样运行"的 ABI 承诺。**
 
+> **本条结论已被取代（superseded）：** 目标方向（同一份组件代码 + 契约不按部署重写、text 何时可跨域共享的精确条件、依赖排序的缺口清单）见 `docs/architecture/deployment.md` §6。上面这段**现状事实**（单一 load base、无页级权限分离、import 只重定位一次）仍然有效；被取代的是"这不是 ABI 承诺"这个**目标层面**的判断。
+
 ---
 
 ## 10. 组件迁移清单
