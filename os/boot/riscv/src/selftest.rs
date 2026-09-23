@@ -190,6 +190,7 @@ fn panic_containment() -> ! {
     ) {
         CallOutcome::Panicked => pass("panic-containment"),
         CallOutcome::Returned(_) => fail("component panic returned unexpectedly"),
+        CallOutcome::NoStack => fail("boundary stack allocation failed"),
     }
 }
 

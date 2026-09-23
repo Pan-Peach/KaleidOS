@@ -54,9 +54,13 @@
 //!
 //! # 本阶段不做（seam / TODO）
 //!
-//! - **不做执行边界**：`kcore_endpoint_call` 当前是 KernelNative 直接分派（无
-//!   service stack / principal 切换 / re-entry 检测 / provider panic containment，
-//!   见 `component/call.rs` 模块文档）；
+//! - **执行边界已落地**：`kcore_endpoint_call` 经 `component/call.rs` 走 Core 控制的
+//!   service-call 边界（per-call Core 拥有栈 / provider principal / re-entry 与
+//!   IRQ 祖先门禁 / provider panic containment，见 `containment::call_component_service`
+//!   与 `component/call.rs` 模块文档）；真实 stack switch / provider panic 由 QEMU
+//!   证明（host fake 不执行组件入口体）。
+//! - **不做 escape-eligibility scope**：Core 临界区内的 provider panic 保持致命
+//!   （下一阶段）；
 //! - 不迁 consumer（scheduler / core_test 仍走 `kcore_interface_*`）；
 //! - 不新增 `TraceEvent`（事件 kind 是 ABI 编码，留给下一阶段）；
 //! - 不做 endpoint 回收（`Invalid` 记录保留为 tombstone，id 不复用）。

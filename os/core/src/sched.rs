@@ -57,9 +57,10 @@ pub enum SchedError {
     NoPolicy,
     /// 任务表状态机拒绝推进（yield/exit 时当前任务不是 Running 等）。
     ///
-    /// 也用于**上下文种类拒绝**：调度操作不得在 IRQ 回调作用域内执行
-    /// （`containment::in_irq_context`，见 [`deny_in_irq_context`]），ABI 上是
-    /// `-EINVAL`。复用本变体是为了不改内部错误枚举与唯一的 errno 映射表。
+    /// 也用于**上下文种类拒绝**：调度操作不得在 IRQ 回调作用域或 service-call
+    /// 边界内（含其下的嵌套边界）执行（`containment::scheduling_forbidden`，见
+    /// [`deny_scheduling_forbidden`]），ABI 上是 `-EINVAL`。复用本变体是为了不改
+    /// 内部错误枚举与唯一的 errno 映射表。
     InvalidTransition,
     /// 当前任务从表中消失（Core 不变式被破坏，不应发生）。
     NotFound,
@@ -67,12 +68,14 @@ pub enum SchedError {
     NoCurrent,
 }
 
-/// 上下文种类门禁：IRQ 回调是同步、不可 yield 的顶半部，调度操作在里面一律
-/// 拒绝（返回 `-EINVAL`，绝不 panic），因为 `schedule_next` 会在 trap 上下文里
-/// 做 context switch、且没有 Core 拥有的恢复点。Core 机制层就拒绝，ABI 边界
-/// （`component/export.rs`）保持原样。
-fn deny_in_irq_context() -> Result<(), SchedError> {
-    if containment::in_irq_context() {
+/// 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
+/// （provider 跑在 Core 拥有的 service stack 上，没有调度可见的任务）内，调度
+/// 操作一律拒绝（返回 `-EINVAL`，绝不 panic），因为 `schedule_next` 会在 trap
+/// 上下文 / 错误的任务上下文里做 context switch，且没有 Core 拥有的恢复点。
+/// 门禁沿边界链**祖先遍历**（`Service → create → sched::run` 不能溜过）。
+/// Core 机制层就拒绝，ABI 边界（`component/export.rs`）保持原样。
+fn deny_scheduling_forbidden() -> Result<(), SchedError> {
+    if containment::scheduling_forbidden() {
         return Err(SchedError::InvalidTransition);
     }
     Ok(())
@@ -338,7 +341,7 @@ pub(crate) fn abort_current_task(task: TaskId, owner: ComponentId) -> ! {
 /// 任务轮流跑到尽。没有 Runnable 任务时直接返回（no-op）。
 /// 全部任务退出（或阻塞）后，控制权在锚点上下文回到调用者。
 pub fn run() -> Result<(), SchedError> {
-    deny_in_irq_context()?;
+    deny_scheduling_forbidden()?;
     if collect_runnable().is_empty() {
         return Ok(());
     }
@@ -347,7 +350,7 @@ pub fn run() -> Result<(), SchedError> {
 
 /// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
 pub fn yield_current() -> Result<(), SchedError> {
-    deny_in_irq_context()?;
+    deny_scheduling_forbidden()?;
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Runnable), None)
 }
@@ -355,7 +358,7 @@ pub fn yield_current() -> Result<(), SchedError> {
 /// 当前任务退出：Running → Exited，切换走。**本任务从此不再恢复**——
 /// 若还有 Runnable 任务则它们接管；全部退出后控制权回到锚点。
 pub fn exit_current() -> Result<(), SchedError> {
-    deny_in_irq_context()?;
+    deny_scheduling_forbidden()?;
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Exited), None)
 }
@@ -1160,6 +1163,44 @@ mod tests {
         // 无关 Runnable 任务，故只断言不再是 IRQ 拒绝）。
         assert!(!containment::in_irq_context());
         assert_ne!(run(), Err(SchedError::InvalidTransition));
+        assert_eq!(current_task(), None);
+        containment::enter_anchor();
+    }
+
+    /// 上下文种类门禁（祖先感知）：service-call 边界内的调度操作一律拒绝，
+    /// 即使上面盖着嵌套的 init 边界——`Service → create → sched::run` 不能溜过。
+    #[test]
+    fn scheduler_operations_are_rejected_under_a_service_call_ancestor() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        crate::task::init();
+        init();
+        crate::component::registry::init();
+        reset_cpu();
+        containment::enter_anchor();
+
+        containment::with_test_service_boundary(
+            ComponentId::from_raw(0xB),
+            crate::component::endpoint::EndpointId::from_raw(1),
+            None,
+            || {
+                assert_eq!(run(), Err(SchedError::InvalidTransition));
+                assert_eq!(yield_current(), Err(SchedError::InvalidTransition));
+                assert_eq!(exit_current(), Err(SchedError::InvalidTransition));
+                containment::with_test_init_boundary(Some(ComponentId::from_raw(0xC)), || {
+                    assert_eq!(
+                        run(),
+                        Err(SchedError::InvalidTransition),
+                        "a nested init boundary must not re-open the scheduler"
+                    );
+                    assert_eq!(yield_current(), Err(SchedError::InvalidTransition));
+                    assert_eq!(exit_current(), Err(SchedError::InvalidTransition));
+                });
+            },
+        );
+
+        // 离开边界：上下文种类恢复（不再走拒绝路径，也绝不残留门禁）。
+        assert!(!containment::scheduling_forbidden());
         assert_eq!(current_task(), None);
         containment::enter_anchor();
     }

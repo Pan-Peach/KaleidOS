@@ -52,11 +52,13 @@ pub fn create_task(
     entry: usize,
     arg: *mut (),
 ) -> Result<TaskId, TaskError> {
-    // 上下文种类门禁：IRQ 回调是同步、不可 yield 的顶半部，不得创建 work
-    //（创建任务会分配内核栈/新执行流）。Core 机制层拒绝，返回 `-EINVAL`
-    //（复用 `InvalidTransition`，不改内部错误枚举与唯一 errno 映射表），
-    // 绝不 panic。
-    if containment::in_irq_context() {
+    // 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
+    //（provider 跑在 Core 拥有的 service stack 上，没有调度可见的任务）内不得
+    // 创建 work（创建任务会分配内核栈 / 新执行流）。门禁沿边界链**祖先遍历**：
+    // 嵌套的 init / exit / task 边界不能把 IRQ 或 service 祖先藏起来。Core 机制
+    // 层拒绝，返回 `-EINVAL`（复用 `InvalidTransition`，不改内部错误枚举与唯一
+    // errno 映射表），绝不 panic。
+    if containment::scheduling_forbidden() {
         return Err(TaskError::InvalidTransition);
     }
     // 锁序：registry → image（先后取得、不嵌套持有）。
@@ -94,10 +96,10 @@ pub fn create_task(
 /// 任务 ID 只是可猜测的 identity；Core 必须在状态转换前验证 requester
 /// 是否等于任务记录中的 owner。
 ///
-/// 上下文种类门禁：IRQ 回调作用域内拒绝启动任务（`-EINVAL`），理由同
-/// [`create_task`]。
+/// 上下文种类门禁：IRQ 回调作用域或 service-call 边界内拒绝启动任务
+/// （`-EINVAL`），理由同 [`create_task`]。
 pub fn start_task(requester: ComponentId, task: TaskId) -> Result<(), TaskError> {
-    if containment::in_irq_context() {
+    if containment::scheduling_forbidden() {
         return Err(TaskError::InvalidTransition);
     }
     get_task_table().lock().start(requester, task)
@@ -473,6 +475,40 @@ mod tests {
         assert!(
             !get_task_table().lock().has_live_tasks(requester),
             "IRQ 上下文的拒绝不得创建任务"
+        );
+        containment::enter_anchor();
+    }
+
+    /// 上下文种类门禁（祖先感知）：service-call 边界内（含嵌套 init 之下）
+    /// 创建 / 启动任务同样被拒（`-EINVAL`），绝不产生任务。
+    #[test]
+    fn task_create_and_start_are_rejected_under_a_service_call_ancestor() {
+        crate::task::init();
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        let requester = ComponentId::from_raw(0xfeed);
+
+        containment::with_test_service_boundary(
+            ComponentId::from_raw(0xB),
+            crate::component::endpoint::EndpointId::from_raw(1),
+            None,
+            || {
+                containment::with_test_init_boundary(Some(ComponentId::from_raw(0xC)), || {
+                    assert_eq!(
+                        create_task(requester, 0x1000, core::ptr::null_mut()),
+                        Err(TaskError::InvalidTransition)
+                    );
+                    assert_eq!(
+                        start_task(requester, TaskId::from_raw(1)),
+                        Err(TaskError::InvalidTransition)
+                    );
+                });
+            },
+        );
+
+        assert!(
+            !get_task_table().lock().has_live_tasks(requester),
+            "service-call 上下文的拒绝不得创建任务"
         );
         containment::enter_anchor();
     }

@@ -10,9 +10,12 @@
 //! - inside a component task the principal is that task's owner;
 //! - inside an IRQ callback scope (`containment::with_irq_scope`) the principal
 //!   is the **IRQ line's owner** with no task — never the interrupted execution;
-//! - after a nested create returns **or panics**, the containment guard stack
-//!   restores the previous boundary (each guard stores the pointer it replaced),
-//!   so the enclosing task/create principal is effective again.
+//! - inside a **service call** (`containment::call_component_service`) the
+//!   principal is the **provider**; the caller's task is reported as execution
+//!   provenance, never as authority over that task;
+//! - after a nested create / service call returns **or panics**, the containment
+//!   guard stack restores the previous boundary (each guard stores the pointer it
+//!   replaced), so the enclosing task/create principal is effective again.
 //!
 //! Only when no boundary is active (Core anchor / host tests) does resolution
 //! fall back to the running task's owner and then the loader-recorded
@@ -71,17 +74,20 @@ impl RequestContext {
     /// boundary.
     ///
     /// Interface publication is a create-time operation: a component task, a
-    /// `kcomp_instance_destroy` hook, and an **IRQ callback scope** are active
-    /// boundaries but are not valid publication principals.  In particular, an
-    /// IRQ scope must not confer create-time publication permission even though
-    /// it establishes a principal for resource requests.
+    /// `kcomp_instance_destroy` hook, an **IRQ callback scope**, and a **service
+    /// call** are active boundaries but are not valid publication principals.  In
+    /// particular, a service call must never confer create-time publication
+    /// permission even though it establishes a principal for resource requests.
     pub(crate) fn ambient_init() -> Option<Self> {
         match containment::active_escape()?.kind {
             EscapeKind::Init { owner } => owner.map(|component| Self {
                 component,
                 task: None,
             }),
-            EscapeKind::Exit { .. } | EscapeKind::Task { .. } | EscapeKind::Irq { .. } => None,
+            EscapeKind::Exit { .. }
+            | EscapeKind::Task { .. }
+            | EscapeKind::Irq { .. }
+            | EscapeKind::ServiceCall { .. } => None,
         }
     }
 }
@@ -89,6 +95,7 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::endpoint::EndpointId;
 
     /// A plain running task resolves to its owner component.
     #[test]
@@ -240,6 +247,61 @@ mod tests {
             );
         });
 
+        containment::enter_anchor();
+    }
+
+    /// 验收：service call 的 principal 是 provider；嵌套按 A → B → C → B → A
+    /// 精确恢复，caller task 一路作为 provenance 传递（不是任务归属）。
+    #[test]
+    fn nested_service_calls_resolve_a_b_c_and_restore_in_order() {
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+
+        let a = ComponentId::from_raw(0xA);
+        let b = ComponentId::from_raw(0xB);
+        let c = ComponentId::from_raw(0xC);
+        let task = TaskId::from_raw(7);
+
+        containment::enter_task(task, a);
+        assert_eq!(RequestContext::ambient().unwrap().component, a, "A");
+
+        containment::with_test_service_boundary(b, EndpointId::from_raw(1), Some(task), || {
+            let ctx = RequestContext::ambient().expect("B boundary");
+            assert_eq!(ctx.component, b, "A → B");
+            assert_eq!(ctx.task, Some(task), "caller task travels as provenance");
+
+            containment::with_test_service_boundary(c, EndpointId::from_raw(2), Some(task), || {
+                let ctx = RequestContext::ambient().expect("C boundary");
+                assert_eq!(ctx.component, c, "B → C");
+                assert_eq!(ctx.task, Some(task));
+            });
+
+            assert_eq!(RequestContext::ambient().unwrap().component, b, "C → B");
+        });
+
+        let restored = RequestContext::ambient().expect("task boundary restored");
+        assert_eq!(restored.component, a, "B → A");
+        assert_eq!(restored.task, Some(task));
+        containment::enter_anchor();
+    }
+
+    /// 验收：service call 建立 principal，但**不**是 create-time publication
+    /// principal —— `ambient_init()` 在 service 边界内恒为 `None`。
+    #[test]
+    fn service_call_boundary_does_not_confer_create_publication() {
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+
+        let provider = ComponentId::from_raw(5);
+        containment::with_test_service_boundary(provider, EndpointId::from_raw(1), None, || {
+            assert!(
+                RequestContext::ambient_init().is_none(),
+                "a service call must not publish"
+            );
+            assert_eq!(RequestContext::ambient().unwrap().component, provider);
+        });
+
+        assert!(RequestContext::ambient_init().is_none());
         containment::enter_anchor();
     }
 

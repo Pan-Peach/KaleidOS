@@ -58,6 +58,10 @@ pub enum ComponentLoadError {
     /// 组件拥有的任务 panic，已由 task-abort 上下文提交为 `Exited`；
     /// 组件的 authority 由 abort 路径撤销（仅作 reason 语义）。
     TaskPanicked(TaskId),
+    /// 组件作为 provider 的 `kcomp_service_dispatch` 在 service-call 边界内
+    /// panic，已切回 caller 的 Core 帧；`component/call.rs` 据此把 provider 提交
+    /// 为 `Failed`（caller 不受影响）。
+    ServicePanicked,
 }
 
 /// 当前正在创建的实例（create 调用期间由 Core 记录）。
@@ -179,6 +183,12 @@ pub fn create_component(
         CallOutcome::Returned(code) => {
             // create 失败：组件自己负责内部错误清理；Core **不调用 destroy**。
             let error = ComponentLoadError::CreateFailed(code);
+            failure::fail_component(id, error);
+            Err(error)
+        }
+        CallOutcome::NoStack => {
+            // 边界栈分配失败（Core 侧 `-ENOMEM`）：入口从未执行，等价 create 失败。
+            let error = ComponentLoadError::CreateFailed(containment::STACK_ALLOCATION_FAILED);
             failure::fail_component(id, error);
             Err(error)
         }

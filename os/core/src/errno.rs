@@ -123,6 +123,14 @@ impl From<CallError> for Errno {
             CallError::ImageMissing => Errno::ENODEV,
             // provider 没有 dispatcher：组件不提供 endpoint 服务（能力缺失）。
             CallError::NoDispatcher => Errno::ENOSYS,
+            // 重入：provider 已在当前同步链上（不是"稍后重试"，是同步环）。
+            CallError::Reentrant => Errno::EBUSY,
+            // 上下文种类拒绝：IRQ 回调不得发起通用服务调用（与 IRQ 内调度同档）。
+            CallError::InIrqContext => Errno::EINVAL,
+            // Core 侧资源耗尽（per-call service stack）：provider 从未执行。
+            CallError::NoServiceStack => Errno::ENOMEM,
+            // provider 已逻辑死亡（panic containment 已提交 Failed + 失效 endpoint）。
+            CallError::ProviderFailed => Errno::EIO,
         }
     }
 }
@@ -145,6 +153,7 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::InterfaceCommitFailed(_) => Errno::EINVAL,
             ComponentLoadError::EndpointCommitFailed(error) => Errno::from(error),
             ComponentLoadError::TaskPanicked(_) => Errno::EIO,
+            ComponentLoadError::ServicePanicked => Errno::EIO,
         }
     }
 }
@@ -388,6 +397,10 @@ mod tests {
             CallError::ProviderBusy,
             CallError::ImageMissing,
             CallError::NoDispatcher,
+            CallError::Reentrant,
+            CallError::InIrqContext,
+            CallError::NoServiceStack,
+            CallError::ProviderFailed,
         ] {
             let expected = match error {
                 CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
@@ -407,6 +420,10 @@ mod tests {
                 CallError::ProviderBusy => Errno::EBUSY,
                 CallError::ImageMissing => Errno::ENODEV,
                 CallError::NoDispatcher => Errno::ENOSYS,
+                CallError::Reentrant => Errno::EBUSY,
+                CallError::InIrqContext => Errno::EINVAL,
+                CallError::NoServiceStack => Errno::ENOMEM,
+                CallError::ProviderFailed => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "CallError {error:?}");
         }
@@ -462,6 +479,7 @@ mod tests {
             ComponentLoadError::InterfaceCommitFailed(InterfaceError::ProviderNotFound),
             ComponentLoadError::EndpointCommitFailed(EndpointError::DuplicatePort),
             ComponentLoadError::TaskPanicked(crate::task::TaskId::from_raw(1)),
+            ComponentLoadError::ServicePanicked,
         ] {
             let expected = match error {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
@@ -482,6 +500,7 @@ mod tests {
                 }
                 ComponentLoadError::EndpointCommitFailed(_) => Errno::EINVAL,
                 ComponentLoadError::TaskPanicked(_) => Errno::EIO,
+                ComponentLoadError::ServicePanicked => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }

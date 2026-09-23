@@ -148,6 +148,12 @@ fn complete_stop(id: ComponentId, outcome: CallOutcome) -> Result<(), ComponentS
             failure::fail_component(id, ComponentLoadError::DestroyFailed(code));
             return Err(ComponentStopError::DestroyFailed(code));
         }
+        CallOutcome::NoStack => {
+            // 边界栈分配失败（Core 侧 `-ENOMEM`）：钩子从未执行，等价 destroy 失败。
+            let code = containment::STACK_ALLOCATION_FAILED;
+            failure::fail_component(id, ComponentLoadError::DestroyFailed(code));
+            return Err(ComponentStopError::DestroyFailed(code));
+        }
         CallOutcome::Panicked => {
             // 契约 §8：destroy panic → 同上（不重试、不进入 Stopped）。
             failure::fail_component(id, ComponentLoadError::DestroyPanicked);

@@ -1,6 +1,7 @@
-//! Component panic containment: init boundary **and** runtime task boundary.
+//! Component panic containment: init boundary, runtime task boundary, and the
+//! component→component **service-call boundary**.
 //!
-//! A KernelNative component can panic at three Core boundaries, and all are
+//! A KernelNative component can panic at four Core boundaries, and all are
 //! contained by escaping to a Core-owned context instead of unwinding:
 //!
 //! 1. **Create boundary** (`kcomp_instance_create`): the component entry runs on
@@ -18,9 +19,53 @@
 //!    ambient identity.  A panic escapes back to
 //!    `component/exit.rs::stop_component`, which classifies it as a destroy
 //!    failure.
+//! 4. **Service-call boundary** (`kcore_endpoint_call`): the provider's
+//!    `kcomp_service_dispatch` runs on its own temporary Core-owned **service
+//!    stack** ([`call_component_service`]) under the **provider's** principal.
+//!    A normal return and a panic both switch back to the calling Core frame,
+//!    which classifies the outcome; a panicked provider is failed by
+//!    `component/call.rs`, never the caller.
 //!
 //! Because control never returns through the panicking frame this is **not**
 //! Rust unwinding and remains compatible with `panic = "abort"`.
+//!
+//! # Service-call boundary
+//!
+//! [`call_component_service`] layers one [`EscapeKind::ServiceCall`] guard over
+//! the caller's boundary for exactly one dispatcher invocation:
+//!
+//! - **Principal**: `RequestContext::ambient()` inside the dispatcher resolves to
+//!   the **provider**, with `task = caller_task` recorded as execution
+//!   provenance — never as authority over that task.  `ambient_init()` is `None`
+//!   inside the boundary: a service call must not confer create-time publication
+//!   permission.
+//! - **Escapable**: a dispatcher panic switches to the suspended caller frame
+//!   (the same save/restore discipline as create/destroy), so
+//!   `component/call.rs` can fail the provider and return a transport error while
+//!   the caller stays alive.  The abandoned service stack is **retained**
+//!   (phase-1 conservative residency, explicit `mem::forget` of the lease — no
+//!   allocator lock on the panic path).
+//! - **Scheduling-forbidden**: the provider has no scheduler-visible task, so
+//!   [`scheduling_forbidden`] rejects `sched::run` / `yield_current` /
+//!   `exit_current` and task creation for the **whole chain** — including beneath
+//!   a nested lifecycle boundary (`Service → create → sched::run` can no longer
+//!   slip past a top-guard-only check).
+//! - **Re-entry**: `component/call.rs` rejects a call whose provider already runs
+//!   in the active synchronous chain ([`provider_in_active_chain`]) — the
+//!   scheduling anchor is deliberately not traversed.
+//! - **Interrupt state**: the RISC-V context record holds `ra` / `sp` / `s0-s11`
+//!   only, so the service boundary saves and restores the interrupt-enable state
+//!   explicitly around the switch.
+//!
+//! # Phase-1 limitation: real dispatch is QEMU-only
+//!
+//! The host fake context backend does not execute component entry bodies, so the
+//! **real** stack switch, a **real** provider panic, and the end-to-end
+//! A → B → C principal order in actual execution cannot be proven by `cargo
+//! test`.  They must be proven on QEMU with a real component that exports
+//! `kcomp_service_dispatch` (a later step).  Host tests exercise the boundary
+//! bookkeeping through the test-only helpers ([`with_test_service_boundary`],
+//! [`test_mark_active_panicked`]) instead.
 //!
 //! # Ambient escape guard (lock-free)
 //!
@@ -48,7 +93,8 @@
 //! that owner.
 //!
 //! An IRQ scope is synchronous and non-yielding: scheduler-affecting Core calls
-//! are rejected while it is active (see [`in_irq_context`]).  It is also **not
+//! are rejected while it is active or anywhere beneath it
+//! ([`scheduling_forbidden`]).  It is also **not
 //! escapable**: [`panic_escape`] restores the interrupted guard and refuses,
 //! because an IRQ callback has no Core-owned context to resume and escaping
 //! into the interrupted task would misattribute the callback's panic.  A panic
@@ -65,6 +111,9 @@
 //! - The failed component's image, allocations, and abandoned stack frames stay
 //!   resident; only authority is revoked via `fail_component`.  The aborted
 //!   task's kernel stack is **not** reclaimed.
+//! - A panicked service call's Core-owned service stack is **not** reclaimed
+//!   either (explicit `mem::forget`; see [`call_component_service`]).  A service
+//!   stack is freed only on the normal-return path.
 //! - Other tasks owned by the failed component are **not** force-stopped:
 //!   `may_run` excludes them from runnable candidates (they never run again),
 //!   but their records stay non-`Exited` because Core has no task-stop API yet.
@@ -81,7 +130,9 @@
 //!   warranted once components do more work before panicking.
 
 use crate::component::ComponentId;
-use crate::memory;
+use crate::component::endpoint::EndpointId;
+use crate::generated::abi::KcompCallFrame;
+use crate::memory::{self, MemoryLease};
 use crate::task::TaskId;
 use arch::{ContextImpl, CpuArch, CpuImpl};
 use core::mem::MaybeUninit;
@@ -89,7 +140,13 @@ use core::mem::MaybeUninit;
 const COMPONENT_STACK_BYTES: usize = 32 * 1024;
 const TASK_ABORT_STACK_BYTES: usize = 32 * 1024;
 const STACK_ALIGNMENT: usize = 16;
-const STACK_ALLOCATION_FAILED: i32 = -12;
+/// 边界栈分配失败时报告的组件入口状态码（`-ENOMEM`）。
+///
+/// 这是 **Core 侧**失败（组件入口从未执行）：类型化表达是
+/// [`CallOutcome::NoStack`]；本常量只供生命周期编排（`component/load.rs` /
+/// `component/exit.rs`）把 `NoStack` 归入既有的 `CreateFailed` /
+/// `DestroyFailed` 分类。
+pub(crate) const STACK_ALLOCATION_FAILED: i32 = -12;
 
 // ---------------------------------------------------------------------------
 // 组件实例 ABI（C 是根，见 `docs/architecture/component-lifecycle.md` §4）
@@ -116,6 +173,12 @@ type InstanceCreate = extern "C" fn(args: *const KcompCreateArgs, out_state: *mu
 /// `kcomp_instance_destroy(state) -> 0 / -errno`。
 type InstanceDestroy = extern "C" fn(state: *mut ()) -> i32;
 
+/// `kcomp_service_dispatch(state, port, method, frame) -> 0 / -errno` 的 Core 侧
+/// 函数类型（手写镜像 `abi/component.toml` 的 `KcompServiceDispatch`，与
+/// `InstanceCreate` / `InstanceDestroy` 同款）。`call.rs` 在锁内解析后把地址拷进
+/// [`IsolatedCall::Service`]，由 [`trampoline`] 在 service 栈上调用。
+pub(crate) type ServiceDispatch = extern "C" fn(*mut (), u32, u32, *const KcompCallFrame) -> i32;
+
 /// 隔离栈上要执行的一次组件调用（参数由调用方在 Core 栈帧里携带）。
 #[derive(Clone, Copy)]
 enum IsolatedCall {
@@ -130,6 +193,15 @@ enum IsolatedCall {
         entry: usize,
         state: *mut (),
     },
+    /// 一次 component→component 服务调用（provider 的
+    /// `kcomp_service_dispatch`，参数全部来自 `component/call.rs` 的锁内拷贝）。
+    Service {
+        dispatcher: ServiceDispatch,
+        instance_state: *mut (),
+        port: u32,
+        method: u32,
+        frame: *const KcompCallFrame,
+    },
 }
 
 /// Result of invoking a component entry on its isolated stack.
@@ -137,6 +209,11 @@ enum IsolatedCall {
 pub enum CallOutcome {
     Returned(i32),
     Panicked,
+    /// The Core-owned boundary stack could not be allocated: the component entry
+    /// **never ran**.  This is a Core-side failure (`-ENOMEM`), not a component
+    /// status — it exists so `Returned(i32)` can never be confused with the
+    /// boundary failing to start.
+    NoStack,
 }
 
 /// Which Core boundary an active escape guard protects.
@@ -163,6 +240,33 @@ pub enum EscapeKind {
     /// cooperative bookkeeping — not an authentication boundary — and is
     /// neither yielding nor escapable (see the module docs).
     Irq { owner: ComponentId },
+    /// One component→component service call running on its own Core-owned
+    /// service stack ([`call_component_service`]).
+    ///
+    /// The owner is the **provider** (Core truth from the resolved endpoint),
+    /// so Core calls the dispatcher makes are attributed to the provider.
+    /// `caller_task` is the task the call originated from — **execution
+    /// provenance, not authorization** to act as that task's owner; it is
+    /// `None` when the call was made from a non-task boundary (init / exit).
+    /// The boundary is escapable (unlike `Irq`) and scheduling-forbidden (see
+    /// the module docs).
+    ServiceCall {
+        owner: ComponentId,
+        endpoint: EndpointId,
+        caller_task: Option<TaskId>,
+    },
+}
+
+impl EscapeKind {
+    /// Whether a panic in this boundary escapes to the Core-owned context
+    /// recorded in the guard ([`panic_escape`]).
+    ///
+    /// An IRQ attribution scope has no Core-owned context to resume and must
+    /// stay fatal; every other boundary (init / exit / task / service call) was
+    /// entered through a saved Core context and can escape to it.
+    pub(crate) const fn is_escapable(self) -> bool {
+        !matches!(self, Self::Irq { .. })
+    }
 }
 
 /// Lock-free snapshot of the active escape guard, for boot diagnostics.
@@ -172,22 +276,27 @@ pub struct EscapeInfo {
 }
 
 impl EscapeInfo {
-    /// Owning component, when known (`Task` / `Exit` always, `Init` only inside
-    /// a load).
+    /// Owning component, when known (`Task` / `Exit` / `Irq` / `ServiceCall`
+    /// always, `Init` only inside a load).
     pub fn owner(self) -> Option<ComponentId> {
         match self.kind {
             EscapeKind::Init { owner } => owner,
             EscapeKind::Exit { owner } => Some(owner),
             EscapeKind::Task { owner, .. } => Some(owner),
             EscapeKind::Irq { owner } => Some(owner),
+            EscapeKind::ServiceCall { owner, .. } => Some(owner),
         }
     }
 
     /// Running task id, or `None` at the init, exit, and IRQ boundaries.
+    ///
+    /// A service call reports the **caller task it originated from** (execution
+    /// provenance); it does not make the provider that task's owner.
     pub fn task(self) -> Option<TaskId> {
         match self.kind {
             EscapeKind::Init { .. } | EscapeKind::Exit { .. } | EscapeKind::Irq { .. } => None,
             EscapeKind::Task { task, .. } => Some(task),
+            EscapeKind::ServiceCall { caller_task, .. } => caller_task,
         }
     }
 }
@@ -300,18 +409,88 @@ pub fn active_escape() -> Option<EscapeInfo> {
     Some(EscapeInfo { kind })
 }
 
-/// Whether the active Core-managed boundary is an IRQ callback
-/// ([`EscapeKind::Irq`]) — the context-kind gate for operations that must not
-/// run in a synchronous, non-yielding top half.
+/// Whether the **innermost** active Core-managed boundary is an IRQ callback
+/// ([`EscapeKind::Irq`]).
 ///
-/// The Core mechanisms (`sched::run` / `yield_current` / `exit_current`,
-/// `task::create_task` / `start_task`) consult this and return an errno
-/// instead of panicking.  Lock-free: one read of the active guard.
+/// The production gates use the ancestor-aware [`scheduling_forbidden`] instead
+/// (a nested boundary on top of an IRQ scope must not hide it), so this
+/// top-guard query is kept **for tests only** — it pins the IRQ-specific
+/// behavior independently of the chain walk.
+#[cfg(test)]
 pub(crate) fn in_irq_context() -> bool {
     matches!(
         active_escape().map(|info| info.kind),
         Some(EscapeKind::Irq { .. })
     )
+}
+
+/// Walks the active boundary chain (innermost → outermost) and reports whether
+/// **any** guard satisfies `predicate`.
+///
+/// The walk follows each guard's saved predecessor and deliberately stops at
+/// the scheduler anchor: [`enter_task`] installs a fresh task guard with no
+/// predecessor, so the anchor's guard (e.g. an enclosing init boundary) is not
+/// part of a task's synchronous chain — a task's chain must not treat the anchor
+/// as a service predecessor.
+///
+/// Lock-free; the chain is only walked synchronously, while every guard's owner
+/// frame is suspended on this CPU.
+fn chain_any(predicate: impl Fn(&EscapeGuard) -> bool) -> bool {
+    let mut next = active_guard();
+    while let Some(guard_ptr) = next {
+        // SAFETY: [Category 2 — Data races] phase 1 is single-active-CPU; the
+        // chain is stable while this synchronous walk runs (no guard is popped
+        // concurrently), and every `previous` points at a live suspended frame.
+        let guard = unsafe { &*guard_ptr };
+        if predicate(guard) {
+            return true;
+        }
+        next = guard.state.previous();
+    }
+    false
+}
+
+/// Whether **any** boundary in the active chain is an IRQ attribution scope
+/// ([`EscapeKind::Irq`]) — including one hidden beneath nested lifecycle
+/// boundaries.
+pub(crate) fn irq_in_chain() -> bool {
+    chain_any(|guard| matches!(guard.kind, EscapeKind::Irq { .. }))
+}
+
+/// Whether **any** boundary in the active chain forbids scheduling: an IRQ scope
+/// (synchronous, non-yielding top half) or a service call (the provider runs on
+/// a Core-owned service stack under its own principal — there is no
+/// scheduler-visible task, and switching away would abandon the service stack).
+///
+/// Ancestor-aware by design: a nested init / exit / task boundary on top of an
+/// IRQ or service boundary must not re-open the scheduler
+/// (`Service → create → sched::run` is rejected).  The Core mechanisms
+/// (`sched::run` / `yield_current` / `exit_current`, `task::create_task` /
+/// `start_task`) consult this and return an errno instead of panicking.
+pub(crate) fn scheduling_forbidden() -> bool {
+    chain_any(|guard| {
+        matches!(
+            guard.kind,
+            EscapeKind::Irq { .. } | EscapeKind::ServiceCall { .. }
+        )
+    })
+}
+
+/// Whether `provider` already runs in the active synchronous chain: as the owner
+/// of a task guard, as the owner of any service-call guard, or as the instance
+/// being created / destroyed by an enclosing init / exit guard.
+///
+/// `component/call.rs` consults this before dispatching: a synchronous call back
+/// into an instance that is already on the current chain is re-entry, not a
+/// service request.  IRQ scopes are intentionally not counted — an IRQ callback
+/// cannot reach a generic service call at all (the IRQ chain gate rejects it
+/// first).
+pub(crate) fn provider_in_active_chain(provider: ComponentId) -> bool {
+    chain_any(|guard| match guard.kind {
+        EscapeKind::Task { owner, .. } | EscapeKind::ServiceCall { owner, .. } => owner == provider,
+        EscapeKind::Init { owner: Some(owner) } | EscapeKind::Exit { owner } => owner == provider,
+        EscapeKind::Init { owner: None } | EscapeKind::Irq { .. } => false,
+    })
 }
 
 /// Calls a component **create entry** (`kcomp_instance_create`) on a Core-owned
@@ -361,12 +540,104 @@ pub fn call_component_destroy(entry: usize, state: *mut (), owner: ComponentId) 
     )
 }
 
+/// Calls a component **service dispatcher** (`kcomp_service_dispatch`) on its own
+/// Core-owned **service stack**, under the provider's principal
+/// ([`EscapeKind::ServiceCall`]).
+///
+/// This is the execution boundary of `kcore_endpoint_call`
+/// (`component/call.rs`): the provider's dispatcher runs on a per-call 32 KiB
+/// Core-owned stack, so a panic switches back to the suspended caller frame
+/// instead of unwinding into (and killing) the caller.  `owner` is the resolved
+/// provider, `endpoint` its opaque endpoint identity (diagnostics), and
+/// `caller_task` the task the call originated from — **provenance only**, never
+/// authority over that task.
+///
+/// The whole invocation is an irq-save critical section: the RISC-V context
+/// record does not carry `sstatus.SIE`, so Core saves the caller's
+/// interrupt-enable state and restores it after the switch — no trap lands on
+/// the freshly-installed service stack, and a provider that escapes while
+/// holding an irq-save (or leaves `SIE` cleared) cannot strand Core with
+/// interrupts disabled.  A nested service call observes `SIE = 0` and its
+/// restore is a no-op.
+///
+/// Stack lifecycle: a normal return frees the service stack; a panic **retains**
+/// it (explicit `mem::forget` of the lease, and no allocator lock on the panic
+/// path) — phase-1 conservative residency, exactly like the failed component's
+/// image and abandoned frames.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_component_service(
+    owner: ComponentId,
+    endpoint: EndpointId,
+    caller_task: Option<TaskId>,
+    dispatcher: ServiceDispatch,
+    instance_state: *mut (),
+    port: u32,
+    method: u32,
+    frame: *const KcompCallFrame,
+) -> CallOutcome {
+    let irq_flags = CpuImpl::disable_irq();
+    let run = run_isolated(
+        IsolatedCall::Service {
+            dispatcher,
+            instance_state,
+            port,
+            method,
+            frame,
+        },
+        EscapeKind::ServiceCall {
+            owner,
+            endpoint,
+            caller_task,
+        },
+    );
+    CpuImpl::restore_irq(irq_flags);
+
+    let IsolatedRun { outcome, stack } = run;
+    match (outcome, stack) {
+        (CallOutcome::Panicked, Some(stack)) => {
+            core::mem::forget(stack);
+            CallOutcome::Panicked
+        }
+        (outcome, Some(stack)) => {
+            let _ = memory::free_region(stack);
+            outcome
+        }
+        (_, None) => CallOutcome::NoStack,
+    }
+}
+
 /// Shared body of the create / destroy boundaries: allocate a Core-owned stack,
 /// install `kind` as the active escape guard, switch, and collect the outcome.
 fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutcome {
+    let IsolatedRun { outcome, stack } = run_isolated(call, kind);
+    if let Some(stack) = stack {
+        let _ = memory::free_region(stack);
+    }
+    outcome
+}
+
+/// One isolated-stack switch: the component entry outcome plus the Core-owned
+/// stack lease, so the caller decides whether to reclaim it (create / destroy
+/// always do; a panicked service call retains it).
+struct IsolatedRun {
+    outcome: CallOutcome,
+    /// `None` = the stack could not be allocated; `outcome` is
+    /// [`CallOutcome::NoStack`] and there is nothing to reclaim.
+    stack: Option<MemoryLease>,
+}
+
+/// Shared mechanism of every isolated-stack boundary: allocate a Core-owned
+/// stack, install `kind` as the active escape guard, switch, and collect the
+/// outcome.
+fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
     let stack = match memory::alloc_region(COMPONENT_STACK_BYTES) {
         Ok(stack) => stack,
-        Err(_) => return CallOutcome::Returned(STACK_ALLOCATION_FAILED),
+        Err(_) => {
+            return IsolatedRun {
+                outcome: CallOutcome::NoStack,
+                stack: None,
+            };
+        }
     };
     let stack_top = (stack.base() + stack.size()) & !(STACK_ALIGNMENT - 1);
     let mut core_context = CpuImpl::new_context(0, 0);
@@ -394,8 +665,10 @@ fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutc
         true => CallOutcome::Panicked,
         false => CallOutcome::Returned(guard.returned),
     };
-    let _ = memory::free_region(stack);
-    outcome
+    IsolatedRun {
+        outcome,
+        stack: Some(stack),
+    }
 }
 
 /// Runs `f` inside an **IRQ attribution scope** ([`EscapeKind::Irq`]): Core
@@ -414,7 +687,7 @@ fn call_on_isolated_stack_with(call: IsolatedCall, kind: EscapeKind) -> CallOutc
 /// authentication boundary**: it records who Core is dispatching for, it cannot
 /// prove the callback code really belongs to `owner`.  The scope is synchronous
 /// and non-yielding; scheduler-affecting Core operations are rejected while it
-/// is active ([`in_irq_context`]).
+/// is active or anywhere beneath it ([`scheduling_forbidden`]).
 pub(crate) fn with_irq_scope<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R {
     let mut guard = EscapeGuard {
         kind: EscapeKind::Irq { owner },
@@ -478,10 +751,15 @@ extern "C" fn trampoline() -> ! {
     let Some(guard_ptr) = active_guard() else {
         halt()
     };
+    // Copy the invocation out with one short raw access.  No `&mut EscapeGuard`
+    // may stay live across the component entry: the entry can reach the same
+    // record through `panic_escape`'s raw pointer (or replace it), which would
+    // invalidate a live `&mut` (Stacked Borrows).  All invocation metadata is
+    // therefore copied into locals before the foreign call.
     // SAFETY: the active guard belongs to the caller frame suspended by
-    // `call_on_isolated_stack_with`; this context is the only execution using it.
-    let guard = unsafe { &mut *guard_ptr };
-    guard.returned = match guard.call {
+    // `run_isolated`; this context is the only execution using it.
+    let call = unsafe { (*guard_ptr).call };
+    let returned = match call {
         IsolatedCall::None => 0,
         IsolatedCall::Create {
             entry,
@@ -501,8 +779,28 @@ extern "C" fn trampoline() -> ! {
             let destroy: InstanceDestroy = unsafe { core::mem::transmute(entry) };
             destroy(state)
         }
+        IsolatedCall::Service {
+            dispatcher,
+            instance_state,
+            port,
+            method,
+            frame,
+        } => {
+            // SAFETY: `dispatcher` comes from `ComponentImage::service_dispatch`
+            // (loader validated + relocated the symbol); `instance_state` /
+            // `frame` belong to the suspended caller (`call.rs` released every
+            // lock before entering the boundary, and the frame stays valid for
+            // the duration of the call).
+            let dispatch: ServiceDispatch = dispatcher;
+            dispatch(instance_state, port, method, frame)
+        }
     };
-    switch_to_core(guard)
+    // Short raw write: this context's own record (a panic never returns here —
+    // `panic_escape` switches to the Core context instead).
+    // SAFETY: [Category 2 — Data races] same record as above; the entry has
+    // returned, so nothing else can mutate it until `switch_to_core`.
+    unsafe { (*guard_ptr).returned = returned };
+    switch_to_core(guard_ptr)
 }
 
 /// Runs on the dedicated abort stack after a task panic; never returns to the
@@ -522,51 +820,57 @@ extern "C" fn task_abort_trampoline() -> ! {
 }
 
 /// Transfers control from the escaping execution to the Core-owned context
-/// recorded in the guard: the saved caller for init, the task-abort context for
-/// a task.  Never returns to the escaping frame.
-fn switch_to_core(guard: &mut EscapeGuard) -> ! {
+/// recorded in the guard: the saved caller for init / exit / service call, the
+/// task-abort context for a task.  Never returns to the escaping frame.
+///
+/// Takes a raw pointer (not `&mut`): the escaping execution may have reached the
+/// record through a raw pointer of its own, so no live reference may exist here.
+fn switch_to_core(guard_ptr: *mut EscapeGuard) -> ! {
     // SAFETY: both context records live in the suspended caller frame of
-    // `call_on_isolated_stack_with`; `from_context` is the current context and
-    // `to_context` was saved immediately before this component began.
+    // `run_isolated` (or are the scheduler's static abort records); the raw
+    // reads copy the two pointers before any switch.
     unsafe {
-        CpuImpl::context_switch(&mut *guard.from_context, &*guard.to_context);
+        let from_context = (*guard_ptr).from_context;
+        let to_context = (*guard_ptr).to_context;
+        CpuImpl::context_switch(&mut *from_context, &*to_context);
     }
     halt()
 }
 
 /// Escapes an active component panic without allocation, logging, or locking.
 ///
-/// Both the init and the task boundary escape through `from_context` →
-/// `to_context`; the resumed Core context performs the containment bookkeeping.
-/// Returns `false` when the panic originated outside an isolated component, or
-/// inside an IRQ attribution scope ([`with_irq_scope`]) — an IRQ callback has no
-/// Core context to resume, so its panic stays fatal (the interrupted guard is
-/// restored before returning).  A `true` result is unreachable in a functioning
-/// context backend because the switch resumes the Core context instead of this
-/// panic handler.
+/// Every escapable boundary (init / exit / task / service call) escapes through
+/// `from_context` → `to_context`; the resumed Core context performs the
+/// containment bookkeeping.  Returns `false` when the panic originated outside an
+/// isolated component, or inside an IRQ attribution scope ([`with_irq_scope`]) —
+/// an IRQ callback has no Core context to resume, so its panic stays fatal (the
+/// interrupted guard is restored before returning).  A `true` result is
+/// unreachable in a functioning context backend because the switch resumes the
+/// Core context instead of this panic handler.
 pub fn panic_escape() -> bool {
     let Some(guard_ptr) = active_guard() else {
         return false;
     };
     // SAFETY: `guard_ptr` is installed by the suspended caller/scheduler on this
     // CPU and remains valid until it is replaced after the switch back.
-    let guard = unsafe { &mut *guard_ptr };
-    if let EscapeKind::Irq { .. } = guard.kind {
+    let kind = unsafe { (*guard_ptr).kind };
+    if !kind.is_escapable() {
         // An IRQ attribution scope has no Core-owned context to resume, and
         // escaping into the interrupted task would misattribute the callback's
         // panic to a task that did not panic.  Restore the interrupted guard
         // (explicit recovery — never rely on `Drop`, there is no unwinding) and
         // report the panic as uncontained: it stays fatal.  A stale IRQ scope
         // therefore cannot outlive the escape attempt.
-        let previous = match guard.state.previous() {
-            Some(previous) => previous,
-            None => core::ptr::null_mut(),
-        };
-        let _ = replace_active(previous);
+        // SAFETY: [Category 2 — Data races] the record is live and this is the
+        // only execution touching it; `previous` is a plain pointer copy.
+        let previous = unsafe { (*guard_ptr).state.previous() };
+        let _ = replace_active(previous.unwrap_or(core::ptr::null_mut()));
         return false;
     }
-    guard.state.mark_panicked();
-    switch_to_core(guard)
+    // SAFETY: [Category 2 — Data races] short raw access; the record is live and
+    // `switch_to_core` never returns to this frame.
+    unsafe { (*guard_ptr).state.mark_panicked() };
+    switch_to_core(guard_ptr)
 }
 
 /// Renders one short panic diagnostic to a direct (lock-free) writer:
@@ -661,6 +965,42 @@ pub(crate) fn with_test_exit_boundary<R>(owner: ComponentId, f: impl FnOnce() ->
     let mut to_context = CpuImpl::new_context(0, 0);
     let mut guard = EscapeGuard {
         kind: EscapeKind::Exit { owner },
+        from_context: &mut from_context,
+        to_context: &mut to_context,
+        call: IsolatedCall::None,
+        returned: 0,
+        state: GuardState::new(None),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
+}
+
+/// Runs `f` with a **service-call** escape boundary installed over the current
+/// one, without a context switch.  Mirrors the guard installed by
+/// [`call_component_service`], so host tests can exercise the boundary nesting,
+/// principal resolution, re-entry, and ancestor gates that the fake context
+/// backend cannot reach (it does not execute component entries).
+#[cfg(test)]
+pub(crate) fn with_test_service_boundary<R>(
+    owner: ComponentId,
+    endpoint: EndpointId,
+    caller_task: Option<TaskId>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let mut from_context = CpuImpl::new_context(0, 0);
+    let mut to_context = CpuImpl::new_context(0, 0);
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::ServiceCall {
+            owner,
+            endpoint,
+            caller_task,
+        },
         from_context: &mut from_context,
         to_context: &mut to_context,
         call: IsolatedCall::None,
@@ -951,5 +1291,263 @@ mod tests {
 
         // Then: the task field is omitted and unknown fields are marked `?`.
         assert_eq!(out, "\n[panic] component=? at ?: <no message>\n");
+    }
+
+    // ------------------------------------------------------------------
+    // Service-call boundary (`kcore_endpoint_call`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn escape_info_reports_service_call_owner_and_caller_task() {
+        // Given: a service-call escape from task 7 into provider 4.
+        let info = EscapeInfo {
+            kind: EscapeKind::ServiceCall {
+                owner: ComponentId::from_raw(4),
+                endpoint: EndpointId::from_raw(9),
+                caller_task: Some(TaskId::from_raw(7)),
+            },
+        };
+
+        // When / Then: the provider is the principal; the caller task is
+        // provenance, not authority over that task.
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(4)));
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+
+        // A call from a non-task boundary (init / exit) carries no task.
+        let no_task = EscapeInfo {
+            kind: EscapeKind::ServiceCall {
+                owner: ComponentId::from_raw(4),
+                endpoint: EndpointId::from_raw(9),
+                caller_task: None,
+            },
+        };
+        assert_eq!(no_task.owner(), Some(ComponentId::from_raw(4)));
+        assert_eq!(no_task.task(), None);
+    }
+
+    /// 验收：service call 与 init / exit / task 一样可逃逸；IRQ scope 保持致命。
+    /// 真实的上下文切换（真机）由 QEMU 证明——host fake 后端不执行组件入口。
+    #[test]
+    fn service_call_boundary_is_escapable_unlike_irq() {
+        assert!(EscapeKind::Init { owner: None }.is_escapable());
+        assert!(
+            EscapeKind::Exit {
+                owner: ComponentId::from_raw(1)
+            }
+            .is_escapable()
+        );
+        assert!(
+            EscapeKind::Task {
+                task: TaskId::from_raw(1),
+                owner: ComponentId::from_raw(1),
+            }
+            .is_escapable()
+        );
+        assert!(
+            EscapeKind::ServiceCall {
+                owner: ComponentId::from_raw(1),
+                endpoint: EndpointId::from_raw(1),
+                caller_task: None,
+            }
+            .is_escapable(),
+            "a provider panic must escape to the Core-owned caller frame"
+        );
+        assert!(
+            !EscapeKind::Irq {
+                owner: ComponentId::from_raw(1)
+            }
+            .is_escapable(),
+            "an IRQ callback has no Core-owned context to resume — stays fatal"
+        );
+    }
+
+    /// 验收：service 祖先（即使上面盖着嵌套的 init 边界）禁止调度；
+    /// IRQ scope 藏在生命周期边界下面也能被祖先遍历找到。
+    #[test]
+    fn service_ancestor_forbids_scheduling_beneath_nested_lifecycle_boundaries() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        let provider = ComponentId::from_raw(0xB);
+        let endpoint = EndpointId::from_raw(3);
+        assert!(!scheduling_forbidden());
+
+        with_test_service_boundary(provider, endpoint, None, || {
+            assert!(scheduling_forbidden(), "a service call forbids scheduling");
+            assert!(!irq_in_chain());
+
+            with_test_init_boundary(Some(ComponentId::from_raw(0xC)), || {
+                assert!(
+                    scheduling_forbidden(),
+                    "a nested init boundary must not re-open the scheduler"
+                );
+                assert!(!in_irq_context(), "top guard is the init boundary");
+
+                with_irq_scope(ComponentId::from_raw(0xD), || {
+                    assert!(scheduling_forbidden());
+                    assert!(
+                        irq_in_chain(),
+                        "an IRQ scope beneath lifecycle boundaries is still found"
+                    );
+                    assert!(in_irq_context(), "innermost guard is the IRQ scope");
+                });
+            });
+
+            assert!(scheduling_forbidden(), "service ancestor restored");
+        });
+
+        assert!(!scheduling_forbidden());
+        assert!(!irq_in_chain());
+        enter_anchor();
+    }
+
+    /// 验收：IRQ scope 藏在 init 边界下面时，top-guard-only 的
+    /// `in_irq_context()` 会漏掉它，祖先遍历不会。
+    #[test]
+    fn irq_ancestor_stays_forbidden_beneath_a_nested_init_boundary() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+
+        with_irq_scope(ComponentId::from_raw(0xE), || {
+            with_test_init_boundary(Some(ComponentId::from_raw(0xF)), || {
+                assert!(!in_irq_context(), "top guard is the init boundary");
+                assert!(irq_in_chain(), "ancestor walk still finds the IRQ scope");
+                assert!(scheduling_forbidden());
+            });
+        });
+
+        assert!(!scheduling_forbidden());
+        enter_anchor();
+    }
+
+    /// 验收：service guard 被标记 panicked（boot panic handler 在逃逸前的动作）
+    /// 后弹出，仍按后进先出恢复被中断的 caller 边界。
+    #[test]
+    fn panicked_service_boundary_restores_previous_boundary() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        let provider = ComponentId::from_raw(9);
+        with_test_service_boundary(
+            provider,
+            EndpointId::from_raw(1),
+            Some(TaskId::from_raw(7)),
+            || {
+                assert_eq!(active_escape().unwrap().owner(), Some(provider));
+                test_mark_active_panicked();
+                assert_eq!(active_escape().unwrap().owner(), Some(provider));
+            },
+        );
+
+        let info = active_escape().expect("caller boundary restored after the panic");
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        enter_anchor();
+    }
+
+    /// 验收：service call 只把 caller task 记为**执行来源**，绝不改写任务归属；
+    /// 边界弹出后 caller 边界原样恢复。
+    #[test]
+    fn service_call_carries_caller_task_provenance_without_mutating_ownership() {
+        let _boundary = test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::task::init();
+        enter_anchor();
+
+        // Given: a caller task owned by A.
+        let caller = ComponentId::from_raw(0x00C0_FFEE);
+        let task = crate::task::get_task_table()
+            .lock()
+            .create(caller, 0x1000, core::ptr::null_mut())
+            .unwrap();
+        enter_task(task, caller);
+
+        // When: A's task makes a service call into B.
+        let provider = ComponentId::from_raw(0xB0B0);
+        with_test_service_boundary(provider, EndpointId::from_raw(7), Some(task), || {
+            // Then: the principal is B, with the caller task as provenance...
+            let ctx = crate::resource::RequestContext::ambient().expect("service boundary");
+            assert_eq!(ctx.component, provider, "provider is the principal");
+            assert_eq!(ctx.task, Some(task), "caller task is provenance");
+            // ...and the task truth is untouched.
+            let table = crate::task::get_task_table().lock();
+            let record = table.get(task).expect("caller task still exists");
+            assert_eq!(
+                record.owner(),
+                caller,
+                "a service call never re-owns the caller task"
+            );
+            assert_eq!(record.state(), crate::task::TaskState::Created);
+        });
+
+        // Then: the interrupted caller boundary is restored.
+        let restored = crate::resource::RequestContext::ambient().expect("task boundary restored");
+        assert_eq!(restored.component, caller);
+        assert_eq!(restored.task, Some(task));
+
+        crate::task::get_task_table().lock().remove(task).unwrap();
+        enter_anchor();
+    }
+
+    /// 验收：re-entry 判定覆盖 task owner / service owner / 外层 init/exit；
+    /// IRQ owner 不算 service predecessor；调度锚点不被穿越。
+    #[test]
+    fn provider_in_active_chain_covers_task_service_and_lifecycle_owners() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+
+        let a = ComponentId::from_raw(0xA);
+        let b = ComponentId::from_raw(0xB);
+        let c = ComponentId::from_raw(0xC);
+        let endpoint = EndpointId::from_raw(1);
+
+        enter_task(TaskId::from_raw(7), a);
+        assert!(
+            provider_in_active_chain(a),
+            "running task owner is in the chain"
+        );
+        assert!(!provider_in_active_chain(b));
+
+        with_test_service_boundary(b, endpoint, Some(TaskId::from_raw(7)), || {
+            assert!(
+                provider_in_active_chain(b),
+                "the provider itself is in the chain"
+            );
+            assert!(
+                provider_in_active_chain(a),
+                "the enclosing task owner stays in the chain"
+            );
+            assert!(!provider_in_active_chain(c));
+
+            with_test_init_boundary(Some(c), || {
+                assert!(
+                    provider_in_active_chain(c),
+                    "an enclosing init instance is in the chain"
+                );
+                assert!(provider_in_active_chain(b));
+                with_irq_scope(ComponentId::from_raw(9), || {
+                    assert!(
+                        !provider_in_active_chain(ComponentId::from_raw(9)),
+                        "an IRQ owner is not a service predecessor"
+                    );
+                });
+            });
+        });
+
+        // The scheduling anchor is not traversed: an init boundary that switched
+        // into a task is not part of the task's synchronous chain.
+        enter_anchor();
+        with_test_init_boundary(Some(c), || {
+            enter_task(TaskId::from_raw(8), a);
+            assert!(provider_in_active_chain(a), "task owner");
+            assert!(
+                !provider_in_active_chain(c),
+                "the anchor's init guard is not part of the task chain"
+            );
+            enter_anchor();
+        });
+
+        enter_anchor();
     }
 }

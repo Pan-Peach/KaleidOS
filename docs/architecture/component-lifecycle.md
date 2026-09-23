@@ -183,16 +183,24 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 ## 7. 资源归属 identity 规则（重要陷阱）
 
-`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/resource/context.rs`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。** 但 **IRQ 回调会安装一个 Core 拥有的归属边界**（`EscapeKind::Irq`，由 `containment::with_irq_scope` 在 `irq::dispatch_callback` 投递 `RouteOutcome::Callback` 时建立；`os/core/src/irq/mod.rs:121-123`）：principal = **该中断线的 owner**（Core 路由表的真相，不是被中断的执行），`task` 为 `None`；被中断执行的边界被保存，并在回调返回后**显式恢复**（嵌套按后进先出；`os/core/src/component/containment.rs:436-457`）。该作用域**同步、不可 yield**，是**受信 KernelNative 组件下的协作式记账，不是认证边界**：它记录 Core 这次投递为谁而做，但**不能证明**回调代码真的属于那个 owner。
+`RequestContext::ambient()` 解析的是**当前 Core 管理的边界或任务 owner**（`os/core/src/resource/context.rs`）。**直接调用另一个组件的函数表不会进入对方的 Core 边界。** 但 **IRQ 回调会安装一个 Core 拥有的归属边界**（`EscapeKind::Irq`，由 `containment::with_irq_scope` 在 `irq::dispatch_callback` 投递 `RouteOutcome::Callback` 时建立；`os/core/src/irq/mod.rs:94-96`）：principal = **该中断线的 owner**（Core 路由表的真相，不是被中断的执行），`task` 为 `None`；被中断执行的边界被保存，并在回调返回后**显式恢复**（嵌套按后进先出；`os/core/src/component/containment.rs:691-712`）。该作用域**同步、不可 yield**，是**受信 KernelNative 组件下的协作式记账，不是认证边界**：它记录 Core 这次投递为谁而做，但**不能证明**回调代码真的属于那个 owner。
 
-在 IRQ 回调作用域内，调度类 Core 操作在 Core 机制层被拒绝并返回 `-EINVAL`（`SchedError::InvalidTransition` / `TaskError::InvalidTransition`，`os/core/src/errno.rs:86,99`）：`sched::run` / `yield_current` / `exit_current`（`os/core/src/sched.rs:340-361`，门禁 `:74-79`）与 `task::create_task` / `start_task`（`os/core/src/task/mod.rs:59-61,100-102`）；只读入口与资源访问不受影响。IRQ 回调内的 panic **不**被收敛，保持**致命**：`panic_escape()` 恢复被中断的 guard 后拒绝逃逸，因为 IRQ 回调没有 Core 拥有的上下文可恢复（`os/core/src/component/containment.rs:572-585`），这与 init / task 边界不同。
+在 IRQ 回调作用域内，调度类 Core 操作在 Core 机制层被拒绝并返回 `-EINVAL`（`SchedError::InvalidTransition` / `TaskError::InvalidTransition`，`os/core/src/errno.rs:68,55`）：`sched::run` / `yield_current` / `exit_current`（`os/core/src/sched.rs:343-360`，祖先感知门禁 `:77-83`）与 `task::create_task` / `start_task`（`os/core/src/task/mod.rs:61,102`）；只读入口与资源访问不受影响。IRQ 回调内的 panic **不**被收敛，保持**致命**：`panic_escape()` 恢复被中断的 guard 后拒绝逃逸，因为 IRQ 回调没有 Core 拥有的上下文可恢复（`os/core/src/component/containment.rs:849-873`），这与 init / task / service-call 边界不同。
+
+### 窄定义的调用边界：`kcore_endpoint_call` 的 service call
+
+`kcore_endpoint_call`（Contract/Endpoint 模型的调用面，`os/core/src/component/call.rs`）就是上面所说的**窄定义的调用边界**：provider 的 `kcomp_service_dispatch` 跑在 Core 拥有的 **per-call service stack** 上（`containment::call_component_service`），principal 是 **provider 自己**——caller 的 task 只作为执行来源（provenance）传递，不构成对该任务的授权；`ambient_init()` 在边界内为 `None`（service call 不得发布）。
+
+- **provider panic 收敛**：dispatcher panic 逃逸回 caller 的 Core 帧，Core 把 provider 标 `Failed`、撤销其 authority 并永久失效它的全部 endpoint；**caller 存活且不变**（绝不把 provider 的 panic 归因 / 终止到 caller）。被放弃的 service stack 保守驻留（phase 1 不回收）。
+- **祖先感知门禁**：边界链上任一 IRQ 作用域或 service call 都禁止调度操作（`containment::scheduling_forbidden`，沿 guard 链祖先遍历——嵌套 init/exit 不能把祖先藏起来）；provider 已在当前同步链上 → `CallError::Reentrant`（`-EBUSY`）；IRQ 祖先链上的通用服务调用 → `CallError::InIrqContext`（`-EINVAL`）。调度锚点不被当作 service predecessor 穿越。
+- **真实分派由 QEMU 证明**：host fake 上下文后端不执行组件入口体，所以真实 stack switch、真实 provider panic 与端到端 principal 顺序必须由 QEMU 上导出 `kcomp_service_dispatch` 的组件验证（host 用例只覆盖边界记账）。
 
 因此：
 - 通过 provider 的 `ctx` **读**它的状态：可以。
 - 从普通 consumer 上下文**申请/释放 provider 拥有的资源**：可能撞 owner 检查。
-- provider panic **不会**自动归因到那个 provider 实例。
+- provider panic：经 `kcore_endpoint_call` 的 service-call 边界**归因到 provider 并收敛**（见上）；绕过 Core 边界直接调用 provider 的函数表则不会。
 
-**不要**用"信任 `ctx` 里的 instance id"去绕过。资源获取与拆除保持在实例生命周期 / 被拥有的任务上下文里；若某服务确实需要 provider 归属的 Core 调用，那是另一个**窄定义的调用边界**机制。
+**不要**用"信任 `ctx` 里的 instance id"去绕过。资源获取与拆除保持在实例生命周期 / 被拥有的任务上下文里；若某服务确实需要 provider 归属的 Core 调用，走 `kcore_endpoint_call` 的 service-call 边界（见上）。
 
 ### `ctx` 指什么
 

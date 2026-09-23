@@ -16,7 +16,7 @@
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
 //! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
-//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现，Core 校验存活后交付；call 用 opaque EndpointId 做**存活解析** + inflight 记账后分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**，见 `component/call.rs`）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
+//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现，Core 校验存活后交付；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
@@ -52,8 +52,9 @@
 //!
 //! - **principal = 最内层当前活动的 Core-managed 执行边界**
 //!   （`containment::active_escape`）：组件任务 → task owner；
-//!   `kcomp_instance_create`（含**嵌套创建**）→ 被创建的实例；嵌套 create
-//!   返回/panic 后恢复上一层边界。
+//!   `kcomp_instance_create`（含**嵌套创建**）→ 被创建的实例；service call
+//!   （`kcore_endpoint_call`）→ **provider**（caller task 只作执行来源）；
+//!   嵌套 create / service call 返回或 panic 后恢复上一层边界。
 //!   所有 authority / task / interface 入口统一走 `RequestContext::ambient()` /
 //!   `ambient_init()`，不再各自偏好当前任务 owner。
 //! - **Failed 实例门禁**：获取资源 / 创建 work 的入口
@@ -628,9 +629,9 @@ extern "C" fn kcore_endpoint_lookup(
     }
 }
 
-/// 调用一个 endpoint（KernelNative **直接分派**；执行边界 / service stack /
-/// principal 切换 / re-entry 检测 / provider panic containment 是下一阶段，
-/// 见 `component/call.rs` 模块文档）。
+/// 调用一个 endpoint：Core 控制的 **service-call 执行边界**（per-call Core
+/// 拥有的 service stack + provider principal + panic containment；见
+/// `component/call.rs` 与 `containment::call_component_service`）。
 ///
 /// **传输状态 ≠ 方法状态**：返回值是本函数的**传输状态**（`0` / `-Errno`）；
 /// provider 自己的 `i32` 返回写入 `*out_status`，**只在传输返回 `0` 时有意义**。
@@ -644,8 +645,11 @@ extern "C" fn kcore_endpoint_lookup(
 /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`
 /// （`EFAULT` `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或
 /// caller 已 `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image
-/// 已不存在；`EBUSY` provider 不在 `Ready` 或 inflight 溢出；`ENOSYS` image
-/// 没有 `kcomp_service_dispatch`）。
+/// 已不存在；`EBUSY` provider 不在 `Ready`、inflight 溢出或**重入**（provider
+/// 已在当前同步链上）；`EINVAL` 调用链上有 **IRQ 作用域**；`ENOMEM` Core 无法
+/// 分配 service stack；`EIO` provider 在边界内 **panic**（已被标记 `Failed` 且
+/// 其 endpoint 永久失效，caller 存活）；`ENOSYS` image 没有
+/// `kcomp_service_dispatch`）。
 #[allow(clippy::too_many_arguments)]
 extern "C" fn kcore_endpoint_call(
     endpoint: u64,

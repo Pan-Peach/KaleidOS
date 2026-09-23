@@ -1,4 +1,4 @@
-//! Endpoint call —— `kcore_endpoint_call` 的 Core 实现（**call ABI 管道**）。
+//! Endpoint call —— `kcore_endpoint_call` 的 Core 实现（**服务调用执行边界**）。
 //!
 //! # 定位
 //!
@@ -7,12 +7,37 @@
 //!
 //! ```text
 //! caller（最内层活动执行边界，RequestContext::ambient）
+//!   → caller 身份门禁（无 principal / caller Failed → EPERM）
+//!   → IRQ 祖先门禁（链上任何 Irq scope，含嵌套之下的 → EINVAL）
 //!   → resolve endpoint（存活：endpoint Live + owner 存在且 Ready）
+//!   → re-entry 门禁（provider 已在当前同步链上 → EBUSY）
 //!   → registry.begin_call(provider)（Ready 门禁 + inflight 记账）
 //!   → 取 provider image 的可选 kcomp_service_dispatch + instance_state + port
-//!   → 【无锁】dispatcher(instance_state, port, method, &frame)
-//!   → registry.finish_call(provider)
+//!   → 【无锁】containment::call_component_service(...)
+//!        （per-call service stack + provider principal + panic containment）
+//!   → registry.finish_call(provider)（正常 / panic / 无栈三条路径都归还）
+//!   → 传输状态：Ok / Err(CallError)；provider 返回值只在 Ok 时写 `*out_status`
 //! ```
+//!
+//! # 执行边界（本阶段落地）
+//!
+//! provider 的 dispatcher 跑在 **Core 拥有的 per-call 32 KiB service stack** 上，
+//! 处于 provider 自己的 principal 之下（[`containment::call_component_service`]）：
+//!
+//! - **principal 切换**：dispatcher 内 `RequestContext::ambient()` 解析为
+//!   provider（不再是 caller）；caller 的 task 只作为**执行来源**传递，不是
+//!   授权。`ambient_init()` 在边界内为 `None`（service call 不得发布）。
+//! - **panic containment**：dispatcher panic 时逃逸回 caller 的 Core 栈帧，
+//!   Core 把 provider 标 `Failed`、撤销其 authority 并永久失效它的全部
+//!   endpoint、归还 inflight，向 caller 返回 [`CallError::ProviderFailed`]——
+//!   **caller 的 task 存活且不变**（绝不为 caller 调用 `abort_current_task`）。
+//! - **re-entry 拒绝**：provider 已在当前同步链上（它自己的 task / 外层 service
+//!   call / 外层 init 或 exit）→ [`CallError::Reentrant`]；调度锚点不被穿越。
+//! - **祖先上下文门禁**：链上任何 IRQ scope（即使藏在嵌套生命周期边界下面）
+//!   都拒绝通用服务调用 → [`CallError::InIrqContext`]。
+//! - **调度门禁**：service 边界内（含嵌套 init 之下）`sched::run` /
+//!   `yield_current` / `exit_current` / task 创建一律拒绝
+//!   （`containment::scheduling_forbidden`）——provider 没有调度可见的任务。
 //!
 //! # 传输状态 ≠ 方法状态
 //!
@@ -28,6 +53,7 @@
 //! 调用**：dispatcher 地址、`instance_state`、`port` 在锁内拷贝进
 //! [`DispatchTarget`]，三个 guard 全部释放后才执行组件代码。组件 dispatcher 在
 //! 调用期间可以自由进入 Core（日志 / task / device...），"持锁调用组件" = 自死锁。
+//! panic 收尾（`fail_component`）同样在边界返回之后、无锁状态下执行。
 //!
 //! # 存活解析（不重复校验 contract / abi）
 //!
@@ -37,34 +63,31 @@
 //! **存活解析**（[`EndpointRegistry::resolve`]）：死 endpoint / 死 owner 一律
 //! 拒绝，绝不把调用重定向到新实例。
 //!
-//! # 本阶段限制（Phase B：KernelNative 直接分派）
+//! # 明确不做（下一阶段）
 //!
-//! 本模块是**直接函数调用**，没有执行边界 / service stack（那是下一阶段）：
+//! - **escape-eligibility scope**：Core 临界区内的 provider panic 保持致命（不是
+//!   本次范围）。
+//! - **consumer 迁移 / 移除 `kcore_interface_*`**：`component/interface.rs` 语义不变。
+//! - **stack pool / 异步调用 / 取消 / drain / 超时**：都不做；service stack 每次
+//!   调用现分配（panic 时保守驻留，见 `containment`）。
 //!
-//! - **无执行边界 / 无 principal 切换**：调用期间 `RequestContext::ambient()`
-//!   仍是 **caller** 的身份——provider 在自己 dispatcher 里发起的 Core 调用
-//!   会被记到 caller 名下。KernelNative 是受信代码，这是刻意的信任模型
-//!   （`AGENTS.md`：部署形态本身就是安全策略），不是安全边界。
-//! - **无 re-entry 检测**：provider 递归调用另一个 endpoint（包括自己）不被拒绝。
-//! - **无 provider panic containment**：dispatcher 内 panic 时 `panic_escape`
-//!   找不到属于 provider 的边界（caller 的边界仍活动），按现有语义会逃逸到
-//!   **caller** 的边界并杀死 caller 的实例；provider 的 inflight 计数也不会归还
-//!   （`finish_call` 被跳过）。
+//! # Phase-1 限制：真实分派只能由 QEMU 证明
 //!
-//! 以上都由下一阶段的执行边界 / service stack 统一解决；本阶段只把**管道**
-//! （flat frame、dispatcher 解析、inflight 记账、传输 / 方法状态分离）落地。
+//! host fake 上下文后端**不执行组件入口体**：真实 service stack 切换、真实
+//! provider panic、以及实际执行中的 A → B → C principal 顺序**不能**由
+//! `cargo test` 证明。它们由 QEMU 上用真实导出 `kcomp_service_dispatch` 的组件
+//! 验证（后续步骤）；host 用例只覆盖边界记账（re-entry / panic 收尾 / 祖先门禁 /
+//! 状态分离），经 test-only 边界辅助函数。
 
+use crate::component::containment::{self, CallOutcome, ServiceDispatch};
 use crate::component::endpoint::{EndpointError, EndpointId, EndpointRegistry};
 use crate::component::image::ImageTable;
+use crate::component::load::ComponentLoadError;
 use crate::component::registry::Registry;
 use crate::component::{ComponentId, endpoint, image, registry};
 use crate::generated::abi::KcompCallFrame;
 use crate::resource::RequestContext;
-
-/// `kcomp_service_dispatch` 的 Core 侧函数类型（手写镜像 `abi/component.toml` 的
-/// `KcompServiceDispatch`，与 `containment.rs` 的 `InstanceCreate` /
-/// `InstanceDestroy` 同款）。
-type ServiceDispatch = extern "C" fn(*mut (), u32, u32, *const KcompCallFrame) -> i32;
+use crate::task::TaskId;
 
 /// endpoint call 的拒绝原因（内部强类型；ABI 翻译在 `errno.rs`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +107,19 @@ pub enum CallError {
     /// provider image 没有 `kcomp_service_dispatch`：组件不提供 endpoint 服务
     /// （能力缺失，不是故障）→ `ENOSYS`。
     NoDispatcher,
+    /// provider 实例已在当前**同步调用链**上运行（它自己的 task / 外层 service
+    /// call / 外层 init 或 exit）：这是重入，不是服务请求 → `EBUSY`。
+    Reentrant,
+    /// 当前调用链上存在 IRQ 归属作用域（即使藏在嵌套生命周期边界之下）：IRQ
+    /// 回调是同步、不可 yield 的顶半部，不得发起通用服务调用 → `EINVAL`
+    /// （与 IRQ 上下文中的调度拒绝同档）。
+    InIrqContext,
+    /// Core 无法分配 per-call service stack（`-ENOMEM`）：provider 入口从未执行，
+    /// 传输失败，绝不写 `*out_status`。
+    NoServiceStack,
+    /// provider dispatcher 在 service 边界内 panic：provider 已被标记 `Failed`
+    /// 且其全部 endpoint 永久失效；caller 存活且不变 → `EIO`。
+    ProviderFailed,
 }
 
 impl From<EndpointError> for CallError {
@@ -100,10 +136,10 @@ struct DispatchTarget {
     provider: ComponentId,
 }
 
-/// 锁内准备：存活解析 → `begin_call` → 取 image dispatcher。
+/// 锁内准备：存活解析 → re-entry 门禁 → `begin_call` → 取 image dispatcher。
 ///
 /// 调用方必须在一个**作用域**里同时持有 registry / endpoint / image guard 并
-/// 在离开作用域后（guard 释放后）才执行 [`invoke`]。
+/// 在离开作用域后（guard 释放后）才进入 [`containment::call_component_service`]。
 fn prepare(
     components: &mut Registry,
     endpoints: &EndpointRegistry,
@@ -114,7 +150,14 @@ fn prepare(
     //     contract / abi 已在组合期交付 id 之前校验）。
     let record = endpoints.resolve(components, id)?;
 
-    // (2) owner 的 image / opaque state 在此刻拷贝（`resolve` 刚校验过 owner
+    // (2) re-entry 门禁：provider 已在当前同步链上（它自己的 task / 外层 service
+    //     call / 外层 init 或 exit）→ 重入，不是服务请求。在 `begin_call` 之前
+    //     拒绝：不产生需要归还的 inflight。
+    if containment::provider_in_active_chain(record.owner) {
+        return Err(CallError::Reentrant);
+    }
+
+    // (3) owner 的 image / opaque state 在此刻拷贝（`resolve` 刚校验过 owner
     //     存在，故这里是纯读取；拷贝后不再借用 record 之外的记录）。
     let Some(instance) = components.get(record.owner) else {
         return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
@@ -122,14 +165,14 @@ fn prepare(
     let image_id = instance.image;
     let instance_state = instance.instance_state;
 
-    // (3) inflight 记账门禁：只有 Ready provider 可以开始服务调用；拒绝
+    // (4) inflight 记账门禁：只有 Ready provider 可以开始服务调用；拒绝
     //     （不在 Ready / 溢出 / 未知）统一映射成 EBUSY。此后任何提前返回
     //     都必须归还计数。
     components
         .begin_call(record.owner)
         .map_err(|_| CallError::ProviderBusy)?;
 
-    // (4) image + **可选** dispatcher：缺失 = 组件不提供 endpoint 服务。
+    // (5) image + **可选** dispatcher：缺失 = 组件不提供 endpoint 服务。
     let Some(image) = images.get(image_id) else {
         components.finish_call(record.owner);
         return Err(CallError::ImageMissing);
@@ -148,16 +191,6 @@ fn prepare(
         port: record.port,
         provider: record.owner,
     })
-}
-
-/// 锁外调用：dispatcher / `instance_state` / `port` 全部来自锁内拷贝。
-fn invoke(target: &DispatchTarget, method: u32, frame: &KcompCallFrame) -> i32 {
-    (target.dispatcher)(
-        target.instance_state,
-        target.port,
-        method,
-        frame as *const KcompCallFrame,
-    )
 }
 
 /// `kcore_endpoint_call` 的 Core 实现：解析 caller → [`dispatch`]。
@@ -194,17 +227,22 @@ pub fn endpoint_call(
         output,
         output_len,
     };
-    let caller = RequestContext::ambient().map(|ctx| ctx.component);
-    dispatch(caller, id, method, &frame, out_status)
+    let ambient = RequestContext::ambient();
+    let caller = ambient.as_ref().map(|ctx| ctx.component);
+    // caller task 只作为 service 边界的**执行来源**（provenance）；它不是授权，
+    // 也不会改写 caller 的任务归属。
+    let caller_task = ambient.as_ref().and_then(|ctx| ctx.task);
+    dispatch(caller, caller_task, id, method, &frame, out_status)
 }
 
 /// 分派核心：`caller` 已由 [`endpoint_call`] 解析（`None` = 无 principal）。
 ///
-/// caller 作为显式参数：无 principal / 已 `Failed` 的 `EPERM` 门禁因此可以脱离
-/// 进程级边界栈直接测试（`RequestContext` 的 fallback 链由 `resource::context`
-/// 自己的用例覆盖）。
+/// caller / caller_task 作为显式参数：无 principal / 已 `Failed` 的 `EPERM` 门禁
+/// 因此可以脱离进程级边界栈直接测试（`RequestContext` 的 fallback 链由
+/// `resource::context` 自己的用例覆盖）。
 fn dispatch(
     caller: Option<ComponentId>,
+    caller_task: Option<TaskId>,
     id: EndpointId,
     method: u32,
     frame: &KcompCallFrame,
@@ -216,7 +254,14 @@ fn dispatch(
         return Err(CallError::CallerFailed);
     }
 
-    // (2) 锁内准备：三个 guard 在本块结束时全部释放——之后才允许执行组件代码。
+    // (2) 祖先上下文门禁：IRQ 回调（即使藏在嵌套生命周期边界之下）不得发起
+    //     通用服务调用——它是同步、不可 yield 的顶半部。
+    if containment::irq_in_chain() {
+        return Err(CallError::InIrqContext);
+    }
+
+    // (3) 锁内准备（含 re-entry 门禁）：三个 guard 在本块结束时全部释放——
+    //     之后才允许执行组件代码。
     let target = {
         let mut components = registry::get_registry().lock();
         let endpoints = endpoint::get_endpoints().lock();
@@ -224,18 +269,69 @@ fn dispatch(
         prepare(&mut components, &endpoints, &images, id)?
     };
 
-    // (3) 无锁派发。
-    let provider_status = invoke(&target, method, frame);
+    // (4) 无锁派发：走 Core 控制的 service-call 执行边界（per-call service stack
+    //     + provider principal + panic containment）。
+    let outcome = containment::call_component_service(
+        target.provider,
+        id,
+        caller_task,
+        target.dispatcher,
+        target.instance_state,
+        target.port,
+        method,
+        frame,
+    );
 
-    // (4) 归还 inflight（`begin_call` 一定成功过；无条件归还，不设门禁）。
-    //     provider panic 会跳过这里——containment 属下一阶段，见模块文档。
-    registry::get_registry().lock().finish_call(target.provider);
+    // (5) 边界返回后的收尾（panic / 无栈 / 正常三条分类）。
+    complete_call(target.provider, outcome, out_status)
+}
 
-    // (5) 传输成功：provider status 写入 out（仅在此时有意义；与传输状态分离）。
-    // SAFETY: `out_status` 由调用方保证可写（C ABI 契约；入口已校验非空）；
-    // unaligned 写防未对齐 UB。
-    unsafe { core::ptr::write_unaligned(out_status, provider_status) };
-    Ok(())
+/// 服务边界返回后的收尾（[`dispatch`] 的尾段）。
+///
+/// 独立成函数，让 host 测试能直接驱动 panic / 无栈 / 正常三条分类（fake 后端不
+/// 做真实上下文切换，provider 入口在 host 上不会被执行——真实执行由 QEMU 上
+/// 导出 `kcomp_service_dispatch` 的组件证明）。
+fn complete_call(
+    provider: ComponentId,
+    outcome: CallOutcome,
+    out_status: *mut i32,
+) -> Result<(), CallError> {
+    match outcome {
+        // provider 返回值 = 方法状态；只在传输成功时写 `*out_status`。
+        CallOutcome::Returned(status) => {
+            registry::get_registry().lock().finish_call(provider);
+            // SAFETY: `out_status` 由调用方保证可写（C ABI 契约；入口已校验
+            // 非空）；unaligned 写防未对齐 UB。
+            unsafe { core::ptr::write_unaligned(out_status, status) };
+            Ok(())
+        }
+        // provider panic：Core 提交 provider 的逻辑死亡 + 归还 inflight；caller
+        // 的 task 保持存活、不变。
+        CallOutcome::Panicked => {
+            handle_provider_panic(provider);
+            Err(CallError::ProviderFailed)
+        }
+        // 边界栈分配失败：Core 侧失败，provider 从未执行；不写 out_status。
+        CallOutcome::NoStack => {
+            registry::get_registry().lock().finish_call(provider);
+            Err(CallError::NoServiceStack)
+        }
+    }
+}
+
+/// Provider dispatcher panic 的 Core 收尾：标记 provider `Failed`（逻辑死亡）、
+/// 撤销它的 authority（设备 quarantine / IRQ route / DMA mapping / 接口解绑）并
+/// 永久失效它的全部 endpoint，最后归还 `begin_call` 记下的 inflight。
+///
+/// **caller 保持存活且不变**：provider panic 在 service 边界被容纳（逃逸回
+/// caller 的 Core 栈帧），绝不归因到 caller，也绝不调用 `abort_current_task`。
+/// 这里是普通 Rust 代码——无 unwinding、不依赖 `Drop`。
+///
+/// 独立成函数，让 host 测试能脱离真实上下文切换直接驱动（fake 后端不执行组件
+/// 入口，真实 provider panic 由 QEMU 证明）。
+fn handle_provider_panic(provider: ComponentId) {
+    crate::component::fail_component(provider, ComponentLoadError::ServicePanicked);
+    registry::get_registry().lock().finish_call(provider);
 }
 
 #[cfg(test)]
@@ -372,11 +468,15 @@ mod tests {
         containment::enter_task(TaskId::from_raw(task), CALLER);
     }
 
-    // -- 1. frame 读写 + provider status 落位 ---------------------------------
+    // -- 1. 调用必须经 service 边界（host fake 不执行入口体） -------------------
 
+    /// 验收：`endpoint_call` 走 `containment::call_component_service`，绝不直接调用
+    /// dispatcher。host fake 上下文后端不执行组件入口体，所以 host 上能钉住的是：
+    /// 边界被进入（dispatcher 从未被直接调用）、传输成功、inflight 归还。
+    /// 真实的 frame 读写 / provider status 落位由 QEMU 上导出
+    /// `kcomp_service_dispatch` 的组件证明（见模块文档的 Phase-1 限制）。
     #[test]
-    fn dispatch_reads_and_writes_frame_and_keeps_provider_status_separate() {
-        // Given：一个带 echo dispatcher 的 Ready provider 与一个 Live endpoint。
+    fn endpoint_call_enters_the_service_boundary_and_balances_accounting() {
         let _serial = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
@@ -407,24 +507,21 @@ mod tests {
             &mut out_status,
         );
 
-        // Then 1：传输 0；provider 的返回值落在 *out_status（两个状态不混）。
+        // Then：传输成功、inflight 归还；fake 后端不执行入口体，所以 dispatcher
+        // 一次都没被直接调用——"绝不绕过边界直接 invoke" 的回归锚点。
         assert_eq!(transport, Ok(()));
-        assert_eq!(out_status, 0x2A);
-        // Then 2：dispatcher 收到正确的 port / method，能读 args / input、写 output。
-        assert_eq!(seen.calls, 1);
-        assert_eq!(seen.port, PORT, "provider 定义的 dispatch token 原样传递");
-        assert_eq!(seen.method, 42, "method 由 Core 原样传递");
-        assert_eq!(seen.args, args);
-        assert_eq!(seen.input, input);
-        assert_eq!(output, [0xA5, 0x5A, 0xC3]);
-        // Then 3：inflight 记账已归还。
+        assert_eq!(seen.calls, 0, "host fake 不执行组件入口；调用绝不绕过边界");
+        assert_eq!(out_status, 0, "边界默认 outcome = 0（入口未执行）");
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
 
         containment::enter_anchor();
     }
 
-    // -- 2. 业务 errno 不冒充传输失败 -----------------------------------------
+    // -- 2. 业务 errno 不冒充传输失败（边界收尾分类） ---------------------------
 
+    /// 验收：`complete_call` 把 provider 返回值当**方法状态**写入 `*out_status`，
+    /// 传输保持 `Ok`——绝不与 Core 失败混淆。host fake 不执行入口体，所以这里直接
+    /// 驱动生产收尾函数（真实 provider 返回值由 QEMU 证明）。
     #[test]
     fn provider_errno_stays_in_out_status_not_transport() {
         let _serial = containment::test_boundary_lock();
@@ -435,30 +532,26 @@ mod tests {
             Some(dispatch_eio as *const () as usize),
             core::ptr::null_mut(),
         );
-        let endpoint = publish(provider, b"svc.errno");
-        enter_caller(12);
 
+        // Given：一次已经记过 inflight 的调用。
+        registry::get_registry()
+            .lock()
+            .begin_call(provider)
+            .unwrap();
         let mut out_status = 0i32;
-        // When：provider 返回 -EIO（空 payload：合法的退化 frame）。
-        let transport = endpoint_call(
-            endpoint,
-            1,
-            core::ptr::null(),
-            0,
-            core::ptr::null(),
-            0,
-            core::ptr::null_mut(),
-            0,
+
+        // When：边界返回 provider 的业务 errno。
+        let transport = complete_call(
+            provider,
+            CallOutcome::Returned(Errno::EIO.code()),
             &mut out_status,
         );
 
-        // Then：传输仍是 0；负值只在 *out_status，绝不与 Core 失败混淆。
+        // Then：传输仍是 0；负值只在 *out_status；inflight 已归还。
         assert_eq!(transport, Ok(()));
         assert_eq!(out_status, Errno::EIO.code());
         assert_ne!(out_status, 0, "provider 的 errno 不是传输状态的 0");
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
-
-        containment::enter_anchor();
     }
 
     // -- 3. image 没有 dispatcher → ENOSYS，provider 不被调用 -------------------
@@ -566,7 +659,7 @@ mod tests {
 
         // (a) 无 principal → NoCaller（EPERM）。caller 是显式参数：本断言不依赖
         //     `RequestContext` 的 fallback 链（无边界锚点的进程级状态），确定。
-        let error = dispatch(None, endpoint, 0, &EMPTY_FRAME, &mut out_status).unwrap_err();
+        let error = dispatch(None, None, endpoint, 0, &EMPTY_FRAME, &mut out_status).unwrap_err();
         assert_eq!(error, CallError::NoCaller);
         assert_eq!(Errno::from(error), Errno::EPERM);
 
@@ -579,7 +672,15 @@ mod tests {
             reg.mark_failed(id).unwrap();
             id
         };
-        let error = dispatch(Some(failed), endpoint, 0, &EMPTY_FRAME, &mut out_status).unwrap_err();
+        let error = dispatch(
+            Some(failed),
+            None,
+            endpoint,
+            0,
+            &EMPTY_FRAME,
+            &mut out_status,
+        )
+        .unwrap_err();
         assert_eq!(error, CallError::CallerFailed);
         assert_eq!(Errno::from(error), Errno::EPERM);
 
@@ -690,5 +791,310 @@ mod tests {
             core::mem::offset_of!(KcompCallFrame, output_len),
             5 * pointer
         );
+    }
+
+    // -- 8. re-entry：provider 已在当前同步链上 → EBUSY --------------------------
+
+    /// 验收：provider 自己的 task、以及外层 service call，都让再次调用同一
+    /// provider 被拒为 `Reentrant`（EBUSY）；调用**另一个** provider 允许；
+    /// 被拒的调用不触碰 inflight / dispatcher。
+    #[test]
+    fn provider_already_in_the_chain_is_rejected_as_reentrant() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_reentry_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.reentry");
+        let other = ready_provider(
+            b"call_reentry_other",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let other_endpoint = publish(other, b"svc.other");
+        enter_caller(21);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+
+        // (a) provider 自己的 task 调用自己的 endpoint → Reentrant（EBUSY）。
+        containment::enter_task(TaskId::from_raw(22), provider);
+        let error = endpoint_call(
+            endpoint,
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut out_status,
+        )
+        .unwrap_err();
+        assert_eq!(error, CallError::Reentrant);
+        assert_eq!(Errno::from(error), Errno::EBUSY);
+
+        // (b) 外层 service call 里再调用同一 provider → Reentrant；
+        // (c) 调用另一个 provider 允许（重入只针对链上已有的实例）。
+        containment::with_test_service_boundary(
+            provider,
+            endpoint,
+            Some(TaskId::from_raw(22)),
+            || {
+                let error = endpoint_call(
+                    endpoint,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut out_status,
+                )
+                .unwrap_err();
+                assert_eq!(error, CallError::Reentrant);
+
+                assert_eq!(
+                    endpoint_call(
+                        other_endpoint,
+                        0,
+                        core::ptr::null(),
+                        0,
+                        core::ptr::null(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                        &mut out_status,
+                    ),
+                    Ok(()),
+                    "a different provider is not re-entry"
+                );
+            },
+        );
+
+        // Then：provider 从未被调用；被拒调用不泄漏 inflight、不写 out_status。
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "provider 从未被调用"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(registry::get_registry().lock().active_calls(other), 0);
+        assert_eq!(out_status, 0);
+
+        containment::enter_anchor();
+    }
+
+    // -- 9. 祖先上下文门禁：IRQ scope 之下（含嵌套）拒绝服务调用 -----------------
+
+    /// 验收：IRQ 回调链上（即使藏在嵌套 init 边界下面）不得发起通用服务调用
+    /// → `InIrqContext`（EINVAL），provider 从未被调用。
+    #[test]
+    fn endpoint_call_from_an_irq_ancestor_is_rejected() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_irq_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.irq");
+        enter_caller(23);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+
+        containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+            let error = endpoint_call(
+                endpoint,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut out_status,
+            )
+            .unwrap_err();
+            assert_eq!(error, CallError::InIrqContext);
+            assert_eq!(Errno::from(error), Errno::EINVAL);
+
+            // 藏在嵌套生命周期边界之下同样拒绝（top-guard-only 检查会漏掉）。
+            containment::with_test_init_boundary(Some(ComponentId::from_raw(5)), || {
+                let error = endpoint_call(
+                    endpoint,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut out_status,
+                )
+                .unwrap_err();
+                assert_eq!(error, CallError::InIrqContext);
+            });
+        });
+
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "IRQ 上下文里的调用绝不派发"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0, "失败调用不写 out_status");
+
+        containment::enter_anchor();
+    }
+
+    // -- 10. provider panic 收尾（无上下文切换） --------------------------------
+
+    /// 验收：provider panic 的 Core 收尾——provider → `Failed`、它的全部 endpoint
+    /// 永久失效（sibling 的 endpoint 仍 Live）、inflight 归还。
+    #[test]
+    fn provider_panic_fails_provider_invalidates_endpoints_and_balances_inflight() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::component::interface::init();
+        crate::resource::init();
+        let provider = ready_provider(
+            b"call_panic_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.panic");
+        let sibling = ready_provider(
+            b"call_panic_sibling",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let sibling_endpoint = publish(sibling, b"svc.ok");
+
+        // Given：一次在飞的调用（begin_call 已记账）。
+        registry::get_registry()
+            .lock()
+            .begin_call(provider)
+            .unwrap();
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 1);
+
+        // When：dispatcher panic 的收尾。
+        handle_provider_panic(provider);
+
+        // Then 1：provider 逻辑死亡；inflight 归还。
+        let reg = registry::get_registry().lock();
+        assert_eq!(
+            reg.get(provider).unwrap().state,
+            crate::component::ComponentState::Failed
+        );
+        assert_eq!(reg.active_calls(provider), 0);
+        // Then 2：provider 的全部 endpoint 永久失效；sibling 完全不受影响。
+        let eps = endpoint::get_endpoints().lock();
+        assert_eq!(
+            eps.lookup(
+                &reg,
+                endpoint,
+                ContractId::from_raw(CONTRACT),
+                InterfaceAbi::from_raw(ABI)
+            ),
+            Err(EndpointError::EndpointDead)
+        );
+        assert_eq!(
+            eps.lookup(
+                &reg,
+                sibling_endpoint,
+                ContractId::from_raw(CONTRACT),
+                InterfaceAbi::from_raw(ABI)
+            )
+            .unwrap()
+            .state,
+            crate::component::endpoint::EndpointState::Live
+        );
+        drop(eps);
+        // Then 3：sibling 仍 Ready（失败只影响被隔离的 provider）。
+        assert_eq!(
+            reg.get(sibling).unwrap().state,
+            crate::component::ComponentState::Ready
+        );
+    }
+
+    /// 验收：边界返回 `Panicked` 时传输错误是 `ProviderFailed`（EIO），且
+    /// **caller 的 task 边界原样存活**——provider panic 绝不转成 caller 的死亡，
+    /// 也不写 `*out_status`。
+    #[test]
+    fn panicked_boundary_returns_provider_failed_and_leaves_caller_alive() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::component::interface::init();
+        crate::resource::init();
+        let provider = ready_provider(
+            b"call_panicked_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.panicked");
+        enter_caller(24);
+        registry::get_registry()
+            .lock()
+            .begin_call(provider)
+            .unwrap();
+        let mut out_status = 0i32;
+
+        // When：边界报告 provider panic。
+        let error = complete_call(provider, CallOutcome::Panicked, &mut out_status).unwrap_err();
+
+        // Then：传输错误 = ProviderFailed（EIO）；不写 out_status；inflight 归还。
+        assert_eq!(error, CallError::ProviderFailed);
+        assert_eq!(Errno::from(error), Errno::EIO);
+        assert_eq!(out_status, 0, "panic 路径不写 out_status");
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        // caller 边界仍在：provider 的逻辑死亡没有波及 caller 的任务归属。
+        let ambient = crate::resource::RequestContext::ambient().expect("caller boundary intact");
+        assert_eq!(ambient.component, CALLER);
+        assert_eq!(ambient.task, Some(TaskId::from_raw(24)));
+        // provider 的 endpoint 永久失效。
+        let reg = registry::get_registry().lock();
+        assert_eq!(
+            endpoint::get_endpoints().lock().lookup(
+                &reg,
+                endpoint,
+                ContractId::from_raw(CONTRACT),
+                InterfaceAbi::from_raw(ABI)
+            ),
+            Err(EndpointError::EndpointDead)
+        );
+        drop(reg);
+        containment::enter_anchor();
+    }
+
+    /// 验收：service stack 分配失败是 **Core 侧**传输失败（`NoServiceStack` →
+    /// ENOMEM），provider 从未执行，绝不冒充 provider 的方法状态。
+    #[test]
+    fn missing_service_stack_is_a_transport_failure_not_provider_status() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_nostack_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        registry::get_registry()
+            .lock()
+            .begin_call(provider)
+            .unwrap();
+        let mut out_status = 0i32;
+
+        let error = complete_call(provider, CallOutcome::NoStack, &mut out_status).unwrap_err();
+        assert_eq!(error, CallError::NoServiceStack);
+        assert_eq!(Errno::from(error), Errno::ENOMEM);
+        assert_eq!(out_status, 0, "provider 从未执行");
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
     }
 }
