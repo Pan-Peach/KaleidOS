@@ -50,9 +50,13 @@ pub(crate) use ring::reset_for_test;
 #[cfg(all(test, feature = "trace"))]
 pub(crate) mod test_support {
     use super::TraceEvent;
+    use crate::test_support::{Rank, TestLock};
 
     /// 串行化会 `clear()` / 需要独占读窗口的测试（ring 自身与 Inspector 读侧）。
-    pub(crate) static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = TRACE（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+    /// [`crate::test_support`]）。
+    pub(crate) static GUARD: TestLock = TestLock::new(Rank::Trace);
 
     /// 读出当前 ring 里的全部事件（`seq` 升序）。
     pub(crate) fn events() -> alloc::vec::Vec<TraceEvent> {

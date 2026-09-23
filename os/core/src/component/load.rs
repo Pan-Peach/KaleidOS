@@ -236,13 +236,16 @@ fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError
 mod tests {
     use super::*;
     use crate::component::ComponentState;
+    use crate::test_support::{Rank, TestLock};
 
     /// 与 `store::tests` 同一份真实包（`manifest` + `kcomp_smoke.kcomp`）。
     const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
 
     /// 串行化本模块触碰全局真相（store / image / registry / interface / handle /
     /// HEAP）的测试；将来新增 load 相关用例都必须先拿这把锁。
-    static LOAD_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = LOAD（模块本地、最外层；见 [`crate::test_support`]）。
+    static LOAD_TEST_LOCK: TestLock = TestLock::new(Rank::Load);
 
     /// 完整有序场景：NotFound → 成功到 `Ready` → 同名再创建得到**共享 image 的
     /// 新实例** → CURRENT 恢复。

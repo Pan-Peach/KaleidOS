@@ -48,6 +48,18 @@
 //!
 //! 旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容，迁移单独评估。
 //!
+//! # Core-critical 导出体
+//!
+//! 每个普通 `kcore_*` 导出体都包在 `with_core_critical` 里：导出体是跑在组件
+//! 栈上的 **Core 代码**（可能持有 Core 锁），期间的 panic 是 **Core panic**，
+//! containment 必须拒绝逃逸（否则 Core bug 会被误算成边界 owner 的失败，且恢复
+//! 路径会带着 Core 锁进入 `fail_component` → 死锁）。组件代码在边界安装时把
+//! 深度挂起到 0，所以组件自己的 panic 照常可逃逸（见 `containment.rs` 的
+//! "Core ABI depth" 与 `containment::panic_escape`）。
+//!
+//! **唯一例外**是 SDK 的显式逃逸请求 `kcore_panic_escape`：包了它，逃逸请求
+//! 本身就永远不可逃逸（组件 panic adapter 会在深度 > 0 时调用它）。
+//!
 //! # 身份解析与 Failed 门禁
 //!
 //! - **principal = 最内层当前活动的 Core-managed 执行边界**
@@ -95,7 +107,7 @@
 
 use crate::component::ComponentId;
 use crate::component::call;
-use crate::component::containment::KcompCreateArgs;
+use crate::component::containment::{KcompCreateArgs, with_core_critical};
 use crate::component::endpoint::{self, ContractId, EndpointId};
 use crate::component::interface::{InterfaceAbi, InterfaceKind, get_interfaces};
 use crate::component::registry;
@@ -142,17 +154,19 @@ unsafe impl Sync for ExportAddress {}
 /// # Safety
 /// 返回指针的释放必须通过 `kcore_heap_dealloc`（携带相同 size/align）。
 extern "C" fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8 {
-    // C ABI 语义：size==0 或非法 align 一律失败返回 null。
-    // （Rust `Layout` 允许空 layout，但 C 风格调用方可能传 0——显式拒绝。）
-    if size == 0 {
-        return core::ptr::null_mut();
-    }
-    let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
-        return core::ptr::null_mut();
-    };
-    // SAFETY: layout 已由 from_size_align 验证；KernelAllocator 是共享堆的
-    // GlobalAlloc 实现（host test 下经 test_support::ensure_init 就绪）。
-    unsafe { memory::KernelAllocator.alloc(layout) }
+    with_core_critical(|| {
+        // C ABI 语义：size==0 或非法 align 一律失败返回 null。
+        // （Rust `Layout` 允许空 layout，但 C 风格调用方可能传 0——显式拒绝。）
+        if size == 0 {
+            return core::ptr::null_mut();
+        }
+        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: layout 已由 from_size_align 验证；KernelAllocator 是共享堆的
+        // GlobalAlloc 实现（host test 下经 test_support::ensure_init 就绪）。
+        unsafe { memory::KernelAllocator.alloc(layout) }
+    })
 }
 
 /// 共享堆释放。契约 = Rust `GlobalAlloc::dealloc`（见模块文档的语义说明）。
@@ -162,17 +176,19 @@ extern "C" fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8 {
 /// `ptr` 必须来自一次成功的 `kcore_heap_alloc`，且 `(size, align)` 必须与那次
 /// 调用完全一致。违反 = UB。
 extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32 {
-    if ptr.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
-        return Errno::EINVAL.code();
-    };
-    // SAFETY: 由调用方保证 ptr/layout 匹配一次成功 alloc（C ABI 契约）。
-    unsafe {
-        memory::KernelAllocator.dealloc(ptr, layout);
-    }
-    0
+    with_core_critical(|| {
+        if ptr.is_null() {
+            return Errno::EFAULT.code();
+        }
+        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
+            return Errno::EINVAL.code();
+        };
+        // SAFETY: 由调用方保证 ptr/layout 匹配一次成功 alloc（C ABI 契约）。
+        unsafe {
+            memory::KernelAllocator.dealloc(ptr, layout);
+        }
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -180,30 +196,32 @@ extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32
 // ---------------------------------------------------------------------------
 
 extern "C" fn kcore_console_write_byte(byte: u8) {
-    ConsoleImpl::write_byte(byte);
+    with_core_critical(|| ConsoleImpl::write_byte(byte));
 }
 
 /// 输出一行（`[kcomp] ` 前缀）。返回 0 / `-Errno`（`EFAULT` 空指针 /
 /// `EOVERFLOW` 长度超 `isize::MAX`）。
 extern "C" fn kcore_log_line(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() && len != 0 {
-        return Errno::EFAULT.code();
-    }
-    if len > isize::MAX as usize {
-        return Errno::EOVERFLOW.code();
-    }
-    const PREFIX: &[u8] = b"[kcomp] ";
-    for &b in PREFIX {
-        ConsoleImpl::write_byte(b);
-    }
-    if len > 0 {
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-        for &b in bytes {
+    with_core_critical(|| {
+        if ptr.is_null() && len != 0 {
+            return Errno::EFAULT.code();
+        }
+        if len > isize::MAX as usize {
+            return Errno::EOVERFLOW.code();
+        }
+        const PREFIX: &[u8] = b"[kcomp] ";
+        for &b in PREFIX {
             ConsoleImpl::write_byte(b);
         }
-    }
-    ConsoleImpl::write_byte(b'\n');
-    0
+        if len > 0 {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            for &b in bytes {
+                ConsoleImpl::write_byte(b);
+            }
+        }
+        ConsoleImpl::write_byte(b'\n');
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -227,19 +245,21 @@ extern "C" fn kcore_trace_read(
     out: *mut crate::trace::TraceRecordAbi,
     out_next: *mut u64,
 ) -> i32 {
-    if out.is_null() || out_next.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(record) = crate::trace::ring::read_one(since) else {
-        return Errno::ENOENT.code();
-    };
-    let abi = crate::trace::TraceRecordAbi::from(&record);
-    // SAFETY: 两个指针在上面已校验非空；它们是调用者提供的可写内存。
-    unsafe {
-        out.write(abi);
-        out_next.write(record.seq.saturating_add(1));
-    }
-    0
+    with_core_critical(|| {
+        if out.is_null() || out_next.is_null() {
+            return Errno::EFAULT.code();
+        }
+        let Some(record) = crate::trace::ring::read_one(since) else {
+            return Errno::ENOENT.code();
+        };
+        let abi = crate::trace::TraceRecordAbi::from(&record);
+        // SAFETY: 两个指针在上面已校验非空；它们是调用者提供的可写内存。
+        unsafe {
+            out.write(abi);
+            out_next.write(record.seq.saturating_add(1));
+        }
+        0
+    })
 }
 
 /// 读 Trace 子系统状态（只读观察面）：容量 / 最旧 seq / 下一 seq / 逐出总数 /
@@ -252,14 +272,16 @@ extern "C" fn kcore_trace_read(
 /// `record.seq - since`（见 [`kcore_trace_read`]）。被事件使能掩码过滤的事件
 /// 不记录、也不消耗 `seq`，不算丢失。
 extern "C" fn kcore_trace_stats(out: *mut crate::trace::TraceStatsAbi) -> i32 {
-    if out.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let stats = crate::trace::stats();
-    let abi = crate::trace::TraceStatsAbi::from(&stats);
-    // SAFETY: out 在上面已校验非空；它是调用者提供的可写内存。
-    unsafe { out.write(abi) };
-    0
+    with_core_critical(|| {
+        if out.is_null() {
+            return Errno::EFAULT.code();
+        }
+        let stats = crate::trace::stats();
+        let abi = crate::trace::TraceStatsAbi::from(&stats);
+        // SAFETY: out 在上面已校验非空；它是调用者提供的可写内存。
+        unsafe { out.write(abi) };
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +289,7 @@ extern "C" fn kcore_trace_stats(out: *mut crate::trace::TraceStatsAbi) -> i32 {
 // ---------------------------------------------------------------------------
 
 extern "C" fn kcore_machine_boot_hart() -> u32 {
-    machine::committed().map_or(0, |m| m.boot_hart as u32)
+    with_core_critical(|| machine::committed().map_or(0, |m| m.boot_hart as u32))
 }
 
 /// 单调时钟（`rdtime` 的原始 tick）——组件侧计时用，无 authority 语义。
@@ -275,25 +297,27 @@ extern "C" fn kcore_machine_boot_hart() -> u32 {
 /// 频率见 [`kcore_timebase_hz`]。注意真机上 timebase 常是 10 MHz（1 tick =
 /// 100 ns），测很短的操作要么**累积多次再除**，要么等 cycle 源（`rdcycle`）。
 extern "C" fn kcore_now() -> u64 {
-    <arch::TimerImpl as arch::Timer>::now()
+    with_core_critical(<arch::TimerImpl as arch::Timer>::now)
 }
 
 /// 时钟频率（Hz）：把 [`kcore_now`] 的 tick 换算成时间需要它。
 extern "C" fn kcore_timebase_hz() -> u64 {
-    machine::committed().map_or(0, |m| m.timebase_frequency)
+    with_core_critical(|| machine::committed().map_or(0, |m| m.timebase_frequency))
 }
 
 extern "C" fn kcore_machine_cpu_count() -> u32 {
-    machine::committed().map_or(0, |m| m.cpu_count as u32)
+    with_core_critical(|| machine::committed().map_or(0, |m| m.cpu_count as u32))
 }
 
 extern "C" fn kcore_machine_has_hart(hart_id: u32) -> i32 {
-    let Some(machine) = machine::committed() else {
-        return 0;
-    };
-    machine.cpu_info[..machine.cpu_count.min(machine.cpu_info.len())]
-        .iter()
-        .any(|cpu| cpu.hart_id.raw() == hart_id as usize) as i32
+    with_core_critical(|| {
+        let Some(machine) = machine::committed() else {
+            return 0;
+        };
+        machine.cpu_info[..machine.cpu_count.min(machine.cpu_info.len())]
+            .iter()
+            .any(|cpu| cpu.hart_id.raw() == hart_id as usize) as i32
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -301,20 +325,22 @@ extern "C" fn kcore_machine_has_hart(hart_id: u32) -> i32 {
 // ---------------------------------------------------------------------------
 
 extern "C" fn kcore_free_page_count() -> u32 {
-    memory::free_block_counts()
-        .iter()
-        .enumerate()
-        .skip(memory::HEAP_MIN_ORDER)
-        .map(|(order, &blocks)| blocks * (1usize << (order - memory::HEAP_MIN_ORDER)))
-        .sum::<usize>() as u32
+    with_core_critical(|| {
+        memory::free_block_counts()
+            .iter()
+            .enumerate()
+            .skip(memory::HEAP_MIN_ORDER)
+            .map(|(order, &blocks)| blocks * (1usize << (order - memory::HEAP_MIN_ORDER)))
+            .sum::<usize>() as u32
+    })
 }
 
 extern "C" fn kcore_task_count() -> u32 {
-    task::get_task_table().lock().len() as u32
+    with_core_critical(|| task::get_task_table().lock().len() as u32)
 }
 
 extern "C" fn kcore_component_count() -> u32 {
-    registry::get_registry().lock().len() as u32
+    with_core_critical(|| registry::get_registry().lock().len() as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,13 +375,15 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
 /// 返回 ComponentId raw（≥ 0）/ `-Errno`
 /// （`EINVAL` 名字非法；其余见 `Errno::from(ComponentLoadError)`）。
 extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
-    let Some(name) = checked_name(name_ptr, name_len) else {
-        return Errno::EINVAL.code();
-    };
-    match crate::component::load::load_and_start(name) {
-        Ok(id) => id.raw() as i32,
-        Err(error) => Errno::from(error).code(),
-    }
+    with_core_critical(|| {
+        let Some(name) = checked_name(name_ptr, name_len) else {
+            return Errno::EINVAL.code();
+        };
+        match crate::component::load::load_and_start(name) {
+            Ok(id) => id.raw() as i32,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 用指定 config 负载创建一个新实例（`docs/architecture/component-lifecycle.md` §4）。
@@ -373,23 +401,25 @@ extern "C" fn kcore_component_create(
     args: *const KcompCreateArgs,
     out_instance: *mut u32,
 ) -> i32 {
-    if args.is_null() || out_instance.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(name) = checked_name(image_name, image_name_len) else {
-        return Errno::EINVAL.code();
-    };
-    // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
-    // Core 只在本次调用内借用它。
-    let args = unsafe { &*args };
-    match crate::component::load::create_component(name, args) {
-        Ok(id) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
-            0
+    with_core_critical(|| {
+        if args.is_null() || out_instance.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(name) = checked_name(image_name, image_name_len) else {
+            return Errno::EINVAL.code();
+        };
+        // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
+        // Core 只在本次调用内借用它。
+        let args = unsafe { &*args };
+        match crate::component::load::create_component(name, args) {
+            Ok(id) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 发布接口（**staged**：`kcomp_instance_create` 期间只记录 pending，不修改
@@ -413,32 +443,34 @@ extern "C" fn kcore_interface_publish(
     api: *const (),
     ctx: *mut (),
 ) -> i32 {
-    let Some(name) = checked_name(name_ptr, name_len) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(kind) = kind_from_u32(kind) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(provider) {
-        return denied;
-    }
-    let reg = registry::get_registry().lock();
-    let mut ifs = get_interfaces().lock();
-    match ifs.stage_publish(
-        &reg,
-        provider,
-        name,
-        kind,
-        InterfaceAbi::from_raw(abi),
-        api,
-        ctx,
-    ) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
+    with_core_critical(|| {
+        let Some(name) = checked_name(name_ptr, name_len) else {
+            return Errno::EINVAL.code();
+        };
+        let Some(kind) = kind_from_u32(kind) else {
+            return Errno::EINVAL.code();
+        };
+        let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(provider) {
+            return denied;
+        }
+        let reg = registry::get_registry().lock();
+        let mut ifs = get_interfaces().lock();
+        match ifs.stage_publish(
+            &reg,
+            provider,
+            name,
+            kind,
+            InterfaceAbi::from_raw(abi),
+            api,
+            ctx,
+        ) {
+            Ok(()) => 0,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 只读查询：`(name, kind, abi)` 是否已绑定且 provider 存活（Ready）。
@@ -449,13 +481,16 @@ extern "C" fn kcore_interface_available(
     kind: u32,
     abi: u64,
 ) -> i32 {
-    let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind)) else {
-        return 0;
-    };
-    let reg = registry::get_registry().lock();
-    let ifs = get_interfaces().lock();
-    ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi))
-        .is_ok() as i32
+    with_core_critical(|| {
+        let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind))
+        else {
+            return 0;
+        };
+        let reg = registry::get_registry().lock();
+        let ifs = get_interfaces().lock();
+        ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi))
+            .is_ok() as i32
+    })
 }
 
 /// consumer 按名 bind：Core 查找接口 → exact-compare ABI fingerprint → 验证当前
@@ -476,27 +511,34 @@ extern "C" fn kcore_interface_bind(
     out_ctx: *mut usize,
     out_generation: *mut u64,
 ) -> i32 {
-    if out_binding.is_null() || out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind)) else {
-        return Errno::EINVAL.code();
-    };
-    let reg = registry::get_registry().lock();
-    let ifs = get_interfaces().lock();
-    match ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi)) {
-        Ok(view) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe {
-                core::ptr::write_unaligned(out_binding, view.id.raw() as u64);
-                core::ptr::write_unaligned(out_api, view.api as usize);
-                core::ptr::write_unaligned(out_ctx, view.ctx as usize);
-                core::ptr::write_unaligned(out_generation, view.generation);
-            }
-            0
+    with_core_critical(|| {
+        if out_binding.is_null()
+            || out_api.is_null()
+            || out_ctx.is_null()
+            || out_generation.is_null()
+        {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let (Some(name), Some(kind)) = (checked_name(name_ptr, name_len), kind_from_u32(kind))
+        else {
+            return Errno::EINVAL.code();
+        };
+        let reg = registry::get_registry().lock();
+        let ifs = get_interfaces().lock();
+        match ifs.bind(&reg, name, kind, InterfaceAbi::from_raw(abi)) {
+            Ok(view) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    core::ptr::write_unaligned(out_binding, view.id.raw() as u64);
+                    core::ptr::write_unaligned(out_api, view.api as usize);
+                    core::ptr::write_unaligned(out_ctx, view.ctx as usize);
+                    core::ptr::write_unaligned(out_generation, view.generation);
+                }
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// consumer 用已有 `BindingId` refresh：exact-compare 期望 ABI → 重新验证 provider →
@@ -511,32 +553,34 @@ extern "C" fn kcore_interface_refresh(
     out_ctx: *mut usize,
     out_generation: *mut u64,
 ) -> i32 {
-    if out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
-        return Errno::EFAULT.code();
-    }
-    // `binding` 是 u64 ABI 宽度；BindingId 是 u32。超范围直接拒绝（不得截断后
-    // 命中一个无关的槽）。
-    let Ok(binding) = u32::try_from(binding) else {
-        return Errno::ENOENT.code();
-    };
-    let reg = registry::get_registry().lock();
-    let ifs = get_interfaces().lock();
-    match ifs.refresh(
-        &reg,
-        crate::component::interface::BindingId::from_raw(binding),
-        InterfaceAbi::from_raw(abi),
-    ) {
-        Ok(view) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe {
-                core::ptr::write_unaligned(out_api, view.api as usize);
-                core::ptr::write_unaligned(out_ctx, view.ctx as usize);
-                core::ptr::write_unaligned(out_generation, view.generation);
-            }
-            0
+    with_core_critical(|| {
+        if out_api.is_null() || out_ctx.is_null() || out_generation.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        // `binding` 是 u64 ABI 宽度；BindingId 是 u32。超范围直接拒绝（不得截断后
+        // 命中一个无关的槽）。
+        let Ok(binding) = u32::try_from(binding) else {
+            return Errno::ENOENT.code();
+        };
+        let reg = registry::get_registry().lock();
+        let ifs = get_interfaces().lock();
+        match ifs.refresh(
+            &reg,
+            crate::component::interface::BindingId::from_raw(binding),
+            InterfaceAbi::from_raw(abi),
+        ) {
+            Ok(view) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    core::ptr::write_unaligned(out_api, view.api as usize);
+                    core::ptr::write_unaligned(out_ctx, view.ctx as usize);
+                    core::ptr::write_unaligned(out_generation, view.generation);
+                }
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -564,32 +608,34 @@ extern "C" fn kcore_endpoint_publish(
     abi: u64,
     port: u32,
 ) -> i32 {
-    let Some(port_name) = checked_name(port_name, port_name_len) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(kind) = kind_from_u32(kind) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(provider) {
-        return denied;
-    }
-    let reg = registry::get_registry().lock();
-    let mut endpoints = endpoint::get_endpoints().lock();
-    match endpoints.stage_publish(
-        &reg,
-        provider,
-        port_name,
-        ContractId::from_raw(contract),
-        kind,
-        InterfaceAbi::from_raw(abi),
-        port,
-    ) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
+    with_core_critical(|| {
+        let Some(port_name) = checked_name(port_name, port_name_len) else {
+            return Errno::EINVAL.code();
+        };
+        let Some(kind) = kind_from_u32(kind) else {
+            return Errno::EINVAL.code();
+        };
+        let Some(provider) = RequestContext::ambient_init().map(|ctx| ctx.component) else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(provider) {
+            return denied;
+        }
+        let reg = registry::get_registry().lock();
+        let mut endpoints = endpoint::get_endpoints().lock();
+        match endpoints.stage_publish(
+            &reg,
+            provider,
+            port_name,
+            ContractId::from_raw(contract),
+            kind,
+            InterfaceAbi::from_raw(abi),
+            port,
+        ) {
+            Ok(()) => 0,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付；
@@ -606,27 +652,29 @@ extern "C" fn kcore_endpoint_lookup(
     contract: u64,
     out_endpoint: *mut u64,
 ) -> i32 {
-    if out_endpoint.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(port_name) = checked_name(port_name, port_name_len) else {
-        return Errno::EINVAL.code();
-    };
-    let reg = registry::get_registry().lock();
-    let endpoints = endpoint::get_endpoints().lock();
-    match endpoints.discover(
-        &reg,
-        ComponentId::from_raw(provider),
-        port_name,
-        ContractId::from_raw(contract),
-    ) {
-        Ok(id) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe { core::ptr::write_unaligned(out_endpoint, id.raw()) };
-            0
+    with_core_critical(|| {
+        if out_endpoint.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(port_name) = checked_name(port_name, port_name_len) else {
+            return Errno::EINVAL.code();
+        };
+        let reg = registry::get_registry().lock();
+        let endpoints = endpoint::get_endpoints().lock();
+        match endpoints.discover(
+            &reg,
+            ComponentId::from_raw(provider),
+            port_name,
+            ContractId::from_raw(contract),
+        ) {
+            Ok(id) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe { core::ptr::write_unaligned(out_endpoint, id.raw()) };
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 调用一个 endpoint：Core 控制的 **service-call 执行边界**（per-call Core
@@ -662,25 +710,31 @@ extern "C" fn kcore_endpoint_call(
     output_len: usize,
     out_status: *mut i32,
 ) -> i32 {
-    // out 指针校验在 ABI 边界（与其它导出同序；`call` 内部另有同一检查，
-    // 服务直接调用者）。
-    if out_status.is_null() {
-        return Errno::EFAULT.code();
-    }
-    match call::endpoint_call(
-        EndpointId::from_raw(endpoint),
-        method,
-        args,
-        args_len,
-        input,
-        input_len,
-        output,
-        output_len,
-        out_status,
-    ) {
-        Ok(()) => 0,
-        Err(error) => Errno::from(error).code(),
-    }
+    with_core_critical(|| {
+        // out 指针校验在 ABI 边界（与其它导出同序；`call` 内部另有同一检查，
+        // 服务直接调用者）。
+        if out_status.is_null() {
+            return Errno::EFAULT.code();
+        }
+        // 注意：provider 的 dispatcher 在 `call::endpoint_call` 内部经
+        // `call_component_service` 的 service 边界运行——边界会把 Core ABI 深度
+        // 挂起到 0，所以 provider 的 panic 仍然可逃逸；只有本函数自己的 Core
+        // 代码（解析 / 记账 / 收尾）是非逃逸区。
+        match call::endpoint_call(
+            EndpointId::from_raw(endpoint),
+            method,
+            args,
+            args_len,
+            input,
+            input_len,
+            output,
+            output_len,
+            out_status,
+        ) {
+            Ok(()) => 0,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -711,61 +765,70 @@ fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller；
 /// 其余见 `Errno::from(TaskError)`）。
 extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) -> i32 {
-    if out_task.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(requester) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(requester) {
-        return denied;
-    }
-    match task::create_task(requester, entry, arg) {
-        Ok(id) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe { core::ptr::write_unaligned(out_task, id.raw()) };
-            0
+    with_core_critical(|| {
+        if out_task.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(requester) = current_task_requester() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(requester) {
+            return denied;
+        }
+        match task::create_task(requester, entry, arg) {
+            Ok(id) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe { core::ptr::write_unaligned(out_task, id.raw()) };
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 启动任务：Core 验证当前 caller 是任务 owner 后才推进 Created → Runnable。
 /// 返回 0 / `-Errno`。
 extern "C" fn kcore_task_start(id: u32) -> i32 {
-    let Some(requester) = current_task_requester() else {
-        return Errno::EPERM.code();
-    };
-    status(task::start_task(requester, TaskId::from_raw(id)))
+    with_core_critical(|| {
+        let Some(requester) = current_task_requester() else {
+            return Errno::EPERM.code();
+        };
+        status(task::start_task(requester, TaskId::from_raw(id)))
+    })
 }
 
 /// 让出 CPU：Running → Runnable + 调度切换。任务再次被选中时返回 0。
 /// 返回 0 / `-Errno`。
+///
+/// 注意：切换离开期间 Core ABI 深度由调度帧挂起/恢复（`sched::schedule_next`），
+/// 本包装的 +1/-1 在任务被重新调度、`yield_current` 返回后仍然平衡。
 extern "C" fn kcore_task_yield() -> i32 {
-    status(sched::yield_current())
+    with_core_critical(|| status(sched::yield_current()))
 }
 
 /// 退出：Running → Exited + 调度切换。**控制权永不回到本任务**——若还有
 /// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
 /// 的上下文）。返回 0 / `-Errno`。
 extern "C" fn kcore_task_exit() -> i32 {
-    status(sched::exit_current())
+    with_core_critical(|| status(sched::exit_current()))
 }
 
 /// 只读查询任务状态（Core 真相的编码视图）：
 /// 0=Created 1=Runnable 2=Running 3=Blocked 4=Exited；`-ESRCH` = 不存在。
 extern "C" fn kcore_task_state(id: u32) -> i32 {
-    let table = task::get_task_table().lock();
-    match table.get(TaskId::from_raw(id)) {
-        None => Errno::ESRCH.code(),
-        Some(record) => match record.state() {
-            TaskState::Created => 0,
-            TaskState::Runnable => 1,
-            TaskState::Running(_) => 2,
-            TaskState::Blocked => 3,
-            TaskState::Exited => 4,
-        },
-    }
+    with_core_critical(|| {
+        let table = task::get_task_table().lock();
+        match table.get(TaskId::from_raw(id)) {
+            None => Errno::ESRCH.code(),
+            Some(record) => match record.state() {
+                TaskState::Created => 0,
+                TaskState::Runnable => 1,
+                TaskState::Running(_) => 2,
+                TaskState::Blocked => 3,
+                TaskState::Exited => 4,
+            },
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -794,8 +857,11 @@ extern "C" fn kcore_panic_escape() -> i32 {
 
 /// 把 CPU 交给调度器：跑完所有 Runnable 任务后返回（锚点上下文）。
 /// 无 Runnable 任务时为 no-op。返回 0 / `-Errno`（见 `Errno::from(SchedError)`）。
+///
+/// 任务切换期间 Core ABI 深度由调度帧挂起/恢复（`sched::schedule_next`）：
+/// 任务代码深度 0（可逃逸），锚点恢复本包装的深度（切换期间不可逃逸）。
 extern "C" fn kcore_sched_run() -> i32 {
-    status(sched::run())
+    with_core_critical(|| status(sched::run()))
 }
 
 // ---------------------------------------------------------------------------
@@ -818,20 +884,22 @@ extern "C" fn kcore_device_nth(
     ordinal: u32,
     out_device_id: *mut u32,
 ) -> i32 {
-    if out_device_id.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(compatible) = checked_name(compatible_ptr, compatible_len) else {
-        return Errno::EINVAL.code();
-    };
-    match machine::nth_compatible(compatible, ordinal) {
-        Ok(device) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe { core::ptr::write_unaligned(out_device_id, device.raw()) };
-            0
+    with_core_critical(|| {
+        if out_device_id.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(compatible) = checked_name(compatible_ptr, compatible_len) else {
+            return Errno::EINVAL.code();
+        };
+        match machine::nth_compatible(compatible, ordinal) {
+            Ok(device) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe { core::ptr::write_unaligned(out_device_id, device.raw()) };
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 认领**一台确切设备**：Core 记 owner 并返回本执行域下的可访问 MMIO 窗口。
@@ -850,26 +918,28 @@ extern "C" fn kcore_device_claim(
     out_mmio: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    if out_mmio.is_null() || out_len.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(ctx.component) {
-        return denied;
-    }
-    match device::claim(&ctx, machine::DeviceId::from_raw(device_id)) {
-        Ok(mapping) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe {
-                core::ptr::write_unaligned(out_mmio, mapping.mmio);
-                core::ptr::write_unaligned(out_len, mapping.mmio_len);
-            }
-            0
+    with_core_critical(|| {
+        if out_mmio.is_null() || out_len.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        match device::claim(&ctx, machine::DeviceId::from_raw(device_id)) {
+            Ok(mapping) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    core::ptr::write_unaligned(out_mmio, mapping.mmio);
+                    core::ptr::write_unaligned(out_len, mapping.mmio_len);
+                }
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 释放设备 ownership。
@@ -878,13 +948,15 @@ extern "C" fn kcore_device_claim(
 /// 释放 IRQ/DMA，再释放 device。返回 0 / `-Errno`（`EPERM` 无法解析 caller /
 /// `ENODEV` 设备不存在或未认领 / `EACCES` 非 owner / `EBUSY` 仍有子项）。
 extern "C" fn kcore_device_release(device_id: u32) -> i32 {
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(device::release(
-        &ctx,
-        machine::DeviceId::from_raw(device_id),
-    ))
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(device::release(
+            &ctx,
+            machine::DeviceId::from_raw(device_id),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -900,51 +972,59 @@ extern "C" fn kcore_device_release(device_id: u32) -> i32 {
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
 /// `ENODEV` 设备不存在或无中断线 / `EACCES` caller 不是设备 owner）。
 extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
-    let Some(caller) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(caller.component) {
-        return denied;
-    }
-    status(irq::register(
-        &caller,
-        machine::DeviceId::from_raw(device_id),
-        handler,
-        ctx,
-    ))
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(caller.component) {
+            return denied;
+        }
+        status(irq::register(
+            &caller,
+            machine::DeviceId::from_raw(device_id),
+            handler,
+            ctx,
+        ))
+    })
 }
 
 /// 使能该设备的中断线：Core 验证 route 后配置中断控制器。
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `ENODEV` 无中断线 /
 /// `EACCES` 非 owner / `EINVAL` 尚未注册 handler）。
 extern "C" fn kcore_irq_enable(device_id: u32) -> i32 {
-    let Some(caller) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(irq::enable(&caller, machine::DeviceId::from_raw(device_id)))
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(irq::enable(&caller, machine::DeviceId::from_raw(device_id)))
+    })
 }
 
 /// 关断该设备的中断线（控制器层）。返回 0 / `-Errno`。
 extern "C" fn kcore_irq_disable(device_id: u32) -> i32 {
-    let Some(caller) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(irq::disable(
-        &caller,
-        machine::DeviceId::from_raw(device_id),
-    ))
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(irq::disable(
+            &caller,
+            machine::DeviceId::from_raw(device_id),
+        ))
+    })
 }
 
 /// 释放该设备的 IRQ route：撤销 route（此后不再投递给已死 owner）并关断控制器线。
 /// 返回 0 / `-Errno`。
 extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
-    let Some(caller) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(irq::release(
-        &caller,
-        machine::DeviceId::from_raw(device_id),
-    ))
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(irq::release(
+            &caller,
+            machine::DeviceId::from_raw(device_id),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -958,35 +1038,39 @@ extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或已 Failed /
 /// `EINVAL` 尺寸非法 / `ENOMEM` 物理内存耗尽）。
 extern "C" fn kcore_dma_alloc(size: usize, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
-    if out_ptr.is_null() || out_len.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(ctx.component) {
-        return denied;
-    }
-    match dma::alloc(ctx.component, size) {
-        Ok(buffer) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe {
-                core::ptr::write_unaligned(out_ptr, buffer.ptr);
-                core::ptr::write_unaligned(out_len, buffer.len);
-            }
-            0
+    with_core_critical(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        match dma::alloc(ctx.component, size) {
+            Ok(buffer) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    core::ptr::write_unaligned(out_ptr, buffer.ptr);
+                    core::ptr::write_unaligned(out_len, buffer.len);
+                }
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 释放一段 DMA 缓冲。backing lease 进 Core 私有 QUARANTINE（**不 free**，设备
 /// 可能仍在 DMA——DMA lifecycle safety，见 `resource::dma`）。返回 0 / `-Errno`。
 extern "C" fn kcore_dma_free(ptr: *mut u8) -> i32 {
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    status(dma::free(ctx.component, ptr))
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(dma::free(ctx.component, ptr))
+    })
 }
 
 /// 把一个 buffer 映射给某台设备，返回**设备可见地址** + mapping identity。
@@ -1006,35 +1090,37 @@ extern "C" fn kcore_dma_map(
     out_device_addr: *mut u64,
     out_mapping: *mut u64,
 ) -> i32 {
-    if out_device_addr.is_null() || out_mapping.is_null() {
-        return Errno::EFAULT.code();
-    }
-    let Some(direction) = dma::DmaDirection::from_i32(direction) else {
-        return Errno::EINVAL.code();
-    };
-    let Some(ctx) = RequestContext::ambient() else {
-        return Errno::EPERM.code();
-    };
-    if let Some(denied) = deny_if_failed(ctx.component) {
-        return denied;
-    }
-    match dma::map(
-        &ctx,
-        machine::DeviceId::from_raw(device_id),
-        ptr,
-        len,
-        direction,
-    ) {
-        Ok(mapping) => {
-            // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-            unsafe {
-                core::ptr::write_unaligned(out_device_addr, mapping.device_addr as u64);
-                core::ptr::write_unaligned(out_mapping, mapping.id);
-            }
-            0
+    with_core_critical(|| {
+        if out_device_addr.is_null() || out_mapping.is_null() {
+            return Errno::EFAULT.code();
         }
-        Err(error) => Errno::from(error).code(),
-    }
+        let Some(direction) = dma::DmaDirection::from_i32(direction) else {
+            return Errno::EINVAL.code();
+        };
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        match dma::map(
+            &ctx,
+            machine::DeviceId::from_raw(device_id),
+            ptr,
+            len,
+            direction,
+        ) {
+            Ok(mapping) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    core::ptr::write_unaligned(out_device_addr, mapping.device_addr as u64);
+                    core::ptr::write_unaligned(out_mapping, mapping.id);
+                }
+                0
+            }
+            Err(error) => Errno::from(error).code(),
+        }
+    })
 }
 
 /// 撤销一条 DMA mapping。返回 0 / `-Errno`（`ENOENT` mapping 不存在）。
@@ -1042,7 +1128,7 @@ extern "C" fn kcore_dma_map(
 /// 不解析 ambient caller：mapping 归属 Core truth（device owner），而 unmap 可能
 /// 发生在 consumer 的任务上下文（provider 方法被直接调用）。
 extern "C" fn kcore_dma_unmap(mapping: u64) -> i32 {
-    status(dma::unmap(mapping))
+    with_core_critical(|| status(dma::unmap(mapping)))
 }
 
 /// 按未 mangled 字节名精确查找导出地址（线性扫：条目少，不值得排序/哈希）。
@@ -1104,6 +1190,31 @@ mod tests {
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
         }
+    }
+
+    /// 机械一致性检查：**除 `kcore_panic_escape` 外每个导出体都包在
+    /// `with_core_critical` 里**（Core panic 必须致命，见模块文档）。
+    ///
+    /// 为什么是文本检查：函数体是否被包装无法从 ABI 观察——调用每个导出都会
+    /// 产生副作用/依赖真实 Core 状态（host 不可行）。实现部分（test module 之前）
+    /// 里非注释行的 `with_core_critical(` 调用点数量必须等于
+    /// `EXPORTS.len() - 1`。新增导出会同时改变两边，漏包即失败。
+    #[test]
+    fn every_ordinary_export_body_is_core_critical() {
+        let implementation_half = include_str!("export.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("export.rs always carries its test module");
+        let wrapped = implementation_half
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("with_core_critical("))
+            .count();
+        assert_eq!(
+            wrapped,
+            EXPORTS.len() - 1,
+            "every export except the escape request must wrap its body"
+        );
     }
 
     #[test]
@@ -1258,11 +1369,11 @@ mod tests {
 
         extern "C" fn irq_stub(_ctx: *mut ()) {}
 
+        let _boundary = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
         crate::resource::init();
-        let _boundary = containment::test_boundary_lock();
 
         // Given：一个被标记 Failed 的组件。
         let id = {
@@ -1581,8 +1692,8 @@ mod tests {
     fn endpoint_publish_stages_and_lookup_resolves_after_commit() {
         use crate::component::{containment, endpoint, registry};
 
-        let _heap = crate::memory::test_support::GUARD.lock();
         let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
         endpoint::init();
@@ -1782,8 +1893,8 @@ mod tests {
     fn failed_create_discards_staged_endpoint_and_lookup_finds_nothing() {
         use crate::component::{containment, endpoint, registry};
 
-        let _heap = crate::memory::test_support::GUARD.lock();
         let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
         endpoint::init();

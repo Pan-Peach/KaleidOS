@@ -20,6 +20,10 @@ extern crate std;
 #[cfg(test)]
 mod build_config;
 
+// host 测试锁的规范顺序 + 违规检测（详见 `src/test_support.rs` 模块文档）。
+#[cfg(test)]
+mod test_support;
+
 pub mod bench;
 pub mod component;
 pub mod errno;

@@ -308,6 +308,13 @@ fn schedule_next(
     if let Some(id) = next {
         crate::trace::emit(crate::trace::TraceEvent::TaskSwitch { from, to: id });
     }
+    // 当前执行（本调度帧）的 Core ABI 深度在切换期间挂起：incoming 是全新任务
+    // 时由 `enter_task` 归零，是被恢复的任务时由**它自己**挂起的调度帧在
+    // `context_switch` 之后恢复。任务 guard 每次切换都被覆盖，所以每个执行只能
+    // 在自己的调度帧里保存自己的深度（见 `containment::EscapeGuard::saved_depth`）。
+    // 必须在 `enter_task` 归零**之前**捕获。
+    let suspended_depth = containment::core_abi_depth();
+
     match next {
         Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
         None => containment::enter_anchor(),
@@ -319,6 +326,9 @@ fn schedule_next(
     unsafe {
         CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
     }
+    // 本帧被重新调度：恢复它离开 CPU 时的 Core ABI 深度（组件代码 = 0，
+    // 若它是在导出体内让出 CPU 则是导出体的深度）。
+    containment::resume_core_abi_depth(suspended_depth);
     Ok(())
 }
 
@@ -383,6 +393,7 @@ mod tests {
     use crate::component::image::ComponentImageId;
     use crate::component::interface::InterfaceRegistry;
     use crate::component::registry::Registry;
+    use crate::test_support::{Rank, TestLock};
     use alloc::vec;
     use core::ptr;
 
@@ -390,7 +401,9 @@ mod tests {
     const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
     /// 串行化触碰进程全局 task table / registry 的调度测试。
-    static SCHED_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = SCHED（模块本地、最外层；见 [`crate::test_support`]）。
+    static SCHED_TEST_LOCK: TestLock = TestLock::new(Rank::Sched);
 
     const ENTRY: usize = 0x8000_0000;
 
@@ -633,9 +646,9 @@ mod tests {
     #[cfg(feature = "trace")]
     fn invalid_proposal_emits_real_event_sequence_and_keeps_truth() {
         let _sched = SCHED_TEST_LOCK.lock();
-        let _trace = crate::trace::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _trace = crate::trace::test_support::GUARD.lock();
         crate::task::init();
         init();
         crate::component::registry::init();
@@ -864,9 +877,9 @@ mod tests {
     #[cfg(feature = "trace")]
     fn proposal_of_existing_but_not_runnable_task_is_rejected() {
         let _sched = SCHED_TEST_LOCK.lock();
-        let _trace = crate::trace::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _trace = crate::trace::test_support::GUARD.lock();
         crate::task::init();
         init();
         crate::component::registry::init();
@@ -953,10 +966,10 @@ mod tests {
     #[cfg(feature = "trace")]
     fn dead_owner_gate_blocks_dispatch_of_isolated_providers_task() {
         let _sched = SCHED_TEST_LOCK.lock();
-        let _trace = crate::trace::test_support::GUARD.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _trace = crate::trace::test_support::GUARD.lock();
         crate::task::init();
         init();
         crate::component::registry::init();
@@ -1327,10 +1340,10 @@ mod tests {
     #[cfg(feature = "trace")]
     fn abort_handoff_commits_exit_fails_owner_and_switches_to_successor() {
         let _sched = SCHED_TEST_LOCK.lock();
-        let _trace = crate::trace::test_support::GUARD.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _trace = crate::trace::test_support::GUARD.lock();
         crate::task::init();
         init();
         crate::component::registry::init();
@@ -1428,10 +1441,10 @@ mod tests {
     #[cfg(feature = "trace")]
     fn run_yield_exit_commit_sequence_is_observable_in_truth_and_trace() {
         let _sched = SCHED_TEST_LOCK.lock();
-        let _trace = crate::trace::test_support::GUARD.lock();
         let _boundary = containment::test_boundary_lock();
-        crate::memory::test_support::ensure_init();
         let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let _trace = crate::trace::test_support::GUARD.lock();
         crate::task::init();
         init();
         crate::component::registry::init();

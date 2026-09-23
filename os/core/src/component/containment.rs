@@ -80,6 +80,37 @@
 //! restored when control returns to the anchor ([`enter_anchor`]); this also
 //! preserves an enclosing init guard when a component task drives the scheduler.
 //!
+//! # Core ABI depth (the escapability gate)
+//!
+//! Containment is for panics in **component** code.  A component calls a
+//! `kcore_*` export, and that export body is Core code running on the same stack
+//! — often while holding Core locks.  Escaping a panic from there would (a)
+//! misattribute a Core bug to the boundary owner, and (b) resume the recovery
+//! path (`fail_component` → registry / trace / resource locks, service-stack
+//! free, DMA cleanup) with the Core lock still held → **deadlock**.  So
+//! escapability is gated on [`CORE_ABI_DEPTH`]:
+//!
+//! - every ordinary `kcore_*` export body runs inside [`with_core_critical`]
+//!   (depth `+1`).  The one deliberate exception is the SDK's explicit escape
+//!   request `kcore_panic_escape`: wrapping it would make the escape request
+//!   itself non-escapable;
+//! - every boundary that hands control to **component** code suspends the depth
+//!   (saves it and zeroes it): [`run_isolated`] (create / destroy / service
+//!   call), [`with_irq_scope`], [`enter_task`], and the test-only boundary
+//!   helpers.  Nested component code called *from* a critical scope is therefore
+//!   still escapable, and the saved depth returns to force when the boundary's
+//!   Core frame resumes — normal return and panic escape both flow through that
+//!   frame;
+//! - task switches are the exception: the task guard is overwritten per switch,
+//!   so the *scheduler* frame ([`crate::sched::schedule_next`]) saves the
+//!   outgoing execution's depth on its own stack and restores it after
+//!   `context_switch` returns.  [`enter_task`] zeroes the depth for a fresh task;
+//!   a resumed task restores its own depth in its own suspended scheduler frame.
+//!
+//! A depth refusal leaves an escapable guard **untouched**: the panic stays
+//! fatal.  There is no recovery path that could run safely while the panicking
+//! Core frame still holds a Core lock.
+//!
 //! # IRQ attribution scope
 //!
 //! [`with_irq_scope`] layers one more boundary over the active guard around one
@@ -120,7 +151,11 @@
 //!   The graceful-stop path therefore refuses components that still own live
 //!   tasks (see `component/exit.rs`).
 //! - No Core lock may span the switch.  A panic while a Core lock is held can
-//!   still leave that lock held (known KernelNative limitation).
+//!   still leave that lock held (known KernelNative limitation) — but such a
+//!   panic can only originate in Core code, and Core code reached through an
+//!   export is Core-critical ([`with_core_critical`]): [`panic_escape`] refuses
+//!   it, so the (possibly lock-holding) Core frame is never abandoned.  The
+//!   panic stays fatal instead of deadlocking the recovery path.
 //! - The task-abort context is single-CPU and reused; it is only entered once
 //!   per panic and never resumed.  It runs on its own 32 KiB Core stack, so the
 //!   abort bookkeeping does not consume the dead task's stack.
@@ -339,6 +374,12 @@ struct EscapeGuard {
     call: IsolatedCall,
     returned: i32,
     state: GuardState<*mut EscapeGuard>,
+    /// Core ABI 深度在边界安装时被挂起（[`suspend_core_abi_depth`]），控制回到
+    /// 安装该 guard 的 Core 帧（正常返回或 panic 逃逸）时恢复。
+    ///
+    /// 任务边界不用它：任务 guard 每次切换都被覆盖，被恢复任务的深度由它自己
+    /// 挂起的调度帧（`sched::schedule_next`）保存/恢复。
+    saved_depth: u32,
 }
 
 // Phase 1 is single-active-CPU and component entry is synchronous, so the
@@ -350,6 +391,79 @@ static mut ACTIVE_GUARD: *mut EscapeGuard = core::ptr::null_mut();
 static mut ANCHOR_GUARD: *mut EscapeGuard = core::ptr::null_mut();
 /// True while the CPU is inside the task-scheduling region.
 static mut TASK_REGION: bool = false;
+
+/// Core ABI execution depth on the current CPU: `0` = the execution is
+/// **component** code (a panic may escape); `> 0` = Core code reached through an
+/// export is on the stack ([`with_core_critical`]) — a panic there is a **Core**
+/// panic and must stay fatal ([`panic_escape`] refuses).
+///
+/// Production: one process-global counter with the same single-active-CPU,
+/// lock-free discipline as [`ACTIVE_GUARD`].  Host tests run many test threads in
+/// one process, and every export call touches this counter, so under `cfg(test)`
+/// it is thread-local instead: each test thread is its own simulated single CPU
+/// (same accommodation as the trace enabled-mask).
+#[cfg(not(test))]
+static mut CORE_ABI_DEPTH: u32 = 0;
+
+#[cfg(test)]
+std::thread_local! {
+    static CORE_ABI_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Current Core ABI depth (see [`CORE_ABI_DEPTH`]).
+pub(crate) fn core_abi_depth() -> u32 {
+    #[cfg(not(test))]
+    // SAFETY: [Category 2 — Data races] phase 1 is single-active-CPU; the counter
+    // is pushed/popped only synchronously on that CPU.
+    return unsafe { core::ptr::addr_of!(CORE_ABI_DEPTH).read() };
+    #[cfg(test)]
+    return CORE_ABI_DEPTH.with(core::cell::Cell::get);
+}
+
+/// Overwrites the Core ABI depth (boundary suspend / restore; see
+/// [`CORE_ABI_DEPTH`]).
+fn set_core_abi_depth(next: u32) {
+    #[cfg(not(test))]
+    // SAFETY: [Category 2 — Data races] same single-active-CPU contract as
+    // `core_abi_depth`.
+    unsafe {
+        core::ptr::addr_of_mut!(CORE_ABI_DEPTH).write(next);
+    }
+    #[cfg(test)]
+    CORE_ABI_DEPTH.with(|depth| depth.set(next));
+}
+
+/// Runs `f` as **Core-critical**: the Core ABI depth is incremented for the whole
+/// call, so a panic inside cannot escape into containment — Core code may hold
+/// Core locks, and the escape's recovery path would deadlock on them.
+///
+/// Every ordinary `kcore_*` export body is wrapped here.  The one exception is
+/// the SDK's explicit escape request `kcore_panic_escape`: wrapping it would
+/// make the escape request itself permanently non-escapable.
+pub(crate) fn with_core_critical<R>(f: impl FnOnce() -> R) -> R {
+    set_core_abi_depth(core_abi_depth() + 1);
+    let result = f();
+    // Explicit decrement, no `Drop` (there is no unwinding): a panic either
+    // escapes (control never returns to this frame) or stays fatal.
+    set_core_abi_depth(core_abi_depth() - 1);
+    result
+}
+
+/// Suspends the Core ABI depth for a component boundary: saves the current value
+/// and zeroes it, so the component code about to run is escapable.  The saved
+/// value is restored by [`resume_core_abi_depth`] when control returns to the
+/// installing Core frame.  Not used at the scheduler boundary — see
+/// [`EscapeGuard::saved_depth`].
+fn suspend_core_abi_depth() -> u32 {
+    let saved = core_abi_depth();
+    set_core_abi_depth(0);
+    saved
+}
+
+/// Restores a depth saved by [`suspend_core_abi_depth`].
+pub(crate) fn resume_core_abi_depth(saved: u32) {
+    set_core_abi_depth(saved);
+}
 
 /// Dedicated stack for the task-abort trampoline: it runs after the dead task's
 /// stack is abandoned, so it must have its own.
@@ -649,12 +763,18 @@ fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
         call,
         returned: 0,
         state: GuardState::new(None),
+        // From here on the stack carries component code: it must be escapable.
+        saved_depth: suspend_core_abi_depth(),
     };
     guard.state = GuardState::new(replace_active(&mut guard));
 
     // The context records are local to this suspended caller frame and remain
     // valid until the component returns or `panic_escape` resumes this point.
     CpuImpl::context_switch(&mut core_context, &component_context);
+
+    // Control is back on this Core frame (component return or panic escape):
+    // restore the Core ABI depth the caller had before the boundary.
+    resume_core_abi_depth(guard.saved_depth);
 
     let previous = match guard.state.previous() {
         Some(previous) => previous,
@@ -698,11 +818,16 @@ pub(crate) fn with_irq_scope<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R 
         call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
+        // `f` is the component callback: it runs escapable (the IRQ guard itself
+        // still refuses the escape; the depth is suspended so nested component
+        // code reached beneath the scope is judged by its own boundary).
+        saved_depth: suspend_core_abi_depth(),
     };
     guard.state = GuardState::new(replace_active(&mut guard));
     let result = f();
     // Explicit restore (no unwinding; see module docs).  The record captured
     // the guard it replaced, so nested IRQ scopes pop in order.
+    resume_core_abi_depth(guard.saved_depth);
     let previous = match guard.state.previous() {
         Some(previous) => previous,
         None => core::ptr::null_mut(),
@@ -716,6 +841,12 @@ pub(crate) fn with_irq_scope<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R 
 /// The first transition out of the anchor saves the ambient (possibly init)
 /// guard; later task-to-task switches only replace the task record.  Must be
 /// called with no Core lock held and immediately before the context switch.
+///
+/// A task executes component code, so the Core ABI depth is zeroed here.  The
+/// *outgoing* execution's depth is not stored in this record — the task guard is
+/// overwritten on every switch; the scheduler frame that is suspended by the
+/// switch (`sched::schedule_next`) saves its own depth and restores it when that
+/// frame is resumed.
 pub fn enter_task(task: TaskId, owner: ComponentId) {
     // SAFETY: [Category 2 — Data races] single active CPU; called on the
     // synchronous scheduling path with all locks released.
@@ -731,10 +862,13 @@ pub fn enter_task(task: TaskId, owner: ComponentId) {
             call: IsolatedCall::None,
             returned: 0,
             state: GuardState::new(None),
+            // Unused at the task boundary: see `EscapeGuard::saved_depth`.
+            saved_depth: 0,
         };
         core::ptr::addr_of_mut!(TASK_GUARD).write(MaybeUninit::new(guard));
         ACTIVE_GUARD = core::ptr::addr_of_mut!(TASK_GUARD).cast::<EscapeGuard>();
     }
+    set_core_abi_depth(0);
 }
 
 /// Scheduler hook: restore the ambient guard before switching **into the anchor**.
@@ -805,6 +939,11 @@ extern "C" fn trampoline() -> ! {
 
 /// Runs on the dedicated abort stack after a task panic; never returns to the
 /// panicking frame.  Commits the dead task and fails its component.
+///
+/// The abort bookkeeping is **Core code**: it is wrapped Core-critical so a
+/// panic inside it (`fail_component` → registry / trace / resource locks,
+/// rescheduling) cannot attempt a second escape through the dead task's guard
+/// and re-enter this very context.
 extern "C" fn task_abort_trampoline() -> ! {
     let Some(guard_ptr) = active_guard() else {
         halt()
@@ -816,7 +955,7 @@ extern "C" fn task_abort_trampoline() -> ! {
         // break.  Halting is safer than resuming an unknown context.
         halt()
     };
-    crate::sched::abort_current_task(task, owner)
+    with_core_critical(|| crate::sched::abort_current_task(task, owner))
 }
 
 /// Transfers control from the escaping execution to the Core-owned context
@@ -837,36 +976,58 @@ fn switch_to_core(guard_ptr: *mut EscapeGuard) -> ! {
     halt()
 }
 
-/// Escapes an active component panic without allocation, logging, or locking.
+/// Decides whether the current execution may escape a panic.  `Some(guard)` =
+/// eligible; `None` = refused.  Kept separate from [`panic_escape`] so host tests
+/// can pin the decision: the fake context backend's `context_switch` is a no-op
+/// followed by `halt`, so a real escape can only be proven on QEMU/ArchTest.
 ///
-/// Every escapable boundary (init / exit / task / service call) escapes through
-/// `from_context` → `to_context`; the resumed Core context performs the
-/// containment bookkeeping.  Returns `false` when the panic originated outside an
-/// isolated component, or inside an IRQ attribution scope ([`with_irq_scope`]) —
-/// an IRQ callback has no Core context to resume, so its panic stays fatal (the
-/// interrupted guard is restored before returning).  A `true` result is
-/// unreachable in a functioning context backend because the switch resumes the
-/// Core context instead of this panic handler.
-pub fn panic_escape() -> bool {
-    let Some(guard_ptr) = active_guard() else {
-        return false;
-    };
+/// Refusals, in order:
+/// - no active boundary: the panic is outside any component boundary;
+/// - non-escapable boundary (an IRQ attribution scope, [`with_irq_scope`]): no
+///   Core-owned context to resume — the interrupted guard is restored **here**
+///   (explicit recovery; never rely on `Drop`, there is no unwinding), so a stale
+///   IRQ scope cannot outlive the attempt;
+/// - **Core ABI depth > 0** ([`with_core_critical`]): Core code is on the stack,
+///   i.e. this is a **Core** panic, not a component panic.  Escaping would
+///   misattribute a Core bug to the boundary owner and resume the recovery path
+///   (`fail_component` → registry / trace / resource locks) while the panicking
+///   Core frame still holds its locks → deadlock.  The escapable guard is left
+///   untouched: the panic stays fatal.
+fn escape_target() -> Option<*mut EscapeGuard> {
+    let guard_ptr = active_guard()?;
     // SAFETY: `guard_ptr` is installed by the suspended caller/scheduler on this
     // CPU and remains valid until it is replaced after the switch back.
     let kind = unsafe { (*guard_ptr).kind };
     if !kind.is_escapable() {
         // An IRQ attribution scope has no Core-owned context to resume, and
         // escaping into the interrupted task would misattribute the callback's
-        // panic to a task that did not panic.  Restore the interrupted guard
-        // (explicit recovery — never rely on `Drop`, there is no unwinding) and
-        // report the panic as uncontained: it stays fatal.  A stale IRQ scope
-        // therefore cannot outlive the escape attempt.
+        // panic to a task that did not panic.
         // SAFETY: [Category 2 — Data races] the record is live and this is the
         // only execution touching it; `previous` is a plain pointer copy.
         let previous = unsafe { (*guard_ptr).state.previous() };
         let _ = replace_active(previous.unwrap_or(core::ptr::null_mut()));
-        return false;
+        return None;
     }
+    if core_abi_depth() > 0 {
+        return None;
+    }
+    Some(guard_ptr)
+}
+
+/// Escapes an active component panic without allocation, logging, or locking.
+///
+/// Every escapable **component** boundary (init / exit / task / service call)
+/// escapes through `from_context` → `to_context`; the resumed Core context
+/// performs the containment bookkeeping.  Returns `false` when the panic
+/// originated outside an isolated component, inside an IRQ attribution scope
+/// ([`with_irq_scope`]), or while Core ABI code is on the stack (see
+/// [`escape_target`]) — all three stay fatal.  A `true` result is unreachable in
+/// a functioning context backend because the switch resumes the Core context
+/// instead of this panic handler.
+pub fn panic_escape() -> bool {
+    let Some(guard_ptr) = escape_target() else {
+        return false;
+    };
     // SAFETY: [Category 2 — Data races] short raw access; the record is live and
     // `switch_to_core` never returns to this frame.
     unsafe { (*guard_ptr).state.mark_panicked() };
@@ -920,12 +1081,16 @@ fn halt() -> ! {
 // without a context switch, and serialize the tests that mutate it.
 
 /// Serializes tests that mutate the process-global active boundary.
+///
+/// rank = BOUNDARY（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+/// [`crate::test_support`]）。
 #[cfg(test)]
-static TEST_BOUNDARY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static TEST_BOUNDARY_LOCK: crate::test_support::TestLock =
+    crate::test_support::TestLock::new(crate::test_support::Rank::Boundary);
 
 /// Acquires the test-only active-boundary lock.
 #[cfg(test)]
-pub(crate) fn test_boundary_lock() -> spin::MutexGuard<'static, ()> {
+pub(crate) fn test_boundary_lock() -> crate::test_support::TestLockGuard<'static> {
     TEST_BOUNDARY_LOCK.lock()
 }
 
@@ -944,9 +1109,12 @@ pub(crate) fn with_test_init_boundary<R>(owner: Option<ComponentId>, f: impl FnO
         call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
+        // Mirrors `run_isolated`: component code runs with the depth suspended.
+        saved_depth: suspend_core_abi_depth(),
     };
     guard.state = GuardState::new(replace_active(&mut guard));
     let result = f();
+    resume_core_abi_depth(guard.saved_depth);
     let previous = match guard.state.previous() {
         Some(previous) => previous,
         None => core::ptr::null_mut(),
@@ -970,9 +1138,12 @@ pub(crate) fn with_test_exit_boundary<R>(owner: ComponentId, f: impl FnOnce() ->
         call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
+        // Mirrors `run_isolated`: component code runs with the depth suspended.
+        saved_depth: suspend_core_abi_depth(),
     };
     guard.state = GuardState::new(replace_active(&mut guard));
     let result = f();
+    resume_core_abi_depth(guard.saved_depth);
     let previous = match guard.state.previous() {
         Some(previous) => previous,
         None => core::ptr::null_mut(),
@@ -1006,9 +1177,12 @@ pub(crate) fn with_test_service_boundary<R>(
         call: IsolatedCall::None,
         returned: 0,
         state: GuardState::new(None),
+        // Mirrors `run_isolated`: the provider dispatcher runs escapable.
+        saved_depth: suspend_core_abi_depth(),
     };
     guard.state = GuardState::new(replace_active(&mut guard));
     let result = f();
+    resume_core_abi_depth(guard.saved_depth);
     let previous = match guard.state.previous() {
         Some(previous) => previous,
         None => core::ptr::null_mut(),
@@ -1027,6 +1201,17 @@ pub(crate) fn test_mark_active_panicked() {
         // lock; the record is live and only this test mutates it.
         unsafe { (*guard_ptr).state.mark_panicked() };
     }
+}
+
+/// Whether the active escape record is marked panicked (test-only probe; pairs
+/// with [`test_mark_active_panicked`]).
+#[cfg(test)]
+pub(crate) fn test_active_panicked() -> bool {
+    active_guard().is_some_and(|guard_ptr| {
+        // SAFETY: [Category 2 — Data races] single active CPU / test boundary
+        // lock; the record is live and only this test reads it.
+        unsafe { (*guard_ptr).state.panicked() }
+    })
 }
 
 #[cfg(test)]
@@ -1199,6 +1384,160 @@ mod tests {
         // The scope's own explicit restore at return is idempotent.
         let info = active_escape().expect("task boundary still restored");
         assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        enter_anchor();
+    }
+
+    // ------------------------------------------------------------------
+    // Core ABI depth（`with_core_critical`）：只有组件代码可逃逸
+    // ------------------------------------------------------------------
+
+    /// 验收：Core ABI 深度 > 0（导出体内）时 `panic_escape()` 拒绝，且**不弹
+    /// 边界、不标记 panicked** —— Core panic 保持致命，恢复路径不会带着 Core 锁
+    /// 进入 `fail_component`（死锁源）。
+    #[test]
+    fn panic_escape_refuses_inside_core_critical_and_keeps_boundary() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+        assert_eq!(core_abi_depth(), 0, "a task runs component code");
+
+        with_core_critical(|| {
+            assert_eq!(core_abi_depth(), 1, "an export body is Core-critical");
+            assert!(
+                !panic_escape(),
+                "a panic inside Core ABI code must stay fatal"
+            );
+            let info = active_escape().expect("boundary left intact by the refusal");
+            assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+            assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+            assert!(
+                !test_active_panicked(),
+                "the refusal must not mark the boundary as a component panic"
+            );
+        });
+
+        assert_eq!(core_abi_depth(), 0, "the critical scope balances its depth");
+        enter_anchor();
+    }
+
+    /// 验收（回归）：无 critical scope 时组件代码照常可逃逸；无边界时
+    /// `panic_escape()` 仍返回 `false`。真实的上下文切换由 QEMU/ArchTest 证明
+    /// （host fake 后端的 `context_switch` 是 no-op + halt，不会真的切走）。
+    #[test]
+    fn panic_escape_is_eligible_outside_core_critical() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        assert!(!panic_escape(), "no boundary → refusal (existing behavior)");
+
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+        assert_eq!(core_abi_depth(), 0);
+        assert!(
+            escape_target().is_some(),
+            "component code without a critical scope may escape"
+        );
+        enter_anchor();
+    }
+
+    /// 验收：critical scope 内**嵌套的组件边界**仍然可逃逸（边界安装把深度挂起
+    /// 到 0），边界弹出后恢复 critical scope 的深度。
+    #[test]
+    fn nested_component_boundary_inside_core_critical_is_escapable() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+
+        with_core_critical(|| {
+            assert_eq!(core_abi_depth(), 1);
+            with_test_init_boundary(Some(ComponentId::from_raw(4)), || {
+                assert_eq!(core_abi_depth(), 0, "the boundary suspends the Core depth");
+                assert!(
+                    escape_target().is_some(),
+                    "nested component code stays escapable inside a critical scope"
+                );
+            });
+            assert_eq!(
+                core_abi_depth(),
+                1,
+                "the nested boundary restores the depth"
+            );
+        });
+        assert_eq!(core_abi_depth(), 0);
+
+        // Outside the critical scope the task boundary is still active and
+        // remains escapable; leaving it returns to the no-boundary refusal.
+        assert_eq!(active_escape().unwrap().task(), Some(TaskId::from_raw(7)));
+        assert!(escape_target().is_some());
+        enter_anchor();
+        assert!(!panic_escape(), "no boundary → refusal again");
+    }
+
+    /// 验收：深度在嵌套边界**正常返回**与**panic 之后**都正确恢复（边界弹出
+    /// 不依赖 Drop / 展开：这里显式标记 panicked，再由 guard 弹出恢复）。
+    #[test]
+    fn boundary_depth_is_restored_after_return_and_after_panic() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        with_core_critical(|| {
+            let provider = ComponentId::from_raw(9);
+            with_test_service_boundary(provider, EndpointId::from_raw(1), None, || {
+                assert_eq!(core_abi_depth(), 0);
+            });
+            assert_eq!(core_abi_depth(), 1, "a normal return restores the depth");
+
+            with_test_service_boundary(provider, EndpointId::from_raw(2), None, || {
+                assert_eq!(core_abi_depth(), 0);
+                test_mark_active_panicked();
+                assert!(test_active_panicked());
+            });
+            assert_eq!(
+                core_abi_depth(),
+                1,
+                "a panicked boundary still restores the depth"
+            );
+        });
+        assert_eq!(core_abi_depth(), 0);
+        enter_anchor();
+    }
+
+    /// 验收：IRQ scope 也把深度挂起（回调是组件代码）并在返回时恢复。
+    #[test]
+    fn irq_scope_suspends_and_restores_core_abi_depth() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        with_core_critical(|| {
+            with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+                assert_eq!(core_abi_depth(), 0, "an IRQ callback is component code");
+            });
+            assert_eq!(core_abi_depth(), 1);
+        });
+        assert_eq!(core_abi_depth(), 0);
+        enter_anchor();
+    }
+
+    /// 验收：create / destroy / service 共用的生产边界（`run_isolated`）在安装时
+    /// 挂起深度、Core 帧恢复时还原（host fake 后端不执行组件入口，只验证边界
+    /// 记账；真实切换由 QEMU 证明）。
+    #[test]
+    fn isolated_stack_boundary_suspends_and_restores_core_abi_depth() {
+        let _boundary = test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        enter_anchor();
+        assert_eq!(core_abi_depth(), 0);
+
+        with_core_critical(|| {
+            let run = run_isolated(IsolatedCall::None, EscapeKind::Init { owner: None });
+            assert_eq!(run.outcome, CallOutcome::Returned(0));
+            assert_eq!(
+                core_abi_depth(),
+                1,
+                "the isolated boundary restores the Core frame's depth"
+            );
+            if let Some(stack) = run.stack {
+                let _ = crate::memory::free_region(stack);
+            }
+        });
+        assert_eq!(core_abi_depth(), 0);
         enter_anchor();
     }
 

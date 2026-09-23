@@ -269,9 +269,14 @@ pub fn committed() -> Option<MachineInfo> {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::test_support::{Rank, TestLock};
+
     /// 串行化「提交全局 MachineInfo」的测试：`COMMITTED` 是进程全局，并行测试
     /// 各自 commit 一份会互相覆盖。测试很短，用自旋锁串起来即可。
-    pub(crate) static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = MACHINE（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+    /// [`crate::test_support`]）。
+    pub(crate) static GUARD: TestLock = TestLock::new(Rank::Machine);
 }
 
 #[cfg(test)]

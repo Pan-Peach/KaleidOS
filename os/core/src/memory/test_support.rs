@@ -13,14 +13,17 @@
 //! `let _g = memory::test_support::GUARD.lock(); memory::test_support::ensure_init();`
 
 use super::*;
-use spin::Mutex;
+use crate::test_support::{Rank, TestLock, TestLockGuard};
 use std::sync::Once;
 
 /// 测试互斥：同一时间只允许一个使用全局堆的测试执行。
-pub(crate) static GUARD: Mutex<()> = Mutex::new(());
+///
+/// rank = MEMORY（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+/// [`crate::test_support`]）。
+pub(crate) static GUARD: TestLock = TestLock::new(Rank::Memory);
 
 /// GUARD 的持有类型（测试签名用）。
-pub(crate) type Guard<'a> = spin::MutexGuard<'a, ()>;
+pub(crate) type Guard<'a> = TestLockGuard<'a>;
 
 static INIT: Once = Once::new();
 

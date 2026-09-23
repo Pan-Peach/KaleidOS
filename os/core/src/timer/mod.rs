@@ -157,6 +157,7 @@ pub fn ticks() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Rank, TestLock};
     use alloc::format;
 
     /// 序列化触碰进程级 timer 全局的测试。
@@ -164,7 +165,9 @@ mod tests {
     /// `STATE` 是进程级 `static`，`init()` 每个进程只能成功一次且无法重置，
     /// 所以整条生命周期必须放在单个 `#[test]` 里。锁本身沿用 irq / sched /
     /// containment / trace 的纪律，防止未来新增测试并发改动同一全局。
-    static TIMER_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = TIMER（模块本地、最外层；见 [`crate::test_support`]）。
+    static TIMER_TEST_LOCK: TestLock = TestLock::new(Rank::Timer);
 
     /// 验收：one-shot timer 机制在 host 上的完整生命周期（未初始化 → init →
     /// 编程 deadline → trap 计数 → 一次性清除 deadline）。

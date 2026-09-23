@@ -129,9 +129,12 @@ mod tests {
     use super::*;
     use crate::component::ComponentState;
     use crate::machine::{CpuId, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
+    use crate::test_support::{Rank, TestLock};
 
     /// 串行化所有触碰全局真相（task table / registry / machine 快照）的测试。
-    static INSPECTOR_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = INSPECTOR（模块本地、最外层；见 [`crate::test_support`]）。
+    static INSPECTOR_TEST_LOCK: TestLock = TestLock::new(Rank::Inspector);
 
     /// 快照必须是**拷贝**，不是活引用：Core 真相随后改变，旧快照不动。
     #[test]

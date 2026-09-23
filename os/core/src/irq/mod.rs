@@ -107,12 +107,15 @@ pub fn route(number: u32) -> Option<(ComponentId, IrqHandler, *mut ())> {
 mod tests {
     use super::*;
     use crate::resource::irq::{self, IrqError};
+    use crate::test_support::{Rank, TestLock};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
     /// 序列化触碰全局 IRQ 表的测试。
-    static IRQ_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    ///
+    /// rank = IRQ（模块本地、最外层；见 [`crate::test_support`]）。
+    static IRQ_TEST_LOCK: TestLock = TestLock::new(Rank::Irq);
 
     extern "C" fn bump(_ctx: *mut ()) {
         CALLS.fetch_add(1, Ordering::AcqRel);
