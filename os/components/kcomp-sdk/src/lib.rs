@@ -49,6 +49,7 @@ pub mod errno;
 pub mod filesystem;
 pub mod frame;
 pub mod generated;
+pub mod probe;
 
 mod dma;
 mod logging;

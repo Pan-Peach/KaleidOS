@@ -3,10 +3,13 @@
 //! # 职责与刻意分层
 //!
 //! ```text
-//! prober（本组件）:  按 compatible 枚举候选 → 请求 Core 加载候选驱动一次
-//!                     → 持有 assignment cursor，向驱动交付 (attempt, DeviceId)
-//! driver:            自己的 init 上下文：next_assignment → claim → fine protocol
-//!                    match → 接受 / 释放 → report_attempt
+//! prober（本组件）:  按 compatible 枚举候选 → 逐台把 (attempt, DeviceId) 编码进
+//!                    DriverCreateConfig → kcore_component_create(候选驱动, config)
+//!                    → create 返回后 pull 候选驱动的 `probe.result` endpoint
+//!                    → 用自己的本地调用更新 assignment cursor
+//! driver:            自己的 create 上下文：读 create config → claim DeviceId
+//!                    → fine protocol match → 接受（attach + publish）/ 拒绝（NoMatch）
+//!                      → 把结果 staged publish 到 config 指定的 `probe.result` 端口
 //! ```
 //!
 //! **prober 不含任何协议知识，也绝不 claim MMIO：**
@@ -16,29 +19,32 @@
 //! - 最后的硬件匹配必须在驱动代码运行、且驱动持有 authority 之后才能完成，
 //!   所以这里只做 coarse candidate match（见 docs/architecture/driver-model.md §9.1 / §12 Q1）。
 //!
-//! # 唯一通道是 assignment Service
+//! # 无环：数据进 create，结果走 probe.result
 //!
-//! `driver.prober` 只传**数据**（device id / attempt），**从不携带 authority**：
-//! prober 不 claim / release 任何资源，也不替驱动创建任务；驱动在**自己的**
-//! `kcomp_instance_create` 上下文里向 Core claim（Core 的 principal 规则把嵌套
-//! create 归属到驱动本身，不是发起 load 的 prober）。
+//! assignment **只作为 create config 的扁平字节**进入驱动（`DeviceId` 是选择
+//! 数据、不是权限）；驱动在**自己的** `kcomp_instance_create` 上下文里向 Core
+//! claim（Core 的 principal 规则把嵌套 create 归属到驱动本身，不是发起 create 的
+//! prober），**绝不回调 prober**。结果由 prober 在 create 返回 0 之后**拉取一次**
+//! （`probe.result` 的 `RESULT` 方法，经 Core call gate），再以普通本地调用写进
+//! cursor——`Task(prober) → Driver create → Service(prober)` 的同步重入环不存在。
 //!
 //! # 生命周期
 //!
-//! publish 是 **staged**：`kcomp_instance_create` 期间只记录 pending，Core 在
-//! create 返回 0 后才提交（prober → `Ready`）。消费者（驱动）只有 prober `Ready`
-//! 后才能 bind，所以本组件在 create 里创建一个**有限** dispatch 任务：monitor 在
-//! load 提交后 `sched::run()` 运行它——枚举候选 compatible → 有匹配就
-//! `kcore_component_load` 候选驱动**一次** → 退出（无后台循环；重复加载 /
-//! 热插拔明确 deferred）。实例状态（候选集 + cursor）由 create 显式分配，经
-//! `out_state` / 服务 ctx / task arg 传递，不再是可变全局。
+//! 本组件 create 期间**不发布** endpoint（旧 `driver.prober` 服务已删除）；它创建
+//! 一个**有限** dispatch 任务：monitor 在 load 提交后 `sched::run()` 运行它——
+//! 枚举候选 → 逐台 create + pull，直到首个 `Match`（成功 attach）后停止；全部
+//! NoMatch / 创建失败则自然结束（无后台循环；热插拔明确 deferred）。实例状态
+//! （候选集 + cursor）由 create 显式分配，经 `out_state` / task arg 传递，不再是
+//! 可变全局。
 //!
 //! # 延期（deferred，勿在本轮长出来）
 //!
 //! - TODO(prober-classes): 更多设备类 / 每类优先级；当前只有一张极小静态目录。
-//! - TODO(prober-multi): 每实例 state 已就位（create 分配、经 ctx / task arg
-//!   传递），但组合策略当前仍只加载**一个** prober（多实例 endpoint 命名未启用）。
+//! - TODO(prober-multi): 每实例 state 已就位（create 分配、经 task arg 传递），
+//!   但组合策略当前仍只加载**一个** prober（多实例 endpoint 命名未启用）。
 //! - TODO(prober-hotplug): 热插拔 / reset / recovery；枚举只在 dispatch 时做一次。
+//! - TODO(prober-broker): 需要 Core-authority 的组件加载仍走 `kcore_component_create`；
+//!   跨执行域的 Core 侧 broker 未实现（`docs/architecture/deployment.md` §6.3）。
 
 #![no_std]
 

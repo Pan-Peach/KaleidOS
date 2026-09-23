@@ -130,13 +130,16 @@ int32_t kcomp_instance_destroy(void *state);
 
 ### 资源输入
 
-`config` 里放**组件自定义的 C 布局小结构**，例如：
+`config` 里放**组件自定义的 C 布局小结构**；跨组件交付的 config 使用**扁平字节、
+无嵌套指针**（设备选择场景的规范布局在 `abi/probe.toml` 的 `DriverCreateConfig`）：
 
 ```c
-struct VirtioBlkCreateConfig {
-    uint32_t       device_id;
-    const uint8_t *endpoint_name;
-    size_t         endpoint_name_len;
+/* 固定 8 字节头部；endpoint_name 字节紧随其后（offset 8，长度 = name_len，无 NUL）。
+   总长恰好 8 + name_len。Core 视整段为不透明字节。 */
+struct kcomp_driver_create_config {
+    uint32_t device_id;          /* offset 0：候选设备（选择数据，不是权限） */
+    uint32_t endpoint_name_len;  /* offset 4：结果端口名长度 */
+    /* uint8_t endpoint_name[];  offset 8，长度 = endpoint_name_len */
 };
 ```
 

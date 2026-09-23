@@ -20,6 +20,9 @@ static LAST_CALL: Mutex<Option<CallRecord>> = Mutex::new(None);
 /// `kcore_endpoint_bind` 的脚本回复：`(status, mechanism, api, ctx)`。
 static BIND_SCRIPT: Mutex<(i32, u32, usize, usize)> = Mutex::new((0, 0, 0, 0));
 static LAST_BIND: Mutex<Option<BindRecord>> = Mutex::new(None);
+/// `kcore_endpoint_publish` 的脚本回复（status）与最近一次入参快照。
+static PUBLISH_SCRIPT: Mutex<i32> = Mutex::new(0);
+static LAST_PUBLISH: Mutex<Option<PublishRecord>> = Mutex::new(None);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 最近一次 `kcore_endpoint_call` 的入参快照。
@@ -40,6 +43,18 @@ pub(crate) struct BindRecord {
     pub abi: u64,
 }
 
+/// 最近一次 `kcore_endpoint_publish` 的入参快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublishRecord {
+    pub port_name: Vec<u8>,
+    pub contract: u64,
+    pub kind: u32,
+    pub abi: u64,
+    pub port: u32,
+    pub api: usize,
+    pub ctx: usize,
+}
+
 /// 串行化所有使用 `kcore_endpoint_call` 脚本的测试。
 pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
@@ -55,6 +70,8 @@ pub(crate) fn reset_script() {
     *LAST_CALL.lock().unwrap() = None;
     *BIND_SCRIPT.lock().unwrap() = (0, 0, 0, 0);
     *LAST_BIND.lock().unwrap() = None;
+    *PUBLISH_SCRIPT.lock().unwrap() = 0;
+    *LAST_PUBLISH.lock().unwrap() = None;
 }
 
 /// 设置下一次 `kcore_endpoint_call` 的 `(transport, method)` 返回。
@@ -87,6 +104,16 @@ pub(crate) fn last_bind() -> Option<BindRecord> {
     LAST_BIND.lock().unwrap().clone()
 }
 
+/// 设置下一次 `kcore_endpoint_publish` 的返回状态（`0` = staged 成功）。
+pub(crate) fn script_publish(status: i32) {
+    *PUBLISH_SCRIPT.lock().unwrap() = status;
+}
+
+/// 最近一次 publish 的快照（`reset_script` 后为 `None`）。
+pub(crate) fn last_publish() -> Option<PublishRecord> {
+    LAST_PUBLISH.lock().unwrap().clone()
+}
+
 fn copy_region(ptr: *const u8, len: usize) -> Vec<u8> {
     if len == 0 {
         Vec::new()
@@ -97,12 +124,13 @@ fn copy_region(ptr: *const u8, len: usize) -> Vec<u8> {
 }
 
 /// Core `kcore_endpoint_validate` 的替身：contract + abi 与**已知契约**
-/// （block.device / filesystem）一致且 id != 0 → 0；否則 -ENOENT / -EINVAL
-/// （与 Core 档位一致）。
+/// （block.device / filesystem / probe.result）一致且 id != 0 → 0；否則
+/// -ENOENT / -EINVAL（与 Core 档位一致）。
 #[unsafe(no_mangle)]
 pub extern "C" fn kcore_endpoint_validate(id: u64, contract: u64, abi: u64) -> i32 {
     use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRACT};
     use crate::generated::filesystem::{KCOMP_FILESYSTEM_ABI, KCOMP_FILESYSTEM_CONTRACT};
+    use crate::generated::probe::{KCOMP_PROBE_RESULT_ABI, KCOMP_PROBE_RESULT_CONTRACT};
     if id == 0 {
         return -2; // ENOENT
     }
@@ -110,6 +138,8 @@ pub extern "C" fn kcore_endpoint_validate(id: u64, contract: u64, abi: u64) -> i
         KCOMP_BLOCK_DEVICE_ABI
     } else if contract == KCOMP_FILESYSTEM_CONTRACT {
         KCOMP_FILESYSTEM_ABI
+    } else if contract == KCOMP_PROBE_RESULT_CONTRACT {
+        KCOMP_PROBE_RESULT_ABI
     } else {
         return -22; // EINVAL
     };
@@ -131,10 +161,14 @@ pub extern "C" fn kcore_endpoint_lookup(
 ) -> i32 {
     use crate::generated::block::KCOMP_BLOCK_DEVICE_CONTRACT;
     use crate::generated::filesystem::KCOMP_FILESYSTEM_CONTRACT;
+    use crate::generated::probe::KCOMP_PROBE_RESULT_CONTRACT;
     if out_endpoint.is_null() {
         return -14; // EFAULT
     }
-    if contract != KCOMP_BLOCK_DEVICE_CONTRACT && contract != KCOMP_FILESYSTEM_CONTRACT {
+    if contract != KCOMP_BLOCK_DEVICE_CONTRACT
+        && contract != KCOMP_FILESYSTEM_CONTRACT
+        && contract != KCOMP_PROBE_RESULT_CONTRACT
+    {
         return -22; // EINVAL
     }
     if provider == 0 {
@@ -145,6 +179,31 @@ pub extern "C" fn kcore_endpoint_lookup(
         core::ptr::write_unaligned(out_endpoint, provider as u64 * 100 + port_name_len as u64)
     };
     0
+}
+
+/// Core `kcore_endpoint_publish` 的替身：按脚本返回状态并记录入参。
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn kcore_endpoint_publish(
+    port_name: *const u8,
+    port_name_len: usize,
+    contract: u64,
+    kind: u32,
+    abi: u64,
+    port: u32,
+    api: *const (),
+    ctx: *mut (),
+) -> i32 {
+    *LAST_PUBLISH.lock().unwrap() = Some(PublishRecord {
+        port_name: copy_region(port_name, port_name_len),
+        contract,
+        kind,
+        abi,
+        port,
+        api: api as usize,
+        ctx: ctx as usize,
+    });
+    *PUBLISH_SCRIPT.lock().unwrap()
 }
 
 /// Core `kcore_endpoint_bind` 的替身：按脚本返回 `(status, mechanism, api, ctx)`；

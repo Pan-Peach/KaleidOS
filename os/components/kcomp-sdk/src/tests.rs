@@ -60,6 +60,28 @@ fn assign_outcome_encoding_is_stable() {
     assert_eq!(crate::binding::ASSIGN_NO_MATCH, 1);
 }
 
+/// `probe.result` 契约身份 / ABI 指纹 / create config 布局锚定（ASCII tag 的
+/// 大端读数）：schema 数值漂移 = 组合期 `lookup` / `validate` 直接拒绝，这里钉死。
+#[test]
+fn probe_result_identity_is_anchored() {
+    use crate::endpoint::Contract;
+    use crate::probe::{
+        KCOMP_DRIVER_CREATE_CONFIG_ABI, KCOMP_PROBE_OUTCOME_MATCH, KCOMP_PROBE_OUTCOME_NO_MATCH,
+        KCOMP_PROBE_RESULT_ABI, KCOMP_PROBE_RESULT_CONTRACT, KCOMP_PROBE_RESULT_METHOD_RESULT,
+        KCOMP_PROBE_RESULT_NAME, KCOMP_PROBE_RESULT_OUTPUT_LEN, ProbeResult,
+    };
+    assert_eq!(KCOMP_PROBE_RESULT_NAME, b"probe.result");
+    assert_eq!(KCOMP_PROBE_RESULT_ABI, 0x5052_4F42_5253_4C54);
+    assert_eq!(KCOMP_PROBE_RESULT_CONTRACT, 0x5052_4243_4F4E_5452);
+    assert_eq!(KCOMP_DRIVER_CREATE_CONFIG_ABI, 0x4452_5643_4F4E_4647);
+    assert_eq!(KCOMP_PROBE_RESULT_METHOD_RESULT, 0);
+    assert_eq!(KCOMP_PROBE_RESULT_OUTPUT_LEN, 8);
+    assert_eq!(KCOMP_PROBE_OUTCOME_MATCH, 0);
+    assert_eq!(KCOMP_PROBE_OUTCOME_NO_MATCH, 1);
+    assert_eq!(ProbeResult::ID, KCOMP_PROBE_RESULT_CONTRACT);
+    assert_eq!(ProbeResult::ABI, KCOMP_PROBE_RESULT_ABI);
+}
+
 /// Trace ABI 布局锚定（编译期 `const _` 断言之外的 host 复核；与 Core
 /// `trace::abi` 的布局测试同值，改了字段必须双侧同步）。
 #[test]

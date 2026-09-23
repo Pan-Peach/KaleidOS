@@ -373,7 +373,8 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
 ///
 /// 这是 `kcore_component_create` 的便利入口（`config_abi = 0`，无 config 负载）。
 /// 返回 ComponentId raw（≥ 0）/ `-Errno`
-/// （`EINVAL` 名字非法；其余见 `Errno::from(ComponentLoadError)`）。
+/// （`EINVAL` 名字非法；其余见 [`ComponentLoadError::abi_status`]——组件的 create
+/// 返回码**原样**透传，不塌缩成 `EIO`）。
 extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
     with_core_critical(|| {
         let Some(name) = checked_name(name_ptr, name_len) else {
@@ -381,7 +382,7 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
         };
         match crate::component::load::load_and_start(name) {
             Ok(id) => id.raw() as i32,
-            Err(error) => Errno::from(error).code(),
+            Err(error) => error.abi_status(),
         }
     })
 }
@@ -394,7 +395,8 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
 ///
 /// 成功 = 0，实例 id（`u32`）写入 `*out_instance`（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` `args` / `out_instance` 为空 / `EINVAL` 名字非法 /
-/// 其余见 `Errno::from(ComponentLoadError)`）。
+/// 其余见 [`ComponentLoadError::abi_status`]——组件的 create 返回码**原样**透传，
+/// 不塌缩成 `EIO`）。
 extern "C" fn kcore_component_create(
     image_name: *const u8,
     image_name_len: usize,
@@ -417,7 +419,7 @@ extern "C" fn kcore_component_create(
                 unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
                 0
             }
-            Err(error) => Errno::from(error).code(),
+            Err(error) => error.abi_status(),
         }
     })
 }

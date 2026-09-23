@@ -1,11 +1,14 @@
 //! prober-owned assignment cursor（纯逻辑，host-testable）。
 //!
 //! prober 把某驱动声明的 compatible 命中的 DeviceId 枚举进这里；
-//! [`AssignmentCursor::next`] 就是那条**游标**，逐台把设备交给驱动；
-//! [`AssignmentCursor::report`] 记录驱动对每个 attempt 的结果。
+//! [`AssignmentCursor::next`] 是那条**游标**——**由 prober 自己的 dispatch 任务**
+//! 逐台取出（每台对应一次 `kcore_component_create` 的 assignment）；
+//! [`AssignmentCursor::report`] 记录该 attempt 的结果，同样是 prober 的**普通本地
+//! 函数调用**（不是 driver 回调，也没有任何 endpoint 往返）。
 //!
-//! `attempt` 是 prober 分配的序号（1 起、唯一），**只用于拒绝 stale report**，
-//! **不是 capability**——它既不是 handle，也不携带 authority。
+//! `attempt` 是 prober 分配的序号（1 起、唯一），既用于结果端口名
+//! （`probe.result.<attempt>`），也用于拒绝 stale report——它**不是 capability**：
+//! 既不是 handle，也不携带 authority。
 
 /// 下发分配的上限（静态定长；无 alloc）。QEMU virt 有 8 台 `virtio,mmio`
 /// transport，16 给“再来一类候选”留出余量。
@@ -77,8 +80,9 @@ impl AssignmentCursor {
         true
     }
 
-    /// 按 push 顺序下发 `driver` 的下一台**尚未下发**的设备，返回
-    /// `(attempt, device_id)`；没有更多返回 `None`（ABI 翻译成 `-ENOENT`）。
+    /// 按 push 顺序取出 `driver` 的下一台**尚未下发**的设备，返回
+    /// `(attempt, device_id)`；没有更多返回 `None`（dispatch 任务据此结束该候选）。
+    /// 取出后该项即为"已下发"——结果经 [`Self::report`] 本地记录。
     pub fn next(&mut self, driver: &[u8]) -> Option<(u32, u32)> {
         for entry in self.entries[..self.count].iter_mut() {
             if entry.driver == driver && !entry.handed {
@@ -89,7 +93,7 @@ impl AssignmentCursor {
         None
     }
 
-    /// 记录某个已下发 `attempt` 的结果（`outcome` 编码见 SDK）。
+    /// 记录某个已下发 `attempt` 的结果（`outcome` 编码见 SDK `probe` 模块）。
     pub fn report(&mut self, attempt: u32, outcome: i32, detail: u32) -> Result<(), ReportError> {
         let Some(entry) = self.entries[..self.count]
             .iter_mut()

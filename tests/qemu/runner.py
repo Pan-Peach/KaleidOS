@@ -29,6 +29,23 @@ the selected profile.  Select a profile first, e.g.
        capacity probe) and exactly one `[fatfs] gate dispatch` line, `method=0`
        (the composer's filesystem mount probe)  -> every business read in both
        chains is Direct: no `kcore_endpoint_call`, no per-call service stack.
+2c. acyclic prober -> driver flow —— with one 1 MiB virtio-blk drive attached,
+   type `load driver_prober`: the prober enumerates the `virtio,mmio` candidates
+   and provisions the driver by `kcore_component_create(virtio_blk,
+   DriverCreateConfig{device_id, 结果端口名})`. The assignment travels INTO
+   create (flat bytes); the driver never calls back into the prober. After
+   create returns 0 the prober PULLS the driver's `probe.result` endpoint
+   (`driver_prober: pull probe.result.1 endpoint=`) and records the outcome
+   locally. Evidence required:
+     * `driver_prober: create virtio_blk attempt=1 device_id=` then
+       `driver_prober: created virtio_blk instance=` and the pull line;
+     * the driver attached (`virtio_blk capacity: 2048 sectors`, `mbr sig=aa55`,
+       `virtio_blk: probe.result published (outcome=0)`) and the pull reports
+       `outcome=0 (Match)`, after which the prober stops
+       (`attempt=1 Match; stopping after first attachment`, exactly one create);
+     * NO re-entrancy / EBUSY rejection marker anywhere (`Reentrant`, `re-entr`,
+       `EBUSY`) -> the flow is acyclic; the old `driver.prober` callback cycle is
+       gone rather than the re-entry gate being weakened.
 3. shutdown —— type `shutdown`, expect QEMU to exit.
 
 Failure contract (any of these fails the run):
@@ -53,6 +70,10 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOGS_DIR = os.path.join(REPO, "tests", "qemu", "logs")
+BUILD_DIR = os.path.join(REPO, "build")
+# 2c 的 virtio-blk 盘：1 MiB raw + MBR 签名（与 driver_prober_runner 同一约定）。
+DISK_BYTES = 1024 * 1024
+MBR_SIG_OFFSET = 510
 
 ARCH_CONF = {
     "rv64": {
@@ -88,9 +109,23 @@ FS_CONSUMER_OK = "[fs_consumer] read ok"
 FS_CONSUMER_CLOSE_OK = "[fs_consumer] close ok"
 FS_CONSUMER_UNMOUNT_OK = "[fs_consumer] unmount ok"
 FS_GATE_DISPATCH = "[fatfs] gate dispatch"
+# Acyclic prober -> driver flow (2c): assignment via create config, result by pull.
+PROBER_CMD = "load driver_prober\n"
+PROBER_LOAD_OK = "load driver_prober: OK"
+PROBER_QUEUED = "driver_prober: 1 candidate(s); dispatch queued"
+PROBER_CREATE = "driver_prober: create virtio_blk attempt=1 device_id="
+PROBER_CREATED = "driver_prober: created virtio_blk instance="
+PROBER_PULL = "driver_prober: pull probe.result.1 endpoint="
+PROBER_ASSIGNMENT = "virtio_blk: assignment device_id="
+PROBER_RESULT_MATCH = "virtio_blk: probe.result published (outcome=0)"
+PROBER_ATTACH = "virtio_blk capacity: 2048 sectors"
+PROBER_MATCH = "driver_prober: attempt=1 outcome=0 (Match) detail=0"
+PROBER_STOPPED = "driver_prober: attempt=1 Match; stopping after first attachment"
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
+# 无环流程绝不允许出现重入 / EBUSY 拒绝（旧回调模型才会撞上；见 2c）。
+REENTRANCY_MARKERS = ("Reentrant", "re-entr", "EBUSY")
 
 # 终端控制序列（core_test 的 ANSI 颜色码）：判定用原始流，写日志前剥离，
 # 让日志文件保持可 grep 的纯文本（`make qemu` 交互终端仍显示颜色）。
@@ -155,6 +190,15 @@ def send(proc, data: str):
     proc.stdin.flush()
 
 
+def make_disk(path: str) -> None:
+    """Create a 1 MiB raw disk image with MBR signature 0xaa55 at byte 510."""
+    image = bytearray(DISK_BYTES)
+    image[MBR_SIG_OFFSET] = 0x55
+    image[MBR_SIG_OFFSET + 1] = 0xAA
+    with open(path, "wb") as disk:
+        disk.write(image)
+
+
 def main() -> int:
     args = parse_args()
     arch = args.arch
@@ -169,8 +213,12 @@ def main() -> int:
         return 1
 
     os.makedirs(LOGS_DIR, exist_ok=True)
+    os.makedirs(BUILD_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = os.path.join(LOGS_DIR, f"{arch}-{stamp}.log")
+    # 2c 需要一台真实的 virtio-blk 设备（prober 的 assignment 要 attach 成功）。
+    disk = os.path.join(BUILD_DIR, f"runner-{arch}-virtio-blk.img")
+    make_disk(disk)
 
     cmd = [
         conf["qemu"],
@@ -180,6 +228,8 @@ def main() -> int:
         "-bios", "default",
         "-kernel", kernel,
         "-nographic",
+        "-drive", f"file={disk},if=none,format=raw,id=hd0",
+        "-device", "virtio-blk-device,drive=hd0",
     ]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -285,6 +335,50 @@ def main() -> int:
         summary.append(
             "block chain: PASS (Rust provider -> C FatFs -> FS consumer, "
             "Direct reads in both chains, 2 gate probes, 0 gate reads)"
+        )
+
+        # -- 2c) acyclic prober -> driver: create-with-config, result by pull --
+        send(proc, PROBER_CMD)
+        output4, ok = collect(
+            proc,
+            CHAIN_TIMEOUT_S,
+            [
+                PROBER_LOAD_OK,
+                PROBER_QUEUED,
+                PROBER_CREATE,
+                PROBER_CREATED,
+                PROBER_PULL,
+                PROBER_ASSIGNMENT,
+                PROBER_RESULT_MATCH,
+                PROBER_ATTACH,
+                PROBER_MATCH,
+                PROBER_STOPPED,
+            ],
+            FATAL_MARKERS + REENTRANCY_MARKERS,
+        )
+        output += "\n" + output4
+        if not ok:
+            raise RunFailure(
+                "prober -> driver flow did not complete: missing prober create / "
+                "pull-after-create / driver attach / Match / stop markers"
+            )
+        # 无环差分证据：整段输出不得出现重入 / EBUSY 拒绝。
+        for marker in REENTRANCY_MARKERS:
+            if marker in output4:
+                raise RunFailure(
+                    f"re-entrancy rejection marker {marker!r} present in the "
+                    "prober -> driver flow (the cycle is not gone)"
+                )
+        # prober 在首个 Match 之后停止：只创建过一个 driver 实例。
+        creates = output4.count("driver_prober: create virtio_blk ")
+        if creates != 1:
+            raise RunFailure(
+                f"expected exactly 1 driver create (stop after first attachment), "
+                f"saw {creates}"
+            )
+        summary.append(
+            "prober -> driver: PASS (assignment via create config, result pulled "
+            "from probe.result, no re-entrancy/EBUSY, 1 driver create)"
         )
 
         # -- 3) shutdown ---------------------------------------------------

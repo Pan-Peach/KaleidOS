@@ -161,6 +161,9 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::DeclareFailed => Errno::EEXIST,
             ComponentLoadError::ResolveFailed => Errno::ENOENT,
             ComponentLoadError::StartFailed => Errno::EIO,
+            // `CreateFailed` 的真实 errno 由 `ComponentLoadError::abi_status()` 在
+            // ABI 边界保留（`Errno` 无法表达任意 raw code，这里 EIO 只是兜底：
+            // 见 `create_failure_preserves_the_component_errno_at_the_abi_boundary`）。
             ComponentLoadError::CreateFailed(_) => Errno::EIO,
             ComponentLoadError::CreatePanicked => Errno::EIO,
             ComponentLoadError::DestroyFailed(_) => Errno::EIO,
@@ -519,6 +522,43 @@ mod tests {
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }
+    }
+
+    /// create 入口的原始 errno 必须在 ABI 边界**保留**：driver prober 的创建失败
+    /// 记录需要真实原因（`-EBUSY` / `-EINVAL`），不能塌缩成 `EIO`。
+    #[test]
+    fn create_failure_preserves_the_component_errno_at_the_abi_boundary() {
+        use crate::component::loader::LoaderError;
+        for (code, expected) in [
+            (Errno::ENODEV.code(), Errno::ENODEV.code()),
+            (Errno::EBUSY.code(), Errno::EBUSY.code()),
+            (Errno::EINVAL.code(), Errno::EINVAL.code()),
+            (Errno::ENOMEM.code(), Errno::ENOMEM.code()),
+        ] {
+            assert_eq!(
+                ComponentLoadError::CreateFailed(code).abi_status(),
+                expected,
+                "CreateFailed({code}) 必须原样透传"
+            );
+        }
+        // 正数非零 = 组件违反 `0 / -errno` 约定 → EIO（不是有意义的 errno）。
+        assert_eq!(
+            ComponentLoadError::CreateFailed(7).abi_status(),
+            Errno::EIO.code()
+        );
+        // 其余臂沿用 `From` 映射（边界状态码是同一张表 + create 透传）。
+        assert_eq!(
+            ComponentLoadError::NotFound.abi_status(),
+            Errno::ENOENT.code()
+        );
+        assert_eq!(
+            ComponentLoadError::Loader(LoaderError::BadMagic).abi_status(),
+            Errno::ENOEXEC.code()
+        );
+        assert_eq!(
+            ComponentLoadError::CreatePanicked.abi_status(),
+            Errno::EIO.code()
+        );
     }
 
     #[test]

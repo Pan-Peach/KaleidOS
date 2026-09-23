@@ -18,6 +18,7 @@ use crate::component::image::{self, ComponentImageId};
 use crate::component::interface::{self, InterfaceError};
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, failure, registry};
+use crate::errno::Errno;
 use crate::task::TaskId;
 use spin::Mutex;
 
@@ -64,12 +65,28 @@ pub enum ComponentLoadError {
     ServicePanicked,
 }
 
+impl ComponentLoadError {
+    /// ABI 边界状态码：**保留** `kcomp_instance_create` 返回的原始 `-errno`。
+    ///
+    /// 组成链上的 caller（尤其 driver prober 的创建失败记录）需要真实原因：
+    /// `-EBUSY`（独占设备 / 第二次 attachment）、`-EINVAL`（config 非法）不能被
+    /// 塌缩成 `EIO`。正数非零违反 `0 / -errno` 约定 → `EIO`（组件违约，不是
+    /// 有意义的 errno）；其余臂沿用 [`Errno::from`] 的映射。
+    pub fn abi_status(self) -> i32 {
+        match self {
+            Self::CreateFailed(code) if code < 0 => code,
+            Self::CreateFailed(_) => Errno::EIO.code(),
+            other => Errno::from(other).code(),
+        }
+    }
+}
+
 /// 当前正在创建的实例（create 调用期间由 Core 记录）。
 ///
-/// `kcore_interface_publish` 的 provider 以及锚点上 create 阶段的 task
-/// requester 从这里解析——组件不需要知道自己/别人的 ComponentId，Core 不信任
-/// 组件自报的身份。普通任务的 requester 从 `TaskRecord.owner` 解析。嵌套创建
-/// （组件 create 里再创建别的组件）时保存/恢复。
+/// `kcore_interface_publish` / `kcore_endpoint_publish` 的 provider 以及锚点上
+/// create 阶段的 task requester 从这里解析——组件不需要知道自己/别人的
+/// ComponentId，Core 不信任组件自报的身份。普通任务的 requester 从
+/// `TaskRecord.owner` 解析。嵌套创建（组件 create 里再创建别的组件）时保存/恢复。
 static CURRENT: Mutex<Option<ComponentId>> = Mutex::new(None);
 
 /// 取当前正在创建的实例；不在 create 调用内返回 None。

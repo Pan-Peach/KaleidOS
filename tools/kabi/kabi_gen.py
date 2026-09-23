@@ -1793,7 +1793,7 @@ OUTPUTS: Tuple[Output, ...] = (
     Output(
         "c",
         "os/components/kcomp-sdk/include/generated/kcomp_abi.h",
-        ("component.toml", "core.toml", "block.toml", "filesystem.toml"),
+        ("component.toml", "core.toml", "block.toml", "filesystem.toml", "probe.toml"),
         guard="KCOMP_GENERATED_ABI_H",
     ),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/abi.rs", ("component.toml", "core.toml")),
@@ -1805,6 +1805,7 @@ OUTPUTS: Tuple[Output, ...] = (
         "os/components/kcomp-sdk/src/generated/filesystem.rs",
         ("filesystem.toml",),
     ),
+    Output("sdk-rust", "os/components/kcomp-sdk/src/generated/probe.rs", ("probe.toml",)),
     Output("core-rust", "os/core/src/generated/abi.rs", ("component.toml", "core.toml")),
     Output(
         "core-exports",
