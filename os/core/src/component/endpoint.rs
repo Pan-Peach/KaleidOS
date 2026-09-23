@@ -5,10 +5,11 @@
 //! `component/interface.rs` 是上一代模型：**一个全局接口名 → 一个 provider 绑定槽**
 //! （`api` / `ctx` function table），同 ABI 重发布是**覆盖**。本模块是它的替代真相模型：
 //! Core 数据模型 + 导出面（`kcore_endpoint_publish` / `kcore_endpoint_lookup` /
-//! `kcore_endpoint_call`，call 实现见 `component/call.rs`）+ 生命周期接线
-//! （create 提交 / failure·stop 失效）已落地；consumer **尚未迁移**——
-//! `interface.rs` 与 `kcore_interface_*` 并行运行（scheduler / core_test 仍在用），
-//! 下一阶段整体替换。
+//! `kcore_endpoint_validate` / `kcore_endpoint_bind` / `kcore_endpoint_call`，call
+//! 实现见 `component/call.rs`）+ 生命周期接线（create 提交 / failure·stop 失效）
+//! 已落地。`bind` 是 **Direct / Gate 的唯一选择点**；第一条完整链（Rust provider →
+//! C consumer）走 Direct。旧模型仍在并行运行（scheduler / core_test 等消费方尚未
+//! 迁移），下一阶段整体替换。
 //!
 //! ```text
 //! Contract：契约身份（kind + exact ABI fingerprint + 诊断名）—— 语义
@@ -23,12 +24,31 @@
 //!   不可变。两个实例可以发布**同名端口 + 同一契约**，各自持有不同 endpoint。
 //! - **publish 创建新 endpoint，绝不覆盖**：没有"同 ABI 覆盖原槽"。端口名在
 //!   **provider 实例内唯一**：重复发布同一端口名（含已失效名字）拒绝，不重定向。
-//! - **consumer 只持有 [`EndpointId`]**：本模型没有 `api` / `ctx`——provider callable
-//!   指针不进入 Core 真相；传输方式（direct call / IPC / Wasm host call）由未来
-//!   阶段按执行域决定，不改本数据模型。
+//! - **consumer 只持有 [`EndpointId`]**：`EndpointId` 是 opaque capability。provider
+//!   交付的 `api` / `ctx`（Direct 的 function table + state）与 `port`（Gate 的
+//!   dispatch token）存在 endpoint 记录上，但 Core **只存、永不解引用**；两者如何
+//!   使用由 [`EndpointRegistry::bind`] 在 bind 时按执行域选定（见下）。
 //! - **EndpointId 单调、从 1 起、绝不回收 / 重定向**：provider 停止或失败后旧
 //!   endpoint 永久 `Invalid`，绝不会解析到新实例。
 //! - 标识符不带版本后缀：契约演进 = 原地替换（`AGENTS.md`）。
+//!
+//! # bind：Core 在绑定时刻选定调用机制（`docs/architecture/deployment.md` §2/§3）
+//!
+//! [`EndpointRegistry::bind`] 是 **Direct / Gate 的唯一选择点**（一次，运行期不再
+//! 按调用重决策）：
+//!
+//! ```text
+//! 校验（exact contract + abi + 存活，复用 lookup）
+//!   → 解析 (caller 执行域, provider 执行域)
+//!   → select_mechanism：
+//!       同域 KernelNative          → Direct（api/ctx 原样交付）
+//!       KernelNative ↔ Isolated    → Gate（opaque EndpointId）
+//!       Isolated ↔ Isolated        → Gate（同 AS 无法证明，绝不假设 Direct）
+//!       Sandbox / Wasm 参与        → 显式拒绝（ENOTSUP；绝不静默降级）
+//! ```
+//!
+//! SDK / 组件**只执行**机制、**不得选择**机制：`api` / `ctx` 只在 Direct 结果里
+//! 交付，Gate 结果不携带裸 function table（binding 不是可搬运的 POD）。
 //!
 //! # 表结构（真相 / 发现分离）
 //!
@@ -61,8 +81,11 @@
 //!   证明（host fake 不执行组件入口体）。
 //! - **不做 escape-eligibility scope**：Core 临界区内的 provider panic 保持致命
 //!   （下一阶段）；
-//! - 不迁 consumer（scheduler / core_test 仍走 `kcore_interface_*`）；
-//! - 不新增 `TraceEvent`（事件 kind 是 ABI 编码，留给下一阶段）；
+//! - **部署 / 域字段仍不存在**：`instance_domain` 恒返回 KernelNative（唯一真实
+//!   存在的部署）；跨域臂已在 `select_mechanism` 里显式拒绝，不是"假装支持"；
+//! - 旧模型消费方（scheduler / core_test）未迁移，仍走 `kcore_interface_*`；
+//! - 不新增 `TraceEvent`（bind 的 caller/callee 域与机制暂不落 trace——事件 kind
+//!   是 ABI 编码，留给下一阶段）；
 //! - 不做 endpoint 回收（`Invalid` 记录保留为 tombstone，id 不复用）。
 
 use alloc::vec::Vec;
@@ -122,7 +145,12 @@ pub enum EndpointState {
     Invalid,
 }
 
-/// 一条 endpoint 真相（`Copy`：无 `Vec`、无借用、无 provider callable 指针）。
+/// 一条 endpoint 真相（`Copy`：无 `Vec`、无借用）。
+///
+/// `api` / `ctx` 是 provider 发布的 **Direct** transport（function table + opaque
+/// state），`port` 是 **Gate** transport（image 的 `kcomp_service_dispatch` 用它选
+/// 契约）。Core 只存这些值、**永不解引用**，并只在 [`EndpointRegistry::bind`]
+/// 选 Direct 时把 `api` / `ctx` 原样交给调用方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointRecord {
     pub id: EndpointId,
@@ -134,7 +162,16 @@ pub struct EndpointRecord {
     /// exact ABI fingerprint（发布时从契约记录拷贝）。
     pub abi: InterfaceAbi,
     pub state: EndpointState,
+    /// provider 的 `#[repr(C)]` function table 指针（Direct；Core 只存）。
+    pub api: *const (),
+    /// provider 的 opaque state（Direct；Core 原样回传）。
+    pub ctx: *mut (),
 }
+
+// `api` / `ctx` 是 opaque provider 指针：Registry 只存取、永不解引用。Send/Sync
+// 安全（与 `interface.rs` 的 `BindingRecord` 同一理由；跨线程使用由外层 Mutex 串行化）。
+unsafe impl Send for EndpointRecord {}
+unsafe impl Sync for EndpointRecord {}
 
 /// 一条契约记录（按 [`ContractId`] 唯一）：首次发布建立 `kind` / `abi`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +203,13 @@ struct PendingPublication {
     kind: InterfaceKind,
     abi: InterfaceAbi,
     port: u32,
+    api: *const (),
+    ctx: *mut (),
 }
+
+// 同 [`EndpointRecord`]：opaque provider 指针，Registry 只存取。
+unsafe impl Send for PendingPublication {}
+unsafe impl Sync for PendingPublication {}
 
 /// Endpoint 模型的拒绝原因（独立于 [`crate::component::interface::InterfaceError`]：
 /// 两代模型的概念不同，不共用错误类型）。
@@ -190,6 +233,114 @@ pub enum EndpointError {
     DuplicatePort,
     /// EndpointId 空间耗尽（u64 单调递增）。
     IdExhausted,
+}
+
+/// 一个组件实例的执行域（`docs/architecture/deployment.md` §3 的模式矩阵）。
+///
+/// **今天只有 [`ExecutionDomain::KernelNative`] 真实存在**：Core 还没有部署 / 域
+/// 字段（deployment.md §7.3），所有实例都跑在共享内核地址空间里。其余变体是矩阵
+/// 的另一半——`select_mechanism` 的交叉臂已经在跑（host 测试覆盖），但**没有**
+/// 任何“假装已实现”的路径：需要未实现机制的组合一律显式拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDomain {
+    /// 与 Core 同特权、同地址空间（今天唯一存在的域）。
+    KernelNative,
+    /// 同特权、私有地址空间（**未实现**：无私有 AS / `satp` 切换）。
+    IsolatedNative,
+    /// 低特权 + 私有地址空间（**未实现**：无 U-mode）。
+    SandboxedNative,
+    /// 更远的执行后端（**未实现**：host call 不在本 ABI 内）。
+    Wasm,
+}
+
+/// Core 在 **bind 时**为一次调用选定的机制（一次，运行期不再重决策）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    /// 同域 KernelNative：provider 的 function table 直接调用（稳态零 Core 介入）。
+    Direct,
+    /// 跨域 / 需 containment：调用走 `kcore_endpoint_call` 的 Core call gate。
+    Gate,
+}
+
+/// bind 的拒绝原因（`kcore_endpoint_bind` 的 ABI 翻译在 `errno.rs`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindError {
+    /// endpoint 校验失败（未发布 / 已死 / owner 消失 / contract·abi 不符）。
+    Endpoint(EndpointError),
+    /// `(caller domain, provider domain)` 没有**已实现**的合法机制
+    /// （跨特权 / Wasm / 同 AS 无法证明且 syscall-IPC 未实现）→ `ENOTSUP`。
+    /// **绝不静默降级成 Direct**（deployment.md §2 ⑤）。
+    UnsupportedMechanism,
+    /// 选中 Direct，但 provider 发布时没有交付 function table（`api` 为空）——
+    /// 该 provider 无法服务 Direct → `ENOTSUP`。
+    DirectWithoutApi,
+}
+
+impl From<EndpointError> for BindError {
+    fn from(error: EndpointError) -> Self {
+        Self::Endpoint(error)
+    }
+}
+
+/// 一次成功 bind 的结果：endpoint 真相（`Copy`）+ Core 选定的机制。
+///
+/// `api` / `ctx` 只在 `mechanism == Direct` 时有意义；Gate 结果不携带裸 function
+/// table（binding 不是可搬运的 POD）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundEndpoint {
+    pub record: EndpointRecord,
+    pub mechanism: Mechanism,
+}
+
+/// **机制选择的唯一决策函数**（Core owns truth；SDK / 组件只执行，不选择）。
+///
+/// 输入是**两端**的执行域（`docs/architecture/deployment.md` §3 矩阵），输出是
+/// 该组合下**已实现**的合法机制；没有已实现机制的组合一律 `Err`——绝不静默
+/// 降级成 Direct：
+///
+/// ```text
+///                KernelNative   IsolatedNative   SandboxedNative   Wasm
+/// KernelNative   Direct         Gate             Gate              reject
+/// Isolated       Gate           Gate (*)         Gate              reject
+/// Sandboxed      reject         reject           reject            reject
+/// Wasm           reject         reject           reject            reject
+/// ```
+///
+/// (*) `Isolated ↔ Isolated`：矩阵允许“同一 AS 时 Direct”，但今天**无法证明**
+/// 两个实例共享同一 AS（私有 AS 尚未实现），因此选 Gate——"同 AS 未知"绝不假设
+/// Direct。Sandbox 参与的组合需要 syscall-IPC（未实现）或可证明的同 AS，一律拒绝。
+pub fn select_mechanism(
+    caller: ExecutionDomain,
+    provider: ExecutionDomain,
+) -> Result<Mechanism, BindError> {
+    use ExecutionDomain::{IsolatedNative, KernelNative, SandboxedNative, Wasm};
+    match (caller, provider) {
+        // 同域 KernelNative：单一内核 AS + 同特权 → Direct。
+        (KernelNative, KernelNative) => Ok(Mechanism::Direct),
+        // K ↔ I / K → S / I → S：同特权（或 Core 经 sret 进入 U）→ Gate。
+        (KernelNative, IsolatedNative)
+        | (IsolatedNative, KernelNative)
+        | (KernelNative, SandboxedNative)
+        | (IsolatedNative, SandboxedNative) => Ok(Mechanism::Gate),
+        // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
+        (IsolatedNative, IsolatedNative) => Ok(Mechanism::Gate),
+        // Sandbox caller：需要 syscall-IPC（未实现）；同 AS 同样无法证明。
+        (SandboxedNative, _) => Err(BindError::UnsupportedMechanism),
+        // Sandbox callee（caller 不是 Sandbox 的臂已在上面给出 Gate）。
+        (_, SandboxedNative) => Err(BindError::UnsupportedMechanism),
+        // Wasm：host call 不在本 ABI 内。
+        (Wasm, _) | (_, Wasm) => Err(BindError::UnsupportedMechanism),
+    }
+}
+
+/// 解析一个实例的执行域。
+///
+/// 今天唯一真实存在的部署是 KernelNative（Core 尚无部署 / 域字段，deployment.md
+/// §7.3），因此这里恒返回它。bind 对 **caller 与 provider 两端各解析一次**——
+/// 引入部署域后，这里是唯一的解析点；绝不只按 provider 的部署标签决策
+/// （合法机制同时取决于两端，deployment.md §1）。
+pub fn instance_domain(_owner: ComponentId) -> ExecutionDomain {
+    ExecutionDomain::KernelNative
 }
 
 /// Contract / Endpoint 的 Core 真相：谁在哪个端口上发布了哪个契约。
@@ -227,6 +378,8 @@ impl EndpointRegistry {
         kind: InterfaceKind,
         abi: InterfaceAbi,
         port: u32,
+        api: *const (),
+        ctx: *mut (),
     ) -> Result<(), EndpointError> {
         let record = components
             .get(provider)
@@ -245,6 +398,8 @@ impl EndpointRegistry {
             kind,
             abi,
             port,
+            api,
+            ctx,
         });
         Ok(())
     }
@@ -271,6 +426,8 @@ impl EndpointRegistry {
                     kind: p.kind,
                     abi: p.abi,
                     port: p.port,
+                    api: p.api,
+                    ctx: p.ctx,
                 });
                 false
             } else {
@@ -312,6 +469,8 @@ impl EndpointRegistry {
                 contract: p.contract,
                 abi: p.abi,
                 state: EndpointState::Live,
+                api: p.api,
+                ctx: p.ctx,
             });
             self.names.push(EndpointName {
                 provider: p.provider,
@@ -371,6 +530,31 @@ impl EndpointRegistry {
             return Err(EndpointError::AbiMismatch);
         }
         Ok(record)
+    }
+
+    /// **bind：Core 在绑定时刻选定调用机制**（`kcore_endpoint_bind` 的实现）。
+    ///
+    /// 先做与 [`Self::lookup`] 同一套校验（exact contract + abi + 存活），再按
+    /// `(caller 执行域, provider 执行域)` 调 [`select_mechanism`]。Direct 结果要求
+    /// provider 交付了 function table（`api` 非空）；Gate 结果不携带裸 function
+    /// table。任何无已实现机制的组合都返回 [`BindError::UnsupportedMechanism`]。
+    pub fn bind(
+        &self,
+        components: &Registry,
+        id: EndpointId,
+        contract: ContractId,
+        abi: InterfaceAbi,
+        caller_domain: ExecutionDomain,
+    ) -> Result<BoundEndpoint, BindError> {
+        // (1) 校验：contract + abi exact-match + 存活（与 validate 同一入口）。
+        let record = self.lookup(components, id, contract, abi)?;
+        // (2) 机制选择：两端执行域缺一不可。
+        let mechanism = select_mechanism(caller_domain, instance_domain(record.owner))?;
+        // (3) Direct 必须真的有 function table 可交付（结构性检查，不解引用）。
+        if mechanism == Mechanism::Direct && record.api.is_null() {
+            return Err(BindError::DirectWithoutApi);
+        }
+        Ok(BoundEndpoint { record, mechanism })
     }
 
     /// 组合期显式解析：composer 问 `(ComponentId, 端口名, contract) → EndpointId`。
@@ -528,6 +712,9 @@ mod tests {
     const ABI_A: InterfaceAbi = InterfaceAbi::from_raw(0xAAAA_0001);
     const ABI_B: InterfaceAbi = InterfaceAbi::from_raw(0xBBBB_0002);
 
+    /// Direct function table 的替身地址（Core 只存、不解引用）。
+    static TABLE: [u8; 8] = [0; 8];
+
     /// 构造注册表并声明三个 Ready 实例（provider_a / provider_b / provider_c）。
     fn ready_world() -> (Registry, Vec<ComponentId>) {
         let mut reg = Registry::new();
@@ -559,6 +746,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             port,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.commit_pending(reg, provider).unwrap();
@@ -580,6 +769,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             7,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
 
@@ -619,6 +810,8 @@ mod tests {
                 InterfaceKind::Device,
                 ABI_A,
                 0,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             ),
             Err(EndpointError::ProviderNotFound)
         );
@@ -635,6 +828,8 @@ mod tests {
                 InterfaceKind::Device,
                 ABI_A,
                 0,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             ),
             Err(EndpointError::ProviderNotReady)
         );
@@ -648,6 +843,8 @@ mod tests {
                 InterfaceKind::Device,
                 ABI_A,
                 0,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             ),
             Err(EndpointError::ProviderNotReady)
         );
@@ -660,6 +857,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             0,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
     }
@@ -677,6 +876,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             8,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.discard_pending(ids[1]);
@@ -733,6 +934,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             8,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.stage_publish(
@@ -743,6 +946,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_B,
             9,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(
@@ -764,6 +969,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             10,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.stage_publish(
@@ -774,6 +981,8 @@ mod tests {
             InterfaceKind::Service,
             ABI_A,
             11,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(
@@ -795,6 +1004,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             12,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.stage_publish(
@@ -805,6 +1016,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_B,
             13,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(
@@ -838,6 +1051,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             7,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(
@@ -902,6 +1117,209 @@ mod tests {
             er.lookup(&empty, endpoint, CONTRACT, ABI_A),
             Err(EndpointError::ProviderNotFound)
         );
+    }
+
+    // -- 4b. bind：Core 在绑定时刻选定调用机制 -------------------------------
+
+    /// 发布一个带 Direct function table 的端口并提交（provider 已 Ready）。
+    fn publish_ready_with_table(
+        er: &mut EndpointRegistry,
+        reg: &Registry,
+        provider: ComponentId,
+        port_name: &[u8],
+        port: u32,
+        api: *const (),
+        ctx: *mut (),
+    ) -> EndpointId {
+        er.stage_publish(
+            reg,
+            provider,
+            port_name,
+            CONTRACT,
+            InterfaceKind::Device,
+            ABI_A,
+            port,
+            api,
+            ctx,
+        )
+        .unwrap();
+        er.commit_pending(reg, provider).unwrap();
+        er.discover(reg, provider, port_name, CONTRACT).unwrap()
+    }
+
+    /// `select_mechanism` 覆盖**全部 16 个 (caller, provider) 组合**：
+    /// 同域 KernelNative → Direct；同特权跨域（K↔I、I↔I、K→S、I→S）→ Gate；
+    /// Sandbox / Wasm 参与 → 显式拒绝（**绝不静默降级成 Direct**）。
+    #[test]
+    fn select_mechanism_covers_the_domain_matrix() {
+        use ExecutionDomain::{IsolatedNative as I, KernelNative as K};
+        use ExecutionDomain::{SandboxedNative as S, Wasm as W};
+
+        let cases: [(
+            ExecutionDomain,
+            ExecutionDomain,
+            Result<Mechanism, BindError>,
+        ); 16] = [
+            (K, K, Ok(Mechanism::Direct)),
+            (K, I, Ok(Mechanism::Gate)),
+            (K, S, Ok(Mechanism::Gate)),
+            (K, W, Err(BindError::UnsupportedMechanism)),
+            (I, K, Ok(Mechanism::Gate)),
+            // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
+            (I, I, Ok(Mechanism::Gate)),
+            (I, S, Ok(Mechanism::Gate)),
+            (I, W, Err(BindError::UnsupportedMechanism)),
+            // Sandbox caller 需要 syscall-IPC（未实现）→ 拒绝。
+            (S, K, Err(BindError::UnsupportedMechanism)),
+            (S, I, Err(BindError::UnsupportedMechanism)),
+            (S, S, Err(BindError::UnsupportedMechanism)),
+            (S, W, Err(BindError::UnsupportedMechanism)),
+            (W, K, Err(BindError::UnsupportedMechanism)),
+            (W, I, Err(BindError::UnsupportedMechanism)),
+            (W, S, Err(BindError::UnsupportedMechanism)),
+            (W, W, Err(BindError::UnsupportedMechanism)),
+        ];
+        for (caller, provider, expected) in cases {
+            assert_eq!(
+                select_mechanism(caller, provider),
+                expected,
+                "{caller:?} -> {provider:?}"
+            );
+        }
+    }
+
+    /// bind（同域 KernelNative）：机制 = Direct，`api` / `ctx` 从 endpoint 记录
+    /// **原样**交付（Core 不解引用、不复制内容）。
+    #[test]
+    fn bind_same_domain_returns_direct_with_provider_table() {
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let mut state = 0u8;
+        let ctx = &mut state as *mut u8 as *mut ();
+        let api = &TABLE as *const u8 as *const ();
+        let endpoint = publish_ready_with_table(&mut er, &reg, ids[0], b"blk0", 7, api, ctx);
+
+        let bound = er
+            .bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
+        assert_eq!(bound.mechanism, Mechanism::Direct);
+        assert_eq!(bound.record.api, api);
+        assert_eq!(bound.record.ctx, ctx);
+        assert_eq!(bound.record.owner, ids[0]);
+    }
+
+    /// bind 的校验与 validate 同源：contract / abi **exact-match** + 存活。
+    #[test]
+    fn bind_rejects_contract_abi_and_liveness_failures() {
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let endpoint = publish_ready_with_table(
+            &mut er,
+            &reg,
+            ids[0],
+            b"blk0",
+            7,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+
+        assert_eq!(
+            er.bind(
+                &reg,
+                endpoint,
+                OTHER_CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative
+            ),
+            Err(BindError::Endpoint(EndpointError::ContractMismatch))
+        );
+        assert_eq!(
+            er.bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_B,
+                ExecutionDomain::KernelNative
+            ),
+            Err(BindError::Endpoint(EndpointError::AbiMismatch))
+        );
+        assert_eq!(
+            er.bind(
+                &reg,
+                EndpointId::from_raw(999),
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative
+            ),
+            Err(BindError::Endpoint(EndpointError::EndpointNotFound))
+        );
+
+        // provider 停止 / 失败 → endpoint 永久死亡，bind 绝不交付。
+        er.invalidate_endpoint(endpoint);
+        assert_eq!(
+            er.bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative
+            ),
+            Err(BindError::Endpoint(EndpointError::EndpointDead))
+        );
+    }
+
+    /// Direct 需要 provider 真的交付了 function table；`api` 为空 → 拒绝
+    /// （不把 null table 交给调用方）。
+    #[test]
+    fn bind_rejects_direct_without_function_table() {
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        // publish_ready 用空 api 发布（Gate-only provider 形状）。
+        let endpoint = publish_ready(&mut er, &reg, ids[0], b"blk0", CONTRACT, 7);
+        assert_eq!(
+            er.bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative
+            ),
+            Err(BindError::DirectWithoutApi)
+        );
+    }
+
+    /// 交叉组合在 bind 上表现为 Gate（不携带裸 function table）——机制由两端
+    /// 执行域决定，不由 provider 的部署标签单独决定。
+    #[test]
+    fn bind_cross_domain_selects_gate_without_function_table() {
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let endpoint = publish_ready_with_table(
+            &mut er,
+            &reg,
+            ids[0],
+            b"blk0",
+            7,
+            &TABLE as *const u8 as *const (),
+            core::ptr::null_mut(),
+        );
+        let bound = er
+            .bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::IsolatedNative,
+            )
+            .unwrap();
+        assert_eq!(bound.mechanism, Mechanism::Gate);
+        assert_eq!(bound.record.port, 7, "Gate 经 port + dispatcher 分派");
     }
 
     /// `resolve` 是 call ABI 的纯存活解析：不携带 contract / abi（id 本身是
@@ -1057,6 +1475,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             7,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         er.stage_publish(
@@ -1067,6 +1487,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             8,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(
@@ -1086,6 +1508,8 @@ mod tests {
             InterfaceKind::Device,
             ABI_A,
             9,
+            core::ptr::null(),
+            core::ptr::null_mut(),
         )
         .unwrap();
         assert_eq!(

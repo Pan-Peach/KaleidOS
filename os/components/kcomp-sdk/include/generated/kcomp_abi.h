@@ -140,6 +140,15 @@ _Static_assert(offsetof(struct kcore_trace_stats, enabled_mask) == 32, "kcore_tr
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
 
+/* `kcore_endpoint_bind` 的机制编码：**Direct**（同域 KernelNative，provider 的
+ * `#[repr(C)]` function table 直接调用；稳态零 Core 介入）。SDK / 组件只**执行**
+ * 机制，不选择机制——选择由 Core 在 bind 时一次性做出（docs/architecture/deployment.md §2）。 */
+#define KCORE_ENDPOINT_MECHANISM_DIRECT UINT32_C(0)
+
+/* `kcore_endpoint_bind` 的机制编码：**Gate**（跨域 / 需 containment：调用走
+ * `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。 */
+#define KCORE_ENDPOINT_MECHANISM_GATE UINT32_C(1)
+
 /* -- Trace（只读观察面；无写入口） -- */
 /* 读 `seq >= since` 的第一条记录；没有更多时返回 -ENOENT（不返回 0）。 */
 int32_t kcore_trace_read(uint64_t since, struct kcore_trace_record *out, uint64_t *out_next);
@@ -207,8 +216,9 @@ int32_t kcore_dma_map(uint32_t device_id, uint8_t *ptr, size_t len, int32_t dire
 int32_t kcore_dma_unmap(uint64_t mapping);
 /* -- Component endpoints（Contract / Endpoint） -- */
 /* 发布 endpoint（staged：init 期间只记录 pending；create 返回 0 后 Core 原子提交）。
- * provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。 */
-int32_t kcore_endpoint_publish(const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint32_t kind, uint64_t abi, uint32_t port);
+ * provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。
+ * api/ctx 是 Direct 的 function table + state（Core 只存不解引用）；port 服务 Gate。 */
+int32_t kcore_endpoint_publish(const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint32_t kind, uint64_t abi, uint32_t port, const void *api, void *ctx);
 /* 按 (provider, port_name, contract) 发现 endpoint：只校验 contract + 存活，
  * **不校验 abi**（id 是 opaque capability，abi 用 kcore_endpoint_validate 核对）。
  * 成功写 EndpointId 到 *out_endpoint；失败返回 -Errno。 */
@@ -216,6 +226,11 @@ int32_t kcore_endpoint_lookup(uint32_t provider, const uint8_t *port_name, size_
 /* 只读校验端点：contract + abi exact-match + 存活（lookup）。无副作用；
  * 成功 = 0，失败 = -Errno（EINVAL 契约/ABI 不符；ENOENT 死端点；ENODEV provider 消失）。 */
 int32_t kcore_endpoint_validate(uint64_t endpoint, uint64_t contract, uint64_t abi);
+/* bind 时由 Core 选定机制（一次）：校验 contract+abi exact-match + 存活后，同域
+ * KernelNative → DIRECT（写 out_api / out_ctx）；否则 → GATE（不写 api/ctx，改用
+ * kcore_endpoint_call）。不支持的组合返回 -ENOTSUP，绝不静默降级；无组件执行边界
+ * 返回 -EPERM。 */
+int32_t kcore_endpoint_bind(uint64_t endpoint, uint64_t contract, uint64_t abi, uint32_t *out_mechanism, size_t *out_api, size_t *out_ctx);
 /* 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
  * *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
  * 执行（per-call 栈 / provider principal / re-entry 与 IRQ 门禁 / panic containment）。 */

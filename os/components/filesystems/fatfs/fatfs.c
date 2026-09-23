@@ -7,6 +7,22 @@
 
 #define FATFS_MAX_OPEN_FILES 8
 
+/* create config（组合策略提供；Core 视为不透明字节）。
+ *
+ *   endpoint = block provider 的 opaque EndpointId——组合期由 composer 用
+ *              `kcore_endpoint_lookup` 解析后交付；本组件**不做**全局名字发现，
+ *              没有 endpoint 就没有块设备。
+ *
+ * `config_abi` 是布局指纹（8 字节 ASCII "FATFSCFG" 的大端读数）：对不上直接拒绝
+ * 创建，不静默按空配置跑。composer 的镜像定义见
+ * `os/components/block_chain/src/lib.rs`（同一布局、同一指纹）。 */
+struct fatfs_create_config
+{
+    uint64_t endpoint;
+};
+
+#define FATFS_CREATE_CONFIG_ABI UINT64_C(0x4641544653434647)
+
 struct fatfs_file_slot
 {
     int used;
@@ -17,11 +33,8 @@ struct fatfs_state
 {
     FATFS filesystem;
 
-    const struct kcomp_block_device_api *block_device_api;
-    void *block_ctx;
-
-    uint64_t binding;
-    uint64_t generation;
+    /* Core 在 create 里选定的调用绑定（机制藏在绑定内部）。 */
+    struct kcomp_block_binding block_binding;
 
     int mounted;
     int alive;
@@ -290,16 +303,18 @@ static void fatfs_selftest_task(void *arg)
     }
 
     result = fatfs_read(state, handle, buffer, sizeof(buffer), &bytes_read);
-    if (result < 0)
+    if (result < 0 || bytes_read == 0)
     {
         kcore_log_line((const uint8_t *)"[fatfs] selftest: read failed\n",
                        sizeof("[fatfs] selftest: read failed\n") - 1);
     }
     else
     {
-        (void)bytes_read;
         kcore_log_line((const uint8_t *)"[fatfs] selftest: read ok\n",
                        sizeof("[fatfs] selftest: read ok\n") - 1);
+        /* 内容原样打一行（不带额外前缀）：QEMU runner 逐字节比对 provider 生成的
+         * 卷内容——"C consumer 经 Direct 拿到 Rust provider 的正确字节"的证据。 */
+        kcore_log_line(buffer, bytes_read);
     }
 
     if (fatfs_close(state, handle) < 0)
@@ -330,12 +345,25 @@ int32_t kcomp_instance_create(
     const struct KcompCreateArgs *args,
     void **out_state)
 {
-    (void)args;
-
     if (out_state == NULL)
         return -EFAULT;
 
     *out_state = NULL;
+
+    /* block endpoint 必须由组合策略经 create config 交付（本组件不做全局名字
+     * 发现）；config_abi 对不上 = 布局不符，拒绝创建而不是猜。 */
+    if (args == NULL || args->config_abi != FATFS_CREATE_CONFIG_ABI)
+    {
+        return -EINVAL;
+    }
+
+    if (args->config == NULL || args->config_len != sizeof(struct fatfs_create_config))
+    {
+        return -EINVAL;
+    }
+
+    const struct fatfs_create_config *config =
+        (const struct fatfs_create_config *)args->config;
 
     struct fatfs_state *state = (struct fatfs_state *)kcore_heap_alloc(
         sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
@@ -346,30 +374,23 @@ int32_t kcomp_instance_create(
 
     memset(state, 0, sizeof(struct fatfs_state));
 
-    size_t block_api_raw = 0;
-    size_t block_ctx_raw = 0;
-
-    // Register the filesystem API with the core
-    int32_t result = kcore_interface_bind(
-        (const uint8_t *)KCOMP_BLOCK_DEVICE_NAME,
-        sizeof(KCOMP_BLOCK_DEVICE_NAME) - 1,
-        KCOMP_IFACE_DEVICE,
+    /* bind block endpoint：Core exact-compare contract + abi、校验存活，并按
+     * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
+     * 不选择、也看不到机制。 */
+    int32_t result = kcomp_block_bind(
+        config->endpoint,
+        KCOMP_BLOCK_DEVICE_CONTRACT,
         KCOMP_BLOCK_DEVICE_ABI,
-        &state->binding,
-        &block_api_raw,
-        &block_ctx_raw,
-        &state->generation);
+        &state->block_binding);
     if (result < 0)
     {
         kcore_heap_dealloc((uint8_t *)state, sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
         return result;
     }
 
-    state->block_device_api = (const struct kcomp_block_device_api *)(uintptr_t)block_api_raw;
-    state->block_ctx = (void *)(uintptr_t)block_ctx_raw;
     state->alive = 1;
 
-    result = fatfs_disk_attach(state->block_device_api, state->block_ctx);
+    result = fatfs_disk_attach(&state->block_binding);
     if (result < 0)
     {
         kcore_heap_dealloc((uint8_t *)state, sizeof(struct fatfs_state), _Alignof(struct fatfs_state));

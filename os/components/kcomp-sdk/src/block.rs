@@ -17,13 +17,17 @@
 //! impl BlockDeviceProvider for MyDevice { ... }   // provider：纯 Rust，无 unsafe
 //! static DEVICE: BlockDeviceService<MyDevice> =
 //!     BlockDeviceService::new(MyDevice { ... });
-//! DEVICE.publish()?;                              // 安全 fn；Core 在 instance_create 返回后 commit
+//! DEVICE.publish_endpoint(b"block.device", PORT)?;  // endpoint 模型（Direct + Gate）
+//! DEVICE.publish()?;                                // 旧 Interface 模型（迁移期保留）
 //! ```
 //!
 //! [`BlockDeviceService::new`] 用单态化 adapter 从 `P` 生成 table；adapter 统一执行
 //! 契约的入参校验（null / 空 / 非 512 倍数 → `-EINVAL`）并把裸指针收窄成
-//! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish`] 的安全性论证见其文档。
+//! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish`] /
+//! [`BlockDeviceService::publish_endpoint`] 的安全性论证见各自文档。
+//! consumer 侧见 [`client::BlockBinding`]（Core 在 bind 时选定机制）。
 
+use crate::abi;
 use crate::binding::{InterfaceAbi, InterfaceKind, Service, publish_service};
 use crate::endpoint::Contract;
 use crate::errno::{Errno, Result};
@@ -32,6 +36,11 @@ use crate::errno::{Errno, Result};
 //   - Direct：本文件下方的 `BlockDeviceService`（`#[repr(C)]` function table）；
 //   - Gate  ：`block::dispatch`（扁平 frame → 同一个 provider 方法）。
 // 业务后端不感知部署（docs/architecture/deployment.md §4）。
+//
+// `backend` 是**私有的调用后端**（Core 在 bind 时选定机制）；`client` 是 consumer
+// 侧的 typed 前端（`BlockBinding`）。provider 发布 endpoint 用
+// [`BlockDeviceService::publish_endpoint`]。
+mod backend;
 pub mod client;
 pub mod dispatch;
 
@@ -169,6 +178,39 @@ impl<P: BlockDeviceProvider> BlockDeviceService<P> {
         // SAFETY: api 由 new 从 P 原地生成（布局 = BlockDeviceApi，不是调用方数据）；
         // ctx = &'static self.provider（地址稳定性见 ctx()）。Core 只存指针、不解引用。
         unsafe { publish_service::<BlockDevice>(&self.api, self.ctx()) }
+    }
+
+    /// 发布 `block.device` **endpoint**（staged：只在 `kcomp_instance_create`
+    /// 期间有效；Core 在 create 返回 0 后原子提交）。
+    ///
+    /// `port_name` 是组合策略分配的端点名（在 provider 实例内唯一）；`port` 是
+    /// provider 定义的不透明 dispatch token——**Gate** 路径经 image 的
+    /// `kcomp_service_dispatch` 用它选中本契约。发布同时交付 **Direct** 的
+    /// `api` / `ctx`；**机制由 Core 在 bind 时按两端执行域选定**，provider 两种
+    /// transport 都提供、**不选择**（`docs/architecture/deployment.md` §2）。
+    ///
+    /// 安全性论证与 [`Self::publish`] 相同：`api` 由 `new` 从 `P` 原地生成，
+    /// `ctx` 是 `'static` provider 字段地址，两个 unsafe 前提都在本模块闭环。
+    pub fn publish_endpoint(&'static self, port_name: &[u8], port: u32) -> Result<()> {
+        // SAFETY: api 布局 = BlockDeviceApi（new 从 P 生成）；ctx = &'static
+        // self.provider（地址稳定）；Core 只存指针、不解引用。
+        let status = unsafe {
+            abi::kcore_endpoint_publish(
+                port_name.as_ptr(),
+                port_name.len(),
+                <BlockDevice as Contract>::ID,
+                <BlockDevice as Contract>::KIND.as_u32(),
+                <BlockDevice as Contract>::ABI,
+                port,
+                (&self.api as *const BlockDeviceApi).cast(),
+                self.ctx(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(Errno::from_code(status))
+        }
     }
 
     /// provider 的 opaque `ctx` = `&self.provider`（Core 原样回传给 table 方法）。

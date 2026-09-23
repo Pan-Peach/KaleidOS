@@ -1,0 +1,16 @@
+[package]
+name = "ram_blk"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# .kcomp = 链接后的组件程序：先编成 staticlib，再由 tools/build-kcomp.sh
+# partial link + GC + strip（SDK 随镜像私有携带）。
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk" }

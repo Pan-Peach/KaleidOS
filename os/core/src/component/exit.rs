@@ -523,6 +523,8 @@ mod tests {
                 InterfaceKind::Device,
                 ENDPOINT_ABI,
                 1,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, first).unwrap();
@@ -534,6 +536,8 @@ mod tests {
                 InterfaceKind::Device,
                 ENDPOINT_ABI,
                 2,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, second).unwrap();

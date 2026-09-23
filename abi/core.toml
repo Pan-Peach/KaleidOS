@@ -205,6 +205,27 @@ value = "12"
 doc = "`IrqAck`：IRQ 线完成 ack。"
 targets = "sdk-rust,core-rust"
 
+[[const]]
+name = "KCORE_ENDPOINT_MECHANISM_DIRECT"
+type = "u32"
+value = "0"
+doc = """
+`kcore_endpoint_bind` 的机制编码：**Direct**（同域 KernelNative，provider 的
+`#[repr(C)]` function table 直接调用；稳态零 Core 介入）。SDK / 组件只**执行**
+机制，不选择机制——选择由 Core 在 bind 时一次性做出（docs/architecture/deployment.md §2）。
+"""
+targets = "c,sdk-rust,core-rust"
+
+[[const]]
+name = "KCORE_ENDPOINT_MECHANISM_GATE"
+type = "u32"
+value = "1"
+doc = """
+`kcore_endpoint_bind` 的机制编码：**Gate**（跨域 / 需 containment：调用走
+`kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
+"""
+targets = "c,sdk-rust,core-rust"
+
 [[function]]
 name = "kcore_trace_read"
 ret = "i32"
@@ -724,6 +745,11 @@ provider = 当前正在创建的实例（Core 从 init 边界解析，**不信�
 `contract` 是组合策略提供的契约身份（不透明 `u64`）；`kind` / `abi` 由**首次发布**
 建立契约真相，后续发布不一致在 commit 时拒绝；`port` 是 provider 定义的不透明
 dispatch token（Core 从不解释）。端口名只要求在 **provider 实例内唯一**。
+`api` / `ctx` 是 provider 交付的两种 transport：`api` 指向 provider 的
+`#[repr(C)]` function table、`ctx` 是 provider opaque state（两者服务 **Direct**
+路径：`kcore_endpoint_bind` 原样交付，Core 只存、**永不解引用**）；`port` + image 的
+`kcomp_service_dispatch` 服务 **Gate** 路径。provider 提供哪种机制由 Core 在 bind
+时按 `(caller domain, callee domain)` 选定，组件不得自行选择。
 create 返回 0 后 Core 原子提交；本函数返回 `0` 只表示"已记录 pending"，
 **不返回 EndpointId**（id 只在 commit 成功后存在，由 `kcore_endpoint_lookup` 发现）。
 `Failed` provider / 不在 create 边界 → `-EPERM`；返回 `0 / -Errno`。
@@ -731,6 +757,7 @@ create 返回 0 后 Core 原子提交；本函数返回 `0` 只表示"已记录 
 c_doc = """
 发布 endpoint（staged：init 期间只记录 pending；create 返回 0 后 Core 原子提交）。
 provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。
+api/ctx 是 Direct 的 function table + state（Core 只存不解引用）；port 服务 Gate。
 """
 [[function.param]]
 name = "port_name"
@@ -750,6 +777,12 @@ type = "u64"
 [[function.param]]
 name = "port"
 type = "u32"
+[[function.param]]
+name = "api"
+type = "*const void"
+[[function.param]]
+name = "ctx"
+type = "*mut void"
 
 [[function]]
 name = "kcore_endpoint_lookup"
@@ -814,6 +847,55 @@ type = "u64"
 [[function.param]]
 name = "abi"
 type = "u64"
+
+[[function]]
+name = "kcore_endpoint_bind"
+ret = "i32"
+category = "Component endpoints（Contract / Endpoint）"
+c_category = "Component endpoints（Contract / Endpoint）"
+doc = """
+**bind 时选定调用机制**（一次，之后不再按调用重决策；docs/architecture/deployment.md §2/§3）。
+先做与 `kcore_endpoint_validate` 同一套校验（contract + abi **exact-match** + 存活：
+endpoint `Live`、owner 存在且 `Ready`），再按 `(caller 执行域, provider 执行域)`
+选定机制并写入 `*out_mechanism`（`KCORE_ENDPOINT_MECHANISM_DIRECT` /
+`KCORE_ENDPOINT_MECHANISM_GATE`）：
+
+- **Direct**：`*out_api` / `*out_ctx` 写入 provider 发布时交付的 function table 指针与
+  opaque state（Core 原样传递、**不解引用**）。只有同域 KernelNative 才可能选中。
+- **Gate**：`*out_api` / `*out_ctx` **不写**（保持调用方原值）；调用方改用
+  `kcore_endpoint_call`（同一 `endpoint` id 即 call-gate handle）。
+
+不支持的组合（跨特权 / Wasm / 无法证明同 AS 且 syscall-IPC 未实现）→ `-ENOTSUP`；
+**绝不静默降级成 Direct**。调用方不在任何组件执行边界内 → `-EPERM`；caller 已
+`Failed` → `-EPERM`。Direct 选中但 provider 未交付 function table（`api` 为空）→
+`-ENOTSUP`。成功 = `0`；失败 = `-Errno`（`EFAULT` 任一 out 为空 /
+`EINVAL` contract 或 abi 不符 / `ENOENT` endpoint 未发布或已死 /
+`ENODEV` provider 已不存在 / `ENOTSUP` 组合无已实现机制）。
+"""
+c_doc = """
+bind 时由 Core 选定机制（一次）：校验 contract+abi exact-match + 存活后，同域
+KernelNative → DIRECT（写 out_api / out_ctx）；否则 → GATE（不写 api/ctx，改用
+kcore_endpoint_call）。不支持的组合返回 -ENOTSUP，绝不静默降级；无组件执行边界
+返回 -EPERM。
+"""
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "contract"
+type = "u64"
+[[function.param]]
+name = "abi"
+type = "u64"
+[[function.param]]
+name = "out_mechanism"
+type = "*mut u32"
+[[function.param]]
+name = "out_api"
+type = "*mut usize"
+[[function.param]]
+name = "out_ctx"
+type = "*mut usize"
 
 [[function]]
 name = "kcore_endpoint_call"

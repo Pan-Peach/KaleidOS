@@ -3,9 +3,9 @@
 
 #include "kcomp.h"
 
-int32_t fatfs_disk_attach(
-    const struct kcomp_block_device_api *block,
-    void *block_ctx);
+/* 挂上/摘下活跃块绑定。绑定本身由 create config 里的 EndpointId 经
+ * `kcomp_block_bind` 构造（见 fatfs.c）；disk glue 只持指针、经统一包装调用。 */
+int32_t fatfs_disk_attach(const struct kcomp_block_binding *block);
 
 void fatfs_disk_detach(void);
 

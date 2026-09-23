@@ -11,6 +11,16 @@ the selected profile.  Select a profile first, e.g.
 1. boot smoke  —— wait for the arch boot marker, then the Core Monitor banner;
 2. auto CoreTest —— type `load core_test`, require every `[core-test] ... PASS`
    line plus the `all: PASS` summary and `load core_test: OK`;
+2b. first complete chain —— type `load block_chain`: the composer creates the
+   Rust RAM block provider (`ram_blk`), resolves its endpoint, probes the Gate
+   transport once, and creates the C consumer (`fatfs`) with that EndpointId as
+   create config. FatFs binds (Core picks the mechanism) and reads HELLO.TXT
+   through the uniform wrapper. Evidence required:
+     * provider business read (`ram_blk: read lba=4`) + FatFs content line
+       (`KALEIDOS BLOCK CHAIN OK`)  -> correct bytes over the chain;
+     * exactly one `ram_blk: gate dispatch` line and it must be `method=0`
+       (the composer's capacity probe)  -> every business read is Direct: no
+       `kcore_endpoint_call`, no per-call service stack.
 3. shutdown —— type `shutdown`, expect QEMU to exit.
 
 Failure contract (any of these fails the run):
@@ -54,6 +64,14 @@ MONITOR_BANNER = "KaleidOS Core Monitor"
 CORE_TEST_CMD = "load core_test\n"
 CORE_TEST_OK = "load core_test: OK"
 CORE_TEST_ALL_PASS = "[core-test] all: PASS"
+# First complete chain: Rust BlockDevice provider -> C consumer (FatFs glue).
+CHAIN_CMD = "load block_chain\n"
+CHAIN_LOAD_OK = "load block_chain: OK"
+CHAIN_GATE_PROBE = "block_chain: gate probe ok"
+CHAIN_PROVIDER_READ = "ram_blk: read lba=4"
+CHAIN_CONSUMER_OK = "[fatfs] selftest: read ok"
+CHAIN_CONTENT = "KALEIDOS BLOCK CHAIN OK"
+CHAIN_GATE_DISPATCH = "ram_blk: gate dispatch"
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
@@ -65,6 +83,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # 各阶段超时（秒）：hang / 慢启动都算失败
 BOOT_TIMEOUT_S = 45
 CORE_TEST_TIMEOUT_S = 30
+CHAIN_TIMEOUT_S = 30
 SHUTDOWN_TIMEOUT_S = 10
 
 
@@ -182,6 +201,47 @@ def main() -> int:
             )
         summary.append(
             f"core_test: PASS ({len(core_test_lines)} report lines, all: PASS)"
+        )
+
+        # -- 2b) first complete chain: Rust provider -> C consumer (Direct) --
+        send(proc, CHAIN_CMD)
+        output3, ok = collect(
+            proc,
+            CHAIN_TIMEOUT_S,
+            [
+                CHAIN_LOAD_OK,
+                CHAIN_GATE_PROBE,
+                CHAIN_PROVIDER_READ,
+                CHAIN_CONSUMER_OK,
+                CHAIN_CONTENT,
+            ],
+            FATAL_MARKERS,
+        )
+        output += "\n" + output3
+        if not ok:
+            raise RunFailure(
+                "block chain did not complete: missing load OK / gate probe / "
+                "provider read / FatFs read / HELLO.TXT content"
+            )
+        # 差分证据：唯一一条 gate dispatch 必须是 composer 的 capacity 探针
+        # （method=0）。任何 method=1 的 gate dispatch 都意味着业务 read 走了
+        # Core call gate —— 那就不再是 Direct，也意味着每次 read 都会分配
+        # per-call service stack。
+        gate_lines = [
+            line for line in output3.splitlines() if CHAIN_GATE_DISPATCH in line
+        ]
+        if len(gate_lines) != 1 or "method=0" not in gate_lines[0]:
+            raise RunFailure(
+                "expected exactly one gate dispatch (composer capacity probe, "
+                f"method=0); got {gate_lines!r}"
+            )
+        if f"{CHAIN_GATE_DISPATCH} method=1" in output3:
+            raise RunFailure(
+                "a business read went through the Core call gate (not Direct)"
+            )
+        summary.append(
+            "block chain: PASS (Rust provider -> C consumer, Direct read, "
+            "1 gate probe, 0 gate reads)"
         )
 
         # -- 3) shutdown ---------------------------------------------------

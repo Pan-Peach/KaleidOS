@@ -108,6 +108,21 @@ impl From<EndpointError> for Errno {
     }
 }
 
+impl From<crate::component::endpoint::BindError> for Errno {
+    fn from(error: crate::component::endpoint::BindError) -> Self {
+        use crate::component::endpoint::BindError;
+        match error {
+            // endpoint 校验失败：沿用 EndpointError 档位（EINVAL / ENOENT / ENODEV）。
+            BindError::Endpoint(error) => Errno::from(error),
+            // 组合 (caller, provider) 没有已实现机制：能力缺失，绝不静默降级。
+            BindError::UnsupportedMechanism => Errno::ENOTSUP,
+            // 选中 Direct 但 provider 没交付 function table：该 provider 服务不了
+            // 这个机制（同样是"机制不可交付"档）。
+            BindError::DirectWithoutApi => Errno::ENOTSUP,
+        }
+    }
+}
+
 impl From<CallError> for Errno {
     fn from(error: CallError) -> Self {
         match error {

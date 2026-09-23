@@ -163,3 +163,12 @@ pub const KIND_IRQ_DISPATCH: u32 = 11;
 
 /// `IrqAck`：IRQ 线完成 ack。
 pub const KIND_IRQ_ACK: u32 = 12;
+
+/// `kcore_endpoint_bind` 的机制编码：**Direct**（同域 KernelNative，provider 的
+/// `#[repr(C)]` function table 直接调用；稳态零 Core 介入）。SDK / 组件只**执行**
+/// 机制，不选择机制——选择由 Core 在 bind 时一次性做出（docs/architecture/deployment.md §2）。
+pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
+
+/// `kcore_endpoint_bind` 的机制编码：**Gate**（跨域 / 需 containment：调用走
+/// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
+pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;

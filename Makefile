@@ -144,7 +144,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # --gc-sections + -u 入口 → strip → 白名单/重定位契约校验，产出 ET_REL .kcomp。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench
+KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench drivers/ram_blk block_chain
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs
@@ -273,6 +273,8 @@ fmt:
 	cd os/components/kcomp-sdk && cargo fmt
 	cd os/components/driver_prober && cargo fmt
 	cd os/components/kbench && cargo fmt
+	cd os/components/drivers/ram_blk && cargo fmt
+	cd os/components/block_chain && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
@@ -284,6 +286,8 @@ clippy:
 	cd os/components/kcomp-sdk && cargo clippy --all-targets
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU，不读 .config）
 test-host:
@@ -291,6 +295,8 @@ test-host:
 	cd os/components/kcomp-sdk && cargo test
 	cd os/components/driver_prober && cargo test
 	cd os/components/kbench && cargo test
+	cd os/components/drivers/ram_blk && cargo test
+	cd os/components/block_chain && cargo test
 
 # Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
 test-kconfig:
@@ -411,12 +417,16 @@ check: init.kpkg
 	cd os/components/kcomp-sdk && cargo fmt -- --check
 	cd os/components/driver_prober && cargo fmt -- --check
 	cd os/components/kbench && cargo fmt -- --check
+	cd os/components/drivers/ram_blk && cargo fmt -- --check
+	cd os/components/block_chain && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	$(MAKE) test-kconfig
 	$(MAKE) abi-check
 	$(MAKE) test-host

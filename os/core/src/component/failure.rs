@@ -263,6 +263,8 @@ mod tests {
                 InterfaceKind::Device,
                 ENDPOINT_ABI,
                 7,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, id).unwrap();
@@ -275,6 +277,8 @@ mod tests {
                 InterfaceKind::Device,
                 ENDPOINT_ABI,
                 9,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.stage_publish(
@@ -285,6 +289,8 @@ mod tests {
                 InterfaceKind::Device,
                 ENDPOINT_ABI,
                 10,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, other).unwrap();
@@ -358,6 +364,8 @@ mod tests {
                     InterfaceKind::Device,
                     ENDPOINT_ABI,
                     7,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
                 )
                 .unwrap();
         }

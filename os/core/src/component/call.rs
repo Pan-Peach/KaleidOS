@@ -352,6 +352,11 @@ mod tests {
     /// 调用方任务 owner：不要求是注册实例（`deny_if_failed` 只拦已 Failed 的
     /// caller——身份不是权限，本层不发明额外门禁）。
     const CALLER: ComponentId = ComponentId::from_raw(0x00C0_FFEE);
+    /// 嵌套生命周期边界的 owner：高位 id（真实 `declare` 序列到不了这里），
+    /// 避免与并行用例在全局 registry 里留下的 `Failed` 记录串扰——`dispatch`
+    /// 先查 `is_failed(caller)`，用 `ComponentId::from_raw(5)` 之类的小 id 会
+    /// 依赖测试执行顺序（偶发 `CallerFailed`）。
+    const NESTED_INIT: ComponentId = ComponentId::from_raw(0x00C0_FFEF);
 
     /// dispatcher 调用计数（"provider 从未被调用"的断言依据）。模块内测试由
     /// `containment::test_boundary_lock` 串行化，快照/比较是确定的。
@@ -455,6 +460,8 @@ mod tests {
                 InterfaceKind::Device,
                 InterfaceAbi::from_raw(ABI),
                 PORT,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
         endpoints.commit_pending(&reg, provider).unwrap();
@@ -925,7 +932,7 @@ mod tests {
             assert_eq!(Errno::from(error), Errno::EINVAL);
 
             // 藏在嵌套生命周期边界之下同样拒绝（top-guard-only 检查会漏掉）。
-            containment::with_test_init_boundary(Some(ComponentId::from_raw(5)), || {
+            containment::with_test_init_boundary(Some(NESTED_INIT), || {
                 let error = endpoint_call(
                     endpoint,
                     0,
@@ -1097,5 +1104,67 @@ mod tests {
         assert_eq!(Errno::from(error), Errno::ENOMEM);
         assert_eq!(out_status, 0, "provider 从未执行");
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+    }
+
+    // -- 11. Gate 选中的绑定仍然可用 ---------------------------------------------
+
+    /// 交叉组合（caller 域 ≠ provider 域）在 bind 上被选为 **Gate**：binding 只携带
+    /// opaque EndpointId（不携带裸 function table）；该 endpoint 仍经
+    /// `kcore_endpoint_call` 正常派发。host fake 不执行入口体，所以这里钉住的是
+    /// "传输成功 + inflight 归还"——真实入口执行由 QEMU 上的真实组件证明。
+    #[test]
+    fn gate_selected_endpoint_still_dispatches_through_endpoint_call() {
+        use crate::component::endpoint::{ExecutionDomain, Mechanism};
+
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_gate_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.gate");
+
+        // Given：两端执行域不同（Isolated caller → KernelNative provider）→ Gate。
+        let bound = {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints()
+                .lock()
+                .bind(
+                    &reg,
+                    endpoint,
+                    ContractId::from_raw(CONTRACT),
+                    InterfaceAbi::from_raw(ABI),
+                    ExecutionDomain::IsolatedNative,
+                )
+                .unwrap()
+        };
+        assert_eq!(bound.mechanism, Mechanism::Gate);
+        assert_eq!(
+            bound.record.port, PORT,
+            "Gate 经 port + kcomp_service_dispatch 分派"
+        );
+
+        // When：caller 经 Core call gate 调用同一 endpoint。
+        enter_caller(31);
+        let mut out_status = 0i32;
+        let transport = endpoint_call(
+            endpoint,
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut out_status,
+        );
+
+        // Then：传输成功、inflight 归还（provider 入口由 host fake 记账，不真实执行）。
+        assert_eq!(transport, Ok(()));
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+
+        containment::enter_anchor();
     }
 }

@@ -1,4 +1,3 @@
-
 #include "kcomp.h"
 #include "ff.h"
 #include "diskio.h"
@@ -6,15 +5,15 @@
 
 #include "diskio_kaleidos.h"
 
-static const struct kcomp_block_device_api *active_block;
-static void *active_block_ctx;
+/* 活跃块绑定：组合策略经 create config 交付 opaque EndpointId，create 里
+ * `kcomp_block_bind` 把它变成绑定（机制由 Core 选定，藏在绑定内部）。
+ * disk glue 只经统一包装 `kcomp_block_capacity` / `kcomp_block_read` 调用——
+ * 不持有裸 function table，也不按机制分支。 */
+static const struct kcomp_block_binding *active_block;
 
-int32_t fatfs_disk_attach(
-    const struct kcomp_block_device_api *block,
-    void *block_ctx)
+int32_t fatfs_disk_attach(const struct kcomp_block_binding *block)
 {
-    if (block == NULL ||
-        block->capacity_sectors == NULL || block->read == NULL)
+    if (block == NULL)
     {
         return -EINVAL;
     }
@@ -25,19 +24,35 @@ int32_t fatfs_disk_attach(
     }
 
     active_block = block;
-    active_block_ctx = block_ctx;
     return 0;
 }
 
 void fatfs_disk_detach(void)
 {
     active_block = NULL;
-    active_block_ctx = NULL;
 }
 
 static int valid_drive(BYTE pdrv)
 {
     return (pdrv == 0 && active_block != NULL);
+}
+
+/* 容量查询的公共收口：传输状态 / 方法状态都必须干净。 */
+static int32_t block_capacity(uint64_t *out_sectors)
+{
+    struct kcomp_call_result result = kcomp_block_capacity(active_block, out_sectors);
+
+    if (result.transport < 0)
+    {
+        return result.transport;
+    }
+
+    if (result.method != 0)
+    {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 DSTATUS disk_status(BYTE pdrv)
@@ -80,16 +95,21 @@ DRESULT disk_read(
 
     uint64_t start = (uint64_t)sector;
     uint64_t sectors = (uint64_t)count;
-    uint64_t capacity = active_block->capacity_sectors(active_block_ctx);
+    uint64_t capacity = 0;
+
+    if (block_capacity(&capacity) < 0)
+    {
+        return RES_ERROR;
+    }
 
     if (start >= capacity || sectors > capacity - start)
     {
         return RES_PARERR;
     }
 
-    int32_t result = active_block->read(active_block_ctx, start, buf, length);
+    struct kcomp_call_result result = kcomp_block_read(active_block, start, buf, length);
 
-    if (result < 0)
+    if (result.transport < 0 || result.method != 0)
     {
         return RES_ERROR;
     }
@@ -132,8 +152,19 @@ DRESULT disk_ioctl(
 
         case GET_SECTOR_COUNT:
         {
-            uint64_t capacity = active_block->capacity_sectors(active_block_ctx);
-            if (buff == NULL || capacity > UINT32_MAX)
+            uint64_t capacity = 0;
+
+            if (buff == NULL)
+            {
+                return RES_PARERR;
+            }
+
+            if (block_capacity(&capacity) < 0)
+            {
+                return RES_ERROR;
+            }
+
+            if (capacity > UINT32_MAX)
             {
                 return RES_PARERR;
             }

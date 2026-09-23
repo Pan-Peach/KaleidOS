@@ -12,7 +12,8 @@
 //! / `console_write_byte` 保持原路径不变）：
 //! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、[`endpoint`] typed
 //! `Endpoint<C>`（Contract / Endpoint 模型）、[`frame`] flat frame 的借用视图、
-//! [`block`] block.device 契约 + provider wrapper + Gate 适配器/typed 前端、
+//! [`block`] block.device 契约 + provider wrapper + **调用后端**（Core 在 bind 时
+//! 选定的 Direct / Gate，`BlockBinding` typed 前端）+ Gate 适配器、
 //! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、`alloc`。
 //!
 //! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；

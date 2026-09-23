@@ -16,7 +16,7 @@
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
 //! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
-//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
+//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_bind` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在；provider 交付 `api`/`ctx`（Direct）+ `port`（Gate），Core 只存不解引用）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；**bind 在绑定时刻按 (caller 域, provider 域) 一次性选定机制**（同域 KernelNative → Direct 并交付 api/ctx；跨域 → Gate 只给 opaque id；不支持组合显式 `-ENOTSUP`，**绝不静默降级**）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
@@ -594,12 +594,19 @@ extern "C" fn kcore_interface_refresh(
 /// 发布**建立契约真相，后续发布不一致在 commit 时拒绝；`port` 是 provider 定义的
 /// 不透明 dispatch token（Core 从不解释）。端口名只要求在 provider 实例内唯一。
 ///
+/// `api` / `ctx` 是 provider 交付的 **Direct** transport：`api` 指向 provider 的
+/// `#[repr(C)]` function table、`ctx` 是 provider opaque state。Core **只存、
+/// 永不解引用**，只在 [`kcore_endpoint_bind`] 选定 Direct 时原样交付。`port` +
+/// image 的 `kcomp_service_dispatch` 服务 **Gate** transport；机制由 Core 在 bind
+/// 时按两端执行域选定，组件不得自行选择。
+///
 /// create 返回 0 后 Core 原子提交该实例的 pending endpoints，因此本函数返回 `0`
 /// 只表示"已记录 pending"——**不返回 EndpointId**（id 只在 commit 成功后存在，
 /// 由 [`kcore_endpoint_lookup`] 发现）。
 /// provider 由最内层活动 create 边界解析（嵌套创建 = 被创建的实例）；`Failed`
 /// provider → `-EPERM`。返回 0 / `-Errno`（`EINVAL` 名字/kind 非法；`EPERM` 不在
 /// create 上下文或 provider 已 `Failed`；其余见 `Errno::from(EndpointError)`）。
+#[allow(clippy::too_many_arguments)]
 extern "C" fn kcore_endpoint_publish(
     port_name: *const u8,
     port_name_len: usize,
@@ -607,6 +614,8 @@ extern "C" fn kcore_endpoint_publish(
     kind: u32,
     abi: u64,
     port: u32,
+    api: *const (),
+    ctx: *mut (),
 ) -> i32 {
     with_core_critical(|| {
         let Some(port_name) = checked_name(port_name, port_name_len) else {
@@ -631,6 +640,8 @@ extern "C" fn kcore_endpoint_publish(
             kind,
             InterfaceAbi::from_raw(abi),
             port,
+            api,
+            ctx,
         ) {
             Ok(()) => 0,
             Err(error) => Errno::from(error).code(),
@@ -702,6 +713,84 @@ extern "C" fn kcore_endpoint_validate(endpoint: u64, contract: u64, abi: u64) ->
             InterfaceAbi::from_raw(abi),
         ) {
             Ok(_) => 0,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
+}
+
+/// **bind：Core 在绑定时刻选定调用机制**（一次，运行期不再按调用重决策）。
+///
+/// 校验（与 [`kcore_endpoint_validate`] 同一入口：exact contract + abi + 存活）后，
+/// 按 `(caller 执行域, provider 执行域)` 选定机制：
+///
+/// - `KCORE_ENDPOINT_MECHANISM_DIRECT`：`*out_api` / `*out_ctx` 写入 provider 发布
+///   时交付的 function table 与 opaque state（Core 原样传递、不解引用）；
+/// - `KCORE_ENDPOINT_MECHANISM_GATE`：`*out_api` / `*out_ctx` **不写**（保持调用方
+///   原值），调用方改用 [`kcore_endpoint_call`]（同一 `endpoint` 即 call-gate handle）。
+///
+/// caller 必须处在某个组件执行边界内（否则 `-EPERM`）——机制选择需要 caller 的
+/// 执行域；caller 已 `Failed` 同样 `-EPERM`（获取绑定 = 获取新能力）。
+/// 不支持的组合（跨特权 / Wasm / 同 AS 无法证明且 syscall-IPC 未实现）→ `-ENOTSUP`，
+/// **绝不静默降级成 Direct**；Direct 选中但 provider 未交付 function table →
+/// `-ENOTSUP`。
+///
+/// 成功 = `0`（机制 + 对应 transport 写入 out）；失败 = `-Errno`
+/// （`EFAULT` 任一 out 为空 / `EINVAL` contract 或 abi 不符 /
+/// `ENOENT` endpoint 未发布或已死 / `ENODEV` provider 已不存在 /
+/// `EPERM` 无 caller 边界或 caller 已 `Failed` / `ENOTSUP` 无已实现机制）。
+#[allow(clippy::too_many_arguments)]
+extern "C" fn kcore_endpoint_bind(
+    endpoint: u64,
+    contract: u64,
+    abi: u64,
+    out_mechanism: *mut u32,
+    out_api: *mut usize,
+    out_ctx: *mut usize,
+) -> i32 {
+    with_core_critical(|| {
+        if out_mechanism.is_null() || out_api.is_null() || out_ctx.is_null() {
+            return Errno::EFAULT.code();
+        }
+        // caller 身份解析：机制选择需要 caller 的执行域，因此**必须**在组件执行
+        // 边界内（monitor / 纯 Core 上下文没有可解析的 caller）。
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(caller.component) {
+            return denied;
+        }
+        let reg = registry::get_registry().lock();
+        let endpoints = endpoint::get_endpoints().lock();
+        match endpoints.bind(
+            &reg,
+            EndpointId::from_raw(endpoint),
+            ContractId::from_raw(contract),
+            InterfaceAbi::from_raw(abi),
+            endpoint::instance_domain(caller.component),
+        ) {
+            Ok(bound) => {
+                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
+                unsafe {
+                    match bound.mechanism {
+                        endpoint::Mechanism::Direct => {
+                            core::ptr::write_unaligned(
+                                out_mechanism,
+                                crate::generated::abi::KCORE_ENDPOINT_MECHANISM_DIRECT,
+                            );
+                            core::ptr::write_unaligned(out_api, bound.record.api as usize);
+                            core::ptr::write_unaligned(out_ctx, bound.record.ctx as usize);
+                        }
+                        endpoint::Mechanism::Gate => {
+                            core::ptr::write_unaligned(
+                                out_mechanism,
+                                crate::generated::abi::KCORE_ENDPOINT_MECHANISM_GATE,
+                            );
+                            // Gate 不写 api/ctx：binding 不携带裸 function table。
+                        }
+                    }
+                }
+                0
+            }
             Err(error) => Errno::from(error).code(),
         }
     })
@@ -1175,6 +1264,9 @@ pub fn resolve(name: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Direct function table 的替身地址（Core 只存、不解引用）。
+    static TABLE: [u8; 8] = [0; 8];
+
     #[test]
     fn resolves_all_entries() {
         use alloc::string::String;
@@ -1218,6 +1310,7 @@ mod tests {
             &b"kcore_endpoint_publish"[..],
             &b"kcore_endpoint_lookup"[..],
             &b"kcore_endpoint_validate"[..],
+            &b"kcore_endpoint_bind"[..],
             &b"kcore_endpoint_call"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
@@ -1746,7 +1839,16 @@ mod tests {
 
         // When：create 执行期间经导出发布（staged）。
         let staged = containment::with_test_init_boundary(Some(id), || {
-            kcore_endpoint_publish(b"blk0".as_ptr(), 4, CONTRACT, 0, ABI, 7)
+            kcore_endpoint_publish(
+                b"blk0".as_ptr(),
+                4,
+                CONTRACT,
+                0,
+                ABI,
+                7,
+                core::ptr::null(),
+                core::ptr::null_mut(),
+            )
         });
         assert_eq!(staged, 0, "staged publish 返回 0（id 只在 commit 后存在）");
 
@@ -1789,13 +1891,31 @@ mod tests {
 
         // When / Then：任务边界（非 init）→ EPERM。
         assert_eq!(
-            kcore_endpoint_publish(b"blk0".as_ptr(), 4, 1, 0, 1, 0),
+            kcore_endpoint_publish(
+                b"blk0".as_ptr(),
+                4,
+                1,
+                0,
+                1,
+                0,
+                core::ptr::null(),
+                core::ptr::null_mut()
+            ),
             Errno::EPERM.code()
         );
         // destroy 钩子（Exit 边界）同样不是 publish principal。
         containment::with_test_exit_boundary(ComponentId::from_raw(9), || {
             assert_eq!(
-                kcore_endpoint_publish(b"blk0".as_ptr(), 4, 1, 0, 1, 0),
+                kcore_endpoint_publish(
+                    b"blk0".as_ptr(),
+                    4,
+                    1,
+                    0,
+                    1,
+                    0,
+                    core::ptr::null(),
+                    core::ptr::null_mut()
+                ),
                 Errno::EPERM.code()
             );
         });
@@ -1879,6 +1999,8 @@ mod tests {
                 InterfaceKind::Device,
                 InterfaceAbi::from_raw(ABI),
                 7,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, id).unwrap();
@@ -1957,6 +2079,8 @@ mod tests {
                 InterfaceKind::Device,
                 InterfaceAbi::from_raw(ABI),
                 7,
+                core::ptr::null(),
+                core::ptr::null_mut(),
             )
             .unwrap();
             eps.commit_pending(&reg, id).unwrap();
@@ -1998,6 +2122,190 @@ mod tests {
         );
     }
 
+    /// `kcore_endpoint_bind`：同域 KernelNative → **DIRECT**，`api` / `ctx` 原样交付
+    /// （Core 不解引用）；contract / abi 必须 exact-match（与 validate 同源）。
+    #[test]
+    fn endpoint_bind_selects_direct_and_hands_out_api_ctx() {
+        use crate::component::containment;
+        use crate::component::{endpoint, registry};
+        use crate::generated::abi::KCORE_ENDPOINT_MECHANISM_DIRECT;
+        use crate::task::TaskId;
+
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        endpoint::init();
+
+        // 契约 id 在**全局** endpoint 注册表里是唯一真相：取一个未被其它用例占用
+        // 的区间（重复 id + 不同 abi = commit AbiMismatch，跨用例串扰）。
+        const CONTRACT: u64 = 0xE0D0_6001;
+        const OTHER_CONTRACT: u64 = 0xE0D0_6002;
+        const ABI: u64 = 0xE0D0_6003;
+        const OTHER_ABI: u64 = 0xE0D0_6004;
+        const CALLER: ComponentId = ComponentId::from_raw(0x00C0_FFEE);
+
+        // Given：一个 Ready provider，发布时交付了 Direct function table + state。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(crate::component::image::ComponentImageId::from_raw(5))
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let mut state = 0u8;
+        let ctx = &mut state as *mut u8 as *mut ();
+        let api = &TABLE as *const u8 as *const ();
+        {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                id,
+                b"blk0",
+                ContractId::from_raw(CONTRACT),
+                InterfaceKind::Device,
+                InterfaceAbi::from_raw(ABI),
+                7,
+                api,
+                ctx,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, id).unwrap();
+        }
+        let mut out = 0u64;
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            0
+        );
+        let ep = out;
+
+        // Given：一个组件 caller 边界（机制选择需要 caller 的执行域）。
+        containment::enter_anchor();
+        containment::enter_task(TaskId::from_raw(7), CALLER);
+
+        // When：bind。
+        let (mut mechanism, mut bound_api, mut bound_ctx) = (0u32, 0usize, 0usize);
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                CONTRACT,
+                ABI,
+                &mut mechanism,
+                &mut bound_api,
+                &mut bound_ctx
+            ),
+            0
+        );
+
+        // Then：机制 = DIRECT；api / ctx 是发布时的原值。
+        assert_eq!(mechanism, KCORE_ENDPOINT_MECHANISM_DIRECT);
+        assert_eq!(bound_api, api as usize);
+        assert_eq!(bound_ctx, ctx as usize);
+
+        // contract / abi 不符 → EINVAL；未知 id → ENOENT（与 validate 同档）。
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                OTHER_CONTRACT,
+                ABI,
+                &mut mechanism,
+                &mut bound_api,
+                &mut bound_ctx
+            ),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                CONTRACT,
+                OTHER_ABI,
+                &mut mechanism,
+                &mut bound_api,
+                &mut bound_ctx
+            ),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(
+            kcore_endpoint_bind(
+                0xDEAD,
+                CONTRACT,
+                ABI,
+                &mut mechanism,
+                &mut bound_api,
+                &mut bound_ctx
+            ),
+            Errno::ENOENT.code()
+        );
+
+        // out 指针：任一为空 → EFAULT（早于 caller 解析）。
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                CONTRACT,
+                ABI,
+                core::ptr::null_mut(),
+                &mut bound_api,
+                &mut bound_ctx
+            ),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                CONTRACT,
+                ABI,
+                &mut mechanism,
+                core::ptr::null_mut(),
+                &mut bound_ctx
+            ),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(
+            kcore_endpoint_bind(
+                ep,
+                CONTRACT,
+                ABI,
+                &mut mechanism,
+                &mut bound_api,
+                core::ptr::null_mut()
+            ),
+            Errno::EFAULT.code()
+        );
+
+        containment::enter_anchor();
+    }
+
+    /// bind 需要 caller 的执行域：不在任何组件执行边界内 → `-EPERM`（机制选择
+    /// 无从谈起，绝不默认成 Direct）。
+    #[test]
+    fn endpoint_bind_without_component_caller_is_rejected() {
+        use crate::component::containment;
+
+        let _boundary = containment::test_boundary_lock();
+        crate::sched::init();
+        crate::task::init();
+        crate::component::registry::init();
+        containment::enter_anchor();
+
+        // 无边界、无运行任务、无 loader 身份 → `ambient()` 为 None：bind 必须
+        // `-EPERM`（机制选择需要 caller 的执行域，绝不默认成 Direct）。并行测试
+        // 共享这些进程全局量，因此仅在确认没有 transient 活跃身份时断言。
+        if crate::sched::current_task().is_none()
+            && crate::component::load::current_component().is_none()
+        {
+            let (mut mechanism, mut api, mut ctx) = (0u32, 0usize, 0usize);
+            assert_eq!(
+                kcore_endpoint_bind(1, 1, 1, &mut mechanism, &mut api, &mut ctx),
+                Errno::EPERM.code()
+            );
+        }
+        containment::enter_anchor();
+    }
+
     /// create 失败 / panic（load.rs 共用的 `fail_component` 清理路径）：pending
     /// endpoint 被丢弃，`kcore_endpoint_lookup` 找不到任何东西——半成品绝不浮出，
     /// 事后提交也不可能产出（provider 已 `Failed`）。
@@ -2026,7 +2334,16 @@ mod tests {
         };
         assert_eq!(
             containment::with_test_init_boundary(Some(id), || {
-                kcore_endpoint_publish(b"blk0".as_ptr(), 4, CONTRACT, 0, ABI, 7)
+                kcore_endpoint_publish(
+                    b"blk0".as_ptr(),
+                    4,
+                    CONTRACT,
+                    0,
+                    ABI,
+                    7,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                )
             }),
             0
         );
