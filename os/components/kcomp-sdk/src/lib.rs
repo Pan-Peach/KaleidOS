@@ -10,9 +10,13 @@
 //!
 //! 模块划分与 crate 外部路径一一对应（`abi` / `binding` / `DmaDirection` / `log`
 //! / `console_write_byte` 保持原路径不变）：
-//! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、[`block`] block.device
-//! 契约 + provider wrapper、[`call`] endpoint call 的原始包装（typed
-//! `Endpoint<C>` 在迁移步骤）、`dma`、`logging`、`panic`、`alloc`。
+//! [`abi`] 原始 extern、[`binding`] 类型化 Service 契约、[`endpoint`] typed
+//! `Endpoint<C>`（Contract / Endpoint 模型）、[`frame`] flat frame 的借用视图、
+//! [`block`] block.device 契约 + provider wrapper + Gate 适配器/typed 前端、
+//! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、`alloc`。
+//!
+//! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；
+//! method switch 由契约自己的适配器（如 [`block::dispatch`]）手写。
 //!
 //! # panic adapter（本 crate 存在的关键理由）
 //!
@@ -39,12 +43,17 @@ pub mod abi;
 pub mod binding;
 pub mod block;
 pub mod call;
+pub mod endpoint;
 pub mod errno;
 pub mod filesystem;
+pub mod frame;
 pub mod generated;
 
 mod dma;
 mod logging;
+
+#[cfg(test)]
+mod test_support;
 
 // 裸机专属 adapter：host 构建下 std 自带 panic handler / 分配器。
 #[cfg(all(target_os = "none", feature = "alloc"))]
@@ -128,6 +137,90 @@ macro_rules! kcomp_instance_destroy {
         // 编译期锚定：生成的函数必须与 `abi` 的 Rust 镜像同签名。
         const _: $crate::abi::KcompInstanceDestroy = kcomp_instance_destroy;
     };
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint 服务入口：image 级 port switch
+// ---------------------------------------------------------------------------
+
+/// 定义组件的 **image 级服务入口** `kcomp_service_dispatch`（可选导出；Core 的
+/// `kcore_endpoint_call` 经它分派），并发出与生命周期宏同类的签名锚定。
+///
+/// 用法：
+///
+/// ```text
+/// kcomp_sdk::kcomp_services! {
+///     state: DeviceState;
+///     BLOCK_PORT => block::dispatch::<DeviceState>,
+/// }
+/// ```
+///
+/// 展开成 `match port { BLOCK_PORT => handler(state, method, call), _ => ENOSYS }`。
+///
+/// - **只做 port switch**：契约自己的 method switch 由 handler 手写（block 用
+///   `block::dispatch`）；宏不发明协议、不解析 frame。
+/// - **不发布 endpoint**：发布名 / 时机来自 create config 与组合策略，publication
+///   是 staged 的；本宏只看 provider 定义的 `port` token。
+/// - **端口 pattern 重复 = 编译错误**（逐对 `const` 断言，不静默覆盖）。
+/// - handler 收到 provider state 的 `&State`（**不是** `&mut`）：实例可能被多个
+///   执行流同时引用（任务 / 调用），可变性由组件自己用内部同步管理。
+/// - `instance_state` 为 NULL → `-EINVAL`（本宏面向有状态 provider；不构造 UB 引用）。
+#[macro_export]
+macro_rules! kcomp_services {
+    (state: $state:ty; $($port:path => $handler:expr),+ $(,)?) => {
+        #[unsafe(no_mangle)]
+        #[allow(unused_variables)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn kcomp_service_dispatch(
+            instance_state: *mut (),
+            port: u32,
+            method: u32,
+            frame: *const $crate::abi::KcompCallFrame,
+        ) -> i32 {
+            if instance_state.is_null() {
+                return $crate::errno::Errno::EINVAL.code();
+            }
+            // SAFETY: Core 的 service 边界保证 instance_state 是 create 写回的实例
+            // state 且在本调用期间有效；非空已在上方检查。
+            let state = unsafe { &*instance_state.cast::<$state>() };
+            // SAFETY: Core 的 service 边界保证 frame 有效、其内存区在本调用期间可用。
+            match unsafe {
+                $crate::frame::with_call(frame, |call| match port {
+                    $($port => ($handler)(state, method, call),)+
+                    _ => $crate::errno::Errno::ENOSYS.code(),
+                })
+            } {
+                Ok(status) => status,
+                Err(errno) => errno.code(),
+            }
+        }
+
+        // 编译期锚定：生成的函数必须与 `abi` 的 Rust 镜像同签名。
+        const _: $crate::abi::KcompServiceDispatch = kcomp_service_dispatch;
+
+        // 端口 token 唯一：重复即编译错误（不静默覆盖 / 不取最后一个）。
+        $crate::__kcomp_services_ports_unique!($($port),+);
+    };
+}
+
+/// [`kcomp_services!`] 的内部辅助：逐对比较端口 pattern（`const` 求值）。
+/// `#[doc(hidden)]`；不要直接调用。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __kcomp_services_ports_unique {
+    ($($ports:expr),+ $(,)?) => {
+        $crate::__kcomp_services_ports_unique!(@pairs [] $($ports),+);
+    };
+    (@pairs [$($seen:expr)*] $head:expr $(, $tail:expr)*) => {
+        $(
+            const _: () = assert!(
+                $seen != $head,
+                "kcomp_services!: duplicate port pattern（端口 token 必须在组件内唯一）"
+            );
+        )*
+        $crate::__kcomp_services_ports_unique!(@pairs [$($seen)* $head] $($tail),*);
+    };
+    (@pairs [$($seen:expr)*]) => {};
 }
 
 // ---------------------------------------------------------------------------

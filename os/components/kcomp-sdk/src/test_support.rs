@@ -1,0 +1,143 @@
+//! host 测试的 Core ABI 替身（`#[cfg(test)]` 限定）。
+//!
+//! kcomp-sdk 的 host 测试无法链接真实 Core；这里用**同一测试二进制内的符号定义**
+//! 满足 `generated::abi` 的 extern 声明：
+//!
+//! - `kcore_endpoint_validate` / `kcore_endpoint_lookup`：行为只由参数决定
+//!   （无共享状态），任何测试可并发调用；
+//! - `kcore_endpoint_call`：行为由脚本变量决定、并记录最近一次调用——使用它的
+//!   测试必须持有 [`lock`]（串行化），避免互相踩。
+//!
+//! 这些替身**只存在于测试构建**；组件镜像链接的是真实 Core 导出。
+
+use std::sync::Mutex;
+use std::vec::Vec;
+
+static CALL_SCRIPT: Mutex<(i32, i32)> = Mutex::new((0, 0));
+static LAST_CALL: Mutex<Option<CallRecord>> = Mutex::new(None);
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 最近一次 `kcore_endpoint_call` 的入参快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallRecord {
+    pub endpoint: u64,
+    pub method: u32,
+    pub args: Vec<u8>,
+    pub input: Vec<u8>,
+    pub output_len: usize,
+}
+
+/// 串行化所有使用 `kcore_endpoint_call` 脚本的测试。
+pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 复位脚本：下一次调用返回 `(transport = 0, method = 0)`，并清空记录。
+pub(crate) fn reset_script() {
+    *CALL_SCRIPT.lock().unwrap() = (0, 0);
+    *LAST_CALL.lock().unwrap() = None;
+}
+
+/// 设置下一次 `kcore_endpoint_call` 的 `(transport, method)` 返回。
+pub(crate) fn script_call(transport: i32, method: i32) {
+    *CALL_SCRIPT.lock().unwrap() = (transport, method);
+}
+
+/// 最近一次调用的快照（`reset_script` 后为 `None`）。
+pub(crate) fn last_call() -> Option<CallRecord> {
+    LAST_CALL.lock().unwrap().clone()
+}
+
+fn copy_region(ptr: *const u8, len: usize) -> Vec<u8> {
+    if len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: 测试替身假设调用方（SDK 自己）传的是本进程内有效切片。
+        unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+    }
+}
+
+/// Core `kcore_endpoint_validate` 的替身：contract + abi 与 block 契约一致且
+/// id != 0 → 0；否則 -ENOENT / -EINVAL（与 Core 档位一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_endpoint_validate(id: u64, contract: u64, abi: u64) -> i32 {
+    use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRACT};
+    if id == 0 {
+        return -2; // ENOENT
+    }
+    if contract != KCOMP_BLOCK_DEVICE_CONTRACT || abi != KCOMP_BLOCK_DEVICE_ABI {
+        return -22; // EINVAL
+    }
+    0
+}
+
+/// Core `kcore_endpoint_lookup` 的替身：contract 匹配且 provider != 0 → 写入
+/// 可预测的 id（`provider * 100 + name_len`）；否则 -Errno。
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_endpoint_lookup(
+    provider: u32,
+    _port_name: *const u8,
+    port_name_len: usize,
+    contract: u64,
+    out_endpoint: *mut u64,
+) -> i32 {
+    use crate::generated::block::KCOMP_BLOCK_DEVICE_CONTRACT;
+    if out_endpoint.is_null() {
+        return -14; // EFAULT
+    }
+    if contract != KCOMP_BLOCK_DEVICE_CONTRACT {
+        return -22; // EINVAL
+    }
+    if provider == 0 {
+        return -2; // ENOENT
+    }
+    // SAFETY: out 非空（上面已查）；写一个测试可预测的值。
+    unsafe {
+        core::ptr::write_unaligned(out_endpoint, provider as u64 * 100 + port_name_len as u64)
+    };
+    0
+}
+
+/// Core `kcore_endpoint_call` 的替身：按脚本返回传输状态；transport == 0 时把
+/// method status 写入 `*out_status`，并在 capacity 调用里模拟 provider 写回复。
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn kcore_endpoint_call(
+    endpoint: u64,
+    method: u32,
+    args: *const u8,
+    args_len: usize,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_len: usize,
+    out_status: *mut i32,
+) -> i32 {
+    use crate::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
+    let (transport, status) = *CALL_SCRIPT.lock().unwrap();
+    *LAST_CALL.lock().unwrap() = Some(CallRecord {
+        endpoint,
+        method,
+        args: copy_region(args, args_len),
+        input: copy_region(input, input_len),
+        output_len,
+    });
+    if transport == 0
+        && status == 0
+        && method == KCOMP_BLOCK_METHOD_CAPACITY
+        && output_len == KCOMP_BLOCK_CAPACITY_LEN
+        && !output.is_null()
+    {
+        // 模拟 provider 回填 capacity = 0x0102_0304_0506_0708（LE）。
+        let reply = 0x0102_0304_0506_0708u64.to_le_bytes();
+        // SAFETY: 输出窗口由调用方保证长度 = CAPACITY_LEN 且可写。
+        unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), output, KCOMP_BLOCK_CAPACITY_LEN) };
+    }
+    if transport == 0 && !out_status.is_null() {
+        // SAFETY: out_status 非空；调用方保证可写。
+        unsafe { core::ptr::write_unaligned(out_status, status) };
+    }
+    transport
+}

@@ -59,7 +59,8 @@
 //!
 //! call ABI 不携带 contract / abi：`EndpointId` 是组合期经
 //! [`EndpointRegistry::lookup`] / [`EndpointRegistry::discover`] 交付的 opaque
-//! capability，contract / abi 已在**交付 id 之前** exact-match 校验。调用只做
+//! capability。发现路径只校验 **contract + 存活**（不携带 abi）；abi 由 consumer
+//! 经 `kcore_endpoint_validate`（[`EndpointRegistry::lookup`]）自行核对。调用只做
 //! **存活解析**（[`EndpointRegistry::resolve`]）：死 endpoint / 死 owner 一律
 //! 拒绝，绝不把调用重定向到新实例。
 //!

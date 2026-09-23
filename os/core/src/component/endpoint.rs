@@ -68,7 +68,7 @@
 use alloc::vec::Vec;
 use spin::{Mutex, Once};
 
-use crate::component::interface::InterfaceAbi;
+use crate::component::abi::InterfaceAbi;
 use crate::component::registry::Registry;
 use crate::component::{ComponentId, ComponentState};
 
@@ -333,9 +333,10 @@ impl EndpointRegistry {
     ///
     /// `kcore_endpoint_call` 的调用路径：call ABI 不携带 contract / abi，因为
     /// [`EndpointId`] 是 consumer 经 [`Self::lookup`] / [`Self::discover`] 拿到的
-    /// **opaque capability**——contract / abi 已在组合期、交付 id 之前由 Core
-    /// exact-match 校验过。这里只回答"现在还能不能调用"：死 endpoint、死 owner
-    /// 一律拒绝（绝不把调用派发到已失效的实例）。
+    /// **opaque capability**。发现路径只校验 contract（不携带 abi）；abi 由
+    /// consumer 用 [`Self::lookup`]（导出面 `kcore_endpoint_validate`）自行核对。
+    /// 这里只回答"现在还能不能调用"：死 endpoint、死 owner 一律拒绝
+    /// （绝不把调用派发到已失效的实例）。
     pub fn resolve(
         &self,
         components: &Registry,

@@ -1,6 +1,8 @@
 //! host 锚定测试：钉住 ABI 编码（`docs/architecture/driver-model.md` §6.2）。
 //! Core 侧有对应测试 `component::export::tests::dma_direction_encoding_is_stable`。
 
+mod macro_services;
+
 #[test]
 fn dma_direction_encoding_is_stable() {
     use crate::DmaDirection::{Bidirectional, FromDevice, ToDevice};

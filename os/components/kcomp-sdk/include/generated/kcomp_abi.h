@@ -209,12 +209,16 @@ int32_t kcore_dma_unmap(uint64_t mapping);
 /* 发布 endpoint（staged：init 期间只记录 pending；create 返回 0 后 Core 原子提交）。
  * provider 由当前 create 上下文解析，不信任组件自报身份；返回 0 不返回 EndpointId。 */
 int32_t kcore_endpoint_publish(const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint32_t kind, uint64_t abi, uint32_t port);
-/* 按 (provider, port_name, contract) 发现 endpoint：成功写 EndpointId 到
- * *out_endpoint；失败返回 -Errno。 */
+/* 按 (provider, port_name, contract) 发现 endpoint：只校验 contract + 存活，
+ * **不校验 abi**（id 是 opaque capability，abi 用 kcore_endpoint_validate 核对）。
+ * 成功写 EndpointId 到 *out_endpoint；失败返回 -Errno。 */
 int32_t kcore_endpoint_lookup(uint32_t provider, const uint8_t *port_name, size_t port_name_len, uint64_t contract, uint64_t *out_endpoint);
+/* 只读校验端点：contract + abi exact-match + 存活（lookup）。无副作用；
+ * 成功 = 0，失败 = -Errno（EINVAL 契约/ABI 不符；ENOENT 死端点；ENODEV provider 消失）。 */
+int32_t kcore_endpoint_validate(uint64_t endpoint, uint64_t contract, uint64_t abi);
 /* 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
- * *out_status（仅传输返回 0 时有意义）。当前是 KernelNative 直接分派（无执行
- * 边界 / panic containment）。 */
+ * *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
+ * 执行（per-call 栈 / provider principal / re-entry 与 IRQ 门禁 / panic containment）。 */
 int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args, size_t args_len, const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len, int32_t *out_status);
 
 /* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
@@ -252,6 +256,26 @@ _Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kco
 
 /* 契约单位：1 sector = 512 字节（`read` / `write` 的 `len` 必须是它的整数倍）。 */
 #define KCOMP_BLOCK_DEVICE_SECTOR 512
+
+/* `block.device` 的 endpoint 契约身份（组合策略提供的不透明 `u64`；
+ * `kcore_endpoint_lookup` / `kcore_endpoint_validate` 的 `contract` 参数）。
+ * 数值 = 8 字节 ASCII tag `b"BLKCONTR"` 的大端读数（与 ABI 指纹同一约定）。 */
+#define KCOMP_BLOCK_DEVICE_CONTRACT UINT64_C(0x424C4B434F4E5452)
+
+/* `capacity` 的方法号：args 空 / input 空 / output = 8 字节 LE `u64`。 */
+#define KCOMP_BLOCK_METHOD_CAPACITY UINT32_C(0)
+
+/* `read` 的方法号：args = 8 字节 LE `u64` lba / input 空 / output 非零且 512 整数倍。 */
+#define KCOMP_BLOCK_METHOD_READ UINT32_C(1)
+
+/* `write` 的方法号：args = 8 字节 LE `u64` lba / input 非零且 512 整数倍 / output 空。 */
+#define KCOMP_BLOCK_METHOD_WRITE UINT32_C(2)
+
+/* `read` / `write` 的 `args` 区长度：一个 LE `u64` lba（没有其它编码）。 */
+#define KCOMP_BLOCK_LBA_LEN 8
+
+/* `capacity` 的 `output` 区长度：一个 LE `u64`（sector 数）。 */
+#define KCOMP_BLOCK_CAPACITY_LEN 8
 
 /* `filesystem` provider/consumer function table（共享布局）。
  * 

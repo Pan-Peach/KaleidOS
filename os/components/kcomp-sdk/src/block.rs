@@ -25,7 +25,18 @@
 //! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish`] 的安全性论证见其文档。
 
 use crate::binding::{InterfaceAbi, InterfaceKind, Service, publish_service};
+use crate::endpoint::Contract;
 use crate::errno::{Errno, Result};
+
+// Gate / Direct 两条部署路径共用同一份业务后端（`BlockDeviceProvider`）：
+//   - Direct：本文件下方的 `BlockDeviceService`（`#[repr(C)]` function table）；
+//   - Gate  ：`block::dispatch`（扁平 frame → 同一个 provider 方法）。
+// 业务后端不感知部署（docs/architecture/deployment.md §4）。
+pub mod client;
+pub mod dispatch;
+
+#[cfg(test)]
+pub(crate) mod tests_support;
 
 // -----------------------------------------------------------------------
 // 契约：block.device —— 驱动提供的 Device Interface（provider: virtio_blk）
@@ -44,7 +55,7 @@ use crate::errno::{Errno, Result};
 /// `block.device` 接口的稳定名字（publish / bind 必须逐字节一致）。
 pub use crate::generated::block::KCOMP_BLOCK_DEVICE_NAME as BLOCK_DEVICE_NAME;
 
-use crate::generated::block::KCOMP_BLOCK_DEVICE_ABI;
+use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRACT};
 
 /// `block.device` 的 exact ABI fingerprint。
 ///
@@ -72,6 +83,17 @@ impl Service for BlockDevice {
     const KIND: InterfaceKind = InterfaceKind::Device;
     const ABI: InterfaceAbi = BLOCK_DEVICE_ABI;
     type Api = BlockDeviceApi;
+}
+
+/// Endpoint 模型的契约身份（contract id + exact ABI + 领域分类）。
+///
+/// 与 [`Service`] 并存：`Service` 是旧 binding（全局名字 → 单槽）的契约表达，
+/// [`Contract`] 是 Endpoint（typed `Endpoint<BlockDevice>`）的表达；两者数值同源
+/// （`abi/block.toml`），迁移期不强制二选一。
+impl Contract for BlockDevice {
+    const ID: u64 = KCOMP_BLOCK_DEVICE_CONTRACT;
+    const ABI: u64 = KCOMP_BLOCK_DEVICE_ABI;
+    const KIND: InterfaceKind = InterfaceKind::Device;
 }
 
 // -----------------------------------------------------------------------

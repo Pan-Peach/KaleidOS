@@ -441,6 +441,24 @@ fn component_contract_literals_are_pinned() {
     assert_eq!(generated_block::KCOMP_BLOCK_DEVICE_NAME, b"block.device");
     assert_eq!(generated_block::KCOMP_BLOCK_DEVICE_SECTOR, 512);
 
+    // Endpoint 调用契约（wire 常量）：contract 身份 + 方法号 + args / output 长度。
+    // 消费路径（C 包装 / SDK typed 前端）与 provider 适配器共用同一份生成常量。
+    assert_eq!(
+        generated_block::KCOMP_BLOCK_DEVICE_CONTRACT,
+        0x424C_4B43_4F4E_5452,
+        "block.device contract id 漂移"
+    );
+    assert_eq!(
+        &generated_block::KCOMP_BLOCK_DEVICE_CONTRACT.to_be_bytes(),
+        b"BLKCONTR",
+        "block.device contract id 不再是 ASCII tag"
+    );
+    assert_eq!(generated_block::KCOMP_BLOCK_METHOD_CAPACITY, 0);
+    assert_eq!(generated_block::KCOMP_BLOCK_METHOD_READ, 1);
+    assert_eq!(generated_block::KCOMP_BLOCK_METHOD_WRITE, 2);
+    assert_eq!(generated_block::KCOMP_BLOCK_LBA_LEN, 8);
+    assert_eq!(generated_block::KCOMP_BLOCK_CAPACITY_LEN, 8);
+
     // filesystem：名字 + 指纹 + 只读 open flag。
     assert_eq!(
         generated_filesystem::KCOMP_FILESYSTEM_ABI,

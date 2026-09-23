@@ -2144,7 +2144,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 41
+    assert len(core.functions) == 42
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
         "kcore_trace_stats",
@@ -2187,6 +2187,13 @@ doc = "I/O error"
     ]
     block_abi = [const for const in block.constants if const.name == "KCOMP_BLOCK_DEVICE_ABI"][0]
     assert block_abi.value == 0x424C_4F43_4B44_4556
+    block_consts = {const.name: const.value for const in block.constants}
+    assert block_consts["KCOMP_BLOCK_DEVICE_CONTRACT"] == 0x424C_4B43_4F4E_5452
+    assert block_consts["KCOMP_BLOCK_METHOD_CAPACITY"] == 0
+    assert block_consts["KCOMP_BLOCK_METHOD_READ"] == 1
+    assert block_consts["KCOMP_BLOCK_METHOD_WRITE"] == 2
+    assert block_consts["KCOMP_BLOCK_LBA_LEN"] == 8
+    assert block_consts["KCOMP_BLOCK_CAPACITY_LEN"] == 8
     assert len(filesystem.structs) == 1 and filesystem.structs[0].size_ptrs == 5
     assert [field.name for field in filesystem.structs[0].fields] == [
         "mount",

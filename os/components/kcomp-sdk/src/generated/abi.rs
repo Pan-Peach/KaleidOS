@@ -358,7 +358,11 @@ unsafe extern "C" {
         abi: u64,
         port: u32,
     ) -> i32;
-    /// 组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付）。
+    /// 组合期发现：`(provider, port_name, contract) → EndpointId`。
+    /// Core 校验的只有 **contract + 存活**（endpoint `Live` + owner 存在且 `Ready`）——
+    /// **不校验 abi**（本 ABI 不携带 abi）。交付的 EndpointId 是 opaque capability，
+    /// 它的 abi 由 consumer 用 `kcore_endpoint_validate` 自行核对（SDK 的
+    /// `Endpoint<C>::from_id` / `lookup` 正是这样做的）。
     /// 成功 = `0`，EndpointId（`u64`）写入 `*out_endpoint`（调用方保证可写，任意对齐）；
     /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法·契约不符 /
     /// `ENOENT` 未发布或 endpoint 已死 / `ENODEV` provider 已不存在）。
@@ -370,24 +374,34 @@ unsafe extern "C" {
         contract: u64,
         out_endpoint: *mut u64,
     ) -> i32;
+    /// 只读校验一个已持有的 EndpointId：`(endpoint, contract, abi) → 0 / -Errno`。
+    /// 实现是 `EndpointRegistry::lookup`——**contract + abi 都 exact-match**，并且
+    /// endpoint `Live`、owner 存在且 `Ready`（与发现路径同一套存活校验）。
+    /// 无副作用、不分配、不改变任何状态；consumer 在取得 id 后核对契约身份用，
+    /// **不**替代 `kcore_endpoint_call` 的逐次存活解析（调用路径仍会重新校验存活）。
+    /// 成功 = `0`；失败 = `-Errno`（`EINVAL` contract 或 abi 不符 /
+    /// `ENOENT` 未发布或 endpoint 已死 / `ENODEV` provider 已不存在）。
+    #[link_name = "kcore_endpoint_validate"]
+    pub fn kcore_endpoint_validate(endpoint: u64, contract: u64, abi: u64) -> i32;
     /// 调用一个 endpoint。**传输状态 ≠ 方法状态**：返回值是 Core 的**传输状态**
     /// （`0` / `-Errno`）；provider 自己的 `i32` 返回写入 `*out_status`——**只在传输
     /// 返回 `0` 时有意义**。provider 返回的负 errno 绝不与 Core 生成的失败混淆。
     /// `endpoint` 是组合期经 `kcore_endpoint_lookup` 取得的 opaque EndpointId
-    /// （contract / abi 已在交付前校验，调用只重新校验存活）；`method` / `port` 语义
-    /// 由 provider 定义，Core 从不解释。`args` / `input` / `output` 是调用方的内存，
-    /// 只在本次调用期间借用：Core 只做结构校验（长度非零时指针不得为空），**不解析
-    /// 其中的字节**。
+    /// （发现路径只校验 contract + 存活；abi 由 `kcore_endpoint_validate` 核对；
+    /// **调用只重新校验存活**）；`method` / `port` 语义由 provider 定义，Core 从不解释。
+    /// `args` / `input` / `output` 是调用方的内存，只在本次调用期间借用：Core 只做
+    /// 结构校验（长度非零时指针不得为空），**不解析其中的字节**。
     /// provider = 当前 provider 实例：Core 校验其 `Ready` 并记 inflight；provider 停止 /
     /// 失败后 endpoint 永久死亡，绝不重定向到新实例。
-    /// **本阶段（Phase B）是 KernelNative 直接分派**：没有执行边界 / service stack /
-    /// principal 切换 / re-entry 检测 / provider panic containment（下一阶段，见
+    /// **执行边界已落地**：dispatcher 跑在 Core 拥有的 per-call service stack 上、处于
+    /// provider principal 之下，带 re-entry 检测与 provider panic containment（见
     /// `component/call.rs` 模块文档）。
     /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`（`EFAULT`
     /// `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或 caller 已
     /// `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image 已不存在；
-    /// `EBUSY` provider 不在 `Ready` 或 inflight 溢出；`ENOSYS` image 没有
-    /// `kcomp_service_dispatch`）。
+    /// `EBUSY` provider 不在 `Ready`、inflight 溢出或重入；`EINVAL` 调用链上有 IRQ
+    /// 作用域；`ENOMEM` Core 无法分配 service stack；`EIO` provider 在边界内 panic
+    /// （已被标记 `Failed`，caller 存活）；`ENOSYS` image 没有 `kcomp_service_dispatch`）。
     #[link_name = "kcore_endpoint_call"]
     pub fn kcore_endpoint_call(
         endpoint: u64,

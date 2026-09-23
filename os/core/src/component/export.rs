@@ -16,7 +16,7 @@
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
 //! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` `kcore_interface_publish` `kcore_interface_available` `kcore_interface_bind` `kcore_interface_refresh` | 组件实例创建/接口发布的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口。接口用 **exact ABI fingerprint**（`u64`，无版本兼容语义）：publish 在 `kcomp_instance_create` 期间只记录 pending（staged），create 返回 0 后 Core 原子提交；consumer bind/refresh 时 Core 重新验证 provider 并返回 opaque `api/ctx/generation` |
-//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现，Core 校验存活后交付；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
+//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_call` | 组件→组件依赖的新真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后经 **service-call 执行边界**（`component/call.rs` + `containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）分派给 provider image 的**可选** `kcomp_service_dispatch`（flat `kcomp_call_frame`；**传输状态 ≠ 方法状态**）。旧 `kcore_interface_*` 与之并行，consumer 迁移是下一阶段 |
 //! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
 //! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
 //! | Scheduler（v2） | `kcore_sched_run` | 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core） |
@@ -638,9 +638,13 @@ extern "C" fn kcore_endpoint_publish(
     })
 }
 
-/// 组合期发现：`(provider, port_name, contract) → EndpointId`（Core 校验后交付；
-/// 绝不交付死 endpoint）。`provider` 是 consumer 显式给出的实例身份——身份不是
-/// 权限，Core 只按真相解析。
+/// 组合期发现：`(provider, port_name, contract) → EndpointId`。
+///
+/// Core 校验的只有 **contract + 存活**（[`EndpointRegistry::discover`]：
+/// endpoint `Live`、owner 存在且 `Ready`），**不校验 abi**——本 ABI 不携带 abi，
+/// 交付的 EndpointId 是 opaque capability；consumer 用
+/// [`kcore_endpoint_validate`] 核对契约 ABI（SDK `Endpoint<C>::from_id`）。
+/// `provider` 是 consumer 显式给出的实例身份——身份不是权限，Core 只按真相解析。
 ///
 /// 成功 = 0，EndpointId（`u64`）写入 `*out_endpoint`（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` 名字非法或契约不符 /
@@ -677,6 +681,32 @@ extern "C" fn kcore_endpoint_lookup(
     })
 }
 
+/// 只读校验一个已持有的 EndpointId：**contract + abi exact-match** +
+/// 存活（[`EndpointRegistry::lookup`]：endpoint `Live`、owner 存在且 `Ready`）。
+///
+/// 无副作用、不分配、不改变任何状态。这是 consumer 在取得 id 后核对契约身份的
+/// 窄入口（SDK `Endpoint<C>::from_id` / `lookup` 用它，把 id 变成 typed
+/// `Endpoint<C>`）；**不**替代 [`kcore_endpoint_call`] 的逐次存活解析——调用路径
+/// 仍独立重新校验存活。
+///
+/// 成功 = `0`；失败 = `-Errno`（`EINVAL` contract 或 abi 不符 /
+/// `ENOENT` endpoint 未发布或已死 / `ENODEV` provider 已不存在）。
+extern "C" fn kcore_endpoint_validate(endpoint: u64, contract: u64, abi: u64) -> i32 {
+    with_core_critical(|| {
+        let reg = registry::get_registry().lock();
+        let endpoints = endpoint::get_endpoints().lock();
+        match endpoints.lookup(
+            &reg,
+            EndpointId::from_raw(endpoint),
+            ContractId::from_raw(contract),
+            InterfaceAbi::from_raw(abi),
+        ) {
+            Ok(_) => 0,
+            Err(error) => Errno::from(error).code(),
+        }
+    })
+}
+
 /// 调用一个 endpoint：Core 控制的 **service-call 执行边界**（per-call Core
 /// 拥有的 service stack + provider principal + panic containment；见
 /// `component/call.rs` 与 `containment::call_component_service`）。
@@ -686,7 +716,8 @@ extern "C" fn kcore_endpoint_lookup(
 /// provider 返回的负 errno 绝不与 Core 生成的失败混淆。
 ///
 /// `endpoint` 是组合期经 [`kcore_endpoint_lookup`] 交付的 opaque `EndpointId`
-/// （contract / abi 已在交付前 exact-match 校验；调用只重新做**存活解析**）。
+/// （发现路径只校验 contract + 存活；abi 由 [`kcore_endpoint_validate`] 核对；
+/// 这里只重新做**存活解析**）。
 /// `args` / `input` / `output` 只在本次调用期间借用：Core 只做结构校验
 /// （长度非零时指针不得为空），**不解析其中的字节**。
 ///
@@ -1186,6 +1217,7 @@ mod tests {
             &b"kcore_dma_unmap"[..],
             &b"kcore_endpoint_publish"[..],
             &b"kcore_endpoint_lookup"[..],
+            &b"kcore_endpoint_validate"[..],
             &b"kcore_endpoint_call"[..],
         ] {
             assert!(resolve(name).is_some(), "{}", String::from_utf8_lossy(name));
@@ -1882,6 +1914,86 @@ mod tests {
         // 未知 provider → ENOENT（名字表按 provider 隔离 = 未发布）。
         assert_eq!(
             kcore_endpoint_lookup(0xDEAD, b"blk0".as_ptr(), 4, CONTRACT, &mut out),
+            Errno::ENOENT.code()
+        );
+    }
+
+    /// `kcore_endpoint_validate`：只读核对已持有的 id——**contract + abi 都
+    /// exact-match**（发现路径不校验 abi，consumer 用它补齐）+ 存活。
+    /// 无副作用：失败不污染后续调用。
+    #[test]
+    fn endpoint_validate_checks_contract_abi_and_liveness() {
+        use crate::component::{endpoint, registry};
+
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        endpoint::init();
+
+        const CONTRACT: u64 = 0xE0D0_4001;
+        const OTHER_CONTRACT: u64 = 0xE0D0_4002;
+        const ABI: u64 = 0xE0D0_4003;
+        const OTHER_ABI: u64 = 0xE0D0_4004;
+
+        // Given：一个 Ready provider 已发布 val0 并解析出 EndpointId。
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(crate::component::image::ComponentImageId::from_raw(4))
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        {
+            let reg = registry::get_registry().lock();
+            let mut eps = endpoint::get_endpoints().lock();
+            eps.stage_publish(
+                &reg,
+                id,
+                b"val0",
+                ContractId::from_raw(CONTRACT),
+                InterfaceKind::Device,
+                InterfaceAbi::from_raw(ABI),
+                7,
+            )
+            .unwrap();
+            eps.commit_pending(&reg, id).unwrap();
+        }
+        let mut out = 0u64;
+        assert_eq!(
+            kcore_endpoint_lookup(id.raw(), b"val0".as_ptr(), 4, CONTRACT, &mut out),
+            0
+        );
+        let ep = out;
+
+        // When / Then：contract + abi 都匹配 → 0。
+        assert_eq!(kcore_endpoint_validate(ep, CONTRACT, ABI), 0);
+        // 任一不符 → EINVAL（validate 是唯一补齐 abi 校验的入口）。
+        assert_eq!(
+            kcore_endpoint_validate(ep, OTHER_CONTRACT, ABI),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(
+            kcore_endpoint_validate(ep, CONTRACT, OTHER_ABI),
+            Errno::EINVAL.code()
+        );
+        // 未知 / 未发布 id → ENOENT。
+        assert_eq!(
+            kcore_endpoint_validate(0xDEAD, CONTRACT, ABI),
+            Errno::ENOENT.code()
+        );
+        // 只读：失败的核对不改变 endpoint 存活（随后仍返回 0）。
+        assert_eq!(kcore_endpoint_validate(ep, CONTRACT, ABI), 0);
+
+        // owner 离开 Ready（停止 / 失败）→ 死端点 ENOENT（与 lookup 同一存活档位）。
+        {
+            let mut reg = registry::get_registry().lock();
+            reg.begin_stop(id).unwrap();
+        }
+        assert_eq!(
+            kcore_endpoint_validate(ep, CONTRACT, ABI),
             Errno::ENOENT.code()
         );
     }
