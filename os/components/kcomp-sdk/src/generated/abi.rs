@@ -397,7 +397,7 @@ unsafe extern "C" {
     /// - **Gate**：`*out_api` / `*out_ctx` **不写**（保持调用方原值）；调用方改用
     ///   `kcore_endpoint_call`（同一 `endpoint` id 即 call-gate handle）。
     ///
-    /// 不支持的组合（跨特权 / Wasm / 无法证明同 AS 且 syscall-IPC 未实现）→ `-ENOTSUP`；
+    /// 不支持的组合（跨特权 / 无法证明同 AS 且 syscall-IPC 未实现）→ `-ENOTSUP`；
     /// **绝不静默降级成 Direct**。调用方不在任何组件执行边界内 → `-EPERM`；caller 已
     /// `Failed` → `-EPERM`。Direct 选中但 provider 未交付 function table（`api` 为空）→
     /// `-ENOTSUP`。成功 = `0`；失败 = `-Errno`（`EFAULT` 任一 out 为空 /

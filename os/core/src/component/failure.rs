@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     use crate::component::ComponentState;
     use crate::component::abi::{InterfaceAbi, InterfaceKind};
-    use crate::component::endpoint::{ContractId, EndpointError, EndpointState};
+    use crate::component::endpoint::{ContractId, EndpointError, EndpointState, ExecutionDomain};
     use crate::component::image::ComponentImageId;
     use crate::component::registry;
     use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
@@ -120,7 +120,7 @@ mod tests {
         let image = crate::component::image::test_support::register_test_image(b"fail_demo", 0);
         let id = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -179,7 +179,12 @@ mod tests {
 
     /// 声明一个 Ready 实例（endpoint 测试只把 image 当身份键，不需要真实 image）。
     fn ready_instance(reg: &mut registry::Registry) -> ComponentId {
-        let id = reg.declare(ComponentImageId::from_raw(0xFA11)).unwrap();
+        let id = reg
+            .declare(
+                ComponentImageId::from_raw(0xFA11),
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();

@@ -32,6 +32,7 @@
 
 use alloc::vec::Vec;
 
+use crate::component::endpoint::ExecutionDomain;
 use crate::component::image::ComponentImageId;
 use crate::component::{ComponentId, ComponentState};
 use spin::{Mutex, Once};
@@ -48,6 +49,7 @@ pub struct InstanceRecord {
     pub id: ComponentId,
     pub state: ComponentState,
     pub image: ComponentImageId,
+    pub execution_domain: ExecutionDomain,
     pub instance_state: *mut (),
     /// 未完成的 consumer→provider 调用计数（`begin_call` / `finish_call`）。
     pub inflight: u32,
@@ -94,6 +96,7 @@ impl Registry {
     pub(crate) fn declare(
         &mut self,
         image: ComponentImageId,
+        kind: ExecutionDomain,
     ) -> Result<ComponentId, RegistryError> {
         let id = ComponentId::from_raw(
             u32::try_from(self.next_id).map_err(|_| RegistryError::IdExhausted)?,
@@ -103,6 +106,7 @@ impl Registry {
             id,
             state: ComponentState::Declared,
             image,
+            execution_domain: kind,
             instance_state: core::ptr::null_mut(),
             inflight: 0,
         });
@@ -299,7 +303,7 @@ mod tests {
 
     /// 驱一个实例走完 init 路径到 `Ready`（stop 路径唯一合法的起点）。
     fn ready(reg: &mut Registry) -> ComponentId {
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -309,8 +313,8 @@ mod tests {
     #[test]
     fn declare_assigns_increasing_ids() {
         let mut reg = r();
-        let a = reg.declare(IMAGE).unwrap();
-        let b = reg.declare(IMAGE).unwrap();
+        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
     }
@@ -319,8 +323,8 @@ mod tests {
     #[test]
     fn one_image_backs_many_instances() {
         let mut reg = r();
-        let first = reg.declare(IMAGE).unwrap();
-        let second = reg.declare(IMAGE).unwrap();
+        let first = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let second = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_ne!(first, second);
         assert_eq!(reg.get(first).unwrap().image, IMAGE);
         assert_eq!(reg.get(second).unwrap().image, IMAGE);
@@ -331,8 +335,8 @@ mod tests {
     #[test]
     fn instance_state_is_per_instance() {
         let mut reg = r();
-        let a = reg.declare(IMAGE).unwrap();
-        let b = reg.declare(IMAGE).unwrap();
+        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         let mut state_a = 1u8;
         let mut state_b = 2u8;
         let ptr_a = core::ptr::addr_of_mut!(state_a).cast::<()>();
@@ -364,8 +368,8 @@ mod tests {
     #[test]
     fn lifecycle_is_per_instance_while_sharing_one_image() {
         let mut reg = r();
-        let a = reg.declare(IMAGE).unwrap();
-        let b = reg.declare(IMAGE).unwrap();
+        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
 
         // b 在 init 中失败 → 只有 b 变成 Failed；a 仍可走完生命周期。
         reg.mark_failed(b).unwrap();
@@ -389,7 +393,10 @@ mod tests {
     #[test]
     fn rejected_transition_leaves_truth_unchanged() {
         init();
-        let id = get_registry().lock().declare(IMAGE).unwrap();
+        let id = get_registry()
+            .lock()
+            .declare(IMAGE, ExecutionDomain::KernelNative)
+            .unwrap();
 
         // Declared → Ready 非法（跳过 Resolved / Starting）。
         assert_eq!(
@@ -416,7 +423,7 @@ mod tests {
     #[test]
     fn resolve_transitions_declared_to_resolved() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
     }
@@ -424,7 +431,7 @@ mod tests {
     #[test]
     fn begin_start_transitions_resolved_to_starting() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
@@ -433,7 +440,7 @@ mod tests {
     #[test]
     fn finish_start_transitions_starting_to_ready() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -443,7 +450,7 @@ mod tests {
     #[test]
     fn finish_start_without_begin_start_is_invalid() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         assert_eq!(reg.finish_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
@@ -453,7 +460,7 @@ mod tests {
     fn begin_start_from_declared_without_resolve_is_invalid() {
         // Declared --begin_start--> Starting 的硬编码已被拆开：必须先 resolve。
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
     }
@@ -461,7 +468,7 @@ mod tests {
     #[test]
     fn resolve_twice_is_invalid_transition() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         assert_eq!(reg.resolve(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
@@ -470,7 +477,7 @@ mod tests {
     #[test]
     fn begin_start_twice_is_invalid_transition() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
@@ -494,7 +501,7 @@ mod tests {
     #[test]
     fn failed_is_reachable_from_any_state() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.mark_failed(id).unwrap();
@@ -513,7 +520,7 @@ mod tests {
     #[test]
     fn is_failed_only_reports_failed_instances() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert!(!reg.is_failed(id));
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
@@ -531,7 +538,7 @@ mod tests {
     #[test]
     fn may_run_only_for_live_instances() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert!(!reg.may_run(id), "Declared does not run work");
         reg.resolve(id).unwrap();
         assert!(!reg.may_run(id), "Resolved does not run work");
@@ -582,7 +589,7 @@ mod tests {
     #[test]
     fn begin_stop_is_only_legal_from_ready() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
         reg.resolve(id).unwrap();
@@ -622,7 +629,7 @@ mod tests {
     #[test]
     fn failed_transition_keeps_original_state() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -634,7 +641,7 @@ mod tests {
     #[test]
     fn begin_start_after_failed_is_invalid_and_keeps_failed() {
         let mut reg = r();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.mark_failed(id).unwrap();
         assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
@@ -647,7 +654,7 @@ mod tests {
         let stopped = ready(&mut reg);
         reg.begin_stop(stopped).unwrap();
         reg.finish_stop(stopped).unwrap();
-        let failed = reg.declare(IMAGE).unwrap();
+        let failed = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.mark_failed(failed).unwrap();
 
         assert_eq!(reg.len(), 2, "tombstone 记录保留");
@@ -655,7 +662,7 @@ mod tests {
         assert_eq!(reg.get(failed).unwrap().state, ComponentState::Failed);
 
         // 新实例拿全新 id，不复用 tombstone 的 id。
-        let fresh = reg.declare(IMAGE).unwrap();
+        let fresh = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_ne!(fresh, stopped);
         assert_ne!(fresh, failed);
         assert_eq!(fresh.raw(), failed.raw() + 1);
@@ -825,7 +832,7 @@ mod tests {
         match op {
             Op::Declare => {
                 // When：声明一个新实例（同一 image 不限实例数）。
-                let result = reg.declare(IMAGE);
+                let result = reg.declare(IMAGE, ExecutionDomain::KernelNative);
 
                 // Then：分配下一单调 id，状态 Declared，image 是同一个。
                 let expected_id = ComponentId::from_raw(model.next_id);
@@ -932,7 +939,7 @@ mod tests {
             let mut reg = r();
             let mut ids = alloc::vec::Vec::new();
             for _ in 0..count {
-                ids.push(reg.declare(IMAGE).unwrap());
+                ids.push(reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap());
             }
             let probe = ids[count / 2];
             let mut bench = crate::bench::Bench::new(name);

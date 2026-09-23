@@ -271,7 +271,7 @@ Core 校验自动退化为 no-op，Core 不需要写任何 `#[cfg]`（host 测�
 3. **它能否真正 stop / unload？**（有明确的停止/卸载路径）
 4. **它的状态是否 loss-tolerant / 可重建？**（丢失后能重建到 safe usable state）
 
-> 组件失败 = **逻辑死亡、物理驻留**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例（逻辑重启）。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain（Wasm / 地址空间）里程碑。panic 契约见 §5.8：phase 1 已实现 init 边界与任务边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，非 unwinding）；但这**不等于** fault isolation。
+> 组件失败 = **逻辑死亡、物理驻留**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例（逻辑重启）。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain（私有地址空间 / 隔离）里程碑——Wasm 是**正交的执行后端维度**，不属于 ExecutionDomain。panic 契约见 §5.8：phase 1 已实现 init 边界与任务边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，非 unwinding）；但这**不等于** fault isolation。
 
 ## 5.7 最小性不是代码高尔夫
 

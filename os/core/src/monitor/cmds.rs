@@ -5,6 +5,7 @@
 //! Core 管理路径的一部分（组件没有全局 trace-control authority，只能读）。
 //! 输出走 `crate::print`（注入式，裸机 SBI / host 静默）。
 
+use crate::component::endpoint::ExecutionDomain;
 use crate::component::load::ComponentLoadError;
 use crate::machine::{IoSpace, MachineInfo};
 use crate::memory;
@@ -103,18 +104,56 @@ pub fn tasks(_line: &[u8]) {
     }
 }
 
-/// `load <name>`：走 Core 的组件实例创建语义入口（薄 caller，创建流程在
+/// 解析 Monitor 的部署域 token（`load <name> [kind]`）。
+///
+/// 只做**词法**映射：部署是否真的可执行由 Core 的创建入口验证（`create_component`
+/// 对未实现域显式拒绝）——Monitor 不是 authority，不能凭输入授予部署。
+fn parse_domain(token: &[u8]) -> Option<ExecutionDomain> {
+    match token {
+        b"native" => Some(ExecutionDomain::KernelNative),
+        b"isolated" => Some(ExecutionDomain::IsolatedNative),
+        b"sandboxed" => Some(ExecutionDomain::SandboxedNative),
+        _ => None,
+    }
+}
+
+/// `load <name> [kind]`：走 Core 的组件实例创建语义入口（薄 caller，创建流程在
 /// `component::load::load_and_start`，与组件 ABI `kcore_component_load` 同源）。
+///
+/// `kind` 是**部署请求**（省略 = `native`）：Core 验证后提交，未实现域显式拒绝。
 pub fn load(args: &[u8]) {
-    let name = args.trim_ascii();
-    if name.is_empty() {
-        printk!("usage: load <name>\n");
+    let mut tokens = args
+        .trim_ascii()
+        .split(|&b| b.is_ascii_whitespace())
+        .filter(|token| !token.is_empty());
+    let Some(name) = tokens.next() else {
+        printk!("usage: load <name> [native|isolated|sandboxed]\n");
+        return;
+    };
+    let kind = match tokens.next() {
+        None => ExecutionDomain::KernelNative,
+        Some(token) => match parse_domain(token) {
+            Some(kind) => kind,
+            None => {
+                printk!("load: unknown deployment '");
+                crate::print::print_bytes(token);
+                printk!("' (native|isolated|sandboxed)\n");
+                return;
+            }
+        },
+    };
+    if tokens.next().is_some() {
+        printk!("usage: load <name> [native|isolated|sandboxed]\n");
         return;
     }
     let name = String::from_utf8_lossy(name);
     // Monitor 单实例便利语义：同名 artifact 已有 Ready/Starting 实例时不再新建
     // （组件 ABI 的 `kcore_component_create` 仍支持多实例；这是交互式 load 的 UX）。
     // `image → instance` 的匹配与 `components` 命令同源。
+    //
+    // TODO(human): "already loaded" 检查要考虑**所请求的 kind**——接入 Isolated
+    // 后，同名 Native 实例不应让 Isolated 请求短路（反之亦然）。见
+    // `load.rs::get_or_load_image` 的按域装载 TODO。
     {
         let images = crate::component::image::get_images().lock();
         if let Some(image) = images.find(name.as_bytes()) {
@@ -134,7 +173,7 @@ pub fn load(args: &[u8]) {
             }
         }
     }
-    match crate::component::load::load_and_start(name.as_bytes()) {
+    match crate::component::load::load_and_start(name.as_bytes(), kind) {
         Ok(id) => {
             let (image, create) = {
                 let reg = crate::component::registry::get_registry().lock();
@@ -374,4 +413,33 @@ pub fn shutdown(_line: &[u8]) {
 
 pub fn reboot(_line: &[u8]) {
     ResetImpl::system_reset(ResetType::ColdReboot);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_domain_maps_each_token_to_its_execution_domain() {
+        assert_eq!(parse_domain(b"native"), Some(ExecutionDomain::KernelNative));
+        assert_eq!(
+            parse_domain(b"isolated"),
+            Some(ExecutionDomain::IsolatedNative)
+        );
+        assert_eq!(
+            parse_domain(b"sandboxed"),
+            Some(ExecutionDomain::SandboxedNative)
+        );
+    }
+
+    #[test]
+    fn parse_domain_rejects_unknown_and_case_variants() {
+        assert_eq!(parse_domain(b""), None);
+        assert_eq!(parse_domain(b"kernel-native"), None);
+        assert_eq!(parse_domain(b"Native"), None);
+        assert_eq!(parse_domain(b"bogus"), None);
+        // `wasm` 是执行模型 / runtime 维度，**不是**执行域：不接受为 kind
+        // （见 `endpoint.rs::ExecutionDomain` 文档）。
+        assert_eq!(parse_domain(b"wasm"), None);
+    }
 }

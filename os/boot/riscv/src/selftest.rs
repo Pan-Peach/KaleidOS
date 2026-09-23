@@ -214,7 +214,10 @@ fn task_panic() -> ! {
     // A Ready scheduler policy provider: load the reference implementation, then
     // **explicitly** discover its `scheduler.policy` endpoint and select it —
     // Core's scheduling path never discovers a scheduler by name.
-    let provider = match kernel::component::load::load_and_start(b"scheduler_rr") {
+    let provider = match kernel::component::load::load_and_start(
+        b"scheduler_rr",
+        kernel::component::endpoint::ExecutionDomain::KernelNative,
+    ) {
         Ok(id) => id,
         Err(_) => fail("task-panic: scheduler_rr load failed"),
     };
@@ -222,7 +225,10 @@ fn task_panic() -> ! {
         fail("task-panic: scheduler policy selection failed");
     }
     // A separate Ready victim, so failing it does not remove the scheduler.
-    let victim = match kernel::component::load::load_and_start(b"kcomp_smoke") {
+    let victim = match kernel::component::load::load_and_start(
+        b"kcomp_smoke",
+        kernel::component::endpoint::ExecutionDomain::KernelNative,
+    ) {
         Ok(id) => id,
         Err(_) => fail("task-panic: kcomp_smoke load failed"),
     };
@@ -297,7 +303,10 @@ extern "C" fn task_panic_entry(_arg: *mut ()) -> ! {
 /// 诊断行由 `arch_runner.py` 在串口输出上断言。
 fn panic_component() -> ! {
     use kernel::component::load::ComponentLoadError;
-    match kernel::component::load::load_and_start(b"kcomp_panic") {
+    match kernel::component::load::load_and_start(
+        b"kcomp_panic",
+        kernel::component::endpoint::ExecutionDomain::KernelNative,
+    ) {
         Err(ComponentLoadError::CreatePanicked) => {}
         Ok(_) => fail("panic-component: component did not panic"),
         Err(_) => fail("panic-component: unexpected load error"),

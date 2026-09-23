@@ -501,7 +501,7 @@ mod tests {
     use super::*;
     use crate::component::abi::{InterfaceAbi, InterfaceKind};
     use crate::component::containment;
-    use crate::component::endpoint::{ContractId, EndpointError};
+    use crate::component::endpoint::{ContractId, EndpointError, ExecutionDomain};
     use crate::component::registry;
     use crate::errno::Errno;
     use crate::task::TaskId;
@@ -600,7 +600,7 @@ mod tests {
         image::init();
         let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image).unwrap();
+        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -836,7 +836,10 @@ mod tests {
         let failed = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(0xCA11))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(0xCA11),
+                    ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.mark_failed(id).unwrap();
             id
@@ -1273,7 +1276,7 @@ mod tests {
     /// "传输成功 + inflight 归还"——真实入口执行由 QEMU 上的真实组件证明。
     #[test]
     fn gate_selected_endpoint_still_dispatches_through_endpoint_call() {
-        use crate::component::endpoint::{ExecutionDomain, Mechanism};
+        use crate::component::endpoint::Mechanism;
 
         let _serial = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();

@@ -143,6 +143,7 @@ fn halt() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::endpoint::ExecutionDomain;
     use crate::component::image::{self, ComponentImageId};
     use crate::component::registry;
     use crate::memory::test_support;
@@ -165,7 +166,9 @@ mod tests {
     fn starting_component(name: &[u8]) -> (ComponentId, usize, usize) {
         let image = image::test_support::register_test_image(name, 0);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image).expect("declare starting component");
+        let id = reg
+            .declare(image, ExecutionDomain::KernelNative)
+            .expect("declare starting component");
         reg.resolve(id).expect("resolve");
         reg.begin_start(id).expect("begin_start");
         drop(reg);
@@ -207,11 +210,14 @@ mod tests {
         let image = image::test_support::register_test_image(b"task_perm_states", 0);
 
         // Declared：只声明。
-        let declared = registry::get_registry().lock().declare(image).unwrap();
+        let declared = registry::get_registry()
+            .lock()
+            .declare(image, ExecutionDomain::KernelNative)
+            .unwrap();
         // Failed：走完 init 路径后逻辑死亡。
         let failed = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.mark_failed(id).unwrap();
@@ -220,7 +226,7 @@ mod tests {
         // Stopped：完整初始化后优雅停止。
         let stopped = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -284,7 +290,12 @@ mod tests {
         let _g = setup();
         let id = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(ComponentImageId::from_raw(0xFFFF)).unwrap();
+            let id = reg
+                .declare(
+                    ComponentImageId::from_raw(0xFFFF),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -337,7 +348,7 @@ mod tests {
         let image = image::test_support::register_test_image(b"task_share_image", 0);
         let (first, first_base, first_size) = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             drop(reg);
@@ -347,7 +358,7 @@ mod tests {
         };
         let second = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id

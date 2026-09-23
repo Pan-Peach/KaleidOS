@@ -54,7 +54,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "load",
-        help: "load a kcomp by name (e.g. load core_test)",
+        help: "load a kcomp by name (e.g. load core_test [native])",
         run: cmds::load,
     },
     Command {

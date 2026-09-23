@@ -49,14 +49,13 @@ Core 与组件共享**一个 Core heap**，不做 per-component 内存记账；�
 | KernelNative | S | 共享内核 AS | 最高性能、常态 | 无硬件强制（可信代码） |
 | IsolatedNative（可选实验，非里程碑） | S | 私有 AS | 生命周期恢复 / 内存回收 | 仅条件性故障隔离（协作与偶然 bug；对恶意无效） |
 | SandboxedNative（未来） | U | 私有 AS | 对抗隔离 / 不可信代码 | 私有 AS + 页表 + 特权级 = 硬件强制 |
-| Wasm（更远） | — | — | 可移植沙箱 | 运行时强制 |
 
 要点：
 
 - **KernelNative 是正常、长期模式**：同域同特权级，调用即普通函数调用，零切换成本。Core 与驱动共享内核地址空间。
 - **IsolatedNative 只是可选的 S-mode 教学实验**，用来观察生命周期恢复与内存回收，**不是里程碑**；S 与 Core 同特权级，天然不是恶意代码边界。
 - **SandboxedNative 才是未来的强制边界**：U 模式 + 私有 AS + 页表，由硬件完成强制。
-- **Wasm 更远**，只作为 Component 的执行后端之一。
+- **执行模型 / runtime（native machine code vs Wasm）是正交维度**：Wasm 只作为 Component 的**执行后端之一**（`AGENTS.md`），**不是第四个执行域**——`KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime。见 `deployment.md` §3。
 
 **部署形态本身就是安全策略，不是 Core 的统一强制。** 若不信任一个组件，就不要把它部署成 KernelNative。三个信任 / 执行域对应三种代价：
 
@@ -263,7 +262,7 @@ allocation（device-agnostic）            mapping（device-related）
 - **`mapping_id` 单调递增 `u64`，从不复用**：这是唯一保留的 "id" 对象，理由是 DMA mapping 有真实的长生命周期（map → 设备使用 → unmap）。
 - `kcore_dma_free` / `kcore_dma_unmap` 做拆除。
 
-### 6.4 未来 syscall 线格式（SandboxedNative / Wasm 方向）
+### 6.4 未来 syscall 线格式（SandboxedNative 方向）
 
 **三个域不得因为"做同一件事"就共用同一个底层 ABI。** 语义（allocate / map / irq / log / interface-call）可以复用，**transport 必须分开**：
 
@@ -433,7 +432,7 @@ runtime:
 ## 13. 已决
 
 - **D1 = A**：保留"单一共享 Core heap、不做 per-component 记账"；只有显式拥有的运行期区域可回收；共享堆分配需要显式清理；**不引入 per-component 私有堆**。
-- **D2 = A**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是可选的**教学实验**、**不是里程碑**；SandboxedNative（U + 私有 AS）是未来的**强制边界**；Wasm 更远。
+- **D2 = A**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是可选的**教学实验**、**不是里程碑**；SandboxedNative（U + 私有 AS）是未来的**强制边界**。执行模型 / runtime（native vs Wasm）是**正交维度**，Wasm 只是 Component 的执行后端之一，不是第四个执行域。
 - **设备访问模型**：`DeviceId`（identity）+ `kcore_device_claim` 返回本执行域窗口；KernelNative 拿裸寄存器基址，driver 自己 `volatile` 读写；不做 per-access 鉴权。旧的 `Handle → validate → Core MMIO read/write`、typed `MmioLease` / `DmaLease` 已删除。
 - **IRQ 模型**：锚点是已认领的 `DeviceId`；只支持 native callback；polled / count / mask / ack 已删除并推迟到真实 isolated / U-mode 执行模型。
 - **DMA 模型**：allocation（device-agnostic）与 mapping（device-related）分离；mapping id 单调递增 `u64` 从不复用；No-IOMMU identity，IOMMU / bounce buffer 在同一 seam。

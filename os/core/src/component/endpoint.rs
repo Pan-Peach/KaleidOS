@@ -43,7 +43,7 @@
 //!       同域 KernelNative          → Direct（api/ctx 原样交付）
 //!       KernelNative ↔ Isolated    → Gate（opaque EndpointId）
 //!       Isolated ↔ Isolated        → Gate（同 AS 无法证明，绝不假设 Direct）
-//!       Sandbox / Wasm 参与        → 显式拒绝（ENOTSUP；绝不静默降级）
+//!       Sandbox 参与              → 显式拒绝（ENOTSUP；绝不静默降级）
 //! ```
 //!
 //! SDK / 组件**只执行**机制、**不得选择**机制：`api` / `ctx` 只在 Direct 结果里
@@ -238,6 +238,13 @@ pub enum EndpointError {
 /// 字段（deployment.md §7.3），所有实例都跑在共享内核地址空间里。其余变体是矩阵
 /// 的另一半——`select_mechanism` 的交叉臂已经在跑（host 测试覆盖），但**没有**
 /// 任何“假装已实现”的路径：需要未实现机制的组合一律显式拒绝。
+///
+/// **本枚举只回答“在哪里、以什么特权 / 地址空间执行”**（placement）。**执行模型 /
+/// ISA / runtime**（native machine code vs Wasm）是**正交维度**，不属于这里：
+/// `KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，
+/// `SandboxedNative` 也都可以是 native code——把 Wasm 塞进本枚举是把苹果和橘子
+/// 放一起。Wasm 作为未来 Component 执行后端（`AGENTS.md` / `deployment.md` §1）
+/// 需要**单独的维度**表达，不要加回本枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDomain {
     /// 与 Core 同特权、同地址空间（今天唯一存在的域）。
@@ -246,8 +253,6 @@ pub enum ExecutionDomain {
     IsolatedNative,
     /// 低特权 + 私有地址空间（**未实现**：无 U-mode）。
     SandboxedNative,
-    /// 更远的执行后端（**未实现**：host call 不在本 ABI 内）。
-    Wasm,
 }
 
 /// Core 在 **bind 时**为一次调用选定的机制（一次，运行期不再重决策）。
@@ -265,7 +270,7 @@ pub enum BindError {
     /// endpoint 校验失败（未发布 / 已死 / owner 消失 / contract·abi 不符）。
     Endpoint(EndpointError),
     /// `(caller domain, provider domain)` 没有**已实现**的合法机制
-    /// （跨特权 / Wasm / 同 AS 无法证明且 syscall-IPC 未实现）→ `ENOTSUP`。
+    /// （跨特权 / 同 AS 无法证明且 syscall-IPC 未实现）→ `ENOTSUP`。
     /// **绝不静默降级成 Direct**（deployment.md §2 ⑤）。
     UnsupportedMechanism,
     /// 选中 Direct，但 provider 发布时没有交付 function table（`api` 为空）——
@@ -296,21 +301,23 @@ pub struct BoundEndpoint {
 /// 降级成 Direct：
 ///
 /// ```text
-///                KernelNative   IsolatedNative   SandboxedNative   Wasm
-/// KernelNative   Direct         Gate             Gate              reject
-/// Isolated       Gate           Gate (*)         Gate              reject
-/// Sandboxed      reject         reject           reject            reject
-/// Wasm           reject         reject           reject            reject
+///                KernelNative   IsolatedNative   SandboxedNative
+/// KernelNative   Direct         Gate             Gate
+/// Isolated       Gate           Gate (*)         Gate
+/// Sandboxed      reject         reject           reject
 /// ```
 ///
 /// (*) `Isolated ↔ Isolated`：矩阵允许“同一 AS 时 Direct”，但今天**无法证明**
 /// 两个实例共享同一 AS（私有 AS 尚未实现），因此选 Gate——"同 AS 未知"绝不假设
 /// Direct。Sandbox 参与的组合需要 syscall-IPC（未实现）或可证明的同 AS，一律拒绝。
+///
+/// **执行模型 / runtime（native machine code vs Wasm）不在本矩阵**——它与执行域
+/// 正交（见 [`ExecutionDomain`] 文档），Wasm 需要单独的维度，不是第四个域。
 pub fn select_mechanism(
     caller: ExecutionDomain,
     provider: ExecutionDomain,
 ) -> Result<Mechanism, BindError> {
-    use ExecutionDomain::{IsolatedNative, KernelNative, SandboxedNative, Wasm};
+    use ExecutionDomain::{IsolatedNative, KernelNative, SandboxedNative};
     match (caller, provider) {
         // 同域 KernelNative：单一内核 AS + 同特权 → Direct。
         (KernelNative, KernelNative) => Ok(Mechanism::Direct),
@@ -322,22 +329,27 @@ pub fn select_mechanism(
         // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
         (IsolatedNative, IsolatedNative) => Ok(Mechanism::Gate),
         // Sandbox caller：需要 syscall-IPC（未实现）；同 AS 同样无法证明。
+        // Sandbox **作为 callee** 的组合（K→S / I→S）已在上面判为 Gate。
         (SandboxedNative, _) => Err(BindError::UnsupportedMechanism),
-        // Sandbox callee（caller 不是 Sandbox 的臂已在上面给出 Gate）。
-        (_, SandboxedNative) => Err(BindError::UnsupportedMechanism),
-        // Wasm：host call 不在本 ABI 内。
-        (Wasm, _) | (_, Wasm) => Err(BindError::UnsupportedMechanism),
     }
 }
 
-/// 解析一个实例的执行域。
+/// 解析一个实例的执行域（**唯一解析点**，deployment.md §1/§7.3）。
 ///
-/// 今天唯一真实存在的部署是 KernelNative（Core 尚无部署 / 域字段，deployment.md
-/// §7.3），因此这里恒返回它。bind 对 **caller 与 provider 两端各解析一次**——
-/// 引入部署域后，这里是唯一的解析点；绝不只按 provider 的部署标签决策
-/// （合法机制同时取决于两端，deployment.md §1）。
-pub fn instance_domain(_owner: ComponentId) -> ExecutionDomain {
-    ExecutionDomain::KernelNative
+/// 从 registry 的实例记录读取部署域（`InstanceRecord::execution_domain`）——该字段
+/// 由创建入口（`component/load.rs::create_component`）验证部署请求后写入，是 Core
+/// owns 的部署真相。bind 对 **caller 与 provider 两端各解析一次**：合法机制同时
+/// 取决于两端，绝不只按 provider 的部署标签决策。
+///
+/// 取已借用的 `&Registry`（而非自行取锁）：`bind` 在**持有 registry 锁**时解析
+/// provider 域，再取一次锁会自死锁（`spin::Mutex` 不可重入）。未知 owner 回退
+/// `KernelNative` 只是防御——`bind` 的存活校验已保证 owner 存在且 `Ready`。
+pub fn instance_domain(components: &Registry, owner: ComponentId) -> ExecutionDomain {
+    components
+        .get(owner)
+        .map_or(ExecutionDomain::KernelNative, |record| {
+            record.execution_domain
+        })
 }
 
 /// Contract / Endpoint 的 Core 真相：谁在哪个端口上发布了哪个契约。
@@ -546,7 +558,7 @@ impl EndpointRegistry {
         // (1) 校验：contract + abi exact-match + 存活（与 validate 同一入口）。
         let record = self.lookup(components, id, contract, abi)?;
         // (2) 机制选择：两端执行域缺一不可。
-        let mechanism = select_mechanism(caller_domain, instance_domain(record.owner))?;
+        let mechanism = select_mechanism(caller_domain, instance_domain(components, record.owner))?;
         // (3) Direct 必须真的有 function table 可交付（结构性检查，不解引用）。
         if mechanism == Mechanism::Direct && record.api.is_null() {
             return Err(BindError::DirectWithoutApi);
@@ -723,7 +735,7 @@ mod tests {
         let mut reg = Registry::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let id = reg.declare(IMAGE).unwrap();
+            let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -821,7 +833,7 @@ mod tests {
 
         // Declared / Resolved 拒绝；Starting / Ready 接受（create 期发布 = Starting）。
         let mut state = Registry::new();
-        let declared = state.declare(IMAGE).unwrap();
+        let declared = state.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_eq!(
             er.stage_publish(
                 &state,
@@ -1150,37 +1162,31 @@ mod tests {
         er.discover(reg, provider, port_name, CONTRACT).unwrap()
     }
 
-    /// `select_mechanism` 覆盖**全部 16 个 (caller, provider) 组合**：
+    /// `select_mechanism` 覆盖**全部 9 个 (caller, provider) 组合**：
     /// 同域 KernelNative → Direct；同特权跨域（K↔I、I↔I、K→S、I→S）→ Gate；
-    /// Sandbox / Wasm 参与 → 显式拒绝（**绝不静默降级成 Direct**）。
+    /// Sandbox 参与 → 显式拒绝（**绝不静默降级成 Direct**）。
+    ///
+    /// 执行模型 / runtime（native vs Wasm）不在矩阵内——它与执行域正交。
     #[test]
     fn select_mechanism_covers_the_domain_matrix() {
-        use ExecutionDomain::{IsolatedNative as I, KernelNative as K};
-        use ExecutionDomain::{SandboxedNative as S, Wasm as W};
+        use ExecutionDomain::{IsolatedNative as I, KernelNative as K, SandboxedNative as S};
 
         let cases: [(
             ExecutionDomain,
             ExecutionDomain,
             Result<Mechanism, BindError>,
-        ); 16] = [
+        ); 9] = [
             (K, K, Ok(Mechanism::Direct)),
             (K, I, Ok(Mechanism::Gate)),
             (K, S, Ok(Mechanism::Gate)),
-            (K, W, Err(BindError::UnsupportedMechanism)),
             (I, K, Ok(Mechanism::Gate)),
             // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
             (I, I, Ok(Mechanism::Gate)),
             (I, S, Ok(Mechanism::Gate)),
-            (I, W, Err(BindError::UnsupportedMechanism)),
             // Sandbox caller 需要 syscall-IPC（未实现）→ 拒绝。
             (S, K, Err(BindError::UnsupportedMechanism)),
             (S, I, Err(BindError::UnsupportedMechanism)),
             (S, S, Err(BindError::UnsupportedMechanism)),
-            (S, W, Err(BindError::UnsupportedMechanism)),
-            (W, K, Err(BindError::UnsupportedMechanism)),
-            (W, I, Err(BindError::UnsupportedMechanism)),
-            (W, S, Err(BindError::UnsupportedMechanism)),
-            (W, W, Err(BindError::UnsupportedMechanism)),
         ];
         for (caller, provider, expected) in cases {
             assert_eq!(
@@ -1600,7 +1606,7 @@ mod tests {
         let (mut reg, ids) = ready_world();
 
         // Declared / Resolved / Starting 都不可服务：只有 Ready 放行。
-        let declared = reg.declare(IMAGE).unwrap();
+        let declared = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert_eq!(reg.begin_call(declared), Err(RegistryError::NotReady));
         reg.resolve(declared).unwrap();
         assert_eq!(reg.begin_call(declared), Err(RegistryError::NotReady));

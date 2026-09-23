@@ -18,7 +18,7 @@
 - `registry.rs`：`Registry`、`InstanceRecord`、`RegistryError`；`declare` / `resolve` / `begin_start` / `finish_start` / `begin_stop` / `finish_stop` / `mark_failed` / `record_instance_state`；全局 `get_registry`。
 - `image.rs`：`ImageTable`、`ComponentImage`、`ComponentImageId`、`ImageError`；`register` / `find` / `get`、全局 `get_images`。
 - `abi.rs`：`InterfaceAbi`（exact fingerprint）、`InterfaceKind`（生成物 re-export）。
-- `load.rs`：`ComponentLoadError`、`current_component()`、`load_and_start()`、`create_component()`。
+- `load.rs`：`ComponentLoadError`、`current_component()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：创建入口**按域分派**（`KernelNative` 走现有创建链；`IsolatedNative` / `SandboxedNative` 是 `todo!()` 占位）——按域装载 / 入口分派仍是 TODO（见 `deployment.md` §6.2/§7.1）。
 - `loader.rs`：`load_component()`、`LoadedComponent`、`LoaderError`；解析 ELF、放置段、应用重定位、解析 `kcomp_instance_create` / `kcomp_instance_destroy` / `kcomp_abi`。
 - `elf.rs`：架构中立 ELF ET_REL 解析（`ElfObject`、`ElfError`、`ElfClass`、`Section`、`Symbol`、`Relocation`）。
 - `store.rs`：内嵌 `.initpkg` cpio store（`CpioEntry`、`EmbeddedStore`、`parse_entries`、`init`、`get_component_store`）。

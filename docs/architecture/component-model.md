@@ -330,9 +330,10 @@ pub enum ExecutionDomain {
     KernelNative,
     IsolatedNative(AddressSpaceId),   // 可选实验（S + 私有 AS），非里程碑
     // future: SandboxedNative(AddressSpaceId)  —— U + 私有 AS，未来的硬件强制边界
-    // future: Wasm(WasmInstance)
 }
 ```
+
+> **执行模型 / ISA / runtime（native machine code vs Wasm）是正交维度，不属于本枚举。** `KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，`SandboxedNative` 也都可以是 native code；把 Wasm 放进 `ExecutionDomain` 是把两个正交维度揉到一起。Wasm 作为未来 Component 的执行后端需要**单独的维度**（见 `deployment.md` §3），不要加回本枚举。
 
 > **契约不能 ABI 锁定**：Interface 和 device claim / IRQ / DMA 机制必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
 
@@ -345,11 +346,13 @@ pub struct InstanceRecord {
     pub id: ComponentId,          // 实例身份
     pub state: ComponentState,
     pub image: ComponentImageId,  // 代码 / 入口 / MemoryLease 归 image
+    pub execution_domain: ExecutionDomain, // 部署域（创建入口验证后写入；今天只有 KernelNative 可执行）
     pub instance_state: *mut (),  // 组件私有的实例状态（create 返回）
 }
 
-// 未来若引入执行域，只在这里加一个轻量种类字段（**尚未实现**）：
-//   pub execution_kind: ExecutionKind,   // KernelNative / IsolatedNative / …（未来字段，尚未实现；旧 ComponentRecord 已删除）
+// 执行域只在记录上放这个轻量种类字段（**不放** AddressSpace runtime 对象）；今天只有
+// KernelNative 有执行器；其余域在创建入口是 `todo!()` 占位（按域分派，绝不静默降级）。
+// 执行模型 / runtime（native machine code vs Wasm）是正交维度，**不进本记录**（见 §4 顶部）。
 ```
 
 真正 runtime：

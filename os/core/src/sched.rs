@@ -597,7 +597,7 @@ mod tests {
     use crate::component::abi::InterfaceKind;
     use crate::component::call::CallError;
     use crate::component::containment;
-    use crate::component::endpoint::{ContractId, EndpointError};
+    use crate::component::endpoint::{ContractId, EndpointError, ExecutionDomain};
     use crate::component::image::{self, ComponentImageId};
     use crate::component::registry;
     use crate::errno::Errno;
@@ -666,7 +666,7 @@ mod tests {
     /// 全局 registry 里的一个 `Ready` 活实例（同一 image 可无限复用，id 跨用例累积）。
     fn ready_component(_name: &[u8]) -> ComponentId {
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(IMAGE).unwrap();
+        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -682,7 +682,7 @@ mod tests {
     ) -> ComponentId {
         let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image).unwrap();
+        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -1225,6 +1225,7 @@ mod tests {
                 crate::component::load::create_component(
                     b"sched_gate_missing",
                     &containment::KcompCreateArgs::empty(),
+                    ExecutionDomain::KernelNative,
                 ),
                 Err(ComponentLoadError::InPolicyContext)
             );
@@ -1252,6 +1253,7 @@ mod tests {
                     crate::component::load::create_component(
                         b"sched_gate_missing",
                         &containment::KcompCreateArgs::empty(),
+                        ExecutionDomain::KernelNative,
                     ),
                     Err(ComponentLoadError::InPolicyContext)
                 );

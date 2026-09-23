@@ -105,19 +105,19 @@
 
 行 = caller 的执行域，列 = callee 的执行域。单元格 = **合法机制**。`rejected` 表示该组合**必须被 Core 显式拒绝**（当前所有跨域格子都是"目标，未实现"）。
 
-| caller ↓ \ callee → | KernelNative（S，共享 AS） | IsolatedNative（S，私有 AS） | SandboxedNative（U，私有 AS） | Wasm（更远） |
-|---|---|---|---|---|
-| **KernelNative** | **Direct**（可选 **Gate**） | **Gate** | **Gate** | **rejected** |
-| **IsolatedNative** | **Gate** | **Direct**（同域）/ **Gate** | **Gate** | **rejected** |
-| **SandboxedNative** | **syscall-IPC** | **syscall-IPC** | **Direct**（同域）/ **syscall-IPC** | **rejected** |
-| **Wasm** | **rejected** | **rejected** | **rejected** | **host call**（更远） |
+| caller ↓ \ callee → | KernelNative（S，共享 AS） | IsolatedNative（S，私有 AS） | SandboxedNative（U，私有 AS） |
+|---|---|---|---|
+| **KernelNative** | **Direct**（可选 **Gate**） | **Gate** | **Gate** |
+| **IsolatedNative** | **Gate** | **Direct**（同域）/ **Gate** | **Gate** |
+| **SandboxedNative** | **syscall-IPC** | **syscall-IPC** | **Direct**（同域）/ **syscall-IPC** |
 
 读法：
 
 - **同域（K↔K、I↔I、S↔S 同一 AS）**：`Direct` 合法（同地址空间、同特权级，就是普通函数调用）。**Gate 也合法**——同一部署可以选择**受控绑定**。
 - **跨域**：`Direct` **非法**，必须是 `Gate`（同特权、跨 AS）或 `syscall-IPC`（跨特权）。任何跨域组合都**不得**返回裸 function table。
 - **跨特权**：S caller → U callee 走 `Gate`（Core 经 `sret` 进入 U，provider 经 `ecall` 返回）；U caller → S/kernel callee 走 `syscall-IPC`（`ecall` 进 Core，Core 分派）。
-- **Wasm / 能力不足**：`rejected`。平台没有对应能力时，Core 拒绝该部署或该绑定，而不是假装能跑。
+- **能力不足**：`rejected`。平台没有对应能力时，Core 拒绝该部署或该绑定，而不是假装能跑。
+- **执行模型 / ISA / runtime（native machine code vs Wasm）不在本矩阵**：它与执行域是**正交维度**——`KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，`SandboxedNative` 也都可以是 native code。把 Wasm 放进 `ExecutionDomain` 是把两个正交维度揉到一起。Wasm 是未来 Component 的一种**执行后端**（`AGENTS.md`），需要**单独的维度**表达，**不是第四个执行域**（登记见 §10）。
 
 **为什么 native binding 绝不能跨域传递：**
 
@@ -463,7 +463,8 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现（step 5）** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
 | `kcore_endpoint_call` 文档与代码一致 | **未做**（文档过时） | `abi/core.toml:797-802` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
-| 部署 / 模式字段 | **未开始** | `deployment\|deploy` 零匹配；`ExecutionDomain` 只在注释 |
+| 部署字段（`InstanceRecord::execution_domain`） | **部分实现**：字段落地 + 创建入口**按域分派**（`KernelNative` 走现有链；`IsolatedNative` / `SandboxedNative` 是 `todo!()` 占位）；只有 KernelNative 可执行 | `registry.rs`、`load.rs`、`endpoint.rs::instance_domain` |
+| 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
 | 按 `(caller, callee)` 域选机制 | **设计完成，未开始** | 本文件 §2、§3 |
 | Direct / Gate 作为**绑定机制**分离 | **设计完成，未开始** | 本文件 §1、§4 |
 | "inflight 只计 Gate" 的契约约束 | **设计完成** | 本文件 §3 |

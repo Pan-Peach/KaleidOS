@@ -109,7 +109,7 @@ use crate::component::ComponentId;
 use crate::component::abi::{InterfaceAbi, InterfaceKind};
 use crate::component::call;
 use crate::component::containment::{KcompCreateArgs, with_core_critical};
-use crate::component::endpoint::{self, ContractId, EndpointId};
+use crate::component::endpoint::{self, ContractId, EndpointId, ExecutionDomain};
 use crate::component::registry;
 use crate::errno::{Errno, status};
 use crate::machine;
@@ -380,7 +380,11 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
         let Some(name) = checked_name(name_ptr, name_len) else {
             return Errno::EINVAL.code();
         };
-        match crate::component::load::load_and_start(name) {
+        // 现有组件 ABI 不携带部署域：默认请求 KernelNative（今天唯一有执行器的域）。
+        // TODO(human): 让组件经 `kcore_component_*` 指定 kind 需要改 `abi/core.toml`
+        // 的参数并重新生成 C/Rust ABI；线上用 `u32` 编码，Core 校验后转内部枚举
+        // （`KcompCreateArgs` 是组件自己的配置负载，不塞部署选择）。
+        match crate::component::load::load_and_start(name, ExecutionDomain::KernelNative) {
             Ok(id) => id.raw() as i32,
             Err(error) => error.abi_status(),
         }
@@ -413,7 +417,8 @@ extern "C" fn kcore_component_create(
         // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
         // Core 只在本次调用内借用它。
         let args = unsafe { &*args };
-        match crate::component::load::create_component(name, args) {
+        // 同 `kcore_component_load`：ABI 未携带部署域 → 默认 KernelNative。
+        match crate::component::load::create_component(name, args, ExecutionDomain::KernelNative) {
             Ok(id) => {
                 // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
                 unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
@@ -571,7 +576,7 @@ extern "C" fn kcore_endpoint_validate(endpoint: u64, contract: u64, abi: u64) ->
 ///
 /// caller 必须处在某个组件执行边界内（否则 `-EPERM`）——机制选择需要 caller 的
 /// 执行域；caller 已 `Failed` 同样 `-EPERM`（获取绑定 = 获取新能力）。
-/// 不支持的组合（跨特权 / Wasm / 同 AS 无法证明且 syscall-IPC 未实现）→ `-ENOTSUP`，
+/// 不支持的组合（跨特权 / 同 AS 无法证明且 syscall-IPC 未实现）→ `-ENOTSUP`，
 /// **绝不静默降级成 Direct**；Direct 选中但 provider 未交付 function table →
 /// `-ENOTSUP`。
 ///
@@ -607,7 +612,7 @@ extern "C" fn kcore_endpoint_bind(
             EndpointId::from_raw(endpoint),
             ContractId::from_raw(contract),
             InterfaceAbi::from_raw(abi),
-            endpoint::instance_domain(caller.component),
+            endpoint::instance_domain(&reg, caller.component),
         ) {
             Ok(bound) => {
                 // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
@@ -1353,7 +1358,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(1))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(1),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -1417,7 +1425,12 @@ mod tests {
         let image = crate::component::image::ComponentImageId::from_raw(9001);
         let failed = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg
+                .declare(
+                    image,
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.mark_failed(id).unwrap();
@@ -1425,7 +1438,12 @@ mod tests {
         };
         let stopped = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image).unwrap();
+            let id = reg
+                .declare(
+                    image,
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -1580,7 +1598,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(1))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(1),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -1730,7 +1751,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(2))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(2),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -1810,7 +1834,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(4))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(4),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -1898,7 +1925,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(5))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(5),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
@@ -2075,7 +2105,10 @@ mod tests {
         let id = {
             let mut reg = registry::get_registry().lock();
             let id = reg
-                .declare(crate::component::image::ComponentImageId::from_raw(3))
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(3),
+                    crate::component::endpoint::ExecutionDomain::KernelNative,
+                )
                 .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();

@@ -128,6 +128,7 @@ impl Inspector {
 mod tests {
     use super::*;
     use crate::component::ComponentState;
+    use crate::component::endpoint::ExecutionDomain;
     use crate::machine::{CpuId, CpuInfo, DeviceDescriptor, MachineInfo, MemoryRegion};
     use crate::test_support::{Rank, TestLock};
 
@@ -186,7 +187,7 @@ mod tests {
             crate::component::image::test_support::register_test_image(b"inspector-probe", 0x2222);
         let id = crate::component::registry::get_registry()
             .lock()
-            .declare(image)
+            .declare(image, ExecutionDomain::KernelNative)
             .expect("declare");
         let mut state = 0u32;
         crate::component::registry::get_registry()

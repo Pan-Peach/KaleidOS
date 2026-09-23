@@ -175,6 +175,7 @@ fn complete_stop(id: ComponentId, outcome: CallOutcome) -> Result<(), ComponentS
 mod tests {
     use super::*;
     use crate::component::ComponentState;
+    use crate::component::endpoint::ExecutionDomain;
     use crate::component::image::{self, ComponentImageId};
     use crate::resource::RequestContext;
     use crate::task::TaskState;
@@ -190,7 +191,7 @@ mod tests {
     fn ready_component(name: &[u8], destroy: usize) -> ComponentId {
         let image = test_image(name, destroy);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image).unwrap();
+        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -200,7 +201,10 @@ mod tests {
     /// 只声明（不 resolve）的实例，用于拒绝门测试。
     fn declared_component(name: &[u8]) -> ComponentId {
         let image = test_image(name, 0);
-        registry::get_registry().lock().declare(image).unwrap()
+        registry::get_registry()
+            .lock()
+            .declare(image, ExecutionDomain::KernelNative)
+            .unwrap()
     }
 
     fn setup() -> crate::memory::test_support::Guard<'static> {
@@ -444,11 +448,11 @@ mod tests {
         let image = test_image(b"exit_two_instances", destroy_hook_ok as *const () as usize);
         let (first, second) = {
             let mut reg = registry::get_registry().lock();
-            let first = reg.declare(image).unwrap();
+            let first = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(first).unwrap();
             reg.begin_start(first).unwrap();
             reg.finish_start(first).unwrap();
-            let second = reg.declare(image).unwrap();
+            let second = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
             reg.resolve(second).unwrap();
             reg.begin_start(second).unwrap();
             reg.finish_start(second).unwrap();
