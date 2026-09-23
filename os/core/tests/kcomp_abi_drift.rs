@@ -189,32 +189,6 @@ fn classify_c_type(raw: &str) -> Result<Width, String> {
     }
 }
 
-fn classify_rust_type(raw: &str) -> Result<Width, String> {
-    let t = raw.trim();
-    if t.contains('*') {
-        return Ok(Width::Ptr);
-    }
-    match t {
-        "usize" | "isize" => Ok(Width::Ptr),
-        "u64" | "i64" => Ok(Width::W64),
-        "u32" | "i32" => Ok(Width::W32),
-        "u16" | "i16" => Ok(Width::W16),
-        "u8" | "i8" => Ok(Width::W8),
-        "()" => Ok(Width::Unit),
-        other => {
-            // 函数指针别名按值传递 = 指针宽；Core 侧别名以此命名（ComponentEntry 等）。
-            let last = other.rsplit("::").next().unwrap_or(other);
-            if last.ends_with("Entry") || last.ends_with("Handler") {
-                Ok(Width::Ptr)
-            } else {
-                Err(format!(
-                    "Rust 类型 `{other}` 未分类；函数指针别名请以 `*Entry`/`*Handler` 命名，或在分类表补充"
-                ))
-            }
-        }
-    }
-}
-
 /// C 参数里剥掉尾随的参数名：`uint64_t a` → `uint64_t`；
 /// `const uint8_t *ptr` → `const uint8_t *`；抽象声明（`size_t`）保持原样。
 fn c_param_type(param: &str) -> &str {
@@ -249,18 +223,6 @@ fn parse_c_params(raw: &str) -> Result<Vec<Width>, String> {
         .collect()
 }
 
-fn parse_rust_params(raw: &str) -> Result<Vec<Width>, String> {
-    split_top_level(raw)
-        .iter()
-        .map(|p| {
-            let (_, ty) = p
-                .split_once(':')
-                .ok_or_else(|| format!("Rust 参数 `{p}` 缺少 `:`"))?;
-            classify_rust_type(ty)
-        })
-        .collect()
-}
-
 /// C 声明名之前的返回类型（单行：`int32_t` / `uint8_t *` / `void`）。
 fn c_return_type(before: &str) -> &str {
     let bytes = before.as_bytes();
@@ -278,18 +240,6 @@ fn c_return_type(before: &str) -> &str {
         }
     }
     before[start..end].trim()
-}
-
-/// Rust 函数 `)` 之后的返回类型（无 `->` = `()`）。
-fn rust_return_type(after: &str) -> &str {
-    let rest = after.trim_start();
-    match rest.strip_prefix("->") {
-        Some(rest) => {
-            let end = rest.find(['{', ';']).unwrap_or(rest.len());
-            rest[..end].trim()
-        }
-        None => "()",
-    }
 }
 
 /// 扫描 C 头文件里所有 `kcore_*` / `kcomp_*` 函数声明（注释需已剥离）。
@@ -325,52 +275,6 @@ fn extract_c_decls(stripped: &str) -> BTreeMap<String, Signature> {
             out.insert(name.clone(), Signature { params, ret })
                 .is_none(),
             "kcomp.h 重复声明 `{name}`"
-        );
-        i = close + 1;
-    }
-    out
-}
-
-/// 扫描 Rust 源码里所有 `fn kcore_*` 定义 / 声明（注释需已剥离）。
-fn extract_rust_decls(stripped: &str) -> BTreeMap<String, Signature> {
-    let bytes = stripped.as_bytes();
-    let mut out = BTreeMap::new();
-    let mut i = 0;
-    while i + 2 <= bytes.len() {
-        let fn_kw = &bytes[i..i + 2] == b"fn"
-            && (i == 0 || !is_ident_byte(bytes[i - 1]))
-            && bytes.get(i + 2).is_some_and(u8::is_ascii_whitespace);
-        if !fn_kw {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 2;
-        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        let name_end = read_ident(bytes, j);
-        if !stripped[j..].starts_with("kcore_") {
-            i = name_end.max(i + 1);
-            continue;
-        }
-        let name = stripped[j..name_end].to_string();
-        let mut k = name_end;
-        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-            k += 1;
-        }
-        if k >= bytes.len() || bytes[k] != b'(' {
-            i = name_end;
-            continue;
-        }
-        let close = matching_paren(bytes, k).unwrap_or_else(|e| panic!("`{name}`: {e}"));
-        let params = parse_rust_params(&stripped[k + 1..close])
-            .unwrap_or_else(|e| panic!("Rust `{name}` 参数: {e}"));
-        let ret = classify_rust_type(rust_return_type(&stripped[close + 1..]))
-            .unwrap_or_else(|e| panic!("Rust `{name}` 返回: {e}"));
-        assert!(
-            out.insert(name.clone(), Signature { params, ret })
-                .is_none(),
-            "Rust 侧重复声明 `{name}`"
         );
         i = close + 1;
     }
@@ -495,27 +399,8 @@ fn c_parser_handles_void_and_function_pointers() {
 }
 
 #[test]
-fn rust_parser_extracts_declaration_shapes() {
-    let src = strip_comments(
-        "// pub fn kcore_hidden(x: u8) -> u8;\npub fn kcore_demo(a: usize, b: *mut u32) -> i32;\n",
-    );
-    let sigs = extract_rust_decls(&src);
-    assert_eq!(sigs.len(), 1, "注释里的伪声明必须被剥离");
-    assert!(sigs.contains_key("kcore_demo"));
-    assert!(!sigs.contains_key("kcore_hidden"));
-    assert_eq!(sigs["kcore_demo"].params, vec![Width::Ptr, Width::Ptr]);
-    assert_eq!(sigs["kcore_demo"].ret, Width::W32);
-}
-
-#[test]
-fn classifiers_reject_unknown_types_and_accept_fn_aliases() {
+fn c_classifier_rejects_unknown_types() {
     assert!(classify_c_type("long double").is_err());
-    assert!(classify_rust_type("SomeRandomStruct").is_err());
-    assert_eq!(
-        classify_rust_type("component::ComponentEntry"),
-        Ok(Width::Ptr)
-    );
-    assert_eq!(classify_rust_type("irq::IrqHandler"), Ok(Width::Ptr));
 }
 
 // ===========================================================================
