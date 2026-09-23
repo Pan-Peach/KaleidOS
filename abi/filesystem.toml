@@ -1,0 +1,66 @@
+# KABI schema — filesystem：只读文件系统服务契约（provider: fatfs 等；
+# consumer: 未来的 VFS）。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 结构 / 常量 + 布局 _Static_assert
+#   os/components/kcomp-sdk/src/generated/filesystem.rs     SDK-Rust 镜像 + `const _` 布局断言
+#
+# 手写部分（facade，不在本文件范围）：契约类型 `FileSystem`（`kcomp-sdk/src/filesystem.rs`）。
+# 组件间契约**不是** Core 导出：Core 只把 publish 进来的 api / ctx 当不透明指针存着。
+
+[[struct]]
+name = "FileSystemApi"
+c_name = "kcomp_filesystem_api"
+size_ptrs = 5
+doc = """
+`filesystem` provider/consumer function table（共享布局）。
+
+第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
+u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。
+"""
+
+[[struct.field]]
+name = "mount"
+type = "fn(ctx: *mut void) -> i32"
+doc = "挂载该 filesystem 实例（provider 自己决定具体语义）。"
+
+[[struct.field]]
+name = "unmount"
+type = "fn(ctx: *mut void) -> i32"
+doc = "卸载该 filesystem 实例。"
+
+[[struct.field]]
+name = "open"
+type = "fn(ctx: *mut void, path: *const char, flags: u32, out_handle: *mut u64) -> i32"
+doc = "`path` 是以 NUL 结尾的、相对于该 filesystem root 的路径；`flags` 见 `KCOMP_FILESYSTEM_OPEN_READ`。"
+
+[[struct.field]]
+name = "close"
+type = "fn(ctx: *mut void, handle: u64) -> i32"
+doc = "关闭一个 open 返回的 handle。"
+
+[[struct.field]]
+name = "read"
+type = "fn(ctx: *mut void, handle: u64, buf: *mut u8, len: usize, out_read: *mut usize) -> i32"
+doc = "从 handle 当前位置读 `len` 字节；实际读到的字节数写回 `out_read`。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_NAME"
+type = "string"
+value = "filesystem"
+targets = "c,sdk-rust"
+doc = "filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字节一致）。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_ABI"
+type = "u64"
+value = "0x4649_4C45_5359_5354"
+targets = "c,sdk-rust"
+doc = "exact ABI fingerprint（8 字节 ASCII \"FILESYST\" 的大端读数）。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_OPEN_READ"
+type = "u32"
+value = "0x00000001"
+targets = "c,sdk-rust"
+doc = "第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。"

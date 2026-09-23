@@ -27,9 +27,9 @@
 
 路径 `os/components/kcomp-sdk/`（连字符；package `kcomp-sdk`；独立 workspace，被根 workspace `exclude`）。它**随每个 `.kcomp` 私有携带**，不是 shared runtime。
 
-- **C 作者面**：`include/kcomp.h`（umbrella，含生成的 `generated/kcomp_abi.h` + 手写的 `block.device` / `filesystem` 契约）、`include/errno.h`、`include/string.h`（freestanding shim 声明）。
+- **C 作者面**：`include/kcomp.h`（umbrella，只 include 生成物 + 契约说明）、`include/generated/kcomp_abi.h`（`kcore_*` / 生命周期入口 / `block.device` / `filesystem` 的 C 声明，schema 单一来源）、`include/errno.h`、`include/string.h`（freestanding shim 声明）。
 - **C 运行时**：`c/kcomp_rt.c`——freestanding **weak** `memcpy` / `memset` / `memmove` / `memcmp` / `strlen` / `strchr`（C 组件私有携带；只实现组件真正引用到的原语，不朝 libc 扩张）。
-- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`block.rs`（`block.device` 契约 + provider 包装）、`filesystem.rs`、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → Core 共享堆）。
+- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`block.rs`（`block.device` 契约类型 + provider 包装，声明本体 re-export 生成物）、`filesystem.rs`、`generated/{abi,block,filesystem,errno}.rs`（schema 生成物）、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → Core 共享堆）。
 - **ABI 目标**：稳定窄 C ABI（`kcore_*` 白名单）；target `riscv64gc-unknown-none-elf` / `riscv32imac-unknown-none-elf`。Rust ABI 永不成为组件 ABI。
 
 ## `.kcomp` 流水线（端到端）

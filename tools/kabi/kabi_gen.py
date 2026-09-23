@@ -9,15 +9,27 @@
 框架能力（跨 phase 复用）：
 
 * **schema loader** —— 解析 + 严格校验（未知键 / 未知类型 / 悬空引用都报错）；
-* **递归类型语法** —— ``void`` / ``u8``…``i64`` / ``usize`` / ``bool`` / ``*const T`` /
+* **递归类型语法** —— ``void`` / ``u8``…``i64`` / ``usize`` / ``bool`` / ``char``
+  （C ``char`` ↔ Rust ``u8``；只用于 ``*const char`` 这类 pointee）/ ``*const T`` /
   ``*mut T`` / 命名类型引用 / ``fn(...) -> ...``（unsafe extern "C" fn 指针）/
-  ``safe fn(...) -> ...``（safe extern "C" fn 指针），解析成类型树后**按语言渲染**，
-  不对类型名做字符串替换；
+  ``safe fn(...) -> ...``（safe extern "C" fn 指针）；fn 参数可带名字
+  （``fn(ctx: *mut void) -> void``），C / Rust 声明里都渲染出来，
+  解析成类型树后**按语言渲染**，不对类型名做字符串替换；
 * **per-target emitters** —— target = C / SDK-Rust / Core-Rust / Core-export-table，
   target 特有行为只在 emitter 里，不在 schema 里；
 * **多 schema 输出** —— 一个输出文件声明它的输入 schema 列表，按列表顺序拼接；
 * **check mode** —— 重生成到临时目录并与提交物逐文件 diff：内容漂移、生成文件缺失、
   生成目录出现计划外文件，三者都会失败。
+
+声明形状（`[[struct]]` 等）由 schema 决定，emitter 只做机械渲染：
+
+* ``[[struct]]`` 可带 ``size`` / ``size64``+``size32`` / ``align``（字面布局断言），
+  也可带 ``size_ptrs = N``——"N 个指针宽字段"的函数表：C 断言
+  ``sizeof(struct X) == N * sizeof(void *)``，Rust 断言
+  ``size_of::<X>() == N * size_of::<usize>()``（外加指针对齐），
+  字段个数 / 顺序漂移 = 编译错误；
+* ``[[const]]`` 类型可以是整数 primitive，也可以是 ``string``（C
+  ``#define NAME "..."`` / Rust ``&[u8] = b"..."``）。
 
 用法（仓库根目录）：
 
@@ -71,6 +83,9 @@ C_PRIMITIVES = {
     "i64": "int64_t",
     "usize": "size_t",
     "bool": "bool",
+    # C 侧是 `char`（不是 `uint8_t`）：FatFs 之类接口的 `const char *path` 必须
+    # 逐字保留；Rust 侧同一契约是 `u8`（`*const u8`）。只作为指针 pointee 使用。
+    "char": "char",
 }
 RUST_PRIMITIVES = {
     "void": "()",
@@ -84,9 +99,11 @@ RUST_PRIMITIVES = {
     "i64": "i64",
     "usize": "usize",
     "bool": "bool",
+    "char": "u8",
 }
 PRIMITIVES = set(C_PRIMITIVES)
-INTEGER_PRIMITIVES = PRIMITIVES - {"void", "bool"}
+# `char` 不参与整数常量（没有字符字面量语法）；字符串常量走 `Str`。
+INTEGER_PRIMITIVES = PRIMITIVES - {"void", "bool", "char"}
 
 
 @dataclass(frozen=True)
@@ -109,17 +126,30 @@ class Named:
 
 @dataclass(frozen=True)
 class Fn:
-    """fn 指针类型。``safe`` = Rust ``extern "C" fn``（否则 ``unsafe extern "C" fn``）。"""
+    """fn 指针类型。``safe`` = Rust ``extern "C" fn``（否则 ``unsafe extern "C" fn``）。
+
+    ``names`` 与 ``params`` 等长（缺省 = 全部匿名）：C / Rust 声明都会渲染出
+    参数名，便于人读；参数名不是类型的一部分。
+    """
 
     params: Tuple["TypeNode", ...]
     ret: "TypeNode"
     safe: bool = False
+    names: Tuple[Optional[str], ...] = ()
 
 
-TypeNode = Union[Prim, Ptr, Named, Fn]
+@dataclass(frozen=True)
+class Str:
+    """字符串常量类型（**只用于** ``[[const]]``）：C `#define NAME "..."` /
+    Rust ``&[u8] = b"..."``。"""
+
+    name: str = "string"
+
+
+TypeNode = Union[Prim, Ptr, Named, Fn, Str]
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_TOKEN_RE = re.compile(r"\s*(\*|->|[(),]|[A-Za-z_][A-Za-z0-9_]*)")
+_TOKEN_RE = re.compile(r"\s*(\*|->|[(),:]|[A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _tokenize_type(text: str) -> List[str]:
@@ -147,10 +177,22 @@ class _TypeParser:
     def _peek(self) -> Optional[str]:
         return self._tokens[self._pos] if self._pos < len(self._tokens) else None
 
+    def _peek2(self) -> Optional[str]:
+        return self._tokens[self._pos + 1] if self._pos + 1 < len(self._tokens) else None
+
     def _next(self) -> Optional[str]:
         token = self._peek()
         self._pos += 1
         return token
+
+    def _take_param_name(self) -> Optional[str]:
+        """fn 参数的可选 `name:` 前缀（参数名不是类型的一部分，只为可读性）。"""
+        token = self._peek()
+        if token is not None and _IDENT_RE.fullmatch(token) and self._peek2() == ":":
+            self._next()
+            self._next()
+            return token
+        return None
 
     def _expect(self, expected: str) -> None:
         token = self._next()
@@ -186,15 +228,19 @@ class _TypeParser:
             self._next()
             self._expect("(")
             params: List[TypeNode] = []
+            names: List[Optional[str]] = []
             if self._peek() != ")":
                 while True:
+                    names.append(self._take_param_name())
                     params.append(self._type())
                     if self._peek() != ",":
                         break
                     self._next()
             self._expect(")")
             self._expect("->")
-            return Fn(params=tuple(params), ret=self._type(), safe=safe)
+            if all(name is None for name in names):
+                names = []  # 全匿名 = 规范化成缺省表示（与手写 Fn 字面量可比）
+            return Fn(params=tuple(params), ret=self._type(), safe=safe, names=tuple(names))
         if not _IDENT_RE.fullmatch(token):
             raise KabiError("invalid type %r: unexpected token %r" % (self._text, token))
         self._next()
@@ -247,6 +293,28 @@ def render_type(node: TypeNode, language: str) -> str:
     raise KabiError("unknown language %r (expected 'c' or 'rust')" % language)
 
 
+def _fn_params(node: Fn) -> Tuple[Tuple[TypeNode, Optional[str]], ...]:
+    """`(参数类型, 可选参数名)` 序列；schema 里参数名可以全省略。"""
+    if not node.names:
+        return tuple((param, None) for param in node.params)
+    if len(node.names) != len(node.params):
+        raise KabiError("fn type param name count mismatch")
+    return tuple(zip(node.params, node.names))
+
+
+def _contains_fn_pointer(node: TypeNode) -> bool:
+    """字段类型里（含指针 pointee）是否有函数指针。
+
+    Rust 对函数指针的 `==` 会触发 `unpredictable_function_pointer_comparisons`
+    （地址不保证唯一），因此含 fn 指针的 struct **不**派生 `PartialEq` / `Eq`。
+    """
+    if isinstance(node, Fn):
+        return True
+    if isinstance(node, Ptr):
+        return _contains_fn_pointer(node.inner)
+    return False
+
+
 def _render_c(node: TypeNode) -> str:
     if isinstance(node, Prim):
         return C_PRIMITIVES[node.name]
@@ -263,8 +331,11 @@ def _render_c(node: TypeNode) -> str:
     raise KabiError("unrenderable type node %r" % (node,))
 
 
-def _render_c_fn(node: Fn) -> str:
-    params = ", ".join(_render_c(param) for param in node.params) or "void"
+def _render_c_fn(node: Fn, names: Optional[Dict[str, str]] = None) -> str:
+    names = names or {}
+    params = (
+        ", ".join(c_decl(param, name or "", names) for param, name in _fn_params(node)) or "void"
+    )
     return "%s (*)(%s)" % (_render_c(node.ret), params)
 
 
@@ -276,7 +347,10 @@ def _render_rust(node: TypeNode) -> str:
     if isinstance(node, Ptr):
         return ("*const " if not node.mutable else "*mut ") + _render_rust(node.inner)
     if isinstance(node, Fn):
-        params = ", ".join(_render_rust(param) for param in node.params)
+        params = ", ".join(
+            ("%s: %s" % (name, _render_rust(param))) if name else _render_rust(param)
+            for param, name in _fn_params(node)
+        )
         head = 'extern "C" fn' if node.safe else 'unsafe extern "C" fn'
         rendered = "%s(%s)" % (head, params)
         ret = _render_rust(node.ret)
@@ -303,7 +377,9 @@ def c_decl(node: TypeNode, decl: str, names: Dict[str, str], const: bool = False
     if isinstance(node, Ptr):
         return c_decl(node.inner, "*" + decl, names, const=not node.mutable)
     if isinstance(node, Fn):
-        params = ", ".join(c_decl(param, "", names) for param in node.params) or "void"
+        params = (
+            ", ".join(c_decl(param, name or "", names) for param, name in _fn_params(node)) or "void"
+        )
         return c_decl(node.ret, "(*%s)(%s)" % (decl, params), names)
     return ("const " if const else "") + c_base(node, names) + " " + decl
 
@@ -534,6 +610,9 @@ class Struct:
     size64: Optional[int] = None
     size32: Optional[int] = None
     align: Optional[int] = None
+    # 函数表：字段必须全是指针宽，布局断言 = N * 指针宽（C `sizeof(void *)` /
+    # Rust `size_of::<usize>()`）+ 指针对齐。与 size / size64 / size32 / align 互斥。
+    size_ptrs: Optional[int] = None
     targets: Tuple[str, ...] = DECL_TARGETS
 
 
@@ -578,7 +657,7 @@ class Constant:
     name: str
     type: TypeNode
     literal: str
-    value: int
+    value: Optional[int]
     doc: str
     targets: Tuple[str, ...] = DECL_TARGETS
 
@@ -858,7 +937,18 @@ def _build_enum(table: dict, path: str, known: Set[str]) -> Enum:
 def _build_struct(table: dict, path: str, known: Set[str]) -> Struct:
     _reject_unknown(
         table,
-        ("name", "c_name", "doc", "size", "size64", "size32", "align", "targets", "field"),
+        (
+            "name",
+            "c_name",
+            "doc",
+            "size",
+            "size64",
+            "size32",
+            "align",
+            "size_ptrs",
+            "targets",
+            "field",
+        ),
         "[[struct]] %r" % table.get("name"),
         path,
     )
@@ -920,6 +1010,21 @@ def _build_struct(table: dict, path: str, known: Set[str]) -> Struct:
     align = table.get("align")
     if align is not None:
         align = _required_int(table, "align", "struct %s" % name, path)
+    size_ptrs = table.get("size_ptrs")
+    if size_ptrs is not None:
+        if isinstance(size_ptrs, bool) or not isinstance(size_ptrs, int) or size_ptrs < 1:
+            raise KabiError("%s: struct %s size_ptrs must be a positive integer" % (path, name))
+        if size is not None or size64 is not None or align is not None:
+            raise KabiError(
+                "%s: struct %s must not combine size_ptrs with size / size64 / size32 / align"
+                % (path, name)
+            )
+        for field in fields:
+            if not isinstance(field.type, (Ptr, Fn)):
+                raise KabiError(
+                    "%s: struct %s size_ptrs requires pointer-sized fields (%s is not)"
+                    % (path, name, field.name)
+                )
     return Struct(
         name=name,
         c_name=c_name,
@@ -928,6 +1033,7 @@ def _build_struct(table: dict, path: str, known: Set[str]) -> Struct:
         size64=size64,
         size32=size32,
         align=align,
+        size_ptrs=size_ptrs,
         targets=_targets(table, path, "struct %s" % name),
     )
 
@@ -1004,14 +1110,38 @@ def _build_object(table: dict, path: str, known: Set[str]) -> Object:
     )
 
 
+def _check_string_const(text: str, path: str, name: str) -> None:
+    """字符串常量只接受可打印 ASCII（无引号 / 反斜杠）：C / Rust 字面量同一份文本。"""
+    for char in text:
+        if char in ('"', "\\") or not (0x20 <= ord(char) <= 0x7E):
+            raise KabiError(
+                "%s: const %s value must be printable ASCII without quotes or backslashes"
+                % (path, name)
+            )
+
+
 def _build_constant(table: dict, path: str, known: Set[str]) -> Constant:
     _reject_unknown(
         table, ("name", "type", "value", "doc", "targets"), "[[const]] %r" % table.get("name"), path
     )
     name = _required_string(table, "name", "const", path)
-    node = parse_type(_required_string(table, "type", "const %s" % name, path), sorted(known))
+    type_text = _required_string(table, "type", "const %s" % name, path).strip()
+    if type_text == "string":
+        literal = _required_string(table, "value", "const %s" % name, path)
+        _check_string_const(literal, path, name)
+        return Constant(
+            name=name,
+            type=Str(),
+            literal=literal,
+            value=None,
+            doc=_doc(table, path, "const %s" % name),
+            targets=_targets(table, path, "const %s" % name),
+        )
+    node = parse_type(type_text, sorted(known))
     if not (isinstance(node, Prim) and node.name in INTEGER_PRIMITIVES):
-        raise KabiError("%s: const %s type must be an integer primitive" % (path, name))
+        raise KabiError(
+            "%s: const %s type must be an integer primitive or 'string'" % (path, name)
+        )
     literal = _required_string(table, "value", "const %s" % name, path).strip()
     try:
         value = int(literal.replace("_", ""), 0)
@@ -1252,12 +1382,17 @@ class CEmitter(Emitter):
         lines: List[str] = []
         if const.doc:
             lines.append(_c_comment(const.doc))
+        if isinstance(const.type, Str):
+            lines.append('#define %s "%s"' % (const.name, const.literal))
+            return "\n".join(lines)
         wrapper = {"u64": "UINT64_C", "u32": "UINT32_C", "u16": "UINT16_C", "u8": "UINT8_C"}
         type_name = const.type.name  # type 已校验为整数 primitive
+        # C 没有数字分隔符：schema 里的 `0x..._...`（Rust 侧更易读）在这里去掉下划线。
+        literal = const.literal.replace("_", "")
         if type_name in wrapper:
-            lines.append("#define %s %s(%s)" % (const.name, wrapper[type_name], const.literal))
+            lines.append("#define %s %s(%s)" % (const.name, wrapper[type_name], literal))
         else:
-            lines.append("#define %s %s" % (const.name, const.literal))
+            lines.append("#define %s %s" % (const.name, literal))
         return "\n".join(lines)
 
     def _entry(self, entry: Entry, names: Dict[str, str]) -> str:
@@ -1283,6 +1418,15 @@ class CEmitter(Emitter):
 def _c_layout_asserts(struct: Struct) -> List[str]:
     c_name = struct.c_name
     lines: List[str] = []
+    if struct.size_ptrs is not None:
+        lines.append(
+            '_Static_assert(sizeof(struct %s) == %d * sizeof(void *), "%s layout drift");'
+            % (c_name, struct.size_ptrs, c_name)
+        )
+        lines.append(
+            '_Static_assert(_Alignof(struct %s) == _Alignof(void *), "%s alignment drift");'
+            % (c_name, c_name)
+        )
     if struct.size64 is not None and struct.size32 is not None:
         if struct.size64 == struct.size32:
             lines.append(
@@ -1387,7 +1531,7 @@ class RustEmitter(Emitter):
         if struct.doc:
             lines.append(_rust_doc(struct.doc))
         lines.append("#[repr(C)]")
-        lines.append("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+        lines.append(self._struct_derives(struct))
         lines.append("pub struct %s {" % struct.name)
         for field in struct.fields:
             if field.doc:
@@ -1398,10 +1542,25 @@ class RustEmitter(Emitter):
         lines.append(self._struct_asserts(struct))
         return "\n".join(lines)
 
+    def _struct_derives(self, struct: Struct) -> str:
+        derives = ["Debug", "Clone", "Copy"]
+        # 函数指针不可有意义地比较（地址不唯一）：不派生 PartialEq / Eq。
+        if not any(_contains_fn_pointer(field.type) for field in struct.fields):
+            derives += ["PartialEq", "Eq"]
+        return "#[derive(%s)]" % ", ".join(derives)
+
     def _struct_asserts(self, struct: Struct) -> str:
         name = struct.name
         literal_asserts: List[str] = []
         width_asserts: List[str] = []
+        if struct.size_ptrs is not None:
+            literal_asserts.append(
+                "assert!(core::mem::size_of::<%s>() == %d * core::mem::size_of::<usize>());"
+                % (name, struct.size_ptrs)
+            )
+            literal_asserts.append(
+                "assert!(core::mem::align_of::<%s>() == core::mem::align_of::<usize>());" % name
+            )
         if struct.size64 is not None and struct.size32 is not None:
             if struct.size64 == struct.size32:
                 literal_asserts.append(
@@ -1468,6 +1627,11 @@ class RustEmitter(Emitter):
         lines: List[str] = []
         if const.doc:
             lines.append(_rust_doc(const.doc))
+        if isinstance(const.type, Str):
+            # const 自带 'static；显式写 `&'static [u8]` 会触发
+            # clippy::redundant_static_lifetimes。
+            lines.append('pub const %s: &[u8] = b"%s";' % (const.name, const.literal))
+            return "\n".join(lines)
         lines.append("pub const %s: %s = %s;" % (const.name, _render_rust(const.type), const.literal))
         return "\n".join(lines)
 
@@ -1624,10 +1788,18 @@ OUTPUTS: Tuple[Output, ...] = (
     Output(
         "c",
         "os/components/kcomp-sdk/include/generated/kcomp_abi.h",
-        ("component.toml", "core.toml"),
+        ("component.toml", "core.toml", "block.toml", "filesystem.toml"),
         guard="KCOMP_GENERATED_ABI_H",
     ),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/abi.rs", ("component.toml", "core.toml")),
+    Output(
+        "sdk-rust", "os/components/kcomp-sdk/src/generated/block.rs", ("block.toml",)
+    ),
+    Output(
+        "sdk-rust",
+        "os/components/kcomp-sdk/src/generated/filesystem.rs",
+        ("filesystem.toml",),
+    ),
     Output("core-rust", "os/core/src/generated/abi.rs", ("component.toml", "core.toml")),
     Output(
         "core-exports",
@@ -1816,6 +1988,21 @@ def _selftest() -> None:
     function_with_args = parse_type("fn(*const void, u64, bool) -> i32")
     assert render_type(function_with_args, "rust") == 'unsafe extern "C" fn(*const (), u64, bool) -> i32'
     assert render_type(parse_type("*const u8"), "c") == "const uint8_t *"
+    # `char` 是 C 侧拼写、Rust 侧 `u8`（FatFs `const char *path` ↔ `*const u8`）。
+    assert render_type(parse_type("*const char"), "c") == "const char *"
+    assert render_type(parse_type("*const char"), "rust") == "*const u8"
+    # fn 参数名（不是类型的一部分，C / Rust 声明都渲染出来）。
+    named_fn = parse_type("fn(ctx: *mut void, lba: u64) -> i32")
+    assert named_fn == Fn(
+        (Ptr(True, Prim("void")), Prim("u64")), Prim("i32"), safe=False, names=("ctx", "lba")
+    )
+    assert (
+        c_decl(named_fn, "read", {}) == "int32_t (*read)(void *ctx, uint64_t lba)"
+    )
+    assert (
+        render_type(named_fn, "rust")
+        == 'unsafe extern "C" fn(ctx: *mut (), lba: u64) -> i32'
+    )
     # C 声明渲染（带名字的 declarator + 命名类型表）
     names = {"KcompCreateArgs": "struct KcompCreateArgs", "IrqHandler": "IrqHandler"}
     assert c_decl(parse_type("*mut *mut void"), "out_state", names) == "void **out_state"
@@ -1894,12 +2081,46 @@ doc = "I/O error"
         '[[enum]]\nname = "X"\nrepr = "i32"\nc_style = "defines"\ndecode_fallback = "NOPE"\n[[enum.variant]]\nname = "A"\nvalue = 1\n',
         '[[enum]]\nname = "X"\nrepr = "i32"\nc_style = "defines"\nbogus = 1\n[[enum.variant]]\nname = "A"\nvalue = 1\n',
         '[[struct]]\nname = "S"\nsize = 8\n[[struct.field]]\nname = "a"\ntype = "u32"\noffset64 = 0\n',
+        # size_ptrs 与字面布局 / 非指针字段都不能共存。
+        '[[struct]]\nname = "S"\nsize_ptrs = 2\nsize = 16\n[[struct.field]]\nname = "a"\ntype = "fn() -> void"\n',
+        '[[struct]]\nname = "S"\nsize_ptrs = 2\n[[struct.field]]\nname = "a"\ntype = "u32"\n[[struct.field]]\nname = "b"\ntype = "fn() -> void"\n',
+        # 字符串常量只接受可打印 ASCII（无引号 / 反斜杠）。
+        '[[const]]\nname = "N"\ntype = "string"\nvalue = "a\\"b"\n',
     ):
         try:
             _build_schema(_parse_toml_subset(bad_text), "abi/demo.toml", "abi/demo.toml")
         except KabiError:
             continue
         raise KabiError("selftest: invalid schema must be rejected:\n%s" % bad_text)
+
+    # —— size_ptrs 函数表 / string 常量：emitter 输出形状 ——
+    demo = _build_schema(
+        _parse_toml_subset(
+            '[[const]]\nname = "DEMO_NAME"\ntype = "string"\nvalue = "demo.name"\n'
+            '[[struct]]\nname = "DemoApi"\nc_name = "demo_api"\nsize_ptrs = 2\n'
+            '[[struct.field]]\nname = "a"\ntype = "fn(ctx: *mut void) -> u32"\n'
+            '[[struct.field]]\nname = "b"\ntype = "fn(ctx: *mut void, x: u64) -> i32"\n'
+        ),
+        "abi/demo.toml",
+        "abi/demo.toml",
+    )
+    assert demo.constants[0].type == Str() and demo.constants[0].value is None
+    assert demo.structs[0].size_ptrs == 2
+    c_struct = CEmitter()._struct(demo.structs[0], {})
+    assert "sizeof(struct demo_api) == 2 * sizeof(void *)" in c_struct
+    assert "_Alignof(struct demo_api) == _Alignof(void *)" in c_struct
+    assert "uint32_t (*a)(void *ctx);" in c_struct
+    rust_struct = RustEmitter()._struct(demo.structs[0])
+    assert "size_of::<DemoApi>() == 2 * core::mem::size_of::<usize>()" in rust_struct
+    assert 'pub a: unsafe extern "C" fn(ctx: *mut ()) -> u32,' in rust_struct
+    # 函数指针不可比较：不派生 PartialEq / Eq（否则 unpredictable_function_pointer_comparisons）。
+    assert "#[derive(Debug, Clone, Copy)]" in rust_struct
+    assert "PartialEq" not in rust_struct
+    assert CEmitter()._constant(demo.constants[0]) == '#define DEMO_NAME "demo.name"'
+    assert (
+        RustEmitter()._constant(demo.constants[0])
+        == 'pub const DEMO_NAME: &[u8] = b"demo.name";'
+    )
 
     # —— 提交的 errno schema 必须可加载且值集合正确 ——
     schema = load_schema("abi/errno.toml")
@@ -1935,6 +2156,29 @@ doc = "I/O error"
     assert [const.value for const in kinds] == list(range(1, 13))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]
     assert absent.value == 2 ** 64 - 1
+
+    # —— block / filesystem schema：组件间契约（function table + 常量）——
+    block, filesystem = load_schemas(["abi/block.toml", "abi/filesystem.toml"])
+    assert len(block.structs) == 1 and block.structs[0].size_ptrs == 3
+    assert [field.name for field in block.structs[0].fields] == [
+        "capacity_sectors",
+        "read",
+        "write",
+    ]
+    block_abi = [const for const in block.constants if const.name == "KCOMP_BLOCK_DEVICE_ABI"][0]
+    assert block_abi.value == 0x424C_4F43_4B44_4556
+    assert len(filesystem.structs) == 1 and filesystem.structs[0].size_ptrs == 5
+    assert [field.name for field in filesystem.structs[0].fields] == [
+        "mount",
+        "unmount",
+        "open",
+        "close",
+        "read",
+    ]
+    filesystem_abi = [
+        const for const in filesystem.constants if const.name == "KCOMP_FILESYSTEM_ABI"
+    ][0]
+    assert filesystem_abi.value == 0x4649_4C45_5359_5354
 
 
 # ===========================================================================

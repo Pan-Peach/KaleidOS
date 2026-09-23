@@ -1,9 +1,11 @@
 //! `block.device` 契约（KIND = Device）+ provider 侧 ergonomic wrapper。
 //!
-//! 本模块是 block 契约的**唯一**住处：`#[repr(C)]` function table
-//! （[`BlockDeviceApi`]）、契约类型（[`BlockDevice`]）与 provider 包装
-//! （[`BlockDeviceProvider`] / [`BlockDeviceService`]）放在一起；[`crate::binding`]
-//! 只 re-export，保持 `binding::BlockDevice` 等既有路径不变。
+//! 本模块是 block 契约的**语义**住处：契约类型（[`BlockDevice`]）与 provider 包装
+//! （[`BlockDeviceProvider`] / [`BlockDeviceService`]）放在一起；`#[repr(C)]`
+//! function table（[`BlockDeviceApi`]）与名字 / 指纹 / sector 常量由
+//! `tools/kabi/kabi_gen.py` 从 `abi/block.toml` 生成（[`crate::generated::block`]），
+//! 这里 re-export；[`crate::binding`] 只 re-export，保持 `binding::BlockDevice`
+//! 等既有路径不变。
 //!
 //! # provider 不写 `unsafe extern "C"`
 //!
@@ -34,8 +36,15 @@ use crate::errno::{Errno, Result};
 // FS 等）bind 消费。契约只在本 SDK 定义（provider 是驱动组件，KIND = Device）；
 // Core 不认识该接口语义，只存 api/ctx 指针 + exact ABI，与 `driver.prober` 同类。
 
+// 声明本体（`#[repr(C)]` function table + 名字 / 指纹 / sector 常量）由
+// `tools/kabi/kabi_gen.py` 从 `abi/block.toml` 生成到 [`crate::generated::block`]：
+// 布局断言（`const _`）与 C 侧 `_Static_assert` 同源，`make abi-check` 保证
+// 生成物与 schema 不漂移。本文件只保留语义 facade 并 re-export 既有路径。
+
 /// `block.device` 接口的稳定名字（publish / bind 必须逐字节一致）。
-pub const BLOCK_DEVICE_NAME: &[u8] = b"block.device";
+pub use crate::generated::block::KCOMP_BLOCK_DEVICE_NAME as BLOCK_DEVICE_NAME;
+
+use crate::generated::block::KCOMP_BLOCK_DEVICE_ABI;
 
 /// `block.device` 的 exact ABI fingerprint。
 ///
@@ -43,44 +52,17 @@ pub const BLOCK_DEVICE_NAME: &[u8] = b"block.device";
 /// （`0x424C_4F43_4B44_4556`，可直接按字节读出拼写——与 `SCHEDULER_POLICY_ABI`
 /// 同一约定）。provider / consumer 都由本 SDK 的同一份定义编译；锚定测试把数值
 /// 钉死，任何改动必须是一次刻意的测试修改（数值漂移 = Core 直接拒绝 bind）。
-pub const BLOCK_DEVICE_ABI: InterfaceAbi = InterfaceAbi::from_raw(0x424C_4F43_4B44_4556);
+///
+/// raw `u64` 本体在生成物（[`KCOMP_BLOCK_DEVICE_ABI`]，schema 单一来源）；
+/// [`InterfaceAbi`] newtype 由手写 `binding.rs` 定义，这里做包装——生成物不会
+/// 改变公开类型。
+pub const BLOCK_DEVICE_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_BLOCK_DEVICE_ABI);
 
 /// BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
 ///
-/// # 契约（两个实现能否互通，全看这几条）
-///
-/// - **单位**：`lba` 以 **512 字节 sector** 计；`len` 是**字节数**，必须是
-///   sector 大小的整数倍。
-/// - **同步 / 阻塞**：`read` / `write` 阻塞到本次传输完成。当前实现（virtio_blk）
-///   轮询设备，因此调用方**不得**处于不能阻塞的上下文。
-/// - **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
-/// - **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
-/// - **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。
-///   用 [`BlockDeviceService`] 发布的 provider 由 SDK 统一挡下（provider 不会被
-///   调用）；手写 table 的 provider 需自行保证同语义。
-/// - **buffer（临时契约）**：`buf` 是裸指针，实现要求它指向 **Core 可见 RAM**
-///   （v1 无 IOMMU：设备地址 == 物理地址 == 虚拟地址）。
-///
-/// # `buf` 裸指针是刻意的临时选择（不是最终设计）
-///
-/// 按 AGENTS.md，"裸指针只来自 Core 派生并持有 provenance 的 typed Lease"——
-/// 裸指针本身不是 authority。这里直接收裸指针，是因为 consumer 侧"分配
-/// DMA-able 内存"的窄接口**尚不存在**，v1 只有这一种可行形状。**一旦出现
-/// 跨执行域的调用方，该参数必须换成 Core 派生的 DMA lease / handle**（那时
-/// 裸地址不再能证明 buffer 归属与设备可达性）；在那之前它只是暂时够用。
-///
-/// 契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size /
-/// ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BlockDeviceApi {
-    /// 设备容量（单位：512 字节 sector）。
-    pub capacity_sectors: unsafe extern "C" fn(ctx: *mut ()) -> u64,
-    /// 从 `lba` 读 `len` 字节到 `buf`（单位 / 阻塞 / 上下文见契约文档）。
-    pub read: unsafe extern "C" fn(ctx: *mut (), lba: u64, buf: *mut u8, len: usize) -> i32,
-    /// 从 `buf` 写 `len` 字节到 `lba`（单位 / 阻塞 / 上下文见契约文档）。
-    pub write: unsafe extern "C" fn(ctx: *mut (), lba: u64, buf: *const u8, len: usize) -> i32,
-}
+/// 定义与布局断言在生成物 [`crate::generated::block`]（schema = `abi/block.toml`）；
+/// 这里 re-export 以保持 `block::BlockDeviceApi` / `binding::BlockDeviceApi` 路径。
+pub use crate::generated::block::BlockDeviceApi;
 
 /// `block.device` 契约（KIND = Device）。
 pub struct BlockDevice;
@@ -97,7 +79,7 @@ impl Service for BlockDevice {
 // -----------------------------------------------------------------------
 
 /// 契约单位：1 sector = 512 字节（wrapper 校验入参用；不是对外 API）。
-const SECTOR_SIZE: usize = 512;
+const SECTOR_SIZE: usize = crate::generated::block::KCOMP_BLOCK_DEVICE_SECTOR;
 
 /// block 设备的 provider 接口：驱动实现它，ABI table 由 SDK 生成。
 ///

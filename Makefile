@@ -301,7 +301,7 @@ test-kconfig:
 # abi-gen 重生成（幂等）；abi-check 重生成到临时目录并逐文件 diff —— 内容漂移、
 # 生成文件缺失、生成目录里出现计划外文件都会响失败（`make check` 已并入）。
 KABI_GEN := python3 tools/kabi/kabi_gen.py
-KABI_SCHEMAS := --schema abi/component.toml --schema abi/core.toml --schema abi/errno.toml
+KABI_SCHEMAS := --schema abi/component.toml --schema abi/core.toml --schema abi/errno.toml --schema abi/block.toml --schema abi/filesystem.toml
 
 abi-gen:
 	$(KABI_GEN) generate $(KABI_SCHEMAS) --out-root .

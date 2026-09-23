@@ -1,0 +1,70 @@
+# KABI schema — block：`block.device` 组件间契约（provider: 驱动如 virtio_blk；
+# consumer: FS 如 FatFs）。
+#
+# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
+#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 结构 / 常量 + 布局 _Static_assert
+#   os/components/kcomp-sdk/src/generated/block.rs          SDK-Rust 镜像 + `const _` 布局断言
+#
+# 手写部分（facade，不在本文件范围）：契约类型 `BlockDevice` / provider wrapper
+# （`kcomp-sdk/src/block.rs`）、`InterfaceAbi` newtype（`binding.rs`）。
+# 组件间契约**不是** Core 导出：Core 只把 publish 进来的 api / ctx 当不透明指针
+# 存着，不认识契约语义，所以名字是 `kcomp_*`（组件面），不是 `kcore_*`。
+
+[[struct]]
+name = "BlockDeviceApi"
+c_name = "kcomp_block_device_api"
+size_ptrs = 3
+doc = """
+BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
+
+# 契约（两个实现能否互通，全看这几条）
+
+- **单位**：`lba` 以 **512 字节 sector** 计；`len` 是**字节数**，必须是 sector 大小的整数倍。
+- **同步 / 阻塞**：`read` / `write` 阻塞到本次传输完成。当前实现（virtio_blk）轮询设备，因此调用方**不得**处于不能阻塞的上下文。
+- **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
+- **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
+- **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。用 `BlockDeviceService` 发布的 provider 由 SDK 统一挡下（provider 不会被调用）；手写 table 的 provider 需自行保证同语义。
+- **buffer（临时契约）**：`buf` 是裸指针，实现要求它指向 **Core 可见 RAM**（v1 无 IOMMU：设备地址 == 物理地址 == 虚拟地址）。
+
+# `buf` 裸指针是刻意的临时选择（不是最终设计）
+
+按 AGENTS.md，"裸指针只来自 Core 派生并持有 provenance 的 typed Lease"——裸指针本身不是 authority。这里直接收裸指针，是因为 consumer 侧"分配 DMA-able 内存"的窄接口**尚不存在**，v1 只有这一种可行形状。**一旦出现跨执行域的调用方，该参数必须换成 Core 派生的 DMA lease / handle**（那时裸地址不再能证明 buffer 归属与设备可达性）；在那之前它只是暂时够用。
+
+契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size / ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。
+"""
+
+[[struct.field]]
+name = "capacity_sectors"
+type = "fn(ctx: *mut void) -> u64"
+doc = "设备容量（单位：512 字节 sector）。"
+
+[[struct.field]]
+name = "read"
+type = "fn(ctx: *mut void, lba: u64, buf: *mut u8, len: usize) -> i32"
+doc = "从 `lba` 读 `len` 字节到 `buf`（单位 / 阻塞 / 上下文见契约文档）。"
+
+[[struct.field]]
+name = "write"
+type = "fn(ctx: *mut void, lba: u64, buf: *const u8, len: usize) -> i32"
+doc = "从 `buf` 写 `len` 字节到 `lba`（单位 / 阻塞 / 上下文见契约文档）。"
+
+[[const]]
+name = "KCOMP_BLOCK_DEVICE_NAME"
+type = "string"
+value = "block.device"
+targets = "c,sdk-rust"
+doc = "接口的稳定名字（publish / bind 必须逐字节一致）。"
+
+[[const]]
+name = "KCOMP_BLOCK_DEVICE_ABI"
+type = "u64"
+value = "0x424C_4F43_4B44_4556"
+targets = "c,sdk-rust"
+doc = "exact ABI fingerprint：8 字节 ASCII \"BLOCKDEV\" 的大端读数。"
+
+[[const]]
+name = "KCOMP_BLOCK_DEVICE_SECTOR"
+type = "usize"
+value = "512"
+targets = "c,sdk-rust"
+doc = "契约单位：1 sector = 512 字节（`read` / `write` 的 `len` 必须是它的整数倍）。"

@@ -1,24 +1,39 @@
-//! 三方 ABI 漂移哨兵：`kcomp.h` ↔ SDK `abi.rs` ↔ Core `export.rs`。
+//! 组件 ABI 漂移哨兵：冻结面 + 绝对数值 pin。
 //!
-//! 纯文本交叉校验（无 bindgen / cbindgen / 代码生成器），任何漂移必须**响亮
-//! 失败**，绝不静默跳过：
+//! ABI 的声明本体（`kcore_*` 导出 / 生命周期入口 / 稳定结构 / 组件间 function
+//! table / 常量 / 枚举）现在全部由 `abi/*.toml` 单源生成（`tools/kabi/kabi_gen.py`
+//! → C / SDK-Rust / Core-Rust，见 `make abi-gen`）。因此本测试**不再做文本交叉
+//! 解析比对**，只保留两类独立守卫：
 //!
-//! 1. **名字集合**：三份文件声明的 `kcore_*` 集合必须逐一相等；
-//! 2. **签名形状**：每个符号的参数个数 + **宽度类别**序列（以及返回类别）必须
-//!    相等——`size_t` / `usize` / 裸指针统一抽象成"指针宽"（RV32/RV64 同抽象）；
-//! 3. **生命周期入口**：必需导出（`kcomp_instance_create` /
-//!    `kcomp_instance_destroy` / `kcomp_abi`）必须在 C 头文件与 Rust 镜像中
-//!    存在且形状正确；旧入口 `kcomp_init` / `kcomp_exit` 不得残留（协调替换，
-//!    无 legacy fallback；注释里的历史说明会被剥离，代码引用必须删除）。
+//! 1. **生成物新鲜度**：`make abi-check` 重生成到临时目录并与提交物逐文件 diff
+//!    （内容漂移 / 生成文件缺失 / 计划外文件都失败）——"schema ↔ 生成物"的唯一守卫；
+//! 2. **布局**：生成物自带编译器断言——C `_Static_assert`（结构大小 / 对齐 /
+//!    字段偏移 / 函数表 `N * sizeof(void *)`）与 Rust `const _: () = assert!(...)`
+//!    （`size_of` / `align_of` / `offset_of` / `N * size_of::<usize>()`）。字段
+//!    个数 / 顺序 / 类型漂移 = 编译错误。
 //!
-//! 三份文件用 `include_str!` 在编译期嵌入：文件缺失 = 编译失败；解析不出符号
-//! = 本文件的 sanity / 自测失败。任何一方不一致 → 测试 panic 并把差异列全。
+//! 本文件因此**删除**了旧的 C ↔ Rust function table 布局文本比对与常量跨源比对
+//! （连同其手写解析器与解析器自测）：那些检查已被上面两条覆盖，且比文本解析更强
+//! （编译器背书）。
+//!
+//! 保留的检查：
+//!
+//! - **生命周期入口面**：必需导出（`kcomp_instance_create` /
+//!   `kcomp_instance_destroy` / `kcomp_abi`）必须在 C 头文件与 Rust 镜像中存在且
+//!   形状正确；旧入口 `kcomp_init` / `kcomp_exit` 不得残留（协调替换，无 legacy
+//!   fallback；注释里的历史说明会被剥离，代码引用必须删除）；
+//! - **绝对数值 pin**：指纹 / 名字 / sector / open-read flag / `InterfaceKind`
+//!   编码直接对**编译进来的真实生成常量**断言（`include!`，不是文本解析）——
+//!   与生成流程解耦，生成器整体失灵时这些稳定契约值也必须顶着。
+//!
+//! 作者面文本与生成物都用 `include_str!` / `include!` 在编译期嵌入：文件缺失 =
+//! 编译失败；解析不出符号 = 本文件的 sanity / 自测失败。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// C 侧作者面（`AGENTS.md`：C 是根）。路径相对本文件：`os/core/tests/`。
 const HEADER_SRC: &str = include_str!("../../components/kcomp-sdk/include/kcomp.h");
-/// C 侧生成物（`abi/*.toml` → `kcore_*` / 生命周期 / 稳定结构的声明本体）。
+/// C 侧生成物（`abi/*.toml` → `kcore_*` / 生命周期 / 稳定结构 / 组件间契约）。
 const GENERATED_HEADER_SRC: &str =
     include_str!("../../components/kcomp-sdk/include/generated/kcomp_abi.h");
 /// SDK 的 Rust 镜像（手写 facade）。
@@ -50,7 +65,7 @@ struct Signature {
 }
 
 // ---------------------------------------------------------------------------
-// 文本解析（手写、够用即止；不是通用 C/Rust parser）
+// 文本解析（手写、够用即止；只服务于生命周期入口面检查）
 // ---------------------------------------------------------------------------
 
 /// 剥离 `//` 行注释与 `/* */` 块注释；双引号字符串**原样保留**（导出表里
@@ -362,20 +377,6 @@ fn extract_rust_decls(stripped: &str) -> BTreeMap<String, Signature> {
     out
 }
 
-/// Core `export.rs` 的 `EXPORTS` 表名字（`name: b"kcore_..."`）。
-fn extract_export_table_names(stripped: &str) -> BTreeSet<String> {
-    const ANCHOR: &str = "name: b\"";
-    let mut out = BTreeSet::new();
-    let mut rest = stripped;
-    while let Some(pos) = rest.find(ANCHOR) {
-        let start = pos + ANCHOR.len();
-        let end = rest[start..].find('"').expect("导出表名字字面量未闭合");
-        out.insert(rest[start..start + end].to_string());
-        rest = &rest[start + end + 1..];
-    }
-    out
-}
-
 /// 折叠空白后的子串检查（声明可以换行 / 缩进）。
 fn contains_normalized(haystack: &str, needle: &str) -> bool {
     let flat = haystack.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -395,38 +396,13 @@ fn contains_ident(src: &str, ident: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 断言
-// ---------------------------------------------------------------------------
-
-fn compare_signatures(
-    label_a: &str,
-    a: &BTreeMap<String, Signature>,
-    label_b: &str,
-    b: &BTreeMap<String, Signature>,
-    problems: &mut Vec<String>,
-) {
-    for (name, sig_a) in a {
-        let Some(sig_b) = b.get(name) else {
-            continue; // 名字集合测试单独报告缺失
-        };
-        if sig_a != sig_b {
-            problems.push(format!(
-                "  `{name}`: {label_a} = ({:?}) -> {:?}；{label_b} = ({:?}) -> {:?}",
-                sig_a.params, sig_a.ret, sig_b.params, sig_b.ret
-            ));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 生命周期入口面（冻结契约）
 // ---------------------------------------------------------------------------
 //
-// 旧的 `kcore_*` 三方文本交叉校验已删除：名字 / 签名 / 布局现在由 abi/*.toml
-// 单源生成 —— C `_Static_assert`（generated/kcomp_abi.h）、Rust `const _: ()`
-// 布局断言（generated/abi.rs）、以及 `component/generated/exports.rs` 的 typed
-// 导出注册表（缺实现 / 签名变了 = 编译错误）在编译期覆盖原来的检查。
-// 本测试只钉住"生命周期入口面存在且形状正确"。
+// 名字 / 签名 / 布局的声明本体由 abi/*.toml 单源生成 —— C `_Static_assert`
+// （generated/kcomp_abi.h）、Rust `const _: ()` 布局断言（generated/abi.rs）、
+// 以及 `component/generated/exports.rs` 的 typed 导出注册表（缺实现 / 签名变了 =
+// 编译错误）在编译期覆盖。本测试只钉住"生命周期入口面存在且形状正确"。
 
 #[test]
 fn lifecycle_entry_surface_is_frozen() {
@@ -532,16 +508,6 @@ fn rust_parser_extracts_declaration_shapes() {
 }
 
 #[test]
-fn export_table_parser_reads_name_literals() {
-    let src = "static E: [X; 2] = [X { name: b\"kcore_a\", address: f }, X { name: b\"kcore_b\", address: g }];";
-    let names = extract_export_table_names(src);
-    assert_eq!(
-        names.into_iter().collect::<Vec<_>>(),
-        vec!["kcore_a".to_string(), "kcore_b".to_string()]
-    );
-}
-
-#[test]
 fn classifiers_reject_unknown_types_and_accept_fn_aliases() {
     assert!(classify_c_type("long double").is_err());
     assert!(classify_rust_type("SomeRandomStruct").is_err());
@@ -553,369 +519,65 @@ fn classifiers_reject_unknown_types_and_accept_fn_aliases() {
 }
 
 // ===========================================================================
-// 组件间契约（C ↔ Rust）：function table 布局与常量
+// 组件间契约（block.device / filesystem）：编译器背书的绝对数值 pin
 // ---------------------------------------------------------------------------
 // 契约不是 Core 导出（Core 只把 api/ctx 当不透明指针存着），所以 C 侧名字是
-// `kcomp_*`。但 provider（Rust，如 virtio_blk）与 consumer（可能是 C，如 FatFs）
-// 必须对同一份布局——布局错了就是跨组件 UB，比 kcore_* 签名漂移更致命。
+// `kcomp_*`。布局一致性由单源生成 + 生成物里的 `_Static_assert`（C）/
+// `const _`（Rust）保证（`make abi-check` 守住生成物新鲜度）；这里只把**稳定
+// 数值**钉死：指纹 / 名字 / sector / open-read flag / InterfaceKind 编码。
+//
+// 下面 `include!` 的是**真实生成物**（与 SDK 编译的是同一份文件），不是文本
+// 解析：常量值变了 = 断言失败，类型 / 布局变了 = 编译失败。
 // ===========================================================================
 
-/// 组件间契约的 Rust 侧（function table + ABI 常量）。
-const SDK_BLOCK_SRC: &str = include_str!("../../components/kcomp-sdk/src/block.rs");
-const SDK_FILESYSTEM_SRC: &str = include_str!("../../components/kcomp-sdk/src/filesystem.rs");
-/// `InterfaceKind` 的 ABI 编码（Rust 侧）。
-const SDK_BINDING_SRC: &str = include_str!("../../components/kcomp-sdk/src/binding.rs");
-
-/// 从 `open`（指向 `{`）找匹配的 `}`。
-fn matching_brace(bytes: &[u8], open: usize) -> Result<usize, String> {
-    assert_eq!(bytes[open], b'{');
-    let mut depth = 0usize;
-    for (i, &b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    Err("花括号不配对".to_string())
+mod generated_block {
+    include!("../../components/kcomp-sdk/src/generated/block.rs");
 }
 
-/// 按顶层分隔符切分（括号 / 方括号 / 花括号内的分隔符不算）。与 `split_top_level`
-/// 同族，但分隔符可指定（结构体字段用 `;` / `,`）。
-fn split_top_level_on(raw: &str, delim: char) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (i, c) in raw.char_indices() {
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            c if c == delim && depth == 0 => {
-                parts.push(raw[start..i].to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(raw[start..].to_string());
-    parts
-}
-
-/// 取 `anchor` 之后第一个 `{ ... }` 的内容（注释需已剥离）。
-fn braced_body(stripped: &str, anchor: &str) -> String {
-    let start = stripped
-        .find(anchor)
-        .unwrap_or_else(|| panic!("找不到锚点 `{anchor}`"));
-    let brace = stripped[start..]
-        .find('{')
-        .map(|i| start + i)
-        .unwrap_or_else(|| panic!("`{anchor}` 之后没有 `{{`"));
-    let end =
-        matching_brace(stripped.as_bytes(), brace).unwrap_or_else(|e| panic!("`{anchor}`: {e}"));
-    stripped[brace + 1..end].to_string()
-}
-
-/// C function table 的字段：`RET (*name)(PARAMS);` → `(name, Signature)`。
-/// 只接受函数指针字段（契约 table 就是函数指针数组）。
-fn parse_c_fn_table(stripped: &str, struct_name: &str) -> Vec<(String, Signature)> {
-    let body = braced_body(stripped, &format!("struct {struct_name}"));
-    let mut fields = Vec::new();
-    for raw in split_top_level_on(&body, ';') {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let paren = raw
-            .find('(')
-            .unwrap_or_else(|| panic!("`{raw}` 不是函数指针字段"));
-        let ret = classify_c_type(raw[..paren].trim())
-            .unwrap_or_else(|e| panic!("C `{struct_name}` 返回类型: {e}"));
-        let close = matching_paren(raw.as_bytes(), paren).unwrap_or_else(|e| panic!("{e}"));
-        let name = raw[paren + 1..close]
-            .trim()
-            .strip_prefix('*')
-            .unwrap_or_else(|| panic!("`{raw}` 字段名前缺 `*`"))
-            .trim()
-            .to_string();
-        let after = close + 1;
-        let paren2 = raw[after..]
-            .find('(')
-            .map(|i| after + i)
-            .unwrap_or_else(|| panic!("`{raw}` 缺参数表"));
-        let close2 = matching_paren(raw.as_bytes(), paren2).unwrap_or_else(|e| panic!("{e}"));
-        let params = parse_c_params(&raw[paren2 + 1..close2]).unwrap_or_else(|e| panic!("{e}"));
-        fields.push((name, Signature { params, ret }));
-    }
-    fields
-}
-
-/// Rust `#[repr(C)]` function table 的字段：`pub name: unsafe extern "C" fn(PARAMS)
-/// -> RET,` → `(name, Signature)`。
-fn parse_rust_fn_table(stripped: &str, struct_name: &str) -> Vec<(String, Signature)> {
-    let body = braced_body(stripped, &format!("pub struct {struct_name} {{"));
-    let mut fields = Vec::new();
-    for raw in split_top_level_on(&body, ',') {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let raw = raw.strip_prefix("pub ").unwrap_or(raw);
-        let (name, ty) = raw
-            .split_once(':')
-            .unwrap_or_else(|| panic!("`{raw}` 缺 `:`"));
-        let fn_at = ty
-            .find("fn(")
-            .unwrap_or_else(|| panic!("`{raw}` 不是 fn 字段"));
-        let paren = ty[fn_at..].find('(').map(|i| fn_at + i).unwrap();
-        let close = matching_paren(ty.as_bytes(), paren).unwrap_or_else(|e| panic!("{e}"));
-        let params = parse_rust_params(&ty[paren + 1..close]).unwrap_or_else(|e| panic!("{e}"));
-        let ret = classify_rust_type(rust_return_type(&ty[close + 1..]))
-            .unwrap_or_else(|e| panic!("{e}"));
-        fields.push((name.trim().to_string(), Signature { params, ret }));
-    }
-    fields
-}
-
-/// 取 C `#define <name> <expr>` 的 expr（名后必须是空白，避免前缀误匹配）。
-fn extract_c_define(stripped: &str, name: &str) -> Option<String> {
-    for line in stripped.lines() {
-        let Some(rest) = line.trim().strip_prefix("#define") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        if let Some(value) = rest.strip_prefix(name)
-            && value.starts_with(char::is_whitespace)
-        {
-            return Some(value.trim().to_string());
-        }
-    }
-    None
-}
-
-/// 取第一个双引号字符串的内容（C `"x"` 与 Rust `b"x"` 通用）。
-fn extract_first_string(expr: &str) -> Option<String> {
-    let start = expr.find('"')?;
-    let rest = &expr[start + 1..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// 取 Rust `const <name> ... = <expr>;` 的 expr。
-fn extract_rust_const_expr(stripped: &str, name: &str) -> Option<String> {
-    let needle = format!("const {name}");
-    let start = stripped.find(&needle)?;
-    let after = &stripped[start + needle.len()..];
-    let eq = after.find('=')?;
-    let rest = &after[eq + 1..];
-    let end = rest.find(';')?;
-    Some(rest[..end].trim().to_string())
-}
-
-/// 解析字面量整数：优先十六进制（`0x...`，含 `UINT64_C(...)` / 下划线），
-/// 否则取最后一个十进制串（enum 判别值 `= 0`）。
-fn parse_u64_literal(text: &str) -> Option<u64> {
-    if let Some(pos) = text.find("0x").or_else(|| text.find("0X")) {
-        let bytes = text.as_bytes();
-        let mut j = pos + 2;
-        while j < bytes.len() && (bytes[j].is_ascii_hexdigit() || bytes[j] == b'_') {
-            j += 1;
-        }
-        let digits: String = text[pos + 2..j].chars().filter(|c| *c != '_').collect();
-        return u64::from_str_radix(&digits, 16).ok();
-    }
-    let bytes = text.as_bytes();
-    let mut best = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let mut j = i;
-            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'_') {
-                j += 1;
-            }
-            let digits: String = text[i..j].chars().filter(|c| *c != '_').collect();
-            best = digits.parse::<u64>().ok();
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    best
-}
-
-/// 取 `anchor` 处 enum 的 `Variant = N` 判别值表。
-fn extract_enum_values(stripped: &str, anchor: &str) -> BTreeMap<String, u64> {
-    let body = braced_body(stripped, anchor);
-    let mut out = BTreeMap::new();
-    for raw in split_top_level_on(&body, ',') {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        if let Some((key, value)) = raw.split_once('=')
-            && let Some(n) = parse_u64_literal(value)
-        {
-            out.insert(key.trim().to_string(), n);
-        }
-    }
-    out
+mod generated_filesystem {
+    include!("../../components/kcomp-sdk/src/generated/filesystem.rs");
 }
 
 #[test]
-fn block_device_fn_table_layout_matches_across_c_and_rust() {
-    let c = parse_c_fn_table(&strip_comments(HEADER_SRC), "kcomp_block_device_api");
-    let r = parse_rust_fn_table(&strip_comments(SDK_BLOCK_SRC), "BlockDeviceApi");
+fn component_contract_literals_are_pinned() {
+    use kernel::component::interface::InterfaceKind;
 
-    let c_names: Vec<_> = c.iter().map(|(n, _)| n.clone()).collect();
-    let r_names: Vec<_> = r.iter().map(|(n, _)| n.clone()).collect();
-    assert_eq!(c_names, r_names, "block.device 字段名 / 顺序漂移");
-
-    let c_map: BTreeMap<_, _> = c.into_iter().collect();
-    let r_map: BTreeMap<_, _> = r.into_iter().collect();
-    let mut problems = Vec::new();
-    compare_signatures("kcomp.h", &c_map, "block.rs", &r_map, &mut problems);
-    assert!(
-        problems.is_empty(),
-        "block.device function table 布局漂移：\n{}",
-        problems.join("\n")
-    );
-}
-
-#[test]
-fn block_device_constants_match_across_c_and_rust() {
-    let c = strip_comments(&[HEADER_SRC, GENERATED_HEADER_SRC].concat());
-    let r = strip_comments(SDK_BLOCK_SRC);
-
-    let c_name = extract_first_string(
-        &extract_c_define(&c, "KCOMP_BLOCK_DEVICE_NAME")
-            .expect("kcomp.h 缺 KCOMP_BLOCK_DEVICE_NAME"),
-    );
-    let r_name = extract_first_string(
-        &extract_rust_const_expr(&r, "BLOCK_DEVICE_NAME").expect("block.rs 缺 BLOCK_DEVICE_NAME"),
-    );
-    assert_eq!(c_name, r_name, "block.device 名字漂移");
-
-    let c_abi = parse_u64_literal(
-        &extract_c_define(&c, "KCOMP_BLOCK_DEVICE_ABI").expect("kcomp.h 缺 KCOMP_BLOCK_DEVICE_ABI"),
-    );
-    let r_abi = parse_u64_literal(
-        &extract_rust_const_expr(&r, "BLOCK_DEVICE_ABI").expect("block.rs 缺 BLOCK_DEVICE_ABI"),
-    );
-    assert_eq!(c_abi, r_abi, "block.device ABI 指纹漂移");
+    // block.device：名字 + 指纹（数值可当 8 字节大端 ASCII 读出来）+ sector 单位。
     assert_eq!(
-        c_abi,
-        Some(0x424C_4F43_4B44_4556),
+        generated_block::KCOMP_BLOCK_DEVICE_ABI,
+        0x424C_4F43_4B44_4556,
         "block.device ABI 指纹值漂移"
     );
-
-    let c_enum = extract_enum_values(&c, "enum KcompInterfaceKind");
-    // `InterfaceKind` 的 Rust 本体在生成物里（binding.rs 只 re-export）。
-    let r_enum = extract_enum_values(
-        &strip_comments(&[SDK_BINDING_SRC, SDK_GENERATED_ABI_SRC].concat()),
-        "enum InterfaceKind",
-    );
-    for (c_key, r_key) in [
-        ("KCOMP_IFACE_DEVICE", "Device"),
-        ("KCOMP_IFACE_SERVICE", "Service"),
-        ("KCOMP_IFACE_POLICY", "Policy"),
-    ] {
-        assert_eq!(
-            c_enum.get(c_key),
-            r_enum.get(r_key),
-            "InterfaceKind::{r_key} 编码漂移"
-        );
-    }
-}
-
-#[test]
-fn filesystem_fn_table_layout_matches_across_c_and_rust() {
-    let c = parse_c_fn_table(&strip_comments(HEADER_SRC), "kcomp_filesystem_api");
-    let r = parse_rust_fn_table(&strip_comments(SDK_FILESYSTEM_SRC), "FileSystemApi");
-
-    let c_names: Vec<_> = c.iter().map(|(n, _)| n.clone()).collect();
-    let r_names: Vec<_> = r.iter().map(|(n, _)| n.clone()).collect();
     assert_eq!(
-        c_names, r_names,
-        "filesystem function table 字段名 / 顺序漂移"
+        &generated_block::KCOMP_BLOCK_DEVICE_ABI.to_be_bytes(),
+        b"BLOCKDEV",
+        "block.device ABI 指纹不再是 ASCII tag"
     );
+    assert_eq!(generated_block::KCOMP_BLOCK_DEVICE_NAME, b"block.device");
+    assert_eq!(generated_block::KCOMP_BLOCK_DEVICE_SECTOR, 512);
 
-    let c_map: BTreeMap<_, _> = c.into_iter().collect();
-    let r_map: BTreeMap<_, _> = r.into_iter().collect();
-    let mut problems = Vec::new();
-    compare_signatures("kcomp.h", &c_map, "filesystem.rs", &r_map, &mut problems);
-    assert!(
-        problems.is_empty(),
-        "filesystem function table 布局漂移：\n{}",
-        problems.join("\n")
-    );
-}
-
-#[test]
-fn filesystem_constants_match_across_c_and_rust() {
-    let c = strip_comments(HEADER_SRC);
-    let r = strip_comments(SDK_FILESYSTEM_SRC);
-
-    let c_name = extract_first_string(
-        &extract_c_define(&c, "KCOMP_FILESYSTEM_NAME").expect("kcomp.h 缺 KCOMP_FILESYSTEM_NAME"),
-    );
-    let r_name = extract_first_string(
-        &extract_rust_const_expr(&r, "FILESYSTEM_NAME").expect("filesystem.rs 缺 FILESYSTEM_NAME"),
-    );
-    assert_eq!(c_name, r_name, "filesystem 名字漂移");
-
-    let c_abi = parse_u64_literal(
-        &extract_c_define(&c, "KCOMP_FILESYSTEM_ABI").expect("kcomp.h 缺 KCOMP_FILESYSTEM_ABI"),
-    );
-    let r_abi = parse_u64_literal(
-        &extract_rust_const_expr(&r, "FILESYSTEM_ABI").expect("filesystem.rs 缺 FILESYSTEM_ABI"),
-    );
-    assert_eq!(c_abi, r_abi, "filesystem ABI 指纹漂移");
-    assert_eq!(c_abi, Some(0x4649_4C45_5359_5354));
-}
-
-#[test]
-fn c_fn_table_parser_reads_function_pointer_fields() {
-    let src = strip_comments(
-        "struct demo_api {\n    uint64_t (*cap)(void *ctx);\n    int32_t (*read)(void *ctx, uint64_t lba, uint8_t *buf, size_t len);\n};\n",
-    );
-    let fields = parse_c_fn_table(&src, "demo_api");
-    assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].0, "cap");
-    assert_eq!(fields[0].1.params, vec![Width::Ptr]);
-    assert_eq!(fields[0].1.ret, Width::W64);
-    assert_eq!(fields[1].0, "read");
+    // filesystem：名字 + 指纹 + 只读 open flag。
     assert_eq!(
-        fields[1].1.params,
-        vec![Width::Ptr, Width::W64, Width::Ptr, Width::Ptr]
+        generated_filesystem::KCOMP_FILESYSTEM_ABI,
+        0x4649_4C45_5359_5354,
+        "filesystem ABI 指纹值漂移"
     );
-    assert_eq!(fields[1].1.ret, Width::W32);
-}
-
-#[test]
-fn rust_fn_table_parser_reads_fn_fields() {
-    let src = strip_comments(
-        r#"#[repr(C)]
-pub struct DemoApi {
-    pub cap: unsafe extern "C" fn(ctx: *mut ()) -> u64,
-    pub read: unsafe extern "C" fn(ctx: *mut (), lba: u64, buf: *mut u8, len: usize) -> i32,
-}
-"#,
-    );
-    let fields = parse_rust_fn_table(&src, "DemoApi");
-    assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].0, "cap");
-    assert_eq!(fields[0].1.params, vec![Width::Ptr]);
-    assert_eq!(fields[0].1.ret, Width::W64);
-    assert_eq!(fields[1].0, "read");
     assert_eq!(
-        fields[1].1.params,
-        vec![Width::Ptr, Width::W64, Width::Ptr, Width::Ptr]
+        &generated_filesystem::KCOMP_FILESYSTEM_ABI.to_be_bytes(),
+        b"FILESYST",
+        "filesystem ABI 指纹不再是 ASCII tag"
     );
-    assert_eq!(fields[1].1.ret, Width::W32);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NAME, b"filesystem");
+    assert_eq!(
+        generated_filesystem::KCOMP_FILESYSTEM_OPEN_READ,
+        0x0000_0001
+    );
+
+    // InterfaceKind 编码（Core 侧真实类型，来自 component.toml 生成物）：
+    // ABI 编码 0/1/2，与 docs/architecture/component-model.md §2 一致。
+    assert_eq!(InterfaceKind::Device as u32, 0);
+    assert_eq!(InterfaceKind::Service as u32, 1);
+    assert_eq!(InterfaceKind::Policy as u32, 2);
 }
 
 // ===========================================================================

@@ -357,12 +357,14 @@ impl Service for DriverProber {
 }
 
 // -----------------------------------------------------------------------
-// block.device —— 契约与 provider wrapper 同处一室：[`crate::block`]
+// block.device / filesystem —— 契约类型与 provider wrapper：[`crate::block`]
 // -----------------------------------------------------------------------
 //
-// 定义（function table / 契约类型 / BlockDeviceProvider / BlockDeviceService）
-// 都在 `crate::block`；这里只 re-export，让既有路径 `binding::BlockDevice` /
-// `binding::BlockDeviceApi` 保持不变。
+// function table（`BlockDeviceApi` / `FileSystemApi`）由 `abi/*.toml` 单源生成
+// （`crate::generated::{block,filesystem}`）；契约类型与 provider wrapper
+// （`BlockDeviceProvider` / `BlockDeviceService`）在 `crate::block` 手写。
+// 这里只 re-export，让既有路径 `binding::BlockDevice` / `binding::BlockDeviceApi`
+// 保持不变。
 
 pub use crate::block::{BLOCK_DEVICE_ABI, BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceApi};
 pub use crate::filesystem::{
