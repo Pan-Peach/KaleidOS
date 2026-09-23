@@ -16,7 +16,8 @@ docs/
 │   ├── component-model.md
 │   ├── component-lifecycle.md   （已冻结的组件生命周期契约）
 │   ├── driver-model.md
-│   └── kconfig.md
+│   ├── kconfig.md
+│   └── porting.md               （第三方库移植 / 调包能力：设计契约 + 候选地图）
 ├── interfaces/                组件/驱动对外契约（ABI、设备语义、文件系统语义）
 │   └── filesystem.md            （文件系统抽象边界契约；未决问题待人类定稿）
 ├── modules/                    每个模块在干嘛：真相 / 机制 / 不做什么 / 代码在哪
@@ -57,6 +58,7 @@ docs/
 | 驱动、device claim、IRQ/DMA、执行域、teardown | `architecture/driver-model.md` | 驱动与执行域细节最终契约 |
 | 分层总览、ResourceDomain / ExecutionDomain 概念 | `architecture/overview.md` | 与 driver-model 细节冲突时以 driver-model 为准 |
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
+| 第三方库移植 / 调包能力（kport、候选库、统一 host 接口） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
 | 组件对外契约（设备/FS/服务） | `interfaces/` | 接口语义契约；文件系统抽象见 `interfaces/filesystem.md` |
 | 每个模块的真实行为与代码位置 | `modules/` | 描述现状；不确定就写"未实现/目标"，不臆造 |
 | 测试策略 | `development/testing.md` | —— |
@@ -74,6 +76,7 @@ docs/
 | 知道某个 Core 模块在干嘛、代码在哪 | `modules/README.md` → `modules/core/<module>.md` |
 | 写一个驱动 / 认领设备 | `architecture/driver-model.md` + `modules/components.md` |
 | 加载 / 停止一个组件 | `architecture/component-lifecycle.md` + `modules/core/component.md` |
+| 把第三方成熟库（FS / net / TLS / runtime）接成组件 | `architecture/porting.md` |
 | 新加一个构建开关 | `architecture/kconfig.md` |
 | 加测试 | `development/testing.md` |
 | 加文档 | `development/docs-guide.md` |

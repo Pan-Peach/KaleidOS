@@ -303,6 +303,7 @@ Phase 1 **已实现** init 边界与任务边界的协作式 containment：组�
 ## 6. 由哲学推导出的工程约束
 
 - **默认外置**：新能力默认不进 Core；只有"无法安全外置的机制与 truth"才进（§0 / §5）。
+- **复用靠 adapter，这是核心能力而非权宜之计**：KaleidOS 的默认不是自己实现 FAT / ext4 / TCP / TLS / WASI / Win32，而是提供一套足够小、足够稳定的 native semantic interface，让成熟库经**薄 adapter** 变成 component；维护负担因此从"维护整个世界"移到"维护接口和胶水"。因此**接口定义必须与语言无关**：契约由 canonical schema（`abi/*.toml` → `tools/kabi/kabi_gen.py`）生成 C / Rust binding，第三方库用什么语言写，Core 不关心。第三方代码**永远不得直调 Core**（库对 Core / virtio / MMIO / DMA 必须一无所知），只认 native semantic interface。见 `docs/architecture/porting.md`。
 - **显式归属**：Core 操作都显式接收 `RequestContext`（谁在请求 / 属于哪个 instance / 哪个 task），不偷偷读 `current_task()` 或全局 caller；**它是执行归属 + 生命周期所有权，不是 security principal**（见 `driver-model.md` §5.1）。
 - **能力退化可见**：MMU / IOMMU / 特权级等平台能力差异必须显式可见，不能伪装（见 `architecture.md`）。
 - **契约不绑 ABI / 传输**：Interface 与 device claim 机制和"怎么调用"解耦；组件边界使用稳定 C ABI，Rust ABI 永不成为组件 ABI（见 `architecture.md`）。
