@@ -57,6 +57,6 @@
 | `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf}.rs` | RISC-V family 机制 |
 | `os/arch/src/riscv/context/{mod,switch32.S,switch64.S}` | 上下文切换 |
 | `os/arch/src/riscv/trap/{mod,supervisor,machine}.rs` + `trap*.S` | trap 入口 / 分发 / S-mode handler |
-| `os/arch/src/riscv/gateway/{mod,gateway32.S,gateway64.S}` | 私有 AS assembly gateway（双映射 `satp` 切换 / trap 往返 / 窄故障分派接缝；increment 3 机制，increment 5/6 起由 `component/isolated_lifecycle.rs` 生产调用（create / destroy / service dispatch）；入口 `a0..a3` 由 Core 预置、汇编只搬运） |
+| `os/arch/src/riscv/gateway/{mod,gateway32.S,gateway64.S}` | 私有 AS assembly gateway（双映射 `satp` 切换 / trap 往返 / 窄故障分派接缝；increment 3 机制，increment 5/6 起由 `component/isolated_lifecycle.rs` 生产调用（create / destroy / service dispatch），increment 7 的失败矩阵（destroy 故障 / Ready 期故障 / stale 阻断 / 逻辑重启）走同一路径；入口 `a0..a3` 由 Core 预置、汇编只搬运） |
 | `os/arch/src/riscv/mmu/{mod,address_space,sv32,sv39,test_pool}.rs` | Sv32 / Sv39 页表机制 |
 | `os/arch/Kconfig` | `ARCH_*` / `PRIVILEGE_*` / `VM_*` choice |

@@ -10,13 +10,24 @@
 //! 规则：
 //! - **一个 artifact 名只有一份 image**：同名再次加载 = 复用 image、产生**新实例**
 //!   （新 `ComponentId`、新 state），不再拒绝。
+//! - **image 记录部署域（`ExecutionDomain`）**：放段结果只在对应执行域里有意义
+//!   （KernelNative = 共享内核 AS 的 VA / 裸 Core 地址；Isolated = 实例私有 AS
+//!   的 VA）。**跨域复用 = 静默降级**，必须由装载门禁显式拒绝
+//!   （`component/load.rs`）。
+//! - **Isolated 的按域段规划（`placement`）随 image 常驻**：同域的第二/第 N 个
+//!   实例把**同一份 backing** 映射进自己的私有 AS（`isolated_lifecycle`）——
+//!   text / rodata 共享，`.data` / `.bss` 仍是 **image-global**（与 KernelNative
+//!   同一契约，见 `docs/architecture/component-lifecycle.md` §9）；per-instance
+//!   状态由实例窗口（Core 预置 backing）承载。
 //! - **image 永不 unload**（pinned-until-reboot）：不实现 `instances == 0 → free`，
 //!   Stopped/Failed 实例记录留作 tombstone（契约 §8/§9）。
 //! - **`MemoryLease` 归 image 所有**；authority（MMIO/IRQ/DMA）、任务、接口发布
 //!   归实例（`ComponentId`）。
 
+use crate::component::endpoint::ExecutionDomain;
 use crate::component::loader::LoadedComponent;
 use crate::memory::MemoryLease;
+use crate::memory::address_space::Mapping;
 use alloc::vec::Vec;
 use spin::{Mutex, Once};
 
@@ -67,6 +78,13 @@ pub struct ComponentImage {
     pub text_size: usize,
     /// 组件 `kcomp_abi` 的已校验值（loader 放段后读取，见 loader.rs）。
     pub abi: u64,
+    /// **部署真相**：这份放段结果属于哪个执行域。放段 / 重定位的 VA 只在对应
+    /// 域里有意义，跨域复用必须显式拒绝（`component/load.rs` 的门禁）。
+    pub domain: ExecutionDomain,
+    /// **Isolated 按域放段的段规划**（VA → backing PA，逐段权限）；KernelNative
+    /// 为空。常驻随 image（lease 归 image）：同域的第二/第 N 个实例把这份
+    /// backing 映射进自己的私有 AS（`isolated_lifecycle`）。
+    pub(crate) placement: Vec<Mapping>,
     /// 常驻段 lease：**归 image 所有**。phase 1 不回收（physical residency）。
     pub(crate) memory: MemoryLease,
 }
@@ -85,14 +103,18 @@ impl ImageTable {
         }
     }
 
-    /// 登记一份加载完成的 image。
+    /// 登记一份加载完成的 image（含部署域与按域段规划）。
     ///
     /// 同名已存在时**不重复登记**，返回已有 id（调用方应先 `find`，避免白做一次
     /// 加载；即使竞争也不会产生第二份同名 image——新 lease 随 `loaded` 释放）。
+    /// **不校验部署域**：跨域复用由装载门禁在登记之前显式拒绝（这里是 Core 内部
+    /// 记账，不发明第二套策略）。
     pub fn register(
         &mut self,
         name: &[u8],
         mut loaded: LoadedComponent,
+        domain: ExecutionDomain,
+        placement: Vec<Mapping>,
     ) -> Result<ComponentImageId, ImageError> {
         if name.len() > MAX_NAME_LEN {
             return Err(ImageError::NameTooLong);
@@ -113,6 +135,8 @@ impl ImageTable {
             service_dispatch: loaded.service_dispatch,
             text_size: loaded.text_size,
             abi: loaded.abi,
+            domain,
+            placement,
             // loader 成功返回必然携带 lease（放段 = 一次 region 分配）。
             memory: loaded.take_memory().expect("loader always returns a lease"),
         });
@@ -183,6 +207,21 @@ pub(crate) mod test_support {
         destroy: usize,
         service_dispatch: Option<usize>,
     ) -> ComponentImageId {
+        register_test_image_in_domain(
+            name,
+            destroy,
+            service_dispatch,
+            ExecutionDomain::KernelNative,
+        )
+    }
+
+    /// 显式指定部署域的测试 image（Isolated 复用 / 跨域拒绝用例）。
+    pub(crate) fn register_test_image_in_domain(
+        name: &[u8],
+        destroy: usize,
+        service_dispatch: Option<usize>,
+        domain: ExecutionDomain,
+    ) -> ComponentImageId {
         let lease = crate::memory::alloc_region(crate::memory::ALLOC_GRANULE).unwrap();
         let base = lease.region().base;
         get_images()
@@ -198,6 +237,8 @@ pub(crate) mod test_support {
                     abi: KCOMP_ABI,
                     memory: Some(lease),
                 },
+                domain,
+                Vec::new(),
             )
             .unwrap()
     }
@@ -223,14 +264,31 @@ mod tests {
         }
     }
 
+    /// 一条 Isolated 段规划（表语义用例：只记真相，不落页表）。
+    fn placement_entry(base: usize) -> Mapping {
+        Mapping {
+            virtual_range: crate::memory::address_space::VirtualRange { base, size: 4096 },
+            physical_range: crate::memory::address_space::PhysicalRange {
+                base: base + 0x1000,
+                size: 4096,
+            },
+            permission: crate::memory::address_space::MappingPermission::READ
+                | crate::memory::address_space::MappingPermission::EXECUTE,
+        }
+    }
+
     #[test]
     fn register_assigns_monotonic_ids_and_find_resolves_name() {
         let _guard = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
 
         let mut table = ImageTable::new();
-        let a = table.register(b"a", loaded()).unwrap();
-        let b = table.register(b"b", loaded()).unwrap();
+        let a = table
+            .register(b"a", loaded(), ExecutionDomain::KernelNative, Vec::new())
+            .unwrap();
+        let b = table
+            .register(b"b", loaded(), ExecutionDomain::KernelNative, Vec::new())
+            .unwrap();
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
         assert_eq!(table.find(b"a"), Some(a));
@@ -246,10 +304,14 @@ mod tests {
 
         // Given：一份已登记的 image。
         let mut table = ImageTable::new();
-        let first = table.register(b"dup", loaded()).unwrap();
+        let first = table
+            .register(b"dup", loaded(), ExecutionDomain::KernelNative, Vec::new())
+            .unwrap();
 
         // When：同名再次登记（第二次加载的 lease 随参数释放）。
-        let second = table.register(b"dup", loaded()).unwrap();
+        let second = table
+            .register(b"dup", loaded(), ExecutionDomain::KernelNative, Vec::new())
+            .unwrap();
 
         // Then：复用同一 image，表不增长。
         assert_eq!(first, second);
@@ -263,14 +325,55 @@ mod tests {
         crate::memory::test_support::ensure_init();
 
         let mut table = ImageTable::new();
-        let id = table.register(b"fields", loaded()).unwrap();
+        let id = table
+            .register(
+                b"fields",
+                loaded(),
+                ExecutionDomain::KernelNative,
+                Vec::new(),
+            )
+            .unwrap();
         let image = table.get(id).unwrap();
         assert_eq!(image.base + 8, image.create);
         assert_eq!(image.base + 16, image.destroy);
         assert_eq!(image.service_dispatch, None, "可选入口缺省不携带");
         assert_eq!(image.text_size, 64);
         assert_eq!(image.abi, KCOMP_ABI);
+        assert_eq!(image.domain, ExecutionDomain::KernelNative);
+        assert!(image.placement.is_empty(), "KernelNative 没有按域段规划");
         assert!(image.memory.size() >= crate::memory::ALLOC_GRANULE);
+    }
+
+    /// Isolated 按域段规划随 image 常驻（重启复用的真相：第二个实例按同一份
+    /// VA→PA 计划映射自己的私有 AS）。
+    #[test]
+    fn isolated_placement_is_recorded_with_the_image() {
+        let _guard = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        let lease = crate::memory::alloc_region(crate::memory::ALLOC_GRANULE).unwrap();
+        let base = lease.region().base;
+        let placement = alloc::vec![placement_entry(0x2000_0000)];
+        let mut table = ImageTable::new();
+        let id = table
+            .register(
+                b"isolated_plan",
+                LoadedComponent {
+                    base,
+                    create: base + 8,
+                    destroy: base + 16,
+                    service_dispatch: None,
+                    text_size: 64,
+                    abi: KCOMP_ABI,
+                    memory: Some(lease),
+                },
+                ExecutionDomain::IsolatedNative,
+                placement.clone(),
+            )
+            .unwrap();
+        let image = table.get(id).unwrap();
+        assert_eq!(image.domain, ExecutionDomain::IsolatedNative);
+        assert_eq!(image.placement, placement);
     }
 
     /// `service_dispatch` 是可选入口：loader 解析到就原样带进 image 真相
@@ -284,7 +387,14 @@ mod tests {
         let mut loaded = loaded();
         loaded.service_dispatch = Some(loaded.base + 32);
         let expected = loaded.service_dispatch;
-        let id = table.register(b"dispatch", loaded).unwrap();
+        let id = table
+            .register(
+                b"dispatch",
+                loaded,
+                ExecutionDomain::KernelNative,
+                Vec::new(),
+            )
+            .unwrap();
         assert_eq!(table.get(id).unwrap().service_dispatch, expected);
     }
 
@@ -293,7 +403,7 @@ mod tests {
         let mut table = ImageTable::new();
         let long = [b'x'; MAX_NAME_LEN + 1];
         assert_eq!(
-            table.register(&long, loaded()),
+            table.register(&long, loaded(), ExecutionDomain::KernelNative, Vec::new()),
             Err(ImageError::NameTooLong)
         );
         assert!(table.is_empty());

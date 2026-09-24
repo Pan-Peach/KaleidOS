@@ -383,6 +383,10 @@ Power On
 
 - **IsolatedNative（可选实验，非里程碑）**：S-mode + 私有 AS（每域 Sv39 根 + **ASID** 免 flush）；
   只提供条件性故障隔离（协作与偶然 bug，**对恶意无效**），**同特权 S-mode 换页表不构成恶意代码边界**；
+  > 现状（2026-09）：受限 IsolatedNative 已落地并在 RV64+RV32 QEMU 证明（私有 AS + gateway
+  > 生命周期 + KernelNative → Isolated 跨域 service Gate + **失败 / 重启矩阵**：每个阶段的失败终态 /
+  > AS 退役或释放 / 预置窗口归还 / runtime slot 清除 / endpoint 永久失效 / stale 阻断 / 逻辑重启）；
+  > **ASID / U-mode 仍未实现**，边界是**协作式**的。见 `architecture/deployment.md` §10。
 - **SandboxedNative（未来）**：U-mode + 私有 AS，才是对抗隔离的**硬件强制边界**
   （私有 AS + 页表 + 特权级；组件 U-mode 低于 Core 特权）。
 

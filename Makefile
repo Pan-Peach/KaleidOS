@@ -144,7 +144,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # --gc-sections + -u 入口 → strip → 白名单/重定位契约校验，产出 ET_REL .kcomp。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic kcomp_isolated kcomp_isolated_life kcomp_isolated_svc drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain
+KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic kcomp_isolated kcomp_isolated_life kcomp_isolated_svc kcomp_isolated_bad drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer

@@ -28,8 +28,14 @@
 //!
 //! # 故障注入
 //!
-//! `config_abi == FAIL_ABI` 时 create 立刻返回 `-EINVAL`（不写任何槽位）：
-//! ArchTest 用它验证"create-entry 失败 → 实例 Failed + AS 退役 + 窗口归还"。
+//! - `config_abi == FAIL_ABI`：create 立刻返回 `-EINVAL`（不写任何槽位）。
+//!   ArchTest 用它验证"create-entry 失败 → 实例 Failed + AS 退役 + 窗口归还"。
+//! - `config_abi == DESTROY_FAULT_ABI`：create **成功**（正常上报），但把
+//!   `R_DESTROY_FAULT` 槽置 1；destroy 入口读到该标记就执行非法指令（在私有 AS
+//!   里 trap）。ArchTest 用它验证"destroy-entry 故障 → `DestroyPanicked` +
+//!   `Failed` + AS 退役"（create / destroy 两条故障路径的对照）。
+//! - destroy 每次进入都会把 `R_DESTROY_CALLS` 自增（在 fault 之前）：ArchTest
+//!   用它证明"绝不自动重试析构"（第二次 stop 被状态机拒绝，计数不变）。
 
 #![no_std]
 
@@ -54,6 +60,8 @@ const DESTROY_MAGIC: usize = 0x4C49_4644; // "LIFD"
 const FAIL_ABI: u64 = 0xDEAD_BEEF;
 /// 故障注入：create 见到这个 config_abi 就执行非法指令（gateway 故障分派）。
 const FAULT_ABI: u64 = 0xDEAD_FA11;
+/// 故障注入：create 成功，但 destroy 入口执行非法指令（destroy 故障路径）。
+const DESTROY_FAULT_ABI: u64 = 0xDEAD_DE57;
 const STATUS_INVALID_CONFIG: i32 = -22; // -EINVAL
 
 const R_MAGIC: usize = 0;
@@ -69,6 +77,10 @@ const R_SELF: usize = 9;
 const R_VIEW_KIND: usize = 11;
 const R_VIEW_BASE: usize = 12;
 const R_VIEW_LEN: usize = 13;
+/// destroy 故障标记（create 写：`DESTROY_FAULT_ABI` → 1）。
+const R_DESTROY_FAULT: usize = 14;
+/// destroy 进入计数（destroy 每次进入先自增；ArchTest 证明"绝不自动重试"）。
+const R_DESTROY_CALLS: usize = 15;
 
 fn read_tp() -> usize {
     let tp: usize;
@@ -101,7 +113,7 @@ struct MemoryViewAbi {
     len: u64,
 }
 
-fn report(args: usize, out_state: usize, args_struct: &CreateArgs) -> usize {
+fn report(args: usize, out_state: usize, args_struct: &CreateArgs, destroy_fault: bool) -> usize {
     let report = args + REPORT_OFF;
     // SAFETY: Core 在 create 前把域视图写进窗口（+WINDOW_VIEW_OFF，8 字节对齐）；
     // 组件只读。
@@ -115,22 +127,36 @@ fn report(args: usize, out_state: usize, args_struct: &CreateArgs) -> usize {
         slots.add(R_SATP).write_volatile(read_satp());
         slots.add(R_ARGS).write_volatile(args);
         slots.add(R_OUT_STATE).write_volatile(out_state);
-        slots.add(R_CONFIG_ABI).write_volatile(args_struct.config_abi as usize);
-        slots.add(R_CONFIG_LEN).write_volatile(args_struct.config_len);
-        slots.add(R_CONFIG0).write_volatile(if args_struct.config_len > 0 {
-            args_struct.config.read_volatile() as usize
-        } else {
-            0
-        });
-        slots.add(R_CONFIG1).write_volatile(if args_struct.config_len > 1 {
-            args_struct.config.add(1).read_volatile() as usize
-        } else {
-            0
-        });
-        slots.add(R_SELF).write_volatile(kcomp_instance_create as *const () as usize);
+        slots
+            .add(R_CONFIG_ABI)
+            .write_volatile(args_struct.config_abi as usize);
+        slots
+            .add(R_CONFIG_LEN)
+            .write_volatile(args_struct.config_len);
+        slots
+            .add(R_CONFIG0)
+            .write_volatile(if args_struct.config_len > 0 {
+                args_struct.config.read_volatile() as usize
+            } else {
+                0
+            });
+        slots
+            .add(R_CONFIG1)
+            .write_volatile(if args_struct.config_len > 1 {
+                args_struct.config.add(1).read_volatile() as usize
+            } else {
+                0
+            });
+        slots
+            .add(R_SELF)
+            .write_volatile(kcomp_instance_create as *const () as usize);
         slots.add(R_VIEW_KIND).write_volatile(view.kind as usize);
         slots.add(R_VIEW_BASE).write_volatile(view.base as usize);
         slots.add(R_VIEW_LEN).write_volatile(view.len as usize);
+        slots
+            .add(R_DESTROY_FAULT)
+            .write_volatile(usize::from(destroy_fault));
+        slots.add(R_DESTROY_CALLS).write_volatile(0);
     }
     report
 }
@@ -159,7 +185,14 @@ pub extern "C" fn kcomp_instance_create(args: *const CreateArgs, out_state: *mut
         unsafe { core::arch::asm!(".4byte 0", options(nostack)) };
         return STATUS_INVALID_CONFIG;
     }
-    let report_ptr = report(args as usize, out_state as usize, args_struct);
+    // destroy 故障注入：create 成功，但标记 destroy 入口要 trap。
+    let destroy_fault = args_struct.config_abi == DESTROY_FAULT_ABI;
+    let report_ptr = report(
+        args as usize,
+        out_state as usize,
+        args_struct,
+        destroy_fault,
+    );
     // SAFETY: out_state 指向实例窗口内的 usize 槽（Core 清零、Core 读回）。
     unsafe { out_state.write(report_ptr as *mut ()) };
     0
@@ -173,7 +206,17 @@ pub extern "C" fn kcomp_instance_destroy(state: *mut ()) -> i32 {
         return 0;
     }
     // SAFETY: state 是 create 写回的实例窗口内地址（同一实例，仍然映射）。
+    let slots = state as *mut usize;
     unsafe {
+        // 先记一次进入（fault 之前）：ArchTest 用它证明"绝不自动重试析构"。
+        let calls = slots.add(R_DESTROY_CALLS).read_volatile();
+        slots.add(R_DESTROY_CALLS).write_volatile(calls + 1);
+        if slots.add(R_DESTROY_FAULT).read_volatile() != 0 {
+            // 故障注入：在私有 AS 里执行非法指令——Core 的窄故障分派（无显式
+            // 策略 = 不可恢复）应放弃本组件，destroy 以 `Panicked` 收场。
+            // SAFETY: 故意 trap；本指令之后不会再被执行（组件被放弃）。
+            core::arch::asm!(".4byte 0", options(nostack));
+        }
         let slot = (state as usize + DESTROY_OFF) as *mut usize;
         slot.write_volatile(DESTROY_MAGIC);
     }

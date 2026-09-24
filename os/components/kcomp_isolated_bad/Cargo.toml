@@ -1,0 +1,16 @@
+[package]
+name = "kcomp_isolated_bad"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# increment 7 ArchTest 夹具：**按域放段必须拒绝**的真实 `.kcomp`。
+# 一个超过实例镜像窗口（16 MiB）的零初始化段（.bss）让 `isolated_load::place`
+# 在"段超出实例窗口"处显式拒绝（`IsolatedPlacementFailed`）；镜像本身
+# **通过** packer 的四项契约校验（ET_REL / 入口 DEFINED / UNDEF 空集 /
+# 重定位白名单）与 Isolated 的 import 包络，因此拒绝点精确落在放段阶段。
+[lib]
+crate-type = ["staticlib"]

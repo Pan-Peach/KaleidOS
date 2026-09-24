@@ -595,6 +595,8 @@ mod tests {
     const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
     const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
     const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
+    /// 放段失败夹具（17 MiB `.bss` 超出实例窗口；increment 7）。
+    const BAD_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_bad.kcomp"));
 
     fn place_fixture() -> PlacedImage {
         let _guard = test_support::GUARD.lock();
@@ -816,6 +818,21 @@ mod tests {
         let mut patched = ISOLATED_KCOMP.to_vec();
         patched[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
         assert_eq!(place(&patched), Err(IsolatedLoadError::MachineMismatch));
+    }
+
+    /// **放段失败夹具**（increment 7）：一份通过 packer 契约校验与 import 包络、
+    /// 但段超出实例窗口的真实 `.kcomp` → `SegmentOutsideWindow`。ArchTest
+    /// `isolated-load-reject` 用同一份夹具证明生产创建入口把它拒绝成
+    /// `IsolatedPlacementFailed`（声明 / AS / image 登记之前）。
+    #[test]
+    fn rejects_the_oversized_fixture_before_any_allocation() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        assert_eq!(
+            place(BAD_KCOMP),
+            Err(IsolatedLoadError::SegmentOutsideWindow),
+            "kcomp_isolated_bad 的超大 .bss 必须在放段阶段被拒绝"
+        );
     }
 
     /// 窗口放不下第二段 → 显式拒绝（不是截断、不是跳过）。

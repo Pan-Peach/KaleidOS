@@ -210,6 +210,22 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-service-limits" => isolated_tests::isolated_service_limits(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service-fault" => isolated_tests::isolated_service_fault(),
+        // increment 7：失败 / 重启验收矩阵（每个阶段失败的不变量 + stale 访问阻断 +
+        // 逻辑重启）。
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-load-reject" => isolated_tests::isolated_load_reject(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-config-reject" => isolated_tests::isolated_config_reject(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-prepare-reject" => isolated_tests::isolated_prepare_reject(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-destroy-fault" => isolated_tests::isolated_destroy_fault(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-stale-access" => isolated_tests::isolated_stale_access(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-ready-fault" => isolated_tests::isolated_ready_fault(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-restart" => isolated_tests::isolated_restart(),
         _ => fail("unknown command"),
     }
 }
@@ -1732,6 +1748,12 @@ mod isolated_tests {
     const LIFE_FAIL_ABI: u64 = 0xDEAD_BEEF;
     /// 故障注入：create 见到这个 config_abi 在私有 AS 里执行非法指令。
     const LIFE_FAULT_ABI: u64 = 0xDEAD_FA11;
+    /// 故障注入：create 成功，但 destroy 入口执行非法指令（destroy 故障路径）。
+    const LIFE_DESTROY_FAULT_ABI: u64 = 0xDEAD_DE57;
+    /// destroy 故障标记槽（create 写；与组件源码逐槽一致）。
+    const LIFE_R_DESTROY_FAULT: usize = 14;
+    /// destroy 进入计数槽（destroy 每次进入先自增）。
+    const LIFE_R_DESTROY_CALLS: usize = 15;
 
     /// 从实例窗口 backing 的 Core 视图读一个槽（窗口 PA 由 Core 的映射真相给出）。
     ///
@@ -1915,55 +1937,135 @@ mod isolated_tests {
         pass("isolated-lifecycle")
     }
 
-    /// create 失败的公共终态断言：实例留 tombstone（`Failed`）、AS 退役、
-    /// Core 预置窗口 / 栈归还、runtime slot 清空（半成品不留）。
-    fn assert_failed_isolated_cleanup() {
+    /// 带用例名的失败出口：日志写清是哪个用例的哪条不变量，再走统一的 FAIL。
+    fn fail_case(case: &str, reason: &'static str) -> ! {
+        kernel::log!("selftest", "{}: {}", case, reason);
+        fail(reason)
+    }
+
+    /// 实例的 Core 真相状态（不存在 = `None`）。
+    fn registry_state(id: ComponentId) -> Option<kernel::component::ComponentState> {
+        kernel::component::registry::get_registry()
+            .lock()
+            .get(id)
+            .map(|record| record.state)
+    }
+
+    /// 最近一个 `Failed` 的 Isolated 实例（id / AS 句柄 / image）；扫描是 ArchTest
+    /// 的观察手段（create 失败时调用方拿不到 id）。
+    fn failed_isolated_instance() -> Option<(
+        ComponentId,
+        AddressSpaceHandle,
+        kernel::component::image::ComponentImageId,
+    )> {
         use kernel::component::endpoint::ExecutionDomain;
-        use kernel::component::isolated_lifecycle;
         use kernel::component::registry;
+        use kernel::component::ComponentState;
+
+        let reg = registry::get_registry().lock();
+        let mut found = None;
+        for record in reg.iter() {
+            if record.execution_domain == ExecutionDomain::IsolatedNative
+                && record.state == ComponentState::Failed
+            {
+                if let Some(handle) = record.address_space {
+                    found = Some((record.id, handle, record.image));
+                }
+            }
+        }
+        found
+    }
+
+    /// 失败清理断言（**Core 中止实例**的路径：create / service 故障）：
+    /// `Failed` + AS 退役 + Core 预置窗口（栈 / 实例窗口 / 邮箱）归还 backing +
+    /// runtime slot 清除。
+    fn assert_failure_released(case: &str, id: ComponentId, handle: AddressSpaceHandle) {
+        use kernel::component::isolated_lifecycle;
         use kernel::component::runtime_slot;
         use kernel::component::ComponentState;
         use kernel::memory::address_space::{self, MapError};
 
-        let (id, handle) = {
-            let reg = registry::get_registry().lock();
-            let mut found = None;
-            for record in reg.iter() {
-                if record.execution_domain == ExecutionDomain::IsolatedNative
-                    && record.state == ComponentState::Failed
-                {
-                    found = Some((record.id, record.address_space));
-                }
-            }
-            match found {
-                Some((id, Some(handle))) => (id, handle),
-                _ => fail("isolated create failure: no failed Isolated instance with an AS"),
-            }
-        };
+        if registry_state(id) != Some(ComponentState::Failed) {
+            fail_case(case, "instance was not marked Failed");
+        }
         match address_space::prepare_activation(handle) {
             Err(MapError::Retired) => {}
-            _ => fail("isolated create failure: address space was not retired"),
+            _ => fail_case(case, "address space was not retired"),
         }
-        if !matches!(
-            address_space::mapping_exact(handle, &isolated_lifecycle::window_range()),
-            Ok(None)
-        ) {
-            fail("isolated create failure: instance window mapping leaked");
-        }
-        if !matches!(
-            address_space::mapping_exact(handle, &isolated_lifecycle::stack_range()),
-            Ok(None)
-        ) {
-            fail("isolated create failure: component stack mapping leaked");
-        }
-        if !matches!(
-            address_space::mapping_exact(handle, &isolated_lifecycle::mailbox_range()),
-            Ok(None)
-        ) {
-            fail("isolated create failure: service mailbox mapping leaked");
+        for range in [
+            isolated_lifecycle::stack_range(),
+            isolated_lifecycle::window_range(),
+            isolated_lifecycle::mailbox_range(),
+        ] {
+            if !matches!(address_space::mapping_exact(handle, &range), Ok(None)) {
+                fail_case(case, "a Core-prepared window leaked");
+            }
         }
         if !runtime_slot::get_slots().lock().get(id).is_null() {
-            fail("isolated create failure: runtime slot was not cleared");
+            fail_case(case, "runtime slot was not cleared");
+        }
+    }
+
+    /// destroy 路径断言（成功或入口故障）：AS 退役 + Core 预置窗口**保持驻留**
+    /// （phase 1 契约；AS 退役后不可再进入）+ runtime slot 清除。
+    fn assert_destroy_path_retired(
+        case: &str,
+        id: ComponentId,
+        handle: AddressSpaceHandle,
+        window: &VirtualRange,
+    ) {
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::runtime_slot;
+        use kernel::memory::address_space::{self, MapError};
+
+        match address_space::prepare_activation(handle) {
+            Err(MapError::Retired) => {}
+            _ => fail_case(case, "address space was not retired"),
+        }
+        if !matches!(address_space::mapping_exact(handle, window), Ok(Some(_))) {
+            fail_case(case, "destroy path must keep the prepared window resident");
+        }
+        for range in [
+            isolated_lifecycle::stack_range(),
+            isolated_lifecycle::mailbox_range(),
+        ] {
+            if !matches!(address_space::mapping_exact(handle, &range), Ok(Some(_))) {
+                fail_case(case, "destroy path must keep the prepared window resident");
+            }
+        }
+        if !runtime_slot::get_slots().lock().get(id).is_null() {
+            fail_case(case, "runtime slot was not cleared");
+        }
+    }
+
+    /// KernelNative 路径不受影响：`kcomp_smoke` 仍能创建到 `Ready`。
+    ///
+    /// increment 7 的"Core stays alive / KernelNative unaffected"不变式：Isolated
+    /// 失败不得污染共享 AS 的生命周期链。
+    fn kernel_native_still_works() -> bool {
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::ComponentState;
+
+        match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => {
+                registry::get_registry()
+                    .lock()
+                    .get(id)
+                    .map(|record| record.state)
+                    == Some(ComponentState::Ready)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// create 失败的公共终态断言：实例留 tombstone（`Failed`）、AS 退役、
+    /// Core 预置窗口 / 栈归还、runtime slot 清空（半成品不留）。
+    fn assert_failed_isolated_cleanup() {
+        match failed_isolated_instance() {
+            Some((id, handle, _)) => assert_failure_released("isolated create failure", id, handle),
+            None => fail("isolated create failure: no failed Isolated instance with an AS"),
         }
     }
 
@@ -2002,8 +2104,11 @@ mod isolated_tests {
             fail("isolated-lifecycle-fail: Core satp not restored");
         }
 
-        // Then：tombstone + 清理（公共断言）。
+        // Then：tombstone + 清理（公共断言）+ KernelNative 路径不受影响。
         assert_failed_isolated_cleanup();
+        if !kernel_native_still_works() {
+            fail("isolated-lifecycle-fail: KernelNative path broke after the failure");
+        }
         pass("isolated-lifecycle-fail")
     }
 
@@ -2042,8 +2147,11 @@ mod isolated_tests {
             fail("isolated-lifecycle-fault: Core satp not restored after the fault");
         }
 
-        // Then：tombstone + 清理（与返回非零同一路径）。
+        // Then：tombstone + 清理（与返回非零同一路径）+ KernelNative 不受影响。
         assert_failed_isolated_cleanup();
+        if !kernel_native_still_works() {
+            fail("isolated-lifecycle-fault: KernelNative path broke after the fault");
+        }
         pass("isolated-lifecycle-fault")
     }
 
@@ -2411,10 +2519,12 @@ mod isolated_tests {
     pub(super) fn isolated_service_limits() -> ! {
         use kernel::component::call::{self, CallError};
         use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_lifecycle;
         use kernel::component::isolated_mailbox;
         use kernel::component::load;
         use kernel::component::registry;
         use kernel::errno::Errno;
+        use kernel::memory::address_space;
 
         let core_satp = read_satp();
         let provider = svc_provider();
@@ -2482,6 +2592,42 @@ mod isolated_tests {
         if out_status != 0 {
             fail("isolated-service-limits: rejected call wrote out_status");
         }
+        // endpoint 仍 Live（拒绝是**每次调用**的容量判定，不是实例故障）。
+        {
+            use kernel::component::abi::InterfaceAbi;
+            use kernel::component::endpoint::ContractId;
+            let reg = registry::get_registry().lock();
+            let live = kernel::component::endpoint::get_endpoints()
+                .lock()
+                .lookup(
+                    &reg,
+                    provider.endpoint,
+                    ContractId::from_raw(SVC_CONTRACT),
+                    InterfaceAbi::from_raw(SVC_ABI),
+                )
+                .is_ok();
+            if !live {
+                fail("isolated-service-limits: endpoint died on a rejected frame");
+            }
+        }
+        // 邮箱从未被触碰（拒绝发生在任何拷贝之前）：描述符仍是零。
+        let mailbox = isolated_lifecycle::mailbox_range();
+        let mailbox_pa = match address_space::mapping_exact(provider.handle, &mailbox) {
+            Ok(Some(mapping)) => mapping.physical_range.base,
+            _ => fail("isolated-service-limits: mailbox is not mapped"),
+        };
+        // SAFETY: 邮箱 backing 由 Core 独占且仍驻留；只读描述符首字。
+        if unsafe {
+            core::ptr::read_volatile(
+                (mailbox_pa + kernel::component::isolated_mailbox::FRAME_OFF) as *const usize,
+            )
+        } != 0
+        {
+            fail("isolated-service-limits: a rejected frame wrote the mailbox");
+        }
+        if !kernel_native_still_works() {
+            fail("isolated-service-limits: KernelNative path broke after rejections");
+        }
         pass("isolated-service-limits")
     }
 
@@ -2490,7 +2636,7 @@ mod isolated_tests {
     /// 实例 Failed + AS 退役 + 窗口归还、Core 存活。
     pub(super) fn isolated_service_fault() -> ! {
         use kernel::component::call::{self, CallError};
-        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::endpoint::{EndpointError, ExecutionDomain};
         use kernel::component::isolated_lifecycle;
         use kernel::component::load;
         use kernel::component::registry;
@@ -2620,6 +2766,41 @@ mod isolated_tests {
                 fail("isolated-service-fault: provider endpoint was not invalidated");
             }
         }
+        // stale endpoint：再次调用在 Core 边界被拒（`resolve` 先于任何进入；
+        // 实例已 Failed、AS 已退役、窗口已归还 → 不可能再执行 provider）。
+        let transport = with_kernel_caller(caller, 0x71, || {
+            call::endpoint_call(
+                provider.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut out_status,
+            )
+        });
+        match transport {
+            Err(CallError::Endpoint(EndpointError::EndpointDead)) => {}
+            other => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-service-fault: stale call was not blocked: {:?}",
+                    other
+                );
+                fail("isolated-service-fault: stale endpoint was not blocked");
+            }
+        }
+        if registry::get_registry().lock().active_calls(provider.id) != 0 {
+            fail("isolated-service-fault: stale call leaked inflight");
+        }
+        if read_satp() != core_satp {
+            fail("isolated-service-fault: Core satp not restored after the stale call");
+        }
+        if !kernel_native_still_works() {
+            fail("isolated-service-fault: KernelNative path broke after the fault");
+        }
         kernel::log!(
             "selftest",
             "isolated-service-fault: contained: id={}, scause={:#x}, stval={:#x}",
@@ -2628,6 +2809,1029 @@ mod isolated_tests {
             SVC_FAULT_STVAL.load(Ordering::Acquire)
         );
         pass("isolated-service-fault")
+    }
+
+    // -----------------------------------------------------------------------
+    // increment 7：失败 / 重启验收矩阵。
+    //
+    // 逐条证明"组件失败 = 逻辑死亡、物理驻留"：每个阶段失败之后实例状态 / AS /
+    // Core 预置窗口 / runtime slot / endpoint / caller 错误 / Core 存活 /
+    // KernelNative 不受影响都有可观察断言；失败之后同一 image 可以**逻辑重启**
+    // （全新实例、全新 AS / 窗口 / slot）。
+    // -----------------------------------------------------------------------
+
+    /// 装载拒绝：放段失败 / import 包络在**声明实例之前**显式拒绝，不留实例 /
+    /// AS / image；KernelNative 路径不受影响。
+    pub(super) fn isolated_load_reject() -> ! {
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::image;
+        use kernel::component::load::{self, ComponentLoadError};
+        use kernel::component::registry;
+        use kernel::errno::Errno;
+
+        let core_satp = read_satp();
+        let instances_before = registry::get_registry().lock().iter().count();
+        let images_before = image::get_images().lock().len();
+
+        // (a) 按域放段失败：17 MiB `.bss` 段超出实例镜像窗口（16 MiB）。
+        let error = match load::create_component(
+            b"kcomp_isolated_bad",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Err(error) => error,
+            Ok(_) => fail_case("isolated-load-reject", "oversized artifact was accepted"),
+        };
+        if error != ComponentLoadError::IsolatedPlacementFailed {
+            kernel::log!(
+                "selftest",
+                "isolated-load-reject: unexpected placement error: {:?}",
+                error
+            );
+            fail_case(
+                "isolated-load-reject",
+                "oversized artifact was not rejected at placement",
+            );
+        }
+        if Errno::from(error) != Errno::EINVAL {
+            fail_case("isolated-load-reject", "placement rejection errno mismatch");
+        }
+
+        // (b) import 包络 = 空集：真实组件的 `kcore_*` import 在装载前拒绝。
+        let error = match load::create_component(
+            b"kcomp_smoke",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Err(error) => error,
+            Ok(_) => fail_case("isolated-load-reject", "kcore import artifact was accepted"),
+        };
+        if error != ComponentLoadError::IsolatedImportUnsupported {
+            kernel::log!(
+                "selftest",
+                "isolated-load-reject: unexpected import error: {:?}",
+                error
+            );
+            fail_case(
+                "isolated-load-reject",
+                "kcore import was not rejected before loading",
+            );
+        }
+        if Errno::from(error) != Errno::ENOTSUP {
+            fail_case("isolated-load-reject", "import rejection errno mismatch");
+        }
+
+        // 两条拒绝都发生在声明 / 放段 / 登记之前：Core 真相零副作用。
+        if read_satp() != core_satp {
+            fail_case(
+                "isolated-load-reject",
+                "Core satp changed on a rejected load",
+            );
+        }
+        if registry::get_registry().lock().iter().count() != instances_before {
+            fail_case(
+                "isolated-load-reject",
+                "a rejected load declared an instance",
+            );
+        }
+        if image::get_images().lock().len() != images_before {
+            fail_case(
+                "isolated-load-reject",
+                "a rejected load registered an image",
+            );
+        }
+
+        // KernelNative 路径不受影响：同一 artifact 仍能正常创建到 Ready。
+        if !kernel_native_still_works() {
+            fail_case(
+                "isolated-load-reject",
+                "KernelNative path broke after rejected Isolated loads",
+            );
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-load-reject: rejected before declare: instances={}",
+            instances_before
+        );
+        pass("isolated-load-reject")
+    }
+
+    /// config 负载拒绝：超过窗口固定区的 config 在 create 入口执行**之前**显式
+    /// 拒绝；实例 Failed + AS 退役 + 预置窗口归还（半成品不留）。
+    pub(super) fn isolated_config_reject() -> ! {
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_lifecycle::WINDOW_CONFIG_MAX;
+        use kernel::component::load::{self, ComponentLoadError};
+        use kernel::errno::Errno;
+
+        let core_satp = read_satp();
+        let oversized = [0u8; WINDOW_CONFIG_MAX + 1];
+        let args = KcompCreateArgs {
+            config_abi: 0x71C0_11EC,
+            config: oversized.as_ptr().cast(),
+            config_len: oversized.len(),
+        };
+        let error = match load::create_component(
+            b"kcomp_isolated_life",
+            &args,
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Err(error) => error,
+            Ok(_) => fail_case("isolated-config-reject", "oversized config was accepted"),
+        };
+        if error != ComponentLoadError::IsolatedConfigRejected {
+            kernel::log!(
+                "selftest",
+                "isolated-config-reject: unexpected error: {:?}",
+                error
+            );
+            fail_case(
+                "isolated-config-reject",
+                "oversized config was not rejected",
+            );
+        }
+        if Errno::from(error) != Errno::EINVAL {
+            fail_case("isolated-config-reject", "config rejection errno mismatch");
+        }
+        if read_satp() != core_satp {
+            fail_case("isolated-config-reject", "Core satp not restored");
+        }
+        // 实例在 create 入口执行之前就失败：tombstone + AS 退役 + 窗口归还 +
+        // slot 清除（与 create 失败同一套清理）。
+        assert_failed_isolated_cleanup();
+        if !kernel_native_still_works() {
+            fail_case(
+                "isolated-config-reject",
+                "KernelNative path broke after the failure",
+            );
+        }
+        pass("isolated-config-reject")
+    }
+
+    /// prepare 失败：机制层的 `isolated::prepare` 在入口不可执行 / 栈不可写 /
+    /// AS 已退役时**显式拒绝**，不改变实例真相（实例仍 Ready、AS 仍可激活、
+    /// slot 原样、Core satp 不变）。
+    ///
+    /// 生产 create 路径的 prepare 失败与其它 create 失败共用 `fail_with_as` 清理
+    /// （已由 create-entry 故障用例证明）；本用例钉住拒绝判据本身 + "拒绝不动
+    /// 真相"。
+    pub(super) fn isolated_prepare_reject() -> ! {
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::image;
+        use kernel::component::isolated::{self, IsolatedPrepareError};
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::runtime_slot;
+        use kernel::component::ComponentState;
+        use kernel::memory::address_space::{self, MapError, VirtualRange};
+
+        let core_satp = read_satp();
+        let id = match load::create_component(
+            b"kcomp_isolated_life",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Ok(id) => id,
+            Err(_) => fail_case("isolated-prepare-reject", "instance create failed"),
+        };
+        let (handle, image_id) = {
+            let reg = registry::get_registry().lock();
+            match reg.get(id) {
+                Some(record) => match record.address_space {
+                    Some(handle) => (handle, record.image),
+                    None => fail_case("isolated-prepare-reject", "instance has no address space"),
+                },
+                None => fail_case("isolated-prepare-reject", "instance record missing"),
+            }
+        };
+        let create_entry = match image::get_images()
+            .lock()
+            .get(image_id)
+            .map(|record| record.create)
+        {
+            Some(entry) => entry,
+            None => fail_case("isolated-prepare-reject", "image is missing"),
+        };
+        let stack = isolated_lifecycle::stack_range();
+        let window = isolated_lifecycle::window_range();
+        let slot = window.base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
+
+        // (a) 入口不在可执行映射：实例窗口是 R+W（不可执行）。
+        match isolated::prepare(
+            handle,
+            window.base,
+            stack,
+            slot,
+            false,
+            isolated::EntryArgs::pair(0, 0),
+        ) {
+            Err(IsolatedPrepareError::EntryNotExecutable) => {}
+            _ => fail_case(
+                "isolated-prepare-reject",
+                "non-executable entry was not rejected",
+            ),
+        }
+        // (b) 栈不被可写映射覆盖：未映射 VA 区间。
+        let unmapped_stack = VirtualRange {
+            base: 0x4000_0000,
+            size: 4096,
+        };
+        match isolated::prepare(
+            handle,
+            create_entry,
+            unmapped_stack,
+            slot,
+            false,
+            isolated::EntryArgs::pair(0, 0),
+        ) {
+            Err(IsolatedPrepareError::StackNotWritable) => {}
+            _ => fail_case("isolated-prepare-reject", "unmapped stack was not rejected"),
+        }
+
+        // 实例真相不变：仍 Ready、AS 仍可激活、slot 原样、Core satp 不变。
+        if registry_state(id) != Some(ComponentState::Ready) {
+            fail_case(
+                "isolated-prepare-reject",
+                "instance left Ready after rejected prepares",
+            );
+        }
+        if address_space::prepare_activation(handle).is_err() {
+            fail_case("isolated-prepare-reject", "address space became unusable");
+        }
+        if runtime_slot::get_slots().lock().get(id) as usize != slot {
+            fail_case("isolated-prepare-reject", "runtime slot changed");
+        }
+        if read_satp() != core_satp {
+            fail_case("isolated-prepare-reject", "Core satp changed");
+        }
+
+        // (c) 退役 AS 拒绝使用：优雅停止之后同一 prepare 得到 `Retired`。
+        if kernel::component::stop_component(id).is_err() {
+            fail_case("isolated-prepare-reject", "stop failed");
+        }
+        match isolated::prepare(
+            handle,
+            create_entry,
+            stack,
+            slot,
+            false,
+            isolated::EntryArgs::pair(0, 0),
+        ) {
+            Err(IsolatedPrepareError::Retired) => {}
+            _ => fail_case(
+                "isolated-prepare-reject",
+                "retired address space accepted a prepare",
+            ),
+        }
+        match address_space::prepare_activation(handle) {
+            Err(MapError::Retired) => {}
+            _ => fail_case("isolated-prepare-reject", "address space was not retired"),
+        }
+        // 退役 AS 拒绝任何**新的落映射**（复用 = 新建空间）：stale 资源不能
+        // 悄悄接受新用途。
+        let stale_mapping = Mapping {
+            virtual_range: VirtualRange {
+                base: 0x4100_0000,
+                size: 4096,
+            },
+            physical_range: PhysicalRange {
+                base: 0x4100_0000,
+                size: 4096,
+            },
+            permission: MappingPermission::READ,
+        };
+        match address_space::map(handle, stale_mapping) {
+            Err(MapError::Retired) => {}
+            _ => fail_case(
+                "isolated-prepare-reject",
+                "retired address space accepted a mapping",
+            ),
+        }
+        if !kernel_native_still_works() {
+            fail_case("isolated-prepare-reject", "KernelNative path broke");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-prepare-reject: typed rejections held: id={}",
+            id.raw()
+        );
+        pass("isolated-prepare-reject")
+    }
+
+    /// destroy 入口故障：`stop_component` → destroy 在私有 AS 里 trap →
+    /// `DestroyPanicked`（EIO）、实例 `Failed`、AS 退役、Core 预置窗口保持驻留
+    /// （phase 1，与优雅停止同一纪律）、runtime slot 清除；**绝不自动重试析构**
+    /// （第二次 stop 被状态机拒绝，destroy 计数不变）。
+    pub(super) fn isolated_destroy_fault() -> ! {
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::ComponentStopError;
+        use kernel::errno::Errno;
+        use kernel::memory::address_space;
+
+        let core_satp = read_satp();
+        let args = KcompCreateArgs {
+            config_abi: LIFE_DESTROY_FAULT_ABI,
+            config: core::ptr::null(),
+            config_len: 0,
+        };
+        let id = match load::create_component(
+            b"kcomp_isolated_life",
+            &args,
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-destroy-fault: create failed: {:?}",
+                    error
+                );
+                fail_case("isolated-destroy-fault", "instance create failed");
+            }
+        };
+        let (handle, window_pa) = {
+            let reg = registry::get_registry().lock();
+            let handle = match reg.get(id).and_then(|record| record.address_space) {
+                Some(handle) => handle,
+                None => fail_case("isolated-destroy-fault", "instance has no address space"),
+            };
+            let window = isolated_lifecycle::window_range();
+            let window_pa = match address_space::mapping_exact(handle, &window) {
+                Ok(Some(mapping)) => mapping.physical_range.base,
+                _ => fail_case("isolated-destroy-fault", "instance window is not mapped"),
+            };
+            (handle, window_pa)
+        };
+        // create 真的在私有 AS 里跑过，并且标记了 destroy 故障。
+        if unsafe { life_slot(window_pa, LIFE_R_DESTROY_FAULT) } != 1 {
+            fail_case("isolated-destroy-fault", "destroy-fault marker missing");
+        }
+
+        // When：优雅停止（destroy 入口在私有 AS 里 trap）。
+        let result = kernel::component::stop_component(id);
+        if result != Err(ComponentStopError::DestroyPanicked) {
+            kernel::log!(
+                "selftest",
+                "isolated-destroy-fault: unexpected stop result: {:?}",
+                result
+            );
+            fail_case(
+                "isolated-destroy-fault",
+                "destroy fault was not reported as DestroyPanicked",
+            );
+        }
+        if Errno::from(ComponentStopError::DestroyPanicked) != Errno::EIO {
+            fail_case("isolated-destroy-fault", "destroy fault errno mismatch");
+        }
+        if read_satp() != core_satp {
+            fail_case(
+                "isolated-destroy-fault",
+                "Core satp not restored after the fault",
+            );
+        }
+
+        // Then：Failed + AS 退役 + 窗口驻留（phase 1）+ slot 清除。
+        if registry_state(id) != Some(kernel::component::ComponentState::Failed) {
+            fail_case("isolated-destroy-fault", "instance was not marked Failed");
+        }
+        assert_destroy_path_retired(
+            "isolated-destroy-fault",
+            id,
+            handle,
+            &isolated_lifecycle::window_range(),
+        );
+        // destroy 入口进入过**恰好一次**（故障前自增的计数）。
+        if unsafe { life_slot(window_pa, LIFE_R_DESTROY_CALLS) } != 1 {
+            fail_case(
+                "isolated-destroy-fault",
+                "destroy entry did not run exactly once",
+            );
+        }
+
+        // 绝不自动重试析构：第二次 stop 被状态机拒绝，destroy 计数不变。
+        if kernel::component::stop_component(id) != Err(ComponentStopError::NotReady) {
+            fail_case(
+                "isolated-destroy-fault",
+                "a failed instance accepted a second stop",
+            );
+        }
+        if unsafe { life_slot(window_pa, LIFE_R_DESTROY_CALLS) } != 1 {
+            fail_case(
+                "isolated-destroy-fault",
+                "destroy was retried after a fault",
+            );
+        }
+        if !kernel_native_still_works() {
+            fail_case("isolated-destroy-fault", "KernelNative path broke");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-destroy-fault: contained: id={}, destroy_calls=1",
+            id.raw()
+        );
+        pass("isolated-destroy-fault")
+    }
+
+    /// stale 访问阻断：优雅停止后（`Stopped` tombstone、AS 退役、窗口驻留）用
+    /// **已解析**的 endpoint 再调用 → Core 边界在 `resolve` 处拒绝
+    /// （`EndpointDead` / ENOENT），provider **从未再次执行**（窗口计数不变），
+    /// AS 仍退役、inflight 未泄漏、Core satp 不变。
+    pub(super) fn isolated_stale_access() -> ! {
+        use kernel::component::abi::InterfaceAbi;
+        use kernel::component::call::{self, CallError};
+        use kernel::component::endpoint::{
+            self, ContractId, EndpointError, ExecutionDomain, Mechanism,
+        };
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::ComponentState;
+        use kernel::errno::Errno;
+        use kernel::memory::address_space::{self, MapError};
+
+        let core_satp = read_satp();
+        let provider = svc_provider();
+        let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => id,
+            Err(_) => fail_case("isolated-stale-access", "caller load failed"),
+        };
+        let bound = {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints().lock().bind(
+                &reg,
+                provider.endpoint,
+                ContractId::from_raw(SVC_CONTRACT),
+                InterfaceAbi::from_raw(SVC_ABI),
+                ExecutionDomain::KernelNative,
+            )
+        };
+        match bound {
+            Ok(bound) if bound.mechanism == Mechanism::Gate => {}
+            _ => fail_case("isolated-stale-access", "bind did not select Gate"),
+        }
+
+        // 先成功服务一次：实例健康、Ready。
+        let input = [0x11u8, 0x22];
+        let mut output = [0u8; 2];
+        let mut out_status = 0i32;
+        let transport = with_kernel_caller(caller, 0x6D, || {
+            call::endpoint_call(
+                provider.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+        if transport != Ok(()) || out_status != SVC_STATUS_OK {
+            fail_case("isolated-stale-access", "healthy call failed");
+        }
+        let calls_before = unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) };
+
+        // When：优雅停止（生产路径；AS 退役、窗口驻留、endpoint 永久失效）。
+        if kernel::component::stop_component(provider.id).is_err() {
+            fail_case("isolated-stale-access", "stop failed");
+        }
+        if registry_state(provider.id) != Some(ComponentState::Stopped) {
+            fail_case("isolated-stale-access", "instance did not reach Stopped");
+        }
+        match address_space::prepare_activation(provider.handle) {
+            Err(MapError::Retired) => {}
+            _ => fail_case("isolated-stale-access", "address space was not retired"),
+        }
+        if !matches!(
+            address_space::mapping_exact(provider.handle, &isolated_lifecycle::window_range()),
+            Ok(Some(_))
+        ) {
+            fail_case(
+                "isolated-stale-access",
+                "destroy path must keep the prepared window resident",
+            );
+        }
+
+        // Then：stale endpoint 被 Core 边界拒绝，provider 从未再次执行。
+        let transport = with_kernel_caller(caller, 0x6E, || {
+            call::endpoint_call(
+                provider.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+        match transport {
+            Err(CallError::Endpoint(EndpointError::EndpointDead)) => {}
+            other => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-stale-access: stale call was not blocked: {:?}",
+                    other
+                );
+                fail_case("isolated-stale-access", "stale endpoint was not blocked");
+            }
+        }
+        if Errno::from(CallError::Endpoint(EndpointError::EndpointDead)) != Errno::ENOENT {
+            fail_case("isolated-stale-access", "stale rejection errno mismatch");
+        }
+        if unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) } != calls_before {
+            fail_case("isolated-stale-access", "provider ran for a stale call");
+        }
+        if registry::get_registry().lock().active_calls(provider.id) != 0 {
+            fail_case("isolated-stale-access", "stale call leaked inflight");
+        }
+        if read_satp() != core_satp {
+            fail_case("isolated-stale-access", "Core satp not restored");
+        }
+        if !kernel_native_still_works() {
+            fail_case("isolated-stale-access", "KernelNative path broke");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-stale-access: blocked: id={}, calls={}",
+            provider.id.raw(),
+            calls_before
+        );
+        pass("isolated-stale-access")
+    }
+
+    /// Ready 期故障 + 逻辑重启：实例**已经成功服务过调用**之后在 dispatch 里
+    /// 故障 → 同一套 containment（Failed + AS 退役 + 窗口归还 + endpoint 永久
+    /// 失效）；随后 stale endpoint 被拒绝；同一 image 创建的全新实例真正独立
+    /// （新 AS / 新窗口 / 新 slot / 新 endpoint）并再次服务。
+    pub(super) fn isolated_ready_fault() -> ! {
+        use kernel::component::abi::InterfaceAbi;
+        use kernel::component::call::{self, CallError};
+        use kernel::component::endpoint::{
+            self, ContractId, EndpointError, ExecutionDomain, Mechanism,
+        };
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::runtime_slot;
+        use kernel::component::ComponentState;
+
+        let core_satp = read_satp();
+        let first = svc_provider();
+        let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => id,
+            Err(_) => fail_case("isolated-ready-fault", "caller load failed"),
+        };
+        let bound = {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints().lock().bind(
+                &reg,
+                first.endpoint,
+                ContractId::from_raw(SVC_CONTRACT),
+                InterfaceAbi::from_raw(SVC_ABI),
+                ExecutionDomain::KernelNative,
+            )
+        };
+        match bound {
+            Ok(bound) if bound.mechanism == Mechanism::Gate => {}
+            _ => fail_case("isolated-ready-fault", "bind did not select Gate"),
+        }
+
+        // (1) 先健康服务一次：Ready、call counter = 1（故障发生在"已经跑起来"的
+        //     实例上，不是首次调用的失败）。
+        let input = [0x33u8, 0x44];
+        let mut output = [0u8; 2];
+        let mut out_status = 0i32;
+        let transport = with_kernel_caller(caller, 0x6F, || {
+            call::endpoint_call(
+                first.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+        if transport != Ok(()) || out_status != SVC_STATUS_OK {
+            fail_case("isolated-ready-fault", "healthy call failed");
+        }
+        if unsafe { svc_slot(first.window_pa, SVC_R_CALLS) } != 1 {
+            fail_case("isolated-ready-fault", "healthy call was not observed");
+        }
+
+        // (2) 故障：provider 读 caller 域内地址（实例 AS 缺页）。
+        SVC_FAULT_COUNT.store(0, Ordering::Release);
+        SVC_FAULT_CAUSE.store(0, Ordering::Release);
+        SVC_FAULT_STVAL.store(0, Ordering::Release);
+        isolated::install();
+        if !isolated::register_fault_policy(svc_fault_policy) {
+            fail_case("isolated-ready-fault", "fault policy registration failed");
+        }
+        let target = [0xEEu8; 8];
+        let target_bytes = (target.as_ptr() as usize).to_le_bytes();
+        let transport = with_kernel_caller(caller, 0x70, || {
+            call::endpoint_call(
+                first.endpoint,
+                SVC_METHOD_FAULT,
+                target_bytes.as_ptr(),
+                target_bytes.len(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut out_status,
+            )
+        });
+        match transport {
+            Err(CallError::ProviderFailed) => {}
+            other => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-ready-fault: unexpected transport: {:?}",
+                    other
+                );
+                fail_case("isolated-ready-fault", "expected ProviderFailed");
+            }
+        }
+        if read_satp() != core_satp {
+            fail_case(
+                "isolated-ready-fault",
+                "Core satp not restored after the fault",
+            );
+        }
+        assert_failure_released("isolated-ready-fault", first.id, first.handle);
+        {
+            let reg = registry::get_registry().lock();
+            let dead = endpoint::get_endpoints()
+                .lock()
+                .resolve(&reg, first.endpoint)
+                .is_err();
+            if !dead {
+                fail_case(
+                    "isolated-ready-fault",
+                    "provider endpoint was not invalidated",
+                );
+            }
+        }
+
+        // (3) stale endpoint：第二次调用在 Core 边界被拒（provider 从未再次进入）。
+        let transport = with_kernel_caller(caller, 0x72, || {
+            call::endpoint_call(
+                first.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+        match transport {
+            Err(CallError::Endpoint(EndpointError::EndpointDead)) => {}
+            other => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-ready-fault: stale call was not blocked: {:?}",
+                    other
+                );
+                fail_case("isolated-ready-fault", "stale endpoint was not blocked");
+            }
+        }
+        if registry::get_registry().lock().active_calls(first.id) != 0 {
+            fail_case("isolated-ready-fault", "stale call leaked inflight");
+        }
+
+        // (4) 逻辑重启：同一 image 的全新实例（fresh AS / window / slot）。
+        let second = svc_provider();
+        if second.id == first.id {
+            fail_case("isolated-ready-fault", "restart reused the ComponentId");
+        }
+        if second.handle.raw_id() == first.handle.raw_id() {
+            fail_case("isolated-ready-fault", "restart reused the address space");
+        }
+        if second.window_pa == 0 {
+            fail_case("isolated-ready-fault", "fresh instance has no window");
+        }
+        if registry_state(first.id) != Some(ComponentState::Failed) {
+            fail_case("isolated-ready-fault", "old instance tombstone was lost");
+        }
+        let expected_slot =
+            isolated_lifecycle::window_range().base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
+        if runtime_slot::get_slots().lock().get(second.id) as usize != expected_slot {
+            fail_case("isolated-ready-fault", "fresh instance has no runtime slot");
+        }
+        if !runtime_slot::get_slots().lock().get(first.id).is_null() {
+            fail_case(
+                "isolated-ready-fault",
+                "dead instance kept its runtime slot",
+            );
+        }
+        if second.endpoint == first.endpoint {
+            fail_case("isolated-ready-fault", "restart reused the endpoint");
+        }
+
+        // (5) 新实例独立且可用：ECHO 成功、自己的计数与 endpoint。
+        let bound = {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints().lock().bind(
+                &reg,
+                second.endpoint,
+                ContractId::from_raw(SVC_CONTRACT),
+                InterfaceAbi::from_raw(SVC_ABI),
+                ExecutionDomain::KernelNative,
+            )
+        };
+        match bound {
+            Ok(bound) if bound.mechanism == Mechanism::Gate => {}
+            _ => fail_case("isolated-ready-fault", "fresh bind did not select Gate"),
+        }
+        let transport = with_kernel_caller(caller, 0x73, || {
+            call::endpoint_call(
+                second.endpoint,
+                SVC_METHOD_ECHO,
+                core::ptr::null(),
+                0,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+        if transport != Ok(()) || out_status != SVC_STATUS_OK {
+            fail_case("isolated-ready-fault", "fresh instance could not serve");
+        }
+        let expected = [input[0] ^ SVC_ECHO_XOR, input[1] ^ SVC_ECHO_XOR];
+        if output != expected {
+            fail_case("isolated-ready-fault", "fresh instance output mismatch");
+        }
+        if unsafe { svc_slot(second.window_pa, SVC_R_CALLS) } != 1 {
+            fail_case(
+                "isolated-ready-fault",
+                "fresh instance call was not observed",
+            );
+        }
+
+        // (6) 收尾：新实例优雅停止（destroy 真的跑过）。
+        if kernel::component::stop_component(second.id).is_err() {
+            fail_case("isolated-ready-fault", "fresh instance stop failed");
+        }
+        if unsafe { svc_slot(second.window_pa, SVC_R_DESTROY_MAGIC) } != SVC_DESTROY_MAGIC {
+            fail_case("isolated-ready-fault", "fresh instance destroy did not run");
+        }
+        if !kernel_native_still_works() {
+            fail_case("isolated-ready-fault", "KernelNative path broke");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-ready-fault: contained + restarted: failed={}, fresh={}",
+            first.id.raw(),
+            second.id.raw()
+        );
+        pass("isolated-ready-fault")
+    }
+
+    /// 逻辑重启：前一个实例 create 失败（`Failed` tombstone）之后同名 artifact
+    /// 创建**全新实例**（同一常驻 image，全新 AS / 窗口 / slot）；两个 tombstone
+    /// 类型（`Failed` / `Stopped`）都不阻止重启；并发活跃实例显式拒绝。
+    pub(super) fn isolated_restart() -> ! {
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load::{self, ComponentLoadError};
+        use kernel::component::registry;
+        use kernel::component::runtime_slot;
+        use kernel::component::ComponentState;
+        use kernel::errno::Errno;
+        use kernel::memory::address_space;
+
+        let core_satp = read_satp();
+
+        // (1) 失败一个实例：create 入口返回 `-EINVAL`（Failed tombstone）。
+        let args = KcompCreateArgs {
+            config_abi: LIFE_FAIL_ABI,
+            config: core::ptr::null(),
+            config_len: 0,
+        };
+        let error = match load::create_component(
+            b"kcomp_isolated_life",
+            &args,
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Err(error) => error,
+            Ok(_) => fail_case("isolated-restart", "fail-config create succeeded"),
+        };
+        if error != ComponentLoadError::CreateFailed(-22) {
+            kernel::log!(
+                "selftest",
+                "isolated-restart: unexpected create error: {:?}",
+                error
+            );
+            fail_case("isolated-restart", "unexpected create error");
+        }
+        let (failed_id, failed_handle, failed_image) = match failed_isolated_instance() {
+            Some(found) => found,
+            None => fail_case("isolated-restart", "no failed Isolated instance"),
+        };
+        assert_failure_released("isolated-restart", failed_id, failed_handle);
+
+        // (2) 重启：同一 image 的全新实例。
+        let second = match load::create_component(
+            b"kcomp_isolated_life",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                kernel::log!("selftest", "isolated-restart: restart failed: {:?}", error);
+                fail_case("isolated-restart", "logical restart failed");
+            }
+        };
+        let (second_handle, second_image, second_window_pa) = {
+            let reg = registry::get_registry().lock();
+            let record = match reg.get(second) {
+                Some(record) => record,
+                None => fail_case("isolated-restart", "restarted instance record missing"),
+            };
+            let handle = match record.address_space {
+                Some(handle) => handle,
+                None => fail_case(
+                    "isolated-restart",
+                    "restarted instance has no address space",
+                ),
+            };
+            let window = isolated_lifecycle::window_range();
+            let window_pa = match address_space::mapping_exact(handle, &window) {
+                Ok(Some(mapping)) => mapping.physical_range.base,
+                _ => fail_case(
+                    "isolated-restart",
+                    "restarted instance window is not mapped",
+                ),
+            };
+            (handle, record.image, window_pa)
+        };
+        if second == failed_id {
+            fail_case("isolated-restart", "restart reused the ComponentId");
+        }
+        if second_handle.raw_id() == failed_handle.raw_id() {
+            fail_case("isolated-restart", "restart reused the address space");
+        }
+        if second_image != failed_image {
+            fail_case("isolated-restart", "restart did not reuse the image");
+        }
+        if registry_state(second) != Some(ComponentState::Ready) {
+            fail_case("isolated-restart", "restarted instance is not Ready");
+        }
+        // create 真的在私有 AS 里跑过（窗口上报）。
+        if unsafe { life_slot(second_window_pa, LIFE_R_MAGIC) } != LIFE_REPORT_MAGIC {
+            fail_case(
+                "isolated-restart",
+                "restarted create did not run in its private AS",
+            );
+        }
+
+        // (3) 并发活跃实例显式拒绝（同一 image 的第二个活跃实例）。
+        let error = match load::create_component(
+            b"kcomp_isolated_life",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Err(error) => error,
+            Ok(_) => fail_case(
+                "isolated-restart",
+                "a concurrent live instance was accepted",
+            ),
+        };
+        if error != ComponentLoadError::IsolatedInstanceLive {
+            kernel::log!(
+                "selftest",
+                "isolated-restart: unexpected concurrency error: {:?}",
+                error
+            );
+            fail_case(
+                "isolated-restart",
+                "concurrent live instance was not rejected",
+            );
+        }
+        if Errno::from(error) != Errno::EBUSY {
+            fail_case("isolated-restart", "concurrency rejection errno mismatch");
+        }
+        if registry_state(second) != Some(ComponentState::Ready) {
+            fail_case(
+                "isolated-restart",
+                "rejected concurrency changed the live instance",
+            );
+        }
+
+        // (4) 优雅停止 second（Stopped tombstone、窗口驻留）→ 再次重启。
+        if kernel::component::stop_component(second).is_err() {
+            fail_case("isolated-restart", "stop failed");
+        }
+        if unsafe { life_slot(second_window_pa, LIFE_DESTROY_SLOT) } != LIFE_DESTROY_MAGIC {
+            fail_case("isolated-restart", "destroy entry did not run");
+        }
+        let third = match load::create_component(
+            b"kcomp_isolated_life",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-restart: second restart failed: {:?}",
+                    error
+                );
+                fail_case("isolated-restart", "restart after Stopped failed");
+            }
+        };
+        let (third_handle, third_window_pa) = {
+            let reg = registry::get_registry().lock();
+            let record = match reg.get(third) {
+                Some(record) => record,
+                None => fail_case("isolated-restart", "second restart record missing"),
+            };
+            let handle = match record.address_space {
+                Some(handle) => handle,
+                None => fail_case("isolated-restart", "second restart has no address space"),
+            };
+            let window = isolated_lifecycle::window_range();
+            let window_pa = match address_space::mapping_exact(handle, &window) {
+                Ok(Some(mapping)) => mapping.physical_range.base,
+                _ => fail_case("isolated-restart", "second restart window is not mapped"),
+            };
+            (handle, window_pa)
+        };
+        if third == second {
+            fail_case("isolated-restart", "second restart reused the ComponentId");
+        }
+        if third_handle.raw_id() == second_handle.raw_id() {
+            fail_case(
+                "isolated-restart",
+                "second restart reused the address space",
+            );
+        }
+        // **全新窗口 backing**：second 的窗口仍驻留（被占用），third 必须拿到
+        // 不同的页——重启的独立性是"全新机制"，不是"复用旧窗口"。
+        if third_window_pa == second_window_pa {
+            fail_case(
+                "isolated-restart",
+                "restart reused the resident window backing",
+            );
+        }
+        // fresh slot：旧实例的 slot 已清除，新实例的 slot 已安装。
+        let expected_slot =
+            isolated_lifecycle::window_range().base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
+        if runtime_slot::get_slots().lock().get(third) as usize != expected_slot {
+            fail_case("isolated-restart", "second restart has no runtime slot");
+        }
+        if !runtime_slot::get_slots().lock().get(second).is_null() {
+            fail_case("isolated-restart", "stopped instance kept its runtime slot");
+        }
+        // 两个 tombstone 都被保留，且都不阻止重启。
+        if registry_state(failed_id) != Some(ComponentState::Failed) {
+            fail_case("isolated-restart", "Failed tombstone was lost");
+        }
+        if registry_state(second) != Some(ComponentState::Stopped) {
+            fail_case("isolated-restart", "Stopped tombstone was lost");
+        }
+
+        // 收尾：停止 third（destroy 真的跑过）。
+        if kernel::component::stop_component(third).is_err() {
+            fail_case("isolated-restart", "third stop failed");
+        }
+        if unsafe { life_slot(third_window_pa, LIFE_DESTROY_SLOT) } != LIFE_DESTROY_MAGIC {
+            fail_case("isolated-restart", "third destroy entry did not run");
+        }
+        if read_satp() != core_satp {
+            fail_case("isolated-restart", "Core satp not restored");
+        }
+        if !kernel_native_still_works() {
+            fail_case("isolated-restart", "KernelNative path broke");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-restart: fresh instances: failed={}, stopped={}, live={}",
+            failed_id.raw(),
+            second.raw(),
+            third.raw()
+        );
+        pass("isolated-restart")
     }
 
     /// 只记录现场、拒绝恢复的窄策略：**组件身份本身不是可恢复的证明**；

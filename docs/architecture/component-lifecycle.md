@@ -229,6 +229,9 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 - **不实现 `image.instances == 0 → unload`。** Image 保持 pinned-until-reboot；Stopped/Failed 实例记录留作 tombstone。
 - 新创建得到**全新 instance ID** 与**全新 state**，引用同一常驻 image（若复用合法）。
+  > Isolated 域的状态：image 记录部署域 + 按域段规划，同域复用 = **逻辑重启**（前一个实例
+  > `Failed` / `Stopped` 之后创建全新实例：全新私有 AS / 全新 Core 预置窗口 / 全新 runtime slot）；
+  > 并发活跃实例与跨域复用显式拒绝。已在 RV64+RV32 QEMU 证明，见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
 - **逻辑重启 ≠ 设备恢复**（隔离到重启，见 §8）。
 

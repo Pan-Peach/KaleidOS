@@ -155,6 +155,21 @@ impl ComponentState {
                 | (Self::Stopping, Self::Stopped)
         )
     }
+
+    /// 实例是否仍**活着**（未到终态）：`Declared` / `Resolved` / `Starting` /
+    /// `Ready` / `Stopping`。
+    ///
+    /// 终态 = `Stopped` / `Failed`（tombstone，phase 1 保留记录）。
+    /// 用途：Isolated 的同 image 并发门禁（`component/load.rs`）——逻辑重启只在
+    /// 前一个实例**逻辑死亡之后**成立；两个活跃实例会共享 image 的
+    /// `.data` / `.bss`（image-global，与 KernelNative 同一契约），不在本阶段
+    /// 承诺的隔离模型内。
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Declared | Self::Resolved | Self::Starting | Self::Ready | Self::Stopping
+        )
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +216,19 @@ mod tests {
                     "{from:?} -> {to:?} legality"
                 );
             }
+        }
+    }
+
+    /// `is_live` 与状态机终态精确互补：只有 `Stopped` / `Failed` 是 tombstone。
+    #[test]
+    fn is_live_marks_exactly_the_non_terminal_states() {
+        use ComponentState::{Declared, Failed, Ready, Resolved, Starting, Stopped, Stopping};
+
+        for state in [Declared, Resolved, Starting, Ready, Stopping] {
+            assert!(state.is_live(), "{state:?} must be live");
+        }
+        for state in [Stopped, Failed] {
+            assert!(!state.is_live(), "{state:?} must be a tombstone");
         }
     }
 

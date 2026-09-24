@@ -116,6 +116,39 @@ CASES = (
     ("isolated-service", None, "isolated-service: gate OK"),
     ("isolated-service-limits", None, None),
     ("isolated-service-fault", None, "isolated-service-fault: contained"),
+    # increment 7: the failure/restart acceptance matrix.  Every row asserts the
+    # AGENTS.md failure contract ("组件失败 = 逻辑死亡、物理驻留"): the instance
+    # reaches its documented state, its AS is retired or released, the
+    # Core-prepared windows are returned, the runtime slot is cleared, the
+    # endpoint (if any) is dead, the caller gets a typed error, Core stays alive,
+    # and the KernelNative path keeps working.
+    #   isolated-load-reject    placement failure (17 MiB .bss beyond the image
+    #                           window) and the empty import envelope are rejected
+    #                           BEFORE any instance/AS/image exists;
+    #   isolated-config-reject  an over-capacity config fails the create stage
+    #                           with the same cleanup as other create failures;
+    #   isolated-prepare-reject the gateway prepare rejects a non-executable
+    #                           entry / unwritable stack / retired AS with typed
+    #                           errors and never mutates the instance truth;
+    #   isolated-destroy-fault  a destroy-entry trap yields DestroyPanicked +
+    #                           Failed + retired AS (windows stay resident per
+    #                           phase 1) and is never retried;
+    #   isolated-stale-access   a resolved-but-dead endpoint is blocked at the
+    #                           Core boundary (the provider never runs again);
+    #   isolated-ready-fault    a fault on an instance that already served a call
+    #                           is contained, then the same image restarts as a
+    #                           genuinely independent fresh instance;
+    #   isolated-restart        a fresh instance of the same image runs to Ready
+    #                           after Failed/Stopped tombstones, with fresh AS /
+    #                           window / slot, while a concurrent live instance is
+    #                           explicitly rejected.
+    ("isolated-load-reject", None, "isolated-load-reject: rejected before declare"),
+    ("isolated-config-reject", None, None),
+    ("isolated-prepare-reject", None, "isolated-prepare-reject: typed rejections held"),
+    ("isolated-destroy-fault", None, "isolated-destroy-fault: contained"),
+    ("isolated-stale-access", None, "isolated-stale-access: blocked"),
+    ("isolated-ready-fault", None, "isolated-ready-fault: contained + restarted"),
+    ("isolated-restart", None, "isolated-restart: fresh instances"),
 )
 
 
