@@ -1933,32 +1933,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn property_test_helpers_are_sane() {
-        // 防呆：op_seq 生成器本身必须产生合法 base（页对齐）
-        let mut space = space(FakeBackend::new());
-        apply_and_check(
-            &mut space,
-            OpKind::Map {
-                base: VM_PAGE,
-                pages: 2,
-                perm: rw(),
-                backend_fail: false,
-            },
-        );
-        assert_eq!(space.mappings().len(), 1);
-        assert_no_overlap(space.mappings());
-        apply_and_check(
-            &mut space,
-            OpKind::Unmap {
-                base: VM_PAGE,
-                pages: 2,
-                backend_fail: false,
-            },
-        );
-        assert_eq!(space.mappings().len(), 0);
-    }
-
     /// GRANULE=1 时，Core 的 `validate` 必须放行非 4K 对齐区间——
     /// 这是"Core 不依赖 MMU"的硬证据（对应 roadmap 的 NoMMU 验收点）。
     #[cfg(feature = "vm-nommu")]

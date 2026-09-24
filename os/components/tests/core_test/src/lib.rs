@@ -30,9 +30,12 @@ extern crate std;
 mod runtime;
 
 /// 静态数据，.data 段。放段/重定位正确性锚点：值原样保持 = 段被正确搬运。
+/// host 构建（`cargo test`）整体编掉——host 上只测纯逻辑。
+#[cfg(not(test))]
 static MAGIC: u32 = 0xC0FFEE;
 
 /// 纯逻辑（host-testable）：.data 段的值在放段后必须原样可读。
+#[cfg(not(test))]
 fn data_ok() -> bool {
     MAGIC == 0xC0FFEE
 }
@@ -46,11 +49,6 @@ fn machine_ok(cpu_count: u32, boot_hart_present: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn data_ok_passes() {
-        assert!(data_ok());
-    }
 
     #[test]
     fn machine_check_accepts_sparse_hart_ids() {

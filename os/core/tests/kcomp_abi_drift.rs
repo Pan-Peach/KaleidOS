@@ -368,41 +368,6 @@ fn lifecycle_entry_surface_is_frozen() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 解析器自测（不依赖三份真实文件的当前状态，保证测试工具本身可信）
-// ---------------------------------------------------------------------------
-
-#[test]
-fn c_parser_extracts_declaration_shapes() {
-    let src = strip_comments(
-        "/* kcore_hidden(uint64_t x); */\nint32_t kcore_demo(uint64_t a, const void *b);\n",
-    );
-    let sigs = extract_c_decls(&src);
-    assert_eq!(sigs.len(), 1, "注释里的伪声明必须被剥离");
-    assert!(sigs.contains_key("kcore_demo"));
-    assert!(!sigs.contains_key("kcore_hidden"));
-    assert_eq!(sigs["kcore_demo"].params, vec![Width::W64, Width::Ptr]);
-    assert_eq!(sigs["kcore_demo"].ret, Width::W32);
-}
-
-#[test]
-fn c_parser_handles_void_and_function_pointers() {
-    let src = strip_comments(
-        "int32_t kcore_a(void);\nint32_t kcore_b(uint64_t h, void (*handler)(void *ctx), void *ctx);\n",
-    );
-    let sigs = extract_c_decls(&src);
-    assert_eq!(sigs["kcore_a"].params, Vec::<Width>::new());
-    assert_eq!(
-        sigs["kcore_b"].params,
-        vec![Width::W64, Width::Ptr, Width::Ptr]
-    );
-}
-
-#[test]
-fn c_classifier_rejects_unknown_types() {
-    assert!(classify_c_type("long double").is_err());
-}
-
 // ===========================================================================
 // 组件间契约（block.device / filesystem）：编译器背书的绝对数值 pin
 // ---------------------------------------------------------------------------

@@ -74,29 +74,6 @@ pub fn frame(args: &[u8], input: &[u8], output: &mut [u8]) -> KcompCallFrame {
 mod tests {
     use super::*;
 
-    /// flat frame 的 host 布局锚定（生成物里的 `const _` 断言之外的显式复核）。
-    #[test]
-    fn call_frame_is_six_pointer_widths() {
-        let pointer = core::mem::size_of::<usize>();
-        assert_eq!(core::mem::size_of::<KcompCallFrame>(), 6 * pointer);
-        assert_eq!(
-            core::mem::align_of::<KcompCallFrame>(),
-            core::mem::align_of::<usize>()
-        );
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, args), 0);
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, args_len), pointer);
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, input), 2 * pointer);
-        assert_eq!(
-            core::mem::offset_of!(KcompCallFrame, input_len),
-            3 * pointer
-        );
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, output), 4 * pointer);
-        assert_eq!(
-            core::mem::offset_of!(KcompCallFrame, output_len),
-            5 * pointer
-        );
-    }
-
     /// `frame` helper：切片 → (ptr, len) 逐字段对应；空切片是"长度 0 + 非空指针"。
     #[test]
     fn frame_helper_wires_slices_to_pointer_length_pairs() {

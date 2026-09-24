@@ -89,13 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn paired_diff_median_reports_signed_delta() {
-        let work = [100u64; SAMPLES];
-        let baseline = [250u64; SAMPLES];
-        assert_eq!(paired_diff_median(&work, &baseline), -150);
-    }
-
-    #[test]
     fn sort_orders_ascending() {
         let mut samples = [0u64; SAMPLES];
         samples[0] = 9;

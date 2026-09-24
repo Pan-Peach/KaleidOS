@@ -5,7 +5,7 @@
 //! 编译通过来证明，反向用例（重复端口）会红，不适合放进本测试套件（没有
 //! compile-fail harness，也不引新依赖）。
 
-use crate::abi::{KcompCallFrame, KcompServiceDispatch};
+use crate::abi::KcompCallFrame;
 use crate::block::dispatch::dispatch as block_dispatch;
 use crate::block::tests_support::BlockMock;
 use crate::errno::Errno;
@@ -20,12 +20,6 @@ crate::kcomp_services! {
     state: BlockMock;
     BLOCK_PORT => block_dispatch::<BlockMock>,
     OTHER_PORT => block_dispatch::<BlockMock>,
-}
-
-/// 宏发出的入口必须与 `abi` 的 Rust 镜像同签名（生命周期宏同一锚定手法）。
-#[test]
-fn generated_dispatch_matches_the_abi_signature_anchor() {
-    let _: KcompServiceDispatch = kcomp_service_dispatch;
 }
 
 /// port switch：选中的 port → 契约 adapter（provider 真被调用）；未知 port /

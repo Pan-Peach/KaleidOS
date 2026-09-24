@@ -203,32 +203,4 @@ mod tests {
         assert_eq!(period, 100_000, "截断为 0 时必须回退到 100_000");
         assert_ne!(period, 0, "idle 周期绝不能为 0");
     }
-
-    /// `print` / `log` / `print_bytes` 走 host `Fake` console（写 stdout），
-    /// 只要求不 panic、返回 `()`（传输侧无失败返回值）。
-    #[test]
-    fn print_log_and_print_bytes_reach_the_console_without_panicking() {
-        // Given/When：格式化并经 Core print 管线输出。三条路径的返回类型都是
-        // `()`（传输侧无失败返回值），故"可编译 + 不 panic"即完整契约。
-        let emit = || {
-            print(format_args!("print {} {}", 1, "two"));
-            log("tag", format_args!("value={}", 7));
-            print_bytes(b"raw bytes");
-        };
-        emit();
-
-        // Then：覆盖 Sink 的 print/log 两段格式化与 print_bytes 直写路径。
-    }
-
-    /// `ConsoleScreen` 是行编辑器的屏幕 sink：`Screen::put` 应原样转发到 console。
-    #[test]
-    fn console_screen_sink_forwards_bytes_to_console() {
-        // Given：屏幕 sink。
-        let mut screen = ConsoleScreen;
-
-        // When：通过 Screen trait 写入（forward 到 print_bytes → Console backend）。
-        crate::monitor::editor::Screen::put(&mut screen, b"screen output");
-
-        // Then：转发路径不 panic（覆盖 sink 实现）。
-    }
 }

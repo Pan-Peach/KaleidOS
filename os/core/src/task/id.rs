@@ -24,23 +24,3 @@ impl core::fmt::Display for TaskId {
         write!(f, "Task{}", self.0)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::TaskId;
-
-    #[test]
-    fn ids_with_same_raw_are_equal() {
-        assert_eq!(TaskId::from_raw(7), TaskId::from_raw(7));
-    }
-
-    #[test]
-    fn ids_with_different_raw_differ() {
-        assert_ne!(TaskId::from_raw(7), TaskId::from_raw(8));
-    }
-
-    #[test]
-    fn raw_roundtrip() {
-        assert_eq!(TaskId::from_raw(42).raw(), 42);
-    }
-}

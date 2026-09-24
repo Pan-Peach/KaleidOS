@@ -1101,30 +1101,9 @@ mod tests {
     }
 
     // -- 7. frame 布局（6 指针宽）---------------------------------------------
-
-    /// 生成物里的 `const _` 断言在编译期覆盖；这里在 host 上再显式钉一次，
-    /// 并钉住扁平字段顺序（args, args_len, input, input_len, output, output_len）。
-    #[test]
-    fn call_frame_is_six_pointer_widths() {
-        let pointer = core::mem::size_of::<usize>();
-        assert_eq!(core::mem::size_of::<KcompCallFrame>(), 6 * pointer);
-        assert_eq!(
-            core::mem::align_of::<KcompCallFrame>(),
-            core::mem::align_of::<usize>()
-        );
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, args), 0);
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, args_len), pointer);
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, input), 2 * pointer);
-        assert_eq!(
-            core::mem::offset_of!(KcompCallFrame, input_len),
-            3 * pointer
-        );
-        assert_eq!(core::mem::offset_of!(KcompCallFrame, output), 4 * pointer);
-        assert_eq!(
-            core::mem::offset_of!(KcompCallFrame, output_len),
-            5 * pointer
-        );
-    }
+    //
+    // 生成物 `generated/abi.rs` 的 `const _` 断言在编译期覆盖 size / align /
+    // offset（`make abi-check` 守住生成物新鲜度）；host 侧不再重复钉。
 
     // -- 8. re-entry：provider 已在当前同步链上 → EBUSY --------------------------
 

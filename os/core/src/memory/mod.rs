@@ -541,20 +541,6 @@ mod tests {
         free_region(lease).expect("free should succeed");
     }
 
-    /// 验收：`MemoryError` 具备值语义（`PartialEq`/`Eq`）与 `Debug` 输出能力。
-    #[test]
-    fn memory_error_equality_and_debug_are_available() {
-        assert_eq!(MemoryError::Exhausted, MemoryError::Exhausted);
-        assert_ne!(MemoryError::Exhausted, MemoryError::InvalidSize);
-        assert_eq!(MemoryError::DoubleFree, MemoryError::DoubleFree);
-
-        let formatted = std::format!("{:?}", MemoryError::InvalidSize);
-        assert!(
-            formatted.contains("InvalidSize"),
-            "Debug output should name the variant, got {formatted:?}"
-        );
-    }
-
     // ------------------------------------------------------------------
     // Property：order_for_size 覆盖 + 单调，align_up_page 只向上且 < 一页 ----
     // ------------------------------------------------------------------

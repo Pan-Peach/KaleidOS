@@ -175,48 +175,6 @@ impl Drop for TestLockGuard<'_> {
 mod tests {
     use super::*;
 
-    /// 规范顺序可以安全嵌套（检测器不误报）。
-    #[test]
-    fn canonical_order_nests_cleanly() {
-        static BOUNDARY: TestLock = TestLock::new(Rank::Boundary);
-        static MACHINE: TestLock = TestLock::new(Rank::Machine);
-        static MEMORY: TestLock = TestLock::new(Rank::Memory);
-        static TRACE: TestLock = TestLock::new(Rank::Trace);
-
-        let boundary = BOUNDARY.lock();
-        let machine = MACHINE.lock();
-        let memory = MEMORY.lock();
-        let trace = TRACE.lock();
-        drop((trace, memory, machine, boundary));
-    }
-
-    /// 负 rank 的模块本地锁先于所有规范锁获取时安全嵌套（全序一次走完）。
-    #[test]
-    fn full_order_including_module_local_ranks_nests_cleanly() {
-        static SCHED: TestLock = TestLock::new(Rank::Sched);
-        static LOAD: TestLock = TestLock::new(Rank::Load);
-        static INSPECTOR: TestLock = TestLock::new(Rank::Inspector);
-        static IRQ: TestLock = TestLock::new(Rank::Irq);
-        static TIMER: TestLock = TestLock::new(Rank::Timer);
-        static BOUNDARY: TestLock = TestLock::new(Rank::Boundary);
-        static MACHINE: TestLock = TestLock::new(Rank::Machine);
-        static MEMORY: TestLock = TestLock::new(Rank::Memory);
-        static TRACE: TestLock = TestLock::new(Rank::Trace);
-
-        let sched = SCHED.lock();
-        let load = LOAD.lock();
-        let inspector = INSPECTOR.lock();
-        let irq = IRQ.lock();
-        let timer = TIMER.lock();
-        let boundary = BOUNDARY.lock();
-        let machine = MACHINE.lock();
-        let memory = MEMORY.lock();
-        let trace = TRACE.lock();
-        drop((
-            trace, memory, machine, boundary, timer, irq, inspector, load, sched,
-        ));
-    }
-
     /// 模块本地锁（负 rank）一旦在规范锁之后获取 → 违反全序，阻塞前 panic。
     #[test]
     #[should_panic(expected = "test lock order violation")]

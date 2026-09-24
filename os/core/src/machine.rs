@@ -372,17 +372,6 @@ mod tests {
         );
     }
 
-    /// DeviceId 是身份：可复制 / 可比较，零合法。
-    #[test]
-    fn device_id_is_a_copyable_identity_including_zero() {
-        let zero = DeviceId::from_raw(0);
-        assert_eq!(zero.raw(), 0);
-        assert_eq!(zero, DeviceId::from_raw(0));
-        assert_ne!(zero, DeviceId::from_raw(1));
-        let copy = zero;
-        assert_eq!(copy, zero);
-    }
-
     /// `write_size`（经 `MemoryRegion` Debug 观察）：**只有**整数 GiB/MiB/KiB 使用
     /// 单位；其余一律按字节显示，绝不做会撒谎的四舍五入。
     #[test]

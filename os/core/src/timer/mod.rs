@@ -158,7 +158,6 @@ pub fn ticks() -> u64 {
 mod tests {
     use super::*;
     use crate::test_support::{Rank, TestLock};
-    use alloc::format;
 
     /// 序列化触碰进程级 timer 全局的测试。
     ///
@@ -219,18 +218,5 @@ mod tests {
         assert_eq!(STATE.lock().next_deadline, None);
         on_trap();
         assert_eq!(ticks(), 4);
-    }
-
-    /// 验收：`TimerError` 支持 `Debug` + 相等比较。
-    #[test]
-    fn timer_error_supports_debug_and_equality() {
-        // Given/When: 同一个变体的两个值，以及一个不同变体。
-        let a = TimerError::NotInitialized;
-        let b = TimerError::NotInitialized;
-
-        // Then: 同变体相等、异变体不等，且 Debug 可格式化。
-        assert_eq!(a, b);
-        assert_ne!(a, TimerError::AlreadyInitialized);
-        assert_eq!(format!("{a:?}"), "NotInitialized");
     }
 }

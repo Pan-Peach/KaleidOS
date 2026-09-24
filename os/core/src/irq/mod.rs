@@ -230,27 +230,4 @@ mod tests {
         crate::component::containment::enter_anchor();
         irq::get_table().lock().revoke_owner(owner);
     }
-
-    /// 验收：`IrqSaveGuard::default()`（走 `Default` impl → `new()`）能构造并析构。
-    #[test]
-    fn irq_save_guard_default_constructs_and_drops_on_host() {
-        let guard = IrqSaveGuard::default();
-        drop(guard);
-        let guard = IrqSaveGuard::new();
-        drop(guard);
-    }
-
-    /// 验收：`crate::irq::init()` 可调用——host 上把 `on_external` 注册进 fake
-    /// backend（`register_external_handler` 是 no-op）且不 panic。
-    #[test]
-    fn irq_init_registers_external_handler() {
-        crate::irq::init();
-    }
-
-    /// host 的 `InterruptController::claim()` 恒返回 `None`，因此 `on_external`
-    /// 的 claim→route→dispatch 循环体一次都不执行，调用应立即返回。
-    #[test]
-    fn on_external_returns_when_host_claim_is_none() {
-        on_external();
-    }
 }

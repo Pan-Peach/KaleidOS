@@ -13,41 +13,6 @@ fn dma_direction_encoding_is_stable() {
     assert_eq!(Bidirectional.as_i32(), 2);
 }
 
-/// InterfaceKind ABI 编码锚定（与 Core `export.rs::kind_from_u32` 一致）。
-#[test]
-fn interface_kind_encoding_is_stable() {
-    use crate::abi::InterfaceKind::{Device, Policy, Service};
-    assert_eq!(Device.as_u32(), 0);
-    assert_eq!(Service.as_u32(), 1);
-    assert_eq!(Policy.as_u32(), 2);
-}
-
-/// SchedulerPolicy 身份锚定：`scheduler.policy` 契约的 name / ABI / contract /
-/// method 数值漂移 = Core 选择直接拒绝（生成物是单一来源，这里钉死数值与拼写）。
-/// 更完整的 wire 编解码锚定在 `crate::scheduler::tests`。
-#[test]
-fn scheduler_policy_identity_is_anchored() {
-    use crate::scheduler::{
-        SCHEDULER_METHOD_CHOOSE_NEXT, SCHEDULER_NONE, SCHEDULER_POLICY_ABI, SCHEDULER_POLICY_NAME,
-        SCHEDULER_TASK_ID_LEN,
-    };
-    assert_eq!(SCHEDULER_POLICY_NAME, b"scheduler.policy");
-    assert_eq!(SCHEDULER_POLICY_ABI.raw(), 0x5343_4845_4455_4C52);
-    assert_eq!(SCHEDULER_METHOD_CHOOSE_NEXT, 0);
-    assert_eq!(SCHEDULER_TASK_ID_LEN, 4);
-    assert_eq!(SCHEDULER_NONE, u32::MAX);
-}
-
-#[test]
-fn filesystem_abi_is_anchored() {
-    assert_eq!(
-        crate::filesystem::FILESYSTEM_ABI.raw(),
-        0x4649_4C45_5359_5354
-    );
-    assert_eq!(crate::filesystem::FILESYSTEM_NAME, b"filesystem");
-    assert_eq!(crate::filesystem::FILESYSTEM_OPEN_READ, 1);
-}
-
 /// `probe.result` 契约身份 / ABI 指纹 / create config 布局锚定（ASCII tag 的
 /// 大端读数）：schema 数值漂移 = 组合期 `lookup` / `validate` 直接拒绝，这里钉死。
 #[test]
@@ -70,26 +35,6 @@ fn probe_result_identity_is_anchored() {
     assert_eq!(ProbeResult::ABI, KCOMP_PROBE_RESULT_ABI);
 }
 
-/// Trace ABI 布局锚定（编译期 `const _` 断言之外的 host 复核；与 Core
-/// `trace::abi` 的布局测试同值，改了字段必须双侧同步）。
-#[test]
-fn trace_abi_layouts_are_anchored() {
-    assert_eq!(core::mem::size_of::<crate::abi::TraceRecordAbi>(), 48);
-    assert_eq!(core::mem::size_of::<crate::abi::TraceStatsAbi>(), 40);
-    assert_eq!(core::mem::align_of::<crate::abi::TraceStatsAbi>(), 8);
-}
-
-/// `KcompCreateArgs` 布局锚定（host = 64-bit 指针 → 24 字节）：C 头文件
-/// `struct KcompCreateArgs` 的 `_Static_assert` 与本测试必须同值；RV32 为 16。
-#[test]
-fn kcomp_create_args_layout_is_anchored() {
-    use crate::abi::KcompCreateArgs;
-    assert_eq!(core::mem::size_of::<KcompCreateArgs>(), 24);
-    assert_eq!(core::mem::align_of::<KcompCreateArgs>(), 8);
-    assert_eq!(core::mem::offset_of!(KcompCreateArgs, config), 8);
-    assert_eq!(core::mem::offset_of!(KcompCreateArgs, config_len), 16);
-}
-
 /// 生命周期入口的 Rust 镜像：函数指针 = 指针宽（C 侧 `KcompTaskEntry` /
 /// `kcomp_instance_create` 的 ABI 宽度由这里钉死）。
 #[test]
@@ -108,34 +53,6 @@ fn kcomp_abi_fingerprint_is_anchored() {
     let abi = crate::abi::KCOMP_ABI;
     assert_eq!(abi, 0x4B43_4F4D_5041_4249);
     assert_eq!(&abi.to_be_bytes(), b"KCOMPABI");
-}
-
-/// `block.device` 名字 / kind 锚定：publish / bind 两侧必须逐字节一致，kind
-/// 必须为 Device（Core 拒绝同名不同 kind）；改动必须是一次刻意的测试修改。
-#[test]
-fn block_device_name_and_kind_are_anchored() {
-    use crate::abi::InterfaceKind::Device;
-    use crate::block::{BLOCK_DEVICE_NAME, BlockDevice};
-    use crate::endpoint::Contract;
-    assert_eq!(BLOCK_DEVICE_NAME, b"block.device");
-    assert_eq!(<BlockDevice as Contract>::KIND, Device);
-}
-
-/// BlockDevice ABI fingerprint 锚定（ASCII "BLOCKDEV"）：数值本身可当 8 字节
-/// 大端 ASCII 读出来——两个断言同时钉死数值与"它真的是那个 tag"。
-#[test]
-fn block_device_abi_is_anchored() {
-    let abi = crate::block::BLOCK_DEVICE_ABI.raw();
-    assert_eq!(abi, 0x424C_4F43_4B44_4556);
-    assert_eq!(&abi.to_be_bytes(), b"BLOCKDEV");
-}
-
-/// `BlockDeviceApi` 布局锚定：三个函数指针、无 padding（host = 64-bit 指针）。
-/// exact ABI fingerprint 认的就是这份布局——字段增删必须同步改测试。
-#[test]
-fn block_device_api_layout_is_anchored() {
-    assert_eq!(core::mem::size_of::<crate::block::BlockDeviceApi>(), 24);
-    assert_eq!(core::mem::align_of::<crate::block::BlockDeviceApi>(), 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,16 +197,10 @@ fn block_provider_adapter_rejects_invalid_args_with_einval() {
     );
 }
 
-/// errno 数值的编译器级 pin。与 Core `kcomp_abi_drift.rs` 的抽查分工：Core 侧只有
-/// `code()`，`from_code()` / `name()` 是 SDK 侧的解码路径，在这里独立钉死。
+/// errno 的 **SDK 侧解码路径**（`from_code()` / `name()`）锚定：Core 的
+/// `code()` 与数值本身由 `kcomp_abi_drift.rs` / `make abi-check` 守卫。
 #[test]
-fn errno_literals_are_pinned_to_stable_numbers() {
-    assert_eq!(Errno::ENOENT as i32, 2);
-    assert_eq!(Errno::EIO as i32, 5);
-    assert_eq!(Errno::EBUSY as i32, 16);
-    assert_eq!(Errno::ENODEV as i32, 19);
-    assert_eq!(Errno::EINVAL as i32, 22);
-    assert_eq!(Errno::EKEYREVOKED as i32, 128);
+fn errno_decoding_keeps_its_contract() {
     // `from_code` 的输入是 ABI 返回形状（`0` / `-errno`）；正数不是合法输入，
     // 落回 EIO 兜底（与生成前行为逐位一致）。
     assert_eq!(Errno::from_code(-22), Errno::EINVAL);

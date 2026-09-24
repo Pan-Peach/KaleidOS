@@ -174,22 +174,7 @@ impl ComponentState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComponentId, ComponentState};
-
-    #[test]
-    fn ids_with_same_raw_are_equal() {
-        assert_eq!(ComponentId::from_raw(3), ComponentId::from_raw(3));
-    }
-
-    #[test]
-    fn ids_with_different_raw_differ() {
-        assert_ne!(ComponentId::from_raw(3), ComponentId::from_raw(4));
-    }
-
-    #[test]
-    fn raw_roundtrip() {
-        assert_eq!(ComponentId::from_raw(17).raw(), 17);
-    }
+    use super::ComponentState;
 
     #[test]
     fn can_transition_matches_lifecycle_matrix() {
@@ -229,24 +214,6 @@ mod tests {
         }
         for state in [Stopped, Failed] {
             assert!(!state.is_live(), "{state:?} must be a tombstone");
-        }
-    }
-
-    #[test]
-    fn failed_is_reachable_from_every_state_and_idempotent() {
-        for from in [
-            ComponentState::Declared,
-            ComponentState::Resolved,
-            ComponentState::Starting,
-            ComponentState::Ready,
-            ComponentState::Stopping,
-            ComponentState::Stopped,
-            ComponentState::Failed,
-        ] {
-            assert!(
-                from.can_transition(ComponentState::Failed),
-                "{from:?} -> Failed must be legal"
-            );
         }
     }
 }

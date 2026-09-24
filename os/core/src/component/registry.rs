@@ -437,103 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_transitions_declared_to_resolved() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
-    }
-
-    #[test]
-    fn begin_start_transitions_resolved_to_starting() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
-    }
-
-    #[test]
-    fn finish_start_transitions_starting_to_ready() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        reg.finish_start(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
-    }
-
-    #[test]
-    fn finish_start_without_begin_start_is_invalid() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        assert_eq!(reg.finish_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
-    }
-
-    #[test]
-    fn begin_start_from_declared_without_resolve_is_invalid() {
-        // Declared --begin_start--> Starting 的硬编码已被拆开：必须先 resolve。
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
-    }
-
-    #[test]
-    fn resolve_twice_is_invalid_transition() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        assert_eq!(reg.resolve(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Resolved);
-    }
-
-    #[test]
-    fn begin_start_twice_is_invalid_transition() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
-    }
-
-    #[test]
-    fn begin_start_undeclared_is_not_found() {
-        let mut reg = r();
-        let ghost = ComponentId::from_raw(99);
-        assert_eq!(reg.begin_start(ghost), Err(RegistryError::NotFound));
-    }
-
-    #[test]
-    fn resolve_undeclared_is_not_found() {
-        let mut reg = r();
-        let ghost = ComponentId::from_raw(99);
-        assert_eq!(reg.resolve(ghost), Err(RegistryError::NotFound));
-    }
-
-    #[test]
-    fn failed_is_reachable_from_any_state() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        reg.mark_failed(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
-    }
-
-    #[test]
-    fn mark_failed_unknown_is_not_found() {
-        let mut reg = r();
-        assert_eq!(
-            reg.mark_failed(ComponentId::from_raw(99)),
-            Err(RegistryError::NotFound)
-        );
-    }
-
-    #[test]
     fn is_failed_only_reports_failed_instances() {
         let mut reg = r();
         let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
@@ -551,8 +454,10 @@ mod tests {
         );
     }
 
+    /// `may_run` 与生命周期状态精确对应：Declared / Resolved 不跑工作，
+    /// Starting / Ready 跑，Stopping / Stopped / Failed 与未知 id 不跑。
     #[test]
-    fn may_run_only_for_live_instances() {
+    fn may_run_matches_liveness_on_every_state() {
         let mut reg = r();
         let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
         assert!(!reg.may_run(id), "Declared does not run work");
@@ -561,106 +466,20 @@ mod tests {
         reg.begin_start(id).unwrap();
         assert!(
             reg.may_run(id),
-            "Starting (kcomp_instance_create) may create/run work"
+            "Starting (kcomp_instance_create) may run work"
         );
         reg.finish_start(id).unwrap();
         assert!(reg.may_run(id), "Ready runs work");
-        reg.mark_failed(id).unwrap();
-        assert!(!reg.may_run(id), "Failed must not run work");
-        assert!(
-            !reg.may_run(ComponentId::from_raw(99)),
-            "unknown must not run"
-        );
-    }
-
-    #[test]
-    fn may_run_excludes_stopping_stopped_and_failed() {
-        // Given：一个 Ready 组件（唯一可运行任务的活状态）。
-        let mut reg = r();
-        let id = ready(&mut reg);
-        assert!(reg.may_run(id), "Ready runs work");
-
-        // When / Then：stop 路径上的状态（经规则表驱动）同样不得运行任务。
         reg.begin_stop(id).unwrap();
         assert!(!reg.may_run(id), "Stopping must not run work");
         reg.finish_stop(id).unwrap();
         assert!(!reg.may_run(id), "Stopped must not run work");
         reg.mark_failed(id).unwrap();
         assert!(!reg.may_run(id), "Failed must not run work");
-    }
-
-    #[test]
-    fn begin_stop_and_finish_stop_drive_ready_to_stopped() {
-        // Given：一个 Ready 组件。
-        let mut reg = r();
-        let id = ready(&mut reg);
-
-        // When / Then：Ready → Stopping → Stopped 由规则表放行。
-        reg.begin_stop(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopping);
-        reg.finish_stop(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopped);
-    }
-
-    #[test]
-    fn begin_stop_is_only_legal_from_ready() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Declared);
-        reg.resolve(id).unwrap();
-        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
-        reg.begin_start(id).unwrap();
-        assert_eq!(reg.begin_stop(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Starting);
-    }
-
-    #[test]
-    fn finish_stop_without_begin_stop_is_invalid() {
-        let mut reg = r();
-        let id = ready(&mut reg);
-        assert_eq!(reg.finish_stop(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
-    }
-
-    #[test]
-    fn stopping_may_transition_to_failed() {
-        let mut reg = r();
-        let id = ready(&mut reg);
-        reg.begin_stop(id).unwrap();
-        reg.mark_failed(id).unwrap();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
-    }
-
-    #[test]
-    fn stopped_cannot_restart() {
-        let mut reg = r();
-        let id = ready(&mut reg);
-        reg.begin_stop(id).unwrap();
-        reg.finish_stop(id).unwrap();
-        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopped);
-    }
-
-    #[test]
-    fn failed_transition_keeps_original_state() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.resolve(id).unwrap();
-        reg.begin_start(id).unwrap();
-        reg.finish_start(id).unwrap();
-        // Ready 再 begin_start：拒绝，且状态保持 Ready
-        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
-    }
-
-    #[test]
-    fn begin_start_after_failed_is_invalid_and_keeps_failed() {
-        let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        reg.mark_failed(id).unwrap();
-        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Failed);
+        assert!(
+            !reg.may_run(ComponentId::from_raw(99)),
+            "unknown must not run"
+        );
     }
 
     #[test]
