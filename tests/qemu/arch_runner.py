@@ -85,6 +85,22 @@ CASES = (
     ("isolated-perm-text", None, "scause=0xf"),
     ("isolated-perm-data", None, "scause=0xc"),
     ("isolated-core-unreachable", None, "scause=0xd"),
+    # increment 5: the Isolated lifecycle is wired end-to-end through the
+    # production entry points.  `isolated-lifecycle` creates a real `.kcomp`
+    # instance via `create_component(.., IsolatedNative)`, proves its
+    # `kcomp_instance_create` ran inside the private AS with the ABI-transit
+    # window (args / config / out_state) and the per-instance runtime slot (tp),
+    # proves the window is reachable only from that instance's AS, then stops it
+    # through `stop_component` and proves `kcomp_instance_destroy` really ran
+    # (window-side destroy marker) and the AS was retired.  The required
+    # substring carries the observed instance window into the runner verdict.
+    # `isolated-lifecycle-fail` / `isolated-lifecycle-fault` prove both
+    # create-entry failure modes (non-zero return and an in-AS fault caught by
+    # the gateway's narrow fault dispatch) leave a `Failed` tombstone with a
+    # retired AS and the Core-prepared window/stack released.
+    ("isolated-lifecycle", None, "isolated-lifecycle: private AS OK"),
+    ("isolated-lifecycle-fail", None, None),
+    ("isolated-lifecycle-fault", None, None),
 )
 
 

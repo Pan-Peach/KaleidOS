@@ -43,8 +43,11 @@
 //!   装回 Core 的 `gp`。组件侧**不**安装自己的 `gp`（按域 gp 环境属于未来 loader）。
 //! - **`tp` = 组件 runtime slot**：进入前由 [`Transition::runtime_slot`] 提供
 //!   （0 = 无 slot）；只有 `tp` 的搬运，没有 TLS / 记账。
-//! - **单 CPU、不可重入**：scratch 与 Core trap 栈是单一静态；在组件生命周期
-//!   接线（increment 4）之前只允许串行驱动。
+//! - **入口参数 `a0` / `a1`**：由 [`Transition::arg0`] / [`Transition::arg1`]
+//!   写入 scratch，进入前装入（入口 ABI 的解释权在 Core；arch 不解释）。
+//! - **单 CPU、不可重入**：scratch 与 Core trap 栈是单一静态；组件生命周期
+//!   （increment 5 起 `component/isolated_lifecycle.rs` 是生产调用方）同步进入、
+//!   不嵌套，ArchTest 也串行驱动。
 //!
 //! # 故障归属
 //!
@@ -85,6 +88,10 @@ pub struct Transition {
     pub interrupts_enabled: bool,
     /// 故障归因 token（Core 真相：AS owner 的 raw id；arch 只透传）。
     pub fault_token: usize,
+    /// 组件入口 `a0`（Core 已验证的值，arch 只搬运；入口 ABI 的解释权在 Core）。
+    pub arg0: usize,
+    /// 组件入口 `a1`（同 [`Transition::arg0`]）。
+    pub arg1: usize,
 }
 
 /// 同步切换的结果。
@@ -170,13 +177,17 @@ struct GatewayScratch {
     status: usize,
     /// 故障归因 token（Core 透传）。
     token: usize,
+    /// 组件入口 `a0`（进入前装入；与 `.S` 的 `G_ENTRY_ARG0` 一致）。
+    entry_arg0: usize,
+    /// 组件入口 `a1`（进入前装入；与 `.S` 的 `G_ENTRY_ARG1` 一致）。
+    entry_arg1: usize,
     _pad: [u8; PAGE_SIZE - SCRATCH_HEADER_BYTES],
 }
 
 /// 头部（除 `_pad`）字节数（两条路径都不含填充）。
 const SCRATCH_HEADER_BYTES: usize = core::mem::size_of::<TrapFrame>()
     + core::mem::size_of::<CoreResume>()
-    + 5 * core::mem::size_of::<usize>();
+    + 7 * core::mem::size_of::<usize>();
 
 // 偏移即 ABI：与 `gateway64.S` / `gateway32.S` 顶部 `.equ` 常量钉死一致。
 const _: () = {
@@ -194,6 +205,17 @@ const _: () = {
     assert!(
         core::mem::offset_of!(CoreResume, trap_stack_top) == 20 * core::mem::size_of::<usize>()
     );
+    // 入口参数：偏移与 `.S` 的 `G_ENTRY_ARG0` / `G_ENTRY_ARG1` 一致。
+    #[cfg(target_arch = "riscv64")]
+    {
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg0) == 480);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg1) == 488);
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg0) == 240);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg1) == 244);
+    }
     assert!(core::mem::size_of::<GatewayScratch>() == PAGE_SIZE);
 };
 
@@ -221,6 +243,8 @@ impl GatewayScratch {
         phase: PHASE_IDLE,
         status: 0,
         token: 0,
+        entry_arg0: 0,
+        entry_arg1: 0,
         _pad: [0; PAGE_SIZE - SCRATCH_HEADER_BYTES],
     };
 }
@@ -331,13 +355,16 @@ pub fn enter(transition: Transition) -> Outcome {
     );
 
     // SAFETY: [Category 2 — Data races] single-CPU, non-reentrant: the
-    // component lifecycle has no caller yet and ArchTest drives it serially.
+    // component lifecycle (increment 5) enters synchronously and never nests a
+    // transition; ArchTest also drives it serially.
     let scratch = core::ptr::addr_of_mut!(SCRATCH);
     unsafe {
         (*scratch).entry_stvec = gateway_trap_entry as *const () as usize;
         (*scratch).core.stvec = super::trap::vector_address();
         (*scratch).core.trap_stack_top = core_trap_stack_top();
         (*scratch).status = 0;
+        (*scratch).entry_arg0 = transition.arg0;
+        (*scratch).entry_arg1 = transition.arg1;
     }
 
     let flags = <CpuImpl as CpuArch>::disable_irq();

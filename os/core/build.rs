@@ -74,7 +74,13 @@ fn main() {
         println!("cargo:rerun-if-changed={}", changed.display());
     }
 
-    let components = ["core_test", "kcomp_smoke", "kcomp_min", "kcomp_isolated"];
+    let components = [
+        "core_test",
+        "kcomp_smoke",
+        "kcomp_min",
+        "kcomp_isolated",
+        "kcomp_isolated_life",
+    ];
     let mut objects = Vec::new();
     for name in components {
         let component_dir = repo.join("os/components").join(name);

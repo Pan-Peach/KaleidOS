@@ -1,4 +1,4 @@
-//! Isolated 域激活网关（**Core 侧准备**；increment 3：机制已落地、生命周期未接线）。
+//! Isolated 域激活网关（**Core 侧准备**；increment 3 机制，increment 5 接入生命周期）。
 //!
 //! 本模块是 [`arch::riscv::gateway`]（双映射汇编切换）的 Core 侧对应物，把
 //! Oracle 设计的两个阶段分开：
@@ -11,18 +11,20 @@
 //!
 //! ```text
 //! Core 调用方
-//!   │  isolated::prepare(handle, entry, stack, slot, irq)   ← 锁内：验证 + 取描述符
+//!   │  isolated::prepare(handle, entry, stack, slot, irq, args)   ← 锁内：验证 + 取描述符
 //!   ▼  PreparedTransition（Copy）
 //! isolated::enter(transition)                              ← 锁外：只搬运
 //!   └─ arch::riscv::gateway::enter → 汇编 …组件… → Outcome
 //! ```
 //!
-//! # 当前没有任何生产调用方（inactive path）
+//! # 生产调用方（increment 5）
 //!
-//! 组件生命周期（`load.rs` / `call.rs` / `containment.rs`）**不调用**本模块：
-//! `create_isolated_native` 仍在 `Starting` 处停下，Isolated 域不执行任何组件。
-//! 本增量只交付机制；ArchTest 直接驱动它证明切换 / trap 往返 / 组件故障分派。
-//! 按域 loader 与生命周期接线属于后续 increment。
+//! `component/isolated_lifecycle.rs` 是唯一生产调用方：Isolated 实例的
+//! `kcomp_instance_create` / `kcomp_instance_destroy` 都经这里在私有 AS 里执行。
+//! ArchTest 仍直接驱动本模块证明切换 / trap 往返 / 组件故障分派。
+//!
+//! 进入参数（组件入口 `a0` / `a1`）由 Core 解释：生命周期用它们交付 create 的
+//! `args` / `out_state`（实例内 VA）与 destroy 的 `state`；gateway 只搬运。
 //!
 //! # 协作式边界（不伪造安全承诺）
 //!
@@ -61,6 +63,8 @@ pub struct PreparedTransition {
     runtime_slot: usize,
     interrupts_enabled: bool,
     fault_token: usize,
+    entry_arg0: usize,
+    entry_arg1: usize,
 }
 
 impl PreparedTransition {
@@ -89,7 +93,8 @@ impl PreparedTransition {
 ///
 /// - `stack`：组件栈的已映射区间；栈顶 = `base + size`，必须 16 字节对齐；
 /// - `runtime_slot`：组件运行的 `tp`（0 = 无；只搬运，不解释）；
-/// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸）。
+/// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸）；
+/// - `entry_args`：组件入口的 `a0` / `a1`（入口 ABI 由 Core 解释，arch 只搬运）。
 ///
 /// `handle` 的 owner 会作为故障归因 token 随描述符携带（Core 真相：AS owner）。
 pub fn prepare(
@@ -98,6 +103,7 @@ pub fn prepare(
     stack: VirtualRange,
     runtime_slot: usize,
     interrupts_enabled: bool,
+    entry_args: (usize, usize),
 ) -> Result<PreparedTransition, IsolatedPrepareError> {
     let pages = gateway::pages();
     let activation = address_space::prepare_transition(handle, &pages, entry, stack)?;
@@ -116,6 +122,8 @@ pub fn prepare(
         runtime_slot,
         interrupts_enabled,
         fault_token: owner.raw() as usize,
+        entry_arg0: entry_args.0,
+        entry_arg1: entry_args.1,
     })
 }
 
@@ -132,6 +140,8 @@ pub fn enter(transition: PreparedTransition) -> Outcome {
         runtime_slot: transition.runtime_slot,
         interrupts_enabled: transition.interrupts_enabled,
         fault_token: transition.fault_token,
+        arg0: transition.entry_arg0,
+        arg1: transition.entry_arg1,
     })
 }
 

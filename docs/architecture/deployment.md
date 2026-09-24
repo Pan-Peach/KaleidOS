@@ -283,7 +283,8 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 ### 6.2 text / data / bss / instance-state 的 VA 与重定位
 
 - 现状（KernelNative）：**单一 load base**（`image.rs:57`），段放置只提供段内对齐、**没有页级权限分离**（`loader.rs:156-187`）；import 只重定位**一次**（`loader.rs:317-372`）；`create` / `destroy` / `service_dispatch` 是绝对 `usize`（`image.rs:59-64`），运行时被 transmute 成函数指针（`os/core/src/component/containment.rs:906,913`）。
-- **Isolated 按域放段已落地（increment 4，仍是 inactive path）**：`os/core/src/component/isolated_load.rs` 把一份 `.kcomp` 按域重新放段——每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），并按域 base **重新应用重定位**（复用 `loader.rs` 的私有 ELF API，绝不复用 KernelNative 放段结果）。由 ArchTest 在 RV64 + RV32 QEMU 证明：真实 `.kcomp` 在私有 AS 里执行、段数据可读、**页表真的按段权限强制**（写 R+X text → scause 15；取指 R+W data → scause 12）、Core 专属映射不可达。**按域 import 解析 / trampoline 仍未实现**（import 包络 = 空集）。
+- **Isolated 生命周期已接线（increment 5）**：`os/core/src/component/isolated_load.rs` 按域重新放段——每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），并按域 base 重新应用重定位（复用 `loader.rs` 的私有 ELF API，绝不复用 KernelNative 放段结果）；`os/core/src/component/isolated_lifecycle.rs` 创建私有 AS、落镜像、预置**组件栈 + 实例内存窗口**，经 assembly gateway 执行 `kcomp_instance_create` / `kcomp_instance_destroy`，任一步失败即退役 AS + 归还预置窗口 + `Failed`。由 ArchTest 在 RV64 + RV32 QEMU 端到端证明（`isolated-lifecycle` / `isolated-lifecycle-fail`）：组件在私有 AS 里跑过、ABI 交窗口（args / config / out_state）与 runtime slot（`tp`）正确、窗口只在该实例 AS 里可达、destroy 入口真的执行、Core AS 每次切换后恢复。**按域 import 解析 / trampoline 仍未实现**（import 包络 = 空集）。
+- **Isolated 的内存路径（increment 5 的决定：Core 预置窗口，无 import 面）**：Core 为每个实例预置一块**实例内存窗口**（Core backing、零初始化、只映射在该实例的私有 AS），交付 create args / `out_state` / runtime context（`tp`），并以 **`kcore_memory_view` 编码**（`kind = LOCAL_VA`、`base/len` = 本窗口）把该域视图预交付给实例。表示是**实例内 VA**（`view.base/len` 只在那个 AS 里有意义，归属由该实例的页表承载；绝不出现物理地址 / Core 私有 VA），ArchTest `isolated-lifecycle` 断言编码与「窗口只在该实例 AS 里可达」。`kcore_memory_acquire` / `release` 的**组件可调用面**（component→Core gate-call trampoline）**本增量不做**：它需要 `ecall` 分派 + 按域 import 解析 + per-instance VA 预算，与跨域 Gate 一起属于后续增量。
 - **同一 artifact 能否按域重定位？** 可以，但**必须按域重新放段 + 重新解析 import**（新 `base`、新 import 目标）。Isolated 侧已具备"按域重新放段 + 重定位"；KernelNative 侧仍是单 base、单次重定位。
 - **text 何时可跨域共享？** 只有当**重定位后的 text 字节完全相同**时才能共享可执行页，即：**same VA**（同一段虚拟地址）+ **same import-target VA**（import 在两端解析到**同一 VA**）。后者的可行做法是 **per-domain fixed-VA trampoline**：把每个 `kcore_*` import 解析到该域一个**固定 VA** 的 trampoline（trampoline 本体按域不同，但地址相同）。做不到这两条，就必须按域各自放段 / 重定位，**不能共享 text**。
 - **instance-state**：`kcomp_instance_create` 返回的 opaque state 是**实例**私有、不是 image 共享；它经该实例自己的 `HeapState`（per-instance runtime context）分配，backing 以 **region 粒度**由 Core **提供**（Core 不记 owner、无账本；backing 经 `kcore_memory_acquire/release` 交付。契约见 `memory-and-heap.md`）。
@@ -295,8 +296,8 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 按依赖顺序，前者不成立后者无从谈起：
 
 1. **执行域字段 + 私有 AS 运行时**：`execution_kind`（当前不存在）、私有地址空间、`satp` 切换、ASID、U-mode、`ecall` 处理。
-   （increment 3 已落地**私有 AS 切换机制**：双映射 assembly gateway + Core 侧准备 + 窄故障分派，见 §10；**ASID / U-mode / `ecall` 仍未实现**，且组件生命周期尚未接入该机制。）
-2. **loader 按域放段 / 按域 import 解析**：按域放段已落地（increment 4，`component/isolated_load.rs`：页级权限分离 + 显式拒绝 + 按域重定位，仍为 inactive path）；按域 import 解析未实现（import 包络仍是空集）。KernelNative 侧仍是单 base 硬编码，跨域复用不可能。
+   （increment 3 已落地**私有 AS 切换机制**：双映射 assembly gateway + Core 侧准备 + 窄故障分派；**increment 5 已把组件生命周期接入该机制**（create / destroy 都经 gateway，见 §10）；**ASID / U-mode / `ecall` 仍未实现**。）
+2. **loader 按域放段 / 按域 import 解析**：按域放段已落地并被生命周期调用（increment 4 机制 + increment 5 接线：`component/isolated_load.rs` / `isolated_lifecycle.rs`）；按域 import 解析未实现（import 包络仍是空集）。KernelNative 侧仍是单 base 硬编码，跨域复用不可能。
 3. **per-domain 本地入口 / adapter**：`kcomp_service_dispatch` 之外，Direct 的按域 function table 与 Gate 的按域 trampoline。
 4. **组件支持范围元数据**：manifest **没有**任何字段声明组件支持哪些部署（`os/core/src/component/store.rs` 只解析 `manifest` 文本 + 组件条目）。
 5. **平台能力声明 + 拒绝语义**：MMU / IOMMU / 特权级 / 私有 AS 是否具备，以及"不具备就拒绝"的路径（`driver-model.md` §11 的能力诚实表）。
@@ -311,7 +312,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| 私有地址空间 | **机制已落地、未接线**（increment 3）：`KernelAddressSpace` 生命周期 + **双映射 assembly gateway**（`satp` 切换 / trap 往返 / 恢复 / 放弃 + 窄故障分派钩子），由 ArchTest 在 RV64+RV32 QEMU 驱动；组件生命周期**尚未调用**，Isolated 仍不执行组件 | 每域私有 AS 接入生命周期 | gateway 代码：`os/arch/src/riscv/gateway/`；Core 准备：`os/core/src/component/isolated.rs`；service call 仍是**同一内核 AS 内的进程内上下文切换**：`os/core/src/component/containment.rs:746-792`（`run_isolated`），切换点 `:773` |
+| 私有地址空间 | **已接线**（increment 3 机制 + increment 5 生命周期）：`KernelAddressSpace` 生命周期 + **双映射 assembly gateway**（`satp` 切换 / trap 往返 / 恢复 / 放弃 + 窄故障分派钩子）；生产调用方 = `component/isolated_lifecycle.rs`（Isolated 的 create / destroy 都经 gateway 在私有 AS 里执行，ArchTest `isolated-lifecycle*` 端到端证明） | 跨域 Gate（未实现）；KernelNative 的 service call 仍是**同一内核 AS 内的进程内上下文切换** | gateway 代码：`os/arch/src/riscv/gateway/`；Core 准备：`os/core/src/component/isolated.rs`；生命周期：`os/core/src/component/isolated_lifecycle.rs`；KernelNative service call：`os/core/src/component/containment.rs:746-792`（`run_isolated`），切换点 `:773` |
 | 上下文切换 | 只存 `ra/sp/s0-s11` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs:24-28`（`RiscvContext` 字段），**无 satp**；私有 AS 的切换走独立汇编路径（`gateway_enter` / `gateway_trap_entry`，不把 satp 塞进 `RiscvContext`） |
 | `activate()` | 写 satp + sfence，**运行期无人调用** | 按域激活 | `os/arch/src/riscv/mmu/mod.rs`；boot 直接构造 `Sv39AddressSpace`，ASID 硬编码 0。运行期切换由 `arch::riscv::gateway` 汇编完成（ArchTest 驱动，无生产调用方） |
 | U-mode / MPP | **无**（`mstatus` 只设 MIE） | U 域 | `UserEnvCall` 已解码（`os/arch/src/riscv/trap/mod.rs:66,97`）但 **panic**（`os/arch/src/riscv/trap/supervisor.rs`） |
@@ -320,7 +321,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| 跨域复用 image | **不可能（KernelNative 侧）**；**Isolated 按域放段已落地（increment 4，未接线）**：`component/isolated_load.rs` 按域重新放段 + 页级权限分离 + 按域重定位，ArchTest 在 RV64/RV32 证明 | 按域 import 解析 | KernelNative 侧：复用按 **artifact 名**（`image.rs:122-127`）、**单一 load base**（`image.rs:57`）、import **只重定位一次**（`loader.rs:156,317-372`）、入口是绝对 `usize` transmute 成 fn 指针（`containment.rs:906,913`）；Isolated 侧：`isolated_load.rs`、ArchTest `isolated-image` / `isolated-perm-*` |
+| 跨域复用 image | **不可能（KernelNative 侧）**；**Isolated 按域放段已落地并接线（increment 4/5）**：`component/isolated_load.rs` 按域重新放段 + 页级权限分离 + 按域重定位，`isolated_lifecycle.rs` 消费它（ArchTest 在 RV64/RV32 证明） | 按域 import 解析 | KernelNative 侧：复用按 **artifact 名**（`image.rs:122-127`）、**单一 load base**（`image.rs:57`）、import **只重定位一次**（`loader.rs:156,317-372`）、入口是绝对 `usize` transmute 成 fn 指针（`containment.rs:906,913`）；Isolated 侧：`isolated_load.rs` / `isolated_lifecycle.rs`、ArchTest `isolated-image` / `isolated-perm-*` / `isolated-lifecycle` |
 
 ### 7.3 部署 / 模式字段
 
@@ -383,8 +384,8 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
 | `os/components/scheduler_rr/src/lib.rs` | 旧的全局名字绑定已删除 | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
 | `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础 | 跨域需真实 AS 切换（未实现） |
-| `os/core/src/component/isolated.rs` | **increment 3**：Core 侧准备（校验 + gateway 页映射 + `PreparedActivation`）与窄故障策略 seam；**无生命周期调用方** | gateway 生命周期接线（后续 increment） |
-| `os/core/src/component/isolated_load.rs` | **increment 4**：按域放段 / 页级权限分离 / 逐段映射（`place` / `place_artifact` / `map_into`）；**无生命周期调用方**（ArchTest 直接驱动） | 生命周期接线 / 按域 import（后续 increment） |
+| `os/core/src/component/isolated.rs` | **increment 3**：Core 侧准备（校验 + gateway 页映射 + `PreparedActivation`）与窄故障策略 seam；**increment 5 起由 `isolated_lifecycle.rs` 调用** | 已完成（生命周期接线）；跨域 Gate 未实现 |
+| `os/core/src/component/isolated_load.rs` | **increment 4**：按域放段 / 页级权限分离 / 逐段映射（`place` / `place_artifact` / `map_into` / `map_mappings`）；**increment 5 起由 `isolated_lifecycle.rs` 生产消费**（ArchTest 直接驱动机制用例） | 按域 import（未实现） |
 | `os/core/src/component/loader.rs` | 单 base 放段 + 单次 import 重定位（KernelNative 路径不变）；私有 ELF API（解析 / 重定位 / 符号 / `kcomp_abi` 校验）被按域装载复用 | 按域 import 解析（未实现） |
 | `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/`、`gateway/` | **increment 3**：双映射 gateway 汇编（`gateway_enter` / `gateway_trap_entry`）+ 窄故障分派接缝已落地；`activate()` 仍无人调用；无 U-mode；ASID 恒 0 + 全量 `sfence.vma` | 按域激活接入生命周期 / U-mode / `ecall` / ASID（未实现） |
 | `os/core/src/component/store.rs`（manifest） | 无支持范围字段 | 组件支持范围元数据（未实现） |
@@ -467,19 +468,19 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现（step 5）** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
 | `kcore_endpoint_call` 文档与代码一致 | **未做**（文档过时） | `abi/core.toml:797-802` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
-| 部署字段（`InstanceRecord::execution_domain`） | **部分实现**：字段落地 + 创建入口**按域分派**。`KernelNative` 走现有链；`IsolatedNative` 是**拒绝包络 + 私有 AS 准备**（无私有 AS 能力 / 含 `kcore_*` import / 复用 KernelNative image → 装载前 `-ENOTSUP`；设备 / DMA / IRQ / 任务 / 出站调用 → `-ENOTSUP`），**不执行组件**；`SandboxedNative` 是 `todo!()` 占位。只有 KernelNative 可执行 | `registry.rs`、`load.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
+| 部署字段（`InstanceRecord::execution_domain`） | **已实现（两域可执行）**：字段落地 + 创建入口**按域分派**。`KernelNative` 走完整现有链；`IsolatedNative` **真正创建、启动、销毁**（私有 AS + 按域装载 + Core 预置窗口 + gateway；无私有 AS 能力 / 含 `kcore_*` import / 复用 KernelNative image → 装载前显式拒绝；设备 / DMA / IRQ / 任务 / 出站调用仍 `-ENOTSUP`）；`SandboxedNative` 是 `todo!()` 占位 | `registry.rs`、`load.rs`、`isolated_lifecycle.rs`、`exit.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
 | 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
 | 按 `(caller, callee)` 域选机制 | **设计完成，未开始** | 本文件 §2、§3 |
 | Direct / Gate 作为**绑定机制**分离 | **设计完成，未开始** | 本文件 §1、§4 |
 | "inflight 只计 Gate" 的契约约束 | **设计完成** | 本文件 §3 |
-| 私有地址空间 / `satp` 切换 / ASID | **部分实现（机制落地、生命周期未接线）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）**加上 increment 3 的双映射 assembly gateway**（Core 侧 `prepare` + arch 汇编进入 / trap 往返 / 恢复 / 放弃、窄 Core 故障分派钩子）已落地；ArchTest 在 **RV64 + RV32 QEMU** 证明「Core → 私有 AS → Core 往返」「私有 AS 内时钟中断在 Core AS / Core trap 栈处理后恢复」「组件页故障可恢复 / 可放弃」。**increment 4** 另落地**按域放段**（`isolated_load.rs`：页级权限分离、按域重定位、显式拒绝），ArchTest 证明真实 `.kcomp` 在私有 AS 里执行、段数据可读、页表按段权限强制（写 R+X text → scause 15 / 取指 R+W data → scause 12）、Core 专属映射不可达。**组件生命周期仍未调用**（Isolated 不执行组件），`activate()` 仍无生产调用方，**ASID 恒 0 + 全量 `sfence.vma`**（不实现 / 不声称 ASID 分配复用）；这是**协作式**边界（S-mode 可直接改 satp），不是对抗隔离 | `memory/address_space.rs`、`component/isolated.rs`、`component/isolated_load.rs`、`arch/src/riscv/gateway/`、`arch/src/vm.rs`、`riscv/mmu`、ArchTest `isolated-*` |
+| 私有地址空间 / `satp` 切换 / ASID | **部分实现（机制落地 + 生命周期已接线；ASID / U-mode 未实现）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）**加上 increment 3 的双映射 assembly gateway**（Core 侧 `prepare` + arch 汇编进入 / trap 往返 / 恢复 / 放弃、窄 Core 故障分派钩子）已落地；ArchTest 在 **RV64 + RV32 QEMU** 证明「Core → 私有 AS → Core 往返」「私有 AS 内时钟中断在 Core AS / Core trap 栈处理后恢复」「组件页故障可恢复 / 可放弃」。**increment 4** 另落地**按域放段**（`isolated_load.rs`：页级权限分离、按域重定位、显式拒绝），ArchTest 证明真实 `.kcomp` 在私有 AS 里执行、段数据可读、页表按段权限强制（写 R+X text → scause 15 / 取指 R+W data → scause 12）、Core 专属映射不可达。**increment 5 起组件生命周期已接线**（`isolated_lifecycle.rs`：Isolated 的 create / destroy 经 gateway 在私有 AS 里执行，失败即退役 AS + 归还预置窗口），`activate()` 仍无生产调用方，**ASID 恒 0 + 全量 `sfence.vma`**（不实现 / 不声称 ASID 分配复用）；这是**协作式**边界（S-mode 可直接改 satp），不是对抗隔离 | `memory/address_space.rs`、`component/isolated.rs`、`component/isolated_load.rs`、`component/isolated_lifecycle.rs`、`arch/src/riscv/gateway/`、`arch/src/vm.rs`、`riscv/mmu`、ArchTest `isolated-*` / `isolated-lifecycle*` |
 | U-mode / `ecall` | **未开始** | `supervisor.rs:63-66`（`UserEnvCall` panic） |
-| 跨域 image 复用（按域放段 / import） | **按域放段已实现（inactive path）**：`component/isolated_load.rs` 按域重新放段 + 重定位 + 页级权限分离，ArchTest `isolated-image` / `isolated-perm-text` / `isolated-perm-data` 在 RV64+RV32 证明；KernelNative image 复用仍被拒绝（`load.rs::validate_isolated_load`）。**按域 import 解析未开始**（空集包络） | `isolated_load.rs`、`load.rs::validate_isolated_load` |
-| `kcore_*` import 的 Isolated / Sandbox 解析 | **未开始**（Isolated 装载**拒绝任何 `kcore_*` import**，绝不回退到裸 Core 地址；per-domain gate trampoline 未实现） | `load.rs::check_isolated_imports`、`loader.rs` |
+| 跨域 image 复用（按域放段 / import） | **按域放段已实现并接线（increment 4/5）**：`component/isolated_load.rs` 按域重新放段 + 重定位 + 页级权限分离，`isolated_lifecycle.rs` 经 image 表登记后消费；ArchTest `isolated-image` / `isolated-perm-*` / `isolated-lifecycle` 在 RV64+RV32 证明。KernelNative image 复用仍被拒绝（`load.rs::validate_isolated_load`；image 表按 artifact 名唯一、不区分域）。**按域 import 解析未开始**（空集包络） | `isolated_load.rs`、`isolated_lifecycle.rs`、`load.rs::validate_isolated_load` |
+| `kcore_*` import 的 Isolated / Sandbox 解析 | **未开始**（Isolated 装载**拒绝任何 import**，绝不回退到裸 Core 地址；per-domain gate trampoline 未实现）。increment 5 的内存路径选择 **Core 预置实例窗口、无 import 面**（见 §6.2）：Isolated 组件本增量不能调用 `kcore_memory_acquire` / `release` | `load.rs::check_isolated_imports`、`isolated_load.rs::check_empty_imports`、`isolated_lifecycle.rs` |
 | 组件支持范围元数据 | **未开始** | manifest 无字段 |
 | 重入嵌套深度上限 | **未开始** | 只有链成员门禁 |
 
-**一句话：** 今天真实存在的是 **KernelNative 单域**；"部署决定调用机制"目前是**契约与缺口清单**，不是可用能力。
+**一句话：** 今天真实可执行的是 **KernelNative** 与**受限的 IsolatedNative**（私有 AS + gateway 生命周期；无 import 面、无跨域服务、协作式边界）；"部署决定调用机制"仍是**契约与缺口清单**。
 
 ---
 

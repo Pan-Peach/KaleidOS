@@ -16,12 +16,11 @@ use crate::component::containment::{self, CallOutcome, KcompCreateArgs};
 use crate::component::elf::ElfObject;
 use crate::component::endpoint::{self, EndpointError, ExecutionDomain};
 use crate::component::image::{self, ComponentImageId};
+use crate::component::isolated_lifecycle;
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, failure, registry};
 use crate::errno::Errno;
-use crate::memory::address_space::{
-    self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange, VirtualRange,
-};
+use crate::memory::address_space;
 use crate::task::TaskId;
 use spin::Mutex;
 
@@ -79,10 +78,22 @@ pub enum ComponentLoadError {
     /// 的 import 解析（Core gate trampoline）尚未实现，任何 `kcore_*` UNDEF 都
     /// 在装载**之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     IsolatedImportUnsupported,
-    /// `IsolatedNative` 装载不得复用**已按 KernelNative 放段 / 重定位**的 image：
-    /// 其 VA 布局与 import 目标（裸 Core 地址）都是共享内核 AS 的产物，复用等于
-    /// 把裸 Core 地址带进 Isolated 域。按域装载落地前一律拒绝。
+    /// `IsolatedNative` 装载不得复用**已登记**的 image：KernelNative 的放段结果
+    /// 其 VA 布局与 import 目标（裸 Core 地址）都是共享内核 AS 的产物，复用等于把
+    /// 裸 Core 地址带进 Isolated 域；image 表按 artifact 名唯一、**不区分执行域**，
+    /// 因此本增量连 Isolated 自己的同名 image 也拒绝复用（按 `(name, domain)`
+    /// 索引留给后续）。
     IsolatedImageReuse,
+    /// `IsolatedNative` 按域放段失败（段出窗 / 重叠 / 权限不可表达 / 入口不可执行 /
+    /// 地址溢出 / 含任何 UNDEF import 的空集包络 / 后端拒绝映射）：镜像不适配该域，
+    /// 显式拒绝（不含 `kcore_*` import——那一类由门禁以 `-ENOTSUP` 区分）。
+    IsolatedPlacementFailed,
+    /// `IsolatedNative` 的 config 负载放不进实例窗口（或指针 / 长度不自洽）：
+    /// 显式拒绝，绝不截断。
+    IsolatedConfigRejected,
+    /// Isolated 的 `kcomp_instance_create` 在私有 AS 内故障，由 gateway 的 Core
+    /// 故障分派判为不可恢复（`Outcome::Faulted`）；实例未完整构造、不调用 destroy。
+    CreateFaulted,
 }
 
 impl ComponentLoadError {
@@ -114,6 +125,19 @@ pub fn current_component() -> Option<ComponentId> {
     *CURRENT.lock()
 }
 
+/// 在 `CURRENT = Some(component)` 的上下文里执行 `f`（返回后恢复嵌套前的值）。
+///
+/// 与 KernelNative create 同一身份纪律：组件在 Core 拥有的边界内看到自己是
+/// "正在被创建的实例"；嵌套调用（组件 create 里再创建组件）保存 / 恢复。
+/// Core 内部 API（不在组件导出白名单里）。
+pub fn with_current<R>(component: ComponentId, f: impl FnOnce() -> R) -> R {
+    let previous = *CURRENT.lock();
+    *CURRENT.lock() = Some(component);
+    let result = f();
+    *CURRENT.lock() = previous;
+    result
+}
+
 /// 用默认配置 + 指定部署域创建一个实例（无 config 负载）。
 ///
 /// 组件 ABI `kcore_component_load` 与 monitor `load <name> [kind]` 的便利入口；
@@ -130,8 +154,8 @@ pub fn load_and_start(
 ///
 /// `kind` 是**部署请求**（Policy proposes）：本函数**按执行域分派**创建路径——
 /// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative`
-/// 走 [`create_isolated_native`] 的**受限门禁**（能力 / import 包络 / image 复用
-/// 任一不满足即 `-ENOTSUP`，不执行组件）；`SandboxedNative` 尚无占位实现
+/// 走 [`create_isolated_native`] 的门禁（能力 / import 包络 / image 复用任一不满足
+/// 即显式拒绝）后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 尚无占位实现
 /// （`todo!()`）。任何域都**绝不静默降级成 native 跑**
 /// （`docs/architecture/deployment.md` §2 ⑤/§10）。
 ///
@@ -263,65 +287,44 @@ fn create_kernel_native(
     }
 }
 
-/// `IsolatedNative` 的**受限装载门禁**（本函数**不执行任何组件**）。
+/// `IsolatedNative` 的创建路径（increment 5：真正创建、启动、销毁）。
 ///
-/// 顺序（任一不满足即显式拒绝，绝不降级成 KernelNative）：
+/// 本函数只做**装载前置门禁**（能力 / image 复用 / import 包络），随后把
+/// 创建编排交给 [`isolated_lifecycle::create`]：
+///
 /// 1. **平台能力**：当前 profile 必须有私有地址空间 backend（NoMMU / 无后端 → 拒绝）；
 /// 2. **image 复用 + import 包络**：不得复用 KernelNative 放段结果，不得含
 ///    未支持的 `kcore_*` import（见 [`validate_isolated_load`]）；
-/// 3. 建立该实例的私有 AS 并只映射装载镜像；
-/// 4. 声明实例 → `resolve` → `begin_start`——`kcomp_instance_create` **不调用**：
-///    真正的 Isolated 入口执行需要 assembly gateway / satp 切换（后续 increment）。
+/// 3. 私有 AS + 按域放段 + Core 预置窗口（栈 / 实例窗口）；
+/// 4. `kcomp_instance_create` 在私有 AS 内经 assembly gateway 执行 → `Ready`；
+///    任一步失败 = 退役 AS + 归还窗口 backing + `Failed`（半成品不留）。
 fn create_isolated_native(
     name: &[u8],
-    _args: &KcompCreateArgs,
+    args: &KcompCreateArgs,
 ) -> Result<ComponentId, ComponentLoadError> {
     // (1) 能力门禁：trait 可用 ≠ 隔离能力（NoMMU 也实现 AddressSpaceBackend）。
     if !address_space::isolation_capable() {
         return Err(ComponentLoadError::IsolationUnsupported);
     }
 
-    // (2) 装载前置门禁；blob 只读一次，随后的装载用同一份字节。
+    // (2) 装载前置门禁；blob 只读一次，随后的按域装载用同一份字节。
     let blob = validate_isolated_load(name)?;
-    let loaded = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
-    let image = image::get_images()
-        .lock()
-        .register(name, loaded)
-        .map_err(|_| ComponentLoadError::ImageFailed)?;
 
-    let id = registry::get_registry()
-        .lock()
-        .declare(image, ExecutionDomain::IsolatedNative)
-        .map_err(|_| ComponentLoadError::DeclareFailed)?;
-
-    // (3) 私有 AS：只映射该实例自己的装载镜像（不做 Core 段 / 堆 / MMIO 的全量映射）。
-    let space = create_isolated_address_space(id, image)?;
-    {
-        let mut reg = registry::get_registry().lock();
-        reg.record_address_space(id, space)
-            .map_err(|_| ComponentLoadError::StartFailed)?;
-    }
-
-    // (4) 生命周期只推进到 `Starting`：没有执行器就不会有 Ready 实例。
-    {
-        let mut reg = registry::get_registry().lock();
-        reg.resolve(id)
-            .map_err(|_| ComponentLoadError::ResolveFailed)?;
-        reg.begin_start(id)
-            .map_err(|_| ComponentLoadError::StartFailed)?;
-    }
-
-    Ok(id)
+    // (3) 生命周期编排（increment 5）。
+    isolated_lifecycle::create(name, &blob, args)
 }
 
 /// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
 /// 字节，调用方用同一份 blob 装载（不重复读取）。
 ///
-/// - **image 复用拒绝**：image 表按 artifact 名唯一，而今天登记的都是
-///   KernelNative 放段 / 重定位结果（import = 裸 Core 函数地址，VA 按共享内核
-///   AS 选定）。复用它们正是"静默降级"——按域装载落地前一律拒绝。
-/// - **import 包络**：本阶段唯一受支持的 Isolated import 集合是**空集**
-///   （`kcore_*` 尚无 per-domain gate 解析）。任何 `kcore_*` UNDEF 在装载前拒绝。
+/// - **image 复用拒绝**：image 表按 artifact 名唯一、**不区分执行域**。复用一份
+///   已登记的 KernelNative 放段结果 = 把裸 Core 地址与共享内核 AS 的 VA 布局带进
+///   Isolated 域（静默降级）；复用一份已登记的 Isolated image（同域第二实例）本
+///   增量同样拒绝——按 `(name, domain)` 索引留给后续，本阶段一个 artifact 只建
+///   一个 Isolated 实例。
+/// - **import 包络 = 空集**：本增量没有 per-domain trampoline。任何 `kcore_*`
+///   UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
+///   按域装载的空集包络拒绝（`isolated_load::place`，`-EINVAL`）。
 fn validate_isolated_load(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
     if image::get_images().lock().find(name).is_some() {
         return Err(ComponentLoadError::IsolatedImageReuse);
@@ -364,44 +367,6 @@ fn check_isolated_imports(blob: &[u8]) -> Result<(), ComponentLoadError> {
 /// 无法解析，由 loader 自己以 `UnresolvedSymbol` 拒绝。
 fn is_kcore_import(name: &[u8]) -> bool {
     name.starts_with(b"kcore_")
-}
-
-fn create_isolated_address_space(
-    owner: ComponentId,
-    image: ComponentImageId,
-) -> Result<AddressSpaceHandle, ComponentLoadError> {
-    let handle = address_space::create_address_space_for(owner).map_err(|error| match error {
-        // 能力门禁的兜底：backend 自己声明没有私有 AS → 同样是"域不支持"，
-        // 不是 I/O 失败。
-        MapError::Unsupported => ComponentLoadError::IsolationUnsupported,
-        _ => ComponentLoadError::StartFailed,
-    })?;
-
-    let mapping = {
-        let images = image::get_images().lock();
-        let comp_image = images.get(image).ok_or(ComponentLoadError::ImageFailed)?;
-        let backing = comp_image.memory.region();
-        let mapped_size = crate::memory::align_up_page(comp_image.text_size);
-
-        if mapped_size == 0 || mapped_size > backing.size {
-            return Err(ComponentLoadError::StartFailed);
-        }
-
-        Mapping {
-            virtual_range: VirtualRange {
-                base: comp_image.base,
-                size: mapped_size,
-            },
-            physical_range: PhysicalRange {
-                base: backing.base,
-                size: mapped_size,
-            },
-            permission: MappingPermission::READ | MappingPermission::EXECUTE,
-        }
-    };
-    address_space::map(handle, mapping).map_err(|_| ComponentLoadError::StartFailed)?;
-
-    Ok(handle)
 }
 
 ///
@@ -541,6 +506,25 @@ mod tests {
         // - CreateFailed / CreatePanicked / EndpointCommitFailed：入口体在 fake
         //   context backend 下不执行（恒 Returned(0)），无法产生非零返回、panic
         //   或 pending publication——真实执行 / 失败路径由 QEMU CoreTest 覆盖。
+    }
+
+    /// `with_current` 的作用域 / 恢复语义（生命周期接线用的身份纪律）：
+    /// 嵌套调用保存 / 恢复外层身份，最外层返回后回到进入前的值。
+    #[test]
+    fn with_current_scopes_and_restores_the_creating_identity() {
+        let _serial = LOAD_TEST_LOCK.lock();
+        let before = current_component();
+        let first = ComponentId::from_raw(0x51D1);
+        let second = ComponentId::from_raw(0x51D2);
+
+        with_current(first, || {
+            assert_eq!(current_component(), Some(first));
+            with_current(second, || {
+                assert_eq!(current_component(), Some(second));
+            });
+            assert_eq!(current_component(), Some(first), "嵌套返回后恢复外层身份");
+        });
+        assert_eq!(current_component(), before, "最外层返回后恢复进入前的值");
     }
 
     /// Sandbox 执行器未实现（`todo!()` 占位），不是静默降级成 native。

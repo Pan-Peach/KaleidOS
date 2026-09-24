@@ -13,17 +13,21 @@ pub mod exit;
 pub mod export;
 pub mod failure;
 pub mod image;
-/// 私有 AS 切换网关的 Core 侧准备（increment 3：机制已落地、生命周期未接线；
-/// 仅 S-mode + MMU + RISC-V 目标有意义，其余 profile 不提供、也不降级）。
+/// 私有 AS 切换网关的 Core 侧准备（increment 3 机制，increment 5 起由
+/// `isolated_lifecycle` 生产调用；仅 S-mode + MMU + RISC-V 目标有意义，
+/// 其余 profile 不提供、也不降级）。
 #[cfg(all(
     feature = "vm-mmu",
     feature = "supervisor",
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
+/// Isolated 域**实例生命周期**（increment 5）：私有 AS + 按域镜像 + Core 预置
+/// 实例窗口 + runtime slot，经 assembly gateway 执行 `kcomp_instance_create` /
+/// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
+pub mod isolated_lifecycle;
 /// 按域装载（increment 4）：把一个已解析的 `.kcomp` 的段按页级权限放进实例的
-/// 私有 AS。**仍是 inactive path**——没有生命周期调用方，ArchTest 直接驱动
-/// （见 `docs/architecture/deployment.md` §6/§10）。
+/// 私有 AS。**increment 5 起由生命周期调用**（见 `isolated_lifecycle`）。
 pub mod isolated_load;
 pub mod load;
 pub mod loader;

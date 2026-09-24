@@ -28,8 +28,10 @@
 //!
 //! # 身份、栈与门禁
 //!
-//! - **执行上下文**：destroy 跑在 Core-owned 临时栈上（与 create 对称，
-//!   见 [`containment::call_component_destroy`]）。
+//! - **执行上下文**：KernelNative 的 destroy 跑在 Core-owned 临时栈上（与 create
+//!   对称，见 [`containment::call_component_destroy`]）；Isolated 的 destroy 跑在
+//!   该实例的私有 AS 内经 assembly gateway（`isolated_lifecycle::destroy`），两者
+//!   按 `InstanceRecord::execution_domain` 分派，**绝不静默互换**。
 //! - **身份**：入口的 ambient identity = **被停止的实例**（`EscapeKind::Exit`），
 //!   不是发起 stop 的 monitor / 其他组件，也不是 `load::current_component()`。
 //!   这是本文件与 `containment` 协同保证的契约（host 测试锁定）。
@@ -65,7 +67,9 @@
 //!   registry 不删除记录、image 不 unload。
 
 use crate::component::containment::{self, CallOutcome};
+use crate::component::endpoint::ExecutionDomain;
 use crate::component::image;
+use crate::component::isolated_lifecycle;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::{self, RegistryError};
 use crate::component::{ComponentId, failure, runtime_slot};
@@ -118,18 +122,28 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     }
 
     // 步骤 2：必需销毁入口。参数 = 实例在 create 时记录的 opaque state
-    // （可为 NULL，无状态组件合法）。identity = 被停止实例（containment 的 Exit 边界）。
-    let (image_id, instance_state) = {
+    // （可为 NULL，无状态组件合法）。身份 = 被停止实例：KernelNative 走
+    // containment 的 Exit 边界；Isolated 由 gateway 进入前的 CURRENT + AS owner 承载。
+    // **按执行域分派**：KernelNative 在 Core 拥有的共享 AS 栈上调用；Isolated 在
+    // 该实例的私有 AS 内经 assembly gateway 调用（两者都绝不静默互换）。
+    let (image_id, instance_state, domain) = {
         let reg = registry::get_registry().lock();
         let record = reg.get(id).expect("begin_stop 后实例必然存在");
-        (record.image, record.instance_state)
+        (record.image, record.instance_state, record.execution_domain)
     };
     let destroy = image::get_images()
         .lock()
         .get(image_id)
         .map(|image| image.destroy)
         .expect("实例的 image 必然常驻登记（pinned-until-reboot）");
-    let outcome = containment::call_component_destroy(destroy, instance_state, id);
+    let outcome = match domain {
+        ExecutionDomain::KernelNative => {
+            containment::call_component_destroy(destroy, instance_state, id)
+        }
+        ExecutionDomain::IsolatedNative => isolated_lifecycle::destroy(id, destroy, instance_state),
+        // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
+        ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
+    };
 
     // 步骤 3 的结果分类 + 步骤 4/5：兜底 → `Stopped`。
     complete_stop(id, outcome)

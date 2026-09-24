@@ -25,7 +25,7 @@
 ## 暴露什么机制
 
 - 类型别名（按 cfg 选定具体实现）：`CpuImpl`、`ConsoleImpl`、`ResetImpl`、`TimerImpl`、`InterruptImpl`、`ContextImpl`、`AddressSpaceImpl`、`ComponentRelocationImpl`。
-- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset`（`lib.rs`）、`AddressSpaceBackend`（`vm.rs`）、`ComponentStore`（`store.rs`）、`RelocationBackend`（`component.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`NoMmuAddressSpace`（`nommu.rs`）、`activate` / `flush_tlb`（`riscv/mmu/mod.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`gateway_enter` / `gateway_trap_entry` / `pages` / `register_component_fault_handler`（`riscv/gateway/`）。
+- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset`（`lib.rs`）、`AddressSpaceBackend`（`vm.rs`）、`ComponentStore`（`store.rs`）、`RelocationBackend`（`component.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`NoMmuAddressSpace`（`nommu.rs`）、`activate` / `flush_tlb`（`riscv/mmu/mod.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`gateway_enter` / `gateway_trap_entry` / `pages` / `register_component_fault_handler`（`riscv/gateway/`，`Transition` 携带入口 `arg0` / `arg1`）。
 
 ## 明确不做
 
@@ -57,6 +57,6 @@
 | `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf}.rs` | RISC-V family 机制 |
 | `os/arch/src/riscv/context/{mod,switch32.S,switch64.S}` | 上下文切换 |
 | `os/arch/src/riscv/trap/{mod,supervisor,machine}.rs` + `trap*.S` | trap 入口 / 分发 / S-mode handler |
-| `os/arch/src/riscv/gateway/{mod,gateway32.S,gateway64.S}` | 私有 AS assembly gateway（双映射 `satp` 切换 / trap 往返 / 窄故障分派接缝；increment 3，无生产调用方） |
+| `os/arch/src/riscv/gateway/{mod,gateway32.S,gateway64.S}` | 私有 AS assembly gateway（双映射 `satp` 切换 / trap 往返 / 窄故障分派接缝；increment 3 机制，increment 5 起由 `component/isolated_lifecycle.rs` 生产调用；入口 `a0` / `a1` 由 Core 预置、汇编只搬运） |
 | `os/arch/src/riscv/mmu/{mod,address_space,sv32,sv39,test_pool}.rs` | Sv32 / Sv39 页表机制 |
 | `os/arch/Kconfig` | `ARCH_*` / `PRIVILEGE_*` / `VM_*` choice |

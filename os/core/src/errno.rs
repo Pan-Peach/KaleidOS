@@ -177,6 +177,11 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::IsolationUnsupported
             | ComponentLoadError::IsolatedImportUnsupported
             | ComponentLoadError::IsolatedImageReuse => Errno::ENOTSUP,
+            // 按域放段失败 / config 负载不合规：镜像 / 请求不适配该域（EINVAL）。
+            ComponentLoadError::IsolatedPlacementFailed
+            | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
+            // 组件在私有 AS 内故障（gateway 放弃）：与其它组件失败同档。
+            ComponentLoadError::CreateFaulted => Errno::EIO,
         }
     }
 }
@@ -523,6 +528,9 @@ mod tests {
             ComponentLoadError::IsolationUnsupported,
             ComponentLoadError::IsolatedImportUnsupported,
             ComponentLoadError::IsolatedImageReuse,
+            ComponentLoadError::IsolatedPlacementFailed,
+            ComponentLoadError::IsolatedConfigRejected,
+            ComponentLoadError::CreateFaulted,
         ] {
             let expected = match error {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
@@ -549,6 +557,9 @@ mod tests {
                 ComponentLoadError::IsolationUnsupported
                 | ComponentLoadError::IsolatedImportUnsupported
                 | ComponentLoadError::IsolatedImageReuse => Errno::ENOTSUP,
+                ComponentLoadError::IsolatedPlacementFailed
+                | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
+                ComponentLoadError::CreateFaulted => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }

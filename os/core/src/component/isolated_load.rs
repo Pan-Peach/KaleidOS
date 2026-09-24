@@ -9,9 +9,9 @@
 //!   │  loader::apply_relocations（同一份 RISC-V 重定位实现，按域 base 重算）
 //!   ▼
 //! PlacedImage（段清单 + 入口 + backing region）
-//!   │  map_into：逐段 VA → backing PA 落进实例 AS（失败回滚本次已落段）
+//!   │  map_into / map_mappings：逐段 VA → backing PA 落进实例 AS（失败回滚本次已落段）
 //!   ▼
-//! 实例 AS 里可经 gateway 进入的镜像（**仍是 inactive path**）
+//! 实例 AS 里可经 gateway 进入的镜像（increment 5 起由生命周期调用）
 //! ```
 //!
 //! # 与 KernelNative loader 的关系
@@ -20,8 +20,10 @@
 //!   的私有 API，本模块直接复用——同一份 arch 重定位实现，不复制算法）。
 //! - **不复用**：KernelNative 的放段结果。那一份的 VA 布局与 import 目标都是
 //!   共享内核 AS 的产物（`load.rs::validate_isolated_load` 已在装载前拒绝）。
-//!   本模块**不调用** `loader::load_component`，也不经 `image` 表注册——镜像
-//!   登记与生命周期接线是后续 increment。
+//!   本模块**不调用** `loader::load_component`。image 登记走
+//!   [`PlacedImage::into_loaded_component`]（lease 归 image 表），落段在登记
+//!   之后仍可用 [`PlacedImage::mappings`] + [`map_mappings`] 完成——生命周期
+//!   接线见 `component/isolated_lifecycle.rs`（increment 5）。
 //!
 //! # 权限与页分离（本 increment 的核心决定）
 //!
@@ -54,7 +56,7 @@
 //! （真正的强制边界是 U-mode，未实现）。ASID 恒 0 + 全量 `sfence.vma`。
 
 use super::elf::{ElfError, ElfObject, Section};
-use super::loader::{self, LoaderError};
+use super::loader::{self, LoadedComponent, LoaderError};
 use crate::memory;
 use crate::memory::address_space::{
     self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange, VirtualRange,
@@ -207,6 +209,34 @@ impl PlacedImage {
             permission: segment.permission,
         }
     }
+
+    /// 全部段的映射清单（按 ELF section 顺序；页级权限分离）。
+    ///
+    /// 生命周期接线（increment 5）用它在 **image 登记之后**仍然能把同一份段
+    /// 规划落进实例 AS（lease 归 image 表，规划不携带借用）。
+    pub fn mappings(&self) -> Vec<Mapping> {
+        self.segments
+            .iter()
+            .map(|segment| self.mapping(segment))
+            .collect()
+    }
+
+    /// 转成 image 表登记所需的 [`LoadedComponent`]（lease 随本次转换归 image 表）。
+    ///
+    /// Isolated image 的 `create` / `destroy` 是**实例 AS 内**的 VA；
+    /// `service_dispatch` 恒为 `None`（定义了 dispatcher 的镜像在放段前已被
+    /// [`IsolatedLoadError::ServiceDispatchUnsupported`] 拒绝）。
+    pub fn into_loaded_component(self) -> LoadedComponent {
+        LoadedComponent {
+            base: self.base,
+            create: self.create,
+            destroy: self.destroy,
+            service_dispatch: None,
+            text_size: self.text_size,
+            abi: self.abi,
+            memory: Some(self.region),
+        }
+    }
 }
 
 /// 按默认窗口/基址放段（**不落 AS**；ArchTest / 未来生命周期接线消费）。
@@ -229,14 +259,26 @@ pub fn place_artifact(name: &[u8]) -> Result<PlacedImage, IsolatedLoadError> {
 /// 本函数**不**做 gateway 页映射（那是 `component::isolated::prepare` 的职责），
 /// 也不触碰任何生命周期路径——调用方负责持有句柄与后续的 `prepare` / `enter`。
 pub fn map_into(handle: AddressSpaceHandle, image: &PlacedImage) -> Result<(), IsolatedLoadError> {
+    map_mappings(handle, &image.mappings())
+}
+
+/// 把一条**已记录的映射清单**落进实例 AS（失败即回滚本次已落映射）。
+///
+/// 与 [`map_into`] 同一机制，只是不携带 [`PlacedImage`]：生命周期接线在 image
+/// 登记（lease 转移给 image 表）之后用它落段。没有私有 AS 能力（NoMMU / 无
+/// backend）时显式拒绝，绝不把恒等翻译当 AS。
+pub fn map_mappings(
+    handle: AddressSpaceHandle,
+    mappings: &[Mapping],
+) -> Result<(), IsolatedLoadError> {
     // 没有私有 AS 能力（NoMMU / 无 backend）就显式拒绝：绝不把恒等翻译当 AS。
     if !address_space::isolation_capable() {
         return Err(IsolatedLoadError::IsolationUnsupported);
     }
     let mut mapped: Vec<VirtualRange> = Vec::new();
-    for segment in &image.segments {
-        match address_space::map(handle, image.mapping(segment)) {
-            Ok(()) => mapped.push(segment.virtual_range),
+    for mapping in mappings {
+        match address_space::map(handle, *mapping) {
+            Ok(()) => mapped.push(mapping.virtual_range),
             Err(error) => {
                 // 半套镜像不留在实例 AS 里（best effort 回滚本次新落的段）。
                 for range in mapped.iter().rev() {
@@ -619,6 +661,31 @@ mod tests {
             assert_eq!(mapping.physical_range.size, segment.virtual_range.size);
             assert_eq!(mapping.permission, segment.permission);
         }
+    }
+
+    /// 生命周期接线（increment 5）的转换：`PlacedImage` → image 表登记的
+    /// `LoadedComponent`（lease 随转换转移；create / destroy 是实例内 VA；
+    /// Isolated image 没有 `service_dispatch`）。
+    #[test]
+    fn into_loaded_component_preserves_the_placement_truth() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let image = place(ISOLATED_KCOMP).expect("place");
+        let base = image.base();
+        let create = image.create();
+        let destroy = image.destroy();
+        let text_size = image.text_size();
+        let abi = image.abi();
+
+        let loaded = image.into_loaded_component();
+
+        assert_eq!(loaded.base, base);
+        assert_eq!(loaded.create, create);
+        assert_eq!(loaded.destroy, destroy);
+        assert_eq!(loaded.service_dispatch, None, "Isolated image 无服务入口");
+        assert_eq!(loaded.text_size, text_size);
+        assert_eq!(loaded.abi, abi);
+        assert!(loaded.memory.is_some(), "lease 必须随转换转移给 image 表");
     }
 
     /// 放段是确定性的；换基址只平移 VA（重定位按域重算），偏移不变。
