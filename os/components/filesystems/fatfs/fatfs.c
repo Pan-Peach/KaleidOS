@@ -20,8 +20,8 @@
  *              没有 endpoint 就没有块设备。
  *
  * `config_abi` 是布局指纹（8 字节 ASCII "FATFSCFG" 的大端读数）：对不上直接拒绝
- * 创建，不静默按空配置跑。composer 的镜像定义见
- * `os/components/block_chain/src/lib.rs`（同一布局、同一指纹）。 */
+ * 创建，不静默按空配置跑。组合方（CoreTest）的 create config 定义见
+ * `os/components/tests/core_test/src/runtime/filesystem.rs`（同一布局、同一指纹）。 */
 struct fatfs_create_config
 {
     uint64_t endpoint;

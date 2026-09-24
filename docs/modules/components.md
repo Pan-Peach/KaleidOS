@@ -5,7 +5,7 @@
 
 ## 组件 crates
 
-实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；测试 / 遗留 —— `block_chain`、`littlefs_chain`、`filesystems/fs_consumer`、`logger`、`Kconfig`。
+实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 是组件选择扩展点（当前无符号）。
 
 **test-only 与生产的分界**：test-only fixture / 组件一律放 `os/components/tests/`；`.kcomp` 名取目录 basename（`load <basename>`），所以搬路径不改组件名，`load core_test` / `load kcomp_c_smoke` 等运行时契约不变。
 
@@ -18,7 +18,6 @@
 | `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
 | `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
 | `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
-| `littlefs_chain` | `os/components/littlefs_chain/` | Rust `.kcomp` | **多实例组合策略**：2× `ram_blk_rw` → 2× `littlefs`（各带独立块设备与 `lfs_t`），证明 Core endpoint/instance 模型承载两个互不干扰的 FS 实例 |
 | `vfs` | `os/components/filesystems/vfs/` | 空目录 | 占位，无文件、无 `Cargo.toml` |
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
@@ -29,7 +28,6 @@
 | `kcomp_isolated_svc` | `os/components/tests/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider（increment 6）。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` / `isolated-stale-access` / `isolated-ready-fault` 证明跨域 Gate、stale 阻断与逻辑重启 |
 | `kcomp_min` | `os/components/tests/kcomp_min/` | Rust staticlib（host fixture） | 手写最小生命周期入口，供 `os/core/build.rs` host 测试钉重定位布局；**不在 `KCOMP_SRCS`** |
 | `kbench` | `os/components/kbench/` | Rust `.kcomp` | 板端 benchmark：clock/query + 真实 `sched.yield_roundtrip` 交接 |
-| `logger` | `os/components/logger/` | Rust lib（workspace 成员） | 结构化日志组件 stub（M2），无 `.kcomp`、无实现 |
 | `kcomp-sdk` | `os/components/kcomp-sdk/` | Rust lib + C 头 / CRT | 组件 SDK/CRT，**不是可加载组件**（见下） |
 
 ## `kcomp-sdk`
@@ -61,11 +59,11 @@
 ```
 
 - **导出白名单**：`abi/core.toml` 声明 **40** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。
-- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw block_chain littlefs_chain`）与 `KCOMP_C_SRCS`（C：`tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer`）；`.kcomp` 名取目录 basename（`load <basename>`）。
+- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw`）与 `KCOMP_C_SRCS`（C：`tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs`）；`.kcomp` 名取目录 basename（`load <basename>`）。
 
 ## 测试 / smoke vs 真实组件
 
-- **真实策略 / 服务 / 驱动**：`scheduler_rr`（policy）、`driver_prober`（service）、`drivers/virtio_blk`（driver）、`filesystems/fatfs`（service）；`logger` 是尚未实现的真实服务 stub。
+- **真实策略 / 服务 / 驱动**：`scheduler_rr`（policy）、`driver_prober`（service）、`drivers/virtio_blk`（driver）、`filesystems/fatfs`（service）。
 - **测试 / smoke / 基准**：`core_test`（CoreTest **权威**：唯一的组件 / 系统集成编排者，见 [testing.md §3](../development/testing.md)，但仍只是 test-only 镜像，故与 fixture 同放 `tests/`）、`kcomp_smoke`、`kcomp_c_smoke`、`kcomp_panic`、`kcomp_isolated`（按域装载 fixture）、`kcomp_isolated_life`（Isolated 生命周期 / destroy 故障注入 fixture）、`kcomp_isolated_svc`（跨域服务 provider fixture）、`kcomp_isolated_bad`（放段失败 fixture）、`kcomp_min`（host fixture）——全部在 `os/components/tests/`；`kbench`（度量）留在生产位置。
 - `filesystems/vfs` 是空占位，两者都不是。
 

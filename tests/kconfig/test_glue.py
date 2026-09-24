@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kconfig / Makefile 胶水契约测试（host-only，快速；`make test-kconfig` 调用）。
+"""Kconfig / Makefile 胶水契约测试（host-only，快速；`make _test-kconfig` 调用）。
 
 只测这一层胶水，不编译任何 Rust：
 
@@ -158,16 +158,22 @@ def check_clean_kernel_gets_config(tmp):
 
 
 def check_fmt_check_gets_config(tmp):
-    """`make fmt check` 里 check 仍拿到 KCFG_*。
+    """`make fmt check` 里 check 仍拿到 KCFG_*（config 驱动的递归构建门禁）。
+
+    只断言契约本身：混合 goal 里 `check` 仍以递归 make 调用配置驱动的构建门禁
+    （`_test-build`），不钉死任何 recipe 文本（例如 clippy 的 target triple）。
 
     MAKE=true：-n 下含 `$(MAKE)` 的递归行仍会被执行，把它变成 no-op，避免
-    测试递归进 test-host / test-build（那会碰共享 build/）。
+    测试递归进 test-host / _test-build（那会碰共享 build/）。
     """
     config = build_config(tmp, "qemu_rv64")
     result = run(["make", "-n", f"KCONFIG_CONFIG={config}", "MAKE=true", "fmt", "check"])
     expect_ok(result, "make fmt check")
-    if "--target riscv64gc-unknown-none-elf" not in result.stdout:
-        raise CheckFailed("check lost its config in `make fmt check`:\n" + result.stdout)
+    if "_test-build" not in result.stdout:
+        raise CheckFailed(
+            "check no longer drives the config-dependent recursive build "
+            "(_test-build) in `make fmt check`:\n" + result.stdout
+        )
 
 
 def check_clean_on_fresh_checkout(tmp):
@@ -232,9 +238,9 @@ def main() -> int:
                 continue
         print(f"PASS {check.__name__}")
     if failed:
-        print(f"test-kconfig: {len(failed)}/{len(CHECKS)} FAILED: {', '.join(failed)}")
+        print(f"_test-kconfig: {len(failed)}/{len(CHECKS)} FAILED: {', '.join(failed)}")
         return 1
-    print(f"test-kconfig: {len(CHECKS)}/{len(CHECKS)} PASS")
+    print(f"_test-kconfig: {len(CHECKS)}/{len(CHECKS)} PASS")
     return 0
 
 

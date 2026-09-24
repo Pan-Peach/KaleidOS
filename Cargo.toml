@@ -5,7 +5,6 @@ members = [
     "os/arch",
     "os/components/scheduler_rr",
     "os/components/tests/core_test",
-    "os/components/logger",
 ]
 exclude = [
     "third_party/buddy_system_allocator",

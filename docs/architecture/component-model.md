@@ -110,8 +110,8 @@ component wrapper
 > 两条语言路径消费**同一个 `kcomp.h`**：C 组件只有这一份声明 + SDK 的 C 运行时
 > （`os/components/kcomp-sdk/c/kcomp_rt.c` 的 weak `mem*` / `strlen` / `strchr`，随组件
 > 私有携带），直接调 `kcore_*`；Rust 组件在同一份声明上加 SDK 的 Rust adapter（入口宏 /
-> 日志 / panic / alloc）。`make test-c-smoke` 用最小 C 组件 `kcomp_c_smoke` 在 QEMU 上
-> 端到端验证这条路径（RV64 + RV32）。
+> 日志 / panic / alloc）。`make test-qemu` 用最小 C 组件 `kcomp_c_smoke` 在 QEMU 上
+> 端到端验证这条路径（CoreTest `c-frontend` 用例 + runner 的机器级 load/unload；RV64 + RV32）。
 > （组件之间本就不允许 flat ELF symbol 互链，见 §2.1。）
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属

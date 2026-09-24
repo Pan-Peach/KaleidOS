@@ -1,6 +1,5 @@
-//! C 前端冒烟（吸收旧 `c_smoke_runner.py` 的加载断言）：加载**真实**
-//! `kcomp_c_smoke` fixture（clang 编出的 freestanding C `.kcomp`，不是内联到
-//! CoreTest 的 C 代码），断言它走完完整的前端链路：
+//! C 前端冒烟：加载**真实** `kcomp_c_smoke` fixture（clang 编出的 freestanding C
+//! `.kcomp`，不是内联到 CoreTest 的 C 代码），断言它走完完整的前端链路：
 //!
 //! ```text
 //! store（cpio）→ loader（ELF32/ELF64 ET_REL 放段 + RV32/RV64 重定位 +
@@ -13,9 +12,10 @@
 //! # 边界
 //!
 //! C 组件打印的 `[c-smoke] hello from C` 是**串口输出**：组件边界内没有读取
-//! 它的 Core API（本阶段不新增 test-only 导出），因此精确 stdout 字节仍由
-//! `make test-c-smoke`（独立 QEMU + 独立 runner）覆盖；本用例覆盖的是同一
-//! fixture 的加载 / 重定位 / 白名单 / create 入口这一可被 Core 观测的部分。
+//! 它的 Core API（本阶段不新增 test-only 导出），因此精确 stdout 字节**故意不
+//! 断言**（过细，留空间）；monitor `load` / `unload kcomp_c_smoke` 的 UX 与
+//! destroy 路径由 runner 在**机器级**检查（`make test-qemu`），本用例覆盖的是
+//! 同一 fixture 的加载 / 重定位 / 白名单 / create 入口这一可被 Core 观测的部分。
 
 use kcomp_sdk::abi::kcore_component_load;
 

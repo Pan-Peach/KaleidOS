@@ -121,7 +121,7 @@ os/core/src/component/{isolated.rs, isolated_load.rs, isolated_lifecycle.rs, iso
                                       按域放段 + Core 预置窗口/邮箱；**没有** os/core/src/execution/ 目录）
 os/core/src/component/{manager.rs, failure.rs} （manager.rs **目标**；failure.rs 现状）
 os/components/                       政策 / 服务 / 测试 Component：
-                                     scheduler_rr / core_test / logger / …
+                                     scheduler_rr / core_test / driver_prober / …
 os/components/drivers/               所有驱动 Component（统一归纳）：
                                      virtio_blk / …（uart **尚未实现**）
 ```

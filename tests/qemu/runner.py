@@ -1,38 +1,51 @@
 #!/usr/bin/env python3
 """KaleidOS automated QEMU runner (host tooling, stdlib only).
 
-Usage:  python3 tests/qemu/runner.py --arch <rv64|rv32> --kernel <path>
+Usage:  python3 tests/qemu/runner.py --arch <rv64|rv32> --kernel <path> \
+            [--scenario default|no-block]
 
 Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT),
 e.g. `kaleidos-rv64`), so the runner never has to guess which image belongs to
 the selected profile.  Select a profile first, e.g.
 `make qemu_<arch>_defconfig`, then `make kernel`:
 
-1. boot smoke  —— wait for the arch boot marker, then the Core Monitor banner;
-2. CoreTest —— type `load core_test`, require `load core_test: OK`, every
+1. boot smoke —— wait for the arch boot marker, then the Core Monitor banner;
+2. C frontend (machine level) —— `load kcomp_c_smoke` must print
+   `load kcomp_c_smoke: OK` and `unload kcomp_c_smoke` must print
+   `unload kcomp_c_smoke: OK`: the monitor load UX and the destroy path are
+   machine-level facts.  Component-internal stdout (`[c-smoke] ...`) is
+   deliberately NOT asserted here (over-fine; CoreTest covers the load
+   lifecycle);
+3. CoreTest —— type `load core_test`, require `load core_test: OK`, every
    expected `[core-test] <case>: PASS` line and the `[core-test] all: PASS`
    verdict.  CoreTest is the **single component/system integration
-   orchestrator**: the filesystem chains (ram_blk -> fatfs -> filesystem
-   endpoint; 2x ram_blk_rw -> littlefs), the driver_prober -> virtio_blk flow
-   and the C-frontend smoke are asserted inside CoreTest, not here.  The runner
-   only boots the machine and reads CoreTest's machine-readable verdict.
-3. shutdown —— type `shutdown`, expect QEMU to exit.
+   orchestrator**: the filesystem chains, the driver_prober -> virtio_blk flow
+   and the C-frontend lifecycle are asserted inside CoreTest, not here.  The
+   runner only boots the machine and reads CoreTest's machine-readable verdict.
+4. shutdown —— type `shutdown`, expect QEMU to exit.
 
-The machine is booted with the device set CoreTest's scenarios need:
-a virtio-rng (a `virtio,mmio` candidate that must report NoMatch) followed by
-two 1 MiB virtio-blk disks (MBR 0xaa55 @ 510) — the first one is attached by
-the driver_prober flow, the second one proves the driver refuses a second
-attachment.
+--scenario selects the QEMU **hardware topology only** (the runner controls the
+machine; CoreTest decides correctness by branching on the machine facts it
+discovers through Core):
+
+  default   virtio-rng + two 1 MiB virtio-blk disks (MBR 0xaa55 @ 510): the
+            first disk is attached by the driver_prober flow, the second one
+            proves the driver refuses a second attachment, and the rng is the
+            first `virtio,mmio` candidate that must report NoMatch.
+  no-block  virtio-rng only, no block device: the prober creates a report-only
+            driver instance for every candidate, pulls NoMatch for each and
+            finishes cleanly without attaching anything.
 
 Failure contract (any of these fails the run):
   - boot marker or banner missing (timeout)  -> hang/regression
+  - `load kcomp_c_smoke` / `unload kcomp_c_smoke` not OK
   - `load core_test` not OK, a case not PASS, or any output containing
     `PANIC` / `FAIL` / `trap fatal`
   - QEMU exits before the verdict
   - QEMU does not exit after shutdown
 
-Raw serial output is saved to tests/qemu/logs/<arch>-<timestamp>.log (ANSI
-color codes stripped). Exit code 0 = PASS, non-zero = FAIL.
+Raw serial output is saved to tests/qemu/logs/<arch>-<scenario>-<timestamp>.log
+(ANSI color codes stripped). Exit code 0 = PASS, non-zero = FAIL.
 """
 
 import argparse
@@ -47,10 +60,13 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOGS_DIR = os.path.join(REPO, "tests", "qemu", "logs")
 BUILD_DIR = os.path.join(REPO, "build")
-# CoreTest 的驱动场景需要的 virtio-blk 盘：1 MiB raw + MBR 签名（两块的约定相同）。
+# default 场景的 virtio-blk 盘：1 MiB raw + MBR 签名（两块的约定相同）。
 DISK_BYTES = 1024 * 1024
 MBR_SIG_OFFSET = 510
 DISK_COUNT = 2
+
+# QEMU 硬件拓扑场景；判定不在 runner 里，CoreTest 按机器事实分支。
+SCENARIOS = ("default", "no-block")
 
 ARCH_CONF = {
     "rv64": {
@@ -67,6 +83,11 @@ ARCH_CONF = {
 }
 
 MONITOR_BANNER = "KaleidOS Core Monitor"
+# 机器级 C 前端：monitor 的 load UX + unload（destroy 路径）。组件内部 stdout
+# （`[c-smoke] hello from C` / `[c-smoke] exit`）故意不断言。
+C_SMOKE = "kcomp_c_smoke"
+C_SMOKE_LOAD_OK = f"load {C_SMOKE}: OK"
+C_SMOKE_UNLOAD_OK = f"unload {C_SMOKE}: OK"
 CORE_TEST_CMD = "load core_test\n"
 CORE_TEST_OK = "load core_test: OK"
 CORE_TEST_ALL_PASS = "[core-test] all: PASS"
@@ -95,6 +116,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # 各阶段超时（秒）：hang / 慢启动都算失败
 BOOT_TIMEOUT_S = 45
+LOAD_TIMEOUT_S = 30
 CORE_TEST_TIMEOUT_S = 60
 SHUTDOWN_TIMEOUT_S = 10
 
@@ -110,6 +132,9 @@ def parse_args():
                         help="profile arch: selects the QEMU binary and boot marker")
     parser.add_argument("--kernel", required=True, metavar="PATH",
                         help="boot artifact to test (the Makefile passes $(OUTPUT))")
+    parser.add_argument("--scenario", choices=SCENARIOS, default="default",
+                        help="QEMU hardware topology: default (disks attached) or "
+                             "no-block (no block device)")
     return parser.parse_args()
 
 
@@ -163,6 +188,7 @@ def make_disk(path: str) -> None:
 def qemu_command(conf, kernel, disks):
     # virtio-rng 在盘之前：它是 prober 的第一个 `virtio,mmio` 候选，必须
     # NoMatch（非块设备），随后的第一块盘 attach、第二块盘验证拒绝二次 attach。
+    # no-block 场景不传盘：候选（rng）仍在，但没有一个块设备。
     cmd = [
         conf["qemu"],
         "-machine", "virt",
@@ -184,6 +210,7 @@ def qemu_command(conf, kernel, disks):
 def main() -> int:
     args = parse_args()
     arch = args.arch
+    scenario = args.scenario
     conf = ARCH_CONF[arch]
 
     # 产物身份由调用方显式给出（Makefile 传 $(OUTPUT)），不再用 mtime 猜镜像；
@@ -197,14 +224,15 @@ def main() -> int:
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(BUILD_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_path = os.path.join(LOGS_DIR, f"{arch}-{stamp}.log")
-    # CoreTest 的驱动场景需要真实的 virtio-blk 设备（prober 的 assignment 要
-    # attach 成功、二次 attach 要被拒绝）。
+    log_path = os.path.join(LOGS_DIR, f"{arch}-{scenario}-{stamp}.log")
+    # default 场景需要真实的 virtio-blk 设备（prober 的 assignment 要 attach
+    # 成功、二次 attach 要被拒绝）；no-block 不挂盘。
     disks = []
-    for index in range(DISK_COUNT):
-        disk = os.path.join(BUILD_DIR, f"runner-{arch}-virtio-blk-{index}.img")
-        make_disk(disk)
-        disks.append(disk)
+    if scenario == "default":
+        for index in range(DISK_COUNT):
+            disk = os.path.join(BUILD_DIR, f"runner-{arch}-virtio-blk-{index}.img")
+            make_disk(disk)
+            disks.append(disk)
 
     proc = subprocess.Popen(
         qemu_command(conf, kernel, disks),
@@ -219,7 +247,9 @@ def main() -> int:
 
     try:
         # -- 1) boot smoke ------------------------------------------------
-        output, ok = collect(proc, BOOT_TIMEOUT_S, [conf["boot_ok"], MONITOR_BANNER], FATAL_MARKERS)
+        output, ok = collect(
+            proc, BOOT_TIMEOUT_S, [conf["boot_ok"], MONITOR_BANNER], FATAL_MARKERS
+        )
         if not ok:
             raise RunFailure(
                 f"boot smoke failed: missing boot marker or monitor banner\n"
@@ -227,7 +257,20 @@ def main() -> int:
             )
         summary.append(f"boot smoke: PASS ({arch} reached Core Monitor)")
 
-        # -- 2) CoreTest: 唯一的组件/系统集成判定 --------------------------
+        # -- 2) C frontend（机器级：monitor load/unload，不碰组件内部 stdout）--
+        send(proc, f"load {C_SMOKE}\n")
+        stage, ok = collect(proc, LOAD_TIMEOUT_S, [C_SMOKE_LOAD_OK], FATAL_MARKERS)
+        output += "\n" + stage
+        if not ok:
+            raise RunFailure(f"`load {C_SMOKE}` did not print {C_SMOKE_LOAD_OK!r}")
+        send(proc, f"unload {C_SMOKE}\n")
+        stage, ok = collect(proc, LOAD_TIMEOUT_S, [C_SMOKE_UNLOAD_OK], FATAL_MARKERS)
+        output += "\n" + stage
+        if not ok:
+            raise RunFailure(f"`unload {C_SMOKE}` did not print {C_SMOKE_UNLOAD_OK!r}")
+        summary.append(f"C frontend: PASS (load/unload {C_SMOKE} at monitor level)")
+
+        # -- 3) CoreTest: 唯一的组件/系统集成判定 --------------------------
         expected = [CORE_TEST_OK, CORE_TEST_ALL_PASS]
         expected += [f"[core-test]   {case}: PASS" for case in CORE_TEST_CASES]
         send(proc, CORE_TEST_CMD)
@@ -250,7 +293,7 @@ def main() -> int:
             f"{len(CORE_TEST_CASES)} absorbed cases + all: PASS)"
         )
 
-        # -- 3) shutdown ---------------------------------------------------
+        # -- 4) shutdown ---------------------------------------------------
         send(proc, SHUTDOWN_CMD)
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         while time.monotonic() < deadline and proc.poll() is None:
@@ -264,7 +307,7 @@ def main() -> int:
         with open(log_path, "w") as log:
             log.write(output)
             log.write("\n==== RUN FAILED ====\n" + str(error) + "\n")
-        print(f"FAIL ({arch}): {error}")
+        print(f"FAIL ({arch}/{scenario}): {error}")
         print(f"log: {log_path}")
         proc.kill()
         return 1
@@ -273,8 +316,8 @@ def main() -> int:
         log.write(output)
         log.write("\n==== RUN PASSED ====\n")
     for line in summary:
-        print(f"[qemu-{arch}] {line}")
-    print(f"[qemu-{arch}] ALL PASS  (log: {log_path})")
+        print(f"[qemu-{arch}/{scenario}] {line}")
+    print(f"[qemu-{arch}/{scenario}] ALL PASS  (log: {log_path})")
     return 0
 
 

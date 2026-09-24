@@ -125,7 +125,7 @@ lwIP       → NetDevice API   → net provider
 > **已落地的先例是 FatFs 与 littlefs。**
 > - **FatFs**：只读文件系统服务——`os/components/filesystems/fatfs/` 是 C `.kcomp`，包上游 `ff.c` 加一个 `block.device` diskio，向上发布最小 `filesystem` 服务契约。
 > - **littlefs**（v2.9.3）：`os/components/filesystems/littlefs/` 是 C `.kcomp`，包上游 `lfs.c` + `lfs_util.c` 加一个 `block.device` 适配（read/prog/erase/sync；block.device 无 erase，故 erase = 整块写 0xFF，prog 用 read-modify-write）。对外仍是**只读** `filesystem` 服务；`mount` 内 format+mount+自检（写读校验，真实走 prog/erase）。
-> - **多实例已端到端证明**：`os/components/littlefs_chain/`（组合策略）创建 2× `ram_blk_rw` → 2× `littlefs`，各带独立块设备与 `lfs_t`，QEMU 下两个实例的 provider / endpoint / instance id 互不相同（`make test-littlefs-chain`，rv64 + rv32）。
+> - **多实例已端到端证明**：CoreTest 的 `littlefs-multi-instance` / `littlefs-isolation` 场景（`os/components/tests/core_test/src/runtime/filesystem.rs`）创建 2× `ram_blk_rw` → 2× `littlefs`，各带独立块设备与 `lfs_t`；`make test-qemu` 下两个实例的 provider / endpoint / instance id 互不相同，且擦掉其一的原始存储不影响另一实例（rv64 + rv32）。
 > 现状与未决问题以 `docs/interfaces/filesystem.md` §11 为准。
 > **其余全部是候选，不是集成状态。** 本文件不声明其它候选库已被接入，也不写具体上游版本号（版本无关紧要，架构契合度才决定能否调）。
 

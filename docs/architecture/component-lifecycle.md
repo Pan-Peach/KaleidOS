@@ -268,7 +268,7 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 | `core_test` | 保持串行诊断运行，**不是**每设备一实例（report state 已在入口局部） | 单例 |
 | `kbench` | 保持**一个**活跃 benchmark 运行（并发会破坏测量）；有意迁移/重置 run 相关全局，含 task/IRQ 状态（`lib.rs:68-74`、`sched.rs:52-67`、`irq.rs:83-87`） | 单例 |
 | `kcomp_smoke` / `kcomp_min` / `kcomp_panic` | 无状态 fixture 返回 null state；no-op / 日志 destroy；**保留 panic fixture 的失败行为** | 无状态 |
-| SDK / `logger` | SDK 是库，不是实例。`logger` 是空脚手架（可选组件） | 不需要发明运行时生命周期机器 |
+| SDK | SDK 是库，不是实例 | 不需要发明运行时生命周期机器 |
 
 ### VirtIO 是非机械部分（启用多实例的 gate）
 
@@ -296,8 +296,9 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 DeviceId / MMIO 基址、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
 7. **C 生命周期 smoke 已落地，FatFs 胶水待接**：`os/components/tests/kcomp_c_smoke` 是一个
    clang 编的 freestanding C 组件，经 `tools/build-kcomp-c.sh` + SDK C 运行时
-   （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-c-smoke`
-   在 RV64/RV32 端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的
+   （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-qemu`
+   （CoreTest `c-frontend` 用例 + runner 的机器级 `load` / `unload`）在 RV64/RV32
+   端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的
    endpoint binding smoke。之后才接 FatFs 胶水——先测 C/Rust 布局与真实调用，再接
    文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或
    `virtio-blk`。
@@ -309,4 +310,4 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 - `make check`（fmt + clippy `-D warnings`）全绿。
 - `make test-host` 全绿（含新增 contract tests）。
 - `make init.kpkg`：所有组件（含 C 组件 `kcomp_c_smoke`）全部通过 `.kcomp` 四项契约校验（ET_REL / 入口 DEFINED / UNDEF 仅 `kcore_*` / 重定位白名单）。
-- `make test-qemu` + `make test-arch` + `make test-c-smoke` 在 **RV64 与 RV32** 双 profile 全绿。
+- `make test`（`test-host` + `test-qemu` + `test-arch`）在 **RV64 与 RV32** 双 profile 全绿。

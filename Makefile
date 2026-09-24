@@ -43,7 +43,7 @@ KCONFIG_MK := $(KCONFIG_CONFIG).mk
 # `clean` / `rootfs` (both have to work on a fresh checkout where no .config
 # exists yet — the FAT image is built by mkfs.vfat/mtools, not by Kconfig).
 # `abi-gen` / `abi-check` are pure source transformations (abi/*.toml → C/Rust).
-CONFIG_FREE_GOALS := clean distclean help fmt test-host bench test-kconfig rootfs abi-gen abi-check
+CONFIG_FREE_GOALS := clean distclean help fmt test-host bench _test-kconfig rootfs abi-gen abi-check
 
 # Goals that CREATE a configuration: they must not generate/parse one, and they
 # cannot be combined with build goals in a single invocation.
@@ -124,7 +124,7 @@ help:
 	@echo "  make core                        Core-only dev image (skips all components)"
 	@echo "  make qemu-core                   run the Core-only dev image (no rootfs drive)"
 	@echo "  make rootfs                      build the small FAT image attached to make qemu"
-	@echo "  make check | test-host | test-build | test-kconfig | test-qemu | test-arch | test-driver-prober"
+	@echo "  make check | test | test-host | test-qemu | test-arch"
 	@echo "  make abi-gen | abi-check         ABI 单一来源：abi/*.toml → 生成 C/Rust（check 只校验）"
 
 # Materialise a configuration on first use.
@@ -146,10 +146,10 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # 因此 test-only fixture 可以整体挪进 tests/ 而不改组件名。test-only fixture/组件
 # 一律放 os/components/tests/（见 AGENTS.md），生产组件留在 os/components/。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw block_chain littlefs_chain
+KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
-KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer
+KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -260,19 +260,17 @@ distclean: clean
 	rm -f .config .config.old .config.mk
 
 # —— 质量工具链（fmt / clippy / check / 测试通道）——
-# 测试入口显式分层（docs/development/testing.md 金字塔落地）：
-#   make test-host    host 单测（快速，日常主力，与 .config 无关）
-#   make test-build   两个架构的交叉构建门禁
-#   make test-qemu-rv64 / test-qemu-rv32   自动 QEMU（boot smoke + 自动 CoreTest）
-#   make test-qemu    两个架构都跑
-#   make test-driver-prober  driver_prober 组件端到端（positive / no-device / extra-device）
-#   make bench        host release 性能基线（手动跑，不进 CI）
-#   make test-kconfig Kconfig / Makefile 胶水契约测试（host-only，快速）
-#   make check        CI 全量门禁 = fmt + clippy + test-kconfig + test-host + test-build
-.PHONY: fmt clippy check abi-gen abi-check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-littlefs-chain test-littlefs-chain-rv64 test-littlefs-chain-rv32 test-littlefs-chain-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+# 公开测试入口只有 5 个（`make help` 只列这些）：
+#   make check      CI 快车道 = fmt + clippy + abi-check + Kconfig 胶水 + host 单测 + 交叉构建
+#   make test       完整测试 = test-host + test-qemu + test-arch
+#   make test-host  host 单测（快速，日常主力，与 .config 无关）
+#   make test-qemu  自动 QEMU（RV64 + RV32；boot smoke + 自动 CoreTest）
+#   make test-arch  ArchTest 白盒 selftest（RV64 + RV32）
+# 其余测试目标都是内部助手：`_` 前缀，不进 `make help`，也不是对外契约。
+.PHONY: fmt clippy check abi-gen abi-check test test-host test-qemu _test-qemu-rv64 _test-qemu-rv32 _test-qemu-one test-arch _test-arch-rv64 _test-arch-rv32 _test-arch-one _test-build _test-kconfig bench boot-build boot-check
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
-OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test -p logger
+OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test
 
 # 代码格式化（rustfmt）；kcomp-sdk 是独立 workspace（root exclude），单独 fmt。
 fmt:
@@ -282,8 +280,6 @@ fmt:
 	cd os/components/kbench && cargo fmt
 	cd os/components/tests/drivers/ram_blk && cargo fmt
 	cd os/components/tests/drivers/ram_blk_rw && cargo fmt
-	cd os/components/block_chain && cargo fmt
-	cd os/components/littlefs_chain && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
@@ -297,8 +293,6 @@ clippy:
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/tests/drivers/ram_blk_rw && cargo clippy --target $(KCFG_TARGET)
-	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET)
-	cd os/components/littlefs_chain && cargo clippy --target $(KCFG_TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU，不读 .config）
 test-host:
@@ -307,10 +301,9 @@ test-host:
 	cd os/components/driver_prober && cargo test
 	cd os/components/kbench && cargo test
 	cd os/components/tests/drivers/ram_blk && cargo test
-	cd os/components/block_chain && cargo test
 
-# Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
-test-kconfig:
+# 内部：Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
+_test-kconfig:
 	python3 tests/kconfig/test_glue.py
 
 # —— KABI：ABI 单一来源生成（abi/*.toml → C / SDK-Rust / Core-Rust）——
@@ -346,96 +339,56 @@ boot-build:
 boot-check:
 	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
-test-build-rv64:
+# 内部：两个架构的交叉构建门禁（`make check` 的一步）。
+_test-build:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config boot-build
-
-test-build-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config boot-check
 
-test-build: test-build-rv64 test-build-rv32
-
 # 自动 QEMU：构建 + 启动 + 自动执行 core_test + 判定 PASS（输出进日志）。
 # 每个架构先落到自己的 .config，再在子 make 里按该 profile 构建。
-test-qemu-rv64:
+# runner 按 QEMU 机器拓扑跑两个场景（场景只控制硬件；判定在 CoreTest 内）：
+#   default   挂 virtio-rng + 两块 1 MiB virtio-blk：prober 首个 Match 后 attach，
+#             第二块盘验证拒绝二次 attach；
+#   no-block  只挂 virtio-rng（无块设备）：prober 对每个候选 create + pull NoMatch、
+#             干净结束，CoreTest 断言 NoMatch 路径而不是 attach。
+_test-qemu-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-qemu-one
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config _test-qemu-one
 
-test-qemu-rv32:
+_test-qemu-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-qemu-one
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config _test-qemu-one
 
-test-qemu-one: kernel
-	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
+_test-qemu-one: kernel
+	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --scenario default
+	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --scenario no-block
 
-test-qemu: test-qemu-rv64 test-qemu-rv32
-
-# driver_prober 端到端：加载 scheduler_rr → driver_prober，prober 自动 load
-# virtio_blk；runner 内跑三个场景：
-#   positive     挂 1 MiB virtio-blk 盘（MBR 签名 0xaa55 @ 510）→ 读到 sector 0；
-#   no-device    不挂盘 → prober 仍加载候选，驱动无支持设备但干净进入 Ready；
-#   extra-device 挂两块同类盘 → 首次 attach 生效，不产生第二个实例。
-test-driver-prober-rv64:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-driver-prober-one
-
-test-driver-prober-rv32:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-driver-prober-one
-
-test-driver-prober-one: kernel
-	@python3 tests/qemu/driver_prober_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
-
-test-driver-prober: test-driver-prober-rv64 test-driver-prober-rv32
-
-# C 组件端到端：加载 kcomp_c_smoke（clang 编的 freestanding C + SDK C 运行时），
-# 断言 create 的 kcore_log_line 日志与 unload 时的 C destroy 证据。
-test-c-smoke-rv64:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-c-smoke-one
-
-test-c-smoke-rv32:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-c-smoke-one
-
-test-c-smoke-one: kernel
-	@python3 tests/qemu/c_smoke_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
-
-test-c-smoke: test-c-smoke-rv64 test-c-smoke-rv32
-
-# 多实例端到端：littlefs_chain 组合两条链（ram_blk_rw → littlefs ×2），断言两个
-# 独立实例各自挂载 + 自检成功，且 provider / endpoint / instance id 互不相同。
-test-littlefs-chain-rv64:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-littlefs-chain-one
-
-test-littlefs-chain-rv32:
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-littlefs-chain-one
-
-test-littlefs-chain-one: kernel
-	@python3 tests/qemu/littlefs_chain_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
-
-test-littlefs-chain: test-littlefs-chain-rv64 test-littlefs-chain-rv32
+# 公开入口：两个架构各跑两个场景。
+test-qemu: _test-qemu-rv64 _test-qemu-rv32
 
 # White-box architectural selftests use a separate image: the private archtest
 # profile = the board defconfig + configs/selftest.fragment (CONFIG_SELFTEST=y),
 # which drives both the boot `selftest` feature and the `-selftest` output name.
-test-arch-rv64:
+_test-arch-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv64/.config qemu_rv64_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv64/.config selftest_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv64/.config test-arch-one
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv64/.config _test-arch-one
 
-test-arch-rv32:
+_test-arch-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv32/.config qemu_rv32_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv32/.config selftest_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv32/.config test-arch-one
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-rv32/.config _test-arch-one
 
-test-arch-one: kernel
+_test-arch-one: kernel
 	@python3 tests/qemu/arch_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
-test-arch: test-arch-rv64 test-arch-rv32
+# 公开入口：两个架构都跑。
+test-arch: _test-arch-rv64 _test-arch-rv32
+
+# 完整测试：host 单测 + 两个架构的 QEMU CoreTest + ArchTest。
+test: test-host test-qemu test-arch
 
 # 一键质量门禁：任何一步失败即整体失败（CI 可直接用）
 check: init.kpkg
@@ -444,7 +397,6 @@ check: init.kpkg
 	cd os/components/driver_prober && cargo fmt -- --check
 	cd os/components/kbench && cargo fmt -- --check
 	cd os/components/tests/drivers/ram_blk && cargo fmt -- --check
-	cd os/components/block_chain && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET) -- -D warnings
@@ -452,10 +404,9 @@ check: init.kpkg
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET) -- -D warnings
-	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET) -- -D warnings
-	$(MAKE) test-kconfig
+	$(MAKE) _test-kconfig
 	$(MAKE) abi-check
 	$(MAKE) test-host
-	$(MAKE) test-build
+	$(MAKE) _test-build
 
 FORCE:

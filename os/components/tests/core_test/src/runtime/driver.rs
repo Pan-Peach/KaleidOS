@@ -1,9 +1,9 @@
-//! 驱动链集成场景（吸收旧 `driver_prober_runner.py` 的断言）：CoreTest 加载
+//! 驱动链集成场景（吸收旧独立 `driver_prober` runner 的断言）：CoreTest 加载
 //! **真实 `driver_prober` 组件**，让它按自己的策略枚举候选并 provisioning
 //! `virtio_blk`，再用 Core 真相（trace 生命周期事件 / 设备归属 / endpoint
 //! 服务）断言它的可观测行为。
 //!
-//! 流程（与旧 runner 的两段式一致，只是锚点换成 CoreTest）：
+//! 流程（两段式）：
 //!
 //! 1. **候选枚举**：CoreTest 自己按 `virtio,mmio` 枚举、逐台 claim + 读
 //!    VirtIO `DeviceID`（0x008）+ release，得到候选布局（数量 / 哪些是块设备 /
@@ -13,19 +13,26 @@
 //!    语义相同）。
 //! 3. **调度**（由 `runtime.rs` 统一 `kcore_sched_run`）：prober 逐台 create
 //!    `virtio_blk`（assignment 经 create config，结果经 `probe.result` 拉取），
-//!    首个 Match（成功 attach）后停止。
-//! 4. **断言**（全部来自 Core 真相）：
-//!    - 窗口内 `ComponentState` 出生事件数 == 1（prober）+ 尝试数（= 第一台
-//!      块设备的 ordinal + 1）→ 证明"枚举 → create → pull → Match/NoMatch →
-//!      首个 attach 后停止"整条无环流程真的发生；
-//!    - 归属：attached 的设备被 driver 持有（CoreTest `claim` → `-EBUSY`），
-//!      其余候选已释放（claim 成功）；只有 attached 实例有 `block.device`
-//!      endpoint，且它能真的读盘（capacity > 0、sector 0 的 MBR 签名 0xAA55）；
-//!    - **NoMatch**（stale 候选）：拿一台非 virtio-blk 的 MMIO 设备（goldfish
-//!      RTC）当候选 create `virtio_blk` → pull 到 `outcome=1`、无 block
-//!      endpoint、claim 已释放（再 claim 成功）；
-//!    - **多设备**：对第二台块设备再 create 一个 `virtio_blk` → 驱动拒绝
-//!      （`-EBUSY`：image-global 单 attachment），且 attached 实例之后仍能读盘。
+//!    首个 Match（成功 attach）后停止；没有 Match 时试完全部候选后干净结束。
+//! 4. **断言**（全部来自 Core 真相）：分支在**机器拓扑事实**上——候选枚举给出的
+//!    `first_blk` 是 Core 交付的真值，runner 只控制 QEMU 挂什么盘，CoreTest 不
+//!    接收"场景"参数：
+//!    - **有块设备**（default 拓扑）：窗口内 `ComponentState` 出生事件数 == 1
+//!      （prober）+ 尝试数（= 第一台块设备的 ordinal + 1）→ 证明"枚举 → create
+//!      → pull → Match/NoMatch → 首个 attach 后停止"整条无环流程真的发生；
+//!      attached 的设备被 driver 持有（CoreTest `claim` → `-EBUSY`），其余候选
+//!      已释放（claim 成功）；只有 attached 实例有 `block.device` endpoint，且
+//!      它能真的读盘（capacity > 0、sector 0 的 MBR 签名 0xAA55）；对第二台块
+//!      设备再 create 一个 `virtio_blk` → 驱动拒绝（`-EBUSY`：image-global 单
+//!      attachment），且 attached 实例之后仍能读盘；
+//!    - **无块设备**（no-block 拓扑）：prober 对**每个**候选 create 一个
+//!      report-only `virtio_blk` 实例并 pull 到 NoMatch，试完全部候选后干净结束；
+//!      断言出生事件数 == 1 + 候选数、每个实例都发布 `probe.result` 且 pull 到
+//!      `outcome=1`、没有任何 `block.device` endpoint（没有 attach）、所有设备
+//!      都未被残留持有（CoreTest 能再次认领）；
+//!    - **stale NoMatch**（两种拓扑共有）：拿一台非 virtio-blk 的 MMIO 设备
+//!      （goldfish RTC）当候选 create `virtio_blk` → pull 到 `outcome=1`、无
+//!      block endpoint、claim 已释放（再 claim 成功）。
 //!
 //! prober 是组件、不是 Core：CoreTest 不重复它的目录/策略判断，只断言"它做了
 //! 什么"能被 Core 观测到的部分。
@@ -101,8 +108,10 @@ fn nth(ordinal: u32) -> Result<u32, i32> {
     if rc == 0 { Ok(device) } else { Err(rc) }
 }
 
-/// 枚举 + coarse 识别候选（claim → 读 `DeviceID` → release）。返回是否得到
-/// 至少一个块设备候选且枚举以 `-ENOENT` 正常终止。
+/// 枚举 + coarse 识别候选（claim → 读 `DeviceID` → release）。返回枚举是否
+/// 自洽：至少一个候选，且以 `-ENOENT` 正常终止。`first_blk == NO_ORDINAL`
+/// 表示这台机器**没有块设备**（no-block 拓扑）——`report` 据此分支到 NoMatch
+/// 路径，而不是 attach 路径。
 fn enumerate_candidates(state: &mut State) -> bool {
     let mut count = 0u32;
     let mut mask = 0u32;
@@ -142,7 +151,7 @@ fn enumerate_candidates(state: &mut State) -> bool {
     state.candidate_count = count;
     state.blk_mask = mask;
     state.first_blk = first_blk;
-    count > 0 && first_blk != NO_ORDINAL && end_ok
+    count > 0 && end_ok
 }
 
 /// 第一段：枚举候选 + 加载真实 `driver_prober`（dispatch 任务留给 `sched_run`）。
@@ -319,17 +328,76 @@ fn check_multi_device(state: &State, attached: u32) -> bool {
     create_driver(device, &name_buf[..name_len], &mut instance) == Errno::EBUSY.code()
 }
 
+/// 该实例是否发布了 `probe.result` 且 pull 到 `NO_MATCH`（按 attempt 命名查找；
+/// pull 是只读方法，prober 已拉过一次不影响再次读取）。
+fn result_is_no_match(instance: u32) -> bool {
+    for attempt in 1..=MAX_CANDIDATES {
+        let mut name_buf = [0u8; probe::RESULT_PORT_NAME_MAX];
+        let Ok(name_len) = probe::result_port_name(attempt, &mut name_buf) else {
+            continue;
+        };
+        if let Ok(endpoint) = Endpoint::<ProbeResult>::lookup(instance, &name_buf[..name_len]) {
+            return matches!(
+                probe::pull_result(endpoint),
+                Ok(reply) if reply.outcome == ProbeReply::NO_MATCH
+            );
+        }
+    }
+    false
+}
+
+/// no-block 拓扑（机器没有块设备）的 NoMatch 路径证据：每个候选都产生一个
+/// report-only `virtio_blk` 实例，该实例发布 `probe.result` 且 pull 到
+/// `NO_MATCH`，并且没有任何实例发布 `block.device` endpoint（**没有 attach**）。
+fn no_match_evidence(state: &State, declared: &[u32]) -> bool {
+    let mut drivers = 0u32;
+    for &id in declared {
+        if id as i32 == state.prober_id {
+            continue;
+        }
+        drivers += 1;
+        if Endpoint::<BlockDevice>::lookup(id, BLOCK_DEVICE_NAME).is_ok() {
+            return false;
+        }
+        if !result_is_no_match(id) {
+            return false;
+        }
+    }
+    drivers == state.candidate_count
+}
+
+/// no-block 拓扑的归属证据：没有候选被残留持有（report-only 实例都已释放
+/// claim），CoreTest 能再次认领每一台设备。
+fn no_block_ownership(state: &State) -> bool {
+    for ordinal in 0..state.candidate_count {
+        let Ok(device) = nth(ordinal) else {
+            return false;
+        };
+        let (mut base, mut len) = (core::ptr::null_mut(), 0usize);
+        if unsafe { abi::kcore_device_claim(device, &mut base, &mut len) } != 0 {
+            return false;
+        }
+        let _ = unsafe { abi::kcore_device_release(device) };
+    }
+    true
+}
+
 /// 第二段：调度返回后，用 Core 真相断言 prober / 驱动的可观测行为。
+///
+/// 拓扑分支：`first_blk == NO_ORDINAL` = 候选里没有块设备（runner 的 no-block
+/// 机器）；否则至少有一台块设备（default 机器）。两个分支都要求 prober 完整
+/// 走完自己的有限流程 + 所有出生实例达到 `Ready`。
 pub fn report(checks: &mut Checks, state: &State) {
     let mut declared = [0u32; MAX_DECLARED];
     let declared_len = trace::declared_components(state.cursor, &mut declared);
+    let no_block = state.first_blk == NO_ORDINAL;
 
-    // prober 在首个 Match 后停止：出生事件 = 1（prober）+ 尝试数
-    // （第一台块设备的 ordinal + 1；它之前每台都 NoMatch 过一次）。
+    // prober 在首个 Match 后停止（有块设备：出生事件 = 1 + 第一台块设备的
+    // ordinal + 1），没有 Match 时试完全部候选（出生事件 = 1 + 候选数）。
     // 每个出生实例还必须走完整生命周期（`Ready`）——旧 runner 的 `components`
     // `state=Ready` 断言的机器可读版本。
-    let attempts = if state.first_blk == NO_ORDINAL {
-        0
+    let attempts = if no_block {
+        state.candidate_count
     } else {
         state.first_blk + 1
     };
@@ -344,6 +412,17 @@ pub fn report(checks: &mut Checks, state: &State) {
             && declared_len as u32 == 1 + attempts
             && lifecycles_ok,
     );
+
+    if no_block {
+        checks.check(
+            38,
+            "driver-attach",
+            no_match_evidence(state, &declared[..declared_len]),
+        );
+        checks.check(39, "driver-no-match", check_no_match());
+        checks.check(40, "driver-multi-device", no_block_ownership(state));
+        return;
+    }
 
     let (ownership_ok, attached_device) = check_ownership(state);
     let (endpoint_count, attached_endpoint) = find_attached(state);

@@ -5,7 +5,8 @@
  * freestanding shim（`strlen` / `strchr`）。C 运行时（mem* / str*，见
  * kcomp-sdk/c/kcomp_rt.c）由 tools/build-kcomp-c.sh 自动随组件编入。
  *
- * 可观测行为（QEMU `test-c-smoke` 断言）：
+ * 可观测行为（CoreTest `c-frontend` 断言加载生命周期；`make test-qemu` 的 runner
+ * 在机器级驱动 monitor `load` / `unload`）：
  *   create  → `[c-smoke] hello from C`（经 kcore_log_line + `strlen`；再经 `strchr`
  *             定位 'f' 打一行 `from C`，证明 shim 的非 mem* 原语也被真实链接）
  *   destroy → `[c-smoke] exit`         （Core 的卸载路径真的调用了 C 的析构入口）

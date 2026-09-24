@@ -55,13 +55,13 @@ CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Co
 入口与编排在 `src/runtime.rs`（`kcomp_instance_create`）。模块边界 = 责任边界（不是行数）。
 
 > **集成场景归属**：CoreTest 是**唯一**的组件 / 系统集成编排者。旧 QEMU runner 与
-> 组合器组件（`block_chain` / `littlefs_chain` / `fs_consumer`）的断言在 CoreTest 里
-> 用**真实组件 + SDK client**（block / filesystem / probe）直接复现；runner 只做
-> boot smoke、发 `load core_test`、检查 `[core-test] <case>: PASS` 与
-> `[core-test] all: PASS`。场景在 task context 里跑（块 / 文件调用契约要求 task），
-> 结果写回实例状态，调度返回后统一发报告行。
+> 组合器组件的断言在 CoreTest 里用**真实组件 + SDK client**（block / filesystem /
+> probe）直接复现；runner 只做 boot smoke、发 `load core_test`、检查
+> `[core-test] <case>: PASS` 与 `[core-test] all: PASS`。场景在 task context 里跑
+> （块 / 文件调用契约要求 task），结果写回实例状态，调度返回后统一发报告行。
 > C fixture 的 `[c-smoke] hello from C` 是串口输出，组件边界内没有读取它的 Core API；
-> 精确 stdout 字节仍由 `make test-c-smoke` 的独立 runner 覆盖，CoreTest 断言
+> 该 stdout 字节**故意不断言**（过细），monitor `load` / `unload kcomp_c_smoke` 的
+> UX 与 destroy 路径由 runner 在机器级检查（`make test-qemu`），CoreTest 断言
 > `kcore_component_load` 返回值 + 该实例的确切生命周期 trace。
 
 > **边界**：CoreTest 只走 Core 导出白名单、只断言 Core 自己报告的返回值 / 状态编码 /

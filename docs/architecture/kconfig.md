@@ -69,9 +69,9 @@ make qemu_rv64_defconfig && make qemu   # 主工作流：先选 profile，再构
 make menuconfig && make qemu            # 第二条：交互调参后直接构建运行
 ```
 
-`menuconfig` / `olddefconfig` / `savedefconfig` / `syncconfig` / `defconfig` / `%_defconfig` 是 **config-only goals**：不能和 build goals 写进同一条 `make` 命令（Makefile 会直接报错），它们本身也不解析已有 config。`clean` / `distclean` / `help` / `fmt` / `test-host` / `bench` / `test-kconfig` 是 config-free goals，`make clean` 在没有 `.config` 的全新 checkout 上也能跑。豁免只对**整条命令**成立：只有所有 goal 都 config-free / config-only 时才跳过 include，所以 `make clean kernel`、`make fmt check` 里的 build goal 仍会拿到 `KCFG_*`。
+`menuconfig` / `olddefconfig` / `savedefconfig` / `syncconfig` / `defconfig` / `%_defconfig` 是 **config-only goals**：不能和 build goals 写进同一条 `make` 命令（Makefile 会直接报错），它们本身也不解析已有 config。`clean` / `distclean` / `help` / `fmt` / `test-host` / `bench` / `_test-kconfig` 是 config-free goals，`make clean` 在没有 `.config` 的全新 checkout 上也能跑。豁免只对**整条命令**成立：只有所有 goal 都 config-free / config-only 时才跳过 include，所以 `make clean kernel`、`make fmt check` 里的 build goal 仍会拿到 `KCFG_*`。
 
-`ARCH=` / `VM=` 之类的 make 变量不参与配置：profile 只由 `.config` 决定（选 profile = `make <board>_defconfig`），没有兼容层会把它们翻译成配置。`make test-kconfig` 跑本层的胶水契约测试（host-only，也是 `make check` 的一步）。
+`ARCH=` / `VM=` 之类的 make 变量不参与配置：profile 只由 `.config` 决定（选 profile = `make <board>_defconfig`），没有兼容层会把它们翻译成配置。`make _test-kconfig` 跑本层的胶水契约测试（host-only，也是 `make check` 的一步）。
 
 ## 3. 符号（phase 1）
 
@@ -139,6 +139,6 @@ Phase 1 **不迁移**：组件 / 驱动选择、调度器、PMP/MPU、平台发�
 
 - `make <board>_defconfig && make qemu` 对三个 profile 都能跑通：`qemu_rv64`、`qemu_rv32`、`qemu_rv32_nommu`；
 - MMU / NoMMU 与 supervisor / machine 由构造互斥（choice + `depends on`），不可能同时选中；
-- `make test-qemu`、`make test-arch`、`make test-driver-prober`、`make check`、`make test-host`、`make test-build` 在两个架构上都通过；
-- `make test-kconfig`（`make check` 的一步）覆盖本层胶水契约：不能存活的显式请求报错（`--set` / defconfig / fragment）、有效 fragment 栈不被误拒、混合 goal 的 include 粒度、config-free goal 不在全新 checkout 上创建 `.config`；
+- `make check`、`make test`、`make test-host`、`make test-qemu`、`make test-arch`（5 个公开测试入口；`test` = host + QEMU + ArchTest）在两个架构上都通过；
+- `make _test-kconfig`（内部助手，`make check` 的一步）覆盖本层胶水契约：不能存活的显式请求报错（`--set` / defconfig / fragment）、有效 fragment 栈不被误拒、混合 goal 的 include 粒度、config-free goal 不在全新 checkout 上创建 `.config`；
 - `make clean` 在没有 `.config` 的全新 checkout 上也能工作。
