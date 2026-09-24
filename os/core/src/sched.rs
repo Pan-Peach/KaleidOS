@@ -1532,6 +1532,9 @@ mod tests {
     #[test]
     fn commit_gate_fails_closed_for_unknown_task() {
         let _sched = SCHED_TEST_LOCK.lock();
+        // `init_world` 回到锚点边界（`enter_anchor` 写进程全局 `ACTIVE_GUARD`），
+        // 必须持 BOUNDARY 锁。
+        let _boundary = containment::test_boundary_lock();
         init_world();
 
         assert!(!owner_still_runnable(TaskId::from_raw(0x0BAD_F00D)));

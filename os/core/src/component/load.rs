@@ -470,6 +470,10 @@ mod tests {
     #[test]
     fn load_and_start_shares_one_image_across_instances() {
         let _serial = LOAD_TEST_LOCK.lock();
+        // `load_and_start` → `create_kernel_native` 经 `call_component_create`
+        // 安装组件边界（Init guard）覆盖进程全局 `ACTIVE_GUARD`，必须持
+        // BOUNDARY 锁（rank 0，先于 memory GUARD）。
+        let _boundary = crate::component::containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         // 本测试是全 crate 唯一挂载 store 的 host 路径（其余 `store::init` 调用点

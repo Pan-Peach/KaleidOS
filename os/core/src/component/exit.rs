@@ -301,6 +301,9 @@ mod tests {
 
     #[test]
     fn stop_drives_ready_to_stopped_through_destroy_entry() {
+        // `stop_component` 安装组件边界（Exit guard）覆盖进程全局 `ACTIVE_GUARD`，
+        // 必须与其它触碰边界栈的测试串行（rank = BOUNDARY，先于 memory GUARD）。
+        let _boundary = containment::test_boundary_lock();
         let _heap = setup();
         // Given：一个 Ready 实例（image 带 destroy 入口）。
         let id = ready_component(b"exit_destroy_ok", destroy_hook_ok as *const () as usize);
@@ -337,6 +340,9 @@ mod tests {
 
     #[test]
     fn double_stop_is_refused_and_keeps_stopped() {
+        // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
+        // 安装 Exit 边界，必须持 BOUNDARY 锁。
+        let _boundary = containment::test_boundary_lock();
         let _heap = setup();
         // Given：一个已经停止的实例。
         let id = ready_component(b"exit_double_stop", destroy_hook_ok as *const () as usize);
@@ -407,6 +413,9 @@ mod tests {
 
     #[test]
     fn stop_backstop_revokes_leftover_device() {
+        // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
+        // 安装 Exit 边界，必须持 BOUNDARY 锁（rank 0，先于 machine / memory GUARD）。
+        let _boundary = containment::test_boundary_lock();
         // Given：Ready 组件 + 一台它没来得及释放的设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
@@ -444,6 +453,9 @@ mod tests {
     /// 保持 Ready，其设备 ownership 不受影响。
     #[test]
     fn stop_affects_only_the_selected_instance() {
+        // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
+        // 安装 Exit 边界，必须持 BOUNDARY 锁（rank 0，先于 machine / memory GUARD）。
+        let _boundary = containment::test_boundary_lock();
         // Given：两个共享同一 image 的 Ready 实例，各自认领一台设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
@@ -505,6 +517,9 @@ mod tests {
         use crate::component::abi::{InterfaceAbi, InterfaceKind};
         use crate::component::endpoint::{self, ContractId, EndpointError, EndpointState};
 
+        // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
+        // 安装 Exit 边界，必须持 BOUNDARY 锁。
+        let _boundary = containment::test_boundary_lock();
         let _heap = setup();
         const CONTRACT: ContractId = ContractId::from_raw(0xE0D0_5001);
         const ENDPOINT_ABI: InterfaceAbi = InterfaceAbi::from_raw(0xE0D0_5002);
@@ -579,6 +594,9 @@ mod tests {
     /// `Stopped` 实例不再有 slot，共享同一 image 的其它实例不受影响。
     #[test]
     fn stop_clears_runtime_slot() {
+        // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
+        // 安装 Exit 边界，必须持 BOUNDARY 锁。
+        let _boundary = containment::test_boundary_lock();
         let _heap = setup();
         let image = test_image(b"exit_slot", destroy_hook_ok as *const () as usize);
         let (id, other) = {
