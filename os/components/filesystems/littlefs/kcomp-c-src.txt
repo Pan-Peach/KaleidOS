@@ -1,0 +1,6 @@
+os/components/filesystems/littlefs/littlefs.c
+os/components/filesystems/littlefs/littlefs_backend.c
+os/components/filesystems/littlefs/littlefs_service.c
+os/components/filesystems/littlefs/lfs_adapter.c
+third_party/littlefs/lfs.c
+third_party/littlefs/lfs_util.c

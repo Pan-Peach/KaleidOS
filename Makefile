@@ -144,10 +144,10 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # --gc-sections + -u 入口 → strip → 白名单/重定位契约校验，产出 ET_REL .kcomp。
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench drivers/ram_blk block_chain
+KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
-KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs filesystems/fs_consumer
+KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -168,6 +168,11 @@ init.kpkg:
 		n=$$(basename $$src); \
 		if [ "$$n" = "fatfs" ]; then \
 			CFLAGS="$${CFLAGS:-} -I$(CURDIR)/third_party/fatfs/source -include $(CURDIR)/os/components/filesystems/fatfs/ffconf.h" \
+			tools/build-kcomp-c.sh \
+				$(CURDIR)/os/components/$$src $(KCFG_TARGET) \
+				$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD_C) || exit 1; \
+		elif [ "$$n" = "littlefs" ]; then \
+			CFLAGS="$${CFLAGS:-} -I$(CURDIR)/third_party/littlefs -DLFS_NO_MALLOC -DLFS_NO_ASSERT -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR" \
 			tools/build-kcomp-c.sh \
 				$(CURDIR)/os/components/$$src $(KCFG_TARGET) \
 				$(KPKG_DIR)/$$n.kcomp $(KPKG_BUILD_C) || exit 1; \
@@ -262,7 +267,7 @@ distclean: clean
 #   make bench        host release 性能基线（手动跑，不进 CI）
 #   make test-kconfig Kconfig / Makefile 胶水契约测试（host-only，快速）
 #   make check        CI 全量门禁 = fmt + clippy + test-kconfig + test-host + test-build
-.PHONY: fmt clippy check abi-gen abi-check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
+.PHONY: fmt clippy check abi-gen abi-check test-host test-kconfig bench test-build test-build-rv64 test-build-rv32 boot-build boot-check test-qemu test-qemu-rv64 test-qemu-rv32 test-qemu-one test-driver-prober test-driver-prober-rv64 test-driver-prober-rv32 test-driver-prober-one test-c-smoke test-c-smoke-rv64 test-c-smoke-rv32 test-c-smoke-one test-littlefs-chain test-littlefs-chain-rv64 test-littlefs-chain-rv32 test-littlefs-chain-one test-arch test-arch-rv64 test-arch-rv32 test-arch-one
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test -p logger
@@ -274,7 +279,9 @@ fmt:
 	cd os/components/driver_prober && cargo fmt
 	cd os/components/kbench && cargo fmt
 	cd os/components/drivers/ram_blk && cargo fmt
+	cd os/components/drivers/ram_blk_rw && cargo fmt
 	cd os/components/block_chain && cargo fmt
+	cd os/components/littlefs_chain && cargo fmt
 	cd os/boot/riscv && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
@@ -287,7 +294,9 @@ clippy:
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/drivers/ram_blk_rw && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/littlefs_chain && cargo clippy --target $(KCFG_TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU，不读 .config）
 test-host:
@@ -392,6 +401,21 @@ test-c-smoke-one: kernel
 	@python3 tests/qemu/c_smoke_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
 
 test-c-smoke: test-c-smoke-rv64 test-c-smoke-rv32
+
+# 多实例端到端：littlefs_chain 组合两条链（ram_blk_rw → littlefs ×2），断言两个
+# 独立实例各自挂载 + 自检成功，且 provider / endpoint / instance id 互不相同。
+test-littlefs-chain-rv64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config test-littlefs-chain-one
+
+test-littlefs-chain-rv32:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config test-littlefs-chain-one
+
+test-littlefs-chain-one: kernel
+	@python3 tests/qemu/littlefs_chain_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT)
+
+test-littlefs-chain: test-littlefs-chain-rv64 test-littlefs-chain-rv32
 
 # White-box architectural selftests use a separate image: the private archtest
 # profile = the board defconfig + configs/selftest.fragment (CONFIG_SELFTEST=y),

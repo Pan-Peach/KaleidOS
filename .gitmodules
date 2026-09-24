@@ -11,3 +11,6 @@
 [submodule "third_party/fatfs"]
 	path = third_party/fatfs
 	url = https://github.com/abbrev/fatfs.git
+[submodule "third_party/littlefs"]
+	path = third_party/littlefs
+	url = https://github.com/littlefs-project/littlefs

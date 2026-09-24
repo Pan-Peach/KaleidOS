@@ -1,0 +1,141 @@
+/* littlefs.c —— littlefs 组件的**生命周期**：create / destroy + endpoint 发布。
+ *
+ * 业务后端（只读 littlefs 文件系统语义）在 littlefs_backend.c；Gate 的扁平
+ * method switch 在 littlefs_service.c；宿主回调（lfs_config → block.device）在
+ * lfs_adapter.c。本文件把三者接起来：
+ *
+ *   create  → alloc state → bind block endpoint（Core 选定机制）→ 填 lfs_config
+ *           → 发布 filesystem endpoint（api/ctx = Direct 的 function table，
+ *             port = Gate token）
+ *   destroy → 逻辑停止（phase 1 不回收 state）
+ *
+ * 挂载不在 create 里做：块调用契约要求 task 上下文，而 create 是 Core 的组件
+ * init 边界；消费者经 filesystem 服务调 mount 时才真正 lfs_mount / format。
+ */
+#include "kcomp.h"
+#include "lfs_adapter.h"
+#include "littlefs_internal.h"
+#include <errno.h>
+#include <string.h>
+
+/* create config（组合策略提供；Core 视为不透明字节）。
+ *
+ *   endpoint = block provider 的 opaque EndpointId——组合期由 composer 用
+ *              `kcore_endpoint_lookup` 解析后交付；本组件**不做**全局名字发现，
+ *              没有 endpoint 就没有块设备。
+ *
+ * `config_abi` 是布局指纹（8 字节 ASCII "LITTLECS" 的大端读数）：对不上直接拒绝
+ * 创建，不静默按空配置跑。 */
+struct littlefs_create_config
+{
+    uint64_t endpoint;
+};
+
+#define LITTLEFS_CREATE_CONFIG_ABI UINT64_C(0x4C4954544C454353)
+
+/* Direct transport：endpoint 发布时作为 api/ctx 交付的 `#[repr(C)]` function
+ * table。同一份业务实现也服务 Gate（littlefs_service.c 的扁平 method switch）。 */
+static const struct kcomp_filesystem_api littlefs_api = {
+    .mount = littlefs_mount,
+    .unmount = littlefs_unmount,
+    .open = littlefs_open,
+    .close = littlefs_close,
+    .read = littlefs_read,
+};
+
+const uint64_t kcomp_abi = UINT64_C(0x4B434F4D50414249);
+
+int32_t kcomp_instance_create(
+    const struct KcompCreateArgs *args,
+    void **out_state)
+{
+    if (out_state == NULL)
+        return -EFAULT;
+
+    *out_state = NULL;
+
+    /* block endpoint 必须由组合策略经 create config 交付（本组件不做全局名字
+     * 发现）；config_abi 对不上 = 布局不符，拒绝创建而不是猜。 */
+    if (args == NULL || args->config_abi != LITTLEFS_CREATE_CONFIG_ABI)
+    {
+        return -EINVAL;
+    }
+
+    if (args->config == NULL || args->config_len != sizeof(struct littlefs_create_config))
+    {
+        return -EINVAL;
+    }
+
+    const struct littlefs_create_config *config =
+        (const struct littlefs_create_config *)args->config;
+
+    struct littlefs_state *state = (struct littlefs_state *)kcore_heap_alloc(
+        sizeof(struct littlefs_state), _Alignof(struct littlefs_state));
+    if (state == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    memset(state, 0, sizeof(struct littlefs_state));
+
+    /* bind block endpoint：Core exact-compare contract + abi、校验存活，并按
+     * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
+     * 不选择、也看不到机制。 */
+    int32_t result = kcomp_block_bind(
+        config->endpoint,
+        KCOMP_BLOCK_DEVICE_CONTRACT,
+        KCOMP_BLOCK_DEVICE_ABI,
+        &state->block_binding);
+    if (result < 0)
+    {
+        kcore_heap_dealloc((uint8_t *)state, sizeof(struct littlefs_state), _Alignof(struct littlefs_state));
+        return result;
+    }
+
+    /* 填 lfs_config：回调 + 几何参数 + 显式缓冲区（LFS_NO_MALLOC，多实例互不
+     * 共享）。block_count 留到 mount 时按设备容量填。 */
+    littlefs_adapter_init(state);
+
+    state->alive = 1;
+
+    /* 发布 filesystem endpoint（staged：Core 在 create 返回 0 后原子提交）：
+     * port_name = 契约名（单例固定名，组合策略据此发现），contract = 契约身份，
+     * port = 本 provider 的 Gate dispatch token；api/ctx = Direct 的 function
+     * table + state（Core 只存、bind 时按机制交付）。两条 transport 都提供，
+     * **不选择**。 */
+    result = kcore_endpoint_publish(
+        (const uint8_t *)KCOMP_FILESYSTEM_NAME,
+        sizeof(KCOMP_FILESYSTEM_NAME) - 1,
+        KCOMP_FILESYSTEM_CONTRACT,
+        KCOMP_IFACE_SERVICE,
+        KCOMP_FILESYSTEM_ABI,
+        LITTLEFS_PORT,
+        &littlefs_api,
+        state);
+
+    if (result < 0)
+    {
+        kcore_heap_dealloc((uint8_t *)state, sizeof(struct littlefs_state), _Alignof(struct littlefs_state));
+        return result;
+    }
+
+    *out_state = state;
+    LITTLEFS_LOG_LINE("[littlefs] endpoint published");
+
+    return 0;
+}
+
+int32_t kcomp_instance_destroy(void *opaque_state)
+{
+    struct littlefs_state *state = opaque_state;
+
+    if (state == NULL)
+        return 0;
+
+    state->alive = 0;
+
+    /* endpoint / binding 的 ctx 可能仍被消费者缓存，open 文件与 lfs_t 都在 state
+     * 里；phase 1 只逻辑停止，不回收 state。 */
+    LITTLEFS_LOG_LINE("[littlefs] destroy");
+    return 0;
+}
