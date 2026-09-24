@@ -28,8 +28,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
     System query：free_page_count / task_count / component_count
-    Component lifecycle：component_load / interface_publish / interface_available /
-      interface_bind / interface_refresh
+    Component lifecycle：component_create / component_load
     Task control：task_create / task_start / task_yield / task_exit / task_state
     Scheduler：sched_run
     Device ownership / MMIO（C6）：device_nth（纯发现）/ device_claim（认领确切设备，Core 记
@@ -94,11 +93,15 @@ P2 中断/驱动雏形：
          后续：第一个 driver component（virtio 等）
 P3 组件化进阶：
   ✅ C7  区域分配（alloc_pages(order) 已落地：MetadataHeap + MemoryLease，含失败回滚语义）
-  C8   MemoryRegion lease + Core 验证的原子 region ownership transfer
+  ✅ C8  区域 backing 的域视图交付（`kcore_memory_acquire/release`，无 owner 账本）已落地；
+         原计划的"原子 region ownership transfer"已废弃（Core 不做内存记账，见 `memory-and-heap.md`）
   C9   任务化组件（kcomp_task + TaskTable）+ kcomp_instance_destroy / 卸载协议（逻辑层先行）
-P4 执行域/隔离（推迟，触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
-  C10 Core AddressSpaceManager + 私有 AS（IsolatedNative=S 可选实验、非里程碑；
-     SandboxedNative=U 未来强制边界）（见 §10 与 driver-model.md；D2=A）
+P4 执行域/隔离（进行中；触发器 = 第三方/对抗组件、硬故障隔离、可执行回收成为需求）：
+  🚧 C10 Core AddressSpaceManager + 私有 AS（IsolatedNative=S 可选实验、非里程碑）已落地受限版本：
+         KernelAddressSpace 生命周期 + 双映射 assembly gateway + 按域放段 + Core 预置窗口/邮箱 +
+         KernelNative → Isolated 跨域 service Gate + 失败/重启矩阵（RV64+RV32 QEMU 证明）；
+         仍缺 ASID / U-mode / ecall / 出站 Isolated 调用 / 按域 import 解析（见 deployment.md §10）；
+         SandboxedNative=U 仍是未来强制边界（`todo!()` 占位）
 ```
 
 ### 下一个里程碑：M0.5 —— Sv39（✅ 已完成，2026-09；本节保留作历史规划）
@@ -270,7 +273,7 @@ Scheduler 提议运行 Task #7  →  Core 验证（存在/Runnable/未在别 CPU
 物理帧分配是 Core 内部机制，验收标准为 **Core 帧分配测试 / 分配器测试**：
 
 ```text
-请求者向 Core 要区域 → Core 分配器选择/验证/commit → 返回 memory lease
+请求者向 Core 要区域 → Core 分配器选择/验证/commit → 返回本执行域访问窗口（kcore_memory_view；无 owner 账本）
 ```
 
 对抗性测试开始建立：double free、wrong owner、invalid scheduler proposal 全部被 Core 拒绝。
@@ -374,8 +377,9 @@ Power On
 > QEMU TCG 不是 cycle-accurate，ASID 收益在 QEMU 中可能不可见——用 QEMU 做功能验证，
 > 不做延迟预测。
 
-**对当前阶段的意义**：现在**零切换成本**（call_component_create 是普通调用；未来每组件任务共享 satp，
-切换只花寄存器+栈）。"切页表"只在**隔离执行域**发生——按触发器推迟（C10）。
+**对当前阶段的意义**：KernelNative 仍是**零切换成本**（call_component_create 是普通调用；同域任务
+共享 satp，切换只花寄存器+栈）。"切页表"只在**隔离执行域**发生——IsolatedNative 的 `satp` 切换
+（increment 3 的 assembly gateway）**已落地**，但仍受 C10 的缺口约束（见下方现状与 `deployment.md` §10）。
 
 **执行域定位（D2=A，见 `driver-model.md`）**：**KernelNative 是常态、长期模式**——同特权级、
 零切换、可信代码（无硬件访问强制，撤销协作式），不追求硬件隔离。私有地址空间只在

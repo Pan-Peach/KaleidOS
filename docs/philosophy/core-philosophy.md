@@ -114,12 +114,12 @@ Core 验证：
 物理内存分配是 **Core 内部机制**（canonical，不热卸载；可能按 build/profile 选择实现）。请求者不"提议"物理地址，而是向 Core 要一段区域：
 
 ```text
-请求者：请给我一帧
+请求者：请给我一段区域
 Core 的分配器：
-  - 选择一个 PhysicalRange
-  - 验证：区域存在？空闲？范围合法？
-  - commit region ownership
-  - 由 Core 提交 region ownership 与 address-space mapping
+  - 选择一个 PhysicalRange（buddy order 的块）
+  - 验证：请求尺寸合法？空闲？范围合法？
+  - commit：占用该块并交付 backing（**不记 owner**——Core 不做内存记账，见 `memory-and-heap.md`）
+  - （Isolated 时）由 Core 把该 region 映射进该实例的 AS；归属由该实例的页表承载
 ```
 
 未来若引入 `MemoryPolicy` 组件，它只能**提议偏好**（如 NUMA 偏好、配额），最终选择/验证/提交仍在 Core。

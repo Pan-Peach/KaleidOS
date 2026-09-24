@@ -397,7 +397,7 @@ Component
 ```
 
 - **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping，**不**记受管内存——Core 不做内存记账、无 region owner 记录，**不是**逐帧 identity、堆字节数，也没有 per-instance arena（per-instance `HeapState` 属于 runtime，不是 ResourceDomain 资源；见 `docs/architecture/memory-and-heap.md`）。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的归属记录），owner 字段直接落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终撤销归属并做 teardown/quarantine**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
-- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。**它只回答"在哪运行、什么特权 / 地址空间"**；执行模型 / ISA / runtime（native machine code vs Wasm）是**正交维度**，不属于这里——Wasm 是未来 Component 的一种执行后端，不是第四个执行域（见 `deployment.md` §3）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/architecture/component-lifecycle.md`），旧 `ComponentRecord` 已删除；实例记录已带 `execution_domain` 字段（`InstanceRecord`），由创建入口验证后写入；`KernelNative` 与受限的 `IsolatedNative`（私有 AS + assembly gateway 生命周期；无 import 面、无跨域服务，见 `deployment.md` §6/§10）都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
+- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。**它只回答"在哪运行、什么特权 / 地址空间"**；执行模型 / ISA / runtime（native machine code vs Wasm）是**正交维度**，不属于这里——Wasm 是未来 Component 的一种执行后端，不是第四个执行域（见 `deployment.md` §3）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/architecture/component-lifecycle.md`），旧 `ComponentRecord` 已删除；实例记录已带 `execution_domain` 字段（`InstanceRecord`），由创建入口验证后写入；`KernelNative` 与受限的 `IsolatedNative`（私有 AS + assembly gateway 生命周期 + KernelNative → Isolated 跨域 service Gate；无 import 面、无出站 Isolated 调用，见 `deployment.md` §6/§10）都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
   - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，**KernelNative 就是可信代码**（无硬件访问强制，撤销为协作式）；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / device claim / IRQ / DMA / teardown 不变式见 `driver-model.md`。
 
 **三个组件信任域（Trust Domain）与 ABI 分离：**
@@ -470,10 +470,12 @@ Scheduler（Component）         Core
     │                           │
     │  请求一段内存区域         │
     │ ────────────────────────► │ 分配器选择可用 PhysicalRange
-    │                           │ 验证：存在？空闲？范围合法？
-    │                           │ commit region ownership
-    │ ◄──────────────────────── │ 返回受 Core 管理的 memory lease
+    │                           │ 验证：尺寸合法？空闲？范围合法？
+    │                           │ commit：占用该块并交付 backing（不记 owner）
+    │ ◄──────────────────────── │ 返回本执行域访问窗口（kcore_memory_view）
 ```
+
+Core **不做内存记账**：不记 owner / 不发 region id / 无 Retired 表；KernelNative 无隔离，Isolated 的归属由该实例的 AS / 页表承载（`MemoryLease` 只是 Core 内部 RAII，不对外暴露）。契约见 `docs/architecture/memory-and-heap.md`。
 
 未来若引入 `MemoryPolicy` 组件，它只能提议偏好（NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
 

@@ -46,9 +46,10 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 - **contents**：首次交付**零初始化**。
 - **failure**：返回 `-Errno`，不发布 backing、不改动 out。
 - **release**：原样交回 `acquire` 给的 `view`。
-  - KernelNative：**受信操作**（无额外鉴权）——把 backing 归还给分配器。
-  - Isolated：由该实例的 AS 校验（页表就是记录），解映射 + 归还。
-  - **不接受**调用方伪造的 base/len 当作释放依据（Isolated 由页表兜住；KernelNative 与既有 `dealloc` 同级，属受信边界）。
+  - KernelNative：**受信操作**（无额外鉴权）——`kcore_memory_release` 校验 `kind` / `reserved` 后直接 `free_region_raw(base, len)`，把 backing 归还分配器；**不触碰任何 AS**（本域没有映射可撤）。
+  - Isolated：**组件可调用面未做**（§8；无 import 面）。Core 内部的窗口回收（create / service 故障，`isolated_lifecycle::release_instance_windows`）先按**精确 acquire extent** 在 AS 里回找（`address_space::mapping_exact`）→ `unmap` 移除 PTE → 再用该 extent 的 physical range `free_region_raw` 归还 backing。
+  - **移除 PTE ≠ 归还 backing**：`unmap` 只撤掉映射记录（AS 退役后不可再进入）；backing 只有拿着 AS 拥有的**精确 acquire extent** 才归还。release 依据不是"某个 PTE 存在"——别名映射下那样会猜错。
+  - **不接受**调用方伪造的 base/len 当作释放依据：`free_region_raw` 只接受与 `alloc_region` 产物同形的 `(base, len)`（非零、页对齐、恰好落在某个 buddy order 上），否则 `EINVAL`；Isolated 的归属由页表兜住（`mapping_exact`），KernelNative 与既有 `dealloc` 同级，属受信边界。
 - 用 `EINVAL` / `EOVERFLOW` / `ENOMEM` / `EPERM` / `ENOENT` / `ENOTSUP`，语义各自区分。
 
 > **术语纠正**：native U-mode sandbox 仍然返回**本域 VA**；linear-memory offset 是 **WASM 执行后端**的属性，不是"沙箱特权"的属性（`deployment.md` 已把这两个维度正交）。
@@ -69,7 +70,7 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 
 ## 4. 生命周期：没有账本，就没有"retire 表"
 
-- **显式 release**：KernelNative → 归还 backing；Isolated → 解映射 + 归还。
+- **显式 release**：KernelNative → `kcore_memory_release` 直接归还 backing（本域无 AS 可撤）；Isolated 的组件可调用面**未做**（§8），Core 内部的窗口回收按 AS 的**精确 acquire extent** 走 `mapping_exact` → `unmap`（移除 PTE）→ `free_region_raw`（归还 backing）。**移除 PTE 只是撤映射，不等于归还 backing**——backing 的归还必须给出当初 acquire 的精确 extent，不能凭"某个 PTE 存在"或调用方伪造的 base/len（见 §2）。
 - **instance 死亡**：
   - KernelNative → **无记录、不回收**。这正是"逻辑死亡、物理驻留"的结果；将来若要给 KernelNative 做物理回收，需要另立机制（那时才需要账本，不在本契约内）。
   - Isolated → **create / service 故障**（Core 中止实例）解映射并归还 Core 预置窗口 backing；**destroy 路径**（优雅停止或 destroy 入口故障）只退役 AS，窗口 backing 驻留（AS 退役后不可再进入）。页表页没有 teardown 接口，"不 leaked AS" = 退役后不再可达。

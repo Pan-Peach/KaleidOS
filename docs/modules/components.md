@@ -58,7 +58,7 @@
   store（cpio newc 解析）→ loader（段放置 + 重定位 + 入口校验）→ registry（生命周期）→ image（常驻镜像）
 ```
 
-- **导出白名单**：`abi/core.toml` 声明 **38** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。
+- **导出白名单**：`abi/core.toml` 声明 **40** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。
 - **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`core_test kcomp_smoke scheduler_rr kcomp_panic kcomp_isolated kcomp_isolated_life kcomp_isolated_svc kcomp_isolated_bad drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain`）与 `KCOMP_C_SRCS`（C：`kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer`）。
 
 ## 测试 / smoke vs 真实组件

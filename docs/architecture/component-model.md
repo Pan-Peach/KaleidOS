@@ -346,12 +346,13 @@ pub struct InstanceRecord {
     pub id: ComponentId,          // 实例身份
     pub state: ComponentState,
     pub image: ComponentImageId,  // 代码 / 入口 / MemoryLease 归 image
-    pub execution_domain: ExecutionDomain, // 部署域（创建入口验证后写入；今天只有 KernelNative 可执行）
+    pub execution_domain: ExecutionDomain, // 部署域（创建入口验证后写入；今天 KernelNative 与受限 IsolatedNative 可执行）
     pub instance_state: *mut (),  // 组件私有的实例状态（create 返回）
 }
 
-// 执行域只在记录上放这个轻量种类字段（**不放** AddressSpace runtime 对象）；今天只有
-// KernelNative 有执行器；其余域在创建入口是 `todo!()` 占位（按域分派，绝不静默降级）。
+// 执行域只在记录上放这个轻量种类字段（**不放** AddressSpace runtime 对象）；今天
+// KernelNative 与受限 IsolatedNative 都有真实执行器；SandboxedNative 在创建入口是
+// `todo!()` 占位（按域分派，绝不静默降级）。
 // 执行模型 / runtime（native machine code vs Wasm）是正交维度，**不进本记录**（见 §4 顶部）。
 ```
 
@@ -409,7 +410,7 @@ endpoint）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，mo
 let ret = containment::call_component_create(runtime.image.create, args, &mut out_state);
 ```
 
-### 4.4 私有 AddressSpace 与执行域（未来 C10）
+### 4.4 私有 AddressSpace 与执行域（C10，进行中）
 
 M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间在需要
 **私有地址空间**时才引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），
@@ -698,9 +699,10 @@ Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 2. **非零退出 / 退出 panic 的最终分类**：见上"暂定默认"。
 3. **`UnexpectedExit` 是否作为独立终态**：当前意外退出统一 `Failed`；新增状态
    要改 `can_transition` 规则表与锚定它的 host 测试。
-4. **信任域分叉**：本版退出钩子与 `kcomp_instance_create` 一样跑在 Core-owned 栈上
-   （KernelNative、协作式、无隔离）；IsolatedNative / SandboxedNative 的停止
-   （地址空间销毁、真正停止任务）是各自 ExecutionDomain 的职责。
+4. **信任域分叉**：KernelNative 的退出钩子跑在 Core-owned 共享 AS 栈上（协作式、无隔离）；
+   IsolatedNative 的停止**已落地**（私有 AS 内经 assembly gateway 执行 `kcomp_instance_destroy` →
+   退役 AS，increment 5/7，见 `deployment.md` §10）；SandboxedNative 的停止（地址空间销毁、
+   真正停止任务）仍是各自 ExecutionDomain 的职责（未实现）。
 5. **实例退役**：`Stopped` 记录保留（不回收段内存、`ComponentId` 不复用）；
    unload 记录 / 重新探测仍待定。
 6. **退出期间的新资源认领门禁**：现有 export 门禁只拦 `Failed`；钩子在

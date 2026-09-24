@@ -58,8 +58,8 @@ docs/
 | 状态归属 / 什么进 Core | `philosophy/core-philosophy.md` | 判断标准与不变式 |
 | 组件生命周期、组件 ABI、image/instance 拆分 | `architecture/component-lifecycle.md` | **已冻结**；与 `component-model.md` 冲突以它为准 |
 | 驱动、device claim、IRQ/DMA、执行域、teardown | `architecture/driver-model.md` | 驱动与执行域细节最终契约 |
-| 内存资源 vs 堆、region owner、执行域访问窗口、回收 | `architecture/memory-and-heap.md` | 内存/堆分层最终契约；访问窗口与 driver-model 的 device claim 同形 |
-| 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **取代** `component-lifecycle.md` §9 第 237 行"共享 text 不是 ABI 承诺"的结论；跨域机制均未实现，见其 §10 |
+| 内存资源 vs 堆、region 归属（无账本）、执行域访问窗口、回收 | `architecture/memory-and-heap.md` | 内存/堆分层最终契约；访问窗口与 driver-model 的 device claim 同形 |
+| 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **取代** `component-lifecycle.md` §9 第 237 行"共享 text 不是 ABI 承诺"的结论；KernelNative → Isolated 的 Gate 已落地，其余跨域机制未实现，见其 §10 |
 | 分层总览、ResourceDomain / ExecutionDomain 概念 | `architecture/overview.md` | 与 driver-model 细节冲突时以 driver-model 为准 |
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
 | 第三方库移植 / 调包能力（候选库 + 许可、组件内 adapter、SDK host-glue） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
@@ -80,7 +80,7 @@ docs/
 | 知道某个 Core 模块在干嘛、代码在哪 | `modules/README.md` → `modules/core/<module>.md` |
 | 写一个驱动 / 认领设备 | `architecture/driver-model.md` + `modules/components.md` |
 | 理解内存与堆的边界（组件怎么拿内存） | `architecture/memory-and-heap.md` |
-| 理解部署如何决定调用机制、跨域调用为何未实现 | `architecture/deployment.md` |
+| 理解部署如何决定调用机制、跨域调用现状（K→I 已落地，其余未实现） | `architecture/deployment.md` |
 | 加载 / 停止一个组件 | `architecture/component-lifecycle.md` + `modules/core/component.md` |
 | 把第三方成熟库（FS / net / TLS / runtime）接成组件 | `architecture/porting.md` |
 | 新加一个构建开关 | `architecture/kconfig.md` |

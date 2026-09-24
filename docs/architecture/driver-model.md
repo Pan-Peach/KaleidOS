@@ -116,7 +116,9 @@ os/core/src/resource/
   irq.rs            IrqTable（device-anchored routes）；register / enable / disable / release
   dma.rs            DmaTable（allocations + mappings）；QUARANTINE
 os/core/src/memory/        MemoryLease（Core 内部 RAII）：buddy / region 分配
-os/core/src/execution/{mod.rs, sandboxed.rs}   （**目标，尚未实现**——执行域仍是 docs 概念）
+os/core/src/component/{isolated.rs, isolated_load.rs, isolated_lifecycle.rs, isolated_mailbox.rs}
+                                     （受限 IsolatedNative 执行域：私有 AS + assembly gateway +
+                                      按域放段 + Core 预置窗口/邮箱；**没有** os/core/src/execution/ 目录）
 os/core/src/component/{manager.rs, failure.rs} （manager.rs **目标**；failure.rs 现状）
 os/components/                       政策 / 服务 / 测试 Component：
                                      scheduler_rr / core_test / logger / …
@@ -444,5 +446,5 @@ runtime:
 
 - `architecture.md`：分层、Core 边界、ResourceDomain / ExecutionDomain 总览；
 - `component-model.md`：组件生命周期、ResourceDomain 视图、AddressSpaceManager；
-- `roadmap.md`：执行域/隔离的里程碑位置（C10 非当前里程碑）；
+- `roadmap.md`：执行域/隔离的里程碑位置（C10 进行中；IsolatedNative 是可选实验、非承诺里程碑）；
 - `references.md`：seL4 typed capability、Theseus 状态归属等借鉴来源（注意 KaleidOS **不**实现 capability 系统，只借用"资源真相在 Core"的思想）。

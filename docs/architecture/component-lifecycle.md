@@ -22,12 +22,18 @@
 
 | 拒绝项 | 原因 |
 |---|---|
-| 私有地址空间、域切换、syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 执行域是推迟的里程碑（`docs/development/roadmap.md`）；phase 1 只有 KernelNative |
+| syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 仍未实现；执行域是进行中的里程碑（`docs/development/roadmap.md`），私有 AS / 域切换的受限版本见下表后的更新 |
 | 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
 | 通用资源转移/授予图、ResourceDomain 容器、per-instance 字节计费/配额、Core 侧内存账本（region owner / region id / Retired 表） | 违反 `AGENTS.md`；所有权转移是推迟项；Core 不做内存记账，见 `docs/architecture/memory-and-heap.md` |
 | loader 复制 `.data/.bss`、跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | **见 §9：当前共享地址空间下，globals 仍是 image-global，per-instance 状态来自显式分配**。复制 BSS 不会重定向已按原 globals 完成重定位的指令 |
 | 驱动注册框架、热插拔策略、依赖解析器、自动 ABI 兼容协商 | 无当下需求 |
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
+
+> **更新（increment 3–7，取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
+> （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 双映射 assembly gateway + 按域放段 +
+> Core 预置窗口 / 邮箱 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
+> 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 按域 import 解析仍未实现**，边界是
+> 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。
 
 ---
 
@@ -296,7 +302,7 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
    文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或
    `virtio-blk`。
 
-**停止点**：**从一份常驻镜像得到多个独立管理的 KernelNative 实例，且 C ABI 经过测试。** 不悄悄滑向已推迟的执行域里程碑。
+**停止点**：**从一份常驻镜像得到多个独立管理的 KernelNative 实例，且 C ABI 经过测试。** 不悄悄滑向执行域里程碑（C10 进行中，见 `docs/architecture/deployment.md` §10）。
 
 ### 验证门（每步）
 

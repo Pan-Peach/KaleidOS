@@ -1,7 +1,7 @@
 # 部署与绑定：部署决定调用机制（deployment.md）
 
 > 本文件是**"部署（deployment）决定调用机制"**的设计契约：谁提议部署、Core 验证什么、`(caller domain, callee domain)` 如何选出调用机制、binding 携带什么、不支持的组合如何拒绝。
-> 它是**设计契约，不是进度快照**。当前**只有 KernelNative 一种部署真实存在**，跨域机制**全部未实现**（§10 是实现状态表，§7 是逐条缺口）。
+> 它是**设计契约，不是进度快照**。**KernelNative 与受限的 IsolatedNative 两种部署真实存在**：`KernelNative → IsolatedNative` 的 Gate 已真正派发（§10）；其余跨域机制（出站 Isolated / Sandbox 参与）仍**未实现**（§10 是实现状态表，§7 是逐条缺口）。
 > 与 `docs/architecture/component-lifecycle.md` 在"同一份组件代码能否跨执行域原样运行"上冲突时，**以本文件为准**：`component-lifecycle.md` §9（第 237 行）"共享 text 是未来的 loader 优化，不是 ABI 承诺"的结论**被本文件取代**（见 §6、§8）。本文件不是要否认它的现状描述，而是把目标写清楚，并把缺口显式登记。
 
 ---
@@ -269,7 +269,7 @@ KcompCallFrame（kcomp_call_frame）
 | **artifact 文件** | `.kcomp` = ET_REL，语言无关；UNDEF 只允许 `kcore_*` | `tools/kcomp-link.sh`、`os/core/src/component/loader.rs` |
 | **加载并重定位后的镜像** | 一次放段、一个 `base`、import 只重定位一次 | `os/core/src/component/image.rs:52-71`；`loader.rs:156,317-372` |
 | **运行实例** | `ComponentId` + `state` + 归属 | `os/core/src/component/registry.rs` |
-| **按域的映射（目标）** | 同一 image 放进某执行域时的 VA 布局 + import 解析 | **未实现** |
+| **按域的映射** | 同一 image 放进某执行域时的 VA 布局 + import 解析 | 按域 VA 布局**已实现并接线**（`isolated_load.rs` / `isolated_lifecycle.rs`，increment 4/5/6）；按域 import 解析**未实现** |
 
 ### 6.1 `kcore_*` import 在三种部署下如何解析（目标）
 
@@ -337,13 +337,13 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| 组合期 exact ABI | **未做** | consumer ABI 与 provider 逐位相等才交付 | `kcore_endpoint_lookup` **没有 abi 参数**（`abi/core.toml:755-783`）；其实现调 `discover`，**只比较 contract**（`endpoint.rs:378-403`、`export.rs:664-669`）。真正查 abi 的 `EndpointRegistry::lookup`（`endpoint.rs:358-373`）**从 C ABI 不可达**。声称已校验的注释（`export.rs:688-689`、`abi/core.toml:794-796`）**是错的** |
+| 组合期 exact ABI | **未做** | consumer ABI 与 provider 逐位相等才交付 | `kcore_endpoint_lookup` **没有 abi 参数**；其实现调 `endpoint::discover`，**只比较 contract + 存活**（`export.rs::kcore_endpoint_lookup`）。真正查 abi 的 `EndpointRegistry::lookup`（`endpoint.rs`）只经 `kcore_endpoint_validate` 对**已持有的 id** 可达，不在发现路径上。当前 `export.rs` / `abi/core.toml` 的 lookup 文档已明确写"不校验 abi"，与代码一致 |
 
 ### 7.5 ABI 文档与重入
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| `kcore_endpoint_call` 文档 | **过时** | 与代码一致 | `abi/core.toml:797-802` 仍写"没有执行边界 / service stack / re-entry 检测 / panic containment（下一阶段）"，而代码**已全部具备**；生成物镜像了这段过时文字 |
+| `kcore_endpoint_call` 文档 | **已一致（覆盖 KernelNative 执行边界）** | 与代码一致 | `abi/core.toml` 的 `kcore_endpoint_call` doc 已写"**执行边界已落地**"（per-call service stack / provider principal / re-entry / panic containment）并显式指向 `component/call.rs` 模块文档；生成物（C / SDK-Rust）镜像该文字。increment 6 的**跨域**（Isolated provider）路由（邮箱帧拷贝 + assembly gateway）写在同一 `call.rs` 模块文档与本文件 §3/§10。**注意**：该 abi doc 只描述 KernelNative 服务边界，跨域语义以 `call.rs` 与 §3/§10 为准 |
 | 重入 | 仅**链成员**门禁 | 可选嵌套深度上限 | 只有链成员判断（`os/core/src/component/call.rs:157`）；**无** `MAX_` / 深度上限 |
 
 ### 7.6 DMA 归属（三条不同规则）
@@ -383,11 +383,11 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | `os/core/src/component/export.rs` | 导出 `kcore_endpoint_*`（旧的 interface 导出面已删除） | 修 `kcore_endpoint_lookup` 增加 abi 校验 |
 | `os/core/src/component/call.rs` | service-call 边界（per-call stack + principal + panic containment） | Gate 机制的落点；补嵌套深度策略（可选） |
 | `os/core/src/trace/event.rs` | `EndpointBind` 事件（endpoint / provider / mechanism） | **已完成**：旧 interface 绑定事件已随模型一起删除 |
-| `abi/core.toml` | `KIND_ENDPOINT_BIND` + 其余 10 个 kind（连续编号）；`kcore_endpoint_lookup` 无 abi；`:797-802` 过时 | 加 abi 参数、更新文档 |
+| `abi/core.toml` | `KIND_ENDPOINT_BIND` + 其余 10 个 kind（连续编号）；`kcore_endpoint_lookup` 无 abi | 加 abi 参数 |
 | `os/components/kcomp-sdk/src/abi.rs` | 共享 ABI 值类型（`InterfaceAbi` / `InterfaceKind`）；旧 `Service` / binding 层已删除 | typed 前端 + 调用后端（Direct / Gate） |
 | `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
 | `os/components/scheduler_rr/src/lib.rs` | 旧的全局名字绑定已删除 | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
-| `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础 | 跨域需真实 AS 切换（未实现） |
+| `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础；`with_isolated_service_boundary` 为跨域 service 边界提供同形 guard（increment 6） | 出站 Isolated caller / Sandbox 参与（未实现） |
 | `os/core/src/component/isolated.rs` | **increment 3**：Core 侧准备（校验 + gateway 页映射 + `PreparedActivation`）与窄故障策略 seam；**increment 5 起由 `isolated_lifecycle.rs` 调用**（create / destroy / service dispatch）；入口参数 `a0..a3` 由 Core 解释 | 已完成（生命周期 + 跨域 service 接线） |
 | `os/core/src/component/isolated_load.rs` | **increment 4**：按域放段 / 页级权限分离 / 逐段映射（`place` / `place_artifact` / `map_into` / `map_mappings`）；**increment 5 起由 `isolated_lifecycle.rs` 生产消费**；**increment 6**：可选 `kcomp_service_dispatch` 解析成实例域 VA（仍拒绝任何 import） | 按域 import（未实现） |
 | `os/core/src/component/isolated_mailbox.rs` | **increment 6**：跨 AS 扁平帧邮箱的页内布局 + 容量 + 拷贝方向（`check_frame` / `write_frame` / `read_output`，host-testable） | —— |
@@ -472,7 +472,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | Endpoint 真相（publish / discover / invalidate） | **已实现** | `endpoint.rs` |
 | Gate 调用边界（per-call stack + principal + panic containment） | **已实现** | `call.rs`、`containment.rs` |
 | SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现（step 5）** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
-| `kcore_endpoint_call` 文档与代码一致 | **未做**（文档过时） | `abi/core.toml:797-802` |
+| `kcore_endpoint_call` 文档与代码一致 | **已做（KernelNative 执行边界）**：abi doc 写"执行边界已落地"并指向 `component/call.rs`；跨域（Isolated provider）语义在同一模块文档与 §3/§10 | `abi/core.toml`（`kcore_endpoint_call` doc）、`component/call.rs` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
 | 部署字段（`InstanceRecord::execution_domain`） | **已实现（两域可执行 + 跨域服务）**：字段落地 + 创建入口**按域分派**。`KernelNative` 走完整现有链；`IsolatedNative` **真正创建、启动、销毁、提供跨域服务**（私有 AS + 按域装载 + Core 预置窗口 / 邮箱 + gateway；无私有 AS 能力 / 含 `kcore_*` import / 复用 KernelNative image → 装载前显式拒绝；设备 / DMA / IRQ / 任务 / **出站**调用仍 `-ENOTSUP`）；`SandboxedNative` 是 `todo!()` 占位 | `registry.rs`、`load.rs`、`isolated_lifecycle.rs`、`isolated_mailbox.rs`、`exit.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
 | 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
