@@ -15,8 +15,8 @@
 //! - visit_trace_since(seq, visitor)             只读遍历 trace（纯转发）
 //!
 //! 观察结果类型在 [`snapshot`]。
-//! 后续可再增加 handle / endpoint registry / irq ownership / dma / address-space
-//! snapshot，但优先只支持现有 CoreTest 真正会使用的数据。
+//! 只暴露 CoreTest 真正使用的数据；不覆盖 handle / endpoint registry / irq
+//! ownership / dma / address-space。
 
 pub mod snapshot;
 

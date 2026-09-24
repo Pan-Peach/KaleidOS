@@ -7,7 +7,7 @@
  *   create  → alloc state → bind block endpoint（Core 选定机制）→ 填 lfs_config
  *           → 发布 filesystem endpoint（api/ctx = Direct 的 function table，
  *             port = Gate token）
- *   destroy → 逻辑停止（phase 1 不回收 state）
+ *   destroy → 逻辑停止（不回收 state）
  *
  * 挂载不在 create 里做：块调用契约要求 task 上下文，而 create 是 Core 的组件
  * init 边界；消费者经 filesystem 服务调 mount 时才真正 lfs_mount / format。
@@ -134,7 +134,7 @@ int32_t kcomp_instance_destroy(void *opaque_state)
     state->alive = 0;
 
     /* endpoint / binding 的 ctx 可能仍被消费者缓存，open 文件与 lfs_t 都在 state
-     * 里；phase 1 只逻辑停止，不回收 state。 */
+     * 里；只逻辑停止，不回收 state。 */
     LITTLEFS_LOG_LINE("[littlefs] destroy");
     return 0;
 }

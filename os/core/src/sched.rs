@@ -1,12 +1,11 @@
 //! 调度 commit 路径（Core 侧）：收集 Runnable 真相 → 请求 SchedulerPolicy
 //! 提议 → Core 验证 → commit 状态 → context switch。
 //!
-//! 这就是 KaleidOS 最有代表性的链：**Policy proposes, Core validates and
-//! commits**。调度器组件（如 scheduler_rr）只看到 runnable id 列表（Core
-//! 提供的、经过裁剪的输入），只能"提议"下一个 TaskId；存在性、状态、
-//! 切换由 Core 验证后生效。
+//! **Policy proposes, Core validates and commits**：调度器组件（如 scheduler_rr）
+//! 只看到 runnable id 列表（Core 提供的、经过裁剪的输入），只能"提议"下一个
+//! TaskId；存在性、状态、切换由 Core 验证后生效。
 //!
-//! # 策略选择与专用执行路径（step 5）
+//! # 策略选择与专用执行路径
 //!
 //! - **选择**（`kcore_sched_set_policy` / [`set_policy`]）：组合方在 provider 的
 //!   create 返回 0 之后**显式**发现 `scheduler.policy` endpoint 并提交它；Core
@@ -22,20 +21,20 @@
 //!   退役，绝不复用）。退役后 Core 用确定性回退（id 序首项，提交前验证 owner）
 //!   继续调度，绝不退化成 `NoPolicy`。
 //!
-//! # 执行流（单 CPU，phase 1）
+//! # 执行流（单 CPU）
 //!
-//! 组件 init（或 monitor）在**锚点栈**上运行；`run()` 首次进入调度时，
-//! 锚点上下文被捕获保存。任务在自己的内核栈上运行；yield/exit 触发
-//! `schedule_next`，选下一个任务或（没有 Runnable 时）切回锚点——
-//! `run()` 在锚点上下文"返回"，调用者继续。
+//! 组件 init（或 monitor）在**锚点栈**上运行；`run()` 首次进入调度时，锚点上下文
+//! 被捕获保存。任务在自己的内核栈上运行；yield/exit 触发 `schedule_next`，选下
+//! 一个任务或（没有 Runnable 时）切回锚点——`run()` 在锚点上下文"返回"，调用者
+//! 继续。
 //!
 //! # 锁纪律（关键）
 //!
-//! `cpu` / `task_table` / `registry`+`endpoints`+`images` 只在**决定阶段**
-//! 短暂持有；`context_switch`（以及任何组件代码，包括策略回调）必须在全部锁
-//! 释放后执行——否则切过去的任务第一次调 yield 就会自死锁（spin::Mutex
-//! 不可重入）。决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。
-//! 跨 CPU 状态机、Running(cpu) 互斥留给 SMP 里程碑。
+//! `cpu` / `task_table` / `registry`+`endpoints`+`images` 只在**决定阶段**短暂
+//! 持有；`context_switch`（以及任何组件代码，包括策略回调）必须在全部锁释放后
+//! 执行——否则切过去的任务第一次调 yield 就会自死锁（spin::Mutex 不可重入）。
+//! 决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。跨 CPU 状态机 /
+//! Running(cpu) 互斥不存在（SMP 未实现）。
 
 use crate::component::abi::InterfaceAbi;
 use crate::component::call;
@@ -83,7 +82,7 @@ pub enum SchedError {
     /// 策略 provider 不在 KernelNative 域：策略回调在 **Core 拥有的栈上、共享
     /// 内核 AS 里**执行（专用 PolicyCall 边界），Isolated / Sandbox provider 的
     /// dispatcher 是它们自己域内的 VA，Core 不能这样调用 → 显式拒绝（`-ENOTSUP`），
-    /// 绝不静默按 KernelNative 语义执行（increment 6 的跨域 Gate 只覆盖通用
+    /// 绝不静默按 KernelNative 语义执行（跨域 Gate 只覆盖通用
     /// service 调用，不覆盖调度 commit 路径）。
     PolicyUnsupportedDomain,
 }
@@ -392,8 +391,8 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
         }
         // provider 返回非 0（契约违约 / 内部错误）：提议不可用 → 同一档失败。
         // 不发 trace 事件：`RejectReason` 的词表只描述"提议被 Core 拒绝"，
-        // 没有描述"provider 自己报告失败"的语义（新增 reason = ABI 变更，留给
-        // 下一阶段）；失败本身仍可从 `ComponentState{Failed}` 事件观察到。
+        // 没有描述"provider 自己报告失败"的语义（新增 reason = ABI 变更）；
+        // 失败本身仍可从 `ComponentState{Failed}` 事件观察到。
         CallOutcome::Returned(_) => {
             crate::component::fail_component(target.owner, ComponentLoadError::PolicyRejected);
             retire_policy(stack);
@@ -450,12 +449,10 @@ fn schedule_next(
         next = None;
     }
 
-    // Phase 1：锁内 commit 状态 + 取上下文指针
+    // 锁内 commit 状态 + 取上下文指针。
     //
-    // TODO(C5): 抢占安全——时钟中断可能在本临界区内打断（被打破的上下文
-    //   持有 cpu/table 锁时，trap 处理器再取同样的锁 = 自死锁）。实现抢占前
-    //   本临界区必须 irq-save：CpuImpl::disable_irq() / restore_irq()，
-    //   决策注记见 core/src/irq.rs。
+    // 抢占安全：本临界区未 irq-save——时钟中断若在此打断，trap 处理器会再取
+    // cpu/table 锁（自死锁）。因此抢占未启用（见 `on_timer_tick`）。
     let (from_ptr, to_ptr, next_owner): (*mut ContextImpl, *mut ContextImpl, Option<ComponentId>) = {
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
@@ -534,7 +531,7 @@ fn schedule_next(
         // （0 = 无 slot）：切换从目标记录装载 `tp`，所以把 slot 预置进记录。
         // 锁外执行 —— slot 表有自己的锁，不得与 cpu / task table 锁嵌套。
         // SAFETY: [Category 2 — Data races] `to_ptr` 指向 incoming 任务的上下文
-        // Box（堆地址稳定）或锚点 Box（全局静态）；phase 1 单 CPU、全部 Core 锁
+        // Box（堆地址稳定）或锚点 Box（全局静态）；单 CPU、全部 Core 锁
         // 已释放，切换前无其他执行触碰该记录。
         CpuImpl::set_context_slot(
             unsafe { &mut *to_ptr },
@@ -603,7 +600,7 @@ pub fn exit_current() -> Result<(), SchedError> {
 
 /// 时钟抢占入口（`timer::on_trap` 调用；中断上下文）。
 ///
-/// # 设计决策（TODO，选型 + 实现留给人）
+/// # 抢占模型（未选型，当前 `todo!()`）
 ///
 /// - **延迟重调度**：只置"需要重调度"标志，安全点消费（实现简单；抢占延迟
 ///   一个安全点，安全点的选择本身是设计点）；

@@ -151,9 +151,8 @@ pub fn load(args: &[u8]) {
     // （组件 ABI 的 `kcore_component_create` 仍支持多实例；这是交互式 load 的 UX）。
     // `image → instance` 的匹配与 `components` 命令同源。
     //
-    // TODO(human): "already loaded" 检查要考虑**所请求的 kind**——接入 Isolated
-    // 后，同名 Native 实例不应让 Isolated 请求短路（反之亦然）。见
-    // `load.rs::get_or_load_image` 的按域装载 TODO。
+    // 注意："already loaded" 检查不看**请求的 kind**——同名 Native 实例会让
+    // Isolated 请求短路（反之亦然）。
     {
         let images = crate::component::image::get_images().lock();
         if let Some(image) = images.find(name.as_bytes()) {
@@ -225,7 +224,7 @@ pub fn load(args: &[u8]) {
 ///
 /// 薄 caller：停止编排在 `component/exit.rs::stop_component`（拒绝拥有未退出
 /// 任务的实例；调用 `kcomp_instance_destroy`；Core 兜底回收）。一份 image 可以有
-/// 多个实例，本命令停掉该 name 的**全部**实例。记录保留——phase 1 不回收段内存、
+/// 多个实例，本命令停掉该 name 的**全部**实例。记录保留——不回收段内存、
 /// 不退役实例，`components` 仍能看到 `state=Stopped`。
 pub fn unload(args: &[u8]) {
     let name = args.trim_ascii();

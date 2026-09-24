@@ -6,7 +6,7 @@
  *   create  → alloc state → bind block endpoint（Core 选定机制）→ attach 磁盘胶水
  *           → 发布 filesystem endpoint（api/ctx = Direct 的 function table，
  *             port = Gate token）
- *   destroy → 逻辑停止（phase 1 不回收 state）
+ *   destroy → 逻辑停止（不回收 state）
  */
 #include "kcomp.h"
 #include "diskio_kaleidos.h"
@@ -136,7 +136,7 @@ int32_t kcomp_instance_destroy(void *opaque_state)
 
     fatfs_disk_detach();
 
-    /* endpoint / binding 的 ctx 可能仍被消费者缓存；phase 1 只逻辑停止，不回收 state。 */
+    /* endpoint / binding 的 ctx 可能仍被消费者缓存；只逻辑停止，不回收 state。 */
     FATFS_LOG_LINE("[fatfs] destroy");
     return 0;
 }

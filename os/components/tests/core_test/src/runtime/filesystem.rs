@@ -1,5 +1,4 @@
-//! 文件系统集成场景（吸收旧组合器组件与对应 QEMU runner 的断言）：CoreTest 以
-//! SDK filesystem client 直接扮演消费者。
+//! 文件系统集成场景：CoreTest 以 SDK filesystem client 直接扮演消费者。
 //!
 //! - **block chain**：`ram_blk`（只读 FAT12 合成 provider）→ 组合期解析
 //!   `block.device` endpoint → `fatfs`（create config 只带 EndpointId）→
@@ -12,12 +11,12 @@
 //! - **littlefs isolation**：把实例 A 的**原始存储**整段擦成 0xFF 后，A 的
 //!   selftest 文件不再读得出，而 B 的实例仍逐字节正确——两个实例的状态不共享。
 //!
-//! 全部在 task context 执行（块调用契约要求 task；消费者必须是 task）。
-//! task 只把结果写回 [`State`]，报告在 create 上下文里、调度返回后统一发出。
+//! 全部在 task context 执行（块调用契约要求 task；消费者必须是 task）。task 只把
+//! 结果写回 [`State`]，报告在 create 上下文里、调度返回后统一发出。
 //!
-//! 机制证据：旧 runner 断言"业务 read 没有 gate dispatch 日志"；组件内看不到
-//! provider 的日志，改为读 trace 的 `EndpointBind` 事件——业务绑定必须是
-//! **Direct**（[`trace::MECHANISM_DIRECT`]），显式探针不产生 bind 事件。
+//! 机制证据：组件内看不到 provider 的日志，因此读 trace 的 `EndpointBind` 事件
+//! ——业务绑定必须是 **Direct**（[`trace::MECHANISM_DIRECT`]），显式探针不产生
+//! bind 事件。
 
 use core::ffi::CStr;
 

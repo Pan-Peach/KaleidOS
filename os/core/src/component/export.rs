@@ -1,52 +1,22 @@
-//! 组件 → Core 稳定 API（EXPORT_SYMBOL 教学版，v1）。
+//! 组件 → Core 稳定 API（EXPORT_SYMBOL 教学版）。
 //!
-//! # 白名单原则（与 oracle 设计一致）
-//! - 导出即契约：表内条目锁定（名字 + C ABI 签名），永不做破坏性修改；
-//! - 未导出的内核函数组件"看不见"——内核内部随便重构，组件零影响；
-//! - 未导出符号 → loader `UnresolvedSymbol`，整次加载失败（exact-name resolution）；
-//! - 组件侧声明方式：`unsafe extern "C" { #[link_name = "kcore_..."] ... }`，
-//!   loader 重定位时按未 mangled 字节名精确匹配。
+//! 符号清单与签名以 `abi/core.toml` 为唯一来源（生成物在 `generated/`；文档见
+//! `docs/modules/core/component.md`）。本文件只放边界纪律：
 //!
-//! # ABI 分类（v1 稳定 + v2 增量 + v3 device/DMA mechanism）
-//!
-//! | 类别 | 符号 | 说明 |
-//! |---|---|---|
-//! | Memory resource（域视图，无账本） | `kcore_memory_acquire` `kcore_memory_release` | 组件取内存 backing 的**唯一**入口：Core 给**本执行域访问窗口**（`kcore_memory_view`；KernelNative = 本域 VA，首次交付零初始化），释放凭同一个 view。**无账本**：不记 owner / 不发 id / 无 region 注册表 / 无 Retired 表——`view` 自身（`base`/`len`）就是身份；KernelNative 的 release 是受信操作。**不是**物理区域/帧分配、**不是**地址空间变更——这些 authority 敏感操作永不裸导出 |
-//! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
-//! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
-//! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
-//! | Component lifecycle（v2） | `kcore_component_create` `kcore_component_load` | 组件实例创建的**语义入口**（非裸 registry mutation；requester/provider 由 Core 从 create 上下文解析，不信任组件自报身份）。`create` 取 `(image_name, KcompCreateArgs)`：同名 artifact 复用已登记的常驻 image，产生新实例（一份 image、N 个实例）；`load` 是默认配置（`config_abi = 0`）的便利入口 |
-//! | Component endpoints（Contract / Endpoint） | `kcore_endpoint_publish` `kcore_endpoint_lookup` `kcore_endpoint_validate` `kcore_endpoint_bind` `kcore_endpoint_call` | 组件→组件依赖的**唯一**真相模型（`component/endpoint.rs`）：publish 在 `kcomp_instance_create` 期间只记录 pending（provider 由 Core 从 init 边界解析，不信任自报身份；**不返回 EndpointId**，id 只在 commit 成功后存在；provider 交付 `api`/`ctx`（Direct）+ `port`（Gate），Core 只存不解引用）；lookup 按 `(provider, port_name, contract)` 组合期发现（只校验 contract + 存活，**不校验 abi**）；validate 对已持有的 id 做只读核对（**contract + abi exact-match** + 存活，无副作用）；**bind 在绑定时刻按 (caller 域, provider 域) 一次性选定机制**（同域 KernelNative → Direct 并交付 api/ctx；跨域 → Gate 只给 opaque id；不支持组合显式 `-ENOTSUP`，**绝不静默降级**）；call 用 opaque EndpointId 做**存活解析** + inflight 记账后**按 provider 执行域**分派（`component/call.rs`）：KernelNative provider 经 **service-call 执行边界**（`containment::call_component_service`：per-call Core 拥有栈、provider principal、provider panic containment）；Isolated provider 经 **跨 AS Gate**（increment 6：`isolated_lifecycle::dispatch_service`——flat `kcomp_call_frame` 被拷贝进 Core 拥有的邮箱、assembly gateway 进私有 AS、provider 故障收敛成 `Failed`）；Sandbox provider 显式 `-ENOTSUP`。两者都调用 provider image 的**可选** `kcomp_service_dispatch`（**传输状态 ≠ 方法状态**）。契约用 **exact ABI fingerprint**（`u64`，无版本兼容语义） |
-//! | Task control（v2） | `kcore_task_create` `kcore_task_start` `kcore_task_yield` `kcore_task_exit` `kcore_task_state` | 任务生命周期的**语义入口**（entry 必须落在 requester 实例镜像内；`arg` opaque 原样透传，任务归属来自 Core 执行边界；状态推进过 Core 状态机验证） |
-//! | Panic containment（v2） | `kcore_panic_escape` | 组件 panic adapter 协作式交还控制权给 Core（活动边界内永不返回；无边界 → `-EPERM`），见 `component/containment.rs` |
-//! | Scheduler（v2） | `kcore_sched_run` `kcore_sched_set_policy` | `sched_run` 把 CPU 交给调度器（propose → validate → commit → switch 全在 Core）；`sched_set_policy` 把 `scheduler.policy` endpoint **提交为调度配置**（只记 EndpointId + 准备好的执行栈，不发布；组合方在 provider create 之后显式发现 + 选择，Core 不按名字发现） |
-//! | Device ownership / MMIO | `kcore_device_nth` `kcore_device_claim` `kcore_device_release` | `device_nth` = 纯发现（列候选；`DeviceId` 是 identity 不是 handle）；`device_claim` = 认领**确切设备**：Core 记 owner 并返回本执行域下的可访问窗口（KernelNative = 寄存器裸指针，steady state 不再进 Core；Isolated 将来 = mapped VA）。**不做 per-access 鉴权**——KernelNative 是可信代码，硬访问限制来自执行域。`device_release` 在仍有 live IRQ/DMA 时拒绝（`-EBUSY`） |
-//! | IRQ routes | `kcore_irq_register` `kcore_irq_enable` `kcore_irq_disable` `kcore_irq_release` | 锚点是 **DeviceId**（`DeviceDescriptor.irq`）：register 记 route（handler + ctx），enable/disable 配置中断控制器，release 撤销 route 并关线。投递 = trap 上下文 native callback（Core 建立 line-owner 归属作用域）。无 poll/ack/event 层——那属于尚不存在的隔离域执行模型 |
-//! | DMA | `kcore_dma_alloc` `kcore_dma_free` `kcore_dma_map` `kcore_dma_unmap` | **allocation 与 mapping 分离**：`alloc` device-agnostic（给一块物理连续内存），`map(device_id, ptr, len, dir)` → 设备可见地址 + mapping id（No-IOMMU identity，未来 IOMMU/bounce buffer 在同一 seam）。`free`/`unmap` 撤销；backing 进 Core 私有 QUARANTINE（**不 free**，设备可能仍在 DMA）。见 `resource/dma.rs` |
-//!
-//! # ABI 错误约定（v3 起）
-//!
-//! ```text
-//! 0          success
-//! -negative  failure: -Errno
-//! ```
-//!
-//! `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）；
-//! 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
-//! `EndpointError` / `DeviceClaimError` / `IrqError` / `DmaError`）保持各自为政，
-//! 只在导出边界翻译成 `Errno`。
-//!
-//! **返回值形状**（按"能否失败"分类）：
-//! - 可失败、无值 → `i32 status`（`0` / `-Errno`）；
-//! - 可失败、有值 → `i32 status + out 参数`（值不混进返回值）；
-//! - 不会失败（纯 query）→ 直接返回值，`0` 是普通值不是哨兵。
-//!
-//! **宽度规则**：`usize` 只用于"语义就是指针宽"的量（地址 `entry`、
-//! `(ptr, len)` 长度、分配器 `size/align`）；counts/ids → `u32`（v3 起，v1 的
-//! `usize` 已迁移）；布尔/编码 → `i32`；DMA mapping identity → `u64`，只经
-//! `status + out` 回传。
-//!
-//! 旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容，迁移单独评估。
+//! - **白名单即契约**：表内条目锁定（名字 + C ABI 签名）；未导出符号 →
+//!   loader `UnresolvedSymbol`，整次加载失败（exact-name resolution，不建 flat
+//!   symbol 表）。组件侧用 `unsafe extern "C" { #[link_name = "kcore_..."] ... }`
+//!   声明，loader 按未 mangled 字节名精确匹配。
+//! - **返回值形状**（按能否失败分类）：可失败、无值 → `i32 status`
+//!   （`0` / `-Errno`）；可失败、有值 → `i32 status + out 参数`（值不混进返回
+//!   值）；不会失败（纯 query）→ 直接返回值，`0` 是普通值不是哨兵。
+//! - **宽度规则**：`usize` 只用于"语义就是指针宽"的量（地址 `entry`、
+//!   `(ptr, len)` 长度、分配器 `size/align`）；counts/ids → `u32`；布尔/编码 →
+//!   `i32`；DMA mapping identity → `u64`，只经 `status + out` 回传。
+//! - `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）；
+//!   各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
+//!   `EndpointError` / `DeviceClaimError` / `IrqError` / `DmaError`）保持各自
+//!   为政，只在导出边界翻译成 `Errno`。
 //!
 //! # Core-critical 导出体
 //!
@@ -55,49 +25,34 @@
 //! containment 必须拒绝逃逸（否则 Core bug 会被误算成边界 owner 的失败，且恢复
 //! 路径会带着 Core 锁进入 `fail_component` → 死锁）。组件代码在边界安装时把
 //! 深度挂起到 0，所以组件自己的 panic 照常可逃逸（见 `containment.rs` 的
-//! "Core ABI depth" 与 `containment::panic_escape`）。
-//!
-//! **唯一例外**是 SDK 的显式逃逸请求 `kcore_panic_escape`：包了它，逃逸请求
-//! 本身就永远不可逃逸（组件 panic adapter 会在深度 > 0 时调用它）。
+//! "Core ABI depth" 与 `containment::panic_escape`）。**唯一例外**是 SDK 的显式
+//! 逃逸请求 `kcore_panic_escape`：包了它，逃逸请求本身就永远不可逃逸。
 //!
 //! # 身份解析与 Failed 门禁
 //!
 //! - **principal = 最内层当前活动的 Core-managed 执行边界**
 //!   （`containment::active_escape`）：组件任务 → task owner；
-//!   `kcomp_instance_create`（含**嵌套创建**）→ 被创建的实例；service call
+//!   `kcomp_instance_create`（含嵌套创建）→ 被创建的实例；service call
 //!   （`kcore_endpoint_call`）→ **provider**（caller task 只作执行来源）；
-//!   嵌套 create / service call 返回或 panic 后恢复上一层边界。
-//!   所有 authority / task / endpoint 入口统一走 `RequestContext::ambient()` /
-//!   `ambient_init()`，不再各自偏好当前任务 owner。
-//! - **Failed 实例门禁**：获取资源 / 创建 work 的入口
-//!   （`kcore_device_claim`、`kcore_irq_register`、`kcore_dma_alloc`、`kcore_dma_map`、
-//!   `kcore_task_create`、`kcore_endpoint_publish`、
-//!   `kcore_endpoint_call`）在 caller/provider 已 `Failed` 时返回 `-EPERM`；
-//!   `release` / `revoke` 及已持有资源（按 DeviceId 锚定）的 teardown 操作
-//!   **不受此门禁限制**。
+//!   嵌套 create / service call 返回或 panic 后恢复上一层边界。所有 authority /
+//!   task / endpoint 入口统一走 `RequestContext::ambient()` / `ambient_init()`，
+//!   不再各自偏好当前任务 owner。
+//! - **Failed 实例门禁**：获取资源 / 创建 work 的入口（`kcore_device_claim`、
+//!   `kcore_irq_register`、`kcore_dma_alloc`、`kcore_dma_map`、`kcore_task_create`、
+//!   `kcore_endpoint_publish`、`kcore_endpoint_call`）在 caller/provider 已
+//!   `Failed` 时返回 `-EPERM`；`release` / `revoke` 及已持有资源（按 DeviceId
+//!   锚定）的 teardown 操作**不受此门禁限制**。
 //!
 //! # 明确不导出（未经 Core validation 的裸 authority mutation）
 //!
-//! 组件可以 **request** 资源（`kcore_device_nth` + `kcore_device_claim` = discover
-//! + request → Core 记 owner → 返回可访问窗口），但任何 Core truth 的 mutation
-//!   都必须由 Core 验证后提交并留 trace；裸 mutation 入口一律不导出：
-//!
-//! - 物理内存：`memory::alloc_region` / `free_region` / `free_region_raw` /
-//!   `vm_page_alloc`——物理帧是 Core 内部机制（canonical），组件要内存走
-//!   `kcore_memory_acquire`（域视图；SDK 便利面见 `kcomp-sdk` 的 `mem` 模块 /
-//!   C 侧 `kcomp_mem.h`）。
-//! - 地址空间：`KernelAddressSpace::map/unmap/activate`——mutation 必须过 Core
-//!   验证与 commit，且需要 `AddressSpaceHandle`（未来类型化授权 API）。
-//! - 裸任务表：`TaskTable::create` / `set_task_state` / context switch——绕过 Core
-//!   truth 的 mutation 一律不导出；v2 的 `kcore_task_*` 是**带验证的语义入口**
-//!   （requester 校验 + entry 镜像校验 + 状态机），不是 `TaskTable` 的透传。
-//! - 注册表：`registry::declare/start/unload`——组件生命周期由 Core 掌控，
-//!   `kcore_component_create`（store → image 复用 → declare → resolve →
-//!   start → kcomp_instance_create）与默认配置便利入口 `kcore_component_load`
-//!   是完整语义请求（registry 无 unload：Stopped/Failed 记录留作 tombstone）。
-//! - Trace 事件：组件未来只能提交"组件自定义事件"，`TaskSwitch/Grant/Revoke/
-//!   CoreRejected` 等 Core authoritative event 由 Core 自己产生（TODO：trace
-//!   环形缓冲落地后加 `kcore_trace_component_event`，sequence 由 Core 分配）。
+//! 组件可以 **request** 资源（discover + request → Core 记 owner → 返回可访问
+//! 窗口），但任何 Core truth 的 mutation 都必须由 Core 验证后提交并留 trace；
+//! 裸 mutation 入口一律不导出：物理帧（`memory::alloc_region` /
+//! `free_region` / `vm_page_alloc`——组件走 `kcore_memory_acquire`）、地址空间
+//! （`KernelAddressSpace::map/unmap/activate`——需要 `AddressSpaceHandle`）、
+//! 裸任务表（`TaskTable::create` / `set_task_state` / context switch；`kcore_task_*`
+//! 是带验证的语义入口）、registry 生命周期（`registry::declare/start/unload`）、
+//! Core authoritative trace event。
 
 use crate::component::ComponentId;
 use crate::component::abi::{InterfaceAbi, InterfaceKind};
@@ -411,10 +366,9 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
         let Some(name) = checked_name(name_ptr, name_len) else {
             return Errno::EINVAL.code();
         };
-        // 现有组件 ABI 不携带部署域：默认请求 KernelNative（今天唯一有执行器的域）。
-        // TODO(human): 让组件经 `kcore_component_*` 指定 kind 需要改 `abi/core.toml`
-        // 的参数并重新生成 C/Rust ABI；线上用 `u32` 编码，Core 校验后转内部枚举
-        // （`KcompCreateArgs` 是组件自己的配置负载，不塞部署选择）。
+        // 组件 ABI 不携带部署域：默认请求 KernelNative。要指定 kind 需改
+        // `abi/core.toml` 的参数并重新生成 ABI（`KcompCreateArgs` 是组件自己的
+        // 配置负载，不塞部署选择）。
         match crate::component::load::load_and_start(name, ExecutionDomain::KernelNative) {
             Ok(id) => id.raw() as i32,
             Err(error) => error.abi_status(),
@@ -755,7 +709,7 @@ fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
 }
 
 /// Isolated / Sandbox 调用者能力门禁：非 KernelNative 域**没有已实现**的
-/// MMIO / DMA / IRQ / 任务 / Core 资源路径（increment 1 的窄支持包络；私有 AS
+/// MMIO / DMA / IRQ / 任务 / Core 资源路径（窄支持包络；私有 AS
 /// 只映射 gateway + 自身内存）→ `-ENOTSUP`，绝不静默按 KernelNative 语义执行。
 ///
 /// 只作用于**获取 authority / 创建 work** 的入口（claim / irq register /
@@ -932,8 +886,8 @@ extern "C" fn kcore_device_nth(
 ///
 /// **访问强制不在 Core 数据路径上**：KernelNative 与 Core 同特权，`*out_mmio`
 /// 直接是寄存器基址——driver 之后自己 volatile 读写，steady state 不再进 Core。
-/// 真正的访问强制来自执行域：Isolated（未来）在 claim 时把窗口映射进组件地址
-/// 空间，`*out_mmio` 返回 mapped VA，未映射访问由页表 fault。上层 driver 不变。
+/// 真正的访问强制来自执行域：Isolated 在 claim 时把窗口映射进组件地址空间，
+/// `*out_mmio` 返回 mapped VA，未映射访问由页表 fault（该路径未实现）。
 ///
 /// 成功 = 0，`*out_mmio`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
@@ -1112,7 +1066,7 @@ extern "C" fn kcore_dma_free(ptr: *mut u8) -> i32 {
 
 /// 把一个 buffer 映射给某台设备，返回**设备可见地址** + mapping identity。
 ///
-/// No-IOMMU：device address == buffer 地址（identity）；未来 IOMMU 只需在 Core
+/// No-IOMMU：device address == buffer 地址（identity）；IOMMU 只需在 Core
 /// 内部把 buffer PA → IOVA（或经 bounce buffer），driver 不变。只有设备 owner 能
 /// 把自己的 buffer 映射给该设备。
 ///
@@ -1475,7 +1429,7 @@ mod tests {
     }
 
     /// Isolated 实例门禁：非 KernelNative 域没有已实现的 MMIO / DMA / IRQ / 任务 /
-    /// 出站调用路径 → acquiring 入口一律 `-ENOTSUP`（increment 1 的窄支持包络）。
+    /// 出站调用路径 → acquiring 入口一律 `-ENOTSUP`（窄支持包络）。
     ///
     /// 对照：同一 `device_claim` 在 KernelNative 边界下**不**被域门禁拒绝，而是走到
     /// 设备解析（`-ENODEV`）——证明这是按域拒绝，不是"所有调用都拒绝"。
@@ -1574,7 +1528,7 @@ mod tests {
     ///
     /// review `docs/notes/resource-model-review.md` §C.5 明确记录这是 known gap：
     /// 其它"不应获得新权威"的状态（`Stopping` / `Stopped`）未被该门禁覆盖。
-    /// 本步骤只 documenting + 锁定现状，**不修改行为**。
+    /// 这里只 documenting + 锁定现状，**不修改行为**。
     #[test]
     fn deny_if_failed_denies_failed_only_not_stopped() {
         use crate::component::registry;

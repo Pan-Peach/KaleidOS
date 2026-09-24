@@ -6,16 +6,11 @@
 //! kcore_* 白名单校验 + kcomp_abi 指纹）→ C kcomp_instance_create 执行 → Ready
 //! ```
 //!
-//! 断言 = Core 自己报告的可观测结果：`kcore_component_load` 返回的 instance id
-//! + 该 id 的**确切**生命周期 trace（`Declared → Resolved → Starting → Ready`）。
-//!
-//! # 边界
-//!
-//! C 组件打印的 `[c-smoke] hello from C` 是**串口输出**：组件边界内没有读取
-//! 它的 Core API（本阶段不新增 test-only 导出），因此精确 stdout 字节**故意不
-//! 断言**（过细，留空间）；monitor `load` / `unload kcomp_c_smoke` 的 UX 与
-//! destroy 路径由 runner 在**机器级**检查（`make test-qemu`），本用例覆盖的是
-//! 同一 fixture 的加载 / 重定位 / 白名单 / create 入口这一可被 Core 观测的部分。
+//! 断言 = Core 自己报告的可观测结果：`kcore_component_load` 返回的 instance id +
+//! 该 id 的**确切**生命周期 trace（`Declared → Resolved → Starting → Ready`）。
+//! C 组件打印的 `[c-smoke] hello from C` 是**串口输出**：组件边界内没有读取它的
+//! Core API，精确 stdout 字节**故意不断言**（过细，留空间）；monitor
+//! `load` / `unload kcomp_c_smoke` 的 UX 与 destroy 路径由 runner 在机器级检查。
 
 use kcomp_sdk::abi::kcore_component_load;
 

@@ -1,31 +1,30 @@
-//! 按域装载（increment 4）：把一个已解析的 `.kcomp`（ELF32/ELF64 ET_REL）放
-//! 进**某个实例的私有地址空间**，每段独立页范围 + 该段真正需要的权限。
+//! 按域装载：把一个已解析的 `.kcomp`（ELF32/ELF64 ET_REL）放进**某个实例的
+//! 私有地址空间**，每段独立页范围 + 该段真正需要的权限。
 //!
 //! ```text
 //! .kcomp 字节
 //!   │  ElfObject::parse（复用 Core 私有 ELF API）
-//!   │  import 包络检查（空集；increment 6 之前没有任何 trampoline）
+//!   │  import 包络检查（空集：任何 UNDEF 符号都拒绝）
 //!   │  plan_sections：ALLOC 段 → 页对齐 VA + 权限（R+X / R / R+W），逐段独占页
 //!   │  loader::apply_relocations（同一份 RISC-V 重定位实现，按域 base 重算）
 //!   ▼
 //! PlacedImage（段清单 + 入口 + backing region）
 //!   │  map_into / map_mappings：逐段 VA → backing PA 落进实例 AS（失败回滚本次已落段）
 //!   ▼
-//! 实例 AS 里可经 gateway 进入的镜像（increment 5 起由生命周期调用）
+//! 实例 AS 里可经 gateway 进入的镜像（由 `isolated_lifecycle` 调用）
 //! ```
 //!
 //! # 与 KernelNative loader 的关系
 //!
-//! - **共享**：ELF 解析 / 重定位 / 符号解析 / `kcomp_abi` 值校验（`loader.rs`
-//!   的私有 API，本模块直接复用——同一份 arch 重定位实现，不复制算法）。
-//! - **不复用**：KernelNative 的放段结果。那一份的 VA 布局与 import 目标都是
-//!   共享内核 AS 的产物（`load.rs::validate_isolated_load` 已在装载前拒绝）。
-//!   本模块**不调用** `loader::load_component`。image 登记走
-//!   [`PlacedImage::into_loaded_component`]（lease 归 image 表），落段在登记
-//!   之后仍可用 [`PlacedImage::mappings`] + [`map_mappings`] 完成——生命周期
-//!   接线见 `component/isolated_lifecycle.rs`（increment 5）。
+//! - **共享**：ELF 解析 / 重定位 / 符号解析 / `kcomp_abi` 值校验（直接复用
+//!   `loader.rs` 的私有 API——同一份 arch 重定位实现，不复制算法）。
+//! - **不复用**：KernelNative 的放段结果（共享内核 AS 的 VA 布局与 import 目标；
+//!   `load.rs::validate_isolated_load` 已在装载前拒绝）。本模块**不调用**
+//!   `loader::load_component`。image 登记走
+//!   [`PlacedImage::into_loaded_component`]（lease 归 image 表），落段在登记之后
+//!   仍可用 [`PlacedImage::mappings`] + [`map_mappings`] 完成。
 //!
-//! # 权限与页分离（本 increment 的核心决定）
+//! # 权限与页分离
 //!
 //! | 段 | 权限 | 依据 |
 //! |---|---|---|
@@ -34,33 +33,32 @@
 //! | 其余 ALLOC | `READ` | rodata |
 //!
 //! **选择 pad 而不是 reject**：真实工具链输出里 `.text` / `.rodata` / `.data`
-//! 常常首尾相接甚至同页，"段邻接"不是错误；若因为权限不同就拒绝，普通
-//! `.kcomp` 根本装不进来。因此每个 ALLOC 段拿到**自己的页对齐范围**（起点
-//! 页对齐、长度向上取整到页），两个段不可能共享一个页——页级权限分离是结构
-//! 保证，不是"但愿编译器不这样排"。代价是每段最多浪费不到一页；对组件镜像
-//! 可接受。`validate_segments` 仍然保留重叠拒绝作为纵深防御（规划器不可达，
-//! 由单元测试直接喂重叠输入覆盖）。
+//! 常常首尾相接甚至同页，"段邻接"不是错误；若因为权限不同就拒绝，普通 `.kcomp`
+//! 根本装不进来。因此每个 ALLOC 段拿到**自己的页对齐范围**（起点页对齐、长度
+//! 向上取整到页），两个段不可能共享一个页——页级权限分离是结构保证，不是"但愿
+//! 编译器不这样排"。代价是每段最多浪费不到一页。`validate_segments` 仍保留重叠
+//! 拒绝作为纵深防御（规划器不可达，由单元测试直接喂重叠输入覆盖）。
 //!
 //! # 显式拒绝（绝不静默）
 //!
-//! - 任何 UNDEF 符号（import 包络 = 空集）；
-//! - 段 VA 超出实例窗口 / 段间重叠 / 权限不可表达（空、W^X）/ 对齐非 2 的幂；
-//! - 入口不在任何可执行段内（`EntryNotExecutable`）；
-//! - 没有私有 AS 能力的 profile（`map_into` 直接拒绝，绝不把恒等映射当 AS）。
+//! 任何 UNDEF 符号（import 包络 = 空集）；段 VA 超出实例窗口 / 段间重叠 / 权限
+//! 不可表达（空、W^X）/ 对齐非 2 的幂；入口不在任何可执行段内
+//! （`EntryNotExecutable`）；没有私有 AS 能力的 profile（`map_into` 拒绝，绝不把
+//! 恒等映射当 AS）。
 //!
-//! # 服务入口（increment 6）
+//! # 服务入口
 //!
-//! `kcomp_service_dispatch` 是**可选**的 image 级入口：定义了它的镜像会得到
-//! 一个**实例域内**的 dispatcher VA（`PlacedImage::service_dispatch`），供
-//! `component/isolated_lifecycle.rs` 经 gateway 在私有 AS 里调用。dispatcher
-//! 与 create / destroy 同一纪律：必须落在一条 `READ|EXECUTE` 段内。它**不是**
-//! import——组件仍然只能调用自己镜像内的代码（import 包络保持空集）。
+//! `kcomp_service_dispatch` 是**可选**的 image 级入口：定义了它的镜像会得到一个
+//! **实例域内**的 dispatcher VA（[`PlacedImage::service_dispatch`]），供
+//! `isolated_lifecycle` 经 gateway 在私有 AS 里调用；与 create / destroy 同一
+//! 纪律（必须落在一条 `READ|EXECUTE` 段内）。它**不是** import——组件仍然只能
+//! 调用自己镜像内的代码。
 //!
 //! # 诚实边界
 //!
-//! 这是**协作式、非对抗**边界：S-mode 组件与 Core 同特权级，可以直接改
-//! `satp` / 自己的页表。本模块证明的是"页表真的按段权限强制"，不是对抗隔离
-//! （真正的强制边界是 U-mode，未实现）。ASID 恒 0 + 全量 `sfence.vma`。
+//! 协作式、非对抗：S-mode 组件与 Core 同特权级，可以直接改 `satp` / 自己的页表。
+//! 本模块证明的是"页表真的按段权限强制"，不是对抗隔离（真正的强制边界是 U-mode，
+//! 未实现）。ASID 恒 0 + 全量 `sfence.vma`。
 
 use super::elf::{ElfError, ElfObject, Section};
 use super::loader::{self, LoadedComponent, LoaderError};
@@ -223,7 +221,7 @@ impl PlacedImage {
 
     /// 全部段的映射清单（按 ELF section 顺序；页级权限分离）。
     ///
-    /// 生命周期接线（increment 5）用它在 **image 登记之后**仍然能把同一份段
+    /// 生命周期接线用它在 **image 登记之后**仍然能把同一份段
     /// 规划落进实例 AS（lease 归 image 表，规划不携带借用）。
     pub fn mappings(&self) -> Vec<Mapping> {
         self.segments
@@ -249,7 +247,7 @@ impl PlacedImage {
     }
 }
 
-/// 按默认窗口/基址放段（**不落 AS**；ArchTest / 未来生命周期接线消费）。
+/// 按默认窗口/基址放段（**不落 AS**；由 ArchTest / 生命周期接线消费）。
 pub fn place(blob: &[u8]) -> Result<PlacedImage, IsolatedLoadError> {
     place_at(blob, ISOLATED_IMAGE_BASE, ISOLATED_IMAGE_WINDOW)
 }
@@ -376,7 +374,7 @@ fn place_at(
         loader::read_abi(image, base, &seg_place, abi_symbol).map_err(IsolatedLoadError::Loader)?;
     ensure_executable_entry(&segments, create)?;
     ensure_executable_entry(&segments, destroy)?;
-    // 可选服务入口：同一纪律——必须落在一条 R+X 段内（increment 6）。
+    // 可选服务入口：同一纪律——必须落在一条 R+X 段内。
     let service_dispatch = match service_dispatch {
         Some(symbol) => {
             let address = loader::resolve_symbol_address(&seg_place, base, symbol)
@@ -595,7 +593,7 @@ mod tests {
     const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
     const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
     const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
-    /// 放段失败夹具（17 MiB `.bss` 超出实例窗口；increment 7）。
+    /// 放段失败夹具（17 MiB `.bss` 超出实例窗口）。
     const BAD_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_bad.kcomp"));
 
     fn place_fixture() -> PlacedImage {
@@ -684,7 +682,7 @@ mod tests {
         }
     }
 
-    /// 生命周期接线（increment 5）的转换：`PlacedImage` → image 表登记的
+    /// 生命周期接线的转换：`PlacedImage` → image 表登记的
     /// `LoadedComponent`（lease 随转换转移；create / destroy 是实例内 VA；
     /// Isolated image 没有 `service_dispatch`）。
     #[test]
@@ -772,7 +770,7 @@ mod tests {
         assert_eq!(place(&patched), Err(IsolatedLoadError::EntryNotExecutable));
     }
 
-    /// increment 6 夹具：真实定义了 `kcomp_service_dispatch` 的 `.kcomp` 按域放段
+    /// `kcomp_service_dispatch` 夹具：真实定义了该入口的 `.kcomp` 按域放段
     /// 成功，且 dispatcher 的解析结果随 `into_loaded_component` 进入 image 表。
     #[test]
     fn places_service_dispatch_fixture_and_preserves_the_entry() {
@@ -820,7 +818,7 @@ mod tests {
         assert_eq!(place(&patched), Err(IsolatedLoadError::MachineMismatch));
     }
 
-    /// **放段失败夹具**（increment 7）：一份通过 packer 契约校验与 import 包络、
+    /// **放段失败夹具**：一份通过 packer 契约校验与 import 包络、
     /// 但段超出实例窗口的真实 `.kcomp` → `SegmentOutsideWindow`。ArchTest
     /// `isolated-load-reject` 用同一份夹具证明生产创建入口把它拒绝成
     /// `IsolatedPlacementFailed`（声明 / AS / image 登记之前）。

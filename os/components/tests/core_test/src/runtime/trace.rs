@@ -1,34 +1,27 @@
-//! 第 4 组（trace sequence）：把“trace 里有类似事件”升级为
-//! **“这个操作产生这个事件”**。
+//! trace 分组：把"trace 里有类似事件"升级为**"这个操作产生这个事件"**。
 //!
-//! 手法：受控操作**之前**取一次游标（`kcore_trace_stats` 的 `next_seq`），
-//! 操作**之后**从该游标读取事件，用操作返回的 id / handle 在载荷里做精确匹配：
+//! 手法：受控操作**之前**取一次游标（`kcore_trace_stats` 的 `next_seq`），操作
+//! **之后**从该游标读取事件，用操作返回的 id / handle 在载荷里做精确匹配：
 //! - 组件生命周期：`kcore_component_load` 返回的 ComponentId ↔ `ComponentState.a`，
 //!   且只接受 `Declared → Resolved → Starting → Ready` 这条确切序列；
-//! - authority：claim / alloc 返回的 raw handle ↔ `ResourceGrant` / `ResourceRevoke.c`
-//!   （`b` = 资源类别，`c` = raw handle，二者同时匹配）；
+//! - authority：claim / alloc 返回的 raw handle ↔ `ResourceGrant` /
+//!   `ResourceRevoke.c`（`b` = 资源类别，`c` = raw handle，二者同时匹配）；
 //! - 调度：`task_create` 返回的 TaskId ↔ `TaskSwitch.b` / `PolicyAccepted.b`，
 //!   且要求窗口内每个提案都来自本次加载的 scheduler_rr、每个切换目标都是本测试
 //!   创建的任务、`PolicyAccepted` 数与 `TaskSwitch` 数一致。
 //!
-//! # `component_state seen` 为什么被换掉（历史）
-//!
-//! 旧检查只在 ring 里找 `kind == ComponentState && c == Starting`：它证明“**某个**
-//! 组件开始初始化”，与被测操作无关。现在按“加载操作的返回值”锚定生命周期。
-//!
 //! # 身份模型的限制（不要把它读成完整证明）
 //!
 //! `ComponentId` 只在**一个 `Registry` 实例内**唯一（`registry.rs`），而 trace
-//! ring 是进程/整机全局的：编号可能与其他 registry（host 测试每个用例一份；
-//! 真机上 unload 后重载是全新实例、新 id）复用。本组能拿到的最强身份是
-//! “本组件刚加载的那个实例的 id”，且断言窗口从**该次 load 前的游标**开始 ——
-//! 窗口内匹配到的事件只可能来自这次操作。要彻底移除该限制，需要身份跨 registry
-//! 全局唯一（全局单调 ComponentId / trace 记录带 boot epoch），那是 Core 的语义
-//! 决定，不在组件侧解决。
+//! ring 是进程/整机全局的：编号可能与其他 registry（host 测试每个用例一份；真机
+//! 上 unload 后重载是全新实例、新 id）复用。本组能拿到的最强身份是"本组件刚加载
+//! 的那个实例的 id"，且断言窗口从**该次 load 前的游标**开始——窗口内匹配到的事件
+//! 只可能来自这次操作。彻底移除该限制需要身份跨 registry 全局唯一（全局单调
+//! ComponentId / trace 记录带 boot epoch），那是 Core 的语义决定。
 //!
-//! 另一个限制：core_test **无法**通过白名单拿到自己的 ComponentId（没有
-//! self-id 导出），所以“core_test 自己的 Starting”无法按 id 断言；本组改为对
-//! “core_test 自己执行的加载操作”做 id 锚定断言 —— 身份来源同样是 Core 返回值。
+//! core_test **无法**通过白名单拿到自己的 ComponentId（没有 self-id 导出），所以
+//! "core_test 自己的 Starting"无法按 id 断言；本组改为对"core_test 自己执行的加载
+//! 操作"做 id 锚定断言——身份来源同样是 Core 返回值。
 
 use kcomp_sdk::abi::{
     ABSENT, KIND_COMPONENT_STATE, KIND_ENDPOINT_BIND, KIND_POLICY_ACCEPTED, KIND_RESOURCE_GRANT,

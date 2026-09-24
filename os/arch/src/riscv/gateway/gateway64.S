@@ -1,4 +1,4 @@
-# KaleidOS increment 3: the Isolated-domain assembly gateway (RV64).
+# The Isolated-domain assembly gateway (RV64).
 #
 # 这是 Private-AS 切换的**唯一**执行出口。它只做寄存器/栈/satp 切换，不含任何
 # Rust、锁或 Core 栈访问：目标 root 生效后到 Core root 恢复前，只允许触碰

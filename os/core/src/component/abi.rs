@@ -11,9 +11,9 @@ pub use crate::generated::abi::InterfaceKind;
 /// 只回答："provider 与 consumer 是否由**完全相同**的 Service ABI contract
 /// 编译？" 不一致 → `EndpointError::AbiMismatch` → 拒绝 publish / validate / bind。
 ///
-/// TODO(service-abi): 具体 Service contract 的 fingerprint 未来在 `kcomp-sdk`
-/// 统一定义（例如由 contract 布局经稳定哈希生成）；当前阶段 Core 只提供 u64
-/// 机制与 seam，不实现 ABI hash 生成器或 proc macro。
+/// 具体 Service contract 的 fingerprint 在 `kcomp-sdk` 统一定义（例如由
+/// contract 布局经稳定哈希生成）；Core 只提供 u64 机制与 seam，不实现 ABI
+/// hash 生成器或 proc macro。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InterfaceAbi(u64);

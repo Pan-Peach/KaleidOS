@@ -9,7 +9,7 @@
 //! `Hal` 的语义约束（virtio-drivers 的 trait 形状）是**无状态的**：回调不接收
 //! per-instance ctx。因此设备身份只能落在 image-global 的 [`DEVICE_ID`] 上——
 //! DMA 归属、destroy 复位都锚在它。真正的 per-instance HAL（把 ctx 带进回调）是
-//! 后续步骤；本步不声称多设备 / 多实例隔离。
+//! 不声称多设备 / 多实例隔离。
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -146,7 +146,7 @@ unsafe impl Hal for CoreHal {
     /// 把现有 buffer 映射给当前设备并返回设备可见地址。
     ///
     /// 这不是裸指针转换：经 Core 的 DMA mapping（No-IOMMU 下 device address 是
-    /// identity，但 seam 已就位；未来 IOMMU/bounce buffer 在此变化）。
+    /// identity，但 seam 已就位；IOMMU/bounce buffer 在此变化）。
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
         let ptr = buffer.as_ptr() as *mut u8;
         let len = buffer.len();

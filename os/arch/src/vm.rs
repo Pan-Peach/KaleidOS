@@ -3,8 +3,6 @@
 //! Core 的 `KernelAddressSpace`（os/core/src/memory/address_space.rs）直接消费
 //! 这里的 `AddressSpaceBackend` / `VirtualRange` / `PhysicalRange` /
 //! `MappingPermission`；`PageAlloc` 是 core buddy heap 给页表 backend 的窄回调。
-//! 未来的 contract crate 可以把这些类型抽出来，让 Core 支持多种翻译 backend，
-//! 但目前保持在本 crate 内即可。
 
 use bitflags::bitflags;
 
@@ -33,7 +31,7 @@ bitflags! {
 }
 
 /// 一个必须**在 Core AS 与目标实例 AS 中以同一 VA → 同一 PA** 出现的机制页
-/// （increment 3 的 assembly gateway：代码页 + 入口 scratch 页）。
+/// （assembly gateway：代码页 + 入口 scratch 页）。
 ///
 /// Core 把 arch 给出的这对 range 落成实例 AS 的一条映射；因为 Core AS 里同一
 /// VA 已经指到同一 PA，切换 `satp` 前后 PC / 数据访问都连续，不必在两个 root
@@ -97,7 +95,6 @@ pub trait AddressSpaceBackend {
 
     /// 准备切换数据：只读，**不写 satp、不刷 TLB、不改状态**。
     ///
-    /// 真正的寄存器写入仍在 `activate()`（未来由 Core 的切换汇编消费本返回值；
-    /// 本阶段没有任何运行期切换）。
+    /// 真正的寄存器写入仍在 `activate()`（切换汇编消费本返回值，见 `gateway`）。
     fn prepare_activation(&self) -> Self::Activation;
 }

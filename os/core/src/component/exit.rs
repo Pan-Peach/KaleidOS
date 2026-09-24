@@ -4,27 +4,22 @@
 //! 汇合点——`Ready → Stopping → Stopped`，中途调用组件的销毁入口
 //! `kcomp_instance_destroy(state)`。生产调用方是 monitor 的 `unload <name>` 命令。
 //!
-//! # 已实现的停止顺序（small option，Oracle 评审后定稿）
+//! # 停止顺序（拒绝门在任何提交之前；拒绝不改 Core 真相）
 //!
 //! ```text
-//! 1. 拒绝门（任何提交之前；拒绝不改 Core 真相）
-//!    a. 实例必须不拥有任何未退出的任务，否则拒绝（不 join、不等待）；
-//!    b. begin_stop 还要求实例存在且处于 Ready（不存在 → NotFound；
-//!       非 Ready → NotReady）；
+//! 1. 拒绝门：实例不拥有任何未退出任务，且存在且处于 Ready
+//!    （不存在 → NotFound；非 Ready → NotReady）；
 //! 2. registry.begin_stop(id)      Ready → Stopping：提交"不再接受新 work"
-//! 3. 调用组件销毁入口 kcomp_instance_destroy(state)
-//!                                必需导出；Core-owned 隔离栈
-//! 4. Core 兜底                     revoke authority + 失效 provider endpoints +
-//!                                  使 provider endpoints 永久失效
-//!                                  （与 failure 路径共用同一序列，见 `failure.rs`）
+//! 3. 调用 kcomp_instance_destroy(state)  必需导出；按执行域选 Core 栈 / 私有 AS
+//! 4. Core 兜底                     revoke authority + 永久失效 provider
+//!                                  endpoints（与 failure 路径共用，见 `failure.rs`）
 //! 5. registry.finish_stop(id)     Stopping → Stopped（终态）
 //! ```
 //!
-//! 为什么任务检查必须在 `begin_stop` **之前**：`may_run` 只允许
-//! `Starting`/`Ready`，一旦提交 `Stopping`，该实例的任务就再也不可能被调度
-//! 回来收尾——"先停后等任务"是自相矛盾的顺序。`yield` 只提交 `Runnable`
-//! （不是 `Exited`），任务不会"自然退出"，所以本版不做等待；等任务清空的
-//! drain variant 明确不在本增量（见下）。
+//! 为什么任务检查必须在 `begin_stop` **之前**：`may_run` 只允许 `Starting`/`Ready`，
+//! 一旦提交 `Stopping`，该实例的任务就再也不可能被调度回来收尾——"先停后等任务"
+//! 是自相矛盾的顺序。`yield` 只提交 `Runnable`（不是 `Exited`），任务不会"自然
+//! 退出"，所以本版不做等待，也不提供 drain variant / task-stop / join。
 //!
 //! # 身份、栈与门禁
 //!
@@ -37,34 +32,25 @@
 //!   这是本文件与 `containment` 协同保证的契约（host 测试锁定）。
 //! - **入口可以释放 authority**：`release` / `revoke` 与已持有 handle 的操作
 //!   不受生命周期门禁限制（见 `export.rs` 的门禁说明），销毁入口能在 `Stopping`
-//!   状态下自行 `kcore_mmio_release` 等；入口返回后 Core 仍兜底撤销一切**剩余**
-//!   authority（多撤不少撤；设备宁可进 quarantine 也不留悬空授权）。
+//!   状态下自行释放资源；入口返回后 Core 仍兜底撤销一切**剩余** authority（多撤
+//!   不少撤；设备宁可进 quarantine 也不留悬空授权）。反向地，入口在 `Stopping`
+//!   期间调用 `kcore_mmio_claim` / `kcore_dma_alloc` 等仍会成功，随后被第 4 步
+//!   兜底撤销——现有 export 门禁只拦 `Failed`。
 //! - **失败路径刻意不调用本入口**（Linux 类比：崩溃的模块不值得信任）：
 //!   [`super::failure::fail_component`] 直接 `mark_failed` + 同一兜底，不经过
 //!   本文件。代价：组件侧的设备收尾（stop DMA / reset / mask IRQ）在失败路径上
-//!   不会发生，Core 的 revoke + quarantine 是唯一兜底（见 docs/architecture/component-model.md
-//!   §5.2）。
+//!   不会发生，Core 的 revoke + quarantine 是唯一兜底（见
+//!   `docs/architecture/component-model.md` §5.2）。
+//! - destroy 入口同步跑在调用者上下文中，无 watchdog；挂死的入口会挂住 stop
+//!   （KernelNative 协作式信任，与 create 同）。
 //!
-//! # destroy 失败语义（契约 §8，已定稿）
+//! # destroy 失败语义
 //!
 //! - `kcomp_instance_destroy` 返回非零 → 实例置 `Failed`（不是 `Stopped`），
 //!   **保留内存**（state 存储不回收），Core containment 兜底；
 //! - panic → 由 Destroy 边界容纳（`CallOutcome::Panicked`）→ 同上；
-//! - **绝不自动重试析构**；`Failed` 是终态，tombstone 保留。
-//!
-//! # 明确 OUT OF SCOPE（本增量不做，留给人类决定）
-//!
-//! - **drain variant**（等任务自然退出再停）：需要 `may_run` 增加"停止中仍允许
-//!   收尾"的语义 + 任务完成协议 / 超时，不是本版"先拒绝再停"能顺带做的；
-//! - **task-stop / join API**：Core 仍无强制停止任务的能力；
-//! - **销毁入口的阻塞 / 超时**：入口同步跑在调用者上下文中，无 watchdog；
-//!   恶意/挂死的入口会挂住 stop（KernelNative 协作式信任，与 create 同）；
-//! - **`UnexpectedExit` 终态**：意外退出统一由 `Failed` 覆盖；
-//! - **退出期间的新 authority 门禁**：现有 export 门禁只拦 `Failed`；入口在
-//!   `Stopping` 期间调用 `kcore_mmio_claim` / `kcore_dma_alloc` 等仍会成功，
-//!   随后被第 4 步兜底撤销。硬拦需要在 export 门禁加入生命周期判定（未定稿）；
-//! - **实例退役 / 段内存回收**：`Stopped` 记录保留（phase 1：逻辑死亡、物理驻留），
-//!   registry 不删除记录、image 不 unload。
+//! - **绝不自动重试析构**；`Failed` 是终态，tombstone 保留。`Stopped` 记录同样
+//!   保留（逻辑死亡、物理驻留），registry 不删除记录、image 不 unload。
 
 use crate::component::containment::{self, CallOutcome};
 use crate::component::endpoint::ExecutionDomain;
@@ -77,11 +63,11 @@ use crate::component::{ComponentId, failure, runtime_slot};
 /// 停止的拒绝 / 失败原因（`stop_component` 的返回错误）。
 ///
 /// ABI 语义：当前只有 monitor `unload` 与 host 测试消费；errno 映射已定
-/// （`errno.rs::From<ComponentStopError>`），未来若导出 `kcore_component_stop`
+/// （`errno.rs::From<ComponentStopError>`），若导出 `kcore_component_stop`
 /// 直接复用，不需要重新定档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentStopError {
-    /// 实例不存在（未声明；phase 1 无 unload）。errno 语义：`ENOENT`。
+    /// 实例不存在（未声明；无 unload）。errno 语义：`ENOENT`。
     NotFound,
     /// 实例不在 `Ready`：只有 `Ready` 有完整、已提交的初始化状态可停止。
     /// 重复 stop（`Stopping` / `Stopped`）与 `Failed` 实例都落到这里。
@@ -96,7 +82,7 @@ pub enum ComponentStopError {
     /// `kcomp_instance_destroy` panic，已由 Destroy 边界切回 Core（同上）。
     /// errno 语义：`EIO`。
     DestroyPanicked,
-    /// 停止途中的状态机提交失败（只会由并发 stop/fail 触发；phase 1 单核不可达，
+    /// 停止途中的状态机提交失败（只会由并发 stop/fail 触发；单核不可达，
     /// 不静默）。errno 语义：`EIO`。
     StateRejected,
 }
@@ -108,7 +94,7 @@ pub enum ComponentStopError {
 pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     // 步骤 1：拒绝门。必须在任何提交之前——拒绝不得改变 Core 真相。
     // 1a. 仍拥有未退出任务？只读扫现有任务表（不建第二账本）。
-    //     与 1b 之间没有可运行窗口：phase 1 单核协作式，当前执行不在任何组件
+    //     与 1b 之间没有可运行窗口：单核协作式，当前执行不在任何组件
     //     任务里；且 `begin_stop` 提交后 `kcore_task_create` 也不再放行该实例。
     if crate::task::get_task_table().lock().has_live_tasks(id) {
         return Err(ComponentStopError::OwnsLiveTasks);
@@ -141,7 +127,7 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
             containment::call_component_destroy(destroy, instance_state, id)
         }
         ExecutionDomain::IsolatedNative => isolated_lifecycle::destroy(id, destroy, instance_state),
-        // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
+        // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
     };
 
@@ -181,7 +167,7 @@ fn complete_stop(id: ComponentId, outcome: CallOutcome) -> Result<(), ComponentS
     // 内存记账——不释放任何内存，见 docs/architecture/memory-and-heap.md §5）。
     runtime_slot::get_slots().lock().clear(id);
     // 不变式：begin_stop 已提交 Stopping，本转换只可能被并发 stop/fail 拒绝
-    // （phase 1 单核不可达）；失败不静默。
+    // （单核不可达）；失败不静默。
     if registry::get_registry().lock().finish_stop(id).is_err() {
         return Err(ComponentStopError::StateRejected);
     }

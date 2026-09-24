@@ -1,26 +1,21 @@
 //! CoreTest 核内运行时：实例入口 + 报告分组编排 + 组件/系统集成场景。
 //!
 //! 入口契约见 `docs/architecture/component-lifecycle.md` §4：经 SDK 宏
-//! `kcomp_instance_create!` / `kcomp_instance_destroy!` 导出（参数标识符由调用点
-//! 给出，state 经 `*out_state` 交给 Core）。create 全部通过返回 `0`，有检查失败
-//! 返回**失败位图**（非 0；`load` 命令据此报告 FAILED）/ `-errno`；destroy 释放
-//! 本实例的状态分配，失败返回 `-errno`（Core 置 Failed，绝不重试）。
+//! `kcomp_instance_create!` / `kcomp_instance_destroy!` 导出，state 经 `*out_state`
+//! 交给 Core。create 全部通过返回 `0`，有检查失败返回**失败位图**（非 0；`load`
+//! 命令据此报告 FAILED）/ `-errno`；destroy 释放本实例的状态分配，失败返回
+//! `-errno`（Core 置 Failed，绝不重试）。
 //!
 //! 输出契约（`tests/qemu/runner.py` 按连续子串匹配，改动即破坏 CI）：
 //! - 每项检查一行 `[core-test]   <name>: PASS|FAIL`；
 //! - 汇总 `[core-test]   N/N checks PASS`；
 //! - 终判 `[core-test] all: PASS`（颜色码只包在标记之外，实现点在 `report.rs`）。
 //!
-//! 分组顺序 = 依赖顺序：
-//! 1. `boot` basics → `sched`（拿到 rr_id / task id）→ `resource`（拿到 handle）
-//!    → `trace` 用这些 Core 返回值做“这个操作产生这个事件”的精确断言；
-//! 2. 组件 / 系统集成场景（吸收旧 QEMU runner 与组合器组件的断言）：
-//!    `filesystem`（block chain + littlefs 多实例；在 task context 跑一轮调度）、
-//!    `driver`（真实 `driver_prober` 的 dispatch 再跑一轮调度）、
-//!    `c_frontend`（加载真实 C fixture）。
-//!
-//! 调度只能从 create 锚点上下文发起（`kcore_sched_run` 的契约上下文），因此
-//! 场景结果先写进 [`State`] 的对应字段，调度返回后再统一发报告行。
+//! 分组顺序 = 依赖顺序：`boot` basics → `sched`（拿到 rr_id / task id）→
+//! `resource`（拿到 handle）→ `trace` 用这些 Core 返回值做"这个操作产生这个事件"
+//! 的精确断言；组件 / 系统集成场景随后执行。调度只能从 create 锚点上下文发起
+//! （`kcore_sched_run` 的契约上下文），因此场景结果先写进 [`State`] 的对应字段，
+//! 调度返回后再统一发报告行。
 
 mod boot;
 mod c_frontend;

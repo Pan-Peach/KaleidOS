@@ -1,38 +1,24 @@
-//! 驱动链集成场景（吸收旧独立 `driver_prober` runner 的断言）：CoreTest 加载
-//! **真实 `driver_prober` 组件**，让它按自己的策略枚举候选并 provisioning
-//! `virtio_blk`，再用 Core 真相（trace 生命周期事件 / 设备归属 / endpoint
-//! 服务）断言它的可观测行为。
+//! 驱动链集成场景：CoreTest 加载**真实 `driver_prober` 组件**，让它按自己的策略
+//! 枚举候选并 provisioning `virtio_blk`，再用 Core 真相（trace 生命周期事件 /
+//! 设备归属 / endpoint 服务）断言它的可观测行为。
 //!
-//! 流程（两段式）：
+//! 两段式流程：
 //!
-//! 1. **候选枚举**：CoreTest 自己按 `virtio,mmio` 枚举、逐台 claim + 读
-//!    VirtIO `DeviceID`（0x008）+ release，得到候选布局（数量 / 哪些是块设备 /
-//!    第一台块设备的位置）——这是下面"停止条件"断言的参照真值。
-//! 2. **准备**：取 trace 游标 → `kcore_component_create("driver_prober")`；它的
-//!    dispatch 任务在 create 里创建/启动，必须在调度器里跑（monitor `load` 的
-//!    语义相同）。
-//! 3. **调度**（由 `runtime.rs` 统一 `kcore_sched_run`）：prober 逐台 create
+//! 1. **候选枚举（参照真值）**：CoreTest 自己按 `virtio,mmio` 枚举、逐台 claim +
+//!    读 VirtIO `DeviceID`（0x008）+ release，得到候选布局（数量 / 哪些是块设备 /
+//!    第一台块设备的位置）。
+//! 2. **准备与调度**：取 trace 游标 → `kcore_component_create("driver_prober")`；
+//!    它的 dispatch 任务在 create 里创建 / 启动，由 `runtime.rs` 统一
+//!    `kcore_sched_run`（monitor `load` 的语义相同）。prober 逐台 create
 //!    `virtio_blk`（assignment 经 create config，结果经 `probe.result` 拉取），
-//!    首个 Match（成功 attach）后停止；没有 Match 时试完全部候选后干净结束。
-//! 4. **断言**（全部来自 Core 真相）：分支在**机器拓扑事实**上——候选枚举给出的
-//!    `first_blk` 是 Core 交付的真值，runner 只控制 QEMU 挂什么盘，CoreTest 不
-//!    接收"场景"参数：
-//!    - **有块设备**（default 拓扑）：窗口内 `ComponentState` 出生事件数 == 1
-//!      （prober）+ 尝试数（= 第一台块设备的 ordinal + 1）→ 证明"枚举 → create
-//!      → pull → Match/NoMatch → 首个 attach 后停止"整条无环流程真的发生；
-//!      attached 的设备被 driver 持有（CoreTest `claim` → `-EBUSY`），其余候选
-//!      已释放（claim 成功）；只有 attached 实例有 `block.device` endpoint，且
-//!      它能真的读盘（capacity > 0、sector 0 的 MBR 签名 0xAA55）；对第二台块
-//!      设备再 create 一个 `virtio_blk` → 驱动拒绝（`-EBUSY`：image-global 单
-//!      attachment），且 attached 实例之后仍能读盘；
-//!    - **无块设备**（no-block 拓扑）：prober 对**每个**候选 create 一个
-//!      report-only `virtio_blk` 实例并 pull 到 NoMatch，试完全部候选后干净结束；
-//!      断言出生事件数 == 1 + 候选数、每个实例都发布 `probe.result` 且 pull 到
-//!      `outcome=1`、没有任何 `block.device` endpoint（没有 attach）、所有设备
-//!      都未被残留持有（CoreTest 能再次认领）；
-//!    - **stale NoMatch**（两种拓扑共有）：拿一台非 virtio-blk 的 MMIO 设备
-//!      （goldfish RTC）当候选 create `virtio_blk` → pull 到 `outcome=1`、无
-//!      block endpoint、claim 已释放（再 claim 成功）。
+//!    首个 Match 后停止；没有 Match 时试完全部候选后干净结束。
+//!
+//! 断言全部来自 Core 真相，且分支在**机器拓扑事实**（参考真值）上，CoreTest 不
+//! 接收"场景"参数：有块设备 → 出生事件数与尝试数吻合、attached 设备被驱动持有
+//! （再次 claim `-EBUSY`）、只有 attached 实例有可读的 `block.device` endpoint、
+//! 第二台块设备被拒（`-EBUSY`，image-global 单 attachment）；无块设备 → 每个候选
+//! 得到 report-only 实例（`probe.result` `outcome=1`、无 `block.device`）、设备无
+//! 残留持有；两种拓扑共有 stale NoMatch 路径（非 virtio-blk 设备作为候选）。
 //!
 //! prober 是组件、不是 Core：CoreTest 不重复它的目录/策略判断，只断言"它做了
 //! 什么"能被 Core 观测到的部分。

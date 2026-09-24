@@ -76,7 +76,7 @@ pub enum Interrupt {
     SupervisorTimer,
     SupervisorExternal,
     // M-mode 中断码（`mcause` 与 `scause` 编码一致）：共享解码器不隐含
-    // S-mode——未来 M-mode profile 直接复用同一套 `from_code`。
+    // S-mode——M-mode profile 复用同一套 `from_code`。
     MachineSoft,
     MachineTimer,
     MachineExternal,

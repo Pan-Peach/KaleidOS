@@ -1,7 +1,6 @@
-//! Isolated 域激活网关（**Core 侧准备**；increment 3 机制，increment 5 接入生命周期）。
+//! Isolated 域激活网关（**Core 侧准备**）。
 //!
-//! 本模块是 [`arch::riscv::gateway`]（双映射汇编切换）的 Core 侧对应物，把
-//! Oracle 设计的两个阶段分开：
+//! [`arch::riscv::gateway`]（双映射汇编切换）的 Core 侧对应物，两个阶段分开：
 //!
 //! 1. [`prepare`]（**持锁阶段**）：校验句柄 / 入口 / 栈，把 gateway 机制页落成
 //!    实例侧同 VA → 同 PA 的映射，取一次 [`PreparedActivation`]（`Copy`、无引用），
@@ -9,39 +8,23 @@
 //! 2. [`enter`]（**无锁阶段**）：只把描述符搬给 arch 汇编（satp + 栈/上下文
 //!    切换）。目标 root 生效后到 Core root 恢复前没有 Rust、没有锁、没有 Core 栈。
 //!
-//! ```text
-//! Core 调用方
-//!   │  isolated::prepare(handle, entry, stack, slot, irq, args)   ← 锁内：验证 + 取描述符
-//!   ▼  PreparedTransition（Copy）
-//! isolated::enter(transition)                              ← 锁外：只搬运
-//!   └─ arch::riscv::gateway::enter → 汇编 …组件… → Outcome
-//! ```
-//!
-//! # 生产调用方（increment 5 / 6）
-//!
-//! `component/isolated_lifecycle.rs` 是唯一生产调用方：Isolated 实例的
-//! `kcomp_instance_create` / `kcomp_instance_destroy`（increment 5）与
-//! `kcomp_service_dispatch`（increment 6 的跨域 service Gate）都经这里在私有
-//! AS 里执行。ArchTest 仍直接驱动本模块证明切换 / trap 往返 / 组件故障分派。
-//!
-//! 进入参数（组件入口 `a0` .. `a3`）由 Core 解释：生命周期用它们交付 create 的
-//! `args` / `out_state`（实例内 VA）与 destroy 的 `state`；increment 6 的跨域
-//! service dispatch 用满四个（`state` / `port` / `method` / provider 域内
-//! `frame`）；gateway 只搬运。
+//! 生产调用方只有 `component/isolated_lifecycle.rs`（Isolated 实例的 create /
+//! destroy / service dispatch）；ArchTest 直接驱动本模块证明切换 / trap 往返 /
+//! 组件故障分派。入口 `a0` .. `a3` 由 Core 解释（见 [`EntryArgs`]），gateway 只搬运。
 //!
 //! # 协作式边界（不伪造安全承诺）
 //!
-//! S-mode 组件与 Core 同特权级：它可以直接改 `satp` / `stvec` / 自己的映射。
-//! 本模块证明的是**机制**（真页表、真 trap 往返、真恢复 / 放弃路径），不是对抗
+//! S-mode 组件与 Core 同特权级：它可以直接改 `satp` / `stvec` / 自己的映射。本
+//! 模块证明的是**机制**（真页表、真 trap 往返、真恢复 / 放弃路径），不是对抗
 //! 隔离；真正的强制边界是 U-mode（SandboxedNative，未实现）。ASID 恒 0 + 全量
-//! `sfence.vma`，不实现也不声称 ASID 支持。
+//! `sfence.vma`。
 //!
 //! # 故障分派（窄 Core 钩子）
 //!
 //! arch 只做 eligibility：trap 来自 gateway 入口且相位是"组件运行中"才交给
-//! [`on_component_fault`]。Core 侧再按显式注册的 [`FaultPolicy`] 决定：
-//! **没有策略 = `Abandon`**——组件身份本身不构成"可恢复"的证明。策略可以检查
-//! 现场（cause / stval / sepc），也可以经 Core API 补映射后 `Resume`。
+//! [`on_component_fault`]。Core 侧再按显式注册的 [`FaultPolicy`] 决定：**没有
+//! 策略 = `Abandon`**——组件身份本身不构成"可恢复"的证明。策略可以检查现场
+//! （cause / stval / sepc），也可以经 Core API 补映射后 `Resume`。
 
 use crate::memory::address_space::{
     self, AddressSpaceHandle, MapError, PreparedActivation, VirtualRange,
@@ -204,8 +187,8 @@ pub fn register_fault_policy(policy: FaultPolicy) -> bool {
 
 /// 把 [`on_component_fault`] 接上 arch 的 gateway trap 分派。
 ///
-/// **当前无生产调用方**：increment 3 由 ArchTest 显式接线；生命周期接线属于
-/// 后续 increment。不接线时 gateway 里的组件异常保持 fatal（arch 的默认）。
+/// `isolated_lifecycle` 与 ArchTest 各自接线；未接线时 gateway 里的组件异常
+/// 保持 fatal（arch 的默认）。
 pub fn install() {
     gateway::register_component_fault_handler(on_component_fault);
 }

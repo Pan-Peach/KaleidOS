@@ -5,8 +5,7 @@
 //! trap 入口与分发、寄存器上下文与 context switch、MMU/TLB、
 //! 用户态模式切换、中断开关、原子/CPU 原语。
 //!
-//! M0 目标：启动入口（`_start`，接收 a0=hartid、a1=dtb 指针）与最小实现。
-//! 后续架构：x86_64 / aarch64 / loongarch64（各自独立 crate）。
+//! 启动入口 `_start` 接收 a0=hartid、a1=dtb 指针；新架构各自独立 crate。
 
 #![no_std]
 extern crate alloc;
@@ -133,7 +132,7 @@ pub trait CpuArch {
     fn set_context_slot(context: &mut Self::Context, slot: usize);
 
     /// 关中断并返回先前状态（irq-save 临界区进入）。
-    /// TODO(C5): Riscv 实现 = `sstatus.SIE` 保存 + 清零；fake = no-op。
+    /// Riscv 实现 = `sstatus.SIE` 保存 + 清零；fake = no-op。
     fn disable_irq() -> Self::IrqFlags;
     /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）。
     fn restore_irq(flags: Self::IrqFlags);
@@ -165,9 +164,8 @@ pub trait Timer {
 ///
 /// 与 `Timer`/`Console`/`SystemReset` 同一模式：Core 只依赖本 trait 与
 /// `InterruptImpl`，不感知 PLIC 寄存器布局。`docs/architecture/overview.md` §3 把中断
-/// 控制器的长期定位写成「驱动（由 discovery 发现）」——现阶段先把机制放在
-/// arch（同 CLINT/timer 的处理方式），未来降级为 Driver Component 时 Core 侧
-/// 调用点不变，只换 backend 实现。
+/// 控制器的长期定位写成「驱动（由 discovery 发现）」——当前机制放在 arch（同
+/// CLINT/timer），Core 侧只依赖 trait，后端实现可替换。
 pub trait InterruptController {
     /// 绑定控制器 MMIO 基址与 boot hart（boot 从 discovery 拿到后调用一次）。
     /// 记录 hart 是因为 S-mode **不能**读 `mhartid`（非法指令），OpenSBI 把

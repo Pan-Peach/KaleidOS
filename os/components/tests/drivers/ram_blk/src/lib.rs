@@ -20,7 +20,7 @@
 //! # 为什么不是 virtio_blk
 //!
 //! 本步只证明机制：合成设备没有 MMIO / DMA / 全局 statics / prober 重入问题。
-//! 真实驱动迁移（per-instance HAL context）是后续步骤。
+//! 本 fixture 没有 per-instance HAL context。
 
 #![no_std]
 
@@ -130,7 +130,7 @@ kcomp_instance_create!(|_args, out_state| {
 });
 
 kcomp_instance_destroy!(|_state| {
-    // phase 1：state 可能仍被消费者引用（Direct binding 的 ctx / 缓存），
+    // state 可能仍被消费者引用（Direct binding 的 ctx / 缓存），
     // 只逻辑停止、不回收存储（docs/architecture/component-lifecycle.md §8）。
     klog!("ram_blk: destroy");
     0

@@ -175,7 +175,7 @@ pub fn run(info: &MachineInfo) -> ! {
         b"breakpoint" => breakpoint_fault(),
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
-        // increment 3：私有 AS assembly gateway（机制证明；组件生命周期未接线）。
+        // 私有 AS assembly gateway（机制证明）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-transition" => isolated_tests::isolated_transition(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
@@ -184,7 +184,7 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-fault" => isolated_tests::isolated_fault(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-fault-abandon" => isolated_tests::isolated_fault_abandon(),
-        // increment 4：真实 `.kcomp` 的按域装载 + 页级权限强制（仍 inactive path）。
+        // 真实 `.kcomp` 的按域装载 + 页级权限强制（直接驱动机制，不经生命周期）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-image" => isolated_tests::isolated_image(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
@@ -195,14 +195,14 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-perm-data" => isolated_tests::isolated_perm_data(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-core-unreachable" => isolated_tests::isolated_core_unreachable(),
-        // increment 5：Isolated 生命周期接线（生产 create → Ready → destroy）。
+        // Isolated 生命周期（生产 create → Ready → destroy）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle" => isolated_tests::isolated_lifecycle(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fail" => isolated_tests::isolated_lifecycle_fail(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fault" => isolated_tests::isolated_lifecycle_fault(),
-        // increment 6：KernelNative caller → Isolated provider 的跨域 service Gate
+        // KernelNative caller → Isolated provider 的跨域 service Gate
         // （扁平帧拷贝 + 邮箱 + gateway；容量拒绝 + 故障 containment）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service" => isolated_tests::isolated_service(),
@@ -210,7 +210,7 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-service-limits" => isolated_tests::isolated_service_limits(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service-fault" => isolated_tests::isolated_service_fault(),
-        // increment 7：失败 / 重启验收矩阵（每个阶段失败的不变量 + stale 访问阻断 +
+        // 失败 / 重启矩阵（每个阶段失败的不变量 + stale 访问阻断 +
         // 逻辑重启）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-load-reject" => isolated_tests::isolated_load_reject(),
@@ -345,7 +345,7 @@ extern "C" fn task_panic_entry(_arg: *mut ()) -> ! {
     panic!("component task panic");
 }
 
-/// step 2 D：**真实 `.kcomp`** 的 panic containment。
+/// **真实 `.kcomp`** 的 panic containment。
 ///
 /// 从内嵌 kpkg 加载 `kcomp_panic`。它的 `kcomp_instance_create` 刻意 `panic!`，
 /// 进入的是**组件镜像自己的** SDK panic adapter（不是 boot panic handler）；
@@ -658,9 +658,9 @@ extern "C" fn external_irq_handler() {
 }
 
 // ---------------------------------------------------------------------------
-// increment 3/4：Isolated 域 ArchTest（私有 AS 切换 / trap 往返 / 组件故障分派 /
-// 按域装载 + 页级权限强制）。机制已落地但**生命周期未接线**：这里直接驱动
-// Core 准备 + arch 汇编 + `component::isolated_load`，证明机制本身。
+// Isolated 域 ArchTest（私有 AS 切换 / trap 往返 / 组件故障分派 / 按域装载 +
+// 页级权限强制）。这里直接驱动 Core 准备 + arch 汇编 + `component::isolated_load`，
+// 证明机制本身（不经组件创建路径）。
 // ---------------------------------------------------------------------------
 #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
 mod isolated_tests {
@@ -1188,12 +1188,12 @@ mod isolated_tests {
     }
 
     // -----------------------------------------------------------------------
-    // increment 4：真实 `.kcomp` 的按域装载 + 页级权限强制。
+    // 真实 `.kcomp` 的按域装载 + 页级权限强制。
     //
     // 夹具 `kcomp_isolated` 零依赖 / 零 import；本模块把它的字节从内嵌 kpkg 读出，
     // 走 `component::isolated_load` 放进一个只含「该镜像各段 + gateway 两页 +
-    // 实例栈 + 控制页」的私有 AS，再经 increment 3 的 gateway 进入。**生命
-    // 周期仍未接线**：没有任何组件创建路径调用这条链。
+    // 实例栈 + 控制页」的私有 AS，再经 assembly gateway 进入。**这条用例直接
+    // 驱动机制**：不经任何组件创建路径。
     // -----------------------------------------------------------------------
 
     /// `kcomp_isolated` 的控制页协议槽号（与组件源码逐槽一致）。
@@ -1228,7 +1228,7 @@ mod isolated_tests {
     static IMAGE_FAULT_STVAL: AtomicUsize = AtomicUsize::new(0);
     static IMAGE_FAULT_PAGE_PA: AtomicUsize = AtomicUsize::new(0);
 
-    /// increment 4 夹具：真实 `.kcomp` 已落进实例 AS + 控制页 + 实例栈 + 一个
+    /// 按域装载夹具：真实 `.kcomp` 已落进实例 AS + 控制页 + 实例栈 + 一个
     /// **Core 专属**金丝雀页（故意不映射进实例 AS）。
     struct IsolatedImageFixture {
         handle: AddressSpaceHandle,
@@ -1713,7 +1713,7 @@ mod isolated_tests {
     }
 
     // -----------------------------------------------------------------------
-    // increment 5：Isolated 生命周期接线（生产路径 create → Ready → destroy）。
+    // Isolated 生命周期（生产路径 create → Ready → destroy）。
     //
     // 夹具 `kcomp_isolated_life` 经 `load::create_component(..., IsolatedNative)`
     // 创建：私有 AS + 按域镜像 + Core 预置窗口（栈 / 实例窗口）由 Core 建立，
@@ -1919,7 +1919,7 @@ mod isolated_tests {
         {
             fail("isolated-lifecycle: instance did not reach Stopped");
         }
-        // SAFETY: 窗口 backing 在销毁后仍驻留（phase 1 逻辑死亡 / 物理驻留）。
+        // SAFETY: 窗口 backing 在销毁后仍驻留（逻辑死亡 / 物理驻留）。
         if slot(LIFE_DESTROY_SLOT) != LIFE_DESTROY_MAGIC {
             fail("isolated-lifecycle: destroy entry did not run");
         }
@@ -2007,7 +2007,7 @@ mod isolated_tests {
     }
 
     /// destroy 路径断言（成功或入口故障）：AS 退役 + Core 预置窗口**保持驻留**
-    /// （phase 1 契约；AS 退役后不可再进入）+ runtime slot 清除。
+    /// （AS 退役后不可再进入）+ runtime slot 清除。
     fn assert_destroy_path_retired(
         case: &str,
         id: ComponentId,
@@ -2040,7 +2040,7 @@ mod isolated_tests {
 
     /// KernelNative 路径不受影响：`kcomp_smoke` 仍能创建到 `Ready`。
     ///
-    /// increment 7 的"Core stays alive / KernelNative unaffected"不变式：Isolated
+    /// "Core stays alive / KernelNative unaffected"不变式：Isolated
     /// 失败不得污染共享 AS 的生命周期链。
     fn kernel_native_still_works() -> bool {
         use kernel::component::endpoint::ExecutionDomain;
@@ -2156,7 +2156,7 @@ mod isolated_tests {
     }
 
     // -----------------------------------------------------------------------
-    // increment 6：KernelNative caller → Isolated provider 的跨域 service Gate。
+    // KernelNative caller → Isolated provider 的跨域 service Gate。
     //
     // provider `kcomp_isolated_svc` 经生产路径创建（私有 AS + 按域镜像 + Core
     // 预置窗口 / 邮箱）；caller 是真实 KernelNative 组件（`kcomp_smoke`）的任务
@@ -2230,8 +2230,8 @@ mod isolated_tests {
 
     /// 经生产路径创建 `kcomp_isolated_svc`，并从 Core 侧登记它的 endpoint。
     ///
-    /// Isolated provider **不能自己 publish**（组件→Core 的 publish trampoline 属
-    /// 后续增量）：组合方（本用例，白盒）在 provider Ready 之后 stage + commit +
+    /// Isolated provider **不能自己 publish**（没有组件→Core 的 publish
+    /// trampoline）：组合方（本用例，白盒）在 provider Ready 之后 stage + commit +
     /// discover。endpoint 真相仍由 Core 拥有；`port` 由 Core 原样透传给 dispatcher。
     fn svc_provider() -> SvcProvider {
         use kernel::component::abi::{InterfaceAbi, InterfaceKind};
@@ -2812,7 +2812,7 @@ mod isolated_tests {
     }
 
     // -----------------------------------------------------------------------
-    // increment 7：失败 / 重启验收矩阵。
+    // 失败 / 重启矩阵。
     //
     // 逐条证明"组件失败 = 逻辑死亡、物理驻留"：每个阶段失败之后实例状态 / AS /
     // Core 预置窗口 / runtime slot / endpoint / caller 错误 / Core 存活 /
@@ -3124,7 +3124,7 @@ mod isolated_tests {
 
     /// destroy 入口故障：`stop_component` → destroy 在私有 AS 里 trap →
     /// `DestroyPanicked`（EIO）、实例 `Failed`、AS 退役、Core 预置窗口保持驻留
-    /// （phase 1，与优雅停止同一纪律）、runtime slot 清除；**绝不自动重试析构**
+    /// （与优雅停止同一纪律）、runtime slot 清除；**绝不自动重试析构**
     /// （第二次 stop 被状态机拒绝，destroy 计数不变）。
     pub(super) fn isolated_destroy_fault() -> ! {
         use kernel::component::containment::KcompCreateArgs;
@@ -3198,7 +3198,7 @@ mod isolated_tests {
             );
         }
 
-        // Then：Failed + AS 退役 + 窗口驻留（phase 1）+ slot 清除。
+        // Then：Failed + AS 退役 + 窗口驻留 + slot 清除。
         if registry_state(id) != Some(kernel::component::ComponentState::Failed) {
             fail_case("isolated-destroy-fault", "instance was not marked Failed");
         }

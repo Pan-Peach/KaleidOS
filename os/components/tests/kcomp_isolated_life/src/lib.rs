@@ -1,14 +1,14 @@
-//! kcomp_isolated_life —— increment 5（Isolated 生命周期接线）的 ArchTest
+//! kcomp_isolated_life —— Isolated 生命周期的 ArchTest
 //! **真实 `.kcomp`**：由生产路径 `create_component(name, args, IsolatedNative)`
 //! 创建、`stop_component` 销毁，全程跑在**自己的私有 AS** 里。
 //!
 //! # 零依赖、零 import
 //!
-//! Isolated 的 import 包络仍是**空集**（本增量选择 Core 预置内存窗口、不引入
+//! Isolated 的 import 包络是**空集**（选择 Core 预置内存窗口、不引入
 //! component→Core 的 gate-call trampoline）：本夹具只用 `core::arch::asm!` 读
 //! CSR 与自己镜像内的 load/store，没有任何 UNDEF 符号。
 //!
-//! # 与 Core 的接口（increment 5 的窗口协议）
+//! # 与 Core 的接口（窗口协议）
 //!
 //! Core 经 gateway 把 `a0 = args`、`a1 = out_state` 交给 `kcomp_instance_create`：
 //!
@@ -49,7 +49,7 @@ pub struct CreateArgs {
 
 /// 上报区在实例窗口里的偏移（Core 不解释；ArchTest 按同一偏移读回）。
 const REPORT_OFF: usize = 512;
-/// Core 预交付的域视图（`kcore_memory_view`）在窗口里的偏移（increment 5 布局）。
+/// Core 预交付的域视图（`kcore_memory_view`）在窗口里的偏移。
 const WINDOW_VIEW_OFF: usize = 384;
 /// destroy 标记相对 `state`（= 上报区基址）的偏移。
 const DESTROY_OFF: usize = 10 * core::mem::size_of::<usize>();

@@ -1,4 +1,4 @@
-//! S-mode **assembly gateway**：Isolated 域私有 AS 的唯一切换出口（increment 3）。
+//! S-mode **assembly gateway**：Isolated 域私有 AS 的唯一切换出口。
 //!
 //! 设计（`docs/architecture/deployment.md` §6.3 / `memory-and-heap.md` §8）：
 //! 切换**不是** Rust 的 `activate()` 三明治。Core 侧先在持锁状态下完成全部
@@ -13,16 +13,14 @@
 //!    ▼
 //! gateway_enter（汇编，双映射页）
 //!    │  保存 Core 现场 → stvec=gateway_trap_entry, sscratch=&scratch
-//!    │  csrw satp=目标 root; sfence.vma
-//!    │  sp=组件栈, tp=slot, ra=返回点, jalr entry
+//!    │  csrw satp=目标 root; sfence.vma → sp=组件栈, tp=slot, ra=返回点, jalr entry
 //!    ▼
 //! 组件在私有 AS 上运行（S-mode；可被 trap）
-//!    │  正常返回 ─────────────────────────────► 恢复 Core root / 现场 → ret
-//!    └─ trap ──► gateway_trap_entry（汇编）
-//!                 保存完整被打断现场 → 切 Core root + 专用 trap 栈
-//!                 → Rust 分派（timer/external 走普通主处理；异常交给 Core 钩子）
-//!                 → Resume：切回实例 root，按 trap 帧恢复并 sret
-//!                 → Abandon：恢复挂起的 Core 调用者（Outcome::Faulted）
+//!    │  正常返回 ─────────────────────────► 恢复 Core root / 现场 → ret
+//!    └─ trap ──► gateway_trap_entry（汇编）→ 保存完整现场、切 Core root + 专用
+//!                 trap 栈 → Rust 分派（timer/external 走普通主处理；异常交给 Core
+//!                 钩子）→ Resume（切回实例 root，按 trap 帧 sret）/ Abandon
+//!                 （恢复挂起的 Core 调用者，Outcome::Faulted）
 //! ```
 //!
 //! # 双映射（dual-mapped gateway）
@@ -32,7 +30,7 @@
 //! Core 侧的 `KernelAddressSpace` 落成实例侧映射（`component::isolated::prepare`）；
 //! 实例 AS 里不会因此出现任何普通 Core 段 / Core 堆 / 页表 / MMIO。
 //!
-//! # 本阶段边界（诚实声明）
+//! # 非显然硬件约束（诚实声明）
 //!
 //! - **协作式、非对抗边界**：S-mode 组件与 Core 同特权级，可以直接改 `satp` /
 //!   `stvec` / 自己的 trampoline；这里证明的是**机制**（真页表、真 trap 往返），
@@ -40,7 +38,7 @@
 //! - **ASID 恒 0 + 全量 `sfence.vma`**：不实现 ASID 分配 / 复用，也不声称支持。
 //! - **`gp` 不是可互换环境**：本镜像没有 `__global_pointer$`、Rust 代码不依赖
 //!   `gp`；gateway 仍把它当现场的一部分保存 / 恢复，并在调用 Core Rust 分派前
-//!   装回 Core 的 `gp`。组件侧**不**安装自己的 `gp`（按域 gp 环境属于未来 loader）。
+//!   装回 Core 的 `gp`。组件侧**不**安装自己的 `gp`（按域 gp 环境不在 arch）。
 //! - **`tp` = 组件 runtime slot**：进入前由 [`Transition::runtime_slot`] 提供
 //!   （0 = 无 slot）；只有 `tp` 的搬运，没有 TLS / 记账。
 //! - **入口参数 `a0` .. `a3`**：由 [`Transition::arg0`] .. [`Transition::arg3`]
@@ -48,8 +46,8 @@
 //!   create / destroy 只用 `a0` / `a1`；service dispatch 用满四个（state / port /
 //!   method / frame）。
 //! - **单 CPU、不可重入**：scratch 与 Core trap 栈是单一静态；组件生命周期
-//!   （increment 5 起 `component/isolated_lifecycle.rs` 是生产调用方）同步进入、
-//!   不嵌套，ArchTest 也串行驱动。
+//!   （`component/isolated_lifecycle.rs` 是生产调用方）同步进入、不嵌套，
+//!   ArchTest 也串行驱动。
 //!
 //! # 故障归属
 //!
@@ -371,7 +369,7 @@ pub fn enter(transition: Transition) -> Outcome {
     );
 
     // SAFETY: [Category 2 — Data races] single-CPU, non-reentrant: the
-    // component lifecycle (increment 5) enters synchronously and never nests a
+    // component lifecycle enters synchronously and never nests a
     // transition; ArchTest also drives it serially.
     let scratch = core::ptr::addr_of_mut!(SCRATCH);
     unsafe {

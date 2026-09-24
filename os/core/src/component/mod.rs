@@ -13,26 +13,25 @@ pub mod exit;
 pub mod export;
 pub mod failure;
 pub mod image;
-/// 私有 AS 切换网关的 Core 侧准备（increment 3 机制，increment 5 起由
-/// `isolated_lifecycle` 生产调用；仅 S-mode + MMU + RISC-V 目标有意义，
-/// 其余 profile 不提供、也不降级）。
+/// 私有 AS 切换网关的 Core 侧准备（`isolated_lifecycle` 生产调用；仅
+/// S-mode + MMU + RISC-V 目标有意义，其余 profile 不提供、也不降级）。
 #[cfg(all(
     feature = "vm-mmu",
     feature = "supervisor",
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
-/// Isolated 域**实例生命周期**（increment 5）：私有 AS + 按域镜像 + Core 预置
-/// 实例窗口 + runtime slot，经 assembly gateway 执行 `kcomp_instance_create` /
+/// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口 +
+/// runtime slot，经 assembly gateway 执行 `kcomp_instance_create` /
 /// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
-/// **increment 6** 起同一模块还承载跨域 service dispatch（KernelNative caller →
-/// Isolated provider，经扁平帧邮箱 + gateway）。
+/// 同一模块还承载跨域 service dispatch（KernelNative caller → Isolated
+/// provider，经扁平帧邮箱 + gateway）。
 pub mod isolated_lifecycle;
-/// 按域装载（increment 4）：把一个已解析的 `.kcomp` 的段按页级权限放进实例的
-/// 私有 AS。**increment 5 起由生命周期调用**（见 `isolated_lifecycle`）。
+/// 按域装载：把一个已解析的 `.kcomp` 的段按页级权限放进实例的私有 AS。
+/// 由 `isolated_lifecycle` 调用。
 pub mod isolated_load;
-/// Isolated 跨域 service 的**扁平调用帧邮箱**（increment 6）：caller frame →
-/// Core 拥有的邮箱 backing → provider 域内 VA；容量固定、超长显式拒绝。
+/// Isolated 跨域 service 的**扁平调用帧邮箱**：caller frame → Core 拥有的邮箱
+/// backing → provider 域内 VA；容量固定、超长显式拒绝。
 pub mod isolated_mailbox;
 pub mod load;
 pub mod loader;
@@ -110,17 +109,12 @@ pub enum ComponentState {
     /// 已停止：`kcomp_instance_destroy` 已返回 0、剩余 authority 与 endpoint 已由
     /// Core 兜底回收（`Stopping → Stopped`，由 `stop_component` 提交）。
     ///
-    /// phase 1 保留记录：不回收段内存、不退役实例、`ComponentId` 不复用。
+    /// 保留记录：不回收段内存、不退役实例、`ComponentId` 不复用。
     Stopped,
     /// 运行过程中失败（逻辑死亡，可触发恢复流程）。
     ///
     /// 意外退出 / abort **当前统一由 `Failed` 覆盖**（组件 panic containment
     /// 路径提交 `Failed`）。
-    ///
-    /// TODO(unexpected-exit): 失败实例的状态提交点（`containment` 的
-    /// task-abort trampoline → `sched::abort_current_task` → `fail_component`）
-    /// 就是未来"独立 abort/exit 通知"的 hook 点；届时可区分普通失败与组件
-    /// 主动退出。
     Failed,
 }
 
@@ -159,10 +153,10 @@ impl ComponentState {
     /// 实例是否仍**活着**（未到终态）：`Declared` / `Resolved` / `Starting` /
     /// `Ready` / `Stopping`。
     ///
-    /// 终态 = `Stopped` / `Failed`（tombstone，phase 1 保留记录）。
+    /// 终态 = `Stopped` / `Failed`（tombstone，记录保留）。
     /// 用途：Isolated 的同 image 并发门禁（`component/load.rs`）——逻辑重启只在
     /// 前一个实例**逻辑死亡之后**成立；两个活跃实例会共享 image 的
-    /// `.data` / `.bss`（image-global，与 KernelNative 同一契约），不在本阶段
+    /// `.data` / `.bss`（image-global，与 KernelNative 同一契约），不在当前
     /// 承诺的隔离模型内。
     pub const fn is_live(self) -> bool {
         matches!(

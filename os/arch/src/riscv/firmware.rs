@@ -54,9 +54,7 @@ pub fn system_reset(reset_type: ResetType) -> ! {
 
 /// 读取当前时间（timebase tick，单调递增）。
 ///
-/// TODO(C5)：实现。两条路（择一/带兜底）：
-/// - S-mode 直接 `rdtime`（当前 QEMU/OpenSBI 已开 `scounteren`，boot 日志可见）；
-/// - SBI TIME 扩展探测（更可移植，但多一次 ecall）。
+/// 实现：S-mode 直接 `rdtime`（当前 QEMU/OpenSBI 已开 `scounteren`）。
 #[cfg(target_arch = "riscv64")]
 pub fn time() -> u64 {
     let time: u64;

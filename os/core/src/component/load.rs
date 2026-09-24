@@ -77,7 +77,7 @@ pub enum ComponentLoadError {
     /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
     /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
     IsolationUnsupported,
-    /// `IsolatedNative` 装载发现**未支持的 `kcore_*` import**：本阶段 Isolated
+    /// `IsolatedNative` 装载发现**未支持的 `kcore_*` import**：Isolated 当前
     /// 的 import 解析（Core gate trampoline）尚未实现，任何 `kcore_*` UNDEF 都
     /// 在装载**之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     IsolatedImportUnsupported,
@@ -92,7 +92,7 @@ pub enum ComponentLoadError {
     /// 只在前一个实例逻辑死亡（`Failed` / `Stopped` tombstone）之后成立。
     /// image 的 `.data` / `.bss` 是 image-global（与 KernelNative 同一契约，
     /// `docs/architecture/component-lifecycle.md` §9），两个活跃 Isolated 实例
-    /// 共享可写段不在本阶段的隔离承诺内 → 显式拒绝（`-EBUSY`），绝不静默共享。
+    /// 共享可写段不在当前的隔离承诺内 → 显式拒绝（`-EBUSY`），绝不静默共享。
     IsolatedInstanceLive,
     /// `IsolatedNative` 按域放段失败（段出窗 / 重叠 / 权限不可表达 / 入口不可执行 /
     /// 地址溢出 / 含任何 UNDEF import 的空集包络 / 后端拒绝映射）：镜像不适配该域，
@@ -106,7 +106,7 @@ pub enum ComponentLoadError {
     CreateFaulted,
     /// Isolated provider 在**跨 AS service dispatch** 期间故障，由 gateway 的 Core
     /// 故障分派判为不可恢复（`Outcome::Faulted`）：provider 逻辑死亡 + AS 退役 +
-    /// Core 预置窗口归还，caller 存活（increment 6）。
+    /// Core 预置窗口归还，caller 存活。
     ServiceFaulted,
 }
 
@@ -194,7 +194,7 @@ pub fn create_component(
         // Isolated 有真实执行器：`create_isolated_native` 建私有 AS、放置镜像，
         // 再经 gateway 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
-        // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
+        // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
     }
 }
@@ -301,7 +301,7 @@ fn create_kernel_native(
     }
 }
 
-/// `IsolatedNative` 的创建路径（increment 5：真正创建、启动、销毁）。
+/// `IsolatedNative` 的创建路径（真正创建、启动、销毁）。
 ///
 /// 本函数只做**装载前置门禁**（能力 / image 复用 / import 包络），随后把
 /// 创建编排交给 [`isolated_lifecycle::create`]：
@@ -326,7 +326,7 @@ fn create_isolated_native(
     // (2) 装载前置门禁；blob 只读一次，随后的按域装载用同一份字节。
     let blob = validate_isolated_load(name)?;
 
-    // (3) 生命周期编排（increment 5）。
+    // (3) 生命周期编排。
     isolated_lifecycle::create(name, &blob, args)
 }
 
@@ -337,7 +337,7 @@ fn create_isolated_native(
 ///   （`ImageDomainMismatch`）；同域复用**只在没有活跃实例时**放行——
 ///   **逻辑重启**（前一个实例 `Failed` / `Stopped` 后创建全新实例）走这条；
 ///   并发活跃实例显式拒绝（`IsolatedInstanceLive`，`-EBUSY`）。
-/// - **import 包络 = 空集**：本阶段没有 per-domain trampoline。任何 `kcore_*`
+/// - **import 包络 = 空集**：没有 per-domain trampoline。任何 `kcore_*`
 ///   UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
 ///   按域装载的空集包络拒绝（`isolated_load::place`，`-EINVAL`）。
 fn validate_isolated_load(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
@@ -480,7 +480,7 @@ mod tests {
     const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
 
     /// 串行化本模块触碰全局真相（store / image / registry / endpoint / handle /
-    /// HEAP）的测试；将来新增 load 相关用例都必须先拿这把锁。
+    /// HEAP）的测试；新增 load 相关用例都必须先拿这把锁。
     ///
     /// rank = LOAD（模块本地、最外层；见 [`crate::test_support`]）。
     static LOAD_TEST_LOCK: TestLock = TestLock::new(Rank::Load);
@@ -599,7 +599,7 @@ mod tests {
         let _ = load_and_start(b"kcomp_smoke", ExecutionDomain::SandboxedNative);
     }
 
-    // -- Isolated 部署的显式拒绝包络（increment 1）-----------------------------
+    // -- Isolated 部署的显式拒绝包络 --------------------------------------------
 
     /// 真实 `.kcomp` fixture（与 loader 用例同一份构建产物）。
     const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));

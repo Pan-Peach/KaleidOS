@@ -15,10 +15,10 @@
 //!   `kcomp_instance_destroy` 自行收尾，再调用本模块共享的
 //!   [`revoke_authority_and_unbind`] 兜底。
 //!
-//! # 明确 DEFERRED（本增量不做）
+//! # 当前边界
 //!
-//! - **强制停止失败组件的任务**（当前只有 yield/exit）。
-//! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
+//! - 不强制停止失败组件的任务（只有 yield/exit）。
+//! - 物理组件镜像不回收（logical death / physical residency）。
 
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, endpoint, registry, runtime_slot};

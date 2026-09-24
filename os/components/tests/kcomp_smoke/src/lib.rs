@@ -1,4 +1,4 @@
-//! kcomp_smoke —— SDK 参考组件（step 2 C）。
+//! kcomp_smoke —— SDK 参考组件。
 //!
 //! 通过 Component SDK 调用 `kcore_*` 白名单（不再自己写 extern / console helper），
 //! 验证链接后的 `.kcomp` 重定位链路（UNDEF 只解析白名单符号），并保持与迁移前

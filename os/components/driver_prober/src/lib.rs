@@ -1,6 +1,4 @@
-//! driver_prober —— 协议无关的设备 prober（组件级“总线”）。
-//!
-//! # 职责与刻意分层
+//! driver_prober —— 协议无关的设备 prober（组件级"总线"）。
 //!
 //! ```text
 //! prober（本组件）:  按 compatible 枚举候选 → 逐台把 (attempt, DeviceId) 编码进
@@ -12,12 +10,11 @@
 //!                      → 把结果 staged publish 到 config 指定的 `probe.result` 端口
 //! ```
 //!
-//! **prober 不含任何协议知识，也绝不 claim MMIO：**
-//!
-//! - 不包含 VirtIO 偏移、DeviceID 取值，或任何 MMIO 读；
-//! - `compatible` 对它是**不透明路由键**——只按字节相等匹配，绝不解释；
-//! - 最后的硬件匹配必须在驱动代码运行、且驱动持有 authority 之后才能完成，
-//!   所以这里只做 coarse candidate match（见 docs/architecture/driver-model.md §9.1 / §12 Q1）。
+//! **prober 不含任何协议知识，也绝不 claim MMIO：** 不含 VirtIO 偏移 / DeviceID
+//! 取值 / 任何 MMIO 读；`compatible` 对它是**不透明路由键**——只按字节相等匹配，
+//! 绝不解释。最后的硬件匹配必须在驱动代码运行、且驱动持有 authority 之后才能
+//! 完成，所以这里只做 coarse candidate match
+//! （见 `docs/architecture/driver-model.md` §9.1 / §12 Q1）。
 //!
 //! # 无环：数据进 create，结果走 probe.result
 //!
@@ -30,21 +27,11 @@
 //!
 //! # 生命周期
 //!
-//! 本组件 create 期间**不发布** endpoint（旧的 assignment 回调服务已删除）；它创建
-//! 一个**有限** dispatch 任务：monitor 在 load 提交后 `sched::run()` 运行它——
-//! 枚举候选 → 逐台 create + pull，直到首个 `Match`（成功 attach）后停止；全部
-//! NoMatch / 创建失败则自然结束（无后台循环；热插拔明确 deferred）。实例状态
-//! （候选集 + cursor）由 create 显式分配，经 `out_state` / task arg 传递，不再是
-//! 可变全局。
-//!
-//! # 延期（deferred，勿在本轮长出来）
-//!
-//! - TODO(prober-classes): 更多设备类 / 每类优先级；当前只有一张极小静态目录。
-//! - TODO(prober-multi): 每实例 state 已就位（create 分配、经 task arg 传递），
-//!   但组合策略当前仍只加载**一个** prober（多实例 endpoint 命名未启用）。
-//! - TODO(prober-hotplug): 热插拔 / reset / recovery；枚举只在 dispatch 时做一次。
-//! - TODO(prober-broker): 需要 Core-authority 的组件加载仍走 `kcore_component_create`；
-//!   跨执行域的 Core 侧 broker 未实现（`docs/architecture/deployment.md` §6.3）。
+//! 本组件 create 期间**不发布** endpoint；它创建一个**有限** dispatch 任务：
+//! monitor 在 load 提交后 `sched::run()` 运行它——枚举候选 → 逐台 create + pull，
+//! 直到首个 `Match`（成功 attach）后停止；全部 NoMatch / 创建失败则自然结束（无
+//! 后台循环）。实例状态（候选集 + cursor）由 create 显式分配，经 `out_state` /
+//! task arg 传递，不是可变全局；枚举只在 dispatch 时做一次。
 
 #![no_std]
 

@@ -1,4 +1,4 @@
-# KaleidOS increment 3 ArchTest fixture (RV32): the "component" that runs in a
+# ArchTest fixture (RV32): the "component" that runs in a
 # private address space.
 #
 # 与 isolated64.S 同形，只有 XLEN 宽度差异（sw/lw、4 字节槽）。控制页按 usize

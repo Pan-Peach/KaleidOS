@@ -31,7 +31,7 @@ use crate::memory::address_space::Mapping;
 use alloc::vec::Vec;
 use spin::{Mutex, Once};
 
-/// artifact 名上限（与旧 registry 一致；超出即拒绝，不截断）。
+/// artifact 名上限（超出即拒绝，不截断）。
 const MAX_NAME_LEN: usize = 64;
 
 /// 组件镜像身份（Identity，不是 Authority）。Core 分配、单调递增、不回收。
@@ -39,7 +39,7 @@ const MAX_NAME_LEN: usize = 64;
 pub struct ComponentImageId(u32);
 
 impl ComponentImageId {
-    /// 身份可从 raw 值构造（Core 记录 / trace / 未来 IPC 用）；存在性由表校验。
+    /// 身份可从 raw 值构造（Core 记录 / trace / IPC 用）；存在性由表校验。
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
@@ -85,7 +85,7 @@ pub struct ComponentImage {
     /// 为空。常驻随 image（lease 归 image）：同域的第二/第 N 个实例把这份
     /// backing 映射进自己的私有 AS（`isolated_lifecycle`）。
     pub(crate) placement: Vec<Mapping>,
-    /// 常驻段 lease：**归 image 所有**。phase 1 不回收（physical residency）。
+    /// 常驻段 lease：**归 image 所有**。不回收（physical residency）。
     pub(crate) memory: MemoryLease,
 }
 

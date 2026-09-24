@@ -41,7 +41,7 @@ CASES = (
     ("context-switch", None, None),
     ("panic-containment", None, None),
     ("task-panic", None, None),
-    # step 2 D: a real .kcomp panics via its own SDK panic adapter; Core must
+    # panic-component: a real .kcomp panics via its own SDK panic adapter; Core must
     # survive and the adapter's diagnostic line must reach the serial console.
     ("panic-component", None, "[kcomp] panic"),
     ("illegal-instruction", 2, None),
@@ -57,7 +57,7 @@ CASES = (
     ("tlb-invalidate", 13, None),
     ("timer", None, None),
     ("external-irq", None, None),
-    # increment 3: the Isolated-domain assembly gateway.  `isolated-transition`
+    # The Isolated-domain assembly gateway.  `isolated-transition`
     # proves the Core -> private AS -> Core round-trip (register/tp/gp save-
     # restore + component-visible private root); `isolated-timer` proves a
     # returning timer interrupt taken inside the private AS, handled on the
@@ -69,7 +69,7 @@ CASES = (
     ("isolated-timer", None, None),
     ("isolated-fault", None, None),
     ("isolated-fault-abandon", None, None),
-    # increment 4: per-domain loading of a real `.kcomp` into a private address
+    # Per-domain loading of a real `.kcomp` into a private address
     # space with page-separated permissions.  `isolated-image` proves the placed
     # image executes through the gateway in its own root (only image segments +
     # gateway + harness pages mapped; Core-only mappings unreachable).
@@ -85,7 +85,7 @@ CASES = (
     ("isolated-perm-text", None, "scause=0xf"),
     ("isolated-perm-data", None, "scause=0xc"),
     ("isolated-core-unreachable", None, "scause=0xd"),
-    # increment 5: the Isolated lifecycle is wired end-to-end through the
+    # The Isolated lifecycle end-to-end through the
     # production entry points.  `isolated-lifecycle` creates a real `.kcomp`
     # instance via `create_component(.., IsolatedNative)`, proves its
     # `kcomp_instance_create` ran inside the private AS with the ABI-transit
@@ -101,7 +101,7 @@ CASES = (
     ("isolated-lifecycle", None, "isolated-lifecycle: private AS OK"),
     ("isolated-lifecycle-fail", None, None),
     ("isolated-lifecycle-fault", None, None),
-    # increment 6: the KernelNative -> Isolated service Gate.  A KernelNative
+    # The KernelNative -> Isolated service Gate.  A KernelNative
     # caller invokes a real `.kcomp` provider's `kcomp_service_dispatch` in its
     # own private AS through the assembly gateway: the flat frame is COPIED
     # through a Core-owned mailbox (provider-side pointers are all mailbox VAs,
@@ -116,7 +116,7 @@ CASES = (
     ("isolated-service", None, "isolated-service: gate OK"),
     ("isolated-service-limits", None, None),
     ("isolated-service-fault", None, "isolated-service-fault: contained"),
-    # increment 7: the failure/restart acceptance matrix.  Every row asserts the
+    # The failure/restart acceptance matrix.  Every row asserts the
     # AGENTS.md failure contract ("组件失败 = 逻辑死亡、物理驻留"): the instance
     # reaches its documented state, its AS is retired or released, the
     # Core-prepared windows are returned, the runtime slot is cleared, the
@@ -132,7 +132,7 @@ CASES = (
     #                           errors and never mutates the instance truth;
     #   isolated-destroy-fault  a destroy-entry trap yields DestroyPanicked +
     #                           Failed + retired AS (windows stay resident per
-    #                           phase 1) and is never retried;
+    #                           current contract) and is never retried;
     #   isolated-stale-access   a resolved-but-dead endpoint is blocked at the
     #                           Core boundary (the provider never runs again);
     #   isolated-ready-fault    a fault on an instance that already served a call

@@ -1,19 +1,15 @@
-//! 第 3 组（device / IRQ / DMA）：discover → claim → 直接访问 → release 的完整链，
-//! 以及 Core 已定义的拒绝路径。
-//!
-//! # 边界：这里没有平台事实
+//! device / IRQ / DMA 分组：discover → claim → 直接访问 → release 的完整链，以及
+//! Core 已定义的拒绝路径。
 //!
 //! 只按 compatible 枚举（名字来自机器自己的 discovery）、认领 Core 给的
 //! `DeviceId`、**直接 volatile 访问** Core 返回的 MMIO 指针，断言 Core 自己报告的
-//! errno。QEMU virt 的**平台白盒**事实（PLIC 线号、enable bit 布局/读回）不在这里
-//! ——那是 ArchTest `external-irq` 的职责。
+//! errno。QEMU virt 的**平台白盒**事实（PLIC 线号、enable bit 布局 / 读回）不在
+//! 这里——那是 ArchTest `external-irq` 的职责。
 //!
-//! # mechanism-first 模型（刻意如此）
-//!
-//! - KernelNative claim 后直接拿到寄存器裸指针，**不存在** per-access Core 鉴权；
-//!   越界/对齐由 driver 自己负责（这里不再有 `mmio-read-bounds` 检查）。
-//! - IRQ 锚在 `DeviceId`：register/enable/disable/release；没有 poll/ack。
-//! - DMA allocation 与 mapping 分离：`alloc → buffer`，`map(device_id) → device addr`。
+//! mechanism-first 模型：KernelNative claim 后直接拿到寄存器裸指针，**不存在**
+//! per-access Core 鉴权（越界 / 对齐由 driver 自己负责）；IRQ 锚在 `DeviceId`
+//! （register / enable / disable / release，没有 poll / ack）；DMA allocation 与
+//! mapping 分离（`alloc → buffer`，`map(device_id) → device addr`）。
 
 use kcomp_sdk::DmaDirection;
 use kcomp_sdk::abi::{

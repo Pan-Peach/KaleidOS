@@ -1,4 +1,4 @@
-//! kcomp-sdk —— 组件 SDK / CRT（step 2）。
+//! kcomp-sdk —— 组件 SDK / CRT。
 //!
 //! 这个 crate 解决三件互相独立的事，全部**随 `.kcomp` 私有携带**（不建 shared
 //! Rust runtime，见 docs/architecture/component-model.md §2.2）：
@@ -9,17 +9,10 @@
 //! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → **当前实例的
 //!    per-instance heap**（[`heap`]，分配器实现是 freestanding C）。
 //!
-//! 模块划分与 crate 外部路径一一对应（`abi` / `DmaDirection` / `log` /
-//! `console_write_byte` 保持原路径不变）：
-//! [`abi`] 原始 extern + 共享 ABI 值类型（`InterfaceAbi` / `InterfaceKind`）、
-//! [`endpoint`] typed `Endpoint<C>`（Contract / Endpoint 模型）、
-//! [`frame`] flat frame 的借用视图、
-//! [`block`] block.device 契约 + provider wrapper + **调用后端**（Core 在 bind 时
-//! 选定的 Direct / Gate，`BlockBinding` typed 前端）+ Gate 适配器、
-//! [`scheduler`] `scheduler.policy` 契约（Gate-only；consumer = Core）、
-//! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、[`heap`]、
-//! [`alloc`]、[`mem`]（raw backing 便利分配器）。
-//!
+//! 其余模块：typed [`endpoint`]、flat [`frame`] 视图、[`block`]（契约 + provider
+//! wrapper + Core 在 bind 时选定的 Direct / Gate 调用后端）、[`scheduler`]
+//! （Gate-only；consumer = Core）、[`call`]、`dma`、`logging`、`panic`、[`mem`]。
+//! 外部路径（`abi` / `DmaDirection` / `log` / `console_write_byte`）保持不变。
 //! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；
 //! method switch 由契约自己的适配器（如 [`block::dispatch`]）手写。
 //!
@@ -135,7 +128,7 @@ macro_rules! kcomp_instance_create {
 ///
 /// destroy 只做组件自己的 quiesce / 私有资源清理；Core 仍会兜底
 /// revoke authority / 失效 endpoint。已交给外部（`'static` SDK 引用）的 state 存储
-/// 本轮保留——consumer 可能持有拷贝过的 typed 前端句柄。
+/// 保留——consumer 可能持有拷贝过的 typed 前端句柄。
 #[macro_export]
 macro_rules! kcomp_instance_destroy {
     (|$state:ident| $body:block) => {

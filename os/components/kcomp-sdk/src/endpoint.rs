@@ -4,7 +4,7 @@
 //!
 //! - Core owns truth：endpoint 的存在性 / 状态 / owner / contract / abi 全在 Core；
 //! - SDK 只实现机制、不选择机制：本模块**不**决定 Direct / Gate——那是 Core 在
-//!   bind 时按 `(caller domain, callee domain)` 选定的（后续步骤的调用后端）；
+//!   bind 时按 `(caller domain, callee domain)` 选定的调用后端；
 //!   这里只把 id 变成"带契约身份的句柄"。
 //!
 //! # 校验只做一次
@@ -36,7 +36,7 @@ pub trait Contract {
 /// 某契约 `C` 的一个**已校验** endpoint（consumer 侧句柄）。
 ///
 /// 不持裸可调用物（provider 指针不进 consumer）；调用机制由 Core 在 bind 时选定、
-/// 由未来的调用后端承载——本类型只承载**身份** + 契约类型。
+/// 由 bind 选定的调用后端承载——本类型只承载**身份** + 契约类型。
 pub struct Endpoint<C: Contract> {
     id: u64,
     _c: PhantomData<fn() -> C>,

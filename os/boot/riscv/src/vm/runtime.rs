@@ -1,11 +1,10 @@
 //! 长期内核地址空间（buddy 动态根）——boot root → runtime root 的交接点。
 //!
 //! `super::bootstrap::init` 建立的临时 root 只活到 `kernel::init()` 完成、
-//! buddy allocator 可用之前；此后本模块用 `Sv39AddressSpace`（buddy 动态
-//! 页表）建立长期 root，`init()` 里完成 build → verify → activate 并在全局
-//! 安装（`main64.rs` 在 `kernel::init()` 后调用一次）。
-//!
-//! 与 bootstrap 的区别只是**实现时机和 backing**，输入是同一个 `KernelLayout`：
+//! buddy allocator 可用之前；此后本模块用 `Sv39AddressSpace`（buddy 动态页表）
+//! 建立长期 root，`init()` 里完成 build → verify → activate 并在全局安装
+//! （`main64.rs` 在 `kernel::init()` 后调用一次）。与 bootstrap 的区别只是
+//! **实现时机和 backing**，输入是同一个 `KernelLayout`：
 //!
 //! ```text
 //!          KernelLayout（layout.rs，linker symbols 的唯一解释者）
@@ -26,21 +25,14 @@
 //! bootstrap 影子 → [KERNEL_VMA, text.va_start) 高半区（含 .bss.stack 高栈，RW）
 //! layout       → 高半区正式段（.text RX / .rodata+.initpkg R / .data+.bss RW）
 //!               → PA = kernel_pa + (va - KERNEL_VMA)
-//! info RAM     → identity 映射（VA == PA，阶段一 RWX：组件池在 buddy identity 页执行）
+//! info RAM     → identity 映射（VA == PA，RWX：组件池在 buddy identity 页执行）
 //! info 设备    → MMIO 区间（VA == PA，RW-NX，页对齐向外取整）
 //! ```
 //!
-//! # 遗留 TODO（与实现并存）
-//! - W^X 收紧：identity RAM 目前带 `EXECUTE`（阶段一组件池在 buddy identity 页里
-//!   执行，loader 从那里跑代码，见 roadmap 组件池 RWX 注记）。等 loader 改用
-//!   专用可执行区之后，identity RAM 可降为 RW-NX；
-//! - PTE 权限验证：`AddressSpaceBackend::translate` 只给 PA、不给权限位；要验证
-//!   权限需给 backend 增加只读 accessor（seam，本轮不做）；
-//! - usable RAM 边界规范化：RAM 映射这里做内向取整（宁少不越界）；若未来出现
-//!   报告非对齐 RAM 的平台，更正确的落点是在 discovery→MachineInfo 提交时
-//!   规范化 usable 边界，而不是各消费方自己 round。
+//! identity RAM 目前带 `EXECUTE`：loader 在组件池（buddy identity 页）里跑代码；
+//! RAM 的 usable 边界做**内向取整**（宁少不越界），设备 MMIO 向外取整。
 //!
-//! Sv39AddressSpace 的机制（map/unmap/translate/权限/失败回滚）已在 arch crate
+//! `Sv39AddressSpace` 的机制（map/unmap/translate/权限/失败回滚）已在 arch crate
 //! 的 host 测试覆盖；本模块只做编排。boot crate 是 riscv-only 二进制
 //! （`test = false`），编排逻辑由 QEMU 端到端验证承接。
 
@@ -52,7 +44,7 @@ use spin::{Mutex, Once};
 
 use super::layout::{KernelLayout, KERNEL_VMA};
 
-/// 全局长期内核地址空间（`init` 安装；未来驱动/可执行区/直接映射等消费方
+/// 全局长期内核地址空间（`init` 安装；驱动/可执行区/直接映射等消费方
 /// 从这里拿 `&mut RuntimeVm` 追加映射）。
 pub static RUNTIME_VM: Once<Mutex<Option<RuntimeVm>>> = Once::new();
 
@@ -153,7 +145,7 @@ impl RuntimeVm {
 
         // 1) identity RAM：VA == PA。bootstrap 曾用 1 GiB 大叶的粗映射，这里
         //    4 KiB 粒度。阶段一带 EXECUTE：组件池在 buddy identity 页里执行
-        //    （loader 从那里跑代码）；W^X 收紧见模块文档 TODO。
+        //    （loader 从那里跑代码）。
         //    对齐：只向内取整（start 向上、end 向下）——绝不把映射扩大到
         //    机器报告的 RAM 边界之外（边缘页可能混着 reserved/非 RAM）。
         let ram_perm =
@@ -252,7 +244,7 @@ impl RuntimeVm {
     /// 对照 layout 逐段校验：段首地址必须能翻译回期望 PA。
     ///
     /// 注意：`translate` 只证明"映上了且 PA 对"，验证不了 PTE 权限位
-    /// （backend accessor 是未来 seam，见模块文档 TODO）。
+    /// （backend 不暴露权限位）。
     pub fn verify(&self, layout: &KernelLayout, kernel_pa: usize) -> Result<(), RuntimeVmError> {
         // 低引导影子（高栈）首地址必须可翻译回 kernel_pa。
         if layout.text.va_start > KERNEL_VMA {

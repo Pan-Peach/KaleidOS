@@ -7,7 +7,7 @@ publish = false
 # 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）
 [workspace]
 
-# step 2：.kcomp = 链接后的组件程序，先编成 staticlib 再由 tools/build-kcomp.sh
+# .kcomp = 链接后的组件程序，先编成 staticlib 再由 tools/build-kcomp.sh
 # partial link + GC + strip（SDK 等依赖随镜像私有携带）。
 [lib]
 crate-type = ["staticlib"]

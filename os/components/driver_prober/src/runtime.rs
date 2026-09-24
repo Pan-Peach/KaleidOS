@@ -1,10 +1,10 @@
 //! 组件运行期实现（引用 `kcore_*`；host `cargo test` 下不编入）。
 //!
-//! # 无环分发（step 4）
+//! # 无环分发
 //!
-//! 旧流程里驱动在**自己的 create 中回调 prober**（assignment 回调 Service），形成
-//! `Task(prober) → Driver create → Service(prober)` 同步重入环。现在流程改为
-//! **数据进 create、结果走出来**，prober 组件不再发布任何 endpoint：
+//! 驱动若在**自己的 create 中回调 prober**（assignment 回调 Service），就会形成
+//! `Task(prober) → Driver create → Service(prober)` 同步重入环。这里的流程是
+//! **数据进 create、结果走出来**，prober 组件不发布任何 endpoint：
 //!
 //! ```text
 //! dispatch 任务（Task(prober)）

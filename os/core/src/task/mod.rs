@@ -46,7 +46,7 @@ pub fn get_task_table() -> &'static spin::Mutex<TaskTable> {
 /// # Seam
 /// caller 身份统一由 `resource::RequestContext::ambient()` 解析（最内层活动执行
 /// 边界优先：组件任务 → task owner；`kcomp_instance_create` → 被创建的实例）。
-/// 真正的 per-execution-domain 凭证（TaskHandle 化）留给未来 ExecutionDomain 里程碑。
+/// 没有真正的 per-execution-domain 凭证（TaskHandle 化未实现）。
 pub fn create_task(
     requester: ComponentId,
     entry: usize,

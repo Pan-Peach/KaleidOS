@@ -125,7 +125,7 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
         rogue == Errno::EFAULT.code() && tasks_after == tasks_before,
     );
 
-    // 组合动作（step 5）：**显式**发现 scheduler_rr 的 `scheduler.policy`
+    // 组合动作：**显式**发现 scheduler_rr 的 `scheduler.policy`
     // endpoint 并把它选成活动策略（Core 只记 EndpointId；调度路径不按名字发现）。
     // 必须在 create 返回 0 之后——endpoint 只在 staged publish 原子提交后存在。
     let selected = if rr_id >= 0 {

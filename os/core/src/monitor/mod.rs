@@ -24,7 +24,7 @@ pub use cmds::mount;
 /// 交互提示符（重绘时重新输出；`LINE_MAX` 与其匹配 80 列预算）。
 const PROMPT: &str = "core> ";
 
-/// 命令表：名称 + 执行函数（返回是否已执行；为未来多值参数预留 args）。
+/// 命令表：名称 + 执行函数（返回是否已执行；args 预留给多值参数）。
 struct Command {
     name: &'static str,
     help: &'static str,
@@ -139,7 +139,7 @@ pub fn run() -> ! {
                     Outcome::Pending => {}
                     Outcome::Submitted => {
                         let line = editor.line();
-                        // 空行 / 纯空白：静默重来（旧 read_line 对空行也是直接继续），
+                        // 空行 / 纯空白：静默重来，
                         // 不能报 unknown command ''。
                         if !line.trim_ascii().is_empty() {
                             match resolve_command(line) {

@@ -21,9 +21,7 @@
 //!
 //! 差异只在于实现时机与 backing（静态池 vs buddy 动态页表）。
 //!
-//! TODO(演进)：`KernelSection.flags` 目前是 arch 的 `PteFlags`。若未来要支持
-//! 多架构/NoMMU，可改为 `arch::vm::MappingPermission` 并在此处做转换——
-//! 本轮保持现状（"先搬归属、不改逻辑"）。
+//! `KernelSection.flags` 使用 arch 的 `PteFlags`；权限语义与 arch backend 一致。
 
 use arch::riscv::mmu::sv39::PteFlags;
 
@@ -69,7 +67,7 @@ pub struct KernelLayout {
 }
 
 impl KernelLayout {
-    /// 顺序输出全部段（供 `bootstrap::init` / 未来 `runtime::build` 遍历）。
+    /// 顺序输出全部段（供 `bootstrap::init` / `runtime::build` 遍历）。
     pub fn sections(&self) -> [KernelSection; 5] {
         [self.text, self.rodata, self.initpkg, self.data, self.bss]
     }

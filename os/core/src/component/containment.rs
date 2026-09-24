@@ -1,192 +1,69 @@
-//! Component panic containment: init boundary, runtime task boundary, and the
-//! component→component **service-call boundary**.
+//! Component panic containment: create / task / destroy / service-call /
+//! policy-call / cross-AS boundaries.
 //!
-//! A KernelNative component can panic at four Core boundaries, and all are
-//! contained by escaping to a Core-owned context instead of unwinding:
+//! A panic in component code never unwinds: the boundary switches control back
+//! to a Core-owned frame, which classifies the outcome, marks the instance
+//! `Failed`, and reschedules.  Compatible with `panic = "abort"`.
 //!
-//! 1. **Create boundary** (`kcomp_instance_create`): the component entry runs on
-//!    a temporary Core-owned stack ([`call_component_create`]).  Its normal
-//!    return and the boot panic handler both switch back to the saved caller
-//!    context; neither path returns through the component context.
-//! 2. **Task boundary**: the scheduler installs an escape guard on every switch
-//!    into a component task ([`enter_task`]).  A panic in the task is redirected
-//!    to a Core-owned **task-abort context** ([`task_abort_trampoline`]), which
-//!    commits the dead task to `Exited`, fails its owning component, and
-//!    reschedules in a clean Core context.
-//! 3. **Destroy boundary** (`kcomp_instance_destroy`, graceful stop): the hook
-//!    runs on the same temporary Core-owned stack as create
-//!    ([`call_component_destroy`]) and records the **stopped instance** as its
-//!    ambient identity.  A panic escapes back to
-//!    `component/exit.rs::stop_component`, which classifies it as a destroy
-//!    failure.
-//! 4. **Service-call boundary** (`kcore_endpoint_call`): the provider's
-//!    `kcomp_service_dispatch` runs on its own temporary Core-owned **service
-//!    stack** ([`call_component_service`]) under the **provider's** principal.
-//!    A normal return and a panic both switch back to the calling Core frame,
-//!    which classifies the outcome; a panicked provider is failed by
-//!    `component/call.rs`, never the caller.
-//! 5. **Policy-call boundary** (`crate::sched::pick_next`): the selected
-//!    scheduler policy's `kcomp_service_dispatch` runs on the Core-owned stack
-//!    prepared at selection time ([`call_component_policy`]) under
-//!    [`EscapeKind::PolicyCall`].  **Core is the caller** (no principal, no
-//!    caller task); a panic returns to the suspended scheduler frame, which
-//!    still owns its `IrqSaveGuard`, and the panicked stack is retained and
-//!    retired, never reused.
-//! 6. **Cross-AS service boundary** (increment 6; KernelNative caller →
-//!    Isolated provider): the provider's `kcomp_service_dispatch` runs in its own
-//!    private address space, entered by the assembly gateway
-//!    (`component/isolated_lifecycle.rs`).  Core installs the same
-//!    [`EscapeKind::ServiceCall`] guard around the gateway transition
-//!    ([`with_isolated_service_boundary`]) so principal / re-entry /
-//!    scheduling-forbidden bookkeeping is identical; the **switch** is the
-//!    gateway's, not a Core stack switch, and a provider **fault** is contained
-//!    by the gateway's trap path (`Outcome::Faulted`) rather than
-//!    `panic_escape` (an Isolated component has no `kcore_*` import surface, so
-//!    it cannot call `kcore_panic_escape`).
+//! - **Create / destroy** (`call_component_create` / `call_component_destroy`):
+//!   the hook runs on a temporary Core-owned stack; a panic returns to
+//!   `component/exit.rs::stop_component` as a destroy failure.
+//! - **Task** (`enter_task` → `task_abort_trampoline`): a panicking task is
+//!   committed to `Exited`, fails its owning component, and reschedules in a
+//!   clean Core context.
+//! - **Service call** (`call_component_service`, `kcore_endpoint_call`): the
+//!   provider's `kcomp_service_dispatch` runs on a Core-owned stack under the
+//!   **provider's** principal (`ambient()` = provider, `task` = caller as
+//!   provenance only; `ambient_init()` is `None`).  A panic is failed by
+//!   `component/call.rs`, never by the caller.  [`scheduling_forbidden`]
+//!   rejects `sched::run` / yield / exit / task creation for the whole chain
+//!   ([`provider_in_active_chain`] rejects re-entry), and interrupt-enable
+//!   state is saved/restored explicitly around the switch (the RISC-V context
+//!   record does not carry `sstatus.SIE`; the runtime slot `tp` **is** part of
+//!   it).
+//! - **Policy call** (`crate::sched::pick_next` → `call_component_policy`):
+//!   Core is the caller (no principal, no caller task); a panic returns to the
+//!   suspended scheduler frame, which still owns its `IrqSaveGuard`.
+//! - **Cross-AS service** (`with_isolated_service_boundary`; KernelNative
+//!   caller → Isolated provider): enters the provider's private AS through the
+//!   assembly gateway with the same `EscapeKind::ServiceCall` bookkeeping; a
+//!   provider fault is contained by the gateway trap path (`Outcome::Faulted`),
+//!   not `panic_escape` (an Isolated component has no `kcore_*` import surface).
 //!
-//! Because control never returns through the panicking frame this is **not**
-//! Rust unwinding and remains compatible with `panic = "abort"`.
+//! # Escapability gate (Core ABI depth)
 //!
-//! # Service-call boundary
+//! Escaping a panic from Core code (an ordinary `kcore_*` export body) would
+//! resume `fail_component`'s recovery path with Core locks still held →
+//! **deadlock**.  Every export body therefore runs inside [`with_core_critical`]
+//! (depth +1), except the explicit escape request `kcore_panic_escape`; every
+//! boundary handing control to component code ([`run_isolated`],
+//! [`with_irq_scope`], [`enter_task`]) suspends the depth, and task switches
+//! save/restore it in the suspended scheduler frame.  A depth refusal leaves
+//! the guard untouched — the panic stays fatal.
 //!
-//! [`call_component_service`] layers one [`EscapeKind::ServiceCall`] guard over
-//! the caller's boundary for exactly one dispatcher invocation:
+//! # Execution guard (lock-free)
 //!
-//! - **Principal**: `RequestContext::ambient()` inside the dispatcher resolves to
-//!   the **provider**, with `task = caller_task` recorded as execution
-//!   provenance — never as authority over that task.  `ambient_init()` is `None`
-//!   inside the boundary: a service call must not confer create-time publication
-//!   permission.
-//! - **Escapable**: a dispatcher panic switches to the suspended caller frame
-//!   (the same save/restore discipline as create/destroy), so
-//!   `component/call.rs` can fail the provider and return a transport error while
-//!   the caller stays alive.  The abandoned service stack is **retained**
-//!   (phase-1 conservative residency, explicit `mem::forget` of the lease — no
-//!   allocator lock on the panic path).
-//! - **Scheduling-forbidden**: the provider has no scheduler-visible task, so
-//!   [`scheduling_forbidden`] rejects `sched::run` / `yield_current` /
-//!   `exit_current` and task creation for the **whole chain** — including beneath
-//!   a nested lifecycle boundary (`Service → create → sched::run` can no longer
-//!   slip past a top-guard-only check).
-//! - **Re-entry**: `component/call.rs` rejects a call whose provider already runs
-//!   in the active synchronous chain ([`provider_in_active_chain`]) — the
-//!   scheduling anchor is deliberately not traversed.
-//! - **Interrupt state**: the RISC-V context record does not carry
-//!   `sstatus.SIE`, so the service boundary saves and restores the
-//!   interrupt-enable state explicitly around the switch.  The runtime slot
-//!   (`tp`) **is** part of the record: each boundary installs the owner's slot
-//!   into the incoming context and the switch restores it (see
-//!   [`crate::component::runtime_slot`]).
+//! [`ACTIVE_GUARD`] is a plain static pointer, never a lock: the boot panic
+//! handler performs no allocation, logging, or locking.  It is only touched at
+//! synchronous entry/switch boundaries on the single active CPU.  [`with_irq_scope`]
+//! layers one more boundary around a component IRQ callback: principal is the
+//! IRQ line's owner, `task = None`, scheduling is forbidden beneath it, and it
+//! is **not escapable** (an IRQ callback has no Core-owned context to resume).
+//! It is bookkeeping for trusted KernelNative components, not an authentication
+//! boundary.
 //!
-//! # Phase-1 limitation: real dispatch is QEMU-only
+//! # Retained on failure (non-obvious)
 //!
-//! The host fake context backend does not execute component entry bodies, so the
-//! **real** stack switch, a **real** provider panic, and the end-to-end
-//! A → B → C principal order in actual execution cannot be proven by `cargo
-//! test`.  They must be proven on QEMU with a real component that exports
-//! `kcomp_service_dispatch` (a later step).  Host tests exercise the boundary
-//! bookkeeping through the test-only helpers ([`with_test_service_boundary`],
-//! [`test_mark_active_panicked`]) instead.
+//! Image, allocations, abandoned stack frames and panicked service/policy
+//! stacks stay resident (`mem::forget`, no allocator lock on the panic path);
+//! only authority is revoked via `fail_component`.  Tasks of a failed component
+//! are excluded by `may_run` but keep non-`Exited` records (no task-stop API),
+//! so graceful stop refuses components that still own live tasks.  No Core lock
+//! may span the switch.  The task-abort context is single-CPU, entered once per
+//! panic, never resumed.
 //!
-//! # Ambient escape guard (lock-free)
-//!
-//! [`ACTIVE_GUARD`] holds the escape record of the execution that is currently
-//! allowed to panic into containment.  It is a plain static pointer, never a
-//! lock: the boot panic handler performs no allocation, logging, or locking, so
-//! it cannot acquire one.  Phase 1 is single-active-CPU, so the record is only
-//! touched at synchronous entry/switch boundaries on that CPU.
-//!
-//! Nesting is tracked for init guards via [`GuardState::previous`].  At the
-//! scheduler boundary the ambient guard is saved once ([`enter_task`]) and
-//! restored when control returns to the anchor ([`enter_anchor`]); this also
-//! preserves an enclosing init guard when a component task drives the scheduler.
-//!
-//! # Core ABI depth (the escapability gate)
-//!
-//! Containment is for panics in **component** code.  A component calls a
-//! `kcore_*` export, and that export body is Core code running on the same stack
-//! — often while holding Core locks.  Escaping a panic from there would (a)
-//! misattribute a Core bug to the boundary owner, and (b) resume the recovery
-//! path (`fail_component` → registry / trace / resource locks, service-stack
-//! free, DMA cleanup) with the Core lock still held → **deadlock**.  So
-//! escapability is gated on [`CORE_ABI_DEPTH`]:
-//!
-//! - every ordinary `kcore_*` export body runs inside [`with_core_critical`]
-//!   (depth `+1`).  The one deliberate exception is the SDK's explicit escape
-//!   request `kcore_panic_escape`: wrapping it would make the escape request
-//!   itself non-escapable;
-//! - every boundary that hands control to **component** code suspends the depth
-//!   (saves it and zeroes it): [`run_isolated`] (create / destroy / service
-//!   call), [`with_irq_scope`], [`enter_task`], and the test-only boundary
-//!   helpers.  Nested component code called *from* a critical scope is therefore
-//!   still escapable, and the saved depth returns to force when the boundary's
-//!   Core frame resumes — normal return and panic escape both flow through that
-//!   frame;
-//! - task switches are the exception: the task guard is overwritten per switch,
-//!   so the *scheduler* frame ([`crate::sched::schedule_next`]) saves the
-//!   outgoing execution's depth on its own stack and restores it after
-//!   `context_switch` returns.  [`enter_task`] zeroes the depth for a fresh task;
-//!   a resumed task restores its own depth in its own suspended scheduler frame.
-//!
-//! A depth refusal leaves an escapable guard **untouched**: the panic stays
-//! fatal.  There is no recovery path that could run safely while the panicking
-//! Core frame still holds a Core lock.
-//!
-//! # IRQ attribution scope
-//!
-//! [`with_irq_scope`] layers one more boundary over the active guard around one
-//! component IRQ callback ([`crate::irq::on_external`]): the principal is the
-//! **IRQ line's owner** (Core truth from the routing table) with `task = None`,
-//! never the interrupted execution.  The scope stores the guard it replaced and
-//! restores it **explicitly** (same discipline as the create/destroy boundaries);
-//! nested scopes restore in order.  It is **bookkeeping for trusted
-//! KernelNative components, not an authentication boundary** — it records who
-//! Core is dispatching for, it cannot prove the callback code really belongs to
-//! that owner.
-//!
-//! An IRQ scope is synchronous and non-yielding: scheduler-affecting Core calls
-//! are rejected while it is active or anywhere beneath it
-//! ([`scheduling_forbidden`]).  It is also **not
-//! escapable**: [`panic_escape`] restores the interrupted guard and refuses,
-//! because an IRQ callback has no Core-owned context to resume and escaping
-//! into the interrupted task would misattribute the callback's panic.  A panic
-//! inside an IRQ scope therefore stays fatal.
-//!
-//! # Diagnostics
-//!
-//! [`active_escape`] is the lock-free read side used by the boot panic handler;
-//! [`write_escape_line`] renders one short line to a direct (lock-free) writer.
-//! Panics outside an active guard keep the existing fatal Core path.
-//!
-//! # Phase-1 limitations (documented, intentional)
-//!
-//! - The failed component's image, allocations, and abandoned stack frames stay
-//!   resident; only authority is revoked via `fail_component`.  The aborted
-//!   task's kernel stack is **not** reclaimed.
-//! - A panicked service call's Core-owned service stack is **not** reclaimed
-//!   either (explicit `mem::forget`; see [`call_component_service`]).  A service
-//!   stack is freed only on the normal-return path.  A panicked **policy** call
-//!   retains its stack the same way and the scheduler retires it: it is never
-//!   reused, and a fresh stack is prepared only by an explicit new policy
-//!   selection.
-//! - Other tasks owned by the failed component are **not** force-stopped:
-//!   `may_run` excludes them from runnable candidates (they never run again),
-//!   but their records stay non-`Exited` because Core has no task-stop API yet.
-//!   The graceful-stop path therefore refuses components that still own live
-//!   tasks (see `component/exit.rs`).
-//! - No Core lock may span the switch.  A panic while a Core lock is held can
-//!   still leave that lock held (known KernelNative limitation) — but such a
-//!   panic can only originate in Core code, and Core code reached through an
-//!   export is Core-critical ([`with_core_critical`]): [`panic_escape`] refuses
-//!   it, so the (possibly lock-holding) Core frame is never abandoned.  The
-//!   panic stays fatal instead of deadlocking the recovery path.
-//! - The task-abort context is single-CPU and reused; it is only entered once
-//!   per panic and never resumed.  It runs on its own 32 KiB Core stack, so the
-//!   abort bookkeeping does not consume the dead task's stack.
-//! - Component task stacks are `memory::ALLOC_GRANULE` (4 KiB, see
-//!   `task::TaskTable::create`); the panic diagnostic shares that stack.  It is
-//!   adequate for the current tests, but a larger component-task stack may be
-//!   warranted once components do more work before panicking.
+//! Contract: `docs/modules/core/component.md`; `docs/philosophy/core-philosophy.md`
+//! §5.8.
 
 use crate::component::ComponentId;
 use crate::component::endpoint::EndpointId;
@@ -458,8 +335,8 @@ std::thread_local! {
 /// Current Core ABI depth (see [`CORE_ABI_DEPTH`]).
 pub(crate) fn core_abi_depth() -> u32 {
     #[cfg(not(test))]
-    // SAFETY: [Category 2 — Data races] phase 1 is single-active-CPU; the counter
-    // is pushed/popped only synchronously on that CPU.
+    // SAFETY: [Category 2 — Data races] single-active-CPU; the counter is
+    // pushed/popped only synchronously on that CPU.
     return unsafe { core::ptr::addr_of!(CORE_ABI_DEPTH).read() };
     #[cfg(test)]
     return CORE_ABI_DEPTH.with(core::cell::Cell::get);
@@ -530,7 +407,7 @@ pub fn init() {
         abort_stack_top(),
     );
     // SAFETY: [Category 1 — Initialization] this runs once during `core::init`,
-    // before the scheduler is reachable; no other CPU exists in phase 1.
+    // before the scheduler is reachable; no other CPU exists.
     unsafe {
         core::ptr::addr_of_mut!(TASK_ABORT_CONTEXT).write(MaybeUninit::new(context));
     }
@@ -544,8 +421,8 @@ fn abort_stack_top() -> usize {
 }
 
 fn replace_active(next: *mut EscapeGuard) -> Option<*mut EscapeGuard> {
-    // SAFETY: [Category 2 — Data races] phase 1 has one active CPU and this
-    // pointer is changed only at synchronous entry/return boundaries; the
+    // SAFETY: [Category 2 — Data races] one active CPU; this pointer is
+    // changed only at synchronous entry/return boundaries; the
     // panic handler runs on that same CPU and performs no nested mutation.
     let previous = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(ACTIVE_GUARD), next) };
     (!previous.is_null()).then_some(previous)
@@ -597,8 +474,8 @@ pub(crate) fn in_irq_context() -> bool {
 fn chain_any(predicate: impl Fn(&EscapeGuard) -> bool) -> bool {
     let mut next = active_guard();
     while let Some(guard_ptr) = next {
-        // SAFETY: [Category 2 — Data races] phase 1 is single-active-CPU; the
-        // chain is stable while this synchronous walk runs (no guard is popped
+        // SAFETY: [Category 2 — Data races] single-active-CPU; the chain is
+        // stable while this synchronous walk runs (no guard is popped
         // concurrently), and every `previous` points at a live suspended frame.
         let guard = unsafe { &*guard_ptr };
         if predicate(guard) {
@@ -913,7 +790,7 @@ pub(crate) fn call_component_policy(
 
     match outcome {
         CallOutcome::Panicked => {
-            // 保守驻留（phase 1，与 service call 的 panic 路径同一纪律）：
+            // 保守驻留（与 service call 的 panic 路径同一纪律）：
             // 保留 lease、绝不复用这块栈，且 panic 路径上不碰分配器锁。
             core::mem::forget(stack);
             (CallOutcome::Panicked, None)

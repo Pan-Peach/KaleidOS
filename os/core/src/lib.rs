@@ -79,7 +79,7 @@ pub fn init(
 
     // 帧区域：reserved[0] 的末尾（对齐帧）→ 包含内核镜像的那个 RAM region
     // 的末尾。多 region 平台内核可能不在 memory_regions[0]，不能硬编码 [0]。
-    // 前提：BSS 已在 bootstrap 启动汇编里清零（本轮迁移，见 entry.S）；
+    // 前提：BSS 已在 bootstrap 启动汇编里清零（见 entry.S）；
     // core 不再负责 BSS 清零（那是启动路径职责）。
     let reserved_start = reserved.first().map_or(0, |r| r.base);
     let reserved_end = reserved

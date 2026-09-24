@@ -1,90 +1,48 @@
 //! Endpoint call —— `kcore_endpoint_call` 的 Core 实现（**服务调用执行边界**）。
 //!
-//! # 定位
+//! `kcore_endpoint_lookup` 在组合期把 `(provider, port_name, contract)` 解析成
+//! opaque [`EndpointId`]；本模块把它变成一次真实调用：caller 身份门禁（无
+//! principal / caller Failed → EPERM）→ IRQ 祖先门禁 → resolve（存活）→
+//! re-entry 门禁 → `registry.begin_call`（Ready 门禁 + inflight 记账）→ 无锁按
+//! **provider 执行域**分派 → `registry.finish_call`（正常 / panic / 故障三条路径
+//! 都归还）。
 //!
-//! 组合期用 `kcore_endpoint_lookup` 把 `(provider, port_name, contract)` 解析成
-//! opaque [`EndpointId`]；本模块把它变成**一次真实调用**：
+//! - **KernelNative provider** → [`containment::call_component_service`]：dispatcher
+//!   跑在 Core 拥有的 per-call 32 KiB service stack、provider 自己的 principal
+//!   之下；panic 时 provider 标 `Failed`、endpoint 永久失效、inflight 归还，
+//!   caller 拿到 [`CallError::ProviderFailed`] 且 task 存活（绝不为 caller
+//!   `abort_current_task`）。
+//! - **IsolatedNative provider** → [`isolated_lifecycle::dispatch_service`]：caller
+//!   的 `args` / `input` 拷贝进 Core 拥有的**邮箱页**（只映射在 provider 私有
+//!   AS），provider 得到邮箱内的实例域 VA，output 由 Core 拷回 caller 缓冲；容量
+//!   固定，超长显式 [`CallError::FrameTooLarge`]（`EMSGSIZE`），**绝不截断**。
+//!   执行边界同形（provider principal / caller-task provenance / re-entry / 调度
+//!   门禁），真正的切换是 assembly gateway 的 `satp`；provider trap →
+//!   `Outcome::Faulted` → provider 逻辑死亡 + AS 退役 + 窗口归还。
+//! - **Sandboxed provider** → 显式拒绝（[`CallError::UnsupportedProviderDomain`]）；
+//!   **Isolated caller** → [`CallError::UnsupportedCallerDomain`]；**绝不静默降级**。
 //!
-//! ```text
-//! caller（最内层活动执行边界，RequestContext::ambient）
-//!   → caller 身份门禁（无 principal / caller Failed → EPERM）
-//!   → IRQ 祖先门禁（链上任何 Irq scope，含嵌套之下的 → EINVAL）
-//!   → resolve endpoint（存活：endpoint Live + owner 存在且 Ready）
-//!   → re-entry 门禁（provider 已在当前同步链上 → EBUSY）
-//!   → registry.begin_call(provider)（Ready 门禁 + inflight 记账）
-//!   → 取 provider image 的可选 kcomp_service_dispatch + instance_state + port
-//!   → 【无锁】按 **provider 执行域** 分派：
-//!        KernelNative → containment::call_component_service(...)
-//!          （per-call service stack + provider principal + panic containment）
-//!        IsolatedNative → isolated_lifecycle::dispatch_service(...)
-//!          （扁平帧拷贝进 Core 拥有的邮箱 + assembly gateway 进私有 AS）
-//!        SandboxedNative → 显式拒绝（ENOTSUP，绝不静默降级）
-//!   → registry.finish_call(provider)（正常 / panic / 故障三条路径都归还）
-//!   → 传输状态：Ok / Err(CallError)；provider 返回值只在 Ok 时写 `*out_status`
-//! ```
-//!
-//! # 执行边界（本阶段落地）
-//!
-//! **同域（provider = KernelNative）**：provider 的 dispatcher 跑在 **Core 拥有的
-//! per-call 32 KiB service stack** 上，处于 provider 自己的 principal 之下
-//! （[`containment::call_component_service`]）：
-//! - **principal 切换**：dispatcher 内 `RequestContext::ambient()` 解析为
-//!   provider（不再是 caller）；caller 的 task 只作为**执行来源**传递，不是
-//!   授权。`ambient_init()` 在边界内为 `None`（service call 不得发布）。
-//! - **panic containment**：dispatcher panic 时逃逸回 caller 的 Core 栈帧，
-//!   Core 把 provider 标 `Failed`、撤销其 authority 并永久失效它的全部
-//!   endpoint、归还 inflight，向 caller 返回 [`CallError::ProviderFailed`]——
-//!   **caller 的 task 存活且不变**（绝不为 caller 调用 `abort_current_task`）。
-//! - **re-entry 拒绝**：provider 已在当前同步链上（它自己的 task / 外层 service
-//!   call / 外层 init 或 exit）→ [`CallError::Reentrant`]；调度锚点不被穿越。
-//! - **祖先上下文门禁**：链上任何 IRQ scope（即使藏在嵌套生命周期边界下面）
-//!   都拒绝通用服务调用 → [`CallError::InIrqContext`]。
-//! - **调度门禁**：service 边界内（含嵌套 init 之下）`sched::run` /
-//!   `yield_current` / `exit_current` / task 创建一律拒绝
-//!   （`containment::scheduling_forbidden`）——provider 没有调度可见的任务。
-//!
-//! # 跨域 service（increment 6：KernelNative caller → Isolated provider）
-//!
-//! `bind` 早已把这对 `(caller, provider)` 执行域选成 **Gate**（binding 只携带
-//! opaque `EndpointId`，绝不交付 provider 域内的裸入口）。调用时本模块按
-//! `InstanceRecord::execution_domain` 路由到
-//! [`isolated_lifecycle::dispatch_service`]：
-//!
-//! - **扁平帧拷贝，绝不共享**：caller 的 `args` / `input` 被拷贝进 Core 拥有的
-//!   **邮箱页**（只映射在 provider 的私有 AS 里），provider 拿到的是邮箱内的
-//!   实例域 VA；output 由 provider 写邮箱、Core 拷回 caller 缓冲。容量固定，
-//!   超长显式拒绝（[`CallError::FrameTooLarge`] → `EMSGSIZE`），**绝不截断**。
-//! - **执行边界同形**：provider principal / caller-task provenance / re-entry /
-//!   调度门禁由 [`containment::with_isolated_service_boundary`] 提供（与同域
-//!   service 边界同一套 guard）；真正的切换是 assembly gateway 的 `satp` 切换。
-//! - **故障 containment**：provider 在私有 AS 里 trap → gateway 的窄故障分派
-//!   （无显式策略 = `Abandon`）→ `Outcome::Faulted` → provider 逻辑死亡 + AS
-//!   退役 + Core 预置窗口归还，caller 拿到 [`CallError::ProviderFailed`]。
-//! - **出站 Isolated caller 仍然拒绝**（[`CallError::UnsupportedCallerDomain`]）；
-//!   Sandboxed provider 显式拒绝（[`CallError::UnsupportedProviderDomain`]）。
-//!
-//! **诚实边界**：这条 Gate 是 **Core 拥有的机制**（帧拷贝 / provider principal /
-//! inflight / 故障收敛），**不是对抗隔离边界**——Isolated provider 与 Core 同特权
-//! 级（S-mode，协作式），它可以直接改 `satp` / 自己的映射；页表提供的只是
-//! "本执行域访问窗口"，真正的强制边界是 U-mode（SandboxedNative，未实现）。
-//! ASID 恒 0 + 全量 `sfence.vma`。
+//! **诚实边界**：这条 Gate 是 Core 拥有的机制，**不是对抗隔离边界**——Isolated
+//! provider 与 Core 同特权级（S-mode，协作式），可以直接改 `satp` / 自己的映射；
+//! 真正的强制边界是 U-mode（SandboxedNative，未实现）。ASID 恒 0 + 全量
+//! `sfence.vma`。
 //!
 //! # 调度策略的专用路径（`sched::pick_next`）
 //!
-//! `SchedulerPolicy` 契约**不**经本模块的通用 `endpoint_call`：Core 自己是
-//! 消费者（`os/core/src/sched.rs`），策略在调度 commit 路径上被调用，执行边界是
-//! [`containment::call_component_policy`] + [`EscapeKind::PolicyCall`]。本模块为它
-//! 提供与 [`prepare`] 同形的锁内准备（[`prepare_policy`]：contract + abi + 存活
-//! → `begin_call` → image dispatcher）与无锁调用（[`call_policy`]）。
+//! `SchedulerPolicy` 契约**不**经通用 `endpoint_call`：Core 自己是消费者，执行
+//! 边界是 [`containment::call_component_policy`] + [`EscapeKind::PolicyCall`]；
+//! 通用路径**拒绝** `scheduler.policy` 契约（[`CallError::ReservedContract`]），
+//! policy 回调内（含嵌套边界之下）通用 endpoint 调用被拒
+//! （[`CallError::InPolicyContext`]），policy 回调内不得创建组件 / 替换策略。
 //!
-//! 三条门禁把这条路径与通用服务调用隔开：
+//! # 锁纪律（不可动摇）
 //!
-//! - 通用路径**拒绝** `scheduler.policy` 契约（[`CallError::ReservedContract`]）：
-//!   组件不能把选中的调度算法当普通服务跑；
-//! - policy 回调内（含嵌套边界之下）通用 endpoint 调用被拒
-//!   （[`CallError::InPolicyContext`]）；
-//! - policy 回调内不得创建组件 / 替换策略（`load.rs` / `sched.rs` 各自的上下文
-//!   门禁）。
+//! 准备阶段可以同时持有 registry / endpoint / image 锁（**固定顺序**
+//! `registry → endpoints → images`，无反向路径），但**任何锁都不得跨 provider
+//! 调用**：dispatcher 地址、`instance_state`、`port` 在锁内拷贝进
+//! [`DispatchTarget`]，全部 guard 释放后才执行组件代码。组件 dispatcher 在调用
+//! 期间可以自由进入 Core（日志 / task / device…），"持锁调用组件" = 自死锁。
+//! panic 收尾（`fail_component`）同样在边界返回之后、无锁状态下执行。
 //!
 //! # 传输状态 ≠ 方法状态
 //!
@@ -93,38 +51,14 @@
 //! provider 返回 `-EIO` 不是 Core 失败，Core 返回 `-ENOENT` 也不是 provider 的
 //! 业务错误——两者永不混淆（`kcore_endpoint_call` 把 `Err` 翻成 `-Errno`）。
 //!
-//! # 锁纪律（不可动摇）
-//!
-//! 准备阶段可以同时持有 registry / endpoint / image 锁（**固定顺序**
-//! `registry → endpoints → images`，无反向路径），但**任何锁都不得跨 provider
-//! 调用**：dispatcher 地址、`instance_state`、`port` 在锁内拷贝进
-//! [`DispatchTarget`]，三个 guard 全部释放后才执行组件代码。组件 dispatcher 在
-//! 调用期间可以自由进入 Core（日志 / task / device...），"持锁调用组件" = 自死锁。
-//! panic 收尾（`fail_component`）同样在边界返回之后、无锁状态下执行。
-//!
 //! # 存活解析（不重复校验 contract / abi）
 //!
 //! call ABI 不携带 contract / abi：`EndpointId` 是组合期经
 //! [`EndpointRegistry::lookup`] / [`EndpointRegistry::discover`] 交付的 opaque
-//! capability。发现路径只校验 **contract + 存活**（不携带 abi）；abi 由 consumer
-//! 经 `kcore_endpoint_validate`（[`EndpointRegistry::lookup`]）自行核对。调用只做
-//! **存活解析**（[`EndpointRegistry::resolve`]）：死 endpoint / 死 owner 一律
-//! 拒绝，绝不把调用重定向到新实例。
+//! capability。调用只做**存活解析**（[`EndpointRegistry::resolve`]）：死 endpoint /
+//! 死 owner 一律拒绝，绝不把调用重定向到新实例。
 //!
-//! # 明确不做（下一阶段）
-//!
-//! - **escape-eligibility scope**：Core 临界区内的 provider panic 保持致命（不是
-//!   本次范围）。
-//! - **stack pool / 异步调用 / 取消 / drain / 超时**：都不做；service stack 每次
-//!   调用现分配（panic 时保守驻留，见 `containment`）。
-//!
-//! # Phase-1 限制：真实分派只能由 QEMU 证明
-//!
-//! host fake 上下文后端**不执行组件入口体**：真实 service stack 切换、真实
-//! provider panic、以及实际执行中的 A → B → C principal 顺序**不能**由
-//! `cargo test` 证明。它们由 QEMU 上用真实导出 `kcomp_service_dispatch` 的组件
-//! 验证（后续步骤）；host 用例只覆盖边界记账（re-entry / panic 收尾 / 祖先门禁 /
-//! 状态分离），经 test-only 边界辅助函数。
+//! Contract: `docs/modules/core/component.md`.
 
 use crate::component::abi::InterfaceAbi;
 use crate::component::containment::{self, CallOutcome, ServiceDispatch};
@@ -184,7 +118,7 @@ pub enum CallError {
     /// 且其全部 endpoint 永久失效；caller 存活且不变 → `EIO`。
     ProviderFailed,
     /// **Isolated（非 KernelNative）caller 的出站调用**：跨 AS Gate 的**出站
-    /// 方向**未实现（increment 6 只落地了 KernelNative → Isolated 的入站方向）。
+    /// 方向**未实现**（只落地了 KernelNative → Isolated 的入站方向）。
     /// 显式拒绝 → `ENOTSUP`——绝不在 KernelNative 的 AS 里替 Isolated caller
     /// 执行这次调用。
     UnsupportedCallerDomain,
@@ -344,7 +278,7 @@ fn dispatch(
     }
 
     // (1b) 部署域门禁：只有 KernelNative caller 有**已实现**的出站调用机制
-    //      （increment 6 只落地了 KernelNative → Isolated 的入站方向）。Isolated
+    //      （只落地了 KernelNative → Isolated 的入站方向）。Isolated
     //      caller 的跨 AS Gate 需要 satp 切换——拒绝，绝不在共享内核 AS 里替它
     //      执行（那会把跨域调用静默降级成 native）。
     if !crate::component::is_kernel_native(caller) {
@@ -396,8 +330,8 @@ fn dispatch(
             );
             complete_call(target.provider, outcome, out_status)
         }
-        // 跨 AS：provider 在自己的私有 AS 里经 assembly gateway 执行
-        // （increment 6）；帧被拷贝进 Core 拥有的邮箱，绝不共享。
+        // 跨 AS：provider 在自己的私有 AS 里经 assembly gateway 执行；帧被拷贝进
+        // Core 拥有的邮箱，绝不共享。
         ExecutionDomain::IsolatedNative => isolated_lifecycle::dispatch_service(
             target.provider,
             id,
@@ -1470,7 +1404,7 @@ mod tests {
         containment::enter_anchor();
     }
 
-    // -- 11b. 跨域 Gate：KernelNative caller → Isolated provider（increment 6） ------
+    // -- 11b. 跨域 Gate：KernelNative caller → Isolated provider --------------------
 
     /// 验收（host 面）：Isolated provider 的 dispatch 需要**真实私有 AS backend**；
     /// host / 无 backend 构建显式拒绝（`UnsupportedProviderDomain` → ENOTSUP），

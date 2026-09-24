@@ -28,7 +28,7 @@
 //! `static SERVICE` 就够。本组件的 provider 必须携带**每实例** state 指针，而 SDK 的
 //! `publish_endpoint` 把 Direct 的 `ctx` 固定为 `&self.provider`——image-global 的
 //! static provider 无法区分实例。因此这里为每个实例在堆上分配一个
-//! `BlockDeviceService<RamBlkRwProvider>` 并泄漏（phase 1 本就不回收实例存储，
+//! `BlockDeviceService<RamBlkRwProvider>` 并泄漏（实例存储不回收，
 //! 见 `docs/architecture/component-lifecycle.md` §8），使 `ctx` 指向本实例。
 
 #![no_std]
@@ -189,7 +189,7 @@ kcomp_instance_create!(|_args, out_state| {
             BlockDeviceService::new(RamBlkRwProvider { state: state.cast() }),
         );
     }
-    // SAFETY: service 永不回收（phase 1 保留实例存储），'static 因此成立；provider
+    // SAFETY: service 永不回收（实例存储保留），'static 因此成立；provider
     // 内的 state 指针在实例存活期内有效。
     let service: &'static BlockDeviceService<RamBlkRwProvider> =
         unsafe { &*service_ptr.cast() };
@@ -213,7 +213,7 @@ kcomp_instance_create!(|_args, out_state| {
 });
 
 kcomp_instance_destroy!(|_state| {
-    // phase 1：state / 缓冲可能仍被消费者引用（Direct binding 的 ctx / 缓存），
+    // state / 缓冲可能仍被消费者引用（Direct binding 的 ctx / 缓存），
     // 只逻辑停止、不回收存储（docs/architecture/component-lifecycle.md §8）。
     klog!("ram_blk_rw: destroy");
     0

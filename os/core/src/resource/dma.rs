@@ -11,12 +11,10 @@
 //!
 //! 分配后端只负责"给我一块满足约束的物理连续内存"，**不知道** VirtIO / NVMe /
 //! NIC，也不知道具体 `DeviceId`。映射才知道设备：No-IOMMU 时 device address 就是
-//! 物理地址（identity）；将来 IOMMU 只需在 [`map`] 内把 buffer PA → IOVA，或当
-//! 设备地址受限时经 bounce buffer，**上层 driver 不变**。
-//!
-//! 旧模型把三件事绑在一起（`dma_alloc(mmio_handle, …)` = 分配 + 设备身份证明 +
-//! 映射，还要 `derive_lease` 才拿到地址）已删除——尤其 `dma_alloc` 依赖
-//! `MmioHandle` 作为"分配 authority"是错误的耦合。
+//! 物理地址（identity）；IOMMU 只需在 [`map`] 内把 buffer PA → IOVA，或当设备
+//! 地址受限时经 bounce buffer，**上层 driver 不变**。分配**不**依赖
+//! `MmioHandle`：把分配 + 设备身份证明 + 映射绑在一起是错误的耦合，`alloc`
+//! 必须 device-agnostic。
 //!
 //! # quarantine：DMA lifecycle safety（correctness，不是 security）
 //!
@@ -27,7 +25,7 @@
 //! 设备可能仍在 DMA 往这块内存写；立即 free/复用会让设备写进已被重新分配的
 //! 区域。无 IOMMU 时 Core **无法确认设备已静默**，因此 backing lease 一律 move
 //! 进 Core 私有 `QUARANTINE`（不归还 buddy）。权威回收需要设备静默
-//! （reset / 确认无未结清）——本版 deferred。
+//! （reset / 确认无未结清），当前没有该机制。
 //!
 //! # DmaMappingId：真实动态生命周期
 //!

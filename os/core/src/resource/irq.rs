@@ -14,12 +14,12 @@
 //! ```
 //!
 //! 锚点是 **DeviceId**，不是 `IrqHandle`：`DeviceDescriptor` 本身带 `irq`，
-//! 单 IRQ 设备下再套一层"MMIO → IRQ authority 派生"没有真实用途，已删除。
+//! 单 IRQ 设备下再套一层"MMIO → IRQ authority 派生"没有真实用途。
 //!
-//! # 刻意不做（defer）
+//! # 刻意不做（当前范围）
 //!
-//! - **Polled / event delivery**（`register_polled` / `poll` / `ack`）：那是为
-//!   未来隔离域设计的 event/wake 机制，执行模型尚未定稿。KernelNative 当前只走
+//! - **Polled / event delivery**（`register_polled` / `poll` / `ack`）：那是隔离
+//!   域的 event/wake 机制，执行模型尚未定稿。KernelNative 当前只走
 //!   最简单路径：IRQ → Core route → native callback（trap 内同步调用）。
 //! - 多 MSI-X vector / shared line / 跨 owner delegation：真实需求出现再加
 //!   `irq_index` 或动态 IRQ 身份。
@@ -38,7 +38,7 @@ use crate::trace::{TraceEvent, emit};
 use arch::InterruptController;
 use spin::{Mutex, Once};
 
-/// 组件提供的中断处理函数（phase 1 KernelNative：direct call）。
+/// 组件提供的中断处理函数（KernelNative：direct call）。
 ///
 /// `ctx` 原样回传，Core 不解引用——与 endpoint 的 provider `ctx` 同一
 /// 生命周期契约（provider Ready 期间有效）。
@@ -137,7 +137,7 @@ impl IrqTable {
             (route.number == number).then_some((
                 route.owner,
                 // SAFETY: handler 只由 `register` 从真实 `IrqHandler` 写入
-                // （phase 1 信任 KernelNative 函数地址，同 scheduler vtable）。
+                // （信任 KernelNative 函数地址，同 scheduler vtable）。
                 unsafe { core::mem::transmute::<usize, IrqHandler>(route.handler) },
                 route.ctx as *mut (),
             ))

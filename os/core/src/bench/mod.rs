@@ -5,31 +5,16 @@
 //!
 //! # 批量计时（batch timing）
 //!
-//! 单次操作夹在两次读钟之间会得到 `d = op + 端点量化 + 读钟开销`。在 10 MHz
-//! timebase（1 tick = 100 ns）上，一次短操作的 `d` 可能只有个位数 tick ——
-//! 量化误差占比极大，而且**可能向下取整**，所以"取最小"并不能消除误差。
-//!
-//! 本 harness 改为：把 `K` 次操作夹在**恰好两次读钟**之间，
-//! `d = t_after - t_before`（结果消耗 `black_box` 也在计时区间内）。
-//! 端点量化被摊薄到约 `q/K`（q 为一个 tick）。这**不**消除宿主抖动 / 循环
-//! 开销 / bias —— 它只修正"读钟粒度 + 计时开销占比"这一项。
-//!
-//! 一次 primitive 的流程：
-//! 1. **时钟刻画**：有界探测（零 delta、最小正 delta、典型读钟 delta）
-//!    与空 batch 的 bracket 开销；
-//! 2. **先温热**（在校准之前，K=1、固定 batch 数）：冷启动样本若进了 pilot，
-//!    K=1 会假 overshoot，把 K 钉死在 1（测量全部低于 floor）；
-//! 3. **选 K**：从 1 翻倍，每个 K 跑 3 个 pilot batch 取**中位数**，直到 batch
-//!    时长达到 `max(200*q, 100*bracket)`，或触及 1 ms cap / K 上限；
-//! 4. **冻结 K 采集**：warmup 后收集 `ROUNDS × BATCHES_PER_ROUND` 个 batch 样本
-//!    （有界数组，全部保留，不截断）；若本轮低于 floor 且 bounds 允许（未到
-//!    [`MAX_RETRIES`]、`2K` 不超 `MAX_OPS_PER_BATCH` 与 cap），翻倍 K 重采，
-//!    报告只写最终 K；只有重试用尽（或 `target > cap`）才标 resolution-limited；
-//! 5. **配对 baseline**：同一 K 交替测 null baseline（只有循环 / `black_box`，
-//!    没有实际工作），原始 work 与 baseline 都报；不减去独立挑选的最小值，
-//!    不把负差值 clamp 成 0；
-//! 6. **报告**：统计对象是 **batch 总时长**（分母 `operations_per_batch`），
-//!    换算成 ns/op 由 host 工具做（先乘后除，测量端不截断）。
+//! 单次操作夹在两次读钟之间会得到 `d = op + 端点量化 + 读钟开销`；在 10 MHz
+//! timebase（1 tick = 100 ns）上量化误差占比极大，而且**可能向下取整**，"取最小"
+//! 并不能消除误差。本 harness 把 `K` 次操作夹在**恰好两次读钟**之间（结果消耗
+//! `black_box` 也在计时区间内），端点量化被摊薄到约 `q/K`；这**不**消除宿主抖动
+//! / 循环开销 / bias，只修正"读钟粒度 + 计时开销占比"这一项。一次 primitive 的
+//! 流程：时钟刻画 → K=1 学习 warmup → 选 K（翻倍 + pilot 中位数，直到
+//! `max(200*q, 100*bracket)` / cap）→ 冻结 K 采集（有界数组，全部保留不截断；
+//! below-floor 仅在 bounds 允许时翻倍重采，否则标 resolution-limited）→ 同 K
+//! 配对 null baseline（原始值同报，不 clamp）→ 报告 batch 总时长（ns/op 换算由
+//! host 工具做）。细节与理由见 `docs/development/benchmark.md`。
 //!
 //! 必须避免（否则数字没有意义）：
 //! - 编译器把被测体优化掉 —— 用 [`core::hint::black_box`] 兜住返回值；
@@ -40,10 +25,8 @@
 //!
 //! 时钟统一走 [`now`]：目标端是 `rdtime`（timebase tick），host 测试是
 //! `std::time::Instant`（ns）。单位不同，所以报告必须同时给出单位与来源
-//! （[`report_environment`]），否则跨平台数字不可比。
-//!
-//! 本模块**不**负责 platform 判定：Core 没有运行时的板级/QEMU 探测，QEMU 与
-//! 真机的区分必须由 runner 记录（`report_environment` 里如实写 `undetected`）。
+//! （[`report_environment`]），否则跨平台数字不可比。Core 没有运行时的板级 /
+//! QEMU 探测，平台区分由 runner 记录（`report_environment` 如实写 `undetected`）。
 
 use alloc::vec::Vec;
 

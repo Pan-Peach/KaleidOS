@@ -1,4 +1,4 @@
-# KaleidOS increment 3 ArchTest fixture (RV64): the "component" that runs in a
+# ArchTest fixture (RV64): the "component" that runs in a
 # private address space.
 #
 # 白色盒测试夹具：每个入口都只在**实例 AS** 里执行，只访问实例 AS 映射的 VA。

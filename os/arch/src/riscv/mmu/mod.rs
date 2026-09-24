@@ -50,7 +50,7 @@ const fn satp_value(root_ppn: usize, asid: u16) -> usize {
 /// 一次 satp 切换所需的原始数据（`AddressSpaceBackend::Activation` 的 RISC-V 形态）。
 ///
 /// 只打包 `root_ppn` + `asid`，**不动寄存器**：真正的 `csrw satp` 仍在
-/// [`activate`]。未来 Core 的切换汇编消费本值（`satp()` 给出预打包的 satp 字），
+/// [`activate`]。Core 的切换汇编消费本值（`satp()` 给出预打包的 satp 字），
 /// 因此它必须是 `Copy` 且不携带借用。ASID 当前恒为 0——`sv39` / `sv32` backend
 /// 都不声明 ASID 支持，切换靠 `sfence.vma` 全清。
 #[cfg(all(

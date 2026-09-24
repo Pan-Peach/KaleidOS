@@ -22,7 +22,7 @@ pub mod firmware;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod plic;
 
-/// 私有 AS 的 assembly gateway（increment 3）：S-mode + MMU + supervisor 才有
+/// 私有 AS 的 assembly gateway：S-mode + MMU + supervisor 才有
 /// 意义（`satp` 切换 + `sret` 往返）；NoMMU / M-mode 构建不提供，也不静默降级。
 #[cfg(all(
     feature = "vm-mmu",

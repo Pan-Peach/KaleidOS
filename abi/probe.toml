@@ -1,4 +1,4 @@
-# KABI schema — probe：**无环的 prober → driver 分发**（step 4）。
+# KABI schema — probe：**无环的 prober → driver 分发**。
 #
 # 旧模型里 driver 在**自己的 create 中回调 prober**（assignment 回调 Service）——
 # 那形成同步重入环，与 endpoint 调用模型

@@ -1,5 +1,4 @@
-//! RR（轮转）调度器组件 —— `scheduler.policy` 的参考实现（M2/C4；step 5 迁移到
-//! endpoint 模型）。
+//! RR（轮转）调度器组件 —— `scheduler.policy` 的参考实现。
 //!
 //! 策略只保存一个 RR cursor（runqueue 真相由 Core 每次调用时传入，本组件
 //! 不持有）。`CHOOSE_NEXT` 只做一件事：在 Core 给的 runnable 列表里轮流
@@ -11,7 +10,7 @@
 //! `*out_state` 交 Core 保管；Core 的 PolicyCall 边界把该 `instance_state` 交给本
 //! image 的 `kcomp_service_dispatch`。替换实例 = 全新分配 = 全新 cursor。
 //!
-//! # 发布 / 消费（endpoint 模型，step 5）
+//! # 发布 / 消费（endpoint 模型）
 //!
 //! create 期间经 [`scheduler::publish_endpoint`] 发布 `scheduler.policy`
 //! **Gate-only** endpoint（staged：create 返回 0 后 Core 才原子提交）：
@@ -49,7 +48,7 @@ struct SchedulerState {
 
 /// RR 提议：在 Core 传入的 runnable（id 升序）里轮流选择。
 ///
-/// **算法与 step 5 前一致**：cursor 每次 +1，对 `count` 取模；runnable 列表每次
+/// **算法**：cursor 每次 +1，对 `count` 取模；runnable 列表每次
 /// 由 Core 重新收集（yield 者不在自己看到的列表里），count 收缩时取模也保持
 /// 有效选择。
 fn rr_slot(state: &SchedulerState, count: usize) -> usize {
@@ -133,7 +132,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
 // 实例析构入口：Core 停止路径（monitor `unload`）调用，返回 0 后才提交 Stopped；
 // 失败 / panic → Core 置 Failed 且**绝不重试**。scheduler_rr 不持有
 // MMIO/IRQ/DMA authority、不拥有任务；唯一的分配（cursor state）是**实例 state**——
-// 契约 §8 本轮保留已暴露的 state 存储（Core / 调度帧可能仍持有它的拷贝）。
+// 契约 §8：已暴露的 state 存储保留（Core / 调度帧可能仍持有它的拷贝）。
 // 这里只留一行可观测证据。
 kcomp_sdk::kcomp_instance_destroy!(|_state| {
     kcomp_sdk::klog!("scheduler_rr: instance destroyed");

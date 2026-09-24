@@ -1,4 +1,4 @@
-//! Isolated 跨域 service 的**扁平调用帧邮箱**（increment 6；host-testable 纯逻辑）。
+//! Isolated 跨域 service 的**扁平调用帧邮箱**（host-testable 纯逻辑）。
 //!
 //! 跨 AS 的调用帧**从不共享**：caller 的 `KcompCallFrame` 只描述 caller 域内的
 //! 三个 `(ptr, len)`；Core 把它们**拷贝**进 provider 实例自己的邮箱页（Core

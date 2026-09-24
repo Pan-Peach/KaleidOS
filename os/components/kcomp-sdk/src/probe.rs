@@ -1,12 +1,12 @@
 //! `probe.result` 契约 + driver assignment create config —— **无环的 prober → driver
-//! 分发**（step 4；见 `abi/probe.toml` 与 `docs/architecture/deployment.md`）。
+//! 分发**（见 `abi/probe.toml` 与 `docs/architecture/deployment.md`）。
 //!
-//! # 为什么需要它
+//! # 无环分发（为什么这样切）
 //!
-//! 旧流程里 driver 在自己的 create 中回调 prober（prober→driver 的 assignment
-//! 回调 Service），形成
-//! `Task(prober) → Driver create → Service(prober)` 同步重入环——endpoint 调用模型
-//! 的 re-entry 门禁必须拒绝它。本模块把流程拆成两半，环即消失：
+//! driver 若在自己的 create 中回调 prober（prober→driver 的 assignment 回调
+//! Service），就会形成 `Task(prober) → Driver create → Service(prober)` 同步重入
+//! 环——endpoint 调用模型的 re-entry 门禁必须拒绝它。本模块把流程拆成两半，
+//! 环即消失：
 //!
 //! ```text
 //! prober task

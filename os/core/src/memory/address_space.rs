@@ -56,8 +56,8 @@ impl AddressSpaceHandle {
 pub enum AddressSpaceState {
     /// **已准备、未退役**：可以落映射、可以准备激活描述符。
     ///
-    /// 它**不**表示"当前已在硬件上激活"——Core 不跟踪"当前 satp 是谁"（本阶段
-    /// 没有任何运行期切换）；激活是切换汇编消费描述符的动作，不在本模块记账。
+    /// 它**不**表示"当前已在硬件上激活"——Core 不跟踪"当前 satp 是谁"；激活是
+    /// 切换汇编消费描述符的动作，不在本模块记账。
     Ready,
     /// **已退役**：不再接受任何映射 / 解映射 / 激活准备，`translate` 返回
     /// `None`。只进不出（复用 = 新建一个空间）。
@@ -93,7 +93,7 @@ impl From<DualMappedPage> for Mapping {
 /// 一个**已准备、可脱离 Core 锁**的激活描述符（`AddressSpaceBackend::Activation`
 /// 的 Core 侧包装：空间身份 + backend 私有的原始切换数据）。
 ///
-/// 用途：未来的切换路径在**持锁期间**取一次描述符，之后即使换页表根、不再触碰
+/// 用途：切换路径在**持锁期间**取一次描述符，之后即使换页表根、不再触碰
 /// Core 的 Rust 互斥量或 Rust 栈，也能用 `token()` 里的原始数据完成汇编切换。
 /// 因此它必须是 `Copy`、不携带引用、且只能由 [`KernelAddressSpace::prepare_activation`]
 /// 构造——**不是**组件可见的能力（不经任何 `kcore_*` 导出）。
@@ -134,7 +134,7 @@ pub enum MapError {
     BackendFailed,
 }
 
-/// 私有 AS 一次切换（increment 3 的 assembly gateway）准备阶段的失败。
+/// 私有 AS 一次切换（assembly gateway）准备阶段的失败。
 ///
 /// **Core 校验、Core 拒绝**：这里的所有检查都发生在任何 `satp` 切换之前，
 /// 失败即不发布描述符、不触碰已提交的映射真相。
@@ -348,8 +348,8 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
 
     /// 把本地址空间激活为当前 satp（委托后端写 satp + sfence）。
     ///
-    /// 本阶段**没有任何运行期调用方**（切换留给后续 increment）；保留它给
-    /// boot 等已激活路径，退役的空间不允许再激活。
+    /// **没有任何运行期调用方**；保留它给 boot 等已激活路径，退役的空间
+    /// 不允许再激活。
     pub fn activate(&self) -> Result<(), MapError> {
         self.ensure_ready()?;
         self.backend.activate().map_err(|_| MapError::BackendFailed)
@@ -388,14 +388,14 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         self.adopt(owner, backend, alloc::vec::Vec::new())
     }
 
-    /// 接管一个**已存在**的后端（典型：boot 当时已建立并激活的长期 root），连同
+    /// 接管一个**已存在**的后端（典型：boot 已建立并激活的长期 root），连同
     /// 调用方声明的既有映射真相一起登记。
     ///
     /// Core **不探测后端**：`mappings` 必须由调用方给出完整、精确的清单（boot
     /// root 的映射只有 boot 知道）。本 hook 存在但**尚未被 boot 调用**——boot 的
     /// `RuntimeVm` 仍按值持有 backend 并负责后续追加映射，把所有权搬进这里需要
     /// 先重构 boot 的 `vm/runtime.rs`（装段 → 登记 → 之后经 Core 追加映射），
-    /// 本轮不做，避免在无 host 测试的 boot 路径上强行改结构。
+    /// 当前不搬所有权，避免在无 host 测试的 boot 路径上强行改结构。
     pub fn adopt(
         &mut self,
         owner: ComponentId,
@@ -483,7 +483,7 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         Ok(())
     }
 
-    /// 准备一次私有 AS 切换（increment 3 的 assembly gateway）。
+    /// 准备一次私有 AS 切换（assembly gateway）。
     ///
     /// 全部校验 + gateway 机制页的实例侧映射都发生在**切换之前**；成功后返回
     /// `Copy`、无引用的 [`PreparedActivation`]——调用方拿到它之后不得再持有本
@@ -633,8 +633,8 @@ mod active {
     /// 接管一个已存在的后端（见 [`AddressSpaceManager::adopt`]）。
     ///
     /// **当前无调用方**：boot 的长期 root 仍由 boot 的 `RuntimeVm` 按值持有；
-    /// 搬迁 boot 的 backend 所有权需要先重构 boot（无 host 测试的路径），本轮
-    /// 只保留这个 seam，不强行实施。
+    /// 搬迁 boot 的 backend 所有权需要先重构 boot（无 host 测试的路径），当前
+    /// 只保留这个 seam，不强制搬迁。
     pub fn adopt(
         owner: ComponentId,
         backend: AddressSpaceImpl,
@@ -675,7 +675,7 @@ mod active {
             .ok_or(MapError::NoSuchSpace)
     }
 
-    /// 准备一次私有 AS 切换（increment 3 的 assembly gateway）：全部校验 +
+    /// 准备一次私有 AS 切换（assembly gateway）：全部校验 +
     /// gateway 机制页映射在锁内完成，返回 `Copy` 描述符；**锁不跨切换**。
     pub fn prepare_transition(
         handle: AddressSpaceHandle,
@@ -1310,8 +1310,8 @@ mod tests {
 
     /// 地址空间生命周期**不涉及任何组件执行**：用从未在 registry 声明的 owner
     /// 跑完 create → map → query → prepare → unmap → retire，全程零组件入口、
-    /// 零 containment 边界、零隐式 satp 写。真实后端激活（increment 3）不在这
-    /// 条路径上——本用例锁定"increment 2 只准备、不切换"。
+    /// 零 containment 边界、零隐式 satp 写。真实后端激活不在这条路径上——本用例
+    /// 锁定"只准备、不切换"。
     #[test]
     fn address_space_lifecycle_needs_no_component_execution() {
         let owner = ComponentId::from_raw(0xDEAD_BEEF); // 未声明的身份也无所谓
@@ -1380,7 +1380,7 @@ mod tests {
         let _ = s.handle();
     }
 
-    // -- increment 3：私有 AS 切换准备（assembly gateway 的 Core 侧校验）-------
+    // -- 私有 AS 切换准备（assembly gateway 的 Core 侧校验）---------------------
 
     fn dual_page(base: usize, pa: usize, perm: MappingPermission) -> DualMappedPage {
         DualMappedPage {

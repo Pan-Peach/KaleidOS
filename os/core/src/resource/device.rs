@@ -54,7 +54,7 @@ impl core::fmt::Debug for DeviceMapping {
 pub enum DeviceClaimError {
     /// `DeviceId` 越界，或机器信息尚未提交（正常组件运行期不可达）。
     DeviceNotFound,
-    /// 该设备不是 MMIO（PIO 空间；本阶段不支持）。
+    /// 该设备不是 MMIO（PIO 空间；当前不支持）。
     NotMmio,
     /// 该设备已被认领，或已被失败 quarantine 标记。
     DeviceBusy,
@@ -182,7 +182,7 @@ pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, De
     let Some(descriptor) = machine.devices[..machine.dev_count].get(device.raw() as usize) else {
         return Err(DeviceClaimError::DeviceNotFound);
     };
-    // 只看 MMIO 空间（PIO 设备本阶段不认领）。
+    // 只看 MMIO 空间（PIO 设备当前不认领）。
     let IoSpace::Mmio { base, size } = descriptor.space else {
         return Err(DeviceClaimError::NotMmio);
     };
@@ -201,7 +201,7 @@ pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, De
 /// 解析本执行域下的 device 窗口。
 ///
 /// - **KernelNative**（当前唯一域）：identity，直接返回寄存器基址。
-/// - **Isolated**（未来）：把 `[base, base+size)` 映射进组件地址空间，
+/// - **Isolated**（未实现）：把 `[base, base+size)` 映射进组件地址空间，
 ///   返回 mapped VA；未映射地址访问由页表 fault 强制。上层 driver 不变。
 ///
 /// 刻意不引入 ExecutionDomain registry — 只有真实存在第二个域时才需要。

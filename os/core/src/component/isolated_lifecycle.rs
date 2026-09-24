@@ -1,45 +1,29 @@
-//! Isolated 域**实例生命周期**（increment 5）：把 increment 3 的私有 AS 切换
-//! gateway、increment 4 的按域装载与 Core 的实例状态机接起来，让
-//! `create_isolated_native` 真正创建、启动、销毁一个 Isolated 实例。
+//! Isolated 域**实例生命周期**：私有 AS 切换 + 按域装载 + Core 实例状态机的接线。
 //!
 //! ```text
 //! create_isolated_native(name, args)                    （load.rs 的门禁之后）
-//!   ├─ isolated_image(name, blob)           ← 已登记同域 → 复用；否则按域放段 + 登记
-//!   │     ├─ isolated_load::place(blob)     ← 按域放段（Core 验证：段 / 权限 / 入口 / abi）
-//!   │     └─ image 表登记（pinned-until-reboot）← lease + 段规划归 image
-//!   ├─ registry.declare(image, IsolatedNative)
-//!   ├─ create_address_space_for(id)         ← 私有 AS（Core 拥有）
-//!   ├─ isolated_load::map_mappings(段)      ← 页表 = 本实例的归属记录
-//!   ├─ map_instance_windows()               ← Core 预置：组件栈 + 实例窗口
-//!   ├─ resolve → begin_start                ← Starting
-//!   ├─ runtime slot = 窗口内 runtime block 的实例内 VA
-//!   ├─ 写 create args / out_state 进窗口
-//!   ├─ isolated::prepare(handle, create, stack, slot, args)
-//!   │     └─ Core 验证：入口在 R|X 段、栈被单条 R|W 映射覆盖、gateway 页精确映射
-//!   ├─ isolated::enter(...)                 ← 组件在私有 AS 里跑 kcomp_instance_create
-//!   └─ Returned(0) → 记录 out_state → 提交 pending → Ready
+//!   ├─ isolated_image(name, blob)      ← 同域已登记则复用；否则按域放段 + 登记
+//!   │     └─ Core 验证：段 / 权限 / 入口 / abi（`isolated_load`）
+//!   ├─ registry.declare(image, IsolatedNative) → create_address_space_for(id)
+//!   ├─ map_mappings(段) + map_instance_windows()（组件栈 + 实例窗口）
+//!   ├─ resolve → begin_start；写 create args / out_state / runtime slot 进窗口
+//!   ├─ isolated::prepare(...)（Core 再验证入口 / 栈 / gateway 页）
+//!   └─ isolated::enter(...) → Returned(0) → 提交 pending → Ready
 //!
 //! destroy（`exit.rs` 按 execution_domain 分派）
-//!   └─ isolated::prepare(handle, image.destroy, stack, slot, (state, 0))
-//!      → enter → Returned(0) → retire(handle) → `complete_stop` 提交 Stopped
+//!   └─ prepare(handle, image.destroy, ...) → enter → Returned(0) → retire(handle)
+//!      → `complete_stop` 提交 Stopped
 //!
-//! 逻辑重启（increment 7）
-//!   └─ 前一个实例 Failed / Stopped（tombstone）后，同名 create 复用同一份
-//!      **常驻 image**（text / rodata / 段规划），但拿到**全新**实例：新
-//!      ComponentId、新私有 AS、新 Core 预置窗口 backing、新 runtime slot。
-//!      `load.rs` 的门禁拒绝跨域复用与**并发活跃**实例（同一 image 的 `.data` /
-//!      `.bss` 是 image-global，与 KernelNative 同一契约）。
+//! 逻辑重启：前一个实例 Failed / Stopped（tombstone）后，同名 create 复用同一份
+//! **常驻 image**，但拿到**全新**实例（新 ComponentId / 新私有 AS / 新窗口 /
+//! 新 runtime slot）；`load.rs` 拒绝跨域复用与**并发活跃**实例（同一 image 的
+//! `.data` / `.bss` 是 image-global，与 KernelNative 同一契约）。
 //!
-//! 跨域 service dispatch（increment 6：KernelNative caller → Isolated provider）
-//!   └─ dispatch_service(provider, dispatcher, state, port, method, frame)
-//!      ├─ 帧结构 / 容量校验（超长 = `-EMSGSIZE`，绝不截断）
-//!      ├─ 拷贝 caller 的 args / input → **邮箱**（Core backing，实例域 VA）
-//!      ├─ isolated::prepare(handle, image.service_dispatch, stack, slot, false,
-//!      │     (state, port, method, mailbox.frame))
-//!      ├─ containment::with_isolated_service_boundary(provider, ...) { enter }
-//!      │     └─ 组件在自己的私有 AS 里执行 `kcomp_service_dispatch`
-//!      ├─ Returned(status) → output 拷回 caller → `*out_status`（方法状态）
-//!      └─ Faulted → fail_provider（Failed + AS 退役 + 窗口归还）→ EIO
+//! service dispatch（KernelNative caller → Isolated provider）
+//!   └─ dispatch_service(...)：容量校验（超长 `-EMSGSIZE`，绝不截断）→ 帧拷进
+//!      **邮箱**（Core backing，实例域 VA）→ `with_isolated_service_boundary`
+//!      包住 `enter` → Returned 时 output 拷回 caller；Faulted 时 fail_provider
+//!      （Failed + AS 退役 + 窗口归还）→ EIO
 //! ```
 //!
 //! # Core 验证 vs 组件提议
@@ -50,46 +34,33 @@
 //! - **组件提议**：`kcomp_instance_create` 返回的 opaque state（Core 只存）与其
 //!   内部行为；`kcomp_instance_destroy` 自行收尾。
 //!
-//! # 内存路径决定（increment 5）：Core 预置窗口，**无 import 面**
+//! # 内存路径：Core 预置窗口，**无 import 面**
 //!
-//! `docs/architecture/memory-and-heap.md` 的域视图契约
-//! （`kcore_memory_acquire` / `release`）要求组件能调到 Core。本增量**不引入**
-//! component→Core 的 gate-call trampoline（那需要 `ecall` 分派 + 按域 import
-//! 解析 + per-instance VA 预算，属于引入跨域 Gate 的后续增量），因此 Isolated
-//! 的 import 包络保持**空集**：任何 UNDEF 符号（含 `kcore_*`）在装载前显式拒绝。
-//! increment 6 同样没有 import 面——跨域 service 调用由 **Core 主动发起**（caller
-//! 是 KernelNative 组件），provider 不需要回调 Core。
+//! Isolated 没有 component→Core gate-call trampoline，import 包络保持**空集**：
+//! 任何 UNDEF 符号（含 `kcore_*`）在装载前显式拒绝；跨域 service 调用由 **Core
+//! 主动发起**，provider 不需要回调 Core。替代机制是 Core 预置的**实例内存窗口**
+//! （[`ISOLATED_WINDOW_BASE`]：Core backing、零初始化、只映射在该实例私有 AS），
+//! 交付 create args / out_state / runtime context；窗口表示是**实例内 VA**（归属
+//! 由该实例页表承载，Core 不另立账本），同一 VA 在 Core AS / 别的实例 AS 里没有
+//! 任何映射。service 邮箱（[`ISOLATED_MAILBOX_BASE`]）同一 backing 纪律：扁平
+//! 调用帧只经这里过边界（拷贝，绝不共享），邮箱只在该实例私有 AS 里可达。
 //!
-//! 替代机制（本增量选择、明示登记）：Core 预置一块**实例内存窗口**
-//! （[`ISOLATED_WINDOW_BASE`]；Core backing、零初始化、只映射在该实例的私有 AS
-//! 里），交付 create args / out_state / runtime context。窗口的表示是**实例内
-//! VA**——与域视图同形（`view.base/len` 只在那个 AS 里有意义），归属由该实例的
-//! 页表承载，Core 不另立账本。窗口**只在创建它的实例 AS 里可达**：同一 VA 在
-//! Core AS / 别的实例 AS 里没有任何映射（ArchTest `isolated-lifecycle` 证明）。
-//!
-//! increment 6 再预置一页**服务调用邮箱**（[`ISOLATED_MAILBOX_BASE`]；同一
-//! backing 纪律）：跨 AS 的扁平调用帧只经这里过边界——caller 的 args / input 被
-//! **拷贝**进邮箱，provider 在实例域内读它们并把 output 写回邮箱，Core 把 output
-//! 拷回 caller 缓冲。邮箱同样只在该实例的私有 AS 里可达；provider 看不到 caller
-//! 的帧 / 缓冲或任何 Core 内存（`isolated_mailbox`）。
-//!
-//! 窗口布局（**Core 内部**；组件**不需要**知道偏移——它只用 Core 经 `a0` ..
-//! `a3` / `tp` 交给它的实例内 VA）：
+//! 窗口布局（**Core 内部**；组件只用 Core 经 `a0` .. `a3` / `tp` 交给它的实例内
+//! VA，不需要知道偏移）：
 //!
 //! ```text
 //! +0    KcompCreateArgs（config_abi / config / config_len）
 //! +32   out_state 槽（usize；create 返回后由 Core 读回）
 //! +64   runtime context block（`tp` 指向这里；Core 从不解释其内容）
-//! +128  config 负载拷贝（≤ WINDOW_CONFIG_MAX 字节；config 指针指向这里）
-//! +384  本窗口的 **域视图编码**（`kcore_memory_view`：kind = LOCAL_VA、
-//!       base = 本实例窗口 VA、len = 窗口长度）——域视图契约的"表示由域承载"
-//!       在这里就是这份记录；可调用的 `kcore_memory_acquire` 面仍属后续增量
+//! +128  config 负载拷贝（≤ WINDOW_CONFIG_MAX 字节）
+//! +384  本窗口的**域视图编码**（`kcore_memory_view`：kind = LOCAL_VA、
+//!       base = 本实例窗口 VA、len = 窗口长度）
 //! ```
 //!
-//! 邮箱布局（**Core 内部**；provider 只见 Core 交付的实例内 VA）见
-//! [`isolated_mailbox`]：描述符 + args / input / output 三个固定容量区。
+//! 邮箱布局（**Core 内部**）见 [`isolated_mailbox`]：描述符 + args / input /
+//! output 三个固定容量区。
 //!
-//! # 失败 / 重启矩阵（increment 7 的语义总结；逐条由 ArchTest 证明）
+//! # 失败 / 重启矩阵
 //!
 //! | 阶段 | 终态 | AS | Core 预置窗口 | slot | caller 得到 |
 //! |---|---|---|---|---|---|
@@ -97,40 +68,30 @@
 //! | create 入口返回非零 / config 拒绝 | `Failed` | 退役 | 归还 backing | 清除 | `CreateFailed` / `IsolatedConfigRejected` |
 //! | create 入口故障（trap） | `Failed` | 退役 | 归还 backing | 清除 | `CreateFaulted` |
 //! | service dispatch 故障 | `Failed` | 退役 | 归还 backing | 清除 | `CallError::ProviderFailed`（EIO） |
-//! | destroy 入口故障 | `Failed` | 退役 | **保持驻留**（phase 1） | 清除 | `DestroyPanicked`（EIO） |
-//! | 优雅 destroy 成功 | `Stopped` | 退役 | **保持驻留**（phase 1） | 清除 | `Ok` |
+//! | destroy 入口故障 | `Failed` | 退役 | **保持驻留** | 清除 | `DestroyPanicked`（EIO） |
+//! | 优雅 destroy 成功 | `Stopped` | 退役 | **保持驻留** | 清除 | `Ok` |
 //!
 //! 读法：**create / service 故障 = Core 中止实例**（预置机制一并归还，半成品不留）；
 //! **destroy 路径 = 实例已走到生命尽头**（无论入口成功或故障都只退役 AS，窗口
-//! backing 按 phase 1 契约驻留——AS 退役后不可再进入，页表页无 teardown 接口）。
-//! 任何终态之后：endpoint 永久失效（`failure` 兜底），stale 调用在 Core 边界被
-//! 拒绝（`resolve` 先于任何进入），同 image 可**逻辑重启**（全新实例）。
+//! backing 驻留——AS 退役后不可再进入，页表页无 teardown 接口）。任何终态之后：
+//! endpoint 永久失效（`failure` 兜底），stale 调用在 Core 边界被 `resolve` 拒绝
+//! （先于任何进入），同 image 可**逻辑重启**。
 //!
-//! # 明确不做（本阶段登记）
+//! # 明确不做（当前边界）
 //!
-//! - **组件→Core 的 import 面**：没有 trampoline / `ecall` 分派，`kcore_*` 一律在
-//!   装载前拒绝（见上）。因此 Isolated provider **不能自己 publish endpoint**
-//!   （组件→Core 的 publish trampoline 属后续增量）：ArchTest 从 Core 侧登记
-//!   provider 的 endpoint（endpoint 真相仍由 Core 拥有），service dispatch 的机制
-//!   不受影响。出站 Isolated caller（Isolated → 任何域）继续显式拒绝。
-//! - **destroy 后的物理回收**：AS 退役（复用 = 新建空间）后窗口 backing 保持驻留
-//!   （phase 1 逻辑死亡 / 物理驻留，与 image 同）；页表页也没有 teardown 接口。
-//! - **同一 image 的并发活跃实例**：显式拒绝（`load.rs` 的 `IsolatedInstanceLive`）。
-//!   逻辑重启只在前一个实例 `Failed` / `Stopped` 之后成立；两个活跃实例会共享
-//!   image 的 `.data` / `.bss`（image-global），不是本阶段承诺的隔离模型。
-//! - **ASID / U-mode**：ASID 恒 0 + 全量 `sfence.vma`；没有 U-mode / `ecall`。
-//! - **大负载 / 零拷贝 / 异步调用**：邮箱容量固定（`isolated_mailbox`），超长显式
-//!   拒绝；没有共享内存、没有 per-call 映射。
-//! - **组件内 Rust `panic!`**：Isolated 组件**没有** `kcore_panic_escape` import
-//!   面，它的 panic handler 只能自旋。因此 panic **不是**被收敛的故障：没有 trap
-//!   发生，gateway 的窄故障分派看不到它，组件会一直自旋（同步调用 = 挂住调用者）。
-//!   被收敛的是 **trap**（非法指令 / 缺页 / 权限 fault），不是 panic。
+//! Isolated provider **不能自己 publish endpoint**（没有组件→Core import 面；
+//! endpoint 真相仍由 Core 拥有；出站 Isolated caller 继续显式拒绝）。destroy 后
+//! 不做物理回收（窗口 / image 驻留）。同一 image 的并发活跃实例显式拒绝
+//! （`load.rs` 的 `IsolatedInstanceLive`）。ASID 恒 0 + 全量 `sfence.vma`；没有
+//! U-mode / `ecall`。邮箱容量固定，没有共享内存、没有 per-call 映射。
+//! **组件内 Rust `panic!` 不是被收敛的故障**：Isolated 组件没有
+//! `kcore_panic_escape` import 面，panic handler 只能自旋（同步调用 = 挂住调用
+//! 者）；被收敛的是 **trap**（非法指令 / 缺页 / 权限 fault）。
 //!
 //! # 诚实边界
 //!
 //! - **协作式、非对抗**：S-mode 组件与 Core 同特权级，可以直接改 `satp` / 自己的
-//!   映射。本模块不声称对抗隔离（那是 U-mode / SandboxedNative，未实现）。
-//! - **ASID 恒 0 + 全量 `sfence.vma`**（arch gateway 的既定边界）。
+//!   映射；本模块不声称对抗隔离（那是 U-mode / SandboxedNative，未实现）。
 //! - **CPU isolation ≠ DMA isolation**：Isolated 实例的 AS 只映射自己的镜像 /
 //!   机制页 / 栈 / 窗口 / 邮箱，**不含**任何 MMIO / Core 段 / 页表 / 别的实例；
 //!   Core 拥有的 DMA backing 是否可被错误复用仍不声称 DMA 静默。
@@ -196,8 +157,8 @@ pub const WINDOW_VIEW_OFF: usize = 384;
 /// 本实例窗口的**域视图编码**：Core 预交付给实例的那份 `kcore_memory_view`。
 ///
 /// `kind = LOCAL_VA`（表示是实例内 VA）、`base/len` = 本实例窗口；绝不出现物理
-/// 地址 / Core 私有 VA。可调用的 `kcore_memory_acquire` 面属后续增量（本增量
-/// Core 直接把这一份记录写进窗口交付）。
+/// 地址 / Core 私有 VA。它是 Core 预交付的记录；可调用的 `kcore_memory_acquire`
+/// 面不存在。
 pub fn window_view() -> MemoryView {
     MemoryView {
         kind: KCORE_MEMORY_VIEW_LOCAL_VA,
@@ -437,7 +398,7 @@ mod imp {
     /// 返回非零 / panic 由那里提交 `Failed`；成功由那里提交 `Stopped`。
     ///
     /// **窗口语义**：destroy 路径（成功或入口故障）一律只退役 AS，Core 预置窗口
-    /// 保持驻留（phase 1 契约；AS 退役后不可再进入，页表页无 teardown 接口）。
+    /// 保持驻留（AS 退役后不可再进入，页表页无 teardown 接口）。
     /// 这与 create / service 故障路径（Core 中止实例、归还预置窗口）不同——见模块
     /// 文档的失败矩阵。
     pub(crate) fn destroy(id: ComponentId, entry: usize, state: *mut ()) -> CallOutcome {
@@ -490,7 +451,7 @@ mod imp {
         outcome
     }
 
-    /// 跨域 service dispatch（increment 6）：KernelNative caller → Isolated provider。
+    /// 跨域 service dispatch：KernelNative caller → Isolated provider。
     ///
     /// 顺序（**Core 验证 vs 组件提议**）：
     ///

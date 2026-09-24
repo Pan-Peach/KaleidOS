@@ -64,7 +64,7 @@ unsafe impl Sync for InstanceRecord {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryError {
-    /// 实例 id 不存在（未声明；phase 1 无 unload）。
+    /// 实例 id 不存在（未声明；无 unload）。
     NotFound,
     /// 状态机非法转换（如 Ready 再 start）。
     InvalidTransition,

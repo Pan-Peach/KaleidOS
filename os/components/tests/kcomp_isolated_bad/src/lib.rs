@@ -1,4 +1,4 @@
-//! kcomp_isolated_bad —— increment 7（失败/重启矩阵）的**放段失败**夹具。
+//! kcomp_isolated_bad —— 失败/重启矩阵的**放段失败**夹具。
 //!
 //! 它是一份**合法** `.kcomp`（ET_REL、`kcomp_instance_create` / `destroy` /
 //! `kcomp_abi` 齐备、UNDEF 空集、重定位白名单内），因此能通过 packer 的四项契约

@@ -16,34 +16,17 @@
 //! 结果（`Match` / `NoMatch`）写进**本实例** state，并 staged publish 到 config
 //! 指定的 `probe.result` 端口；prober 在 create 返回 0 之后拉取。
 //!
-//! # 每个候选设备一个实例
+//! 每次 create 只处理**一台**设备：**Match** → claim + attach + `block.device`
+//! endpoint + `probe.result` 同时发布，create 返回 0（`Match` 只在 attach 与两个
+//! publication 都成功之后才写进结果）；**NoMatch** → release claim、只发布
+//! `probe.result`（outcome = NoMatch）的 **report-only 实例**，create 仍返回 0；
+//! **创建失败**（config 非法 / claim 失败 / attach 失败 / publish 失败 / panic）→
+//! 走 create 边界回传错误，由 prober 单独记录为 creation failure。
 //!
-//! 每次 create 只处理**一台**设备：
-//!
-//! - **Match**：claim + attach + `block.device` endpoint + `probe.result` 同时发布，
-//!   create 返回 0；`Match` 只在 attach 与两个 publication 都成功之后才写进结果。
-//! - **NoMatch**：release claim、不发布 block endpoint，只发布 `probe.result`
-//!   （outcome = NoMatch）的 **report-only 实例**；create 仍返回 0。
-//! - **创建失败**（config 非法 / claim 失败 / attach 失败 / publish 失败 / panic）：
-//!   走 create 边界回传错误，由 prober 单独记录为 creation failure。
-//!
-//! # 访问模型：claim 拿裸指针，steady state 不进 Core
-//!
-//! `kcore_device_claim` 返回本执行域下的 MMIO 指针（KernelNative = 寄存器基址）。
-//! 之后 `MmioTransport` 直接 volatile 访问，Core 不参与每一次寄存器读写——不存在
-//! `kcore_mmio_read_u32/write_u32` 这种 per-access 鉴权。
-//!
-//! # DMA：allocation 与 mapping 分离
-//!
-//! ```text
-//! dma_alloc  = kcore_dma_alloc(内存) + kcore_dma_map(device_id, buffer)
-//! share      = kcore_dma_map(device_id, buffer)      现有 buffer 映射给设备
-//! unshare    = kcore_dma_unmap(mapping)
-//! dma_dealloc= kcore_dma_unmap + kcore_dma_free
-//! ```
-//!
-//! 组件内部用 `DMA_MAP: device_addr → mapping id` 做极薄 bookkeeping（`unshare`
-//! 只收到 paddr）。No-IOMMU 下 device address 就是 buffer 地址。
+//! 访问与 DMA 走 Core 的既有机制（`kcore_device_claim` 返回本执行域 MMIO 指针，
+//! steady state 不进 Core，无 per-access 鉴权；`kcore_dma_alloc` / `kcore_dma_map`
+//! 分离，见 `docs/architecture/driver-model.md`），本驱动只做薄 bookkeeping。
+//! No-IOMMU 下 device address 就是 buffer 地址。
 //!
 //! # 状态与锁序（不变量）
 //!
@@ -59,13 +42,13 @@
 //! DMA 回调去 `DMA_MAP.take`，所以 exit 里 drop 必须在 `BLK` 锁内执行。
 //! `DEVICE_ID` / `MMIO_BASE` 刻意用原子而不是锁：Hal 回调可能在 `BLK` 锁内运行。
 //!
-//! # 已知限制（本步不解决，如实登记）
+//! # 已知限制（如实登记）
 //!
 //! - `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK` 仍是 **image-global**：image 被
-//!   多个实例复用时它们不隔离。本步只保证：**拒绝第二个 attachment**、报告数据
+//!   多个实例复用时它们不隔离。保证的是：**拒绝第二个 attachment**、报告数据
 //!   **按实例**保存、report-only 实例的 destroy **绝不复位**已 attach 实例的设备。
 //! - `CoreHal` 的回调是**无上下文的**（`Hal` 不接收 per-instance ctx），因此 DMA
-//!   归属只能锚在全局 `DEVICE_ID` 上；真正的 per-instance HAL 是后续步骤。
+//!   归属只能锚在全局 `DEVICE_ID` 上；没有 per-instance HAL 回调上下文。
 //! - 因此**不声称多设备支持**：一个 virtio_blk 镜像在同一时刻只 attach 一台设备。
 
 #![no_std]

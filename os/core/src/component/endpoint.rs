@@ -1,14 +1,8 @@
 //! Component Endpoint Registry —— Contract / Endpoint 模型（**唯一绑定真相**）。
 //!
-//! # 定位
-//!
-//! 本模块是组件→组件依赖的**唯一**真相模型（旧的"全局接口名 → 单 provider
-//! 绑定槽"模型已删除，见 `AGENTS.md`：契约演进 = 原地替换，不保留 legacy）：
-//! Core 数据模型 + 导出面（`kcore_endpoint_publish` / `kcore_endpoint_lookup` /
-//! `kcore_endpoint_validate` / `kcore_endpoint_bind` / `kcore_endpoint_call`，call
-//! 实现见 `component/call.rs`）+ 生命周期接线（create 提交 / failure·stop 失效）
-//! 已落地。`bind` 是 **Direct / Gate 的唯一选择点**；第一条完整链（Rust provider →
-//! C consumer）走 Direct。
+//! 组件→组件依赖只走这里：数据模型 + 导出面（`kcore_endpoint_*`，call 实现见
+//! `component/call.rs`）+ 生命周期接线（create 提交 / failure·stop 失效）。
+//! `bind` 是 **Direct / Gate 的唯一选择点**。
 //!
 //! ```text
 //! Contract：契约身份（kind + exact ABI fingerprint + 诊断名）—— 语义
@@ -18,23 +12,25 @@
 //! # 规则
 //!
 //! - **Contract ≠ Endpoint**：多个 provider 可以实现同一契约。契约由**首次发布**
-//!   建立 `kind` / `abi`（[`ContractRecord`]），后续发布 kind / abi 不一致必须拒绝。
-//! - **Endpoint 归属唯一**：`ComponentId` 就是实例身份；endpoint 生命周期内 owner
-//!   不可变。两个实例可以发布**同名端口 + 同一契约**，各自持有不同 endpoint。
+//!   建立 `kind` / `abi`（[`ContractRecord`]），后续发布 kind / abi 不一致必须
+//!   拒绝。
+//! - **Endpoint 归属唯一**：`ComponentId` 就是实例身份；endpoint 生命周期内
+//!   owner 不可变。两个实例可以发布**同名端口 + 同一契约**，各持不同 endpoint。
 //! - **publish 创建新 endpoint，绝不覆盖**：没有"同 ABI 覆盖原槽"。端口名在
 //!   **provider 实例内唯一**：重复发布同一端口名（含已失效名字）拒绝，不重定向。
-//! - **consumer 只持有 [`EndpointId`]**：`EndpointId` 是 opaque capability。provider
-//!   交付的 `api` / `ctx`（Direct 的 function table + state）与 `port`（Gate 的
-//!   dispatch token）存在 endpoint 记录上，但 Core **只存、永不解引用**；两者如何
-//!   使用由 [`EndpointRegistry::bind`] 在 bind 时按执行域选定（见下）。
+//! - **consumer 只持有 [`EndpointId`]**：opaque capability。provider 交付的
+//!   `api` / `ctx`（Direct 的 function table + state）与 `port`（Gate 的 dispatch
+//!   token）存在 endpoint 记录上，但 Core **只存、永不解引用**；如何使用由
+//!   [`EndpointRegistry::bind`] 在 bind 时按执行域选定。
 //! - **EndpointId 单调、从 1 起、绝不回收 / 重定向**：provider 停止或失败后旧
-//!   endpoint 永久 `Invalid`，绝不会解析到新实例。
+//!   endpoint 永久 `Invalid`，绝不解析到新实例（`Invalid` 记录是 tombstone，
+//!   id 不复用）。
 //! - 标识符不带版本后缀：契约演进 = 原地替换（`AGENTS.md`）。
 //!
 //! # bind：Core 在绑定时刻选定调用机制（`docs/architecture/deployment.md` §2/§3）
 //!
-//! [`EndpointRegistry::bind`] 是 **Direct / Gate 的唯一选择点**（一次，运行期不再
-//! 按调用重决策）：
+//! [`EndpointRegistry::bind`] 是 **Direct / Gate 的唯一选择点**，一次选定，运行期
+//! 不再按调用重决策：
 //!
 //! ```text
 //! 校验（exact contract + abi + 存活，复用 lookup）
@@ -54,8 +50,8 @@
 //! - `endpoints`：endpoint 真相（[`EndpointRecord`] 是 `Copy`：无 `Vec`、无借用，
 //!   `lookup` 直接返回值）。
 //! - `contracts`：契约身份（首次发布建立，之后只校验）。
-//! - `names`：发现表 `(provider, 端口名) → endpoint`（[`EndpointName`]）。
-//!   单独成表，`lookup` 不被名字检索拖慢；只有 `discover` 查它。
+//! - `names`：发现表 `(provider, 端口名) → endpoint`（[`EndpointName`]）。单独
+//!   成表，`lookup` 不被名字检索拖慢；只有 `discover` 查它。
 //! - `pending`：staged publish 暂存。
 //!
 //! # Staged publish
@@ -70,21 +66,7 @@
 //! 2. 通过后逐条**创建新 endpoint**（`Live`）并登记发现名。
 //!
 //! init 失败 / panic：[`EndpointRegistry::discard_pending`] 丢弃该实例全部 pending。
-//!
-//! # 本阶段不做（seam / TODO）
-//!
-//! - **执行边界已落地**：`kcore_endpoint_call` 经 `component/call.rs` 走 Core 控制的
-//!   service-call 边界（per-call Core 拥有栈 / provider principal / re-entry 与
-//!   IRQ 祖先门禁 / provider panic containment，见 `containment::call_component_service`
-//!   与 `component/call.rs` 模块文档）；真实 stack switch / provider panic 由 QEMU
-//!   证明（host fake 不执行组件入口体）。
-//! - **不做 escape-eligibility scope**：Core 临界区内的 provider panic 保持致命
-//!   （下一阶段）；
-//! - **部署 / 域字段仍不存在**：`instance_domain` 恒返回 KernelNative（唯一真实
-//!   存在的部署）；跨域臂已在 `select_mechanism` 里显式拒绝，不是"假装支持"；
-//! - **bind 落 trace**：成功的 bind 发射 `TraceEvent::EndpointBind`
-//!   （endpoint / provider / Core 选定的机制），见 [`EndpointRegistry::bind`]；
-//! - 不做 endpoint 回收（`Invalid` 记录保留为 tombstone，id 不复用）。
+//! 成功的 bind 发射 `TraceEvent::EndpointBind`（endpoint / provider / 选定的机制）。
 
 use alloc::vec::Vec;
 use spin::{Mutex, Once};
@@ -133,7 +115,7 @@ impl EndpointId {
 
 /// Endpoint 生命周期状态。
 ///
-/// `Pending` 预留给"已预留 id、尚未提交"的未来路径；当前
+/// `Pending` 预留给"已预留 id、尚未提交"的路径；当前
 /// [`EndpointRegistry::stage_publish`] 不创建 endpoint，
 /// [`EndpointRegistry::commit_pending`] 直接产出 `Live`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +225,7 @@ pub enum EndpointError {
 /// ISA / runtime**（native machine code vs Wasm）是**正交维度**，不属于这里：
 /// `KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，
 /// `SandboxedNative` 也都可以是 native code——把 Wasm 塞进本枚举是把苹果和橘子
-/// 放一起。Wasm 作为未来 Component 执行后端（`AGENTS.md` / `deployment.md` §1）
+/// 放一起。Wasm 作为 Component 执行后端之一（`AGENTS.md` / `deployment.md` §1）
 /// 需要**单独的维度**表达，不要加回本枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDomain {
@@ -393,7 +375,7 @@ impl EndpointRegistry {
         let record = components
             .get(provider)
             .ok_or(EndpointError::ProviderNotFound)?;
-        // `Starting` = 正在 call_create；`Ready` 允许未来 monitor 驱动的重发布。
+        // `Starting` = 正在 call_create；`Ready` 允许后续重发布。
         if !matches!(
             record.state,
             ComponentState::Starting | ComponentState::Ready
@@ -1376,7 +1358,7 @@ mod tests {
         assert_eq!(bound.record.port, 7, "Gate 经 port + dispatcher 分派");
     }
 
-    /// increment 6 的绑定方向：**KernelNative caller → Isolated provider** 在 bind
+    /// 绑定方向：**KernelNative caller → Isolated provider** 在 bind
     /// 上选 Gate（binding 只携带 opaque `EndpointId` + `port`；provider 域内的裸
     /// 入口绝不交付给另一个域）。
     #[test]

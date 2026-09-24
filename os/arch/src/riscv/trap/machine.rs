@@ -1,6 +1,6 @@
 //! M-mode trap 入口（`mtvec`/`mcause`/`mepc`/`mtval`）。
 //!
-//! 用于未来 RV32 M-mode / NoMMU bare-metal profile（无 OpenSBI 委托）。
+//! 用于 RV32 M-mode / NoMMU bare-metal profile（无 OpenSBI 委托）。
 //! 与 `supervisor` 共享本目录 `mod.rs` 的 `Trap`/`TrapFrame`/`Scause` 解码
 //! （cause 编码在 S/M 模式一致）。
 //!

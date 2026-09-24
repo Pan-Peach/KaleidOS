@@ -6,13 +6,13 @@
 //!   失败清理与复用）。不是"每次访问重新鉴权"。
 //! - **IRQ routes**：哪条中断线归哪个 owner、回调是谁（trap 需要一个锚点）。
 //! - **DMA mappings**：哪个设备能看到哪段 buffer（No-IOMMU 时就是 identity，
-//!   但 seam 留给未来 IOMMU / bounce buffer）。
+//!   但 seam 为 IOMMU / bounce buffer 保留）。
 //!
 //! # 访问强制（access enforcement）不在 KernelNative 数据路径上
 //!
 //! KernelNative 与 Core 同特权、共享内核地址空间：组件本来就能访问裸地址。
 //! 通过 `Handle -> validate -> Core MMIO read/write` 来"保护" MMIO 没有真实
-//! 安全意义，**已删除**。受信 KernelNative 驱动 claim 后直接拿到 MMIO 指针，
+//! 安全意义。受信 KernelNative 驱动 claim 后直接拿到 MMIO 指针，
 //! steady state 不再进 Core。
 //!
 //! 真正的访问强制来自执行域（mechanism，不是每次 API 鉴权）：
@@ -21,12 +21,12 @@
 //! KernelNative   trusted / raw pointer / 不做硬件访问限制
 //! Isolated       private address space / claim 后建立 mapping
 //!                未映射访问 → fault（由页表强制）
-//! 未来 Sandboxed privilege + private address space
+//! Sandboxed    privilege + private address space（未实现）
 //! ```
 //!
-//! 当前只有 KernelNative，因此 [`device::claim`] 直接返回寄存器基址指针；
-//! Isolated 分支将来在同一 seam 里把窗口映射进组件地址空间再返回 VA。上层
-//! driver 的寄存器访问逻辑不因 execution domain 改变而重写。
+//! 当前 [`device::claim`] 直接返回寄存器基址指针；Isolated 分支在同一 seam 里
+//! 把窗口映射进组件地址空间再返回 VA。上层 driver 的寄存器访问逻辑不因
+//! execution domain 改变而重写。
 //!
 //! # 保留的 correctness 不变量（不是 security）
 //!

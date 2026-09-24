@@ -1,5 +1,5 @@
-//! kcomp_isolated_svc —— increment 6（KernelNative caller → Isolated provider 的
-//! 跨域 service Gate）的 ArchTest **真实 `.kcomp`** provider。
+//! kcomp_isolated_svc —— KernelNative caller → Isolated provider 的跨域 service
+//! Gate 的 ArchTest **真实 `.kcomp`** provider。
 //!
 //! 由生产路径 `create_component(name, args, IsolatedNative)` 创建（私有 AS +
 //! 按域镜像 + Core 预置窗口），随后一个 KernelNative caller 经
@@ -7,15 +7,15 @@
 //!
 //! # 零依赖、零 import
 //!
-//! Isolated 的 import 包络仍是**空集**（本增量不做 per-domain trampoline）：
+//! Isolated 的 import 包络是**空集**（没有 per-domain trampoline）：
 //! 本夹具没有任何 UNDEF 符号，只用 `core::arch::asm!` 读 CSR 与自己镜像内的
 //! load/store。**provider 不能调用 Core**——它只能读 Core 交付给它的邮箱与实例
-//! 窗口。Core 侧的 endpoint publication（组件→Core 的 publish trampoline）也属于
-//! 后续增量，因此 ArchTest 从 Core 侧登记本 provider 的 endpoint（见 selftest）。
+//! 窗口。Core 侧没有 endpoint publication（组件→Core 的 publish trampoline），
+//! 因此 ArchTest 从 Core 侧登记本 provider 的 endpoint（见 selftest）。
 //!
-//! # 与 Core 的接口（increment 6 的窗口 + 邮箱协议）
+//! # 与 Core 的接口（窗口 + 邮箱协议）
 //!
-//! create（与 increment 5 同一窗口协议）：
+//! create（同一窗口协议）：
 //!
 //! ```text
 //! args      → 实例窗口基址 + 0（KcompCreateArgs）

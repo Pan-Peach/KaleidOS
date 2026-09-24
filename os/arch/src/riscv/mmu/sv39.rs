@@ -254,7 +254,7 @@ impl Sv39PageTable {
     /// - **原子性**：任一页失败（分配失败或 AlreadyMapped）时回滚本次已写入的叶子，
     ///   保证后端页表与 Core 的 `mappings` 列表一致（要么全有、要么全无）。
     ///   失败路径不能直接用 `?`，要用 `match ... break` 才能走到下面的回滚。
-    /// - 回滚后中间空表会保留在 `frames` 里（无害；回收属后续里程碑）。
+    /// - 回滚后中间空表会保留在 `frames` 里（无害；无回收接口）。
     pub fn map_range(
         &mut self,
         va: VirtualRange,

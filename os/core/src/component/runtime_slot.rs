@@ -1,7 +1,7 @@
 //! 每实例 **runtime slot**：`ComponentId → 运行时自有的 opaque 状态指针` 的
 //! 稳定位置（`docs/architecture/memory-and-heap.md` §5 的先行条件）。
 //!
-//! 组件运行时（未来 SDK）把每个实例的运行时上下文（堆指针等）放在这里；Core
+//! 组件运行时（SDK）把每个实例的运行时上下文（堆指针等）放在这里；Core
 //! 只**存 / 取**这个指针，**从不解释、从不解引用**。切换路径把 slot 装进
 //! RISC-V `tp` 寄存器（见 `arch::CpuArch::install_runtime_slot` /
 //! `set_context_slot`），所以组件代码总在自己的 runtime context 下运行：
@@ -20,8 +20,8 @@
 //!
 //! # 生命周期
 //!
-//! - **安装**（`install`）：将来由 SDK 经窄 ABI 在实例建立时完成（本增量无人
-//!   安装 —— 所有路径在 slot 为 0 时行为不变）。
+//! - **安装**（`install`）：由 SDK 经窄 ABI 在实例建立时完成（未安装时 slot 为
+//!   0，所有路径行为不变）。
 //! - **清除**（`clear`）：实例死亡（`failure::fail_component`）与优雅停止
 //!   （`component/exit.rs`）时由 Core 清除，避免死实例的 runtime context 再被
 //!   任何执行带着跑。

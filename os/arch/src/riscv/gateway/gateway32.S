@@ -1,4 +1,4 @@
-# KaleidOS increment 3: the Isolated-domain assembly gateway (RV32).
+# The Isolated-domain assembly gateway (RV32).
 #
 # 与 gateway64.S 同一机制、同一 ABI，只有 XLEN 宽度差异：
 #

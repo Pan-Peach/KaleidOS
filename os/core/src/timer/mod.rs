@@ -6,14 +6,13 @@
 //! 拆子模块、保持单文件小**（参考 `task/` 的粒度：id/state/table/error 各一个
 //! 文件）——不预造空桩，等第一个真实关注点出现时落文件，避免单文件巨无霸。
 //!
-//! # C5 骨架（Core 机制，canonical，不做成组件）
+//! # 定位（Core 机制，canonical，不做成组件）
 //!
 //! 单次 deadline 编程 + tick 分发 + 与调度器的抢占 seam。硬件访问走
 //! `arch::TimerImpl`（`Timer` trait：`now` / `set_deadline`），Core 不感知
-//! SBI/CLINT 细节；组件未来拿 `TimerHandle`（Authority ≠ Interface），
-//! 本阶段只有 Core 自己消费。
+//! SBI/CLINT 细节；当前只有 Core 自己消费（组件 `TimerHandle` 未实现）。
 //!
-//! # 接线点（实现时按序）
+//! # 接线点
 //!
 //! 1. `init`：登记 trap 回调并打开 timer interrupt，不自动产生周期 tick；
 //! 2. `arm_deadline`：为下一个 sleep/timeout/event 编程 one-shot deadline；
@@ -114,7 +113,7 @@ pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
 /// 职责：重编程下一次 deadline + tick 计数 + 触发调度抢占 seam
 /// （`crate::sched::on_timer_tick`）。
 ///
-/// TODO(C5)：实现；抢占模型（延迟重调度 vs trap 内直接切换）见 sched 侧注记。
+/// 抢占模型（延迟重调度 vs trap 内直接切换）见 [`crate::sched::on_timer_tick`]。
 pub extern "C" fn on_trap() {
     #[cfg(feature = "preempt")]
     let now = arch::TimerImpl::now();
@@ -147,8 +146,6 @@ pub extern "C" fn on_trap() {
 }
 
 /// 已过去的 tick 数（观测/测试用）。
-///
-/// TODO(C5)：实现。
 pub fn ticks() -> u64 {
     let _irq_guard = crate::irq::IrqSaveGuard::new();
     STATE.lock().ticks
@@ -163,7 +160,7 @@ mod tests {
     ///
     /// `STATE` 是进程级 `static`，`init()` 每个进程只能成功一次且无法重置，
     /// 所以整条生命周期必须放在单个 `#[test]` 里。锁本身沿用 irq / sched /
-    /// containment / trace 的纪律，防止未来新增测试并发改动同一全局。
+    /// containment / trace 的纪律，防止新增测试并发改动同一全局。
     ///
     /// rank = TIMER（模块本地、最外层；见 [`crate::test_support`]）。
     static TIMER_TEST_LOCK: TestLock = TestLock::new(Rank::Timer);

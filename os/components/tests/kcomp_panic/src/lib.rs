@@ -1,4 +1,4 @@
-//! kcomp_panic —— panic containment 的**真实 `.kcomp`** 测试组件（step 2 D）。
+//! kcomp_panic —— panic containment 的**真实 `.kcomp`** 测试组件。
 //!
 //! 与 `kcomp_smoke` 不同，这里故意在 `kcomp_instance_create` 里 `panic!`：panic
 //! 进入的是组件私有 SDK panic adapter（本镜像自带），它打印诊断后调

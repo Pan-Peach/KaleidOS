@@ -1,12 +1,12 @@
-//! kcomp_isolated —— increment 4（按域放段 / 页级权限分离）的 ArchTest **真实 `.kcomp`**。
+//! kcomp_isolated —— 按域放段 / 页级权限分离的 ArchTest **真实 `.kcomp`**。
 //!
 //! 它**不被任何组件生命周期路径加载**：ArchTest（`os/boot/riscv/src/selftest.rs`）
 //! 把它的字节从内嵌 kpkg 读出，走 `component::isolated_load` 放进一个私有 AS，
-//! 再经 increment 3 的 assembly gateway 进入 `kcomp_instance_create`。
+//! 再经 assembly gateway 进入 `kcomp_instance_create`。
 //!
 //! # 为什么零依赖、零 import
 //!
-//! Isolated 的第一版 import 包络是**空集**（`docs/architecture/deployment.md` §6.1）：
+//! Isolated 的 import 包络是**空集**（`docs/architecture/deployment.md` §6.1）：
 //! 本夹具只做本镜像内的 load/store 与自调用，不引用 `kcore_*`、不引用 SDK
 //! （panic adapter 会带 `kcore_*` import），因此镜像里没有任何 UNDEF 符号。
 //! 这也让它成为"按域装载不依赖 KernelNative 重定位结果"的最小真实样本。

@@ -1,20 +1,18 @@
-//! CoreTest 测试组件（第一个 .kcomp）：核内自检 Core 的真实接口。
+//! CoreTest 测试组件（第一个 `.kcomp`）：核内自检 Core 的真实接口。
 //!
-//! - `kcomp_instance_create`：loader 放段 + 重定位后由 Core 调用；返回 0 =
-//!   全部通过，非 0 = 失败位图（`load` 命令会据此报告 FAILED）
-//! - 报告分组（`runtime/`，每个分组一个模块 —— 模块边界 = 责任边界）：
-//!   - `boot`：`.data` 段搬运 / 机器真相 / 内存分配器 / 组件注册表
-//!   - `sched`：组件加载 → 接口可用 → 任务创建/启动 → RR 调度 → yield/exit
-//!   - `resource`：MMIO / IRQ / DMA 的 discover → claim → access → release，
-//!     外加 Core 已明确定义的拒绝路径（重复认领 / 子项未释放 / 死 root 派生）
-//!   - `trace`：**操作 → 事件**断言（操作前取游标、用操作返回的 id/handle 精确匹配）
-//! - 平台事实不入本组件：QEMU virt 的 PLIC 线号 / context 公式 / enable bit
-//!   读回属于平台白盒，已由 ArchTest `external-irq`
-//!   （`os/boot/riscv/src/selftest.rs`）直接驱动 PLIC 覆盖。这里只断言 Core
-//!   自己报告的返回值与状态编码，不读中断控制器寄存器
+//! - `kcomp_instance_create`：loader 放段 + 重定位后由 Core 调用；返回 0 = 全部
+//!   通过，非 0 = 失败位图（`load` 命令会据此报告 FAILED）。
+//! - 报告分组（`runtime/`，模块边界 = 责任边界）：`boot`（.data / 机器真相 /
+//!   分配器 / 注册表）、`sched`（加载 → 任务 → RR 调度 → yield/exit）、`resource`
+//!   （MMIO / IRQ / DMA discover → claim → access → release + 拒绝路径）、`trace`
+//!   （操作 → 事件的精确锚定），外加组件/系统集成场景 `filesystem` / `driver` /
+//!   `c_frontend`。
+//! - 平台事实不入本组件：QEMU virt 的 PLIC 线号 / context 公式 / enable bit 属于
+//!   ArchTest（`os/boot/riscv/src/selftest.rs`）；这里只断言 Core 自己报告的返回值
+//!   与状态编码，不读中断控制器寄存器。
 //! - 只走导出白名单（`kcomp-sdk` 的 `kcore_*` 声明是 ABI 单一来源），无 god-mode；
-//!   不直接触碰 TaskTable / Registry / Sv39 / CpuContext —— 那是 Core 的真相
-//! - host 测试只覆盖纯逻辑；真实执行在核内
+//!   不直接触碰 TaskTable / Registry / Sv39 / CpuContext —— 那是 Core 的真相。
+//!   host 测试只覆盖纯逻辑；真实执行在核内。
 
 #![no_std]
 
