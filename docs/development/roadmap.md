@@ -330,14 +330,14 @@ Device Interface（如 BlockDevice / UART 设备）
 - **确定性测试**：Test Scheduler / Hunt Mode（CHESS 思路）；
 - **内存回收（未来里程碑）**：完整 buddy、通用 Core heap、完整 panic recovery（内存回收 / 真隔离）—— 均推迟到显式未来里程碑；phase 1 已实现 init / task 边界的**协作式** panic containment（独立栈 + stack-switch escape，逻辑死亡，见 `component-model.md` §5.1），但只做资源归属撤销与 quarantine，不承诺共享堆字节回收。
 
-### 方向：移植平台 / kport（方向，非承诺里程碑）
+### 方向：第三方库移植 / 调包能力（方向，非承诺里程碑）
 
 > **这是方向，不是承诺的里程碑。** 没有排期、没有验收标准；只有当某个具体 component 真的需要它时才推进。
 
 不自己重写 FAT / ext4 / TCP / TLS / WASI / Win32，而是让成熟库经**薄 adapter** 变成 component：维护负担从"维护整个世界"移到"维护接口和胶水"。完整契约与候选地图见 `docs/architecture/porting.md`。
 
-- `kport` 层（`kcomp-sdk/kport` 或独立 `kaleidos-port`）：第三方库只认 native semantic interface（BlockDevice / NetDevice / Clock / File / Random / Socket），**永不直调 Core**；库对 KaleidOS / virtio / MMIO / DMA 必须一无所知；
-- 候选（均为候选，非集成）：FatFs（**已集成，只读**）、lwext4、littlefs、smoltcp、lwIP、Mbed TLS、TinyUSB、WAMR、picolibc；
+- **不设独立 `kport` 层**：移植代码只落在**组件内 adapter**（per-library，不可共享）与 **SDK 可选 host-glue**（如 picolibc 的 `_write` / `sbrk` / `_exit`）。第三方库只认 native semantic interface（BlockDevice / Filesystem / Clock / File / RNG / Socket），**永不直调 Core**；库对 KaleidOS / virtio / MMIO / DMA 必须一无所知（详见 `docs/architecture/porting.md` §3）；
+- 候选（均为候选，非集成；**许可须核对上游 LICENSE**）：FatFs（**已集成，只读**）、littlefs（**已集成，只读服务 + 多实例已验证**）、lwext4（**GPLv2，纳入前先定许可策略**）、smoltcp、lwIP、Mbed TLS、TinyUSB、WAMR、picolibc；
 - 前置：统一 host 接口里多数尚不存在（Block 已落地；File / Namespace 是设计；Net / RNG / Clock / Log / Thread / Sync 是提案）；
 - 远期：Windows personality 走 Wine / ReactOS 研究路线（Wine 需完整 POSIX 环境；ReactOS 借语义不整体移植；均非常后期）。
 

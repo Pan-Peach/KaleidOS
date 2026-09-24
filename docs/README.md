@@ -60,7 +60,7 @@ docs/
 | 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **取代** `component-lifecycle.md` §9 第 237 行"共享 text 不是 ABI 承诺"的结论；跨域机制均未实现，见其 §10 |
 | 分层总览、ResourceDomain / ExecutionDomain 概念 | `architecture/overview.md` | 与 driver-model 细节冲突时以 driver-model 为准 |
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
-| 第三方库移植 / 调包能力（kport、候选库、统一 host 接口） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
+| 第三方库移植 / 调包能力（候选库 + 许可、组件内 adapter、SDK host-glue） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
 | 组件对外契约（设备/FS/服务） | `interfaces/` | 接口语义契约；文件系统抽象见 `interfaces/filesystem.md` |
 | 每个模块的真实行为与代码位置 | `modules/` | 描述现状；不确定就写"未实现/目标"，不臆造 |
 | 测试策略 | `development/testing.md` | —— |

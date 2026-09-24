@@ -20,6 +20,6 @@ interfaces/ 尚未成体系前，多数对外契约暂时写在架构文档里�
 | 组件入口 `kcomp_instance_create` / `kcomp_instance_destroy` | `architecture/component-lifecycle.md` §4 |
 | Interface（Device / Service / Policy）与 binding | `architecture/component-model.md` §2 |
 | 设备语义侧：device claim / IRQ / DMA 的 API 形状与 errno | `architecture/driver-model.md` §6 |
-| 组件侧 SDK（Rust adapter / C 头 / C 运行时）与第三方库移植层（`kport`） | `modules/components.md`；移植契约见 `architecture/porting.md` |
+| 组件侧 SDK（Rust adapter / C 头 / C 运行时）与第三方库移植（组件内 adapter + SDK host-glue） | `modules/components.md`；移植契约见 `architecture/porting.md` |
 
 > **不要**在本目录重复上面已有的内容；新接口文档应引用它们，而不是复制一份会漂移的副本。

@@ -212,7 +212,7 @@ FsInstance + FsNode + 同一份 storage
 **现状**（务必按此描述，不要拔高）：
 
 - `block.device` 设备接口已落地：块设备驱动认领设备后向上发布，单位、阻塞、`0/-errno` 等契约已在 SDK 中写清；
-- 一个最小 `filesystem` 服务契约已存在：只读、`mount/unmount/open/close/read`、不透明 u64 handle、singleton 端点名；FatFs 组件已经绑 `block.device` 并发布它，自带一个最小 selftest；
+- 一个最小 `filesystem` 服务契约已存在：只读、`mount/unmount/open/close/read`、不透明 u64 handle、singleton 端点名；**两个** provider 已落地并绑 `block.device`：FatFs（只读 FAT，自带最小 selftest）与 littlefs（v2.9.3，`mount` 内 format + 自检，真实走 prog/erase）；`littlefs_chain` 组合策略已端到端证明**两个同类型 FS 实例各自发布并各自被 bind**（QEMU，rv64 + rv32）；
 - `vfs/` 目前是空目录：**没有** namespace 服务，**没有** File service，**没有** 独立的 generic FS 接口层；
 - **没有**稳定的 VFS / Page Cache 路径（与 `docs/development/benchmark.md` 一致）。
 
