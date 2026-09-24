@@ -15,7 +15,7 @@
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
 | `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
 | `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
-| `ram_blk_rw` | `os/components/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_heap_alloc` 分配独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
+| `ram_blk_rw` | `os/components/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
 | `littlefs_chain` | `os/components/littlefs_chain/` | Rust `.kcomp` | **多实例组合策略**：2× `ram_blk_rw` → 2× `littlefs`（各带独立块设备与 `lfs_t`），证明 Core endpoint/instance 模型承载两个互不干扰的 FS 实例 |
 | `vfs` | `os/components/filesystems/vfs/` | 空目录 | 占位，无文件、无 `Cargo.toml` |
 | `kcomp_smoke` | `os/components/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |

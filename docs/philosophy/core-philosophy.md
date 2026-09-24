@@ -222,8 +222,9 @@ BlockDevice（Interface）
 
 **反例自查**：RR 算法放进 Core？—— 不需要。它错了只会调度得烂，不会让两个任务同时占一个 CPU（检查在 Core）。物理帧分配则相反：它是 Core 内部机制 —— 分配错了会破坏所有权真相，必须由 Core 掌握（见 §3 分配示例）。
 
-## 5.5 内存：无 per-component 记账
+## 5.5 内存：Core 管 Memory，不管 Heap
 
+**分层**：Core 只以 region / address-space 粒度提供 backing 与 mapping，**不**做内存记账——**不**记 region owner、**不**记 malloc/free 对象、**不**做 per-instance 字节计费或配额；每个 `ComponentInstance` 拥有独立 `HeapState`（共享的是分配器实现代码，不是堆；Core 对象堆仅供 Core 内部使用）。归属不由 Core 记：KernelNative 无隔离、无账本（没有可裁决的对象）；Isolated / Sandboxed 的归属与映射由该实例的地址空间 / 页表承载。KernelNative 的 region release / instance failure 只保证**逻辑失效**，已发布 backing 保留驻留、不承诺物理回收——没有归属记录，KernelNative 实例死亡也就没有可回收之物（这正是"逻辑死亡、物理驻留"的结果）。完整契约见 `docs/architecture/memory-and-heap.md`；访问窗口与 `kcore_device_claim` 同形（语义统一、表示不统一）。
 
 #### 5.5.1 内存三分法
 

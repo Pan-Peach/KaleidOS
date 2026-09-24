@@ -28,6 +28,7 @@
 - `export.rs`：`kcore_*` 导出 ABI 实现（40 项）与 `resolve(name) -> Option<usize>`。
 - `failure.rs`：`fail_component`、`revoke_authority_and_unbind`。
 - `exit.rs`：`stop_component`、`ComponentStopError`。
+- `runtime_slot.rs`：每实例 **runtime slot**（`RuntimeSlotTable`、`RuntimeSlot`）；`install` / `clear` / `get`、全局 `get_slots`。Core 只存 / 取组件运行时自有的 opaque 指针（RISC-V `tp`，切换边界安装；`0` = 无 slot），**从不解释** —— 执行状态，不是内存记账（`docs/architecture/memory-and-heap.md` §5）。
 - 重导出：`panic_escape`、`ComponentStopError`、`stop_component`、`fail_component`、`ComponentImage`、`ComponentImageId`。
 
 ## 明确不做
@@ -56,4 +57,5 @@
 | `os/core/src/component/export.rs` | `kcore_*` 导出 ABI 实现 + `resolve` |
 | `os/core/src/component/failure.rs` | `fail_component`、归属撤销 |
 | `os/core/src/component/exit.rs` | `stop_component`（`Stopping` / `Stopped`） |
+| `os/core/src/component/runtime_slot.rs` | 每实例 runtime slot（`tp`）：install / clear / get |
 | `os/core/src/component/generated/exports.rs` | 生成的 `EXPORTS: [Export; 40]` 表 |

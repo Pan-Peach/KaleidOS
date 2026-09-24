@@ -22,7 +22,7 @@
 
 - **不做 per-access 鉴权**：`kcore_device_claim` 之后 driver 直接拿裸 MMIO 指针，稳态不再进 Core（KernelNative 就是可信代码，见 `docs/architecture/driver-model.md` §1.1）。
 - 只强制**正确性**不变式：设备独占、失败 quarantine、拆机顺序（仍有 live IRQ/DMA → `-EBUSY`）。撤销在 KernelNative 是协作式的。
-- 不记内存字节（共享 Core heap 无 per-component 记账），ResourceDomain 不是 struct 而是一个视图。
+- 不记堆内对象 / 堆字节（per-instance `HeapState` 由 runtime 拥有），**也不做内存记账**：无 region owner 记录、无 region 账本，`resource` 下没有 memory 模块（见 `docs/architecture/memory-and-heap.md`）。ResourceDomain 不是 struct 而是一个视图。
 - 不碰中断控制器寄存器（那在 arch）；`irq` 模块只管投递（见 [`irq.md`](irq.md)）。
 
 ## 代码在哪

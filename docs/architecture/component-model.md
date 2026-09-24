@@ -95,7 +95,7 @@ component wrapper
 | DEFINED | component code、third-party crate code、必需的 Rust support、private helpers、`kcomp_instance_create` / `kcomp_instance_destroy` |
 | UNDEFINED | 只允许显式放行的 `kcore_*` imports（对齐 §2.1 的 export 白名单） |
 
-- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（`kcore_heap_alloc/dealloc`、`kcore_log_line`、`kcore_device_*`、`kcore_irq_*`、`kcore_dma_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
+- **third-party crate 是组件私有实现**：`smoltcp`、`virtio-drivers`、buddy allocator helper、协议 parser 一旦被组件使用，就成为 `.kcomp` 内部细节。Core 不认识 `smoltcp::socket::udp::...`，也不导出任何 Rust compiler/runtime 符号去满足组件；Core 只暴露固定 ABI（内存 `kcore_memory_acquire/release`（域视图，见 `docs/architecture/memory-and-heap.md`）、`kcore_log_line`、`kcore_device_*`、`kcore_irq_*`、`kcore_dma_*`、`kcore_task_*`、`kcore_panic_escape` ...）。
 - **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
 - **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
 
@@ -116,21 +116,21 @@ component wrapper
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
 
-Core heap 是共享的（§3），但组件不裸调 Core 导出，中间有 SDK adapter 层：
+Core 管 Memory、不管 Heap（§3）：每个实例有自己的 `HeapState`（共享的是分配器实现代码），组件不裸调 Core 导出，中间有 SDK adapter 层：
 
 ```text
-GlobalAlloc   → component allocator adapter → kcore_heap_alloc / kcore_heap_dealloc → Core heap
+GlobalAlloc   → component allocator adapter → kcore_memory_acquire / kcore_memory_release → Core backing / mapping（无账本）
 log crate     → component-local logger      → kcore_log_line                         → final sink
 panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸，见 §5） → —
 ```
 
-> 这不是"每个组件自带一个堆"：每个组件有自己的 adapter（满足 Rust 类型/宏契约），但**底层资源仍由 Core 统一管理**。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带。
+> 每个实例拥有自己的 `HeapState`（不是 image-global 的自带堆；共享的是分配器实现代码），**backing 仍以 region 为单位由 Core 提供**（Core **不**记 owner：无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载）。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带；`#[global_allocator]` 的 static 状态不是 per-instance 存储，必须由 per-instance runtime context 提供。契约见 `docs/architecture/memory-and-heap.md`。
 
 > 现状（step 2）：`os/components/kcomp-sdk` 是这一层的落地——它是 `kcore_*` 导出白名单的
 > 单一来源（C 头 `include/kcomp.h`，Rust 镜像 `src/abi.rs`，漂移由
 > `os/core/tests/kcomp_abi_drift.rs` 兜底），提供 `kcomp_instance_create!` / `kcomp_instance_destroy!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
 > `#[panic_handler]`（打印诊断后调 `kcore_panic_escape` 协作式逃逸），以及 feature `alloc`
-> 下的 `#[global_allocator]`（接 Core 共享堆，无 per-component 堆）。SDK 是普通 library，
+> 下的 `#[global_allocator]`（接 per-instance `HeapState`（`crate::heap`）；backing 经 `kcore_memory_acquire/release` 提供，见 `docs/architecture/memory-and-heap.md`）。SDK 是普通 library，
 > 编译进每个 `.kcomp`，不是可加载组件、也不是 shared runtime。
 >
 > **C 组件没有这些 Rust adapter**：它只 `#include "kcomp.h"`（`kcore_*` 声明 + 入口契约），
@@ -190,7 +190,7 @@ struct Mapping {               // DMA mapping（device-related）
 }
 ```
 
-> **KernelNative 的 Core 与组件共享一个 Core heap**：ResourceDomain **不**追踪 per-component 的堆分配或字节计费，也没有 per-component arena / 私有堆。它只记录设备所有权 / IRQ route / DMA mapping 和受管理的内存区域，用于 revoke / teardown / quarantine。
+> **KernelNative 的 Core 管 Memory、不管 Heap**：每个实例拥有独立 `HeapState`（共享的是分配器实现代码）。ResourceDomain **不**追踪 per-instance 的堆分配或字节计费，也没有 per-instance arena，**也不记受管内存**——Core 不做内存记账（无 region owner 记录），它只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine。契约见 `docs/architecture/memory-and-heap.md`。
 >
 > `ComponentId` 是 identity（不是权限），`DeviceId` 也是 identity。所有权记录只存在于各资源表，两者已经明确分离。
 

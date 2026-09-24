@@ -285,7 +285,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 - 现状：**单一 load base**（`image.rs:57`），段放置只提供段内对齐、**没有页级权限分离**（`loader.rs:156-187`）；import 只重定位**一次**（`loader.rs:317-372`）；`create` / `destroy` / `service_dispatch` 是绝对 `usize`（`image.rs:59-64`），运行时被 transmute 成函数指针（`os/core/src/component/containment.rs:906,913`）。
 - **同一 artifact 能否按域重定位？** 可以，但**必须按域重新放段 + 重新解析 import**（新 `base`、新 import 目标）。今天的 loader 没有这条路径。
 - **text 何时可跨域共享？** 只有当**重定位后的 text 字节完全相同**时才能共享可执行页，即：**same VA**（同一段虚拟地址）+ **same import-target VA**（import 在两端解析到**同一 VA**）。后者的可行做法是 **per-domain fixed-VA trampoline**：把每个 `kcore_*` import 解析到该域一个**固定 VA** 的 trampoline（trampoline 本体按域不同，但地址相同）。做不到这两条，就必须按域各自放段 / 重定位，**不能共享 text**。
-- **instance-state**：`kcomp_instance_create` 返回的 opaque state 经共享 Core heap 分配（地址稳定），是**实例**私有，不是 image 共享。
+- **instance-state**：`kcomp_instance_create` 返回的 opaque state 是**实例**私有、不是 image 共享；它经该实例自己的 `HeapState`（per-instance runtime context）分配，backing 以 **region 粒度**由 Core **提供**（Core 不记 owner、无账本；backing 经 `kcore_memory_acquire/release` 交付。契约见 `memory-and-heap.md`）。
 
 > **不要声称一个 `mode` 字段就能实现这些。** 一个字段只表达"意图"；上面每一条都需要真实机制（§7 的依赖排序缺口）。
 

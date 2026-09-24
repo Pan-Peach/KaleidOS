@@ -38,9 +38,9 @@
 
 稳态寄存器 / 缓冲访问不需要 per-access 校验；补货、IRQ 投递、DMA map/unmap、claim/release 仍进 Core。
 
-### 1.4 内存模型澄清（D1=A）
+### 1.4 内存模型澄清（D1 已修订）
 
-Core 与组件共享**一个 Core heap**，不做 per-component 内存记账；只有**显式拥有的运行期区域（owned runtime region）可回收**，共享堆上的分配需要**显式清理**。**不得以"地址空间隔离"为名引入 per-component 私有堆**——地址空间隔离解决的是访问强制，不是内存计费。
+**Core 管 Memory，不管 Heap，也不做内存记账**：Core 对象堆只供 Core 内部使用；每个实例拥有独立 `HeapState`（共享的是分配器实现代码，不是堆）。Core 只以 **region / address-space 粒度**提供 backing / mapping 并推进生命周期，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 的归属由该实例的地址空间 / 页表承载），**不**做 per-instance 字节计费或配额。region release / instance failure 只保证**逻辑失效**、不承诺物理回收：KernelNative 已发布 backing 保留驻留，且因为没有归属记录，实例死亡也没有可回收之物。地址空间隔离解决的是访问强制，不是内存计费——**不得以"地址空间隔离"为名把 `HeapState` 分离说成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
 
 ## 2. 三个执行域模型
 
@@ -431,7 +431,7 @@ runtime:
 
 ## 13. 已决
 
-- **D1 = A**：保留"单一共享 Core heap、不做 per-component 记账"；只有显式拥有的运行期区域可回收；共享堆分配需要显式清理；**不引入 per-component 私有堆**。
+- **D1（已修订）**：Core 管 Memory、不管 Heap，也不做内存记账；每个实例拥有独立 `HeapState`（共享分配器实现代码，不共享堆）；Core 只以 region 粒度提供 backing / mapping，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 归属由该实例的 AS / 页表承载），**不**做 per-instance 字节计费；region release / instance failure 只保证逻辑失效、backing 保留驻留（不承诺物理回收，无归属记录时实例死亡亦无可回收之物）；**不得以"地址空间隔离"为名把 `HeapState` 分离当成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
 - **D2 = A**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是可选的**教学实验**、**不是里程碑**；SandboxedNative（U + 私有 AS）是未来的**强制边界**。执行模型 / runtime（native vs Wasm）是**正交维度**，Wasm 只是 Component 的执行后端之一，不是第四个执行域。
 - **设备访问模型**：`DeviceId`（identity）+ `kcore_device_claim` 返回本执行域窗口；KernelNative 拿裸寄存器基址，driver 自己 `volatile` 读写；不做 per-access 鉴权。旧的 `Handle → validate → Core MMIO read/write`、typed `MmioLease` / `DmaLease` 已删除。
 - **IRQ 模型**：锚点是已认领的 `DeviceId`；只支持 native callback；polled / count / mask / ack 已删除并推迟到真实 isolated / U-mode 执行模型。

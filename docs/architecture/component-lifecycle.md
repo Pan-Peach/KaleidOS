@@ -24,7 +24,7 @@
 |---|---|
 | 私有地址空间、域切换、syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 执行域是推迟的里程碑（`docs/development/roadmap.md`）；phase 1 只有 KernelNative |
 | 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
-| 通用资源转移/授予图、ResourceDomain 容器、per-component heap、内存计费 | 违反 `AGENTS.md`；所有权转移是推迟项 |
+| 通用资源转移/授予图、ResourceDomain 容器、per-instance 字节计费/配额、Core 侧内存账本（region owner / region id / Retired 表） | 违反 `AGENTS.md`；所有权转移是推迟项；Core 不做内存记账，见 `docs/architecture/memory-and-heap.md` |
 | loader 复制 `.data/.bss`、跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | **见 §9：当前共享地址空间下，globals 仍是 image-global，per-instance 状态来自显式分配**。复制 BSS 不会重定向已按原 globals 完成重定位的指令 |
 | 驱动注册框架、热插拔策略、依赖解析器、自动 ABI 兼容协商 | 无当下需求 |
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
@@ -124,7 +124,7 @@ int32_t kcomp_instance_destroy(void *state);
   组件侧不要手写 `const E*: i32`：Rust 用 `kcomp_sdk::Errno` / `Result<T>`，C 用 SDK 的
   `<errno.h>` shim（`return -ENODEV;`）。线格式仍是裸 `i32`（`0 / -errno`），类型只活在语言边界。
 - Core 把 `*out_state` 初始化为 `NULL`；成功时组件写入自己完成的 state 指针；**无状态组件可成功返回 NULL**。
-- 状态经现有 shared heap 分配。**Core 只存/传指针，不解释、不通用释放。**
+- 状态经该实例自己的 `HeapState` 分配；**共享的是分配器实现代码，不是堆**。Core 只存/传指针，不解释、不通用释放。（分层与**无账本**契约见 `docs/architecture/memory-and-heap.md`：Core 不记 region owner，无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载；per-instance runtime context 是目标；backing 已由 `kcore_memory_acquire/release`（域视图）提供。）
 - `kcomp_abi` 是手工维护的精确契约指纹；**不加版本后缀、不做兼容协商、不自动生成哈希**。
 - **协调替换**：原地删除 `kcomp_init` / `kcomp_exit`，**不留 legacy fallback**（`AGENTS.md`：不保证陈旧 `.kcomp` 可加载）。
 

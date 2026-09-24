@@ -24,7 +24,7 @@ MMU：Sv39（RV64，identity + 高半区双映射 + high-half 交接）与 Sv32�
   → monitor `load <name>` → call_component_create（kcomp_instance_create）
 导出白名单（EXPORT_SYMBOL 教学版，os/core/src/component/export.rs）：
   一组 kcore_*，按稳定 ABI 分类：
-    Runtime/shared heap：kcore_heap_alloc / kcore_heap_dealloc（共享堆，契约 = GlobalAlloc）
+    Memory resource：kcore_memory_acquire / kcore_memory_release（域视图，无账本）
     Logging：console_write_byte / log_line
     Machine query：machine_boot_hart / machine_cpu_count / machine_has_hart
     System query：free_page_count / task_count / component_count

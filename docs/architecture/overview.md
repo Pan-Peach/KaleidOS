@@ -199,7 +199,7 @@ Core 是整个系统的**机制与所有权真相核心（mechanism & ownership 
 
 - Task 与 CPU 执行状态（Task 身份、状态、运行在哪个 CPU、上下文）
 - 物理内存（Physical Memory）：帧真相 + **canonical 帧分配器作为 Core 机制**（静态帧池，不热卸载）
-- 共享 Core heap（Core 与组件共用，无 per-component 记账）
+- Core 对象堆（仅 Core 内部；组件不共享）与 **region 粒度**的 backing / mapping（Core **不**做内存记账：不记 region owner，无隔离域不记归属，Isolated / Sandboxed 由该实例的 AS / 页表承载；见 `docs/architecture/memory-and-heap.md`）
 - AddressSpace
 - IRQ / Timer / MMIO / DMA
 - 内核对象（Kernel Object）
@@ -316,8 +316,8 @@ Component → Component     = Endpoint binding（endpoint.rs：publish/lookup/di
                             function table 或 Core call gate，禁止 flat ELF symbol 互链）
 ```
 
-- Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出共享堆
-  （`kcore_heap_alloc/dealloc`）、输出通道、已提交真相的只读查询，以及经过
+- Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出内存获取
+  （`kcore_memory_acquire/release`，域视图）、输出通道、已提交真相的只读查询，以及经过
   Core 处理的**语义入口**（组件加载 / endpoint 发布 / 任务控制 / 设备与 IRQ 与 DMA：
   `kcore_device_nth` + `kcore_device_claim/release`、
   `kcore_irq_register/enable/disable/release`、
@@ -396,7 +396,7 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping 和受管理的内存区域，**不是**逐帧 identity、堆字节数，也没有 per-component arena。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的归属记录），owner 字段直接落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终撤销归属并做 teardown/quarantine**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
+- **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping，**不**记受管内存——Core 不做内存记账、无 region owner 记录，**不是**逐帧 identity、堆字节数，也没有 per-instance arena（per-instance `HeapState` 属于 runtime，不是 ResourceDomain 资源；见 `docs/architecture/memory-and-heap.md`）。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的归属记录），owner 字段直接落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终撤销归属并做 teardown/quarantine**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
 - **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。**它只回答"在哪运行、什么特权 / 地址空间"**；执行模型 / ISA / runtime（native machine code vs Wasm）是**正交维度**，不属于这里——Wasm 是未来 Component 的一种执行后端，不是第四个执行域（见 `deployment.md` §3）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/architecture/component-lifecycle.md`），旧 `ComponentRecord` 已删除；实例记录已带 `execution_domain` 字段（`InstanceRecord`），由创建入口验证后写入，但只有 `KernelNative` 有真实执行器（创建入口按域分派，`IsolatedNative` / `SandboxedNative` 是 `todo!()` 占位）。`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
   - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，**KernelNative 就是可信代码**（无硬件访问强制，撤销为协作式）；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / device claim / IRQ / DMA / teardown 不变式见 `driver-model.md`。
 
