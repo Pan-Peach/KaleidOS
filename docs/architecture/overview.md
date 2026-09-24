@@ -214,34 +214,11 @@ Arch 的一次性机制，不是运行期 AddressSpace。未来运行期地址�
 Core 独占提交，Sv39/Sv32 页表只是 Arch backend 维护的硬件投影。Arch 可以保存这份
 投影，但不能绕过 Core 独立改变映射、所有权或生命周期。
 
-### 内存模型：语义与机制分离
+### 内存模型
 
-Core 的内存模型不等于某一种页表格式。内存相关概念保持三层分离：
+Core 的内存模型不等于某一种页表格式，保持三层分离：Physical Memory（谁拥有哪些帧）/ Protection（谁能访问）/ Address Translation（VA→PA）。Core 面向 region / address-space 语义；`VPN` / `PTE` / `satp` 与具体 walk 算法留在 arch backend。
 
-```text
-Physical Memory
-    机器有哪些 RAM、哪些帧可分配、帧的 owner 是谁
-
-Protection
-    某个 Domain/Component 是否拥有访问某个区域的权利
-
-Address Translation
-    一个地址如何从 VA 翻译到 PA
-```
-
-Core 面向 `MemoryDomain`、region、ownership 和 permission；它不应该知道
-`VPN`、`PTE`、`satp` 或某个具体页表遍历算法。`MemoryDomain` 表达执行实体
-拥有哪些内存、允许访问哪些区域，以及这些区域的权限。
-
-有 MMU 的平台可以由 `MemoryDomain` 关联 paged `AddressSpace`，由架构 backend
-实现地址翻译和硬件权限；没有 MMU 的平台则可以使用 flat memory 加 PMP/MPU
-等 protection backend。NoMMU 不是一种特殊的页表，也不承诺具备 page fault、
-COW 或任意虚拟地址空间等 MMU 语义。
-
-**MMU / NoMMU 是平台能力，不是哲学分叉。** Core 不因平台能力缺失而拒绝平台，而是
-允许能力降级，并把差异统一到 `AddressSpaceManager` / `MappingSource` 抽象
-（map / unmap / domain / protection），backend 可以是 RV64+Sv39、RV32+Sv32 或 NoMMU。
-能力差异必须显式可见、绝不假装：
+**MMU / NoMMU 是平台能力，不是哲学分叉**：Core 允许能力降级并把差异统一到 `AddressSpaceManager` / backend，能力差异必须显式可见、绝不假装：
 
 | 平台能力 | 可承诺的隔离 |
 |---|---|
@@ -249,14 +226,7 @@ COW 或任意虚拟地址空间等 MMU 语义。
 | MMU，无 IOMMU | CPU 隔离；DMA 受限（需信任或额外约束） |
 | NoMMU | 基于信任的 native domain，无硬件强制 |
 
-每一处能力差异都必须在 Profile / 机器描述中显式呈现，而不是在 Core 里用同一套假设
-抹平（差异如何暴露给驱动见 `driver-model.md`）。
-
-当前 RISC-V 已提供 RV64/Sv39 与 RV32/Sv32 backend，但它们只是 address-translation
-实现，不是 KaleidOS 的内存模型。Core 公共路径使用 virtual region、PhysicalRange、
-抽象 permission 等概念；裸 `PhysAddr`、PTE、VPN、`satp` 和 TLB 操作留在
-arch/backend 内部。具体映射、撤销和地址空间激活接口随实现阶段演进，
-不在这里提前固定完整 API。
+内存 / 堆分层、无账本与访问窗口契约见 `docs/architecture/memory-and-heap.md`；能力如何暴露给驱动见 `docs/architecture/driver-model.md`。
 
 ### Core 不包含（这些属于 Component）
 
@@ -316,62 +286,21 @@ Component → Component     = Endpoint binding（endpoint.rs：publish/lookup/di
                             function table 或 Core call gate，禁止 flat ELF symbol 互链）
 ```
 
-- Core Export ABI 是 **Component → Core 的 mechanism boundary**：导出内存获取
-  （`kcore_memory_acquire/release`，域视图）、输出通道、已提交真相的只读查询，以及经过
-  Core 处理的**语义入口**（组件加载 / endpoint 发布 / 任务控制 / 设备与 IRQ 与 DMA：
-  `kcore_device_nth` + `kcore_device_claim/release`、
-  `kcore_irq_register/enable/disable/release`、
-  `kcore_dma_alloc/free/map/unmap`）。**不导出未经 Core 提交的裸 mutation**：
-  物理帧分配的最终提交、地址空间变更、裸任务表改动仍是 Core 内部提交点——
-  组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。
-- Component Endpoint Registry 是 **Core 的组件依赖真相**：谁在哪个端口发布了哪个
-  契约、endpoint 是否存活。两者是独立概念，互不替代。
-- 内存粒度定案：`ALLOC_GRANULE`（物理分配）与 `AddressSpaceBackend::GRANULE`
-  （VM 映射）语义解耦；RISC-V trap 按特权级拆分（`trap/supervisor.rs` =
-  S-mode 机制，`trap/machine.rs` = M-mode 骨架，共享解码在 `trap/mod.rs`），
-  未来 S-mode+MMU 与 M-mode+NoMMU 双 profile 不互相牵制。
+Core Export ABI 不导出**未经 Core 提交的裸 mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动都是 Core 内部提交点——组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。Endpoint Registry 是 Core 的组件依赖真相；两者是独立概念，互不替代。
 
-### Core ABI 错误约定（v3 起）
+### Core ABI 错误约定与宽度
 
 ```text
 0          success
 -negative  failure: -Errno
 ```
 
-- `Errno` 是稳定、Linux/POSIX 风格的数值命名空间（`os/core/src/errno.rs`）：
-  **完整的 `asm-generic/errno` 集合**（1–133）。现成的 no_std errno crate 全部门控在
-  hosted / Linux（`libc` 的常量在 `#[cfg(target_os = "linux")]` 之类的模块里，裸机
-  取不到），所以编号由我们自己持有——但**数值照抄标准、不发明**。进入 public ABI 后
-  数字不再变更。
-- 组件面是同一套码：Rust 侧 `kcomp-sdk` 的 `Errno` / `Result<T>`（`src/errno.rs`），
-  C 侧 `<errno.h>` shim（`include/errno.h`；`-ffreestanding` 不提供）。三方数值由
-  `os/core/tests/kcomp_abi_drift.rs` 钉死。
-- 各子系统的内部错误（`TaskError` / `ComponentLoadError` / `SchedError` /
-  `EndpointError` / `CallError` / `DeviceClaimError` / `DeviceReleaseError` / `IrqError` /
-  `DmaError` / `MemoryError` ...）保持丰富与类型安全，
-  只在 Core ABI 边界翻译成 `Errno`——映射表集中在 `errno.rs`。
-- 组件（Rust / C / Wasm / IPC）只需要理解这一套错误码。
+`Errno` 是稳定、Linux/POSIX 风格的数值命名空间（完整 `asm-generic/errno`，1–133；数值照抄标准、不发明）；各子系统的内部错误只在 Core ABI 边界翻译成它（映射集中在 `os/core/src/errno.rs`），Rust / C 组件面是同一套码，三方数值由 `os/core/tests/kcomp_abi_drift.rs` 钉死。
 
-**返回值形状**（按"能否失败"分类，无例外）：
+- **返回值形状**（按"能否失败"分类）：`i32 status`（可失败、无值）/ `i32 status + out`（可失败、有值）/ 直接返回值（不会失败的纯 query）。
+- **宽度规则**：`usize` 仅指针宽的量（地址、`(ptr,len)`、`size/align`）；`u32` counts / ids；`i32` 布尔与编码；`u64` 不透明 id（只经 `status + out` 回传）。KernelNative 同 target 编译天然一致；跨 transport 另行定义。
 
-| 形状 | 用于 | 例 |
-|---|---|---|
-| `i32 status`（`0` / `-Errno`） | 可失败、无值 | `kcore_task_yield` |
-| `i32 status + out` | 可失败、有值 | `kcore_device_claim` |
-| 直接返回值 | 不会失败的纯 query（`0` 是普通值，不是哨兵） | `kcore_free_page_count` |
-
-**宽度规则**（kcore ABI 数值类型的唯一口径）：
-
-| 宽度 | 用于 |
-|---|---|
-| `usize` | 仅"语义就是指针宽"的量：地址（`entry`）、`(ptr, len)`、分配器 `size/align` |
-| `u32` | counts / ids（hart / cpu / page / task / component ...） |
-| `i32` | 布尔与编码（`has_hart` / `task_state`） |
-| `u64` | 不透明 id（`EndpointId` / DMA mapping id），只经 `status + out` 回传 |
-
-KernelNative 下组件与 Core 同 target 编译，宽度天然一致；跨 transport（IPC / Wasm）
-不复用本签名，宽度另行定义。旧 v1/v2 的 `id >= 0 / -Errno` 值型签名保持兼容；
-新增"可为空的查询"用 `status + out`，不拿 0 当哨兵（`boot_hart` 的 0 是历史唯一样本）。
+ABI 形状的单一来源是 `abi/*.toml`，生成物见 `docs/modules/core/generated.md`。
 
 ### 资源认领流（claim 流）
 
@@ -396,11 +325,10 @@ Component
 └── ExecutionDomain  —— 它在哪运行
 ```
 
-- **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping，**不**记受管内存——Core 不做内存记账、无 region owner 记录，**不是**逐帧 identity、堆字节数，也没有 per-instance arena（per-instance `HeapState` 属于 runtime，不是 ResourceDomain 资源；见 `docs/architecture/memory-and-heap.md`）。**实现决策：不设 ResourceDomain struct** —— 它是一个"视图"（所有 `owner == ComponentId(id)` 的归属记录），owner 字段直接落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`（见 component-model.md §3）。组件停止时 Core 保证**最终撤销归属并做 teardown/quarantine**（graceful shutdown / forced containment 双路径，不预设 universal revoke order）；
-- **ExecutionDomain**：实现形态是 owning enum —— `KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。**它只回答"在哪运行、什么特权 / 地址空间"**；执行模型 / ISA / runtime（native machine code vs Wasm）是**正交维度**，不属于这里——Wasm 是未来 Component 的一种执行后端，不是第四个执行域（见 `deployment.md` §3）。**现状**：image 与 instance 已分离（`ComponentImageId` + `InstanceRecord`，见 `docs/architecture/component-lifecycle.md`），旧 `ComponentRecord` 已删除；实例记录已带 `execution_domain` 字段（`InstanceRecord`），由创建入口验证后写入；`KernelNative` 与受限的 `IsolatedNative`（私有 AS + assembly gateway 生命周期 + KernelNative → Isolated 跨域 service Gate；无 import 面、无出站 Isolated 调用，见 `deployment.md` §6/§10）都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。`ComponentRuntime`/`ComponentManager` 仍是目标，未见代码。ExecutionDomain 只引用 AddressSpace 身份，不拥有可独立修改的页表对象。
-  - **D2=A 定位**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，**KernelNative 就是可信代码**（无硬件访问强制，撤销为协作式）；`IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；`SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。驱动 / device claim / IRQ / DMA / teardown 不变式见 `driver-model.md`。
+- **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping，**不**记受管内存（Core 不做内存记账；per-instance `HeapState` 属 runtime，不是 ResourceDomain 资源）。**不设 struct**：它是"所有 `owner == ComponentId` 的归属记录"这一**视图**，owner 字段落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`。组件停止时 Core 保证最终撤销归属并 teardown / quarantine。
+- **ExecutionDomain**：回答"在哪运行、什么特权 / 地址空间"：`KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。执行模型 / ISA / runtime（native vs Wasm）是**正交维度**，不属于这里（Wasm 是未来 Component 的一种执行后端，不是第四个执行域）。image 与 instance 已分离（`InstanceRecord` 带 `execution_domain`，由创建入口验证后写入）；`KernelNative` 与受限 `IsolatedNative` 都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。
 
-**三个组件信任域（Trust Domain）与 ABI 分离：**
+**三个组件信任域与 ABI 分离：**
 
 | 域 | 特权级 | 地址空间 | 信任假设 | 边界 ABI |
 |---|---|---|---|---|
@@ -408,31 +336,9 @@ Component
 | IsolatedNative | S-mode | 私有 AS | 半可信 | 受控边界 |
 | SandboxedNative | U-mode | 私有 AS | 不可信 | syscall wire 格式 |
 
-- 同一语义操作（allocate / map / irq / log / interface-call）在三个域中是同一件事，
-  但 **transport / ABI 必须分离**：不能因为"做的是同一件事"就强推同一套底层 ABI；
-- 因此 KaleidOS **既不"必须是微内核"、也不"必须是宏内核"**：不同信任级使用不同边界，
-  同一组件图按需组合成宏内核、微内核或混合形态。
+同一语义操作在不同域是同一件事，但 **transport / ABI 必须分离**；**部署形态本身就是安全策略**，Core 不统一强制——不信任一个组件就不要把它部署成 `KernelNative`。AddressSpace 是 Core 内部机制，设备窗口的映射由 `kcore_device_claim` 在解析调用者 execution domain 时自动完成，不交给驱动随意映射。
 
-**部署形态本身就是安全策略，Core 不统一强制。** 若不信任一个组件，就不要把它部署成
-`KernelNative`——而不是让 Core 把每个组件都塞进同等重量的机制。信任问题首先由"选择
-哪种执行域"回答，Core 不为统一性牺牲部署自由度。
-
-**AddressSpace 是 Core 内部机制，不是驱动可取用的对象。** 驱动不应取得任意地址空间后到处映射；设备窗口的映射由 `kcore_device_claim` 在解析调用者 execution domain 时自动完成（KernelNative identity，未来 Isolated 映射进组件 AS）。Core 只在 `driver-model.md` §3 的同一 seam 内决定返回裸指针还是 mapped VA：
-
-```text
-driver   claim(device_id)
-           │
-           ▼
-Core     解析调用者的 execution domain（推导目标 AS）
-           │
-           ▼
-Core     记 device owner + 解析本域窗口（KernelNative 裸指针 / Isolated mapped VA）
-           │
-           ▼
-Core     记录 ownership / trace
-```
-
-> 架构上不要把 Component 永远绑定为"内核地址空间中的 Rust 函数"：契约（Interface + mechanism）与执行域解耦，才能在同一组件图上自由选择信任边界。
+> 驱动 / device claim / IRQ / DMA / teardown 与执行域细节分别见 `docs/architecture/driver-model.md` 与 `docs/architecture/deployment.md`。
 
 ## 7. OS Profile
 
@@ -452,34 +358,16 @@ OS = Resource Core + Component Graph + Profile
 
 ```text
 Scheduler（Component）         Core
-    │                           │
     │  propose: 运行 Task #7    │
-    │ ────────────────────────► │ 检查：Task #7 存在？
-    │                           │ 检查：Runnable？
-    │                           │ 检查：没在别的 CPU 上跑？
-    │                           │
+    │ ────────────────────────► │ 校验：存在？Runnable？未在别 CPU 跑？
     │ ◄──────────────────────── │ commit / reject（记录 trace）
 ```
 
 ### 分配示例（Core 内部机制）
 
-物理帧分配是 Core 内部机制，不是"提议 → 验证"的策略流：
+物理帧分配是 Core **内部机制**，不是"提议 → 验证"的策略流：Core 选择并提交 backing，返回本执行域访问窗口，**不记 owner**。未来若引入 `MemoryPolicy` 组件，它只能提议偏好（NUMA 偏好、配额），最终选择 / 验证 / 提交仍在 Core。
 
-```text
-请求者（Component）            Core
-    │                           │
-    │  请求一段内存区域         │
-    │ ────────────────────────► │ 分配器选择可用 PhysicalRange
-    │                           │ 验证：尺寸合法？空闲？范围合法？
-    │                           │ commit：占用该块并交付 backing（不记 owner）
-    │ ◄──────────────────────── │ 返回本执行域访问窗口（kcore_memory_view）
-```
-
-Core **不做内存记账**：不记 owner / 不发 region id / 无 Retired 表；KernelNative 无隔离，Isolated 的归属由该实例的 AS / 页表承载（`MemoryLease` 只是 Core 内部 RAII，不对外暴露）。契约见 `docs/architecture/memory-and-heap.md`。
-
-未来若引入 `MemoryPolicy` 组件，它只能提议偏好（NUMA 偏好、配额），最终选择/验证/提交仍在 Core。
-
-**含义**：策略可以随便想、随便错；但任何对真实资源的改动，都必须经过 Core 验证并记录。Core 拒绝时留下 trace（policy proposal / Core rejection），这是调试和 CoreTest 的抓手。
+**含义**：策略可以随便想、随便错；但任何对真实资源的改动都必须经 Core 验证并记录，拒绝时留下 trace（policy proposal / Core rejection）。契约细节见 `docs/philosophy/core-philosophy.md` 与 `docs/architecture/memory-and-heap.md`。
 
 ## 9. 与参考系统的关系（详见 references.md）
 

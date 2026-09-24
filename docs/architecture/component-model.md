@@ -71,7 +71,7 @@ Component → Component     = Endpoint binding（endpoint.rs）——禁止 flat
 - 阶段一 KernelNative 用 direct call / function table；传输升级（IPC / Wasm host
   call）不改 endpoint 数据模型。
 
-### 2.2 `.kcomp` = 链接后的组件程序（目标：step 2-3）
+### 2.2 `.kcomp` = 链接后的组件程序
 
 `.kcomp` 不是 rustc 的 `.o`，而是**链接后的组件程序（linked component program）**。运行时动态加载保持不变，但构建管线是：
 
@@ -99,7 +99,7 @@ component wrapper
 - **不建 shared Rust runtime**：不为所有 `.kcomp` 提供"shared core crate / shared alloc / shared fmt blob / shared runtime / component runtime symbol bag"去动态链接——那会把 rustc 版本、compiler 实现细节、monomorphization、内部 ABI 与 runtime state 变成系统 ABI。第一步接受每个组件**私有携带**它确实需要的少量 Rust support，再用 archive extraction / section GC / strip 压到最小；只有真实测量之后、且只针对极少数稳定能力，才允许提升进 Core ABI。
 - **loader 不是 Rust dynamic linker**：它只做段放置 + 对白名单 `kcore_*` 的重定位，不理解 Rust 内部 ABI。
 
-> 现状（step 2）：上述管线已落地，且已拆成「语言前端 + 语言无关 packer」两段：
+> 上述管线已落地，且已拆成「语言前端 + 语言无关 packer」两段：
 > Rust 前端 `tools/build-kcomp.sh` 编出 `staticlib`（SDK / 依赖随镜像私有携带），
 > C 前端 `tools/build-kcomp-c.sh` 编出 freestanding `.o`（clang，不链 libc），
 > 两者都把输入交给 `tools/kcomp-link.sh` 做 partial link + section GC + strip，产出
@@ -116,30 +116,15 @@ component wrapper
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
 
-Core 管 Memory、不管 Heap（§3）：每个实例有自己的 `HeapState`（共享的是分配器实现代码），组件不裸调 Core 导出，中间有 SDK adapter 层：
+Core 管 Memory、不管 Heap：每个实例有自己的 `HeapState`（共享的是分配器实现代码），backing 以 region 粒度由 Core 提供（**不记 owner**）。adapter 层随 `.kcomp` 私有携带：
 
 ```text
-GlobalAlloc   → component allocator adapter → kcore_memory_acquire / kcore_memory_release → Core backing / mapping（无账本）
-log crate     → component-local logger      → kcore_log_line                         → final sink
-panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸，见 §5） → —
+GlobalAlloc   → component allocator adapter → kcore_memory_acquire / release → Core backing / mapping（无账本）
+log crate     → component-local logger      → kcore_log_line
+panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸）
 ```
 
-> 每个实例拥有自己的 `HeapState`（不是 image-global 的自带堆；共享的是分配器实现代码），**backing 仍以 region 为单位由 Core 提供**（Core **不**记 owner：无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载）。adapter 是 SDK / CRT 的一部分，随 `.kcomp` 私有携带；`#[global_allocator]` 的 static 状态不是 per-instance 存储，必须由 per-instance runtime context 提供。契约见 `docs/architecture/memory-and-heap.md`。
-
-> 现状（step 2）：`os/components/kcomp-sdk` 是这一层的落地——它是 `kcore_*` 导出白名单的
-> 单一来源（C 头 `include/kcomp.h`，Rust 镜像 `src/abi.rs`，漂移由
-> `os/core/tests/kcomp_abi_drift.rs` 兜底），提供 `kcomp_instance_create!` / `kcomp_instance_destroy!` 入口宏、`klog!` 日志（经 `kcore_log_line`）、组件私有
-> `#[panic_handler]`（打印诊断后调 `kcore_panic_escape` 协作式逃逸），以及 feature `alloc`
-> 下的 `#[global_allocator]`（接 per-instance `HeapState`（`crate::heap`）；backing 经 `kcore_memory_acquire/release` 提供，见 `docs/architecture/memory-and-heap.md`）。SDK 是普通 library，
-> 编译进每个 `.kcomp`，不是可加载组件、也不是 shared runtime。
->
-> **C 组件没有这些 Rust adapter**：它只 `#include "kcomp.h"`（`kcore_*` 声明 + 入口契约），
-> 直接调 `kcore_*`；日志 / panic 也走 `kcore_log_line` / `kcore_panic_escape`。它额外需要
-> 的只有 freestanding `mem*` / `strlen` / `strchr`，由 SDK 的 C 运行时提供；`#include
-> <string.h>` 解析到 SDK 的 freestanding shim（clang `-ffreestanding` 不提供它，而 FatFs
-> 的 `ff.c` 会 include）。C 运行时**不建 shared runtime**：由 `tools/build-kcomp-c.sh`
-> 随每个 C 组件编入（与 Rust 组件的 adapter 私有携带同理）。边界刻意收紧——只实现组件
-> 真正引用到的原语，**不朝 libc 扩张**。
+`#[global_allocator]` 的 static 状态不是 per-instance 存储，必须由 per-instance runtime context 提供。C 组件没有这些 Rust adapter，只 `#include "kcomp.h"` 直调 `kcore_*`，外加 SDK 的 freestanding `mem*` / `strlen` / `strchr`；边界刻意收紧，**不朝 libc 扩张**，也不是 shared runtime。契约见 `docs/architecture/memory-and-heap.md`。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
@@ -190,11 +175,9 @@ struct Mapping {               // DMA mapping（device-related）
 }
 ```
 
-> **KernelNative 的 Core 管 Memory、不管 Heap**：每个实例拥有独立 `HeapState`（共享的是分配器实现代码）。ResourceDomain **不**追踪 per-instance 的堆分配或字节计费，也没有 per-instance arena，**也不记受管内存**——Core 不做内存记账（无 region owner 记录），它只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine。契约见 `docs/architecture/memory-and-heap.md`。
->
-> `ComponentId` 是 identity（不是权限），`DeviceId` 也是 identity。所有权记录只存在于各资源表，两者已经明确分离。
+> **ResourceDomain 不记受管内存**：Core 不做内存记账（无 region owner 记录），只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine；per-instance `HeapState` 属 runtime。契约见 `docs/architecture/memory-and-heap.md`。`ComponentId` 与 `DeviceId` 都是 identity（不是权限），所有权记录只存在于各资源表。
 
-> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报设备号），并把 mapping 记在 device owner 名下；`kcore_dma_alloc` 本身是 device-agnostic 的，所以**不需要**也不接受"设备身份证明"。**不建模**“设备是不是 DMA master”：FDT 没有可靠来源（真实 QEMU virt DTB 只在 `/soc/pci@30000000` 标 `dma-coherent`），本阶段按**协作式信任**处理。**未决问题**：组件目前可以自己 claim 中断控制器（PLIC）等设备——“认领一台设备 = 拿到它的全部语义”这个边界还没有人回答；记录见 `docs/development/testing.md` §3。
+> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报），并把 mapping 记在 device owner 名下。不建模"设备是不是 DMA master"（FDT 无可靠来源），按**协作式信任**处理。**未决**：组件可自行 claim PLIC 等设备，边界问题无人回答。规范契约见 `docs/architecture/driver-model.md`；记录见 `docs/development/testing.md` §6。
 
 ### 3.1 归属表可以非常普通
 
@@ -410,48 +393,9 @@ endpoint）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，mo
 let ret = containment::call_component_create(runtime.image.create, args, &mut out_state);
 ```
 
-### 4.4 私有 AddressSpace 与执行域（C10，进行中）
+### 4.4 私有 AddressSpace 与执行域（C10）
 
-M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间在需要
-**私有地址空间**时才引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），
-由 Core 的 AddressSpaceManager 统一管理。
-
-> **D2=A**：`KernelNative`（S + 共享内核 AS）是常态、长期模式，就是可信代码（无硬件访问强制，撤销协作式）；
-> `IsolatedNative`（S + 私有 AS）是可选教学实验、**非里程碑**，只做条件性故障隔离；
-> `SandboxedNative`（U + 私有 AS）才是未来的硬件强制边界。详见 `driver-model.md`。
-
-```text
-Core AddressSpaceTable
-└── AddressSpaceSlot
-  ├── owner / generation / lifecycle
-  ├── semantic mappings
-  └── opaque ArchSpace
-    └── Sv39 root / PTE pages
-```
-
-`ExecutionDomain` 只保存 `AddressSpaceId`，不拥有可以绕过 Core 修改映射的页表
-对象。Core 保存地址空间的语义真相；PTE 只是 backend 的硬件投影。
-
-Core 的 map/unmap 是**内部提交点**（不导出给组件）：调用者只表达"要把哪个资源映射进自己的域"，目标地址空间由 execution domain 推导，最终映射由 Core 提交。
-
-```text
-map 提交（Core 内部）
-  → validate region / overlap / permission
-  → install backend mapping
-  → commit mapping record and trace
-```
-
-物理内存的占用和区域归属由 Core 保存，不放进 PTE 的 RSW 字段；映射销毁也不
-依赖 `Drop` 扫页表。私有、借用和共享关系由 Core 的 region/lifetime 记录表达，
-页表 backend 只负责安装、撤销和激活硬件映射。backend 内部可以按 4 KiB 拆分，
-但这不改变 Core 的 region 粒度。
-
-映射和销毁必须是 Core 控制的显式事务：地址空间进入 `Dying` 后拒绝新操作，
-停止引用它的任务，确认没有 CPU 正在使用，再由 backend 销毁页表，最后由 Core
-按 ownership 回收资源并递增 generation。
-
-具体的 backend contract 和 `ArchSpace` 所在 crate 仍需遵守当前依赖方向；在真正
-实现 C10 前，不把 Core 绑定到 `Sv39`、`Pte`、`satp` 或某个具体 Arch backend。
+M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间只在需要**私有地址空间**时引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），由 Core 的 AddressSpaceManager 统一管理：`ExecutionDomain` 只保存 `AddressSpaceId`，Core 保存语义真相，PTE 只是 backend 的硬件投影。map / unmap 是 Core 内部提交点（不导出给组件）；映射与销毁是 Core 控制的显式事务（进入 `Dying` 后拒绝新操作、确认无 CPU 使用、backend 销毁、Core 按 ownership 回收并递增 generation）。实现 C10 前不把 Core 绑定到 `Sv39` / `Pte` / `satp` 或具体 backend。定位见 `driver-model.md`，现状见 `docs/modules/core/memory.md`。
 
 ### 4.8 Loader 自然分叉
 
@@ -508,208 +452,41 @@ Rust Drop
 revoke_owner(id)   ← 只是保险："还有没释放的归属？有就 Core 扫掉（quarantine）。"
 ```
 
-### 4.10 代码结构（目标形态）
-
-```text
-component/
-├── mod.rs
-│   ├── ComponentId
-│   ├── ComponentState
-│   └── ExecutionKind
-│
-├── registry.rs
-│   └── InstanceRecord
-│       ├── id
-│       ├── state
-│       ├── image
-│       └── instance_state
-│
-├── manager.rs                 ← 以后新增
-│   ├── ComponentManager
-│   └── ComponentRuntime
-│       ├── LoadedComponent
-│       └── ExecutionDomain
-│
-└── loader.rs
-    └── load_component()
-
-
-execution/
-├── mod.rs
-│   └── ExecutionDomain
-│       ├── KernelNative
-│       └── IsolatedNative(AddressSpaceId)
-│
-└── address_space.rs
-  └── AddressSpaceManager / AddressSpaceSlot（未来 C10）
-
-
-resource/    —— 概念分文件，不堆单文件：
-  device.rs  —— DeviceTable{owner, quarantine}
-  irq.rs     —— IrqTable{routes}（锚点 = device_index）
-  dma.rs     —— DmaTable{allocations, mappings} + QUARANTINE
-  每张表 record 带 owner: ComponentId
-```
-
-ownership 结构：
-
-```text
-ComponentManager
-      │
-      ├── Registry
-      │       └── metadata
-      │
-      └── ComponentRuntime
-              ├── LoadedComponent
-              └── ExecutionDomain
-                     │
-               ┌─────┴─────┐
-               │           │
-          KernelNative   AddressSpaceId
-                        │
-                Core-controlled backend
-```
-
-而 ResourceDomain 根本不在这棵树里：
-
-```text
-IRQ table  ─ owner=A ─┐
-MMIO table ─ owner=A ─┼── ResourceDomain(A)
-DMA table  ─ owner=A ─┘
-```
-
-### 4.11 落地顺序：现在只做两小步
-
-1. **先不要写 ResourceDomain**。等 device/IRQ 真正开始做的时候，在每个资源归属 record 上加 `owner: ComponentId`，再留一个 `revoke_owner(ComponentId)` 就够了；
-2. **完成 region allocation contract 后、真正需要隔离执行时**，再引入 `AddressSpaceManager`。
-  它维护 `AddressSpaceSlot`、generation、语义 mapping ledger，并通过 Core 控制的
-  backend 完成 map/unmap/activate/destroy；不使用 RSW ownership，也不依赖 `Drop`
-  扫页表释放帧。
 
 ## 5. 生命周期
 
-> **本节已被取代（superseded）：组件生命周期与组件 ABI 的冻结契约在
-> `docs/architecture/component-lifecycle.md`。** 该文件定义 instance-aware 入口
-> `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定与
-> `ComponentImageId` + `InstanceRecord` 身份模型；本节保留原设计叙述，仅就地
-> 更新事实性的 ABI 名称与签名。两者冲突时以冻结契约为准。
+> **组件生命周期与组件 ABI 的冻结契约在 `docs/architecture/component-lifecycle.md`**（instance-aware 入口 `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定、`ComponentImageId` + `InstanceRecord` 身份模型）。本节只保留失败谱系与退出语义要点；冲突时以冻结契约为准。
 
-所有组件共享统一生命周期（但**不共享**业务接口）：
+所有组件共享统一生命周期（但**不共享**业务接口），单一真相 = `ComponentState::can_transition`：
 
 ```text
 Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 ```
 
-| 状态 | 含义 |
-|---|---|
-| Declared | 系统知道这个组件存在 |
-| Resolved | 所有 requires 都已找到 provider（Registry `resolve()` 已落地；真实绑定在 Endpoint Registry，无 requires 时 vacuous 成立） |
-| Starting | 正在初始化（执行 `kcomp_instance_create`） |
-| Ready | 可以对外提供 Interface |
-| Stopping | 正在停止：`kcomp_instance_destroy` 执行期（`Ready → Stopping` 由 `stop_component` 提交；任务被 run 门禁排除，publish 被拒，已有归属记录仍可 `release`） |
-| Stopped | 已停止：`kcomp_instance_destroy` 已返回、剩余归属与 endpoint 已被 Core 兜底撤销（device 进 quarantine；记录保留；不回收段内存） |
-| Failed | 运行过程中失败（可触发恢复流程；任何阶段都可能进入） |
+`ComponentId` 永不复用；`Stopped` / `Failed` 记录留 tombstone，段内存不回收（phase 1）。**过期访问边界（勿高估）**：`bind` / `claim` / IRQ 投递 / 调度都查生命周期，但 consumer 已缓存的裸 function table 指针在 provider `Stopped` / `Failed` 后**仍会调用成功**（段内存未释放）——这是"物理驻留 + KernelNative 无隔离"的直接后果，不是 bug。意外退出 / abort 当前统一由 `Failed` 覆盖（hook 点见 `ComponentState::Failed` 的 `TODO(unexpected-exit)`）。
 
-> **`kcomp_instance_destroy`（Linux `module_exit` 类比）是组件 ABI 的对称退出入口**
-> （`int32_t kcomp_instance_destroy(void *state)`，返回 `0 / -errno`）：Core loader 会
-> **必需解析**该符号（`ComponentImage::destroy` / `LoadedComponent::destroy`；缺失即
-> 加载失败）；monitor `unload <name>` 驱动的停止路径
-> （`component/exit.rs::stop_component`）在实例 `Ready` 时调用它，并把实例推进
-> `Stopping → Stopped`（第一版语义见 §5.2；drain variant / 实例退役仍开放）。
->
-> **Failed 的恢复 = 逻辑重启**：标记 Failed、停止调度、在 Core 边界阻断过期访问、启动全新实例。phase 1 不承诺内存回收（KernelNative 无隔离）；完整回收留给未来 ExecutionDomain。
->
-> **"阻断过期访问"的实际边界（重要，勿高估）**：它只对 **Core 经手的路径**成立
-> —— `bind` / `claim` / IRQ 投递 / 调度都会查生命周期（provider 必须
-> `Ready`，见 `component/endpoint.rs`；Core 每次调度决策都重新 `resolve_policy()`，
-> 见 `os/core/src/sched.rs`）。它**不覆盖"consumer 手里已经拿到的裸函数表指针"**：
-> 接口交付的是 `api: *const ()` / `ctx: *mut ()`，且 Core 明确"永不解引用"
-> （`component/endpoint.rs` 顶部文档）—— 因此 consumer 若缓存了这张表，
-> **组件 `Stopped`（甚至 `Failed`）之后调用仍会成功**，因为段内存未被释放。
-> 这是"物理驻留 + KernelNative 无隔离"的直接后果，不是 bug。
->
-> 收口方案（按代价）：①约定 consumer 每次调用前重新 `bind` 取表
-> （Core 内部已是此模式，但对外只是约定、非强制）；②Core 受控间接层
-> （per-endpoint trampoline，唯一能在不换架构的前提下强制的做法）；③真回收 +
-> per-domain 地址空间（`ExecutionDomain`，旧指针直接 fault）。三条的取舍与
-> "热插拔到底做到哪一步"绑定，Linux 对照见 `references.md` 第 17 条。
-
-> 意外退出 / abort 当前统一由 `Failed` 覆盖（组件 panic containment 路径）。未来
-> 独立 abort/exit 通知的 hook 点见 `ComponentState::Failed` 的 `TODO(unexpected-exit)`。
-
-### 5.1 失败谱系：Result 失败 vs panic（不虚构不存在的 recovery）
+### 5.1 失败谱系：Result 失败 vs panic
 
 | 类别 | 表达 | 语义 |
 |---|---|---|
-| 普通失败 | `Result` / status code / `kcomp_instance_create() != 0` / `kcomp_instance_destroy() != 0`（返回 `0 / -errno`，见 §5.2） | 可恢复的**组件失败**，走正常 teardown / restart（§3.3） |
+| 普通失败 | `Result` / status code（`kcomp_instance_create` / `destroy` 返回 `0 / -errno`） | 可恢复的组件失败，走正常 teardown / restart |
 | 意外 panic | `panic!`（`panic=abort`） | 进程级 abort，不能凭空转成组件 recovery boundary |
 
-> `panic=abort` 下，Core 栈上的普通 panic 不可能"魔法般"变成组件 recovery boundary。
+phase 1 已有 init / task 边界的**协作式 containment**（Core-owned 独立栈 + stack-switch 回 Core，标记 `Failed`，不做 Rust unwinding；内存回收仍 deferred）。**panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存 / UB / 带锁死亡，真正的 memory-fault containment 属 IsolatedNative / U-mode。
 
-**当前（phase 1）已有 init 边界 + task 边界的协作式 containment**：组件跑在 Core-owned 独立栈上；panic 时 Core 打印诊断，然后 stack-switch 回 Core 上下文，把该 task / instance 提交为 Failed（逻辑死亡，**不做 Rust unwinding**；内存回收仍 deferred）。
+### 5.2 退出语义
 
-**panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存、制造 UB、持有裸指针、带锁死亡。真正的 memory-fault containment 是 IsolatedNative / U-mode 的职责（见 §4.4 与 `driver-model.md`）。
-
-### 5.2 退出语义：第一版（small option）已实现
-
-`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 =
-`component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>`
-（组件侧参考实现 = `kcomp_smoke`：无资源可释放时也留一行"钩子已跑"的证据）。
-
-**已实现顺序（small option，Oracle 评审后定稿）**：
+`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 = `component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>`。顺序：
 
 ```text
-1. 拒绝门（任何提交之前；拒绝不改 Core 真相）
-   a. 实例必须不拥有未退出的任务             → 否则 OwnsLiveTasks / EBUSY（不 join、不等待）
-   b. 实例必须存在且处于 Ready（规则表）      → 否则 NotFound / ENOENT 或 NotReady / EINVAL
-2. begin_stop                              Ready → Stopping：任务 run 门禁 + publish 拒绝
-3. kcomp_instance_destroy（必需入口）        Core-owned 隔离栈；ambient identity = 被停止实例
-4. Core 兜底                               撤销归属（device quarantine / DMA 停车）+ 失效 provider endpoint（与失败路径同序列）
-5. finish_stop                             Stopping → Stopped（记录保留）
+1. 拒绝门（提交之前；拒绝不改 Core 真相）：有未退出任务 → EBUSY；非 Ready → NotReady / EINVAL
+2. begin_stop             Ready → Stopping：任务 run 门禁 + publish 拒绝
+3. kcomp_instance_destroy Core-owned 隔离栈；ambient identity = 被停止实例
+4. Core 兜底              撤销归属（device quarantine / DMA 停车）+ 失效 provider endpoint
+5. finish_stop            Stopping → Stopped（记录保留）
 ```
 
-- **为什么是这个顺序**：`may_run` 只允许 `Starting` / `Ready`，一旦提交
-  `Stopping`，该实例的任务就不可能再被调度回来收尾——"先停后等任务"自相矛盾；
-  `yield` 只提交 `Runnable`（不是 `Exited`），任务不会"自然退出"。
-- **身份**：退出钩子跑在 Core-owned 临时栈上（与 `kcomp_instance_create` 对称，
-  `containment::call_component_destroy`），其 Core 调用身份是**被停止的实例**
-  （`EscapeKind::Exit`），不是发起 stop 的 monitor / 其他组件；
-  `kcore_endpoint_publish` 在 exit 边界被拒（publish 是 init 期操作）。
-- **归属**：组件应在钩子里 `release` 自己持有的东西（teardown 不受生命
-  周期门禁限制）；钩子返回后 Core 仍兜底撤销一切**剩余**归属。剩余的
-  device claim 会进失败 quarantine（撤销 ≠ 设备可安全复用），组件自己
-  `release` 的不会——兜底与失败路径共用 `failure::revoke_authority_and_unbind`。
-- **失败路径刻意不调用 exit**（Linux 类比：崩溃的模块不值得信任）：`Failed`
-  只走 `fail_component`（mark + 兜底）。**未闭合**：组件侧的设备收尾
-  （stop DMA / reset / mask IRQ）在失败路径上不会发生，Core 的 revoke +
-  quarantine 是唯一兜底。
-- **暂定默认（待人类定稿）**：`kcomp_instance_destroy` 返回非零（`-errno`）→ 镜像 `InitFailed`
-  （`Failed` + 兜底）；钩子 panic → 镜像 `InitPanicked`（Exit 边界容纳 →
-  `Failed`）。反方论证：退出失败可能不值得把实例标为逻辑死亡（它已经停了一
-  半），也可以选择记录并继续 `Stopped`。
-- **拒绝语义**：非 `Ready`（重复 stop / `Failed` / 未完成 init）→ `NotReady` /
-  `EINVAL`；未知实例 → `NotFound` / `ENOENT`；有活任务 → `OwnsLiveTasks` /
-  `EBUSY`（errno 映射见 `errno.rs::From<ComponentStopError>`）。
-
-**仍开放（本版不做，需人类定稿）**：
-
-1. **drain variant**（等任务清空再停）：需要 (a) `may_run` 增加"停止中仍允许
-   收尾"的第三种语义，(b) 任务完成协议 / 超时 / 看门狗，(c) 与强制停止的关系。
-   当前 small option 是"有活任务直接拒绝"。
-2. **非零退出 / 退出 panic 的最终分类**：见上"暂定默认"。
-3. **`UnexpectedExit` 是否作为独立终态**：当前意外退出统一 `Failed`；新增状态
-   要改 `can_transition` 规则表与锚定它的 host 测试。
-4. **信任域分叉**：KernelNative 的退出钩子跑在 Core-owned 共享 AS 栈上（协作式、无隔离）；
-   IsolatedNative 的停止**已落地**（私有 AS 内经 assembly gateway 执行 `kcomp_instance_destroy` →
-   退役 AS，increment 5/7，见 `deployment.md` §10）；SandboxedNative 的停止（地址空间销毁、
-   真正停止任务）仍是各自 ExecutionDomain 的职责（未实现）。
-5. **实例退役**：`Stopped` 记录保留（不回收段内存、`ComponentId` 不复用）；
-   unload 记录 / 重新探测仍待定。
-6. **退出期间的新资源认领门禁**：现有 export 门禁只拦 `Failed`；钩子在
-   `Stopping` 期间仍可 `kcore_device_claim`（随后被兜底撤销）。硬拦需要把
-   acquiring 门禁从"非 `Failed`"改成生命周期判定（会同时影响 `Stopped`）。
-7. **退出钩子的阻塞 / 超时 / 看门狗**：钩子同步执行、无超时；挂死会挂住
-   stop（KernelNative 协作式信任，与 `kcomp_instance_create` 同）。
+失败路径**刻意不调用** `kcomp_instance_destroy`（崩溃的模块不值得信任），`Failed` 只走 `fail_component`（mark + 兜底）。**仍开放**：drain variant（等任务清空）、非零退出 / 退出 panic 的最终分类、`UnexpectedExit` 是否独立终态、Sandbox 停止、实例退役、退出期间的资源认领门禁、退出钩子阻塞 / 超时 / 看门狗。细节见冻结契约。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 

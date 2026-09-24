@@ -29,7 +29,7 @@
 | 驱动注册框架、热插拔策略、依赖解析器、自动 ABI 兼容协商 | 无当下需求 |
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
 
-> **更新（increment 3–7，取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
+> **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
 > （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 双映射 assembly gateway + 按域放段 +
 > Core 预置窗口 / 邮箱 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
 > 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 按域 import 解析仍未实现**，边界是
@@ -255,22 +255,7 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 ---
 
-## 10. 组件迁移清单
-
-通用模式：**不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态。**
-IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别名的理由。
-
-| 组件 | 最小迁移 | 单例裁定 |
-|---|---|---|
-| `virtio_blk` | 每设备一份 state 分配：block 对象 + claimed **DeviceId** + MMIO 基址 + DMA 记账。在配置的 endpoint 上发布该 state。create 只探测**选中的一个**候选，不再消费整条 assignment 流 | 每个已 attach 设备一个实例 |
-| `scheduler_rr` | `CURSOR` 移入实例状态（`scheduler_rr/src/lib.rs:36-60`）；表保持 static | 当前 profile 保留**一个活跃调度角色**，但允许用全新 cursor 的替换实例 |
-| `driver_prober` | `SET`/`CURSOR` 移入 state 并传给 dispatch（`runtime.rs:28-43,96-145`）；候选目录保持不可变全局 | 当前系统图保留**一个 prober** |
-| `core_test` | 保持串行诊断运行，**不是**每设备一实例（report state 已在入口局部） | 单例 |
-| `kbench` | 保持**一个**活跃 benchmark 运行（并发会破坏测量）；有意迁移/重置 run 相关全局，含 task/IRQ 状态（`lib.rs:68-74`、`sched.rs:52-67`、`irq.rs:83-87`） | 单例 |
-| `kcomp_smoke` / `kcomp_min` / `kcomp_panic` | 无状态 fixture 返回 null state；no-op / 日志 destroy；**保留 panic fixture 的失败行为** | 无状态 |
-| SDK | SDK 是库，不是实例 | 不需要发明运行时生命周期机器 |
-
-### VirtIO 是非机械部分（启用多实例的 gate）
+## 10. VirtIO 多实例 gate（契约约束）
 
 当前 HAL 回调**没有 receiver/ctx**，直接读全局 `DEVICE_ID` / `MMIO_BASE` 与 `DMA_MAP`（`virtio_blk/src/lib.rs`）。只把这些全局搬进 `State`，HAL **仍然找不到它们**。
 
@@ -278,36 +263,5 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 
 **这是 gate：在适配器被证明正确之前，不要启用多个 VirtIO 实例。** 也**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖问题。
 
-### 迁移中已一并修的既有 bug
+> 通用迁移模式（不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态）与各组件迁移状态属于实现进度，不入本契约；C 生命周期 smoke 已落地，FatFs 胶水仍待接。
 
-旧 `virtio_blk` 的 `MMIO_HANDLE: AtomicUsize` 在 **RV32 上截断 u64 handle 的一半**。mechanism-first 模型删除 u64 handle 后该问题消失：现在的驱动状态是 `DEVICE_ID: AtomicU32`（claim 锚点）+ `MMIO_BASE: AtomicUsize`（claim 返回的基址），都不需要 u64 handle。
-
----
-
-## 11. 实施顺序与验证门
-
-协调替换：**loader / containment / SDK / packer 必须一起切**（中间状态不编译是预期的，不要加兼容垫片）。
-
-1. **冻结契约与范围**（本文件）。
-2. **冻结 C 侧声明**（`kcomp.h` + Rust 镜像布局 + drift test）——**在写 FatFs 胶水之前**。顺带定：首版 FatFs 是只读，还是需要 block flush（当前契约**没有** flush/ioctl，`block.rs:71-72`）。
-3. **写 host contract tests**，然后拆分 image/instance 记录。测试须覆盖：两实例共享一 image、独立 ctx/owner、不同 endpoint、发布失败保留既有 provider、stop/failure 只影响选中实例。
-4. **一起切换 loader / containment / SDK / packer**：保留嵌套调用者恢复，在现有 Core-owned 栈上传递 create/destroy 参数，更新 `tools/kcomp-link.sh` 的符号保留/校验；**重建每个组件**，不维护兼容。
-5. **迁移普通组件 + task 上下文**：在碰硬件之前，先验证"两个简单有状态实例 + 用全新 ID/ctx 重启"。scheduler/prober/诊断按组合策略保持单例。
-6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 DeviceId / MMIO 基址、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
-7. **C 生命周期 smoke 已落地，FatFs 胶水待接**：`os/components/tests/kcomp_c_smoke` 是一个
-   clang 编的 freestanding C 组件，经 `tools/build-kcomp-c.sh` + SDK C 运行时
-   （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-qemu`
-   （CoreTest `c-frontend` 用例 + runner 的机器级 `load` / `unload`）在 RV64/RV32
-   端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的
-   endpoint binding smoke。之后才接 FatFs 胶水——先测 C/Rust 布局与真实调用，再接
-   文件系统语义。FatFs 的卷路由与库内全局适配全部留在该组件内，Core 不感知 FAT 或
-   `virtio-blk`。
-
-**停止点**：**从一份常驻镜像得到多个独立管理的 KernelNative 实例，且 C ABI 经过测试。** 不悄悄滑向执行域里程碑（C10 进行中，见 `docs/architecture/deployment.md` §10）。
-
-### 验证门（每步）
-
-- `make check`（fmt + clippy `-D warnings`）全绿。
-- `make test-host` 全绿（含新增 contract tests）。
-- `make init.kpkg`：所有组件（含 C 组件 `kcomp_c_smoke`）全部通过 `.kcomp` 四项契约校验（ET_REL / 入口 DEFINED / UNDEF 仅 `kcore_*` / 重定位白名单）。
-- `make test`（`test-host` + `test-qemu` + `test-arch`）在 **RV64 与 RV32** 双 profile 全绿。

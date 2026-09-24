@@ -188,22 +188,7 @@ lfs_t #1 / #2 / #3     →     FsInstance #1 / #2 / #3
 
 > **顺序：** 现在不急。FatFs 既不要 malloc 也不要 printf。等**第一个真正要 malloc / printf 的库**出现（开 FatFs 写支持 / LFN / exFAT，或接 lwIP / WAMR）时再上。
 
-**已验证的 cross-file recipe（2026-09，picolibc 1.5.1 + clang 10；rv64 / rv32 均通过）——提案，尚未接入构建：**
-
-picolibc 自带 cross file 直接建出的 `libc.a` 会被 packer 拒（含 `ALIGN` / `RELAX` / `BRANCH` / `JAL` / `RVC_*` / `ADD*` / `SUB*` / `TPREL_*` 及 `.init_array` / `.tdata` / `.tbss`）。根因：它没用组件的 freestanding 旗标。把 cross file 的 `c` / `cpp` 换成组件同款：
-
-```text
-clang --target=riscv64-unknown-elf -nostdlib \
-  -march=rv64gc -mabi=lp64d -mcmodel=medany \
-  -mno-relax -fno-pic -fno-unwind-tables -fno-asynchronous-unwind-tables \
-  -ffunction-sections -fdata-sections
-```
-
-（rv32 用 `--target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32`。）再加 meson 选项 `-Dnewlib-global-errno=true`（去 TLS errno）。结果：**BRANCH / ALIGN / RELAX / eh_frame 全部消失**；archive 选择性链接（组件只用 `strcpy` / `malloc` / `strlen` / `snprintf`）后，最终 `.kcomp` 的重定位**全部落在白名单内**，TLS / init_array 成员不会被拉入。
-
-组件侧仍需提供的 glue：`_write`（→ console）、`sbrk`（或 `__heap_start` / `__heap_end`）、`_exit`；以及 `__ashlti3` / `__lshrti3`（128 位移位，C 组件没有 compiler_builtins）。
-
-**已知环境约束（2026-09）：** clang 10 建不了 picolibc 1.8（libm complex 用 `__builtin_complex`，需 clang ≥ 11），但能建 **1.5.1**；rv32 的 meson 链接器探测在 clang 10 下需 `-B<dir>`（该 dir 放一个指向 `riscv64-unknown-elf-ld` 的 `ld` 包装）绕过 `-fuse-ld=<绝对路径>` 不被识别的问题。
+跨界配方的具体命令 / 旗标属实现笔记，不在此保留；硬约束是：picolibc 必须用**同一套 freestanding recipe** 交叉编译（否则重定位 / TLS / `.init_array` / PIC 会被 packer 拒），且组件侧仍需提供 `_write` / `sbrk` / `_exit` 等 glue。
 
 ## 7. Windows 兼容：嵌套是长线选项，不是当前任务
 
