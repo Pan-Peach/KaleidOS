@@ -1,0 +1,13 @@
+[package]
+name = "kcomp_isolated"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# increment 4 ArchTest 夹具：真实的 `.kcomp`，但**刻意零依赖、零 import**——
+# Isolated 按域装载的 import 包络是空集（`docs/architecture/deployment.md` §6.1）。
+[lib]
+crate-type = ["staticlib"]

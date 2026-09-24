@@ -426,7 +426,7 @@ fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError
 
 /// 从仓库读取 `<name>.kcomp` 的原始字节（`KernelNative` 与 `IsolatedNative`
 /// 装载共用；两者对同一 artifact 的处理不同，但读取方式一致）。
-fn read_artifact(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
+pub(crate) fn read_artifact(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
     let store = crate::component::store::get_component_store()
         .ok_or(ComponentLoadError::StoreNotMounted)?;
     let kname = [name, b".kcomp"].concat();

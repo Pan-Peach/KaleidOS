@@ -69,6 +69,22 @@ CASES = (
     ("isolated-timer", None, None),
     ("isolated-fault", None, None),
     ("isolated-fault-abandon", None, None),
+    # increment 4: per-domain loading of a real `.kcomp` into a private address
+    # space with page-separated permissions.  `isolated-image` proves the placed
+    # image executes through the gateway in its own root (only image segments +
+    # gateway + harness pages mapped; Core-only mappings unreachable).
+    # `isolated-perm-text` / `isolated-perm-data` prove the page tables really
+    # enforce segment permissions: a store to the R+X text page faults with
+    # scause 15 and an instruction fetch from the R+W data page faults with
+    # scause 12 — both observed by the Core fault policy and then abandoned.
+    # `isolated-core-unreachable` proves a Core-only page is unreachable from
+    # the instance AS (load page fault, scause 13).  The required substrings
+    # carry the observed scause into the runner verdict.
+    ("isolated-image", None, "isolated-image: private AS OK"),
+    ("isolated-image-wrong-env", None, None),
+    ("isolated-perm-text", None, "scause=0xf"),
+    ("isolated-perm-data", None, "scause=0xc"),
+    ("isolated-core-unreachable", None, "scause=0xd"),
 )
 
 

@@ -752,6 +752,20 @@ pub fn map(_handle: AddressSpaceHandle, _mapping: Mapping) -> Result<(), MapErro
     Err(MapError::BackendFailed)
 }
 
+/// 无后端构建没有真实映射可撤：显式失败（`isolated_load::map_into` 的回滚路径
+/// 只有能力检查通过（真实 backend）之后才可能到达；这里保持接口形状，绝不
+/// 静默假装成功）。
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn unmap(_handle: AddressSpaceHandle, _range: &VirtualRange) -> Result<(), MapError> {
+    Err(MapError::BackendFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

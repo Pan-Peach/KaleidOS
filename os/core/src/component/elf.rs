@@ -10,6 +10,7 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_RELA: u32 = 4;
 const SHT_NOBITS: u32 = 8;
 const SHT_REL: u32 = 9;
+const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 
@@ -59,6 +60,11 @@ impl Section {
     /// 可执行段（`SHF_EXECINSTR`）：入口地址只允许落在这里。
     pub(crate) const fn is_exec(self) -> bool {
         self.flags & SHF_EXECINSTR != 0
+    }
+
+    /// 可写段（`SHF_WRITE`）：按域装载据此给 data / bss 落 R+W 权限。
+    pub(crate) const fn is_write(self) -> bool {
+        self.flags & SHF_WRITE != 0
     }
 
     /// BSS 段（NOBITS）：无文件数据，放段时零填充。

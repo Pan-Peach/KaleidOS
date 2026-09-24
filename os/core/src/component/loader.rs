@@ -173,7 +173,7 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
 
 /// 在符号表里查找名为 `name`、kind 为 `kind` 的已定义（`shndx != 0`）符号，
 /// 返回 `(shndx, st_value)`；不存在 / 未定义返回 `None`。
-fn symbol_offset(
+pub(crate) fn symbol_offset(
     object: &ElfObject<'_>,
     symbol_table: usize,
     name: &[u8],
@@ -194,7 +194,7 @@ fn symbol_offset(
 }
 
 /// `(shndx, st_value)` → 加载后的绝对地址（段放置偏移 + base）。
-fn resolve_symbol_address(
+pub(crate) fn resolve_symbol_address(
     seg_place: &[(usize, usize)],
     base: usize,
     (section, value): (usize, usize),
@@ -250,7 +250,7 @@ fn checked_dispatch_offset(
 }
 
 /// 校验 `kcomp_abi` 的边界与值：8 字节必须落在装载镜像内，且等于 [`KCOMP_ABI`]。
-fn read_abi(
+pub(crate) fn read_abi(
     image: &[u8],
     base: usize,
     seg_place: &[(usize, usize)],
@@ -314,7 +314,7 @@ fn place_alloc_sections(sections: &[Section]) -> Result<(usize, Vec<(usize, usiz
     Ok((put, seg_place))
 }
 
-fn apply_relocations(
+pub(crate) fn apply_relocations(
     object: &ElfObject<'_>,
     base: usize,
     image: &mut [u8],

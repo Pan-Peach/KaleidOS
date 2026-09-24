@@ -24,7 +24,7 @@
 - 不做内存记账：无 region owner 记录、无 region id、无 Retired 表，也不做 per-instance 字节计费 / 配额（`D1` 已修订；见 `docs/architecture/memory-and-heap.md`）。per-instance `HeapState` 是 runtime 的事，不是 Core 记账。
 - `alloc_region` **不负责清零**。
 - `ALLOC_GRANULE` 与 `AddressSpaceBackend::GRANULE` 语义解耦（数值同为 4 KiB 只是巧合）。
-- `AddressSpaceManager` **没有组件可达的执行路径**：全局表只在 Isolated 门禁通过后建实例私有 AS，而当前所有真实组件都因 `kcore_*` import 被装载前拒绝（**不执行组件**）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`kcore_address_space_map` 刻意不在导出白名单。increment 3 的 `prepare_transition` + assembly gateway 也只由 ArchTest 驱动（`component/isolated.rs`），生命周期尚未接线。
+- `AddressSpaceManager` **没有组件可达的执行路径**：全局表只在 Isolated 门禁通过后建实例私有 AS，而当前所有真实组件都因 `kcore_*` import 被装载前拒绝（**不执行组件**）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`kcore_address_space_map` 刻意不在导出白名单。increment 3 的 `prepare_transition` + assembly gateway、increment 4 的按域放段 / 逐段映射（`component/isolated_load.rs`，页级权限分离）也都只由 ArchTest 驱动，生命周期尚未接线。
 
 ## 代码在哪
 

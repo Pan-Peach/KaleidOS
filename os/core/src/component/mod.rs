@@ -21,6 +21,10 @@ pub mod image;
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
+/// 按域装载（increment 4）：把一个已解析的 `.kcomp` 的段按页级权限放进实例的
+/// 私有 AS。**仍是 inactive path**——没有生命周期调用方，ArchTest 直接驱动
+/// （见 `docs/architecture/deployment.md` §6/§10）。
+pub mod isolated_load;
 pub mod load;
 pub mod loader;
 pub mod registry;
