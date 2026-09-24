@@ -11,7 +11,7 @@
 //!
 //! | 类别 | 符号 | 说明 |
 //! |---|---|---|
-//! | Runtime / shared heap | `kcore_heap_alloc` `kcore_heap_dealloc` | KernelNative 组件与 Core 共享堆的分配/释放（契约 = Rust `GlobalAlloc`）。**不是**物理区域/帧分配、**不是**地址空间变更——这些 authority 敏感操作永不裸导出 |
+//! | Memory resource（域视图，无账本） | `kcore_memory_acquire` `kcore_memory_release` | 组件取内存 backing 的**唯一**入口：Core 给**本执行域访问窗口**（`kcore_memory_view`；KernelNative = 本域 VA，首次交付零初始化），释放凭同一个 view。**无账本**：不记 owner / 不发 id / 无 region 注册表 / 无 Retired 表——`view` 自身（`base`/`len`）就是身份；KernelNative 的 release 是受信操作。**不是**物理区域/帧分配、**不是**地址空间变更——这些 authority 敏感操作永不裸导出 |
 //! | Logging / diagnostics | `kcore_console_write_byte` `kcore_log_line` | 输出通道（传输在 arch `Console` backend） |
 //! | Machine query | `kcore_machine_boot_hart` `kcore_machine_cpu_count` `kcore_machine_has_hart` | 已提交机器真相的只读查询 |
 //! | System query | `kcore_free_page_count` `kcore_task_count` `kcore_component_count` | 已提交 Core 真相的只读查询 |
@@ -82,8 +82,10 @@
 //! + request → Core 记 owner → 返回可访问窗口），但任何 Core truth 的 mutation
 //!   都必须由 Core 验证后提交并留 trace；裸 mutation 入口一律不导出：
 //!
-//! - 物理内存：`memory::alloc_region` / `free_region` / `vm_page_alloc`——物理帧是
-//!   Core 内部机制（canonical），组件要内存走 `kcore_heap_alloc`（共享堆）。
+//! - 物理内存：`memory::alloc_region` / `free_region` / `free_region_raw` /
+//!   `vm_page_alloc`——物理帧是 Core 内部机制（canonical），组件要内存走
+//!   `kcore_memory_acquire`（域视图；SDK 便利面见 `kcomp-sdk` 的 `mem` 模块 /
+//!   C 侧 `kcomp_mem.h`）。
 //! - 地址空间：`KernelAddressSpace::map/unmap/activate`——mutation 必须过 Core
 //!   验证与 commit，且需要 `AddressSpaceHandle`（未来类型化授权 API）。
 //! - 裸任务表：`TaskTable::create` / `set_task_state` / context switch——绕过 Core
@@ -96,14 +98,6 @@
 //! - Trace 事件：组件未来只能提交"组件自定义事件"，`TaskSwitch/Grant/Revoke/
 //!   CoreRejected` 等 Core authoritative event 由 Core 自己产生（TODO：trace
 //!   环形缓冲落地后加 `kcore_trace_component_event`，sequence 由 Core 分配）。
-//!
-//! # 共享堆 ABI 的所有权/生命周期语义
-//!
-//! `kcore_heap_alloc/dealloc` 是 KernelNative 组件共享 Core 堆的入口（AGENTS.md：
-//! Core 与组件共享一个 Core heap，无 per-component 记账）。契约与 Rust
-//! `GlobalAlloc` 完全一致：dealloc 的 `(ptr, size, align)` 必须与一次成功的 alloc
-//! 严格匹配，违反 = UB（与 C `malloc/free` 错配同类）。组件失败后的泄漏在 phase 1
-//! 可接受（不承诺共享堆字节回收，见 roadmap §8）；完整回收留给未来 ExecutionDomain。
 
 use crate::component::ComponentId;
 use crate::component::abi::{InterfaceAbi, InterfaceKind};
@@ -112,13 +106,13 @@ use crate::component::containment::{KcompCreateArgs, with_core_critical};
 use crate::component::endpoint::{self, ContractId, EndpointId, ExecutionDomain};
 use crate::component::registry;
 use crate::errno::{Errno, status};
+use crate::generated::abi::{KCORE_MEMORY_VIEW_LOCAL_VA, MemoryView};
 use crate::machine;
 use crate::memory;
 use crate::resource::{RequestContext, device, dma, irq};
 use crate::sched;
 use crate::task::{self, TaskId, TaskState};
 use arch::{Console, ConsoleImpl};
-use core::alloc::GlobalAlloc;
 
 // ---------------------------------------------------------------------------
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
@@ -145,49 +139,86 @@ struct ExportAddress(*const ());
 unsafe impl Sync for ExportAddress {}
 
 // ---------------------------------------------------------------------------
-// Category 1：Runtime / shared heap（KernelNative 组件共享堆）
+// Category 1：Memory resource（域视图，无账本）
 // ---------------------------------------------------------------------------
 
-/// 共享堆分配。契约 = Rust `GlobalAlloc::alloc`：`align` 必须为 2 的幂，
-/// `size > 0`；失败返回 null。所有权归调用方组件；Core 不做 per-component 记账。
+/// 取一段内存 backing，返回**本执行域访问窗口**（`kcore_memory_view`）。
 ///
-/// # Safety
-/// 返回指针的释放必须通过 `kcore_heap_dealloc`（携带相同 size/align）。
-extern "C" fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8 {
+/// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+/// （`base` / `len`）就是身份，释放凭同一个 view 走 [`kcore_memory_release`]。
+/// `min_len > 0`、`min_align` 为非零 2 的幂；成功时 `view.len >= min_len`
+/// （实际 backing 粒度 = Core 页，今天 4 KiB）。首次交付**零初始化**。
+///
+/// 成功 = 0，view 写入 `*out_view`（调用方保证可写，任意对齐）；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` size/align 非法 /
+/// `EOVERFLOW` `min_len` 超出本域指针宽 / `ENOMEM` 物理内存耗尽）。
+extern "C" fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut MemoryView) -> i32 {
     with_core_critical(|| {
-        // C ABI 语义：size==0 或非法 align 一律失败返回 null。
-        // （Rust `Layout` 允许空 layout，但 C 风格调用方可能传 0——显式拒绝。）
-        if size == 0 {
-            return core::ptr::null_mut();
+        if out_view.is_null() {
+            return Errno::EFAULT.code();
         }
-        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
-            return core::ptr::null_mut();
+        if min_len == 0 || min_align == 0 || !min_align.is_power_of_two() {
+            return Errno::EINVAL.code();
+        }
+        let Ok(size) = usize::try_from(min_len) else {
+            return Errno::EOVERFLOW.code();
         };
-        // SAFETY: layout 已由 from_size_align 验证；KernelAllocator 是共享堆的
-        // GlobalAlloc 实现（host test 下经 test_support::ensure_init 就绪）。
-        unsafe { memory::KernelAllocator.alloc(layout) }
+        match memory::alloc_region(size) {
+            Ok(lease) => {
+                let base = lease.base();
+                let len = lease.size();
+                // 首次交付零初始化：backing 可能带着上一任占用者的内容。
+                // SAFETY: base/len 来自 alloc_region，是有效的可写物理区域
+                // （v1 identity 映射下 pa == va，与 vm_page_alloc 同一前提）。
+                unsafe { core::ptr::write_bytes(base as *mut u8, 0, len) };
+                // 故意泄漏 lease：本契约没有 Core 侧账本，backing 的释放凭 view
+                // 走 `kcore_memory_release`——让 Drop 归还会与显式 release 双重释放。
+                core::mem::forget(lease);
+                // SAFETY: out_view 已校验非空；可写性由调用方保证（C ABI 契约）。
+                unsafe {
+                    out_view.write(MemoryView {
+                        kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+                        reserved: 0,
+                        base: base as u64,
+                        len: len as u64,
+                    });
+                }
+                0
+            }
+            Err(_) => Errno::ENOMEM.code(),
+        }
     })
 }
 
-/// 共享堆释放。契约 = Rust `GlobalAlloc::dealloc`（见模块文档的语义说明）。
-/// 返回 0 / `-Errno`（`EFAULT` 空指针 / `EINVAL` 非法 layout）。
+/// 交回一个 [`kcore_memory_acquire`] 交付的 view：把 backing 归还分配器。
 ///
-/// # Safety
-/// `ptr` 必须来自一次成功的 `kcore_heap_alloc`，且 `(size, align)` 必须与那次
-/// 调用完全一致。违反 = UB。
-extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32 {
+/// KernelNative 是**受信操作**：不校验归属、无账本——只有 `(base, len)` 必须与
+/// acquire 交付的 view 完全一致。
+///
+/// view 以 `*const` 传入（`memory-and-heap.md` §2 的 C 原型是 by-value 聚合）：
+/// `kcomp_abi_drift.rs` 的 C 签名哨兵只按宽度分类参数、没有 by-value 聚合类别，
+/// by-value 会打挂那个冻结测试；RISC-V psABI 下 24 字节聚合本就按引用传递，
+/// wire ABI 等价。
+///
+/// 成功 = 0；失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法 /
+/// `reserved` 非 0 / `(base, len)` 不是一次 acquire 产物的形状）。
+extern "C" fn kcore_memory_release(view: *const MemoryView) -> i32 {
     with_core_critical(|| {
-        if ptr.is_null() {
+        if view.is_null() {
             return Errno::EFAULT.code();
         }
-        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
+        // SAFETY: 调用方保证 view 指向调用期间有效的 MemoryView（C ABI 契约）。
+        let view = unsafe { *view };
+        if view.kind != KCORE_MEMORY_VIEW_LOCAL_VA || view.reserved != 0 {
+            return Errno::EINVAL.code();
+        }
+        let (Ok(base), Ok(len)) = (usize::try_from(view.base), usize::try_from(view.len)) else {
             return Errno::EINVAL.code();
         };
-        // SAFETY: 由调用方保证 ptr/layout 匹配一次成功 alloc（C ABI 契约）。
-        unsafe {
-            memory::KernelAllocator.dealloc(ptr, layout);
+        match memory::free_region_raw(base, len) {
+            Ok(()) => 0,
+            Err(_) => Errno::EINVAL.code(),
         }
-        0
     })
 }
 
@@ -1130,8 +1161,8 @@ mod tests {
         for name in [
             &b"kcore_trace_read"[..],
             &b"kcore_trace_stats"[..],
-            &b"kcore_heap_alloc"[..],
-            &b"kcore_heap_dealloc"[..],
+            &b"kcore_memory_acquire"[..],
+            &b"kcore_memory_release"[..],
             &b"kcore_console_write_byte"[..],
             &b"kcore_log_line"[..],
             &b"kcore_machine_boot_hart"[..],
@@ -1464,35 +1495,85 @@ mod tests {
         );
     }
 
+    /// `kcore_memory_acquire/release`：域视图往返（走真实导出函数，不是复刻逻辑）。
+    ///
+    /// 锁定契约语义：首次交付零初始化、`kind = KCORE_MEMORY_VIEW_LOCAL_VA`、
+    /// `view.len >= min_len`、release 归还 backing（同尺寸再 acquire 复用同一块）；
+    /// `min_len == 0` / `min_align` 非 2 的幂 → `EINVAL`；null out → `EFAULT`；
+    /// absurd view（零 / 未页对齐 / 非 2 的幂 / 未知 kind）→ `EINVAL`。
+    /// **无账本**：release 只凭 view 自身。
     #[test]
-    fn heap_alloc_dealloc_roundtrip() {
+    fn memory_acquire_release_roundtrip() {
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
-        let alloc = resolve(b"kcore_heap_alloc").unwrap();
-        let dealloc = resolve(b"kcore_heap_dealloc").unwrap();
-        let alloc: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute(alloc) };
-        let dealloc: extern "C" fn(*mut u8, usize, usize) -> i32 =
-            unsafe { core::mem::transmute(dealloc) };
 
-        let p = alloc(32, 8);
-        assert!(!p.is_null(), "共享堆必须能分配");
-        // 写读往返，验证可写
-        unsafe {
-            core::ptr::write_volatile(p as *mut u64, 0xDEAD_BEEF);
-            assert_eq!(core::ptr::read_volatile(p as *mut u64), 0xDEAD_BEEF);
-        }
-        assert_eq!(dealloc(p, 32, 8), 0);
-    }
+        let acquire = resolve(b"kcore_memory_acquire").unwrap();
+        let acquire: extern "C" fn(u64, u64, *mut MemoryView) -> i32 =
+            unsafe { core::mem::transmute(acquire) };
+        let release = resolve(b"kcore_memory_release").unwrap();
+        let release: extern "C" fn(*const MemoryView) -> i32 =
+            unsafe { core::mem::transmute(release) };
 
-    #[test]
-    fn heap_alloc_invalid_layout_returns_null() {
-        let _g = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        let alloc = resolve(b"kcore_heap_alloc").unwrap();
-        let alloc: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute(alloc) };
-        // size=0 与非法 align（非 2 的幂）必须返回 null，不得 panic/UB。
-        assert!(alloc(0, 8).is_null());
-        assert!(alloc(16, 3).is_null());
+        let empty = MemoryView {
+            kind: 0,
+            reserved: 0,
+            base: 0,
+            len: 0,
+        };
+
+        // null out → EFAULT；size/align 非法 → EINVAL（都早于分配）。
+        let mut view = empty;
+        assert_eq!(acquire(1, 8, core::ptr::null_mut()), Errno::EFAULT.code());
+        assert_eq!(acquire(0, 8, &mut view), Errno::EINVAL.code());
+        assert_eq!(acquire(1, 0, &mut view), Errno::EINVAL.code());
+        assert_eq!(acquire(1, 3, &mut view), Errno::EINVAL.code());
+
+        // 成功：kind 由 Core 选定、len 覆盖请求、首次交付零初始化。
+        assert_eq!(acquire(1, 8, &mut view), 0);
+        assert_eq!(view.kind, KCORE_MEMORY_VIEW_LOCAL_VA);
+        assert!(view.len >= 1 && view.len.is_power_of_two());
+        assert_eq!(view.base % crate::memory::ALLOC_GRANULE as u64, 0);
+        // SAFETY: view.base 来自 alloc_region（块容量 = view.len），host 下是有效内存。
+        let head = unsafe { core::slice::from_raw_parts(view.base as *const u8, 16) };
+        assert!(head.iter().all(|&b| b == 0), "首次交付必须零初始化");
+
+        // release 归还 backing：同尺寸再次 acquire 必须复用同一块。
+        let first = view;
+        assert_eq!(release(&view), 0);
+        assert_eq!(acquire(1, 8, &mut view), 0);
+        assert_eq!((view.base, view.len), (first.base, first.len));
+        assert_eq!(release(&view), 0);
+
+        // null → EFAULT；absurd view → EINVAL（零 / 未页对齐 / 非 2 的幂 / 未知 kind）。
+        assert_eq!(release(core::ptr::null()), Errno::EFAULT.code());
+        assert_eq!(release(&empty), Errno::EINVAL.code());
+        assert_eq!(
+            release(&MemoryView {
+                kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+                reserved: 0,
+                base: 0x1001,
+                len: 4096,
+            }),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(
+            release(&MemoryView {
+                kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+                reserved: 0,
+                base: 0x1000,
+                len: 5000,
+            }),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(
+            release(&MemoryView {
+                kind: 0,
+                reserved: 0,
+                base: first.base,
+                len: first.len,
+            }),
+            Errno::EINVAL.code()
+        );
     }
 
     /// `kcore_trace_read`：一次只读一条、`out_next` 作续读游标、读空返回

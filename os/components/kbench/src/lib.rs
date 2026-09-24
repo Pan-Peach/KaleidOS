@@ -36,7 +36,9 @@ mod trace;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 
 use kcomp_sdk::abi;
+use kcomp_sdk::abi::MemoryView;
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::mem;
 
 #[cfg(test)]
 extern crate std;
@@ -66,7 +68,7 @@ struct Context {
     cap: u64,
 }
 
-/// 一次 benchmark 运行的 per-instance 可变状态（Core 共享堆分配）。
+/// 一次 benchmark 运行的 per-instance 可变状态（Core backing 分配）。
 ///
 /// 全部从 image-global `static` 迁入这里（`docs/architecture/component-lifecycle.md` §10）：
 /// 组件代码常驻，实例状态来自显式分配；create 返回本分配的不透明指针，
@@ -100,6 +102,8 @@ pub(crate) struct State {
     /// 认领中的设备身份（仅锚点上下文读写）：正常路径在 `irq::run` 内同步释放并
     /// 清零；destroy 用它兜底 quiesce。
     pub(crate) irq_device: u32,
+    /// 本 state 的 backing 窗口（create 的 acquire 交付；destroy 原样交回）。
+    pub(crate) region: MemoryView,
 }
 
 impl State {
@@ -120,6 +124,12 @@ impl State {
             irq_served: AtomicBool::new(false),
             irq_uart_lease: AtomicUsize::new(0),
             irq_device: 0,
+            region: MemoryView {
+                kind: 0,
+                reserved: 0,
+                base: 0,
+                len: 0,
+            },
         }
     }
 }
@@ -263,18 +273,19 @@ fn run_primitive_observed<F: FnMut() -> u64>(
 // `0` = 成功（`*out_state` = 本实例 state）；负 errno = 失败，Core 走 Failed 且
 // **不会**调用 destroy（构造期清理由本入口负责）。
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
-    // per-instance state：从 Core 共享堆分配并构造，把不透明指针交给 Core
-    // （Core 只存/传，不解释布局、不通用释放）。失败返回 -ENOMEM。
+    // per-instance state：从 Core 取一段 backing 并构造，把不透明指针交给 Core
+    // （Core 只存/传，不解释布局）。失败返回 -ENOMEM。
     let size = core::mem::size_of::<State>();
     let align = core::mem::align_of::<State>();
-    // SAFETY: 纯分配调用，无所有权语义；成功 = 按 align 对齐的 size 字节，失败 = NULL。
-    let state_ptr = unsafe { abi::kcore_heap_alloc(size, align) };
-    if state_ptr.is_null() {
-        return Errno::ENOMEM.code();
-    }
-    let state = state_ptr as *mut State;
-    // SAFETY: 刚分配、独占、对齐满足 State；一次写入完成初始化。
+    let region = match mem::mem_alloc(size as u64, align as u64) {
+        Ok(view) => view,
+        Err(_) => return Errno::ENOMEM.code(),
+    };
+    let state = region.base as *mut State;
+    // SAFETY: 刚 acquire、独占、对齐满足 State；一次写入完成初始化。
     unsafe { core::ptr::write(state, State::new()) };
+    // SAFETY: state 落在 region 内；destroy 凭同一 view 原样交回。
+    unsafe { (*state).region = region };
     // SAFETY: out_state 由 Core 保证可写；Core 只存/传该指针，不解释、不释放。
     unsafe { *out_state = state as *mut () };
 
@@ -366,14 +377,12 @@ kcomp_sdk::kcomp_instance_destroy!(|state| {
     // `kcore_sched_run` 返回时已全部退出，Core 的 Stopping 路径拒绝存活任务；
     // 无强制终止 API（已推迟），因此这里没有可做的任务操作。
     irq::quiesce(state);
-    let size = core::mem::size_of::<State>();
-    let align = core::mem::align_of::<State>();
-    // SAFETY: state 是本组件 create 经 `*out_state` 写回、Core 原样交还的同一分配，
-    // 用分配时相同的 size / align 释放。
-    let freed = unsafe { abi::kcore_heap_dealloc(state as *mut u8, size, align) };
-    if freed != 0 {
+    // SAFETY: state 是本组件 create 经 `*out_state` 写回、Core 原样交还的同一分配；
+    // region 是 acquire 交付的原样 view。
+    let region = unsafe { (*state).region };
+    if let Err(error) = mem::mem_release(region) {
         report::write_str("[kbench] destroy: release failed\n");
-        return freed;
+        return error.code();
     }
     report::write_str("[kbench] destroy: state released\n");
     0

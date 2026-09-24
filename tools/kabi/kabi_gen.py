@@ -2170,7 +2170,7 @@ doc = "I/O error"
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
     assert len([func for func in core.functions if func.core_params != func.params]) == 1
-    assert len(core.structs) == 2 and len(component.structs) == 2
+    assert len(core.structs) == 3 and len(component.structs) == 2
     frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
     assert frame.c_name == "kcomp_call_frame" and frame.size_ptrs == 6
     assert [field.name for field in frame.fields] == [

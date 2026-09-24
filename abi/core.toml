@@ -102,6 +102,43 @@ doc = """
 """
 offset = 32
 
+[[struct]]
+name = "MemoryView"
+c_name = "kcore_memory_view"
+doc = """
+本执行域可访问的内存窗口（`kcore_memory_acquire` 的 out / `kcore_memory_release` 的 in）。
+`kind` 是整数常量编码（见 `KCORE_MEMORY_VIEW_*`），不用 Rust enum layout；
+`reserved` 保留、必须为 0。
+**无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+（`base` / `len`）就是身份。
+"""
+size = 24
+align = 8
+
+[[struct.field]]
+name = "kind"
+type = "u32"
+doc = "访问窗口编码：`KCORE_MEMORY_VIEW_LOCAL_VA` / `KCORE_MEMORY_VIEW_LINEAR_OFFSET`。"
+offset = 0
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+doc = "保留；必须为 0。"
+offset = 4
+
+[[struct.field]]
+name = "base"
+type = "u64"
+doc = "窗口基址（本域 VA；绝不返回物理地址或 Core 私有 VA）。"
+offset = 8
+
+[[struct.field]]
+name = "len"
+type = "u64"
+doc = "窗口长度（字节；成功时 ≥ 请求的 `min_len`，实际粒度由 Core 决定）。"
+offset = 16
+
 [[alias]]
 name = "IrqHandler"
 c_name = "IrqHandler"
@@ -223,6 +260,24 @@ doc = """
 """
 targets = "c,sdk-rust,core-rust"
 
+[[const]]
+name = "KCORE_MEMORY_VIEW_LOCAL_VA"
+type = "u32"
+value = "1"
+doc = """
+`kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
+"""
+targets = "c,sdk-rust,core-rust"
+
+[[const]]
+name = "KCORE_MEMORY_VIEW_LINEAR_OFFSET"
+type = "u32"
+value = "2"
+doc = """
+`kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。
+"""
+targets = "c,sdk-rust,core-rust"
+
 [[function]]
 name = "kcore_trace_read"
 ret = "i32"
@@ -278,31 +333,56 @@ doc = """
 """
 
 [[function]]
-name = "kcore_heap_alloc"
-ret = "*mut u8"
-category = "Runtime / shared heap"
-c_category = "Runtime / shared heap（Core 共享堆，非 per-component 堆）"
+name = "kcore_memory_acquire"
+ret = "i32"
+category = "Memory resource（域视图，无账本）"
+c_category = "Memory resource（域视图，无账本）"
+doc = """
+取一段内存 backing，返回**本执行域访问窗口**（`kind = KCORE_MEMORY_VIEW_LOCAL_VA`）。
+
+`min_len > 0`、`min_align` 为非零 2 的幂；成功时 `view.len >= min_len`（实际
+backing 粒度由 Core 决定，今天最小 4 KiB）。首次交付**零初始化**。
+**无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+（`base` / `len`）就是身份；释放凭同一个 view 走 `kcore_memory_release`。
+成功 = `0`（view 写入 `*out_view`）；失败 = `-Errno`（`EFAULT` out 为空 /
+`EINVAL` size/align 非法 / `EOVERFLOW` `min_len` 超出本域指针宽 /
+`ENOMEM` 物理内存耗尽）。
+"""
+c_doc = """
+取一段内存 backing，返回本执行域访问窗口（kind = KCORE_MEMORY_VIEW_LOCAL_VA）：
+min_len > 0、min_align 为非零 2 的幂；成功时 view.len >= min_len，首次交付零初始化。
+无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。
+"""
 [[function.param]]
-name = "size"
-type = "usize"
+name = "min_len"
+type = "u64"
 [[function.param]]
-name = "align"
-type = "usize"
+name = "min_align"
+type = "u64"
+[[function.param]]
+name = "out_view"
+type = "*mut MemoryView"
 
 [[function]]
-name = "kcore_heap_dealloc"
+name = "kcore_memory_release"
 ret = "i32"
-category = "Runtime / shared heap"
-c_category = "Runtime / shared heap（Core 共享堆，非 per-component 堆）"
+category = "Memory resource（域视图，无账本）"
+c_category = "Memory resource（域视图，无账本）"
+doc = """
+交回一个 `kcore_memory_acquire` 交付的 view：把 backing 归还分配器。
+
+KernelNative 是**受信操作**（不校验归属、无账本），`(base, len)` 必须与 acquire
+交付的 view 完全一致。成功 = `0`；
+失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法、`reserved` 非 0，
+或 `(base, len)` 不是一次 acquire 产物的形状）。
+"""
+c_doc = """
+交回一个 kcore_memory_acquire 交付的 view，把 backing 归还分配器。
+KernelNative 受信操作；(base, len) 必须与 acquire 一致。
+"""
 [[function.param]]
-name = "ptr"
-type = "*mut u8"
-[[function.param]]
-name = "size"
-type = "usize"
-[[function.param]]
-name = "align"
-type = "usize"
+name = "view"
+type = "*const MemoryView"
 
 [[function]]
 name = "kcore_console_write_byte"

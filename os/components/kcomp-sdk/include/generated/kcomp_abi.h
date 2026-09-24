@@ -137,6 +137,28 @@ _Static_assert(offsetof(struct kcore_trace_stats, next_seq) == 16, "kcore_trace_
 _Static_assert(offsetof(struct kcore_trace_stats, overwritten_total) == 24, "kcore_trace_stats.overwritten_total offset drift");
 _Static_assert(offsetof(struct kcore_trace_stats, enabled_mask) == 32, "kcore_trace_stats.enabled_mask offset drift");
 
+/* 本执行域可访问的内存窗口（`kcore_memory_acquire` 的 out / `kcore_memory_release` 的 in）。
+ * `kind` 是整数常量编码（见 `KCORE_MEMORY_VIEW_*`），不用 Rust enum layout；
+ * `reserved` 保留、必须为 0。
+ * **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+ * （`base` / `len`）就是身份。 */
+struct kcore_memory_view {
+    /* 访问窗口编码：`KCORE_MEMORY_VIEW_LOCAL_VA` / `KCORE_MEMORY_VIEW_LINEAR_OFFSET`。 */
+    uint32_t kind;
+    /* 保留；必须为 0。 */
+    uint32_t reserved;
+    /* 窗口基址（本域 VA；绝不返回物理地址或 Core 私有 VA）。 */
+    uint64_t base;
+    /* 窗口长度（字节；成功时 ≥ 请求的 `min_len`，实际粒度由 Core 决定）。 */
+    uint64_t len;
+};
+_Static_assert(sizeof(struct kcore_memory_view) == 24, "kcore_memory_view layout drift");
+_Static_assert(_Alignof(struct kcore_memory_view) == 8, "kcore_memory_view alignment drift");
+_Static_assert(offsetof(struct kcore_memory_view, kind) == 0, "kcore_memory_view.kind offset drift");
+_Static_assert(offsetof(struct kcore_memory_view, reserved) == 4, "kcore_memory_view.reserved offset drift");
+_Static_assert(offsetof(struct kcore_memory_view, base) == 8, "kcore_memory_view.base offset drift");
+_Static_assert(offsetof(struct kcore_memory_view, len) == 16, "kcore_memory_view.len offset drift");
+
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
 
@@ -148,6 +170,12 @@ typedef void (*IrqHandler)(void *ctx);
 /* `kcore_endpoint_bind` 的机制编码：**Gate**（跨域 / 需 containment：调用走
  * `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。 */
 #define KCORE_ENDPOINT_MECHANISM_GATE UINT32_C(1)
+
+/* `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。 */
+#define KCORE_MEMORY_VIEW_LOCAL_VA UINT32_C(1)
+
+/* `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。 */
+#define KCORE_MEMORY_VIEW_LINEAR_OFFSET UINT32_C(2)
 
 /* -- Trace（只读观察面；无写入口） -- */
 /* 读 `seq >= since` 的第一条记录；没有更多时返回 -ENOENT（不返回 0）。 */
@@ -161,9 +189,14 @@ int32_t kcore_trace_stats(struct kcore_trace_stats *out);
 uint64_t kcore_now(void);
 /* 时钟频率（Hz），用于把 tick 换算成时间。 */
 uint64_t kcore_timebase_hz(void);
-/* -- Runtime / shared heap（Core 共享堆，非 per-component 堆） -- */
-uint8_t *kcore_heap_alloc(size_t size, size_t align);
-int32_t kcore_heap_dealloc(uint8_t *ptr, size_t size, size_t align);
+/* -- Memory resource（域视图，无账本） -- */
+/* 取一段内存 backing，返回本执行域访问窗口（kind = KCORE_MEMORY_VIEW_LOCAL_VA）：
+ * min_len > 0、min_align 为非零 2 的幂；成功时 view.len >= min_len，首次交付零初始化。
+ * 无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。 */
+int32_t kcore_memory_acquire(uint64_t min_len, uint64_t min_align, struct kcore_memory_view *out_view);
+/* 交回一个 kcore_memory_acquire 交付的 view，把 backing 归还分配器。
+ * KernelNative 受信操作；(base, len) 必须与 acquire 一致。 */
+int32_t kcore_memory_release(const struct kcore_memory_view *view);
 /* -- Logging / diagnostics -- */
 void kcore_console_write_byte(uint8_t byte);
 int32_t kcore_log_line(const uint8_t *ptr, size_t len);

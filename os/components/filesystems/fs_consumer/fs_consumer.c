@@ -144,14 +144,14 @@ int32_t kcomp_instance_create(
     const struct fs_consumer_create_config *config =
         (const struct fs_consumer_create_config *)args->config;
 
-    struct fs_consumer_state *state = (struct fs_consumer_state *)kcore_heap_alloc(
-        sizeof(struct fs_consumer_state), _Alignof(struct fs_consumer_state));
-    if (state == NULL)
+    /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
+    struct kcore_memory_view state_region;
+    if (kcomp_mem_alloc(&state_region, sizeof(struct fs_consumer_state),
+                        _Alignof(struct fs_consumer_state)) < 0)
     {
         return -ENOMEM;
     }
-
-    memset(state, 0, sizeof(struct fs_consumer_state));
+    struct fs_consumer_state *state = (struct fs_consumer_state *)(uintptr_t)state_region.base;
 
     /* bind filesystem endpoint：Core exact-compare contract + abi、校验存活，并按
      * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
@@ -163,8 +163,7 @@ int32_t kcomp_instance_create(
         &state->binding);
     if (result < 0)
     {
-        kcore_heap_dealloc(
-            (uint8_t *)state, sizeof(struct fs_consumer_state), _Alignof(struct fs_consumer_state));
+        kcomp_mem_free(&state_region);
         return result;
     }
 
@@ -173,8 +172,7 @@ int32_t kcomp_instance_create(
     result = kcore_task_create(fs_consumer_task, state, &task);
     if (result < 0)
     {
-        kcore_heap_dealloc(
-            (uint8_t *)state, sizeof(struct fs_consumer_state), _Alignof(struct fs_consumer_state));
+        kcomp_mem_free(&state_region);
         return result;
     }
 

@@ -5,8 +5,8 @@
 //!
 //! `ram_blk` 的内容是编译期生成的只读 FAT12 卷，`write` 恒返回 `-EROFS`。littlefs
 //! 需要 prog + erase，因此要一个**可写**且**每实例独立**的后端：每个实例在
-//! `kcomp_instance_create` 里经 Core 共享堆分配自己的 N 扇区**零初始化**缓冲，
-//! 两个实例的存储互不影响。
+//! `kcomp_instance_create` 里经 Core 取一段 backing（`kcore_memory_acquire`，
+//! 首次交付零初始化）作为自己的 N 扇区缓冲，两个实例的存储互不影响。
 //!
 //! # 机制（与 ram_blk 同形）
 //!
@@ -39,11 +39,11 @@ use kcomp_sdk as _;
 #[cfg(test)]
 extern crate std;
 
-use kcomp_sdk::abi;
 use kcomp_sdk::block::dispatch::dispatch as block_dispatch;
 use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDeviceProvider, BlockDeviceService};
 use kcomp_sdk::errno::{Errno, Result};
 use kcomp_sdk::frame::Call;
+use kcomp_sdk::mem;
 use kcomp_sdk::{kcomp_instance_create, kcomp_instance_destroy, kcomp_services, klog};
 
 /// provider 定义的端口 token（**Gate** 路径经 `kcomp_service_dispatch` 用它选中
@@ -138,30 +138,30 @@ kcomp_services! {
 }
 
 kcomp_instance_create!(|_args, out_state| {
-    // (1) 每实例缓冲：N 扇区，零初始化。新实例 = 全新空白设备。
+    // (1) 每实例缓冲：N 扇区。`mem_alloc` 首次交付零初始化（新实例 = 全新空白设备）。
     let buf_size = SECTOR * SECTORS;
-    // SAFETY: 纯分配调用，无所有权语义；成功 = 对齐的 size 字节，失败 = NULL。
-    let buf = unsafe { abi::kcore_heap_alloc(buf_size, 1) };
-    if buf.is_null() {
-        return Errno::ENOMEM.code();
-    }
-    // SAFETY: buf 是刚分配、恰好 buf_size 字节、尚未初始化的存储。
-    unsafe { core::ptr::write_bytes(buf, 0, buf_size) };
+    let buf_view = match mem::mem_alloc(buf_size as u64, 1) {
+        Ok(view) => view,
+        Err(_) => return Errno::ENOMEM.code(),
+    };
+    let buf = buf_view.base as *mut u8;
 
     // (2) 每实例 state：容量 + 缓冲指针。
     let state_size = core::mem::size_of::<RamBlkRwState>();
     let state_align = core::mem::align_of::<RamBlkRwState>();
-    // SAFETY: 同 (1) 的分配。
-    let state = unsafe { abi::kcore_heap_alloc(state_size, state_align) };
-    if state.is_null() {
-        // SAFETY: buf 来自本次 create 的 kcore_heap_alloc（size/align 相同）。
-        unsafe { abi::kcore_heap_dealloc(buf, buf_size, 1) };
-        return Errno::ENOMEM.code();
-    }
-    // SAFETY: state 是刚分配、对齐满足、尚未初始化的 RamBlkRwState 存储。
+    let state_view = match mem::mem_alloc(state_size as u64, state_align as u64) {
+        Ok(view) => view,
+        Err(_) => {
+            let _ = mem::mem_release(buf_view);
+            return Errno::ENOMEM.code();
+        }
+    };
+    let state = state_view.base as *mut RamBlkRwState;
+    // SAFETY: state 是 acquire 交付、对齐满足的 RamBlkRwState 存储；ptr::write 直接
+    // 放置初始值（不读旧值）。
     unsafe {
         core::ptr::write(
-            state.cast::<RamBlkRwState>(),
+            state,
             RamBlkRwState {
                 sectors: SECTORS as u64,
                 buf,
@@ -173,17 +173,16 @@ kcomp_instance_create!(|_args, out_state| {
     //     所以 Direct 的 read/write 落在本实例缓冲上（见文件头 §结构差异）。
     let service_size = core::mem::size_of::<BlockDeviceService<RamBlkRwProvider>>();
     let service_align = core::mem::align_of::<BlockDeviceService<RamBlkRwProvider>>();
-    // SAFETY: 同 (1) 的分配。
-    let service_ptr = unsafe { abi::kcore_heap_alloc(service_size, service_align) };
-    if service_ptr.is_null() {
-        // SAFETY: buf / state 来自本次 create 的 kcore_heap_alloc（size/align 相同）。
-        unsafe {
-            abi::kcore_heap_dealloc(buf, buf_size, 1);
-            abi::kcore_heap_dealloc(state, state_size, state_align);
+    let service_view = match mem::mem_alloc(service_size as u64, service_align as u64) {
+        Ok(view) => view,
+        Err(_) => {
+            let _ = mem::mem_release(buf_view);
+            let _ = mem::mem_release(state_view);
+            return Errno::ENOMEM.code();
         }
-        return Errno::ENOMEM.code();
-    }
-    // SAFETY: service_ptr 是刚分配、对齐满足、尚未初始化的 BlockDeviceService 存储。
+    };
+    let service_ptr = service_view.base as *mut u8;
+    // SAFETY: service_ptr 是 acquire 交付、对齐满足的 BlockDeviceService 存储。
     unsafe {
         core::ptr::write(
             service_ptr.cast::<BlockDeviceService<RamBlkRwProvider>>(),
@@ -200,12 +199,10 @@ kcomp_instance_create!(|_args, out_state| {
     // Gate dispatch token；api/ctx = Direct 的 function table + 本实例 provider。
     if let Err(error) = service.publish_endpoint(BLOCK_DEVICE_NAME, BLOCK_PORT) {
         // 发布失败：pending 未提交，Core 不调用 destroy——构造期清理由组件负责。
-        // SAFETY: 三个指针都来自本次 create 的 kcore_heap_alloc（size/align 相同）。
-        unsafe {
-            abi::kcore_heap_dealloc(buf, buf_size, 1);
-            abi::kcore_heap_dealloc(state, state_size, state_align);
-            abi::kcore_heap_dealloc(service_ptr, service_size, service_align);
-        }
+        // 三块 backing 都按 acquire 交付的 view 原样交回。
+        let _ = mem::mem_release(buf_view);
+        let _ = mem::mem_release(state_view);
+        let _ = mem::mem_release(service_view);
         return error.code();
     }
 

@@ -12,7 +12,6 @@
 #include "diskio_kaleidos.h"
 #include "fatfs_internal.h"
 #include <errno.h>
-#include <string.h>
 
 /* create config（组合策略提供；Core 视为不透明字节）。
  *
@@ -66,14 +65,14 @@ int32_t kcomp_instance_create(
     const struct fatfs_create_config *config =
         (const struct fatfs_create_config *)args->config;
 
-    struct fatfs_state *state = (struct fatfs_state *)kcore_heap_alloc(
-        sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
-    if (state == NULL)
+    /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
+    struct kcore_memory_view state_region;
+    if (kcomp_mem_alloc(&state_region, sizeof(struct fatfs_state),
+                        _Alignof(struct fatfs_state)) < 0)
     {
         return -ENOMEM;
     }
-
-    memset(state, 0, sizeof(struct fatfs_state));
+    struct fatfs_state *state = (struct fatfs_state *)(uintptr_t)state_region.base;
 
     /* bind block endpoint：Core exact-compare contract + abi、校验存活，并按
      * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
@@ -85,7 +84,7 @@ int32_t kcomp_instance_create(
         &state->block_binding);
     if (result < 0)
     {
-        kcore_heap_dealloc((uint8_t *)state, sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
+        kcomp_mem_free(&state_region);
         return result;
     }
 
@@ -94,7 +93,7 @@ int32_t kcomp_instance_create(
     result = fatfs_disk_attach(&state->block_binding);
     if (result < 0)
     {
-        kcore_heap_dealloc((uint8_t *)state, sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
+        kcomp_mem_free(&state_region);
         return result;
     }
 
@@ -116,7 +115,7 @@ int32_t kcomp_instance_create(
     if (result < 0)
     {
         fatfs_disk_detach();
-        kcore_heap_dealloc((uint8_t *)state, sizeof(struct fatfs_state), _Alignof(struct fatfs_state));
+        kcomp_mem_free(&state_region);
         return result;
     }
 

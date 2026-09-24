@@ -12,7 +12,7 @@
 //! 4. littlefs 在 create 里 format+mount 自己的块设备、跑内部 selftest，并发布
 //!    **filesystem endpoint**；组合策略再次发现它。
 //!
-//! 两条链用**不同的 provider 实例**（各自 `kcore_heap_alloc` 的 RAM 缓冲），因此
+//! 两条链用**不同的 provider 实例**（各自 `kcore_memory_acquire` 的 RAM 缓冲），因此
 //! 两个 littlefs 挂载在**互相独立**的存储上——这就是"Core 面对多实例"的端到端证据。
 //!
 //! 本组件**不选择调用机制**：机制由 Core 在 consumer 的 bind 时按两端执行域选定。

@@ -193,6 +193,24 @@ pub(crate) fn free_region(lease: MemoryLease) -> Result<(), MemoryError> {
     release_region(region, order)
 }
 
+/// 释放一段**只有 `(base, size)` 身份**的区域（无 lease 的显式 release 路径）。
+///
+/// 契约 `kcore_memory_acquire/release` 无 Core 侧账本：`view` 自身就是身份，
+/// 因此释放端只能按调用方交回的 `(base, size)` 归还——本函数只接受与
+/// [`alloc_region`] 产物同形的参数（`base` 非零且页对齐；`size` 恰好落在某个
+/// buddy order 上，即 ≥ 一页的 2 的幂），其它一律 `InvalidSize`：**绝不猜测
+/// 块大小去释放**（错配 = 归还一段不属于自己的物理内存）。
+pub(crate) fn free_region_raw(base: usize, size: usize) -> Result<(), MemoryError> {
+    if base == 0 || base % ALLOC_GRANULE != 0 || !size.is_power_of_two() {
+        return Err(MemoryError::InvalidSize);
+    }
+    let order = order_for_size(size)?;
+    if (1usize << order) != size {
+        return Err(MemoryError::InvalidSize);
+    }
+    release_region(PhysicalRange { base, size }, order)
+}
+
 fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError> {
     let mut heap = HEAP.lock();
     let base = region.base as *mut u8;

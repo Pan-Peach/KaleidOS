@@ -152,6 +152,33 @@ const _: () = {
     assert!(core::mem::offset_of!(TraceStatsAbi, enabled_mask) == 32);
 };
 
+/// 本执行域可访问的内存窗口（`kcore_memory_acquire` 的 out / `kcore_memory_release` 的 in）。
+/// `kind` 是整数常量编码（见 `KCORE_MEMORY_VIEW_*`），不用 Rust enum layout；
+/// `reserved` 保留、必须为 0。
+/// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+/// （`base` / `len`）就是身份。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryView {
+    /// 访问窗口编码：`KCORE_MEMORY_VIEW_LOCAL_VA` / `KCORE_MEMORY_VIEW_LINEAR_OFFSET`。
+    pub kind: u32,
+    /// 保留；必须为 0。
+    pub reserved: u32,
+    /// 窗口基址（本域 VA；绝不返回物理地址或 Core 私有 VA）。
+    pub base: u64,
+    /// 窗口长度（字节；成功时 ≥ 请求的 `min_len`，实际粒度由 Core 决定）。
+    pub len: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MemoryView>() == 24);
+    assert!(core::mem::align_of::<MemoryView>() == 8);
+    assert!(core::mem::offset_of!(MemoryView, kind) == 0);
+    assert!(core::mem::offset_of!(MemoryView, reserved) == 4);
+    assert!(core::mem::offset_of!(MemoryView, base) == 8);
+    assert!(core::mem::offset_of!(MemoryView, len) == 16);
+};
+
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
 
@@ -202,6 +229,12 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
 
+/// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
+pub const KCORE_MEMORY_VIEW_LOCAL_VA: u32 = 1;
+
+/// `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。
+pub const KCORE_MEMORY_VIEW_LINEAR_OFFSET: u32 = 2;
+
 unsafe extern "C" {
     // -- Trace（只读观察面；无写入口） --
     /// 读 `seq >= since` 的第一条记录到 `out`，`out_next` 回写下一次应传的
@@ -220,11 +253,26 @@ unsafe extern "C" {
     /// 时钟频率（Hz），用于把 tick 换算成时间。
     #[link_name = "kcore_timebase_hz"]
     pub fn kcore_timebase_hz() -> u64;
-    // -- Runtime / shared heap（Core 共享堆，非 per-component 堆） --
-    #[link_name = "kcore_heap_alloc"]
-    pub fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8;
-    #[link_name = "kcore_heap_dealloc"]
-    pub fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32;
+    // -- Memory resource（域视图，无账本） --
+    /// 取一段内存 backing，返回**本执行域访问窗口**（`kind = KCORE_MEMORY_VIEW_LOCAL_VA`）。
+    ///
+    /// `min_len > 0`、`min_align` 为非零 2 的幂；成功时 `view.len >= min_len`（实际
+    /// backing 粒度由 Core 决定，今天最小 4 KiB）。首次交付**零初始化**。
+    /// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+    /// （`base` / `len`）就是身份；释放凭同一个 view 走 `kcore_memory_release`。
+    /// 成功 = `0`（view 写入 `*out_view`）；失败 = `-Errno`（`EFAULT` out 为空 /
+    /// `EINVAL` size/align 非法 / `EOVERFLOW` `min_len` 超出本域指针宽 /
+    /// `ENOMEM` 物理内存耗尽）。
+    #[link_name = "kcore_memory_acquire"]
+    pub fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut MemoryView) -> i32;
+    /// 交回一个 `kcore_memory_acquire` 交付的 view：把 backing 归还分配器。
+    ///
+    /// KernelNative 是**受信操作**（不校验归属、无账本），`(base, len)` 必须与 acquire
+    /// 交付的 view 完全一致。成功 = `0`；
+    /// 失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法、`reserved` 非 0，
+    /// 或 `(base, len)` 不是一次 acquire 产物的形状）。
+    #[link_name = "kcore_memory_release"]
+    pub fn kcore_memory_release(view: *const MemoryView) -> i32;
     // -- Logging / diagnostics --
     #[link_name = "kcore_console_write_byte"]
     pub fn kcore_console_write_byte(byte: u8);

@@ -55,4 +55,8 @@
 #include "kcomp_block.h"
 #include "kcomp_filesystem.h"
 
+/* raw backing 便利分配器（`kcore_memory_acquire/release` 的薄包装；与
+ * `kcomp_kalloc.h` 的 per-instance 堆正交——普通 malloc/free 走后者）。 */
+#include "kcomp_mem.h"
+
 #endif /* KCOMP_H */

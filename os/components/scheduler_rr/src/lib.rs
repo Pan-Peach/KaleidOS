@@ -7,9 +7,9 @@
 //! 拿不到任务表、状态或任何 Core truth 的写权限。
 //!
 //! 实例生命周期（`docs/architecture/component-lifecycle.md` §3/§10）：cursor 是**实例状态**，
-//! 在 `kcomp_instance_create` 里经 Core 共享堆分配，`*out_state` 交 Core 保管；
-//! Core 的 PolicyCall 边界把该 `instance_state` 交给本 image 的
-//! `kcomp_service_dispatch`。替换实例 = 全新分配 = 全新 cursor。
+//! 在 `kcomp_instance_create` 里经 Core 取一段 backing（`kcore_memory_acquire`），
+//! `*out_state` 交 Core 保管；Core 的 PolicyCall 边界把该 `instance_state` 交给本
+//! image 的 `kcomp_service_dispatch`。替换实例 = 全新分配 = 全新 cursor。
 //!
 //! # 发布 / 消费（endpoint 模型，step 5）
 //!
@@ -29,9 +29,9 @@ use kcomp_sdk as _;
 extern crate std;
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use kcomp_sdk::abi;
 use kcomp_sdk::errno::Errno;
 use kcomp_sdk::frame;
+use kcomp_sdk::mem;
 use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME};
 
 /// provider 定义的不透明 dispatch token：image 级 `kcomp_service_dispatch` 用它
@@ -40,7 +40,7 @@ pub const SCHEDULER_POLICY_PORT: u32 = 0;
 
 /// RR 调度器**实例状态**：cursor 指向 runnable 列表中的下一个槽位。
 ///
-/// 经 Core 共享堆分配（地址稳定）、作为实例 state 交给 Core；不同实例各自独立
+/// 经 Core backing 分配（地址稳定）、作为实例 state 交给 Core；不同实例各自独立
 /// 轮转（不再是 image-global 的共享 cursor）。
 #[repr(C)]
 struct SchedulerState {
@@ -96,16 +96,17 @@ kcomp_sdk::kcomp_services! {
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let size = core::mem::size_of::<SchedulerState>();
     let align = core::mem::align_of::<SchedulerState>();
-    // SAFETY: 纯分配调用，无所有权语义；成功 = 对齐的 size 字节，失败 = NULL。
-    let state = unsafe { abi::kcore_heap_alloc(size, align) };
-    if state.is_null() {
-        return Errno::ENOMEM.code();
-    }
+    let state_view = match mem::mem_alloc(size as u64, align as u64) {
+        Ok(view) => view,
+        Err(_) => return Errno::ENOMEM.code(),
+    };
+    let state = state_view.base as *mut SchedulerState;
     // 新实例从 cursor 0 开始：替换实例拿到全新 cursor。
-    // SAFETY: state 是刚分配、对齐满足、尚未初始化的 SchedulerState 存储。
+    // SAFETY: state 是 acquire 交付、对齐满足的 SchedulerState 存储；ptr::write
+    // 直接放置初始值（不读旧值）。
     unsafe {
         core::ptr::write(
-            state.cast::<SchedulerState>(),
+            state,
             SchedulerState {
                 cursor: AtomicU32::new(0),
             },
@@ -114,12 +115,9 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
 
     // 发布策略 endpoint（Gate-only：api / ctx 为空；staged，create 返回 0 后
     // Core 原子提交）。发布失败：pending 未提交，Core 不调用 destroy；构造期
-    // 清理由组件自己负责——释放刚分配的 state。返回码保持旧入口的 -1。
+    // 清理由组件自己负责——把刚取的 backing 原样交回。返回码保持旧入口的 -1。
     if scheduler::publish_endpoint(SCHEDULER_POLICY_NAME, SCHEDULER_POLICY_PORT).is_err() {
-        // SAFETY: state 来自本次 create 的 kcore_heap_alloc（size/align 相同）。
-        unsafe {
-            abi::kcore_heap_dealloc(state, size, align);
-        }
+        let _ = mem::mem_release(state_view);
         return -1;
     }
 

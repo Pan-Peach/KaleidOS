@@ -6,7 +6,8 @@
 //! 1. [`abi`]：`kcore_*` 导出白名单的**单一来源**（组件不再各自复制 extern 块）；
 //! 2. 入口 / 日志 / panic adapter：`kcomp_instance_create!` /
 //!    `kcomp_instance_destroy!`、[`log`]/`klog!`、`#[panic_handler]`；
-//! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → Core 共享堆。
+//! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → **当前实例的
+//!    per-instance heap**（[`heap`]，分配器实现是 freestanding C）。
 //!
 //! 模块划分与 crate 外部路径一一对应（`abi` / `DmaDirection` / `log` /
 //! `console_write_byte` 保持原路径不变）：
@@ -16,7 +17,8 @@
 //! [`block`] block.device 契约 + provider wrapper + **调用后端**（Core 在 bind 时
 //! 选定的 Direct / Gate，`BlockBinding` typed 前端）+ Gate 适配器、
 //! [`scheduler`] `scheduler.policy` 契约（Gate-only；consumer = Core）、
-//! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、`alloc`。
+//! [`call`] endpoint call 的原始包装、`dma`、`logging`、`panic`、[`heap`]、
+//! [`alloc`]、[`mem`]（raw backing 便利分配器）。
 //!
 //! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；
 //! method switch 由契约自己的适配器（如 [`block::dispatch`]）手写。
@@ -32,9 +34,12 @@
 //!
 //! # alloc adapter
 //!
-//! `#[global_allocator]` 不是"每个组件自带堆"：它只是把 Rust `GlobalAlloc`
-//! 契约接到 **Core 共享堆**（`kcore_heap_alloc/dealloc`）。默认关闭，组件按需
-//! 通过 `kcomp-sdk = { path = "...", features = ["alloc"] }` 开启。
+//! `#[global_allocator]` 不是"每个组件自带堆"的镜像，也不是 Core 共享堆：它只是
+//! 把 Rust `GlobalAlloc` 契约路由到 [`heap::current_heap`] 指向的 per-instance
+//! heap（分配器实现是 `c/kalloc.c` 的 freestanding C；见
+//! `docs/architecture/memory-and-heap.md` §5 / §6）。默认关闭，组件按需通过
+//! `kcomp-sdk = { path = "...", features = ["alloc"] }` 开启；未设置堆时分配
+//! 返回 null，绝不 panic。
 
 #![no_std]
 
@@ -43,6 +48,7 @@
 extern crate std;
 
 pub mod abi;
+pub mod alloc;
 pub mod block;
 pub mod call;
 pub mod endpoint;
@@ -50,6 +56,8 @@ pub mod errno;
 pub mod filesystem;
 pub mod frame;
 pub mod generated;
+pub mod heap;
+pub mod mem;
 pub mod probe;
 pub mod scheduler;
 
@@ -59,9 +67,7 @@ mod logging;
 #[cfg(test)]
 mod test_support;
 
-// 裸机专属 adapter：host 构建下 std 自带 panic handler / 分配器。
-#[cfg(all(target_os = "none", feature = "alloc"))]
-mod alloc;
+// 裸机专属 panic adapter：host 构建下 std 自带 panic handler。
 #[cfg(target_os = "none")]
 mod panic;
 

@@ -22,18 +22,20 @@
 //!
 //! # 每实例状态
 //!
-//! 候选集 + assignment cursor 仍经 `kcore_heap_alloc` 在 create 显式分配，作为
-//! task arg 传入。与旧实现不同，本组件不发布 endpoint、不暴露 ctx：cursor 只被
-//! dispatch 任务读写，因此不需要 `UnsafeCell`，跨 `kcore_*` 调用持有 `&mut` 也
-//! 不会别名（唯一引用者就是本任务）。
+//! 候选集 + assignment cursor 经 `kcore_memory_acquire`（`kcomp_sdk::mem`）在
+//! create 显式取 backing，作为 task arg 传入。与旧实现不同，本组件不发布
+//! endpoint、不暴露 ctx：cursor 只被 dispatch 任务读写，因此不需要 `UnsafeCell`，
+//! 跨 `kcore_*` 调用持有 `&mut` 也不会别名（唯一引用者就是本任务）。
 //!
 //! `attempt` 映射到结果端口名 `probe.result.<attempt>`（实例内唯一、与保留名
 //! `probe.result` 不同）；每次 create 只带**一台**设备，因此一个候选设备对应一个
 //! driver 实例（NoMatch 的实例是无资源、无 block endpoint 的 report-only 实例）。
 
 use kcomp_sdk::abi;
+use kcomp_sdk::abi::MemoryView;
 use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::mem;
 use kcomp_sdk::probe::{self, DriverCreateConfig, ProbeReply, ProbeResult};
 
 use crate::cursor::AssignmentCursor;
@@ -51,20 +53,13 @@ fn state_ptr(ctx: *mut ()) -> *mut ProberState {
 }
 
 /// 构造期失败清理：state 尚未发布给任何 consumer、也没有任务持有它，按契约
-/// §3「构造期清理由组件自己负责」归还。已经交给 Core 的存储（task arg）不在此
-/// 释放，按 §8 物理驻留。
+/// §3「构造期清理由组件自己负责」把 create 取的 backing 原样交回 Core。已经交给
+/// Core 的存储（task arg）不在此释放，按 §8 物理驻留。
 ///
-/// # Safety
-/// `state` 必须来自本文件里成功的一次 `kcore_heap_alloc`，且未被任何任务持有。
-unsafe fn free_state(state: *mut ProberState) {
-    // SAFETY: 调用者保证指针来自一次成功的 alloc，size / align 完全一致。
-    unsafe {
-        let _ = abi::kcore_heap_dealloc(
-            state.cast::<u8>(),
-            core::mem::size_of::<ProberState>(),
-            core::mem::align_of::<ProberState>(),
-        );
-    }
+/// 调用方保证 `view` 来自本文件里成功的一次 `mem::mem_alloc`，且该 backing 未被
+/// 任何任务持有。
+fn release_state(view: MemoryView) {
+    let _ = mem::mem_release(view);
 }
 
 fn name(bytes: &[u8]) -> &str {
@@ -256,17 +251,17 @@ extern "C" fn dispatch_task(arg: *mut ()) {
 // 写回 `*out_state`。**不发布 endpoint**：driver 不再回调 prober。
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // 1) 每实例 state：去重候选集 + assignment cursor（不再有可变全局）。
-    let state = unsafe {
-        abi::kcore_heap_alloc(
-            core::mem::size_of::<ProberState>(),
-            core::mem::align_of::<ProberState>(),
-        )
+    let state_view = match mem::mem_alloc(
+        core::mem::size_of::<ProberState>() as u64,
+        core::mem::align_of::<ProberState>() as u64,
+    ) {
+        Ok(view) => view,
+        Err(_) => {
+            kcomp_sdk::klog!("driver_prober: state allocation failed");
+            return Errno::ENOMEM.code();
+        }
     };
-    if state.is_null() {
-        kcomp_sdk::klog!("driver_prober: state allocation failed");
-        return Errno::ENOMEM.code();
-    }
-    let state = state.cast::<ProberState>();
+    let state = state_view.base as *mut ProberState;
     // SAFETY: 刚分配、无别名；ptr::write 直接放置初始值（不读旧值）。
     unsafe {
         core::ptr::write(
@@ -282,7 +277,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // SAFETY: 刚写入的本实例 state。
     if unsafe { &(*state).set }.is_empty() {
         kcomp_sdk::klog!("driver_prober: empty candidate directory");
-        unsafe { free_state(state) };
+        release_state(state_view);
         return Errno::ENOENT.code();
     }
 
@@ -293,7 +288,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let rc = unsafe { abi::kcore_task_create(dispatch_task, state.cast::<()>(), &mut task) };
     if rc < 0 {
         kcomp_sdk::klog!("driver_prober: dispatch task create failed (rc={})", rc);
-        unsafe { free_state(state) };
+        release_state(state_view);
         return rc;
     }
     // SAFETY: task 由上一行成功创建。

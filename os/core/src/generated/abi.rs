@@ -122,6 +122,33 @@ const _: () = {
     assert!(core::mem::offset_of!(TraceStatsAbi, enabled_mask) == 32);
 };
 
+/// 本执行域可访问的内存窗口（`kcore_memory_acquire` 的 out / `kcore_memory_release` 的 in）。
+/// `kind` 是整数常量编码（见 `KCORE_MEMORY_VIEW_*`），不用 Rust enum layout；
+/// `reserved` 保留、必须为 0。
+/// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
+/// （`base` / `len`）就是身份。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryView {
+    /// 访问窗口编码：`KCORE_MEMORY_VIEW_LOCAL_VA` / `KCORE_MEMORY_VIEW_LINEAR_OFFSET`。
+    pub kind: u32,
+    /// 保留；必须为 0。
+    pub reserved: u32,
+    /// 窗口基址（本域 VA；绝不返回物理地址或 Core 私有 VA）。
+    pub base: u64,
+    /// 窗口长度（字节；成功时 ≥ 请求的 `min_len`，实际粒度由 Core 决定）。
+    pub len: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MemoryView>() == 24);
+    assert!(core::mem::align_of::<MemoryView>() == 8);
+    assert!(core::mem::offset_of!(MemoryView, kind) == 0);
+    assert!(core::mem::offset_of!(MemoryView, reserved) == 4);
+    assert!(core::mem::offset_of!(MemoryView, base) == 8);
+    assert!(core::mem::offset_of!(MemoryView, len) == 16);
+};
+
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
 
@@ -171,6 +198,12 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_bind` 的机制编码：**Gate**（跨域 / 需 containment：调用走
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
+
+/// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
+pub const KCORE_MEMORY_VIEW_LOCAL_VA: u32 = 1;
+
+/// `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。
+pub const KCORE_MEMORY_VIEW_LINEAR_OFFSET: u32 = 2;
 
 /// `scheduler.policy` 契约的 endpoint 端口名（组合期 discover 用；provider 实例内唯一）。
 /// 名字不是全局身份：Core 只按 `(provider, port_name, contract)` 发现，绝不按名字

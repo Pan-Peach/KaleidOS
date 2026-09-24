@@ -30,11 +30,11 @@ use kcomp_sdk as _;
 #[cfg(test)]
 extern crate std;
 
-use kcomp_sdk::abi;
 use kcomp_sdk::block::dispatch::dispatch as block_dispatch;
 use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDeviceProvider, BlockDeviceService};
 use kcomp_sdk::errno::{Errno, Result};
 use kcomp_sdk::frame::Call;
+use kcomp_sdk::mem;
 use kcomp_sdk::{kcomp_instance_create, kcomp_instance_destroy, kcomp_services, klog};
 
 mod fat12;
@@ -98,15 +98,16 @@ kcomp_services! {
 kcomp_instance_create!(|_args, out_state| {
     let size = core::mem::size_of::<RamBlkState>();
     let align = core::mem::align_of::<RamBlkState>();
-    // SAFETY: 纯分配调用，无所有权语义；成功 = 对齐的 size 字节，失败 = NULL。
-    let state = unsafe { abi::kcore_heap_alloc(size, align) };
-    if state.is_null() {
-        return Errno::ENOMEM.code();
-    }
-    // SAFETY: state 是刚分配、对齐满足、尚未初始化的 RamBlkState 存储。
+    let state_view = match mem::mem_alloc(size as u64, align as u64) {
+        Ok(view) => view,
+        Err(_) => return Errno::ENOMEM.code(),
+    };
+    let state = state_view.base as *mut RamBlkState;
+    // SAFETY: state 是 acquire 交付、对齐满足的 RamBlkState 存储；ptr::write 直接
+    // 放置初始值（不读旧值）。
     unsafe {
         core::ptr::write(
-            state.cast::<RamBlkState>(),
+            state,
             RamBlkState {
                 sectors: fat12::SECTORS as u64,
             },
@@ -118,8 +119,7 @@ kcomp_instance_create!(|_args, out_state| {
     // Gate dispatch token；api/ctx = Direct 的 function table + state。
     if let Err(error) = SERVICE.publish_endpoint(BLOCK_DEVICE_NAME, BLOCK_PORT) {
         // 发布失败：pending 未提交，Core 不调用 destroy——构造期清理由组件负责。
-        // SAFETY: state 来自本次 create 的 kcore_heap_alloc（size/align 相同）。
-        unsafe { abi::kcore_heap_dealloc(state, size, align) };
+        let _ = mem::mem_release(state_view);
         return error.code();
     }
 

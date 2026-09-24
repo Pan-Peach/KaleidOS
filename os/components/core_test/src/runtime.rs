@@ -21,8 +21,8 @@ mod resource;
 mod sched;
 mod trace;
 
-use kcomp_sdk::abi;
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::mem;
 use report::Checks;
 
 // 实例创建入口（C ABI，`docs/architecture/component-lifecycle.md` §4）。
@@ -35,18 +35,18 @@ use report::Checks;
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let size = core::mem::size_of::<sched::State>();
     let align = core::mem::align_of::<sched::State>();
-    // SAFETY: 纯分配调用，无所有权语义；成功 = 按 align 对齐的 size 字节，失败 = NULL。
-    let raw = unsafe { abi::kcore_heap_alloc(size, align) };
-    if raw.is_null() {
-        return Errno::ENOMEM.code();
-    }
-    let state = raw.cast::<sched::State>();
+    let region = match mem::mem_alloc(size as u64, align as u64) {
+        Ok(view) => view,
+        Err(_) => return Errno::ENOMEM.code(),
+    };
+    let state = region.base as *mut sched::State;
     // 逐字段初始化而非 `ptr::write`：不产生任何 memcpy/memset libcall，保持
     // freestanding（packer 只放行 `kcore_*` 未定义符号）。
-    // SAFETY: state 指向刚分配、已对齐、尚未初始化的 State 存储。
+    // SAFETY: state 指向 acquire 交付、已对齐的 State 存储。
     unsafe {
         (*state).a_count = 0;
         (*state).b_count = 0;
+        (*state).region = region;
     }
     // SAFETY: out_state 由 Core 保证可写；Core 只存/传该指针，不解释、不释放。
     unsafe { *out_state = state.cast::<()>() };
@@ -68,9 +68,11 @@ kcomp_sdk::kcomp_instance_destroy!(|state| {
     for &c in "[core-test] teardown\n".as_bytes() {
         kcomp_sdk::console_write_byte(c);
     }
-    let size = core::mem::size_of::<sched::State>();
-    let align = core::mem::align_of::<sched::State>();
-    // SAFETY: state 是本组件 create 经 `*out_state` 写回、Core 原样交还的同一分配，
-    // 用分配时相同的 size / align 释放。
-    unsafe { abi::kcore_heap_dealloc(state.cast::<u8>(), size, align) }
+    // SAFETY: state 是本组件 create 经 `*out_state` 写回、Core 原样交还的同一分配；
+    // region 是 acquire 交付的原样 view。
+    let region = unsafe { (*state.cast::<sched::State>()).region };
+    match mem::mem_release(region) {
+        Ok(()) => 0,
+        Err(error) => error.code(),
+    }
 });

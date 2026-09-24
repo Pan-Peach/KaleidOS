@@ -34,19 +34,20 @@ pub(super) static EXPORTS: [Export; 40] = [
             implementation as *const ()
         }),
     },
-    // Category 1：Runtime / shared heap
+    // Category 1：Memory resource（域视图，无账本）
     Export {
-        name: b"kcore_heap_alloc",
+        name: b"kcore_memory_acquire",
         address: ExportAddress({
-            let implementation: extern "C" fn(usize, usize) -> *mut u8 = super::kcore_heap_alloc;
+            let implementation: extern "C" fn(u64, u64, *mut MemoryView) -> i32 =
+                super::kcore_memory_acquire;
             implementation as *const ()
         }),
     },
     Export {
-        name: b"kcore_heap_dealloc",
+        name: b"kcore_memory_release",
         address: ExportAddress({
-            let implementation: extern "C" fn(*mut u8, usize, usize) -> i32 =
-                super::kcore_heap_dealloc;
+            let implementation: extern "C" fn(*const MemoryView) -> i32 =
+                super::kcore_memory_release;
             implementation as *const ()
         }),
     },

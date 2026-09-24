@@ -23,6 +23,10 @@ static LAST_BIND: Mutex<Option<BindRecord>> = Mutex::new(None);
 /// `kcore_endpoint_publish` 的脚本回复（status）与最近一次入参快照。
 static PUBLISH_SCRIPT: Mutex<i32> = Mutex::new(0);
 static LAST_PUBLISH: Mutex<Option<PublishRecord>> = Mutex::new(None);
+/// `kcore_memory_acquire` 的脚本回复：`(status, base, len)`。
+static MEM_ACQUIRE_SCRIPT: Mutex<(i32, usize, usize)> = Mutex::new((0, 0, 0));
+/// `kcore_memory_release` 的脚本回复（status）。
+static MEM_RELEASE_SCRIPT: Mutex<i32> = Mutex::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 最近一次 `kcore_endpoint_call` 的入参快照。
@@ -72,6 +76,19 @@ pub(crate) fn reset_script() {
     *LAST_BIND.lock().unwrap() = None;
     *PUBLISH_SCRIPT.lock().unwrap() = 0;
     *LAST_PUBLISH.lock().unwrap() = None;
+    *MEM_ACQUIRE_SCRIPT.lock().unwrap() = (0, 0, 0);
+    *MEM_RELEASE_SCRIPT.lock().unwrap() = 0;
+}
+
+/// 设置下一次 `kcore_memory_acquire` 的回复：`status != 0` 时失败；成功时写
+/// `MemoryView { kind = LOCAL_VA, reserved = 0, base, len }`。
+pub(crate) fn script_mem_acquire(status: i32, base: usize, len: usize) {
+    *MEM_ACQUIRE_SCRIPT.lock().unwrap() = (status, base, len);
+}
+
+/// 设置下一次 `kcore_memory_release` 的返回状态。
+pub(crate) fn script_mem_release(status: i32) {
+    *MEM_RELEASE_SCRIPT.lock().unwrap() = status;
 }
 
 /// 设置下一次 `kcore_endpoint_call` 的 `(transport, method)` 返回。
@@ -204,6 +221,43 @@ pub extern "C" fn kcore_endpoint_publish(
         ctx: ctx as usize,
     });
     *PUBLISH_SCRIPT.lock().unwrap()
+}
+
+/// Core `kcore_memory_acquire` 的替身：按脚本回复 `(status, base, len)`；成功时写
+/// `MemoryView`（kind = LOCAL_VA），失败 = `-Errno` 且不写 out（与 Core 同档）。
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_memory_acquire(
+    _min_len: u64,
+    _min_align: u64,
+    out_view: *mut crate::abi::MemoryView,
+) -> i32 {
+    use crate::abi::{KCORE_MEMORY_VIEW_LOCAL_VA, MemoryView};
+    if out_view.is_null() {
+        return -14; // EFAULT
+    }
+    let (status, base, len) = *MEM_ACQUIRE_SCRIPT.lock().unwrap();
+    if status != 0 {
+        return status;
+    }
+    // SAFETY: out_view 非空（上面已查）；调用方（SDK / 测试）保证可写。
+    unsafe {
+        out_view.write(MemoryView {
+            kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+            reserved: 0,
+            base: base as u64,
+            len: len as u64,
+        });
+    }
+    0
+}
+
+/// Core `kcore_memory_release` 的替身：按脚本返回状态；null view → `-EFAULT`。
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_memory_release(view: *const crate::abi::MemoryView) -> i32 {
+    if view.is_null() {
+        return -14; // EFAULT
+    }
+    *MEM_RELEASE_SCRIPT.lock().unwrap()
 }
 
 /// Core `kcore_endpoint_bind` 的替身：按脚本返回 `(status, mechanism, api, ctx)`；
