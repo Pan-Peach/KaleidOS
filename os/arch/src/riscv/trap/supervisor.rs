@@ -20,12 +20,19 @@ pub fn init() {
     }
 }
 
-unsafe fn set_trap_vector() {
+/// 普通 Core trap 向量（`trap_vec`）的链接地址。
+///
+/// gateway 在组件运行期间把 `stvec` 临时换成自己的双映射入口，切回 Core 前必须
+/// 装回本地址，使嵌套 / 普通 Core trap 不走组件入口路径。
+pub fn vector_address() -> usize {
     unsafe extern "C" {
         static trap_vec: u8;
     }
+    core::ptr::addr_of!(trap_vec) as usize
+}
 
-    let addr = core::ptr::addr_of!(trap_vec) as usize;
+unsafe fn set_trap_vector() {
+    let addr = vector_address();
 
     unsafe {
         core::arch::asm!("csrw stvec, {addr}",

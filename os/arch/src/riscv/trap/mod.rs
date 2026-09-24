@@ -143,10 +143,10 @@ mod tests {
 
 /// cause 寄存器解码（`Scause` 名称沿用 S-mode；M-mode 下语义相同，
 /// 只是中断位位置与寄存器名不同，由 `machine` 模块自行读取）。
-struct Scause(usize);
+pub(crate) struct Scause(usize);
 
 impl Scause {
-    fn from_bits(bits: usize) -> Self {
+    pub(crate) fn from_bits(bits: usize) -> Self {
         Scause(bits)
     }
 
@@ -154,7 +154,7 @@ impl Scause {
         (self.0 >> (usize::BITS - 1)) != 0
     }
 
-    fn cause(&self) -> Trap {
+    pub(crate) fn cause(&self) -> Trap {
         let code = self.0 & !(1usize << (usize::BITS - 1));
 
         if self.is_interrupt() {
@@ -174,6 +174,8 @@ pub mod supervisor;
 pub use machine::init;
 #[cfg(all(feature = "supervisor", not(feature = "machine")))]
 pub use supervisor::init;
+#[cfg(all(feature = "supervisor", not(feature = "machine")))]
+pub use supervisor::vector_address;
 
 #[cfg(all(feature = "machine", feature = "supervisor"))]
 pub fn init() {}

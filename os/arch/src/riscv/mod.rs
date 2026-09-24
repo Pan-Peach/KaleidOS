@@ -22,6 +22,15 @@ pub mod firmware;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod plic;
 
+/// 私有 AS 的 assembly gateway（increment 3）：S-mode + MMU + supervisor 才有
+/// 意义（`satp` 切换 + `sret` 往返）；NoMMU / M-mode 构建不提供，也不静默降级。
+#[cfg(all(
+    feature = "vm-mmu",
+    feature = "supervisor",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+pub mod gateway;
+
 /// 重定位实现：纯字节/编码逻辑，任何目标可编译（host 也测它本身）。
 pub mod elf;
 

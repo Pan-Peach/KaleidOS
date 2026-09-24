@@ -13,6 +13,14 @@ pub mod exit;
 pub mod export;
 pub mod failure;
 pub mod image;
+/// 私有 AS 切换网关的 Core 侧准备（increment 3：机制已落地、生命周期未接线；
+/// 仅 S-mode + MMU + RISC-V 目标有意义，其余 profile 不提供、也不降级）。
+#[cfg(all(
+    feature = "vm-mmu",
+    feature = "supervisor",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+pub mod isolated;
 pub mod load;
 pub mod loader;
 pub mod registry;

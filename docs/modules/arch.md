@@ -20,12 +20,12 @@
 - 通用地址方案原语：`HIGH_HALF_OFFSET`、`physical_address_of`（RV64 高半区 → 物理；否则恒等）。
 - 架构中立 VM contract（`os/arch/src/vm.rs`）：`AddressSpaceBackend`（`const GRANULE`、`map` / `unmap` / `translate` / `activate`）、`VirtualRange` / `PhysicalRange` / `MappingPermission` / `PageAlloc`。
 - 组件传输 / 对象 ABI 机制：`ComponentStore` / `StoreEntry`（`store.rs`）、`RelocationBackend` / `Relocation` / `WordSize`（`component.rs`）。
-- 具体 RISC-V 机制：trap 入口与分发、context switch、Sv39 / Sv32 页表编码与 walk、NoMMU identity backend、SBI 边界、PLIC、`RiscvRelocator`。
+- 具体 RISC-V 机制：trap 入口与分发、context switch、Sv39 / Sv32 页表编码与 walk、NoMMU identity backend、SBI 边界、PLIC、`RiscvRelocator`、私有 AS 的 assembly gateway（双映射 `satp` 切换 / trap 往返，increment 3）。
 
 ## 暴露什么机制
 
 - 类型别名（按 cfg 选定具体实现）：`CpuImpl`、`ConsoleImpl`、`ResetImpl`、`TimerImpl`、`InterruptImpl`、`ContextImpl`、`AddressSpaceImpl`、`ComponentRelocationImpl`。
-- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset`（`lib.rs`）、`AddressSpaceBackend`（`vm.rs`）、`ComponentStore`（`store.rs`）、`RelocationBackend`（`component.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`NoMmuAddressSpace`（`nommu.rs`）、`activate` / `flush_tlb`（`riscv/mmu/mod.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）。
+- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset`（`lib.rs`）、`AddressSpaceBackend`（`vm.rs`）、`ComponentStore`（`store.rs`）、`RelocationBackend`（`component.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`NoMmuAddressSpace`（`nommu.rs`）、`activate` / `flush_tlb`（`riscv/mmu/mod.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`gateway_enter` / `gateway_trap_entry` / `pages` / `register_component_fault_handler`（`riscv/gateway/`）。
 
 ## 明确不做
 
@@ -57,5 +57,6 @@
 | `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf}.rs` | RISC-V family 机制 |
 | `os/arch/src/riscv/context/{mod,switch32.S,switch64.S}` | 上下文切换 |
 | `os/arch/src/riscv/trap/{mod,supervisor,machine}.rs` + `trap*.S` | trap 入口 / 分发 / S-mode handler |
+| `os/arch/src/riscv/gateway/{mod,gateway32.S,gateway64.S}` | 私有 AS assembly gateway（双映射 `satp` 切换 / trap 往返 / 窄故障分派接缝；increment 3，无生产调用方） |
 | `os/arch/src/riscv/mmu/{mod,address_space,sv32,sv39,test_pool}.rs` | Sv32 / Sv39 页表机制 |
 | `os/arch/Kconfig` | `ARCH_*` / `PRIVILEGE_*` / `VM_*` choice |

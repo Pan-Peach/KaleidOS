@@ -57,6 +57,18 @@ CASES = (
     ("tlb-invalidate", 13, None),
     ("timer", None, None),
     ("external-irq", None, None),
+    # increment 3: the Isolated-domain assembly gateway.  `isolated-transition`
+    # proves the Core -> private AS -> Core round-trip (register/tp/gp save-
+    # restore + component-visible private root); `isolated-timer` proves a
+    # returning timer interrupt taken inside the private AS, handled on the
+    # Core AS / Core trap stack, then resumed; `isolated-fault` proves a
+    # recoverable component page fault (Core policy maps the missing page and
+    # the component retries); `isolated-fault-abandon` proves component
+    # identity alone is NOT recoverable (Core refuses, the gateway abandons).
+    ("isolated-transition", None, None),
+    ("isolated-timer", None, None),
+    ("isolated-fault", None, None),
+    ("isolated-fault-abandon", None, None),
 )
 
 

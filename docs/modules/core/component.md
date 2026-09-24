@@ -29,6 +29,7 @@
 - `failure.rs`：`fail_component`、`revoke_authority_and_unbind`。
 - `exit.rs`：`stop_component`、`ComponentStopError`。
 - `runtime_slot.rs`：每实例 **runtime slot**（`RuntimeSlotTable`、`RuntimeSlot`）；`install` / `clear` / `get`、全局 `get_slots`。Core 只存 / 取组件运行时自有的 opaque 指针（RISC-V `tp`，切换边界安装；`0` = 无 slot），**从不解释** —— 执行状态，不是内存记账（`docs/architecture/memory-and-heap.md` §5）。
+- `isolated.rs`：私有 AS 切换的 Core 侧准备（`PreparedTransition`、`prepare`、`enter`、`ComponentFault`、`FaultPolicy`、`install` / `register_fault_policy`）。increment 3：机制已落地但**组件生命周期尚未调用**（inactive path，ArchTest 直接驱动）；`prepare` 在锁内校验并取出 `Copy` 描述符，`enter` 在锁外只把描述符搬给 `arch::riscv::gateway` 汇编。
 - 重导出：`panic_escape`、`ComponentStopError`、`stop_component`、`fail_component`、`ComponentImage`、`ComponentImageId`。
 
 ## 明确不做
@@ -58,4 +59,5 @@
 | `os/core/src/component/failure.rs` | `fail_component`、归属撤销 |
 | `os/core/src/component/exit.rs` | `stop_component`（`Stopping` / `Stopped`） |
 | `os/core/src/component/runtime_slot.rs` | 每实例 runtime slot（`tp`）：install / clear / get |
+| `os/core/src/component/isolated.rs` | 私有 AS 切换的 Core 侧准备 + 窄故障策略（increment 3；无生命周期调用方） |
 | `os/core/src/component/generated/exports.rs` | 生成的 `EXPORTS: [Export; 40]` 表 |

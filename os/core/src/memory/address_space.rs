@@ -7,7 +7,9 @@ use crate::component::ComponentId;
 
 // 共享词汇表直接复用 arch::vm（os/core 依赖 os/arch，方向正确）。
 // 这里 re-export 一份，让 `address_space::PhysicalRange` 等对 memory/mod.rs 仍可用。
-pub use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
+pub use arch::vm::{
+    AddressSpaceBackend, DualMappedPage, MappingPermission, PhysicalRange, VirtualRange,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AddressSpaceId(u32);
@@ -26,6 +28,28 @@ impl AddressSpaceId {
 pub struct AddressSpaceHandle {
     id: AddressSpaceId,
     generation: u32,
+}
+
+impl AddressSpaceHandle {
+    /// 从原始部件重建句柄。
+    ///
+    /// 句柄是 **identity（id + generation），不是权限**：每次管理器调用都按其
+    /// 校验，伪造 / 过期的句柄得到 `MapError::NoSuchSpace`。为 Core 内部需要
+    /// 在不持管理器锁的路径上传递身份（故障归因 / 测试）提供。
+    pub const fn from_raw(id: u32, generation: u32) -> Self {
+        Self {
+            id: AddressSpaceId::from_raw(id),
+            generation,
+        }
+    }
+
+    pub const fn raw_id(self) -> u32 {
+        self.id.raw()
+    }
+
+    pub const fn raw_generation(self) -> u32 {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +76,17 @@ pub struct Mapping {
 impl Mapping {
     pub(crate) fn backend_parts(self) -> (VirtualRange, PhysicalRange, MappingPermission) {
         (self.virtual_range, self.physical_range, self.permission)
+    }
+}
+
+/// arch 的「必须同 VA → 同 PA 的双映射机制页」→ Core 记录的映射。
+impl From<DualMappedPage> for Mapping {
+    fn from(page: DualMappedPage) -> Self {
+        Self {
+            virtual_range: page.virtual_range,
+            physical_range: page.physical_range,
+            permission: page.permission,
+        }
     }
 }
 
@@ -99,6 +134,29 @@ pub enum MapError {
     BackendFailed,
 }
 
+/// 私有 AS 一次切换（increment 3 的 assembly gateway）准备阶段的失败。
+///
+/// **Core 校验、Core 拒绝**：这里的所有检查都发生在任何 `satp` 切换之前，
+/// 失败即不发布描述符、不触碰已提交的映射真相。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolatedPrepareError {
+    /// 句柄不存在（未知 id / generation）。
+    NoSuchSpace,
+    /// 目标空间已退役。
+    Retired,
+    /// 该 profile 没有私有地址空间能力 / 没有真实 backend。
+    Unsupported,
+    /// gateway 机制页的实例侧映射与 arch 给出的期望不一致（已存在别的映射 /
+    /// 后端拒绝）。**绝不覆盖**已提交的映射真相。
+    GatewayMapping,
+    /// 组件入口不在任何**可执行**映射内。
+    EntryNotExecutable,
+    /// 组件栈区间不被单条**可读写**映射完整覆盖。
+    StackNotWritable,
+    /// 栈区间形状非法（空 / 未页对齐 / 栈顶未 16 字节对齐 / 地址溢出）。
+    InvalidStack,
+}
+
 /// 对齐检查委托给 backend 的 `GRANULE`（不引用分配器常量）。
 /// GRANULE 必须是 2 的幂；NoMMU backend 用 1 时这里自动退化为恒真。
 fn is_aligned<B: AddressSpaceBackend>(addr: usize) -> bool {
@@ -107,6 +165,20 @@ fn is_aligned<B: AddressSpaceBackend>(addr: usize) -> bool {
 
 fn ranges_overlap(a: &VirtualRange, b: &VirtualRange) -> bool {
     a.base < b.base + b.size && b.base < a.base + a.size
+}
+
+/// `[base, base + size)` 是否被 `range` 完整覆盖（空区间 / 溢出一律 false）。
+fn range_contains(range: &VirtualRange, base: usize, size: usize) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    let Some(range_end) = range.base.checked_add(range.size) else {
+        return false;
+    };
+    range.base <= base && end <= range_end
 }
 
 /// Core-owned logical address space: 资源/权限/生命周期对象。
@@ -410,6 +482,105 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         self.get_mut(handle).ok_or(MapError::NoSuchSpace)?.retire();
         Ok(())
     }
+
+    /// 准备一次私有 AS 切换（increment 3 的 assembly gateway）。
+    ///
+    /// 全部校验 + gateway 机制页的实例侧映射都发生在**切换之前**；成功后返回
+    /// `Copy`、无引用的 [`PreparedActivation`]——调用方拿到它之后不得再持有本
+    /// 管理器锁（切换汇编在目标 root 生效后不会再碰 Core）。
+    ///
+    /// 校验顺序（任一失败即显式拒绝，不发布描述符）：
+    /// 1. 栈形状：非空、页对齐、栈顶 16 字节对齐、地址不溢出；
+    /// 2. 句柄存在且 `Ready`（退役拒绝）；
+    /// 3. 入口落在一条**已记录且带 `EXECUTE`** 的映射内；
+    /// 4. 栈被**单条**带 `READ|WRITE` 的映射完整覆盖；
+    /// 5. `gateway_pages` 按精确 VA→PA 落成实例侧映射（完全相同的既有映射视为
+    ///    已就绪——准备是幂等的；存在冲突则拒绝，**绝不覆盖**）。
+    ///
+    /// 第 5 步中途失败时，**撤销本次新落的** gateway 页（已存在的映射不动）：
+    /// 准备要么完整成立，要么不留下半套机制映射。
+    pub fn prepare_transition(
+        &mut self,
+        handle: AddressSpaceHandle,
+        gateway_pages: &[DualMappedPage],
+        entry: usize,
+        stack: VirtualRange,
+    ) -> Result<PreparedActivation<B::Activation>, IsolatedPrepareError> {
+        let stack_top = stack
+            .base
+            .checked_add(stack.size)
+            .ok_or(IsolatedPrepareError::InvalidStack)?;
+        if stack.size == 0
+            || stack_top % 16 != 0
+            || !is_aligned::<B>(stack.base)
+            || !is_aligned::<B>(stack.size)
+        {
+            return Err(IsolatedPrepareError::InvalidStack);
+        }
+
+        let space = self.get(handle).ok_or(IsolatedPrepareError::NoSuchSpace)?;
+        if space.state() != AddressSpaceState::Ready {
+            return Err(IsolatedPrepareError::Retired);
+        }
+        let entry_mapping = space
+            .mappings()
+            .iter()
+            .find(|m| range_contains(&m.virtual_range, entry, 1));
+        match entry_mapping {
+            Some(mapping) if mapping.permission.contains(MappingPermission::EXECUTE) => {}
+            _ => return Err(IsolatedPrepareError::EntryNotExecutable),
+        }
+        let stack_mapping = space
+            .mappings()
+            .iter()
+            .find(|m| range_contains(&m.virtual_range, stack.base, stack.size));
+        match stack_mapping {
+            Some(mapping)
+                if mapping.permission.contains(MappingPermission::READ)
+                    && mapping.permission.contains(MappingPermission::WRITE) => {}
+            _ => return Err(IsolatedPrepareError::StackNotWritable),
+        }
+
+        let space = self
+            .get_mut(handle)
+            .ok_or(IsolatedPrepareError::NoSuchSpace)?;
+        let mut newly_mapped = 0usize;
+        for page in gateway_pages {
+            let expected = Mapping::from(*page);
+            match space.mapping_exact(&page.virtual_range) {
+                Some(existing) if *existing == expected => {}
+                Some(_) => {
+                    rollback_new_gateway_pages(space, gateway_pages, newly_mapped);
+                    return Err(IsolatedPrepareError::GatewayMapping);
+                }
+                None => match space.map(expected) {
+                    Ok(()) => newly_mapped += 1,
+                    Err(_) => {
+                        rollback_new_gateway_pages(space, gateway_pages, newly_mapped);
+                        return Err(IsolatedPrepareError::GatewayMapping);
+                    }
+                },
+            }
+        }
+
+        space.prepare_activation().map_err(|error| match error {
+            MapError::NoSuchSpace => IsolatedPrepareError::NoSuchSpace,
+            MapError::Retired => IsolatedPrepareError::Retired,
+            _ => IsolatedPrepareError::GatewayMapping,
+        })
+    }
+}
+
+/// 撤销 `prepare_transition` 本次**新落**的前 `count` 个 gateway 页（best effort：
+/// 已存在的映射不动；后端 unmap 失败不掩盖原始错误——原始错误已经确定返回）。
+fn rollback_new_gateway_pages<B: AddressSpaceBackend>(
+    space: &mut KernelAddressSpace<B>,
+    gateway_pages: &[DualMappedPage],
+    count: usize,
+) {
+    for page in gateway_pages.iter().take(count) {
+        let _ = space.unmap(&page.virtual_range);
+    }
 }
 
 // 真实地址空间后端 alias（`arch::AddressSpaceImpl`）只在 VM profile + 适用 target 下
@@ -424,12 +595,15 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
 ))]
 mod active {
     use super::{
-        AddressSpaceBackend, AddressSpaceHandle, AddressSpaceManager, MapError, Mapping,
-        PreparedActivation, VirtualRange,
+        AddressSpaceBackend, AddressSpaceHandle, AddressSpaceManager, DualMappedPage,
+        IsolatedPrepareError, MapError, Mapping, PreparedActivation, VirtualRange,
     };
     use crate::component::ComponentId;
 
     pub use arch::AddressSpaceImpl;
+
+    /// 当前 backend 的切换 token 类型（RISC-V = 预打包的 `SatpActivation`）。
+    pub type ActiveActivation = <AddressSpaceImpl as AddressSpaceBackend>::Activation;
 
     type ActiveSpaces = AddressSpaceManager<AddressSpaceImpl>;
 
@@ -479,11 +653,48 @@ mod active {
         SPACES.lock().unmap(handle, range)
     }
 
+    /// 精确查询一条已记录映射（只读快照；Core 真相）。
+    pub fn mapping_exact(
+        handle: AddressSpaceHandle,
+        range: &VirtualRange,
+    ) -> Result<Option<Mapping>, MapError> {
+        SPACES.lock().mapping_exact(handle, range)
+    }
+
+    /// 翻译虚拟地址（后端真相；未映射是 `Ok(None)`）。
+    pub fn translate(handle: AddressSpaceHandle, va: usize) -> Result<Option<usize>, MapError> {
+        SPACES.lock().translate(handle, va)
+    }
+
+    /// 空间的 owner（Core 真相；故障归因 / 诊断用）。
+    pub fn owner(handle: AddressSpaceHandle) -> Result<ComponentId, MapError> {
+        SPACES
+            .lock()
+            .get(handle)
+            .map(|space| space.owner())
+            .ok_or(MapError::NoSuchSpace)
+    }
+
+    /// 准备一次私有 AS 切换（increment 3 的 assembly gateway）：全部校验 +
+    /// gateway 机制页映射在锁内完成，返回 `Copy` 描述符；**锁不跨切换**。
+    pub fn prepare_transition(
+        handle: AddressSpaceHandle,
+        gateway_pages: &[DualMappedPage],
+        entry: usize,
+        stack: VirtualRange,
+    ) -> Result<PreparedActivation<ActiveActivation>, IsolatedPrepareError> {
+        if !isolation_capable() {
+            return Err(IsolatedPrepareError::Unsupported);
+        }
+        SPACES
+            .lock()
+            .prepare_transition(handle, gateway_pages, entry, stack)
+    }
+
     /// 准备激活描述符（持锁取一次；消费方不再触碰本管理器）。
     pub fn prepare_activation(
         handle: AddressSpaceHandle,
-    ) -> Result<PreparedActivation<<AddressSpaceImpl as AddressSpaceBackend>::Activation>, MapError>
-    {
+    ) -> Result<PreparedActivation<ActiveActivation>, MapError> {
         SPACES.lock().prepare_activation(handle)
     }
 
@@ -501,8 +712,8 @@ mod active {
     )
 ))]
 pub use active::{
-    AddressSpaceImpl, adopt, create_address_space_for, isolation_capable, map, prepare_activation,
-    retire, unmap,
+    ActiveActivation, AddressSpaceImpl, adopt, create_address_space_for, isolation_capable, map,
+    mapping_exact, owner, prepare_activation, prepare_transition, retire, translate, unmap,
 };
 
 /// 无后端构建（host test）：没有可用的私有地址空间实现——能力恒为 `false`，
@@ -539,10 +750,6 @@ pub fn create_address_space_for(_owner: ComponentId) -> Result<AddressSpaceHandl
 )))]
 pub fn map(_handle: AddressSpaceHandle, _mapping: Mapping) -> Result<(), MapError> {
     Err(MapError::BackendFailed)
-}
-#[allow(dead_code)]
-const fn _handle_shape(id: AddressSpaceId, generation: u32) -> AddressSpaceHandle {
-    AddressSpaceHandle { id, generation }
 }
 
 #[cfg(test)]
@@ -1157,6 +1364,406 @@ mod tests {
         assert_eq!(s.state(), AddressSpaceState::Ready);
         assert_eq!(s.mappings().len(), 1);
         let _ = s.handle();
+    }
+
+    // -- increment 3：私有 AS 切换准备（assembly gateway 的 Core 侧校验）-------
+
+    fn dual_page(base: usize, pa: usize, perm: MappingPermission) -> DualMappedPage {
+        DualMappedPage {
+            virtual_range: VirtualRange {
+                base,
+                size: VM_PAGE,
+            },
+            physical_range: PhysicalRange {
+                base: pa,
+                size: VM_PAGE,
+            },
+            permission: perm,
+        }
+    }
+
+    fn gateway_pages() -> [DualMappedPage; 2] {
+        [
+            dual_page(
+                0x9000,
+                0x1_9000,
+                MappingPermission::READ | MappingPermission::EXECUTE,
+            ),
+            dual_page(
+                0xa000,
+                0x1_a000,
+                MappingPermission::READ | MappingPermission::WRITE,
+            ),
+        ]
+    }
+
+    const ENTRY: usize = 0x1000;
+    const STACK: VirtualRange = VirtualRange {
+        base: 0x7000,
+        size: VM_PAGE,
+    };
+
+    /// 一次成功的准备：gateway 两页被落成实例侧映射，入口/栈校验通过，返回
+    /// 描述符是快照（准备幂等：第二次调用不重复落映射、不报 Overlap）。
+    #[test]
+    fn prepare_transition_maps_gateway_pages_and_is_idempotent() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(handle, mapping(STACK.base, STACK.size, rw()))
+            .unwrap();
+
+        let prepared = manager
+            .prepare_transition(handle, &gateway_pages(), ENTRY, STACK)
+            .expect("prepared transition");
+        assert_eq!(prepared.handle(), handle);
+        assert_eq!(
+            prepared.token(),
+            FakeActivation {
+                mapped_count: 4,
+                asid: 7
+            },
+            "2 条实例映射 + 2 条 gateway 机制页"
+        );
+        for page in gateway_pages() {
+            assert_eq!(
+                manager.mapping_exact(handle, &page.virtual_range).unwrap(),
+                Some(Mapping::from(page)),
+                "gateway 机制页必须按同 VA → 同 PA 落成实例侧映射"
+            );
+        }
+
+        // 幂等：同一组机制页再准备一次不产生第二条映射、不报 Overlap。
+        let again = manager
+            .prepare_transition(handle, &gateway_pages(), ENTRY, STACK)
+            .expect("idempotent prepare");
+        assert_eq!(again.token().mapped_count, 4);
+        assert_eq!(
+            manager.get(handle).unwrap().backend.mapped.len(),
+            4,
+            "不得重复落 gateway 映射"
+        );
+    }
+
+    /// gateway 机制页已存在**不同**的映射 → 显式拒绝，且不覆盖已提交真相。
+    #[test]
+    fn prepare_transition_rejects_conflicting_gateway_mapping() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(handle, mapping(STACK.base, STACK.size, rw()))
+            .unwrap();
+        // 代码页 VA 已被别的 PA 占用（不是 gateway 期望的映射）。
+        let intruder = mapping(0x9000, 0x2_9000, MappingPermission::READ);
+        manager.map(handle, intruder).unwrap();
+
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::GatewayMapping)
+        );
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &intruder.virtual_range)
+                .unwrap(),
+            Some(intruder),
+            "冲突时不得触碰 / 覆盖已提交映射"
+        );
+    }
+
+    /// 第 `fail_at` 次 `map` 失败的后端：验证 prepare 的 gateway 半途失败会
+    /// **撤销本次新落的页**，不留下半套机制映射。
+    struct SelectiveMapFailBackend {
+        map_calls: usize,
+        fail_at: usize,
+        committed: Vec<(VirtualRange, PhysicalRange, MappingPermission)>,
+        unmapped: Vec<VirtualRange>,
+    }
+
+    impl SelectiveMapFailBackend {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                map_calls: 0,
+                fail_at,
+                committed: Vec::new(),
+                unmapped: Vec::new(),
+            }
+        }
+    }
+
+    impl AddressSpaceBackend for SelectiveMapFailBackend {
+        type Error = ();
+        const GRANULE: usize = VM_PAGE;
+        const PRIVATE_ADDRESS_SPACE: bool = true;
+        type Activation = FakeActivation;
+
+        fn create(_alloc: arch::vm::PageAlloc) -> Result<Self, ()> {
+            Ok(Self::new(0))
+        }
+
+        fn map(
+            &mut self,
+            va: VirtualRange,
+            pa: PhysicalRange,
+            perm: MappingPermission,
+        ) -> Result<(), ()> {
+            self.map_calls += 1;
+            if self.map_calls == self.fail_at {
+                return Err(());
+            }
+            self.committed.push((va, pa, perm));
+            Ok(())
+        }
+
+        fn unmap(&mut self, va: VirtualRange) -> Result<(), ()> {
+            self.unmapped.push(va);
+            self.committed.retain(|(range, _, _)| *range != va);
+            Ok(())
+        }
+
+        fn translate(&self, _va: usize) -> Option<usize> {
+            None
+        }
+
+        fn activate(&self) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn prepare_activation(&self) -> Self::Activation {
+            FakeActivation {
+                mapped_count: self.committed.len(),
+                asid: 1,
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_transition_rolls_back_partial_gateway_mapping() {
+        // 第 1/2 次是 entry + stack；第 3 次落 gateway 代码页成功，第 4 次失败。
+        let mut manager: AddressSpaceManager<SelectiveMapFailBackend> =
+            AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(9), SelectiveMapFailBackend::new(4));
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(handle, mapping(STACK.base, STACK.size, rw()))
+            .unwrap();
+
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::GatewayMapping)
+        );
+        let pages = gateway_pages();
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &pages[0].virtual_range)
+                .unwrap(),
+            None,
+            "半途失败必须撤销本次新落的 gateway 代码页"
+        );
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &pages[1].virtual_range)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            manager.get(handle).unwrap().backend.unmapped,
+            vec![pages[0].virtual_range]
+        );
+
+        // 后端恢复后重试：完整落位（准备幂等、可重试）。
+        manager.get_mut(handle).unwrap().backend.fail_at = 0;
+        assert!(
+            manager
+                .prepare_transition(handle, &pages, ENTRY, STACK)
+                .is_ok()
+        );
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &pages[0].virtual_range)
+                .unwrap(),
+            Some(Mapping::from(pages[0]))
+        );
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &pages[1].virtual_range)
+                .unwrap(),
+            Some(Mapping::from(pages[1]))
+        );
+    }
+
+    /// 入口必须在一条**已记录且可执行**的映射内。
+    #[test]
+    fn prepare_transition_requires_executable_entry() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager.map(handle, mapping(ENTRY, VM_PAGE, rw())).unwrap();
+        manager
+            .map(handle, mapping(STACK.base, STACK.size, rw()))
+            .unwrap();
+
+        // RW（无 X）→ 拒绝。
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::EntryNotExecutable)
+        );
+        // 未映射地址 → 同样拒绝。
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), 0x4000, STACK),
+            Err(IsolatedPrepareError::EntryNotExecutable)
+        );
+    }
+
+    /// 栈必须被单条 READ|WRITE 映射完整覆盖；只读 / 部分覆盖都拒绝。
+    #[test]
+    fn prepare_transition_requires_writable_stack() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(
+                handle,
+                mapping(STACK.base, VM_PAGE, MappingPermission::READ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::StackNotWritable)
+        );
+
+        // 只覆盖一半（单条映射不完整覆盖）→ 仍拒绝。
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(handle, mapping(STACK.base, VM_PAGE, rw()))
+            .unwrap();
+        let half = VirtualRange {
+            base: STACK.base,
+            size: 2 * VM_PAGE,
+        };
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, half),
+            Err(IsolatedPrepareError::StackNotWritable)
+        );
+    }
+
+    /// 栈形状非法（空 / 非页对齐 / 栈顶非 16 字节对齐）在触碰任何状态前拒绝。
+    #[test]
+    fn prepare_transition_rejects_invalid_stack_shape() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+
+        let empty = VirtualRange {
+            base: STACK.base,
+            size: 0,
+        };
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, empty),
+            Err(IsolatedPrepareError::InvalidStack)
+        );
+        let unaligned = VirtualRange {
+            base: STACK.base,
+            size: VM_PAGE - 16,
+        };
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, unaligned),
+            Err(IsolatedPrepareError::InvalidStack),
+            "栈顶 16 字节对齐是 arch 的硬前提"
+        );
+        // 失败不得有任何副作用：gateway 页没有被落进空间。
+        assert_eq!(manager.get(handle).unwrap().backend.mapped.len(), 0);
+    }
+
+    /// 退役 / 未知句柄拒绝，绝不降级。
+    #[test]
+    fn prepare_transition_rejects_retired_and_unknown_space() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        manager
+            .map(
+                handle,
+                mapping(
+                    ENTRY,
+                    VM_PAGE,
+                    MappingPermission::READ | MappingPermission::EXECUTE,
+                ),
+            )
+            .unwrap();
+        manager
+            .map(handle, mapping(STACK.base, STACK.size, rw()))
+            .unwrap();
+        manager.retire(handle).unwrap();
+
+        assert_eq!(
+            manager.prepare_transition(handle, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::Retired)
+        );
+
+        let ghost = AddressSpaceHandle::from_raw(999, 1);
+        assert_eq!(
+            manager.prepare_transition(ghost, &gateway_pages(), ENTRY, STACK),
+            Err(IsolatedPrepareError::NoSuchSpace)
+        );
+    }
+
+    /// 句柄 raw 部件往返：从 raw 重建的句柄仍按 id + generation 校验。
+    #[test]
+    fn handle_raw_parts_round_trip_identity() {
+        let handle = AddressSpaceHandle::from_raw(3, 9);
+        assert_eq!(handle.raw_id(), 3);
+        assert_eq!(handle.raw_generation(), 9);
+        assert_eq!(
+            AddressSpaceHandle::from_raw(handle.raw_id(), handle.raw_generation()),
+            handle
+        );
     }
 
     // -- Property tests（Invariant A–D，docs/development/testing.md §5）---------------------

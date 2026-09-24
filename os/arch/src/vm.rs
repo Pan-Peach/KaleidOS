@@ -32,6 +32,20 @@ bitflags! {
     }
 }
 
+/// 一个必须**在 Core AS 与目标实例 AS 中以同一 VA → 同一 PA** 出现的机制页
+/// （increment 3 的 assembly gateway：代码页 + 入口 scratch 页）。
+///
+/// Core 把 arch 给出的这对 range 落成实例 AS 的一条映射；因为 Core AS 里同一
+/// VA 已经指到同一 PA，切换 `satp` 前后 PC / 数据访问都连续，不必在两个 root
+/// 里维护不同的 gateway VA。它是**机制页，不是组件资源**：除这些页之外，实例
+/// AS 只应包含该实例自己的内存（Core 段 / Core 堆 / 页表 / MMIO 都不进）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DualMappedPage {
+    pub virtual_range: VirtualRange,
+    pub physical_range: PhysicalRange,
+    pub permission: MappingPermission,
+}
+
 /// 一次性"给一个已归零的页，返回其物理地址"的钩子。
 ///
 /// 这就是 buddy allocator（`core::memory::alloc_region`）的窄接口：

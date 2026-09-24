@@ -294,6 +294,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 按依赖顺序，前者不成立后者无从谈起：
 
 1. **执行域字段 + 私有 AS 运行时**：`execution_kind`（当前不存在）、私有地址空间、`satp` 切换、ASID、U-mode、`ecall` 处理。
+   （increment 3 已落地**私有 AS 切换机制**：双映射 assembly gateway + Core 侧准备 + 窄故障分派，见 §10；**ASID / U-mode / `ecall` 仍未实现**，且组件生命周期尚未接入该机制。）
 2. **loader 按域放段 / 按域 import 解析**：现单 base 硬编码，跨域复用不可能。
 3. **per-domain 本地入口 / adapter**：`kcomp_service_dispatch` 之外，Direct 的按域 function table 与 Gate 的按域 trampoline。
 4. **组件支持范围元数据**：manifest **没有**任何字段声明组件支持哪些部署（`os/core/src/component/store.rs` 只解析 `manifest` 文本 + 组件条目）。
@@ -309,10 +310,10 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| 私有地址空间 | **无** | 每域私有 AS | service call 是**同一内核 AS 内的进程内上下文切换**：`os/core/src/component/containment.rs:746-792`（`run_isolated`），切换点 `:773` |
-| 上下文切换 | 只存 `ra/sp/s0-s11` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs:24-28`（`RiscvContext` 字段），**无 satp** |
-| `activate()` | 写 satp + sfence，**运行期无人调用** | 按域激活 | `os/arch/src/riscv/mmu/mod.rs:56-68`；boot 直接构造 `Sv39AddressSpace`，ASID 硬编码 0 |
-| U-mode / MPP | **无**（`mstatus` 只设 MIE） | U 域 | `UserEnvCall` 已解码（`os/arch/src/riscv/trap/mod.rs:66,97`）但 **panic**（`os/arch/src/riscv/trap/supervisor.rs:63-66`） |
+| 私有地址空间 | **机制已落地、未接线**（increment 3）：`KernelAddressSpace` 生命周期 + **双映射 assembly gateway**（`satp` 切换 / trap 往返 / 恢复 / 放弃 + 窄故障分派钩子），由 ArchTest 在 RV64+RV32 QEMU 驱动；组件生命周期**尚未调用**，Isolated 仍不执行组件 | 每域私有 AS 接入生命周期 | gateway 代码：`os/arch/src/riscv/gateway/`；Core 准备：`os/core/src/component/isolated.rs`；service call 仍是**同一内核 AS 内的进程内上下文切换**：`os/core/src/component/containment.rs:746-792`（`run_isolated`），切换点 `:773` |
+| 上下文切换 | 只存 `ra/sp/s0-s11` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs:24-28`（`RiscvContext` 字段），**无 satp**；私有 AS 的切换走独立汇编路径（`gateway_enter` / `gateway_trap_entry`，不把 satp 塞进 `RiscvContext`） |
+| `activate()` | 写 satp + sfence，**运行期无人调用** | 按域激活 | `os/arch/src/riscv/mmu/mod.rs`；boot 直接构造 `Sv39AddressSpace`，ASID 硬编码 0。运行期切换由 `arch::riscv::gateway` 汇编完成（ArchTest 驱动，无生产调用方） |
+| U-mode / MPP | **无**（`mstatus` 只设 MIE） | U 域 | `UserEnvCall` 已解码（`os/arch/src/riscv/trap/mod.rs:66,97`）但 **panic**（`os/arch/src/riscv/trap/supervisor.rs`） |
 
 ### 7.2 镜像复用与入口
 
@@ -381,8 +382,9 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
 | `os/components/scheduler_rr/src/lib.rs` | 旧的全局名字绑定已删除 | **已完成（step 5）**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
 | `os/core/src/component/containment.rs` | `run_isolated`（`:746`）为 Gate 服务栈基础 | 跨域需真实 AS 切换（未实现） |
+| `os/core/src/component/isolated.rs` | **increment 3**：Core 侧准备（校验 + gateway 页映射 + `PreparedActivation`）与窄故障策略 seam；**无生命周期调用方** | 按域 loader / 生命周期接线（increment 4） |
 | `os/core/src/component/loader.rs` | 单 base 放段 + 单次 import 重定位 | 按域放段 / 按域 import 解析（未实现） |
-| `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/` | `activate()` 无人调用；无 satp 切换；无 U-mode | 私有 AS / U-mode / `ecall`（未实现） |
+| `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/`、`gateway/` | **increment 3**：双映射 gateway 汇编（`gateway_enter` / `gateway_trap_entry`）+ 窄故障分派接缝已落地；`activate()` 仍无人调用；无 U-mode；ASID 恒 0 + 全量 `sfence.vma` | 按域激活接入生命周期 / U-mode / `ecall` / ASID（未实现） |
 | `os/core/src/component/store.rs`（manifest） | 无支持范围字段 | 组件支持范围元数据（未实现） |
 
 ### 8.2 分阶段顺序
@@ -468,7 +470,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | 按 `(caller, callee)` 域选机制 | **设计完成，未开始** | 本文件 §2、§3 |
 | Direct / Gate 作为**绑定机制**分离 | **设计完成，未开始** | 本文件 §1、§4 |
 | "inflight 只计 Gate" 的契约约束 | **设计完成** | 本文件 §3 |
-| 私有地址空间 / `satp` 切换 / ASID | **部分实现（仅准备，不切换）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）落地并有 host 测试；**运行期 `satp` 切换 / assembly gateway / ASID 未实现**（`activate()` 仍无生产调用方，切换后继续用 ASID 0 + 全量 `sfence.vma`） | `memory/address_space.rs`、`arch/src/vm.rs`、`riscv/mmu` |
+| 私有地址空间 / `satp` 切换 / ASID | **部分实现（机制落地、生命周期未接线）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）**加上 increment 3 的双映射 assembly gateway**（Core 侧 `prepare` + arch 汇编进入 / trap 往返 / 恢复 / 放弃、窄 Core 故障分派钩子）已落地；ArchTest 在 **RV64 + RV32 QEMU** 证明「Core → 私有 AS → Core 往返」「私有 AS 内时钟中断在 Core AS / Core trap 栈处理后恢复」「组件页故障可恢复 / 可放弃」。**组件生命周期仍未调用**（Isolated 不执行组件），`activate()` 仍无生产调用方，**ASID 恒 0 + 全量 `sfence.vma`**（不实现 / 不声称 ASID 分配复用）；这是**协作式**边界（S-mode 可直接改 satp），不是对抗隔离 | `memory/address_space.rs`、`component/isolated.rs`、`arch/src/riscv/gateway/`、`arch/src/vm.rs`、`riscv/mmu`、ArchTest `isolated-*` |
 | U-mode / `ecall` | **未开始** | `supervisor.rs:63-66`（`UserEnvCall` panic） |
 | 跨域 image 复用（按域放段 / import） | **未开始**（Isolated 装载**拒绝复用** KernelNative image：VA 与 import 目标不同） | 单 base、单次重定位；`load.rs::validate_isolated_load` |
 | `kcore_*` import 的 Isolated / Sandbox 解析 | **未开始**（Isolated 装载**拒绝任何 `kcore_*` import**，绝不回退到裸 Core 地址；per-domain gate trampoline 未实现） | `load.rs::check_isolated_imports`、`loader.rs` |
