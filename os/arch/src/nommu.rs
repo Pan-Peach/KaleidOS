@@ -28,6 +28,15 @@ impl AddressSpaceBackend for NoMmuAddressSpace {
 
     type Error = NoMmuError;
 
+    fn create(alloc: crate::vm::PageAlloc) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        // NoMMU 不需要页表分配器。
+        let _ = alloc;
+        Ok(Self)
+    }
+
     fn map(
         &mut self,
         va: VirtualRange,

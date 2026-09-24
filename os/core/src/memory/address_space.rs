@@ -247,6 +247,75 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
     }
 }
 
+// 真实地址空间后端 alias（`arch::AddressSpaceImpl`）只在 VM profile + 适用 target 下
+// 存在（见 `os/arch/src/lib.rs`）：NoMMU profile，或 MMU profile + RISC-V target。
+// 其余构建（含 host test）没有真实后端 —— 给显式失败的 stub，**绝不静默降级成 native**。
+#[cfg(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+))]
+mod active {
+    use super::{AddressSpaceBackend, AddressSpaceHandle, AddressSpaceManager, MapError, Mapping};
+    use crate::component::ComponentId;
+
+    pub use arch::AddressSpaceImpl;
+
+    type ActiveSpaces = AddressSpaceManager<AddressSpaceImpl>;
+
+    static SPACES: spin::Mutex<ActiveSpaces> = spin::Mutex::new(ActiveSpaces::empty());
+
+    /// 为一个实例建立私有地址空间（Isolated 域）。后端用 Core 注入的 `PageAlloc`
+    /// （`memory::vm_page_alloc`）分配页表页。
+    pub fn create_address_space_for(owner: ComponentId) -> Result<AddressSpaceHandle, MapError> {
+        let backend =
+            <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
+                .map_err(|_| MapError::BackendFailed)?;
+        Ok(SPACES.lock().create(owner, backend))
+    }
+
+    /// 在已建立的地址空间上落一段映射（Core 验证 → 后端写 PTE → Core 记录真相）。
+    pub fn map(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
+        SPACES
+            .lock()
+            .get_mut(handle)
+            .ok_or(MapError::NotMapped)?
+            .map(mapping)
+    }
+}
+
+#[cfg(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+))]
+pub use active::{AddressSpaceImpl, create_address_space_for, map};
+
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn create_address_space_for(_owner: ComponentId) -> Result<AddressSpaceHandle, MapError> {
+    Err(MapError::BackendFailed)
+}
+
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn map(_handle: AddressSpaceHandle, _mapping: Mapping) -> Result<(), MapError> {
+    Err(MapError::BackendFailed)
+}
 #[allow(dead_code)]
 const fn _handle_shape(id: AddressSpaceId, generation: u32) -> AddressSpaceHandle {
     AddressSpaceHandle { id, generation }
@@ -283,6 +352,10 @@ mod tests {
     impl AddressSpaceBackend for FakeBackend {
         type Error = ();
         const GRANULE: usize = VM_PAGE;
+
+        fn create(_alloc: arch::vm::PageAlloc) -> Result<Self, ()> {
+            Ok(Self::new())
+        }
 
         fn map(
             &mut self,
@@ -389,6 +462,10 @@ mod tests {
     impl AddressSpaceBackend for EightKBackend {
         type Error = ();
         const GRANULE: usize = 0x2000; // 8 KiB，故意 ≠ ALLOC_GRANULE
+
+        fn create(_alloc: arch::vm::PageAlloc) -> Result<Self, ()> {
+            Ok(EightKBackend)
+        }
 
         fn map(
             &mut self,

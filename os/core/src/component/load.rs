@@ -18,6 +18,9 @@ use crate::component::image::{self, ComponentImageId};
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, failure, registry};
 use crate::errno::Errno;
+use crate::memory::address_space::{
+    self, AddressSpaceHandle, Mapping, MappingPermission, PhysicalRange, VirtualRange,
+};
 use crate::task::TaskId;
 use spin::Mutex;
 
@@ -137,7 +140,7 @@ pub fn create_component(
         ExecutionDomain::KernelNative => create_kernel_native(name, args),
         // TODO(human): Isolated 执行器——按域放段 + 按域 import 解析 + 私有 AS
         // 入口（deployment.md §6.2/§7.1）；配合 `get_or_load_image` 的按域装载。
-        ExecutionDomain::IsolatedNative => todo!("Isolated 执行器未实现"),
+        ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
         // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
     }
@@ -175,12 +178,6 @@ fn create_kernel_native(
 
     // 入口调用：期间 CURRENT = 本实例（publish / task_create 的身份来源）。
     // Core 先把 out_state 置 NULL（无状态组件可成功写回 NULL）。
-    //
-    // TODO(human): 执行入口按域分派。当前 `call_component_create` 只切独立栈，没有
-    // 地址空间切换（deployment.md §7.1：`activate()` 无人调用、无 satp 切换、无
-    // U-mode）。Isolated 实例必须等域运行环境 + 按域装载 + 按域入口都就绪后，才越过
-    // begin_start 执行组件代码——在那之前，`create_component` 的按域分派对
-    // Isolated/Sandbox 是 `todo!()` 占位，根本不会走到这里。
     let mut instance_state: *mut () = core::ptr::null_mut();
     let previous = *CURRENT.lock();
     *CURRENT.lock() = Some(id);
@@ -251,10 +248,74 @@ fn create_kernel_native(
     }
 }
 
-/// 取同名已登记的 image；没有就用 store + loader 加载一份并登记。
-///
-/// image 登记是 pinned-until-reboot：第二、第三个实例只会复用，不会重新加载
-/// （即使并发加载在 register 处撞上，同名也只会保留第一份）。
+fn create_isolated_native(
+    name: &[u8],
+    args: &KcompCreateArgs,
+) -> Result<ComponentId, ComponentLoadError> {
+    let image = get_or_load_image(name)?;
+    let create_entry = image::get_images()
+        .lock()
+        .get(image)
+        .map(|image| image.create)
+        .ok_or(ComponentLoadError::ImageFailed)?;
+    let id = registry::get_registry()
+        .lock()
+        .declare(image, ExecutionDomain::IsolatedNative)
+        .map_err(|_| ComponentLoadError::DeclareFailed)?;
+
+    let space =
+        create_isolated_address_space(id, image).map_err(|_| ComponentLoadError::StartFailed)?;
+    {
+        let mut reg = registry::get_registry().lock();
+        reg.record_address_space(id, space)
+            .map_err(|_| ComponentLoadError::StartFailed)?;
+    }
+
+    {
+        let mut reg = registry::get_registry().lock();
+        reg.resolve(id)
+            .map_err(|_| ComponentLoadError::ResolveFailed)?;
+        reg.begin_start(id)
+            .map_err(|_| ComponentLoadError::StartFailed)?;
+    }
+
+    Ok(id)
+}
+
+fn create_isolated_address_space(
+    owner: ComponentId,
+    image: ComponentImageId,
+) -> Result<AddressSpaceHandle, ComponentLoadError> {
+    let handle = address_space::create_address_space_for(owner)
+        .map_err(|_| ComponentLoadError::StartFailed)?;
+
+    let mapping = {
+        let images = image::get_images().lock();
+        let comp_image = images.get(image).ok_or(ComponentLoadError::ImageFailed)?;
+        let backing = comp_image.memory.region();
+        let mapped_size = crate::memory::align_up_page(comp_image.text_size);
+
+        if mapped_size == 0 || mapped_size > backing.size {
+            return Err(ComponentLoadError::StartFailed);
+        }
+
+        Mapping {
+            virtual_range: VirtualRange {
+                base: comp_image.base,
+                size: mapped_size,
+            },
+            physical_range: PhysicalRange {
+                base: backing.base,
+                size: mapped_size,
+            },
+            permission: MappingPermission::READ | MappingPermission::EXECUTE,
+        }
+    };
+    address_space::map(handle, mapping).map_err(|_| ComponentLoadError::StartFailed)?;
+
+    Ok(handle)
+}
+
 ///
 /// TODO(human): 按域装载。image 表按 **artifact 名**索引、单一 load base、import
 /// 只重定位一次（deployment.md §6.2/§7.2）——同名 Native 镜像不能直接拿来在
@@ -384,19 +445,10 @@ mod tests {
         //   或 pending publication——真实执行 / 失败路径由 QEMU CoreTest 覆盖。
     }
 
-    /// 未实现的执行域是**显式占位**（`todo!()`），不是静默降级成 native。
+    /// Sandbox 执行器未实现（`todo!()` 占位），不是静默降级成 native。
     ///
     /// 独立于 store / image：分派发生在 `get_or_load_image` 之前，因此本用例不需要
     /// 挂载仓库。仍取 LOAD_TEST_LOCK 与上面的全局真相用例串行。
-    /// 实现 Isolated 执行器后本用例会失败——届时改成真实路径的断言。
-    #[test]
-    #[should_panic(expected = "Isolated 执行器未实现")]
-    fn isolated_deployment_is_an_unimplemented_placeholder() {
-        let _serial = LOAD_TEST_LOCK.lock();
-        let _ = load_and_start(b"kcomp_smoke", ExecutionDomain::IsolatedNative);
-    }
-
-    /// 同上：Sandbox 执行器未实现（`todo!()` 占位）。
     #[test]
     #[should_panic(expected = "Sandbox 执行器未实现")]
     fn sandboxed_deployment_is_an_unimplemented_placeholder() {

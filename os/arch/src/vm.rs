@@ -52,6 +52,10 @@ pub trait AddressSpaceBackend {
 
     type Error;
 
+    fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
+    where
+        Self: Sized;
+
     fn map(
         &mut self,
         va: VirtualRange,

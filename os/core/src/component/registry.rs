@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 use crate::component::endpoint::ExecutionDomain;
 use crate::component::image::ComponentImageId;
 use crate::component::{ComponentId, ComponentState};
+use crate::memory::address_space::AddressSpaceHandle;
 use spin::{Mutex, Once};
 
 /// 一个组件实例（load 路径在 image 登记后填充）。
@@ -50,6 +51,7 @@ pub struct InstanceRecord {
     pub state: ComponentState,
     pub image: ComponentImageId,
     pub execution_domain: ExecutionDomain,
+    pub address_space: Option<AddressSpaceHandle>,
     pub instance_state: *mut (),
     /// 未完成的 consumer→provider 调用计数（`begin_call` / `finish_call`）。
     pub inflight: u32,
@@ -107,6 +109,7 @@ impl Registry {
             state: ComponentState::Declared,
             image,
             execution_domain: kind,
+            address_space: None,
             instance_state: core::ptr::null_mut(),
             inflight: 0,
         });
@@ -130,6 +133,19 @@ impl Registry {
         instance_state: *mut (),
     ) -> Result<(), RegistryError> {
         self.record_mut(id)?.instance_state = instance_state;
+        Ok(())
+    }
+
+    pub fn record_address_space(
+        &mut self,
+        id: ComponentId,
+        address_space: AddressSpaceHandle,
+    ) -> Result<(), RegistryError> {
+        let record = self.record_mut(id)?;
+        if record.execution_domain == ExecutionDomain::KernelNative {
+            return Err(RegistryError::InvalidTransition);
+        }
+        record.address_space = Some(address_space);
         Ok(())
     }
 

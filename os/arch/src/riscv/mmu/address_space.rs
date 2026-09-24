@@ -39,6 +39,13 @@ impl AddressSpaceBackend for Sv39AddressSpace {
     type Error = sv39::MapError;
     const GRANULE: usize = sv39::VM_PAGE_SIZE;
 
+    fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        Self::new(alloc, 0)
+    }
+
     fn map(
         &mut self,
         va: VirtualRange,
@@ -92,6 +99,13 @@ impl Sv32AddressSpace {
 impl AddressSpaceBackend for Sv32AddressSpace {
     type Error = sv32::MapError;
     const GRANULE: usize = sv32::VM_PAGE_SIZE;
+
+    fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        Self::new(alloc, 0)
+    }
 
     fn map(
         &mut self,
