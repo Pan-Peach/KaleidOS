@@ -138,7 +138,7 @@ impl Reporter {
 /// 检查器：Reporter + 实例 create 入口的失败位图。
 pub struct Checks {
     report: Reporter,
-    failed: u32,
+    failed: u64,
 }
 
 impl Checks {
@@ -154,17 +154,24 @@ impl Checks {
     }
 
     /// 记一项检查；失败时把 `bit` 并进失败位图（`1 << bit`）。
+    ///
+    /// 检查数超过 32 后位图升为 `u64`；返回 `i32` 时高 32 位折回低位（见
+    /// [`Checks::finish`]），位号约定仍是"追加新检查用新位、不复用旧位"。
     pub fn check(&mut self, bit: u32, name: &str, ok: bool) {
         if !self.report.check(name, ok) {
-            self.failed |= 1u32 << bit;
+            self.failed |= 1u64 << bit;
         }
     }
 
     /// 汇总 + 终判；返回失败位图（0 = 全部通过）。
+    ///
+    /// create 入口的返回类型是 `i32`，位图高 32 位折回低位（位号只用于定位
+    /// 失败检查，`load` 与 runner 只判 0 / 非 0；明细在报告行）。
     pub fn finish(&mut self) -> i32 {
         self.report.group("summary");
         let all_ok = self.report.summary() && self.failed == 0;
         self.report.verdict(all_ok);
-        self.failed as i32
+        let folded = (self.failed | (self.failed >> 32)) as u32;
+        folded as i32
     }
 }

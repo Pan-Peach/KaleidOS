@@ -9,7 +9,7 @@
 
 | 组件 | 路径 | 形态 | 一句话 |
 |---|---|---|---|
-| `core_test` | `os/components/core_test/` | Rust `.kcomp` | CoreTest 板内自检；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace） |
+| `core_test` | `os/components/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend） |
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；cursor 是实例状态，只提议下一个 `TaskId` |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | 协议无关设备 prober（总线角色）：opaque compatible 粗匹配；逐台以扁平 create config 下发 `(device_id, 结果端口名)`，create 返回后 pull 驱动的 `probe.result`，本地更新 cursor（**无环**，driver 不回调） |
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |

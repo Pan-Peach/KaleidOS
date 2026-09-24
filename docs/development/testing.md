@@ -49,7 +49,20 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
 CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Core 与 Arch 的**真实行为**。
 以普通 `.kcomp` 身份运行（无 god-mode），源码按**报告分组**拆为 `src/runtime/`：
 `report`（输出骨架 + 失败位图）/ `boot` / `sched` / `resource` / `trace`，
+外加**组件 / 系统集成场景**：`filesystem`（block chain + littlefs 多实例与存储隔离）、
+`driver`（真实 `driver_prober` → `virtio_blk` 的枚举 / Match·NoMatch / 首个 attach
+后停止 / 多设备拒绝）、`c_frontend`（真实 `kcomp_c_smoke` fixture 的加载与生命周期）。
 入口与编排在 `src/runtime.rs`（`kcomp_instance_create`）。模块边界 = 责任边界（不是行数）。
+
+> **集成场景归属**：CoreTest 是**唯一**的组件 / 系统集成编排者。旧 QEMU runner 与
+> 组合器组件（`block_chain` / `littlefs_chain` / `fs_consumer`）的断言在 CoreTest 里
+> 用**真实组件 + SDK client**（block / filesystem / probe）直接复现；runner 只做
+> boot smoke、发 `load core_test`、检查 `[core-test] <case>: PASS` 与
+> `[core-test] all: PASS`。场景在 task context 里跑（块 / 文件调用契约要求 task），
+> 结果写回实例状态，调度返回后统一发报告行。
+> C fixture 的 `[c-smoke] hello from C` 是串口输出，组件边界内没有读取它的 Core API；
+> 精确 stdout 字节仍由 `make test-c-smoke` 的独立 runner 覆盖，CoreTest 断言
+> `kcore_component_load` 返回值 + 该实例的确切生命周期 trace。
 
 > **边界**：CoreTest 只走 Core 导出白名单、只断言 Core 自己报告的返回值 / 状态编码 /
 > trace 事件。**平台白盒事实**（QEMU virt 的 PLIC 线号、S-mode context 公式、

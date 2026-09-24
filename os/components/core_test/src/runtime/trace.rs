@@ -31,8 +31,9 @@
 //! “core_test 自己执行的加载操作”做 id 锚定断言 —— 身份来源同样是 Core 返回值。
 
 use kcomp_sdk::abi::{
-    ABSENT, KIND_COMPONENT_STATE, KIND_POLICY_ACCEPTED, KIND_RESOURCE_GRANT, KIND_RESOURCE_REVOKE,
-    KIND_TASK_SWITCH, TraceRecordAbi, TraceStatsAbi, kcore_trace_read, kcore_trace_stats,
+    ABSENT, KIND_COMPONENT_STATE, KIND_ENDPOINT_BIND, KIND_POLICY_ACCEPTED, KIND_RESOURCE_GRANT,
+    KIND_RESOURCE_REVOKE, KIND_TASK_SWITCH, TraceRecordAbi, TraceStatsAbi, kcore_trace_read,
+    kcore_trace_stats,
 };
 
 use super::report::Checks;
@@ -49,6 +50,9 @@ const STATE_READY: u64 = 3;
 const RESOURCE_DEVICE: u64 = 0;
 const RESOURCE_IRQ: u64 = 1;
 const RESOURCE_DMA: u64 = 2;
+
+/// `EndpointBind` 的 mechanism 编码（Core `trace::abi::mechanism_code` 的镜像）。
+pub const MECHANISM_DIRECT: u64 = 0;
 
 /// 操作前取续读游标：`next_seq` = 下一条事件的 seq（读侧从它开始就不会看到旧事件）。
 /// stats 读不到时返回 `u64::MAX`（扫描读不到任何记录 → 断言失败）：**失败要关闭**，
@@ -91,6 +95,33 @@ fn scan(from: u64, mut visit: impl FnMut(&TraceRecordAbi)) {
     }
 }
 
+/// 窗口内每个 `EndpointBind` 事件：`visit(endpoint, mechanism)`。
+///
+/// 这是 Core 在 bind 时选定调用机制的**唯一可观测点**（运行期不再重决策），
+/// 用来替代旧 runner "业务调用没有 gate dispatch 日志"的差分证据：
+/// 业务读的绑定机制必须是 [`MECHANISM_DIRECT`]。
+pub fn binds(from: u64, mut visit: impl FnMut(u64, u64)) {
+    scan(from, |record| {
+        if record.kind == KIND_ENDPOINT_BIND {
+            visit(record.a, record.c);
+        }
+    });
+}
+
+/// 窗口内的**出生**事件（`ComponentState` 的 `from == ABSENT`）：每个
+/// `kcore_component_create` / `kcore_component_load` 恰好一条。返回写入 `out`
+/// 的组件 id 数（超出容量丢弃；容量不足时返回值会小于真实数量）。
+pub fn declared_components(from: u64, out: &mut [u32]) -> usize {
+    let mut count = 0usize;
+    scan(from, |record| {
+        if record.kind == KIND_COMPONENT_STATE && record.b == ABSENT && count < out.len() {
+            out[count] = record.a as u32;
+            count += 1;
+        }
+    });
+    count
+}
+
 /// 读路径可用：从 Core 自己报告的 `oldest_seq` 起读，至少能读到一条记录。
 fn readable() -> bool {
     let Some(stats) = stats() else {
@@ -104,9 +135,9 @@ fn readable() -> bool {
     seen > 0
 }
 
-/// 加载操作产出的**确切**生命周期：`rr_id` 只允许按
+/// 加载操作产出的**确切**生命周期：`id` 只允许按
 /// `Declared → Resolved → Starting → Ready` 走一遍（多余/乱序转换都失败）。
-fn component_lifecycle(from: u64, id: i32) -> bool {
+pub fn component_lifecycle(from: u64, id: i32) -> bool {
     if id < 0 {
         return false;
     }
