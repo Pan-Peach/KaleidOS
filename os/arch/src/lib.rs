@@ -114,6 +114,24 @@ pub trait CpuArch {
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     fn init();
+
+    /// 读取当前执行的 **runtime slot**（RISC-V `tp`）；`0` = 无 slot。
+    ///
+    /// slot 是组件运行时自有的 opaque 状态指针（**执行状态，不是内存记账**，
+    /// 见 `docs/architecture/memory-and-heap.md` §5）：Core 只存 / 传，从不解释。
+    /// **Core 是唯一写者** —— RISC-V psABI 把 `tp` 标为 unallocatable/fixed，
+    /// 编译器永不分配或写入它；trap 帧另行保存 / 恢复它（`TrapFrame.x[4]`）。
+    fn runtime_slot() -> usize;
+
+    /// 把 `slot` 写入当前执行的 runtime slot 寄存器（RISC-V `tp`）；`0` = 无
+    /// slot。**Core 是唯一写者**（见 [`Self::runtime_slot`]）。
+    fn install_runtime_slot(slot: usize);
+
+    /// 把 `slot` 预置进一个**上下文记录**：切换路径从目标记录装载 runtime slot
+    /// 寄存器，因此下一次切入该上下文时，被恢复的执行带着自己的 runtime
+    /// context 运行。`0` = 无 slot（`new_context` 的初值）。
+    fn set_context_slot(context: &mut Self::Context, slot: usize);
+
     /// 关中断并返回先前状态（irq-save 临界区进入）。
     /// TODO(C5): Riscv 实现 = `sstatus.SIE` 保存 + 清零；fake = no-op。
     fn disable_irq() -> Self::IrqFlags;

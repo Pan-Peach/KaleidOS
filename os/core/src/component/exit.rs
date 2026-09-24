@@ -68,7 +68,7 @@ use crate::component::containment::{self, CallOutcome};
 use crate::component::image;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::{self, RegistryError};
-use crate::component::{ComponentId, failure};
+use crate::component::{ComponentId, failure, runtime_slot};
 
 /// 停止的拒绝 / 失败原因（`stop_component` 的返回错误）。
 ///
@@ -163,6 +163,9 @@ fn complete_stop(id: ComponentId, outcome: CallOutcome) -> Result<(), ComponentS
     // 组件自行收尾之后，Core 仍然兜底收回剩余 authority / 解绑 provider /
     // 使 provider endpoints 永久失效。
     failure::revoke_authority_and_unbind(id);
+    // Teardown：实例不再执行组件代码，丢掉它的 runtime slot（执行状态，不是
+    // 内存记账——不释放任何内存，见 docs/architecture/memory-and-heap.md §5）。
+    runtime_slot::get_slots().lock().clear(id);
     // 不变式：begin_stop 已提交 Stopping，本转换只可能被并发 stop/fail 拒绝
     // （phase 1 单核不可达）；失败不静默。
     if registry::get_registry().lock().finish_stop(id).is_err() {
@@ -570,5 +573,45 @@ mod tests {
                 .state,
             EndpointState::Live
         );
+    }
+
+    /// 优雅停止（teardown）清除 runtime slot（执行状态，不是内存记账）：
+    /// `Stopped` 实例不再有 slot，共享同一 image 的其它实例不受影响。
+    #[test]
+    fn stop_clears_runtime_slot() {
+        let _heap = setup();
+        let image = test_image(b"exit_slot", destroy_hook_ok as *const () as usize);
+        let (id, other) = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            let other = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            reg.resolve(other).unwrap();
+            reg.begin_start(other).unwrap();
+            reg.finish_start(other).unwrap();
+            (id, other)
+        };
+        let mut state = 1u8;
+        let slot = core::ptr::addr_of_mut!(state).cast::<()>();
+        runtime_slot::get_slots().lock().install(id, slot);
+        runtime_slot::get_slots().lock().install(other, slot);
+
+        // When：优雅停止第一个实例。
+        assert_eq!(stop_component(id), Ok(()));
+
+        // Then：被停实例的 slot 被清除；另一个实例的 slot 原样。
+        assert!(
+            runtime_slot::get_slots().lock().get(id).is_null(),
+            "teardown 必须清除 runtime slot"
+        );
+        assert_eq!(
+            runtime_slot::get_slots().lock().get(other),
+            slot,
+            "其它实例的 slot 不受影响"
+        );
+
+        runtime_slot::get_slots().lock().clear(other);
     }
 }

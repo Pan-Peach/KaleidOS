@@ -15,6 +15,10 @@ __switch:
     sw s9, 44(a0)
     sw s10, 48(a0)
     sw s11, 52(a0)
+    # tp = 本执行上下文的 runtime slot（0 = 无 slot）；与 RiscvContext 布局一致
+    # （ra@0 / sp@4 / s0-s11@8-52 / tp@56）。psABI 把 tp 标为 unallocatable，
+    # 编译器从不写它 —— Core 是唯一写者；trap 帧另行保存 tp（TrapFrame.x[4]）。
+    sw tp, 56(a0)
 
     # 恢复新的寄存器上下文到 to
     lw ra, 0(a1)
@@ -31,4 +35,5 @@ __switch:
     lw s9, 44(a1)
     lw s10, 48(a1)
     lw s11, 52(a1)
+    lw tp, 56(a1)
     ret

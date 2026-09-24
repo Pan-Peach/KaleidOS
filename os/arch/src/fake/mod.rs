@@ -66,6 +66,20 @@ impl CpuArch for Fake {
         ctx
     }
 
+    fn runtime_slot() -> usize {
+        // host 无真实寄存器 / 无真实执行：没有「当前执行的 tp」，恒为 0（无 slot）。
+        0
+    }
+
+    fn install_runtime_slot(_slot: usize) {
+        // host 无真实寄存器：no-op 占位（真机语义见 Riscv 实现）。
+    }
+
+    fn set_context_slot(context: &mut Self::Context, slot: usize) {
+        // x4 = tp（与 Riscv 的上下文记录同形）；host 只作为测试可观察的占位。
+        context.regs[4] = slot;
+    }
+
     fn init() {
         trap::init();
     }
@@ -154,5 +168,19 @@ mod tests {
         assert!(!trap::is_initialized());
         Fake::init();
         assert!(trap::is_initialized());
+    }
+
+    /// runtime slot 占位：新上下文无 slot（tp = 0），`set_context_slot` 预置
+    /// x4（tp）。host 没有真实寄存器，`runtime_slot` / `install_runtime_slot`
+    /// 是 0 / no-op 占位 —— 真机语义由 QEMU 证明。
+    #[test]
+    fn context_slot_is_seeded_and_new_context_has_none() {
+        let mut ctx = Fake::new_context(0x8000_0000, 0x9000_0000);
+        assert_eq!(ctx.reg(4), 0, "tp = 0 (no runtime slot)");
+        Fake::set_context_slot(&mut ctx, 0x1234);
+        assert_eq!(ctx.reg(4), 0x1234, "tp = seeded runtime slot");
+        assert_eq!(Fake::runtime_slot(), 0, "host has no current tp");
+        Fake::install_runtime_slot(0x1234);
+        assert_eq!(Fake::runtime_slot(), 0, "host install is a no-op");
     }
 }

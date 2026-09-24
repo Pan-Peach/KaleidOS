@@ -60,9 +60,12 @@
 //! - **Re-entry**: `component/call.rs` rejects a call whose provider already runs
 //!   in the active synchronous chain ([`provider_in_active_chain`]) — the
 //!   scheduling anchor is deliberately not traversed.
-//! - **Interrupt state**: the RISC-V context record holds `ra` / `sp` / `s0-s11`
-//!   only, so the service boundary saves and restores the interrupt-enable state
-//!   explicitly around the switch.
+//! - **Interrupt state**: the RISC-V context record does not carry
+//!   `sstatus.SIE`, so the service boundary saves and restores the
+//!   interrupt-enable state explicitly around the switch.  The runtime slot
+//!   (`tp`) **is** part of the record: each boundary installs the owner's slot
+//!   into the incoming context and the switch restores it (see
+//!   [`crate::component::runtime_slot`]).
 //!
 //! # Phase-1 limitation: real dispatch is QEMU-only
 //!
@@ -897,6 +900,25 @@ fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
     }
 }
 
+/// The runtime slot the execution inside a boundary runs with: the boundary
+/// owner's currently installed slot, or `0` = none (an anonymous init boundary
+/// / test boundary, or an instance that never installed one).
+///
+/// This is the "every entry establishes the correct runtime context" half of
+/// `docs/architecture/memory-and-heap.md` §5: Core only **installs** the opaque
+/// slot at switch boundaries and never interprets it.
+fn boundary_slot(kind: EscapeKind) -> usize {
+    let owner = match kind {
+        EscapeKind::Init { owner } => owner,
+        EscapeKind::Exit { owner }
+        | EscapeKind::Task { owner, .. }
+        | EscapeKind::Irq { owner }
+        | EscapeKind::ServiceCall { owner, .. }
+        | EscapeKind::PolicyCall { owner, .. } => Some(owner),
+    };
+    owner.map_or(0, crate::component::runtime_slot::slot_of)
+}
+
 /// [`run_isolated`] on an **already allocated** Core-owned stack: install `kind`
 /// as the active escape guard, switch, and collect the outcome.
 ///
@@ -906,6 +928,11 @@ fn run_isolated(call: IsolatedCall, kind: EscapeKind) -> IsolatedRun {
 fn run_isolated_on(stack_top: usize, call: IsolatedCall, kind: EscapeKind) -> CallOutcome {
     let mut core_context = CpuImpl::new_context(0, 0);
     let mut component_context = CpuImpl::new_context(trampoline as *const () as usize, stack_top);
+    // Runtime context (§5): the component runs under its owner's runtime slot.
+    // The switch loads `tp` from the **incoming context record**, so seeding the
+    // record is the only effective install; `0` (the `new_context` default) is a
+    // no-op for every existing path.
+    CpuImpl::set_context_slot(&mut component_context, boundary_slot(kind));
     let mut guard = EscapeGuard {
         kind,
         from_context: &mut component_context,
@@ -920,7 +947,15 @@ fn run_isolated_on(stack_top: usize, call: IsolatedCall, kind: EscapeKind) -> Ca
 
     // The context records are local to this suspended caller frame and remain
     // valid until the component returns or `panic_escape` resumes this point.
+    //
+    // Runtime slot: same discipline as `saved_depth` / `sstatus.SIE` — save the
+    // Core frame's own slot around the switch and re-install it when this frame
+    // resumes (normal return and panic escape both flow through here).  The
+    // record already preserves it; the explicit re-install guarantees a stale
+    // record can never leak a component slot into the Core frame.
+    let suspended_slot = CpuImpl::runtime_slot();
     CpuImpl::context_switch(&mut core_context, &component_context);
+    CpuImpl::install_runtime_slot(suspended_slot);
 
     // Control is back on this Core frame (component return or panic escape):
     // restore the Core ABI depth the caller had before the boundary.
@@ -1107,6 +1142,15 @@ extern "C" fn task_abort_trampoline() -> ! {
 /// Transfers control from the escaping execution to the Core-owned context
 /// recorded in the guard: the saved caller for init / exit / service call, the
 /// task-abort context for a task.  Never returns to the escaping frame.
+///
+/// # Runtime slot (`tp`)
+///
+/// The switch restores `tp` from `to_context`, which already carries the
+/// Core-side execution's slot: the caller's slot for init / exit / service /
+/// policy (captured when the boundary was entered, see [`run_isolated_on`]),
+/// and `0` — Core — for the task-abort context.  The escaping component's slot
+/// is saved into `from_context` and never leaks into the resumed Core frame; no
+/// extra install is needed on this path.
 ///
 /// Takes a raw pointer (not `&mut`): the escaping execution may have reached the
 /// record through a raw pointer of its own, so no live reference may exist here.
@@ -2123,5 +2167,59 @@ mod tests {
         });
 
         enter_anchor();
+    }
+
+    // ------------------------------------------------------------------
+    // Runtime slot（`tp`，docs/architecture/memory-and-heap.md §5）
+    // ------------------------------------------------------------------
+
+    /// 验收：边界 slot 解析 —— owner 已安装的 slot 生效；无 owner（匿名 init /
+    /// 测试边界）或未安装 = 0（无 slot）。真实的 `tp` 装载由 QEMU 证明（host
+    /// fake 后端没有寄存器）。
+    #[test]
+    fn boundary_slot_resolves_owner_slot_or_zero() {
+        let owner = ComponentId::from_raw(0x00C0_5E07);
+        let mut state = 0x5Au8;
+        let slot = core::ptr::addr_of_mut!(state).cast::<()>();
+        crate::component::runtime_slot::get_slots()
+            .lock()
+            .install(owner, slot);
+
+        assert_eq!(
+            boundary_slot(EscapeKind::Task {
+                task: TaskId::from_raw(1),
+                owner,
+            }),
+            slot as usize,
+            "task 边界用 owner 的 slot"
+        );
+        assert_eq!(
+            boundary_slot(EscapeKind::Init { owner: Some(owner) }),
+            slot as usize,
+            "create 边界用被初始化实例的 slot"
+        );
+        assert_eq!(
+            boundary_slot(EscapeKind::ServiceCall {
+                owner,
+                endpoint: EndpointId::from_raw(1),
+                caller_task: None,
+            }),
+            slot as usize,
+            "service 边界用 provider 的 slot"
+        );
+        assert_eq!(
+            boundary_slot(EscapeKind::Init { owner: None }),
+            0,
+            "匿名 init / 测试边界 = 无 slot"
+        );
+
+        crate::component::runtime_slot::get_slots()
+            .lock()
+            .clear(owner);
+        assert_eq!(
+            boundary_slot(EscapeKind::Exit { owner }),
+            0,
+            "清除后 = 无 slot"
+        );
     }
 }

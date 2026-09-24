@@ -16,6 +16,7 @@ pub mod image;
 pub mod load;
 pub mod loader;
 pub mod registry;
+pub mod runtime_slot;
 pub mod store;
 
 pub use containment::panic_escape;

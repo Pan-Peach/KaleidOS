@@ -445,11 +445,7 @@ fn schedule_next(
     //   持有 cpu/table 锁时，trap 处理器再取同样的锁 = 自死锁）。实现抢占前
     //   本临界区必须 irq-save：CpuImpl::disable_irq() / restore_irq()，
     //   决策注记见 core/src/irq.rs。
-    let (from_ptr, to_ptr, next_owner): (
-        *mut ContextImpl,
-        *const ContextImpl,
-        Option<ComponentId>,
-    ) = {
+    let (from_ptr, to_ptr, next_owner): (*mut ContextImpl, *mut ContextImpl, Option<ComponentId>) = {
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
 
@@ -474,7 +470,7 @@ fn schedule_next(
             }
         };
 
-        let (to_ptr, next_owner): (*const ContextImpl, Option<ComponentId>) = match next {
+        let (to_ptr, next_owner): (*mut ContextImpl, Option<ComponentId>) = match next {
             Some(id) => {
                 // owner 先取（Copy），再可变借 table 推进状态。
                 let owner = table.get(id).ok_or(SchedError::NotFound)?.owner();
@@ -482,17 +478,17 @@ fn schedule_next(
                     .transition(id, TaskState::Running(CpuId(0)))
                     .map_err(|_| SchedError::InvalidTransition)?;
                 cpu_guard.current = Some(id);
-                let rec = table.get(id).ok_or(SchedError::NotFound)?;
-                (rec.context.as_ref() as *const ContextImpl, Some(owner))
+                let rec = table.get_mut(id).ok_or(SchedError::NotFound)?;
+                (rec.context.as_mut() as *mut ContextImpl, Some(owner))
             }
             None => {
                 cpu_guard.current = None;
                 (
                     cpu_guard
                         .anchor
-                        .as_ref()
+                        .as_mut()
                         .expect("anchor exists after first run")
-                        .as_ref() as *const ContextImpl,
+                        .as_mut() as *mut ContextImpl,
                     None,
                 )
             }
@@ -517,6 +513,23 @@ fn schedule_next(
     // 在自己的调度帧里保存自己的深度（见 `containment::EscapeGuard::saved_depth`）。
     // 必须在 `enter_task` 归零**之前**捕获。
     let suspended_depth = containment::core_abi_depth();
+    // Runtime context（`docs/architecture/memory-and-heap.md` §5）：本调度帧自己的
+    // runtime slot 同样在切换期间挂起，切回来后重新装回 —— 与 `suspended_depth`
+    // 同一纪律（记录里也已保存 / 恢复；显式重装保证 stale 记录不会把 incoming
+    // 组件的 slot 漏进 Core 帧）。
+    let suspended_slot = CpuImpl::runtime_slot();
+    if let Some(owner) = next_owner {
+        // incoming 任务**每次**切换都重新建立 owner 当前的 runtime slot
+        // （0 = 无 slot）：切换从目标记录装载 `tp`，所以把 slot 预置进记录。
+        // 锁外执行 —— slot 表有自己的锁，不得与 cpu / task table 锁嵌套。
+        // SAFETY: [Category 2 — Data races] `to_ptr` 指向 incoming 任务的上下文
+        // Box（堆地址稳定）或锚点 Box（全局静态）；phase 1 单 CPU、全部 Core 锁
+        // 已释放，切换前无其他执行触碰该记录。
+        CpuImpl::set_context_slot(
+            unsafe { &mut *to_ptr },
+            crate::component::runtime_slot::slot_of(owner),
+        );
+    }
 
     match next {
         Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
@@ -530,8 +543,9 @@ fn schedule_next(
         CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
     }
     // 本帧被重新调度：恢复它离开 CPU 时的 Core ABI 深度（组件代码 = 0，
-    // 若它是在导出体内让出 CPU 则是导出体的深度）。
+    // 若它是在导出体内让出 CPU 则是导出体的深度）与 runtime slot。
     containment::resume_core_abi_depth(suspended_depth);
+    CpuImpl::install_runtime_slot(suspended_slot);
     Ok(())
 }
 

@@ -21,7 +21,7 @@
 //! - **物理组件镜像回收**：Phase 1 保持 logical death / physical residency。
 
 use crate::component::load::ComponentLoadError;
-use crate::component::{ComponentId, endpoint, registry};
+use crate::component::{ComponentId, endpoint, registry, runtime_slot};
 use crate::resource::{device, dma, irq};
 
 /// 组件失败（逻辑死亡）的 Core 编排：`mark_failed` → 资源兜底。
@@ -33,6 +33,10 @@ use crate::resource::{device, dma, irq};
 pub fn fail_component(id: ComponentId, reason: ComponentLoadError) {
     let _ = reason;
     registry::get_registry().lock().mark_failed(id).ok();
+    // 逻辑死亡：丢掉实例的 runtime slot。这是**执行状态**，不是内存记账——
+    // 不释放任何内存，只是死实例的 runtime context 不再被任何执行带着跑
+    // （docs/architecture/memory-and-heap.md §5）。
+    runtime_slot::get_slots().lock().clear(id);
     revoke_authority_and_unbind(id);
 }
 
@@ -342,5 +346,52 @@ mod tests {
             eps.discover(&reg, id, b"pending0", CONTRACT),
             Err(EndpointError::EndpointNotFound)
         );
+    }
+
+    /// 死亡路径清除 runtime slot（执行状态，不是内存记账）：`fail_component`
+    /// 之后该实例不再有 slot，其它实例不受影响。
+    #[test]
+    fn fail_component_clears_runtime_slot() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::component::image::init();
+        endpoint::init();
+        crate::resource::init();
+
+        let image =
+            crate::component::image::test_support::register_test_image(b"slot_fail_demo", 0);
+        let (id, other) = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            let other = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            reg.resolve(other).unwrap();
+            reg.begin_start(other).unwrap();
+            reg.finish_start(other).unwrap();
+            (id, other)
+        };
+        let mut state = 1u8;
+        let slot = core::ptr::addr_of_mut!(state).cast::<()>();
+        runtime_slot::get_slots().lock().install(id, slot);
+        runtime_slot::get_slots().lock().install(other, slot);
+
+        // When：组件失败（逻辑死亡）。
+        fail_component(id, ComponentLoadError::CreateFailed(1));
+
+        // Then：死实例的 slot 被清除；另一个实例的 slot 原样。
+        assert!(
+            runtime_slot::get_slots().lock().get(id).is_null(),
+            "死亡必须清除 runtime slot"
+        );
+        assert_eq!(
+            runtime_slot::get_slots().lock().get(other),
+            slot,
+            "其它实例的 slot 不受影响"
+        );
+
+        runtime_slot::get_slots().lock().clear(other);
     }
 }
