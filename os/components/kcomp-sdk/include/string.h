@@ -18,8 +18,12 @@ void *memmove(void *dest, const void *src, size_t n);
 void *memset(void *dest, int value, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 
-/* -- 字符串原语（显式调用；目前只有 FatFs 实际引用到这两个）-- */
+/* -- 字符串原语（显式调用）--
+ * FatFs 引用 strlen / strchr；littlefs 额外引用 strcpy / strspn / strcspn。 */
 size_t strlen(const char *s);
 char *strchr(const char *s, int c);
+char *strcpy(char *dest, const char *src);
+size_t strspn(const char *s, const char *accept);
+size_t strcspn(const char *s, const char *reject);
 
 #endif /* KCOMP_STRING_H */

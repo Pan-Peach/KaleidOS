@@ -131,6 +131,42 @@ struct kcomp_call_result kcomp_block_read(const struct kcomp_block_binding *bind
     return error_result(-EINVAL);
 }
 
+struct kcomp_call_result kcomp_block_write(const struct kcomp_block_binding *binding,
+                                           uint64_t lba, const void *input, size_t input_len)
+{
+    if (binding == NULL) {
+        return error_result(-EINVAL);
+    }
+    const struct kcomp_block_binding_internal *b = binding_ref(binding);
+
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_DIRECT) {
+        if (b->api == NULL || b->api->write == NULL) {
+            return error_result(-EPROTO);
+        }
+        /* Direct 没有传输层：transport = 0，method 就是 table 的返回。 */
+        struct kcomp_call_result result;
+        result.transport = 0;
+        result.method = b->api->write(b->ctx, lba, (const uint8_t *)input, input_len);
+        return result;
+    }
+
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
+        uint8_t args[KCOMP_BLOCK_LBA_LEN];
+        struct kcomp_call_result result;
+
+        for (size_t i = 0; i < KCOMP_BLOCK_LBA_LEN; i++) {
+            args[i] = KCOMP_BLOCK_LBA_BYTE(lba, i);
+        }
+        result.method = 0;
+        result.transport = kcore_endpoint_call(b->endpoint, KCOMP_BLOCK_METHOD_WRITE, args,
+                                               sizeof(args), (const uint8_t *)input, input_len, NULL,
+                                               0, &result.method);
+        return result;
+    }
+
+    return error_result(-EINVAL);
+}
+
 struct kcomp_call_result kcomp_block_capacity(const struct kcomp_block_binding *binding,
                                               uint64_t *out_sectors)
 {

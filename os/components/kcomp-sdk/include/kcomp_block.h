@@ -10,8 +10,10 @@
  * 藏在绑定内部——消费者看不到、也不得解释它（**不暴露裸 function table**）。
  *
  * 线格式（`abi/block.toml` 单源）：
- *   read(1)：args = 8 字节 LE `u64` lba；output 非零且 512 的整数倍
- *            （传输长度就是 `output_len`，没有单独编码的长度）。
+ *   read(1) ：args = 8 字节 LE `u64` lba；output 非零且 512 的整数倍
+ *             （传输长度就是 `output_len`，没有单独编码的长度）。
+ *   write(2)：args = 8 字节 LE `u64` lba；input 非零且 512 的整数倍
+ *             （传输长度就是 `input_len`）；output 空。
  *
  * 实现（不透明绑定的内部表示）在 `kcomp-sdk/c/kcomp_block.c`，随每个 C 组件私有
  * 携带；本头文件只暴露声明。
@@ -61,6 +63,12 @@ int32_t kcomp_block_bind(uint64_t endpoint, uint64_t contract, uint64_t abi,
  * 成功（transport == 0）时 provider 的 `0 / -errno` 在 `result.method`。 */
 struct kcomp_call_result kcomp_block_read(const struct kcomp_block_binding *binding,
                                           uint64_t lba, void *output, size_t output_len);
+
+/* 把 `input_len` 字节从 `input` 写到 `lba`（长度 / 对齐由调用方保证，与
+ * `kcore_endpoint_call` 的契约一致：长度非零且为 sector 的整数倍时指针不得为空）。
+ * 成功（transport == 0）时 provider 的 `0 / -errno` 在 `result.method`。 */
+struct kcomp_call_result kcomp_block_write(const struct kcomp_block_binding *binding,
+                                           uint64_t lba, const void *input, size_t input_len);
 
 /* 读设备容量（单位：512 字节 sector）到 `*out_sectors`。
  * 成功（transport == 0 且 method == 0）时 `*out_sectors` 有效。 */

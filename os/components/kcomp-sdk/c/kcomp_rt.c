@@ -83,3 +83,48 @@ __attribute__((weak)) char *strchr(const char *s, int c) {
         }
     }
 }
+
+/* littlefs（lfs.c）额外引用到的三个（strcpy / strspn / strcspn）。同样 weak、
+ * 同样只补"实际引用到的"——不朝 libc 扩张。 */
+
+__attribute__((weak)) char *strcpy(char *dest, const char *src) {
+    char *d = dest;
+    while ((*d++ = *src++) != '\0') {
+    }
+    return dest;
+}
+
+__attribute__((weak)) size_t strspn(const char *s, const char *accept) {
+    size_t count = 0;
+    while (s[count] != '\0') {
+        const char *a = accept;
+        int found = 0;
+        while (*a != '\0') {
+            if (*a == s[count]) {
+                found = 1;
+                break;
+            }
+            a++;
+        }
+        if (!found) {
+            break;
+        }
+        count++;
+    }
+    return count;
+}
+
+__attribute__((weak)) size_t strcspn(const char *s, const char *reject) {
+    size_t count = 0;
+    while (s[count] != '\0') {
+        const char *r = reject;
+        while (*r != '\0') {
+            if (*r == s[count]) {
+                return count;
+            }
+            r++;
+        }
+        count++;
+    }
+    return count;
+}
