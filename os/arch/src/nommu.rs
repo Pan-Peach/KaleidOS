@@ -26,6 +26,13 @@ impl AddressSpaceBackend for NoMmuAddressSpace {
     /// 恒等：任何对齐都合法（Core 校验自动 no-op）。
     const GRANULE: usize = 1;
 
+    /// NoMMU 没有页表、没有 satp：`AddressSpaceBackend` 可用**不等于**能承载
+    /// Isolated 域。Core 的 Isolated 部署 / 装载路径据此显式拒绝。
+    const PRIVATE_ADDRESS_SPACE: bool = false;
+
+    /// 没有可切换的翻译状态：描述符是空类型（汇编转换在 NoMMU 上不存在）。
+    type Activation = ();
+
     type Error = NoMmuError;
 
     fn create(alloc: crate::vm::PageAlloc) -> Result<Self, Self::Error>
@@ -61,6 +68,8 @@ impl AddressSpaceBackend for NoMmuAddressSpace {
     fn activate(&self) -> Result<(), NoMmuError> {
         Ok(())
     }
+
+    fn prepare_activation(&self) {}
 }
 
 #[cfg(test)]

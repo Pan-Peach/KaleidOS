@@ -463,15 +463,15 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现（step 5）** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
 | `kcore_endpoint_call` 文档与代码一致 | **未做**（文档过时） | `abi/core.toml:797-802` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
-| 部署字段（`InstanceRecord::execution_domain`） | **部分实现**：字段落地 + 创建入口**按域分派**（`KernelNative` 走现有链；`IsolatedNative` / `SandboxedNative` 是 `todo!()` 占位）；只有 KernelNative 可执行 | `registry.rs`、`load.rs`、`endpoint.rs::instance_domain` |
+| 部署字段（`InstanceRecord::execution_domain`） | **部分实现**：字段落地 + 创建入口**按域分派**。`KernelNative` 走现有链；`IsolatedNative` 是**拒绝包络 + 私有 AS 准备**（无私有 AS 能力 / 含 `kcore_*` import / 复用 KernelNative image → 装载前 `-ENOTSUP`；设备 / DMA / IRQ / 任务 / 出站调用 → `-ENOTSUP`），**不执行组件**；`SandboxedNative` 是 `todo!()` 占位。只有 KernelNative 可执行 | `registry.rs`、`load.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
 | 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
 | 按 `(caller, callee)` 域选机制 | **设计完成，未开始** | 本文件 §2、§3 |
 | Direct / Gate 作为**绑定机制**分离 | **设计完成，未开始** | 本文件 §1、§4 |
 | "inflight 只计 Gate" 的契约约束 | **设计完成** | 本文件 §3 |
-| 私有地址空间 / `satp` 切换 / ASID | **未开始** | `mmu/mod.rs:56-68` 无人调用 |
+| 私有地址空间 / `satp` 切换 / ASID | **部分实现（仅准备，不切换）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）落地并有 host 测试；**运行期 `satp` 切换 / assembly gateway / ASID 未实现**（`activate()` 仍无生产调用方，切换后继续用 ASID 0 + 全量 `sfence.vma`） | `memory/address_space.rs`、`arch/src/vm.rs`、`riscv/mmu` |
 | U-mode / `ecall` | **未开始** | `supervisor.rs:63-66`（`UserEnvCall` panic） |
-| 跨域 image 复用（按域放段 / import） | **未开始** | 单 base、单次重定位 |
-| `kcore_*` import 的 Isolated / Sandbox 解析 | **未开始** | 只有 native 直接符号地址 |
+| 跨域 image 复用（按域放段 / import） | **未开始**（Isolated 装载**拒绝复用** KernelNative image：VA 与 import 目标不同） | 单 base、单次重定位；`load.rs::validate_isolated_load` |
+| `kcore_*` import 的 Isolated / Sandbox 解析 | **未开始**（Isolated 装载**拒绝任何 `kcore_*` import**，绝不回退到裸 Core 地址；per-domain gate trampoline 未实现） | `load.rs::check_isolated_imports`、`loader.rs` |
 | 组件支持范围元数据 | **未开始** | manifest 无字段 |
 | 重入嵌套深度上限 | **未开始** | 只有链成员门禁 |
 

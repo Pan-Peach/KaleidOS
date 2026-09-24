@@ -35,6 +35,47 @@ const SV39_MODE: usize = 8;
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 const SV32_MODE: usize = 1;
 
+/// 组装 satp 原始值（模式 | ASID | root PPN）。`activate` 与
+/// [`SatpActivation::satp`] 共用，保证两条路径的编码一致。
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
+const fn satp_value(root_ppn: usize, asid: u16) -> usize {
+    (SV39_MODE << 60) | ((asid as usize) << 44) | root_ppn
+}
+
+#[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
+const fn satp_value(root_ppn: usize, asid: u16) -> usize {
+    (SV32_MODE << 31) | ((asid as usize) << 22) | root_ppn
+}
+
+/// 一次 satp 切换所需的原始数据（`AddressSpaceBackend::Activation` 的 RISC-V 形态）。
+///
+/// 只打包 `root_ppn` + `asid`，**不动寄存器**：真正的 `csrw satp` 仍在
+/// [`activate`]。未来 Core 的切换汇编消费本值（`satp()` 给出预打包的 satp 字），
+/// 因此它必须是 `Copy` 且不携带借用。ASID 当前恒为 0——`sv39` / `sv32` backend
+/// 都不声明 ASID 支持，切换靠 `sfence.vma` 全清。
+#[cfg(all(
+    feature = "vm-mmu",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SatpActivation {
+    /// 根页表物理页号（`PA >> 12`，写 satp 的 PPN 字段）。
+    pub root_ppn: usize,
+    /// 该地址空间的 ASID（当前恒 0）。
+    pub asid: u16,
+}
+
+#[cfg(all(
+    feature = "vm-mmu",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+impl SatpActivation {
+    /// 预打包的 satp 值（模式 | ASID | root PPN）——汇编只需一条 `csrw satp`。
+    pub const fn satp(self) -> usize {
+        satp_value(self.root_ppn, self.asid)
+    }
+}
+
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 pub type AddressSpace = address_space::Sv39AddressSpace;
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
@@ -54,7 +95,7 @@ pub unsafe fn flush_tlb() {
 /// `root_ppn` 是根页表物理页号；`asid` 是该地址空间的 ASID。
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 pub unsafe fn activate(root_ppn: usize, asid: u16) {
-    let satp = (SV39_MODE << 60) | ((asid as usize) << 44) | root_ppn;
+    let satp = satp_value(root_ppn, asid);
 
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
@@ -70,7 +111,7 @@ pub unsafe fn activate(root_ppn: usize, asid: u16) {
 /// Write an Sv32 `satp` value and flush stale translations.
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 pub unsafe fn activate(root_ppn: usize, asid: u16) {
-    let satp = (SV32_MODE << 31) | ((asid as usize) << 22) | root_ppn;
+    let satp = satp_value(root_ppn, asid);
 
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack, preserves_flags));

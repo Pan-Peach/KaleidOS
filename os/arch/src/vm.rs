@@ -50,6 +50,21 @@ pub trait AddressSpaceBackend {
     /// 校验自动退化为 no-op）。这保证 Core 不偷偷依赖"必须有 MMU 页"。
     const GRANULE: usize;
 
+    /// 该后端是否提供**私有地址空间**能力（独立页表 + 切换机制）。
+    ///
+    /// **`AddressSpaceBackend` 可用 ≠ 有隔离能力**：NoMMU 恒等翻译同样实现本
+    /// trait，但 `VA == PA`、无页表、无 satp——无法承载 Isolated 域，声明
+    /// `false`。Core 的部署/装载路径据此**显式拒绝**（绝不把 NoMMU 当私有 AS
+    /// 用）。除了"私有 AS 存在"，本常量**不**表达任何安全承诺：S-mode 换页表
+    /// 是协作式、非对抗边界（见 `docs/development/roadmap.md` §10.1）。
+    const PRIVATE_ADDRESS_SPACE: bool;
+
+    /// 切换汇编所需的原始数据：由 backend 打包，Core **只搬运、不解释**。
+    ///
+    /// 必须是 `Copy` 且不携带借用：描述符在 Core 锁内准备，之后**不得**再触碰
+    /// Core 锁或 Rust 栈（真正的 satp 切换发生在汇编路径上，可能已经换根）。
+    type Activation: Copy;
+
     type Error;
 
     fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
@@ -65,4 +80,10 @@ pub trait AddressSpaceBackend {
     fn unmap(&mut self, va: VirtualRange) -> Result<(), Self::Error>;
     fn translate(&self, va: usize) -> Option<usize>;
     fn activate(&self) -> Result<(), Self::Error>;
+
+    /// 准备切换数据：只读，**不写 satp、不刷 TLB、不改状态**。
+    ///
+    /// 真正的寄存器写入仍在 `activate()`（未来由 Core 的切换汇编消费本返回值；
+    /// 本阶段没有任何运行期切换）。
+    fn prepare_activation(&self) -> Self::Activation;
 }

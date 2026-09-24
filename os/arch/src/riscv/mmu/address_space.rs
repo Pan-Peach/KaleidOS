@@ -38,6 +38,10 @@ impl Sv39AddressSpace {
 impl AddressSpaceBackend for Sv39AddressSpace {
     type Error = sv39::MapError;
     const GRANULE: usize = sv39::VM_PAGE_SIZE;
+    /// 独立页表 + satp：具备承载私有地址空间的翻译机制（协作式边界，
+    /// 不是对抗隔离——见 `vm::AddressSpaceBackend::PRIVATE_ADDRESS_SPACE`）。
+    const PRIVATE_ADDRESS_SPACE: bool = true;
+    type Activation = super::SatpActivation;
 
     fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
     where
@@ -68,6 +72,13 @@ impl AddressSpaceBackend for Sv39AddressSpace {
             super::activate(self.table.root_ppn(), self.asid);
         }
         Ok(())
+    }
+
+    fn prepare_activation(&self) -> Self::Activation {
+        super::SatpActivation {
+            root_ppn: self.table.root_ppn(),
+            asid: self.asid,
+        }
     }
 }
 
@@ -99,6 +110,10 @@ impl Sv32AddressSpace {
 impl AddressSpaceBackend for Sv32AddressSpace {
     type Error = sv32::MapError;
     const GRANULE: usize = sv32::VM_PAGE_SIZE;
+    /// 独立页表 + satp：具备承载私有地址空间的翻译机制（协作式边界，
+    /// 不是对抗隔离——见 `vm::AddressSpaceBackend::PRIVATE_ADDRESS_SPACE`）。
+    const PRIVATE_ADDRESS_SPACE: bool = true;
+    type Activation = super::SatpActivation;
 
     fn create(alloc: PageAlloc) -> Result<Self, Self::Error>
     where
@@ -129,5 +144,12 @@ impl AddressSpaceBackend for Sv32AddressSpace {
             super::activate(self.table.root_ppn(), self.asid);
         }
         Ok(())
+    }
+
+    fn prepare_activation(&self) -> Self::Activation {
+        super::SatpActivation {
+            root_ppn: self.table.root_ppn(),
+            asid: self.asid,
+        }
     }
 }

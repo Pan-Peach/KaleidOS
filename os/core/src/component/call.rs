@@ -150,6 +150,10 @@ pub enum CallError {
     /// provider dispatcher 在 service 边界内 panic：provider 已被标记 `Failed`
     /// 且其全部 endpoint 永久失效；caller 存活且不变 → `EIO`。
     ProviderFailed,
+    /// **Isolated（非 KernelNative）caller 的出站调用**：跨 AS 的 Gate 需要真实
+    /// 的地址空间切换（assembly gateway，未实现）。显式拒绝 → `ENOTSUP`——
+    /// 绝不在 KernelNative 的 AS 里替 Isolated caller 执行这次调用。
+    UnsupportedCallerDomain,
 }
 
 impl From<EndpointError> for CallError {
@@ -288,6 +292,13 @@ fn dispatch(
     let caller = caller.ok_or(CallError::NoCaller)?;
     if crate::component::is_failed(caller) {
         return Err(CallError::CallerFailed);
+    }
+
+    // (1b) 部署域门禁：只有 KernelNative caller 有**已实现**的出站调用机制。
+    //      Isolated caller 的跨 AS Gate 需要 satp 切换（未实现）——拒绝，绝不
+    //      在共享内核 AS 里替它执行（那会把跨域调用静默降级成 native）。
+    if !crate::component::is_kernel_native(caller) {
+        return Err(CallError::UnsupportedCallerDomain);
     }
 
     // (2) 祖先上下文门禁：IRQ 回调（即使藏在嵌套生命周期边界之下）不得发起
@@ -857,6 +868,62 @@ mod tests {
         assert_eq!(Errno::from(error), Errno::EPERM);
 
         // Then：两条门禁都在 provider 之前；inflight 未被触碰。
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "provider 从未被调用"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0, "失败调用不写 out_status");
+    }
+
+    /// Isolated（非 KernelNative）caller 的**出站调用**被显式拒绝：跨 AS Gate
+    /// 需要 satp 切换（未实现）→ `ENOTSUP`，绝不在共享内核 AS 里替它执行。
+    ///
+    /// 门禁在 provider 解析 / inflight 记账**之前**，与其它 caller 门禁同序。
+    #[test]
+    fn isolated_caller_is_rejected_before_any_dispatch() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider(
+            b"call_isolated_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+        );
+        let endpoint = publish(provider, b"svc.isolated");
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+
+        // Given：一个 Isolated 实例（Starting = 活实例，身份有效）。
+        let isolated = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(0x1501),
+                    ExecutionDomain::IsolatedNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+
+        // When：它调用一个真实存活、Ready 的 provider。
+        let mut out_status = 0i32;
+        let error = dispatch(
+            Some(isolated),
+            None,
+            endpoint,
+            0,
+            &EMPTY_FRAME,
+            &mut out_status,
+        )
+        .unwrap_err();
+
+        // Then：`UnsupportedCallerDomain`（ENOTSUP）；provider 从未被调用、
+        // inflight 未被触碰、out_status 不写（传输失败 ≠ 方法状态）。
+        assert_eq!(error, CallError::UnsupportedCallerDomain);
+        assert_eq!(Errno::from(error), Errno::ENOTSUP);
         assert_eq!(
             DISPATCH_CALLS.load(Ordering::SeqCst),
             before,

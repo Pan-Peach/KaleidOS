@@ -37,6 +37,19 @@ pub fn may_run(id: ComponentId) -> bool {
     registry::get_registry().lock().may_run(id)
 }
 
+/// Core 真相查询：`id` 是否运行在 [`endpoint::ExecutionDomain::KernelNative`]。
+///
+/// 只有 KernelNative 具备**已实现**的 Core ABI 资源 / 调用路径（MMIO、DMA、
+/// IRQ、任务、出站服务调用）。Isolated / Sandbox 的对应机制尚未实现，所有
+/// acquiring 入口据此**显式拒绝**（`-ENOTSUP`），绝不静默跨域降级。
+///
+/// 未声明的身份回退 `KernelNative`（`endpoint::instance_domain` 的既有防御
+/// 语义）；需要存在性校验的调用方必须另行解析 caller。
+pub fn is_kernel_native(id: ComponentId) -> bool {
+    let registry = registry::get_registry().lock();
+    endpoint::instance_domain(&registry, id) == endpoint::ExecutionDomain::KernelNative
+}
+
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
 /// 由 Core 分配；组件的 ResourceDomain 以 ComponentId 为键记录。
 /// 可被猜测/构造/传递，但真正的操作权限来自 Core 授予的组件凭证（token），

@@ -689,8 +689,9 @@ extern "C" fn kcore_endpoint_bind(
 ///
 /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`
 /// （`EFAULT` `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或
-/// caller 已 `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image
-/// 已不存在；`EBUSY` provider 不在 `Ready`、inflight 溢出或**重入**（provider
+/// caller 已 `Failed`；`ENOTSUP` caller 不在 KernelNative 域（Isolated 出站调用
+/// 需要未实现的跨 AS Gate）；`ENOENT` endpoint 未发布或已死；`ENODEV` owner /
+/// image 已不存在；`EBUSY` provider 不在 `Ready`、inflight 溢出或**重入**（provider
 /// 已在当前同步链上）；`EINVAL` 调用链上有 **IRQ 作用域**；`ENOMEM` Core 无法
 /// 分配 service stack；`EIO` provider 在边界内 **panic**（已被标记 `Failed` 且
 /// 其 endpoint 永久失效，caller 存活）；`ENOSYS` image 没有
@@ -753,13 +754,27 @@ fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
     crate::component::is_failed(component).then_some(Errno::EPERM.code())
 }
 
+/// Isolated / Sandbox 调用者能力门禁：非 KernelNative 域**没有已实现**的
+/// MMIO / DMA / IRQ / 任务 / Core 资源路径（increment 1 的窄支持包络；私有 AS
+/// 只映射 gateway + 自身内存）→ `-ENOTSUP`，绝不静默按 KernelNative 语义执行。
+///
+/// 只作用于**获取 authority / 创建 work** 的入口（claim / irq register /
+/// dma alloc / dma map / task create）；teardown（release / free / unmap）仍由
+/// 各自的 owner 校验约束，不受本门禁限制。
+fn deny_if_isolated(component: crate::component::ComponentId) -> Option<i32> {
+    let reg = registry::get_registry().lock();
+    (endpoint::instance_domain(&reg, component) != ExecutionDomain::KernelNative)
+        .then_some(Errno::ENOTSUP.code())
+}
+
 /// 创建任务。requester = 当前 caller；`entry` 必须落在该实例的
 /// 装载镜像内（越界指针一律拒绝）；`arg` 是 opaque 参数，Core 原样透传给任务
 /// 入口（`typedef void (*)(void *)`），**任务归属仍来自 Core 的执行边界**，
 /// 与 `arg` 内容无关。
 ///
 /// 成功 = 0，TaskId（`u32`）写入 `*out_task`（调用方保证可写，任意对齐）；
-/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller；
+/// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
+/// `ENOTSUP` caller 不在 KernelNative 域（Isolated 任务未实现）；
 /// 其余见 `Errno::from(TaskError)`）。
 extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) -> i32 {
     with_core_critical(|| {
@@ -770,6 +785,9 @@ extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) 
             return Errno::EPERM.code();
         };
         if let Some(denied) = deny_if_failed(requester) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(requester) {
             return denied;
         }
         match task::create_task(requester, entry, arg) {
@@ -919,8 +937,8 @@ extern "C" fn kcore_device_nth(
 ///
 /// 成功 = 0，`*out_mmio`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
-/// `Failed` / `ENODEV` 设备不存在 / `ENOTSUP` 设备是 PIO / `EBUSY` 设备已被认领
-/// 或已 quarantine）。
+/// `Failed` / `ENOTSUP` caller 不在 KernelNative 域（Isolated 无 MMIO 窗口）
+/// 或设备是 PIO / `ENODEV` 设备不存在 / `EBUSY` 设备已被认领或已 quarantine）。
 extern "C" fn kcore_device_claim(
     device_id: u32,
     out_mmio: *mut *mut u8,
@@ -934,6 +952,9 @@ extern "C" fn kcore_device_claim(
             return Errno::EPERM.code();
         };
         if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(ctx.component) {
             return denied;
         }
         match device::claim(&ctx, machine::DeviceId::from_raw(device_id)) {
@@ -978,6 +999,7 @@ extern "C" fn kcore_device_release(device_id: u32) -> i32 {
 /// 它的代码。单 IRQ 模型：一台设备一条线，被 claim 的 DeviceId 就是锚点。
 ///
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
+/// `ENOTSUP` caller 不在 KernelNative 域（Isolated 无 IRQ 路径）/
 /// `ENODEV` 设备不存在或无中断线 / `EACCES` caller 不是设备 owner）。
 extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
     with_core_critical(|| {
@@ -985,6 +1007,9 @@ extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: 
             return Errno::EPERM.code();
         };
         if let Some(denied) = deny_if_failed(caller.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(caller.component) {
             return denied;
         }
         status(irq::register(
@@ -1044,6 +1069,7 @@ extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
 ///
 /// 成功 = 0，`*out_ptr`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或已 Failed /
+/// `ENOTSUP` caller 不在 KernelNative 域（Isolated 无 DMA 路径）/
 /// `EINVAL` 尺寸非法 / `ENOMEM` 物理内存耗尽）。
 extern "C" fn kcore_dma_alloc(size: usize, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
     with_core_critical(|| {
@@ -1054,6 +1080,9 @@ extern "C" fn kcore_dma_alloc(size: usize, out_ptr: *mut *mut u8, out_len: *mut 
             return Errno::EPERM.code();
         };
         if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(ctx.component) {
             return denied;
         }
         match dma::alloc(ctx.component, size) {
@@ -1089,7 +1118,8 @@ extern "C" fn kcore_dma_free(ptr: *mut u8) -> i32 {
 ///
 /// 成功 = 0，`*out_device_addr`（`u64`）与 `*out_mapping`（`u64`）写入；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` direction 非法或范围非法 /
-/// `EPERM` 无法解析 caller 或已 Failed / `ENODEV` 设备不存在 / `EACCES` 非 owner）。
+/// `EPERM` 无法解析 caller 或已 Failed / `ENOTSUP` caller 不在 KernelNative 域 /
+/// `ENODEV` 设备不存在 / `EACCES` 非 owner）。
 extern "C" fn kcore_dma_map(
     device_id: u32,
     ptr: *mut u8,
@@ -1109,6 +1139,9 @@ extern "C" fn kcore_dma_map(
             return Errno::EPERM.code();
         };
         if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(ctx.component) {
             return denied;
         }
         match dma::map(
@@ -1437,6 +1470,101 @@ mod tests {
                     core::ptr::null_mut(),
                 ),
                 Errno::EPERM.code()
+            );
+        });
+    }
+
+    /// Isolated 实例门禁：非 KernelNative 域没有已实现的 MMIO / DMA / IRQ / 任务 /
+    /// 出站调用路径 → acquiring 入口一律 `-ENOTSUP`（increment 1 的窄支持包络）。
+    ///
+    /// 对照：同一 `device_claim` 在 KernelNative 边界下**不**被域门禁拒绝，而是走到
+    /// 设备解析（`-ENODEV`）——证明这是按域拒绝，不是"所有调用都拒绝"。
+    #[test]
+    fn isolated_component_is_denied_core_resource_exports() {
+        use crate::component::{containment, registry};
+
+        extern "C" fn irq_stub(_ctx: *mut ()) {}
+
+        let _boundary = containment::test_boundary_lock();
+        registry::init();
+        crate::resource::init();
+
+        // Given：一个 Isolated 实例（Starting = 活实例，但域没有已实现路径）。
+        let isolated = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(1),
+                    ExecutionDomain::IsolatedNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+
+        // When / Then：获取 authority / 创建 work 的入口全部 `-ENOTSUP`。
+        containment::with_test_init_boundary(Some(isolated), || {
+            let (mut ptr, mut len, mut mapping) = (core::ptr::null_mut(), 0usize, 0u64);
+            let mut out_task = 0u32;
+            assert_eq!(
+                kcore_device_claim(0, &mut ptr, &mut len),
+                Errno::ENOTSUP.code()
+            );
+            assert_eq!(
+                kcore_irq_register(0, irq_stub, core::ptr::null_mut()),
+                Errno::ENOTSUP.code()
+            );
+            assert_eq!(
+                kcore_dma_alloc(4096, &mut ptr, &mut len),
+                Errno::ENOTSUP.code()
+            );
+            assert_eq!(
+                kcore_dma_map(0, core::ptr::null_mut(), 16, 0, &mut 0u64, &mut mapping),
+                Errno::ENOTSUP.code()
+            );
+            assert_eq!(
+                kcore_task_create(0x1000, core::ptr::null_mut(), &mut out_task),
+                Errno::ENOTSUP.code()
+            );
+            let mut out_status = 0i32;
+            assert_eq!(
+                kcore_endpoint_call(
+                    999,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut out_status,
+                ),
+                Errno::ENOTSUP.code(),
+                "Isolated 出站调用（跨 AS Gate 未实现）必须显式拒绝"
+            );
+        });
+
+        // 对照：KernelNative 边界下 device_claim 不被域门禁拒绝——设备解析失败是
+        // 它自己的错误（`-ENODEV`），不是 `-ENOTSUP`。
+        let native = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(
+                    crate::component::image::ComponentImageId::from_raw(2),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        containment::with_test_init_boundary(Some(native), || {
+            let (mut ptr, mut len) = (core::ptr::null_mut(), 0usize);
+            assert_eq!(
+                kcore_device_claim(9999, &mut ptr, &mut len),
+                Errno::ENODEV.code(),
+                "KernelNative 不受域门禁限制，失败来自设备解析"
             );
         });
     }

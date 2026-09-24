@@ -13,13 +13,14 @@
 //! state），不再拒绝；image 登记进 `component/image.rs` 的 image 表并 pinned 到重启。
 
 use crate::component::containment::{self, CallOutcome, KcompCreateArgs};
+use crate::component::elf::ElfObject;
 use crate::component::endpoint::{self, EndpointError, ExecutionDomain};
 use crate::component::image::{self, ComponentImageId};
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, failure, registry};
 use crate::errno::Errno;
 use crate::memory::address_space::{
-    self, AddressSpaceHandle, Mapping, MappingPermission, PhysicalRange, VirtualRange,
+    self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange, VirtualRange,
 };
 use crate::task::TaskId;
 use spin::Mutex;
@@ -70,6 +71,18 @@ pub enum ComponentLoadError {
     /// 在 **policy 回调**（`PolicyCall` 边界，含其下的嵌套边界）内请求创建组件：
     /// 策略回调有界（不得阻塞 / 不得分配 / 不得创建组件），Core 拒绝 → `-EINVAL`。
     InPolicyContext,
+    /// 请求 `IsolatedNative` 部署，但当前平台 / profile **没有私有地址空间能力**
+    /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
+    /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
+    IsolationUnsupported,
+    /// `IsolatedNative` 装载发现**未支持的 `kcore_*` import**：本阶段 Isolated
+    /// 的 import 解析（Core gate trampoline）尚未实现，任何 `kcore_*` UNDEF 都
+    /// 在装载**之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
+    IsolatedImportUnsupported,
+    /// `IsolatedNative` 装载不得复用**已按 KernelNative 放段 / 重定位**的 image：
+    /// 其 VA 布局与 import 目标（裸 Core 地址）都是共享内核 AS 的产物，复用等于
+    /// 把裸 Core 地址带进 Isolated 域。按域装载落地前一律拒绝。
+    IsolatedImageReuse,
 }
 
 impl ComponentLoadError {
@@ -116,9 +129,11 @@ pub fn load_and_start(
 /// 用指定 config 负载 + 部署域创建一个新实例，返回实例 id。
 ///
 /// `kind` 是**部署请求**（Policy proposes）：本函数**按执行域分派**创建路径——
-/// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative` /
-/// `SandboxedNative` 尚无执行器，是**显式占位**（`todo!()`），绝不静默降级成 native
-/// 跑（`docs/architecture/deployment.md` §2 ⑤/§10）。
+/// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative`
+/// 走 [`create_isolated_native`] 的**受限门禁**（能力 / import 包络 / image 复用
+/// 任一不满足即 `-ENOTSUP`，不执行组件）；`SandboxedNative` 尚无占位实现
+/// （`todo!()`）。任何域都**绝不静默降级成 native 跑**
+/// （`docs/architecture/deployment.md` §2 ⑤/§10）。
 ///
 /// 锁纪律：registry / image 锁只覆盖各自的查询与提交；`kcomp_instance_create`
 /// 在**无锁**状态下调用（组件 create 可能再创建别的组件、publish 接口、创建任务，
@@ -138,8 +153,8 @@ pub fn create_component(
     // guard"（guard 会让"未实现域"与"已实现域"共用同一条装载路径，混淆真相）。
     match kind {
         ExecutionDomain::KernelNative => create_kernel_native(name, args),
-        // TODO(human): Isolated 执行器——按域放段 + 按域 import 解析 + 私有 AS
-        // 入口（deployment.md §6.2/§7.1）；配合 `get_or_load_image` 的按域装载。
+        // Isolated 执行器尚未落地（assembly gateway / satp 切换是后续 increment）：
+        // `create_isolated_native` 只做**受限门禁 + 私有 AS 准备**，不调用组件入口。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
         // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
@@ -248,29 +263,46 @@ fn create_kernel_native(
     }
 }
 
+/// `IsolatedNative` 的**受限装载门禁**（本函数**不执行任何组件**）。
+///
+/// 顺序（任一不满足即显式拒绝，绝不降级成 KernelNative）：
+/// 1. **平台能力**：当前 profile 必须有私有地址空间 backend（NoMMU / 无后端 → 拒绝）；
+/// 2. **image 复用 + import 包络**：不得复用 KernelNative 放段结果，不得含
+///    未支持的 `kcore_*` import（见 [`validate_isolated_load`]）；
+/// 3. 建立该实例的私有 AS 并只映射装载镜像；
+/// 4. 声明实例 → `resolve` → `begin_start`——`kcomp_instance_create` **不调用**：
+///    真正的 Isolated 入口执行需要 assembly gateway / satp 切换（后续 increment）。
 fn create_isolated_native(
     name: &[u8],
-    args: &KcompCreateArgs,
+    _args: &KcompCreateArgs,
 ) -> Result<ComponentId, ComponentLoadError> {
-    let image = get_or_load_image(name)?;
-    let create_entry = image::get_images()
+    // (1) 能力门禁：trait 可用 ≠ 隔离能力（NoMMU 也实现 AddressSpaceBackend）。
+    if !address_space::isolation_capable() {
+        return Err(ComponentLoadError::IsolationUnsupported);
+    }
+
+    // (2) 装载前置门禁；blob 只读一次，随后的装载用同一份字节。
+    let blob = validate_isolated_load(name)?;
+    let loaded = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
+    let image = image::get_images()
         .lock()
-        .get(image)
-        .map(|image| image.create)
-        .ok_or(ComponentLoadError::ImageFailed)?;
+        .register(name, loaded)
+        .map_err(|_| ComponentLoadError::ImageFailed)?;
+
     let id = registry::get_registry()
         .lock()
         .declare(image, ExecutionDomain::IsolatedNative)
         .map_err(|_| ComponentLoadError::DeclareFailed)?;
 
-    let space =
-        create_isolated_address_space(id, image).map_err(|_| ComponentLoadError::StartFailed)?;
+    // (3) 私有 AS：只映射该实例自己的装载镜像（不做 Core 段 / 堆 / MMIO 的全量映射）。
+    let space = create_isolated_address_space(id, image)?;
     {
         let mut reg = registry::get_registry().lock();
         reg.record_address_space(id, space)
             .map_err(|_| ComponentLoadError::StartFailed)?;
     }
 
+    // (4) 生命周期只推进到 `Starting`：没有执行器就不会有 Ready 实例。
     {
         let mut reg = registry::get_registry().lock();
         reg.resolve(id)
@@ -282,12 +314,68 @@ fn create_isolated_native(
     Ok(id)
 }
 
+/// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
+/// 字节，调用方用同一份 blob 装载（不重复读取）。
+///
+/// - **image 复用拒绝**：image 表按 artifact 名唯一，而今天登记的都是
+///   KernelNative 放段 / 重定位结果（import = 裸 Core 函数地址，VA 按共享内核
+///   AS 选定）。复用它们正是"静默降级"——按域装载落地前一律拒绝。
+/// - **import 包络**：本阶段唯一受支持的 Isolated import 集合是**空集**
+///   （`kcore_*` 尚无 per-domain gate 解析）。任何 `kcore_*` UNDEF 在装载前拒绝。
+fn validate_isolated_load(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
+    if image::get_images().lock().find(name).is_some() {
+        return Err(ComponentLoadError::IsolatedImageReuse);
+    }
+    let blob = read_artifact(name)?;
+    check_isolated_imports(&blob)?;
+    Ok(blob)
+}
+
+/// 扫描 ELF 符号表：任一 **UNDEF**（`shndx == 0`）的 `kcore_*` 符号都是未支持的
+/// Isolated import（见 [`validate_isolated_load`]）。
+fn check_isolated_imports(blob: &[u8]) -> Result<(), ComponentLoadError> {
+    let object =
+        ElfObject::parse(blob).map_err(|error| ComponentLoadError::Loader(error.into()))?;
+    let symbol_table = object
+        .symbol_table_index()
+        .map_err(|error| ComponentLoadError::Loader(error.into()))?;
+    let count = object
+        .symbol_count(symbol_table)
+        .map_err(|error| ComponentLoadError::Loader(error.into()))?;
+    for index in 0..count {
+        let symbol = object
+            .symbol(symbol_table, index)
+            .map_err(|error| ComponentLoadError::Loader(error.into()))?;
+        if symbol.shndx != 0 {
+            continue; // 已定义（含 section / file 符号）。
+        }
+        let name = object
+            .symbol_name(symbol_table, symbol)
+            .map_err(|error| ComponentLoadError::Loader(error.into()))?;
+        if is_kcore_import(name) {
+            return Err(ComponentLoadError::IsolatedImportUnsupported);
+        }
+    }
+    Ok(())
+}
+
+/// 该符号名是否属于 `kcore_*` 导出面（即 loader 在 KernelNative 下会重定位到
+/// **裸 Core 地址**的那一类）。非 `kcore_*` 的 UNDEF 不在本包络内：它们本来就
+/// 无法解析，由 loader 自己以 `UnresolvedSymbol` 拒绝。
+fn is_kcore_import(name: &[u8]) -> bool {
+    name.starts_with(b"kcore_")
+}
+
 fn create_isolated_address_space(
     owner: ComponentId,
     image: ComponentImageId,
 ) -> Result<AddressSpaceHandle, ComponentLoadError> {
-    let handle = address_space::create_address_space_for(owner)
-        .map_err(|_| ComponentLoadError::StartFailed)?;
+    let handle = address_space::create_address_space_for(owner).map_err(|error| match error {
+        // 能力门禁的兜底：backend 自己声明没有私有 AS → 同样是"域不支持"，
+        // 不是 I/O 失败。
+        MapError::Unsupported => ComponentLoadError::IsolationUnsupported,
+        _ => ComponentLoadError::StartFailed,
+    })?;
 
     let mapping = {
         let images = image::get_images().lock();
@@ -328,6 +416,17 @@ fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError
         return Ok(id);
     }
 
+    let blob = read_artifact(name)?;
+    let comp = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
+    image::get_images()
+        .lock()
+        .register(name, comp)
+        .map_err(|_| ComponentLoadError::ImageFailed)
+}
+
+/// 从仓库读取 `<name>.kcomp` 的原始字节（`KernelNative` 与 `IsolatedNative`
+/// 装载共用；两者对同一 artifact 的处理不同，但读取方式一致）。
+fn read_artifact(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
     let store = crate::component::store::get_component_store()
         .ok_or(ComponentLoadError::StoreNotMounted)?;
     let kname = [name, b".kcomp"].concat();
@@ -340,12 +439,7 @@ fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError
     store
         .read(&kname, &mut blob)
         .map_err(|_| ComponentLoadError::ReadFailed)?;
-
-    let comp = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
-    image::get_images()
-        .lock()
-        .register(name, comp)
-        .map_err(|_| ComponentLoadError::ImageFailed)
+    Ok(blob)
 }
 
 // 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（REAL_KPKG）；
@@ -454,5 +548,72 @@ mod tests {
     fn sandboxed_deployment_is_an_unimplemented_placeholder() {
         let _serial = LOAD_TEST_LOCK.lock();
         let _ = load_and_start(b"kcomp_smoke", ExecutionDomain::SandboxedNative);
+    }
+
+    // -- Isolated 部署的显式拒绝包络（increment 1）-----------------------------
+
+    /// 真实 `.kcomp` fixture（与 loader 用例同一份构建产物）。
+    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
+
+    /// **平台能力拒绝**：请求 `IsolatedNative` 而当前构建没有私有 AS backend
+    /// （host 构建正是如此）→ `IsolationUnsupported`（`-ENOTSUP`）。
+    ///
+    /// 关键：`AddressSpaceBackend` trait 可用 ≠ 有隔离能力；拒绝发生在**读取
+    /// 仓库与装载之前**，所以本用例不需要挂载 store。
+    #[test]
+    fn isolated_deployment_without_private_address_space_is_rejected() {
+        let _serial = LOAD_TEST_LOCK.lock();
+
+        // When：一个存在于仓库、但从未被读取过的名字。
+        // Then：能力门禁先拒绝（不是 NotFound / StoreNotMounted，也不是静默 native）。
+        assert_eq!(
+            load_and_start(
+                b"isolated_capability_probe",
+                ExecutionDomain::IsolatedNative
+            ),
+            Err(ComponentLoadError::IsolationUnsupported)
+        );
+        assert_eq!(current_component(), None, "拒绝路径不得残留 CURRENT");
+    }
+
+    /// **import 包络拒绝**：真实组件的 `kcore_*` UNDEF 在装载前被拒绝——绝不
+    /// 回退到 KernelNative 的裸 Core 函数地址。
+    #[test]
+    fn isolated_load_rejects_kcore_imports_before_loading() {
+        assert_eq!(
+            check_isolated_imports(SMOKE_KCOMP),
+            Err(ComponentLoadError::IsolatedImportUnsupported),
+            "kcomp_smoke 的 kcore_* import 必须被 Isolated 装载拒绝"
+        );
+    }
+
+    /// `is_kcore_import` 只认 `kcore_*` 导出面：空名 / 其它 UNDEF 由 loader
+    /// 自己的 `UnresolvedSymbol` 处理，不冒充"支持的 import"。
+    #[test]
+    fn isolated_import_classifier_matches_the_kcore_export_surface() {
+        assert!(is_kcore_import(b"kcore_log_line"));
+        assert!(is_kcore_import(b"kcore_"));
+        assert!(!is_kcore_import(b""));
+        assert!(!is_kcore_import(b"kcomp_instance_create"));
+        assert!(!is_kcore_import(b"memcpy"));
+    }
+
+    /// **image 复用拒绝**：Isolated 请求不得复用已登记的 KernelNative image
+    /// （其 import 目标是裸 Core 地址、VA 按共享内核 AS 选定）。
+    #[test]
+    fn isolated_load_rejects_reusing_an_existing_image() {
+        let _serial = LOAD_TEST_LOCK.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        image::init();
+
+        // Given：一份按 KernelNative 放段 / 重定位的已登记 image（测试替身）。
+        image::test_support::register_test_image(b"isolated_reuse_probe", 0);
+
+        // When / Then：Isolated 装载在 image 复用检查处拒绝，不读仓库、不装载。
+        assert_eq!(
+            validate_isolated_load(b"isolated_reuse_probe"),
+            Err(ComponentLoadError::IsolatedImageReuse)
+        );
     }
 }

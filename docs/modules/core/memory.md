@@ -16,7 +16,7 @@
 - `KernelAllocator`（`GlobalAlloc`，**现状**接 Core 共享堆；导出面已由 `kcore_memory_acquire/release`（域视图）原地替换，**不引入 Core 侧账本**，见 `docs/architecture/memory-and-heap.md`）。
 - 常量：`ALLOC_GRANULE = 4096`（物理分配粒度）、`HEAP_ORDER = 32`、`HEAP_MIN_ORDER = 12`。
 - `MemoryLease`、`MemoryError`。
-- `address_space`：`KernelAddressSpace<B>`、`AddressSpaceManager<B>`、`AddressSpaceId`、`AddressSpaceHandle`、`Mapping`、`MapError`，并重导出 `arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange}`。
+- `address_space`：`KernelAddressSpace<B>`、`AddressSpaceManager<B>`、`AddressSpaceId`、`AddressSpaceHandle`、`AddressSpaceState`（`Ready` / `Retired`）、`Mapping`、`MapError`、`PreparedActivation`（Core 内激活描述符，不经任何 `kcore_*` 导出）；生命周期 API：`map` / `unmap` / `mapping_exact`（精确区间查询）/ `translate` / `prepare_activation` / `retire` / `adopt`（接管既有 backend 的 hook；boot root 尚未接线）；并重导出 `arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange}`。
 
 ## 明确不做
 
@@ -24,7 +24,7 @@
 - 不做内存记账：无 region owner 记录、无 region id、无 Retired 表，也不做 per-instance 字节计费 / 配额（`D1` 已修订；见 `docs/architecture/memory-and-heap.md`）。per-instance `HeapState` 是 runtime 的事，不是 Core 记账。
 - `alloc_region` **不负责清零**。
 - `ALLOC_GRANULE` 与 `AddressSpaceBackend::GRANULE` 语义解耦（数值同为 4 KiB 只是巧合）。
-- `AddressSpaceManager` 生产路径**从未实例化**（休眠）；`kcore_address_space_map` 刻意不在导出白名单。
+- `AddressSpaceManager` **没有组件可达的执行路径**：全局表只在 Isolated 门禁通过后建实例私有 AS，而当前所有真实组件都因 `kcore_*` import 被装载前拒绝（**不执行组件**）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`kcore_address_space_map` 刻意不在导出白名单。
 
 ## 代码在哪
 

@@ -140,6 +140,8 @@ impl From<CallError> for Errno {
             CallError::NoServiceStack => Errno::ENOMEM,
             // provider 已逻辑死亡（panic containment 已提交 Failed + 失效 endpoint）。
             CallError::ProviderFailed => Errno::EIO,
+            // Isolated caller 的出站调用：跨 AS Gate 未实现 = 能力缺失，不是 I/O 错误。
+            CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
         }
     }
 }
@@ -170,6 +172,11 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::PolicyRejected => Errno::EIO,
             // 上下文种类拒绝：policy 回调内不得创建组件（与调度拒绝同档）。
             ComponentLoadError::InPolicyContext => Errno::EINVAL,
+            // 部署能力不足 / Isolated 装载包络拒绝：能力缺失（不是 I/O 错误）。
+            // 三项都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的 I/O。
+            ComponentLoadError::IsolationUnsupported
+            | ComponentLoadError::IsolatedImportUnsupported
+            | ComponentLoadError::IsolatedImageReuse => Errno::ENOTSUP,
         }
     }
 }
@@ -454,6 +461,7 @@ mod tests {
             CallError::ReservedContract,
             CallError::NoServiceStack,
             CallError::ProviderFailed,
+            CallError::UnsupportedCallerDomain,
         ] {
             let expected = match error {
                 CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
@@ -479,6 +487,7 @@ mod tests {
                 CallError::ReservedContract => Errno::EPERM,
                 CallError::NoServiceStack => Errno::ENOMEM,
                 CallError::ProviderFailed => Errno::EIO,
+                CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
             };
             assert_eq!(Errno::from(error), expected, "CallError {error:?}");
         }
@@ -511,6 +520,9 @@ mod tests {
             ComponentLoadError::PolicyPanicked,
             ComponentLoadError::PolicyRejected,
             ComponentLoadError::InPolicyContext,
+            ComponentLoadError::IsolationUnsupported,
+            ComponentLoadError::IsolatedImportUnsupported,
+            ComponentLoadError::IsolatedImageReuse,
         ] {
             let expected = match error {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
@@ -534,6 +546,9 @@ mod tests {
                 ComponentLoadError::PolicyPanicked => Errno::EIO,
                 ComponentLoadError::PolicyRejected => Errno::EIO,
                 ComponentLoadError::InPolicyContext => Errno::EINVAL,
+                ComponentLoadError::IsolationUnsupported
+                | ComponentLoadError::IsolatedImportUnsupported
+                | ComponentLoadError::IsolatedImageReuse => Errno::ENOTSUP,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }
