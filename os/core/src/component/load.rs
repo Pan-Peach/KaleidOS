@@ -191,15 +191,15 @@ pub fn create_component(
     // guard"（guard 会让"未实现域"与"已实现域"共用同一条装载路径，混淆真相）。
     match kind {
         ExecutionDomain::KernelNative => create_kernel_native(name, args),
-        // Isolated 执行器尚未落地（assembly gateway / satp 切换是后续 increment）：
-        // `create_isolated_native` 只做**受限门禁 + 私有 AS 准备**，不调用组件入口。
+        // Isolated 有真实执行器：`create_isolated_native` 建私有 AS、放置镜像，
+        // 再经 gateway 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
         // TODO(human): Sandbox 执行器——U-mode + 私有 AS + ecall。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
     }
 }
 
-/// `KernelNative` 的创建路径（今天唯一有真实执行器的域）。
+/// `KernelNative` 的创建路径。
 ///
 /// 生命周期：`Declared → resolve → Resolved → begin_start → Starting →
 /// kcomp_instance_create → { failure → Failed | success → record state →
