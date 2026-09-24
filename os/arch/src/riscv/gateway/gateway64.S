@@ -9,8 +9,9 @@
 #   gateway_enter(scratch=a0, satp=a1, entry=a2, stack_top=a3,
 #                 slot=a4, irq_enable=a5, token=a6) -> void
 #
-# 组件入口 a0 / a1 由 Rust 包装预置在 scratch 的 G_ENTRY_ARG0 / G_ENTRY_ARG1
-# （入口 ABI 由 Core 解释，汇编只搬运）。
+# 组件入口 a0 .. a3 由 Rust 包装预置在 scratch 的 G_ENTRY_ARG0 .. G_ENTRY_ARG3
+# （入口 ABI 由 Core 解释，汇编只搬运；create / destroy 只用 a0 / a1，
+# service dispatch 用满四个参数）。
 #
 # 偏移常量必须与 `GatewayScratch` 字段偏移一致（Rust 侧 const 断言钉住字段
 # 偏移；QEMU ArchTest 钉住本文件的实际行为）。`entry_stvec` / `core_stvec` /
@@ -42,6 +43,8 @@
 .equ G_TOKEN,             472
 .equ G_ENTRY_ARG0,        480     # 组件入口 a0（Core 预置，见 Transition::arg0）
 .equ G_ENTRY_ARG1,        488     # 组件入口 a1（Core 预置，见 Transition::arg1）
+.equ G_ENTRY_ARG2,        496     # 组件入口 a2（Core 预置，见 Transition::arg2）
+.equ G_ENTRY_ARG3,        504     # 组件入口 a3（Core 预置，见 Transition::arg3）
 
 .equ PHASE_TO_COMPONENT,  1
 .equ PHASE_COMPONENT,     2
@@ -108,10 +111,14 @@ gateway_enter:
     csrs sstatus, SIE_BIT
 1:
     # 组件入口参数（Core 预置在 scratch；此刻 a0 = &scratch，sscratch 已持有它）。
+    # 入口地址暂存 t3：a2 / a3 随后要装入口参数（t3 是 caller-saved，不在 Core 现场里）。
+    mv t3, a2
     ld t0, G_ENTRY_ARG0(a0)
     ld a1, G_ENTRY_ARG1(a0)
+    ld a2, G_ENTRY_ARG2(a0)
+    ld a3, G_ENTRY_ARG3(a0)
     mv a0, t0
-    jalr a2                      # ra = 紧随其后的返回点
+    jalr t3                      # ra = 紧随其后的返回点
 
 # ---------------------------------------------------------------------------
 # 同步返回：组件 `ret` 落在这里（ra 由上面的 jalr 设置）

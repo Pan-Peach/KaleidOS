@@ -43,8 +43,10 @@
 //!   装回 Core 的 `gp`。组件侧**不**安装自己的 `gp`（按域 gp 环境属于未来 loader）。
 //! - **`tp` = 组件 runtime slot**：进入前由 [`Transition::runtime_slot`] 提供
 //!   （0 = 无 slot）；只有 `tp` 的搬运，没有 TLS / 记账。
-//! - **入口参数 `a0` / `a1`**：由 [`Transition::arg0`] / [`Transition::arg1`]
+//! - **入口参数 `a0` .. `a3`**：由 [`Transition::arg0`] .. [`Transition::arg3`]
 //!   写入 scratch，进入前装入（入口 ABI 的解释权在 Core；arch 不解释）。
+//!   create / destroy 只用 `a0` / `a1`；service dispatch 用满四个（state / port /
+//!   method / frame）。
 //! - **单 CPU、不可重入**：scratch 与 Core trap 栈是单一静态；组件生命周期
 //!   （increment 5 起 `component/isolated_lifecycle.rs` 是生产调用方）同步进入、
 //!   不嵌套，ArchTest 也串行驱动。
@@ -92,6 +94,10 @@ pub struct Transition {
     pub arg0: usize,
     /// 组件入口 `a1`（同 [`Transition::arg0`]）。
     pub arg1: usize,
+    /// 组件入口 `a2`（同 [`Transition::arg0`]；create / destroy 为 0）。
+    pub arg2: usize,
+    /// 组件入口 `a3`（同 [`Transition::arg0`]；create / destroy 为 0）。
+    pub arg3: usize,
 }
 
 /// 同步切换的结果。
@@ -179,15 +185,19 @@ struct GatewayScratch {
     token: usize,
     /// 组件入口 `a0`（进入前装入；与 `.S` 的 `G_ENTRY_ARG0` 一致）。
     entry_arg0: usize,
-    /// 组件入口 `a1`（进入前装入；与 `.S` 的 `G_ENTRY_ARG1` 一致）。
+    /// 组件入口 `a1`（与 `.S` 的 `G_ENTRY_ARG1` 一致）。
     entry_arg1: usize,
+    /// 组件入口 `a2`（与 `.S` 的 `G_ENTRY_ARG2` 一致）。
+    entry_arg2: usize,
+    /// 组件入口 `a3`（与 `.S` 的 `G_ENTRY_ARG3` 一致）。
+    entry_arg3: usize,
     _pad: [u8; PAGE_SIZE - SCRATCH_HEADER_BYTES],
 }
 
 /// 头部（除 `_pad`）字节数（两条路径都不含填充）。
 const SCRATCH_HEADER_BYTES: usize = core::mem::size_of::<TrapFrame>()
     + core::mem::size_of::<CoreResume>()
-    + 7 * core::mem::size_of::<usize>();
+    + 9 * core::mem::size_of::<usize>();
 
 // 偏移即 ABI：与 `gateway64.S` / `gateway32.S` 顶部 `.equ` 常量钉死一致。
 const _: () = {
@@ -205,16 +215,20 @@ const _: () = {
     assert!(
         core::mem::offset_of!(CoreResume, trap_stack_top) == 20 * core::mem::size_of::<usize>()
     );
-    // 入口参数：偏移与 `.S` 的 `G_ENTRY_ARG0` / `G_ENTRY_ARG1` 一致。
+    // 入口参数：偏移与 `.S` 的 `G_ENTRY_ARG0` .. `G_ENTRY_ARG3` 一致。
     #[cfg(target_arch = "riscv64")]
     {
         assert!(core::mem::offset_of!(GatewayScratch, entry_arg0) == 480);
         assert!(core::mem::offset_of!(GatewayScratch, entry_arg1) == 488);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg2) == 496);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg3) == 504);
     }
     #[cfg(target_arch = "riscv32")]
     {
         assert!(core::mem::offset_of!(GatewayScratch, entry_arg0) == 240);
         assert!(core::mem::offset_of!(GatewayScratch, entry_arg1) == 244);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg2) == 248);
+        assert!(core::mem::offset_of!(GatewayScratch, entry_arg3) == 252);
     }
     assert!(core::mem::size_of::<GatewayScratch>() == PAGE_SIZE);
 };
@@ -245,6 +259,8 @@ impl GatewayScratch {
         token: 0,
         entry_arg0: 0,
         entry_arg1: 0,
+        entry_arg2: 0,
+        entry_arg3: 0,
         _pad: [0; PAGE_SIZE - SCRATCH_HEADER_BYTES],
     };
 }
@@ -365,6 +381,8 @@ pub fn enter(transition: Transition) -> Outcome {
         (*scratch).status = 0;
         (*scratch).entry_arg0 = transition.arg0;
         (*scratch).entry_arg1 = transition.arg1;
+        (*scratch).entry_arg2 = transition.arg2;
+        (*scratch).entry_arg3 = transition.arg3;
     }
 
     let flags = <CpuImpl as CpuArch>::disable_irq();

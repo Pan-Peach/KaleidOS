@@ -13,17 +13,21 @@
 //!   → re-entry 门禁（provider 已在当前同步链上 → EBUSY）
 //!   → registry.begin_call(provider)（Ready 门禁 + inflight 记账）
 //!   → 取 provider image 的可选 kcomp_service_dispatch + instance_state + port
-//!   → 【无锁】containment::call_component_service(...)
-//!        （per-call service stack + provider principal + panic containment）
-//!   → registry.finish_call(provider)（正常 / panic / 无栈三条路径都归还）
+//!   → 【无锁】按 **provider 执行域** 分派：
+//!        KernelNative → containment::call_component_service(...)
+//!          （per-call service stack + provider principal + panic containment）
+//!        IsolatedNative → isolated_lifecycle::dispatch_service(...)
+//!          （扁平帧拷贝进 Core 拥有的邮箱 + assembly gateway 进私有 AS）
+//!        SandboxedNative → 显式拒绝（ENOTSUP，绝不静默降级）
+//!   → registry.finish_call(provider)（正常 / panic / 故障三条路径都归还）
 //!   → 传输状态：Ok / Err(CallError)；provider 返回值只在 Ok 时写 `*out_status`
 //! ```
 //!
 //! # 执行边界（本阶段落地）
 //!
-//! provider 的 dispatcher 跑在 **Core 拥有的 per-call 32 KiB service stack** 上，
-//! 处于 provider 自己的 principal 之下（[`containment::call_component_service`]）：
-//!
+//! **同域（provider = KernelNative）**：provider 的 dispatcher 跑在 **Core 拥有的
+//! per-call 32 KiB service stack** 上，处于 provider 自己的 principal 之下
+//! （[`containment::call_component_service`]）：
 //! - **principal 切换**：dispatcher 内 `RequestContext::ambient()` 解析为
 //!   provider（不再是 caller）；caller 的 task 只作为**执行来源**传递，不是
 //!   授权。`ambient_init()` 在边界内为 `None`（service call 不得发布）。
@@ -38,6 +42,32 @@
 //! - **调度门禁**：service 边界内（含嵌套 init 之下）`sched::run` /
 //!   `yield_current` / `exit_current` / task 创建一律拒绝
 //!   （`containment::scheduling_forbidden`）——provider 没有调度可见的任务。
+//!
+//! # 跨域 service（increment 6：KernelNative caller → Isolated provider）
+//!
+//! `bind` 早已把这对 `(caller, provider)` 执行域选成 **Gate**（binding 只携带
+//! opaque `EndpointId`，绝不交付 provider 域内的裸入口）。调用时本模块按
+//! `InstanceRecord::execution_domain` 路由到
+//! [`isolated_lifecycle::dispatch_service`]：
+//!
+//! - **扁平帧拷贝，绝不共享**：caller 的 `args` / `input` 被拷贝进 Core 拥有的
+//!   **邮箱页**（只映射在 provider 的私有 AS 里），provider 拿到的是邮箱内的
+//!   实例域 VA；output 由 provider 写邮箱、Core 拷回 caller 缓冲。容量固定，
+//!   超长显式拒绝（[`CallError::FrameTooLarge`] → `EMSGSIZE`），**绝不截断**。
+//! - **执行边界同形**：provider principal / caller-task provenance / re-entry /
+//!   调度门禁由 [`containment::with_isolated_service_boundary`] 提供（与同域
+//!   service 边界同一套 guard）；真正的切换是 assembly gateway 的 `satp` 切换。
+//! - **故障 containment**：provider 在私有 AS 里 trap → gateway 的窄故障分派
+//!   （无显式策略 = `Abandon`）→ `Outcome::Faulted` → provider 逻辑死亡 + AS
+//!   退役 + Core 预置窗口归还，caller 拿到 [`CallError::ProviderFailed`]。
+//! - **出站 Isolated caller 仍然拒绝**（[`CallError::UnsupportedCallerDomain`]）；
+//!   Sandboxed provider 显式拒绝（[`CallError::UnsupportedProviderDomain`]）。
+//!
+//! **诚实边界**：这条 Gate 是 **Core 拥有的机制**（帧拷贝 / provider principal /
+//! inflight / 故障收敛），**不是对抗隔离边界**——Isolated provider 与 Core 同特权
+//! 级（S-mode，协作式），它可以直接改 `satp` / 自己的映射；页表提供的只是
+//! "本执行域访问窗口"，真正的强制边界是 U-mode（SandboxedNative，未实现）。
+//! ASID 恒 0 + 全量 `sfence.vma`。
 //!
 //! # 调度策略的专用路径（`sched::pick_next`）
 //!
@@ -98,8 +128,11 @@
 
 use crate::component::abi::InterfaceAbi;
 use crate::component::containment::{self, CallOutcome, ServiceDispatch};
-use crate::component::endpoint::{ContractId, EndpointError, EndpointId, EndpointRegistry};
+use crate::component::endpoint::{
+    ContractId, EndpointError, EndpointId, EndpointRegistry, ExecutionDomain,
+};
 use crate::component::image::ImageTable;
+use crate::component::isolated_lifecycle;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::Registry;
 use crate::component::{ComponentId, endpoint, image, registry};
@@ -150,10 +183,18 @@ pub enum CallError {
     /// provider dispatcher 在 service 边界内 panic：provider 已被标记 `Failed`
     /// 且其全部 endpoint 永久失效；caller 存活且不变 → `EIO`。
     ProviderFailed,
-    /// **Isolated（非 KernelNative）caller 的出站调用**：跨 AS 的 Gate 需要真实
-    /// 的地址空间切换（assembly gateway，未实现）。显式拒绝 → `ENOTSUP`——
-    /// 绝不在 KernelNative 的 AS 里替 Isolated caller 执行这次调用。
+    /// **Isolated（非 KernelNative）caller 的出站调用**：跨 AS Gate 的**出站
+    /// 方向**未实现（increment 6 只落地了 KernelNative → Isolated 的入站方向）。
+    /// 显式拒绝 → `ENOTSUP`——绝不在 KernelNative 的 AS 里替 Isolated caller
+    /// 执行这次调用。
     UnsupportedCallerDomain,
+    /// provider 的执行域没有**已实现**的 dispatch 机制（今天只有 KernelNative
+    /// 与 IsolatedNative 有；SandboxedNative provider 未实现）→ `ENOTSUP`。
+    /// 绝不静默降级成同域调用。
+    UnsupportedProviderDomain,
+    /// 扁平调用帧超过跨 AS 传输的邮箱容量（`isolated_mailbox`）：显式拒绝 →
+    /// `EMSGSIZE`——**绝不截断**，provider 从未执行。
+    FrameTooLarge,
 }
 
 impl From<EndpointError> for CallError {
@@ -163,11 +204,15 @@ impl From<EndpointError> for CallError {
 }
 
 /// 锁内拷贝出的分派目标：锁外调用只碰这里的数据（+ 调用方内存）。
-struct DispatchTarget {
-    dispatcher: ServiceDispatch,
-    instance_state: *mut (),
-    port: u32,
-    provider: ComponentId,
+pub(crate) struct DispatchTarget {
+    /// image 入口地址（**provider 域内**的 VA：KernelNative = Core AS；
+    /// Isolated = 该实例私有 AS）。域决定谁把它变成可调用物。
+    pub(crate) dispatcher: usize,
+    pub(crate) instance_state: *mut (),
+    pub(crate) port: u32,
+    pub(crate) provider: ComponentId,
+    /// provider 的执行域（Core 真相；机制选择的输入）。
+    pub(crate) domain: ExecutionDomain,
 }
 
 /// 锁内准备：存活解析 → re-entry 门禁 → `begin_call` → 取 image dispatcher。
@@ -204,6 +249,8 @@ fn prepare(
     };
     let image_id = instance.image;
     let instance_state = instance.instance_state;
+    // 部署真相（Core 拥有）：provider 的执行域决定 dispatch 机制。
+    let domain = instance.execution_domain;
 
     // (4) inflight 记账门禁：只有 Ready provider 可以开始服务调用；拒绝
     //     （不在 Ready / 溢出 / 未知）统一映射成 EBUSY。此后任何提前返回
@@ -223,13 +270,15 @@ fn prepare(
     };
 
     Ok(DispatchTarget {
-        // SAFETY: `service_dispatch` 只由 loader 写入（放段后解析 `STT_FUNC`
-        // 符号 + 已分配 executable 段边界校验），组件无法伪造；image 常驻
-        // （pinned-until-reboot），地址在调用期间有效。
-        dispatcher: unsafe { core::mem::transmute::<usize, ServiceDispatch>(dispatcher) },
+        // `service_dispatch` 只由 loader 写入（放段后解析 `STT_FUNC` 符号 +
+        // 已分配 executable 段边界校验），组件无法伪造；image 常驻
+        // （pinned-until-reboot），地址在调用期间有效。**域内 VA**：只有
+        // `domain` 对应的 dispatch 路径可以把它变成可调用物。
+        dispatcher,
         instance_state,
         port: record.port,
         provider: record.owner,
+        domain,
     })
 }
 
@@ -294,9 +343,10 @@ fn dispatch(
         return Err(CallError::CallerFailed);
     }
 
-    // (1b) 部署域门禁：只有 KernelNative caller 有**已实现**的出站调用机制。
-    //      Isolated caller 的跨 AS Gate 需要 satp 切换（未实现）——拒绝，绝不
-    //      在共享内核 AS 里替它执行（那会把跨域调用静默降级成 native）。
+    // (1b) 部署域门禁：只有 KernelNative caller 有**已实现**的出站调用机制
+    //      （increment 6 只落地了 KernelNative → Isolated 的入站方向）。Isolated
+    //      caller 的跨 AS Gate 需要 satp 切换——拒绝，绝不在共享内核 AS 里替它
+    //      执行（那会把跨域调用静默降级成 native）。
     if !crate::component::is_kernel_native(caller) {
         return Err(CallError::UnsupportedCallerDomain);
     }
@@ -322,21 +372,50 @@ fn dispatch(
         prepare(&mut components, &endpoints, &images, id)?
     };
 
-    // (4) 无锁派发：走 Core 控制的 service-call 执行边界（per-call service stack
-    //     + provider principal + panic containment）。
-    let outcome = containment::call_component_service(
-        target.provider,
-        id,
-        caller_task,
-        target.dispatcher,
-        target.instance_state,
-        target.port,
-        method,
-        frame,
-    );
-
-    // (5) 边界返回后的收尾（panic / 无栈 / 正常三条分类）。
-    complete_call(target.provider, outcome, out_status)
+    // (4) 无锁派发：按 **provider 执行域**选已实现的机制（Core 真相；
+    //     `bind` 已在绑定时刻选定，这里只执行——绝不在 Core AS 里替 Isolated
+    //     provider 跑它的 dispatcher）。
+    match target.domain {
+        // 同域 KernelNative：走 Core 控制的 service-call 执行边界
+        // （per-call service stack + provider principal + panic containment）。
+        ExecutionDomain::KernelNative => {
+            // SAFETY: `dispatcher` 只由 loader 写入（放段后解析 `STT_FUNC` +
+            // executable 段边界校验），组件无法伪造；image 常驻；KernelNative
+            // 的入口 VA 在共享内核 AS 里就是可调用地址。
+            let dispatcher: ServiceDispatch =
+                unsafe { core::mem::transmute::<usize, ServiceDispatch>(target.dispatcher) };
+            let outcome = containment::call_component_service(
+                target.provider,
+                id,
+                caller_task,
+                dispatcher,
+                target.instance_state,
+                target.port,
+                method,
+                frame,
+            );
+            complete_call(target.provider, outcome, out_status)
+        }
+        // 跨 AS：provider 在自己的私有 AS 里经 assembly gateway 执行
+        // （increment 6）；帧被拷贝进 Core 拥有的邮箱，绝不共享。
+        ExecutionDomain::IsolatedNative => isolated_lifecycle::dispatch_service(
+            target.provider,
+            id,
+            caller_task,
+            target.dispatcher,
+            target.instance_state,
+            target.port,
+            method,
+            frame,
+            out_status,
+        ),
+        // 没有已实现的 provider 机制（SandboxedNative 未实现）：显式拒绝，
+        // 绝不静默降级成同域调用。
+        ExecutionDomain::SandboxedNative => {
+            registry::get_registry().lock().finish_call(target.provider);
+            Err(CallError::UnsupportedProviderDomain)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,12 +685,27 @@ mod tests {
         dispatcher: Option<usize>,
         instance_state: *mut (),
     ) -> ComponentId {
+        ready_provider_in_domain(
+            name,
+            dispatcher,
+            instance_state,
+            ExecutionDomain::KernelNative,
+        )
+    }
+
+    /// 同 [`ready_provider`]，但显式指定 provider 的执行域（部署真相）。
+    fn ready_provider_in_domain(
+        name: &[u8],
+        dispatcher: Option<usize>,
+        instance_state: *mut (),
+        domain: ExecutionDomain,
+    ) -> ComponentId {
         registry::init();
         endpoint::init();
         image::init();
         let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+        let id = reg.declare(image, domain).unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -877,8 +971,8 @@ mod tests {
         assert_eq!(out_status, 0, "失败调用不写 out_status");
     }
 
-    /// Isolated（非 KernelNative）caller 的**出站调用**被显式拒绝：跨 AS Gate
-    /// 需要 satp 切换（未实现）→ `ENOTSUP`，绝不在共享内核 AS 里替它执行。
+    /// Isolated（非 KernelNative）caller 的**出站调用**被显式拒绝：跨 AS Gate 的
+    /// 出站方向未实现 → `ENOTSUP`，绝不在共享内核 AS 里替它执行。
     ///
     /// 门禁在 provider 解析 / inflight 记账**之前**，与其它 caller 门禁同序。
     #[test]
@@ -1397,8 +1491,148 @@ mod tests {
         containment::enter_anchor();
     }
 
-    // -- 12. 保留契约：调度策略不得经通用调用路径执行 -----------------------------
+    // -- 11b. 跨域 Gate：KernelNative caller → Isolated provider（increment 6） ------
 
+    /// 验收（host 面）：Isolated provider 的 dispatch 需要**真实私有 AS backend**；
+    /// host / 无 backend 构建显式拒绝（`UnsupportedProviderDomain` → ENOTSUP），
+    /// **绝不**在共享内核 AS 里替它执行 dispatcher，也不泄漏 inflight / out_status。
+    ///
+    /// 真实的跨 AS 执行（邮箱拷贝 + gateway + 故障 containment）由 QEMU ArchTest
+    /// `isolated-service*` 用真实 `.kcomp` 证明。
+    #[test]
+    fn isolated_provider_is_rejected_on_a_build_without_a_private_address_space() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider_in_domain(
+            b"call_isolated_gate_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+            ExecutionDomain::IsolatedNative,
+        );
+        let endpoint = publish(provider, b"svc.isolated.gate");
+        enter_caller(51);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+
+        let error = endpoint_call(
+            endpoint,
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut out_status,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CallError::UnsupportedProviderDomain);
+        assert_eq!(Errno::from(error), Errno::ENOTSUP);
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "provider 从未被调用"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0, "失败调用不写 out_status");
+
+        containment::enter_anchor();
+    }
+
+    /// 验收（host 面）：超过邮箱容量的扁平帧在**任何拷贝 / 派发之前**显式拒绝
+    /// （`FrameTooLarge` → EMSGSIZE），绝不截断；inflight 归还、provider 从未执行。
+    #[test]
+    fn oversized_frame_is_rejected_before_any_dispatch() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider_in_domain(
+            b"call_isolated_oversize_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+            ExecutionDomain::IsolatedNative,
+        );
+        let endpoint = publish(provider, b"svc.isolated.oversize");
+        enter_caller(52);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+        let args = [0u8; crate::component::isolated_mailbox::ARGS_MAX + 1];
+        let mut output = [0u8; 1];
+
+        let error = endpoint_call(
+            endpoint,
+            0,
+            args.as_ptr(),
+            args.len(),
+            core::ptr::null(),
+            0,
+            output.as_mut_ptr(),
+            output.len(),
+            &mut out_status,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CallError::FrameTooLarge);
+        assert_eq!(Errno::from(error), Errno::EMSGSIZE);
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "超长帧绝不派发"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0, "失败调用不写 out_status");
+        assert_eq!(output, [0u8; 1], "拒绝的调用不触碰 caller 缓冲");
+
+        containment::enter_anchor();
+    }
+
+    /// 验收（host 面）：Sandboxed provider 没有已实现的 dispatch 机制 →
+    /// 显式拒绝（ENOTSUP），**绝不静默降级**成同域调用。
+    #[test]
+    fn sandboxed_provider_is_rejected_explicitly() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider_in_domain(
+            b"call_sandbox_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+            ExecutionDomain::SandboxedNative,
+        );
+        let endpoint = publish(provider, b"svc.sandbox");
+        enter_caller(53);
+        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
+        let mut out_status = 0i32;
+
+        let error = endpoint_call(
+            endpoint,
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            0,
+            &mut out_status,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CallError::UnsupportedProviderDomain);
+        assert_eq!(Errno::from(error), Errno::ENOTSUP);
+        assert_eq!(
+            DISPATCH_CALLS.load(Ordering::SeqCst),
+            before,
+            "provider 从未被调用"
+        );
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
+        assert_eq!(out_status, 0);
+
+        containment::enter_anchor();
+    }
+
+    // -- 12. 保留契约：调度策略不得经通用调用路径执行 -----------------------------
     /// 验收：`scheduler.policy` 契约的 endpoint 经通用 `kcore_endpoint_call` 被拒
     /// （`ReservedContract` → EPERM）——调度策略只能由 Core 的调度路径经专用
     /// PolicyCall 边界执行，组件不能把选中的调度算法当普通服务跑。

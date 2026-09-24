@@ -73,6 +73,8 @@ impl From<SchedError> for Errno {
             SchedError::NoDispatcher => Errno::ENOSYS,
             // Core 无法准备策略执行栈：资源耗尽，策略配置不变。
             SchedError::NoPolicyStack => Errno::ENOMEM,
+            // 策略 provider 不在 KernelNative 域：没有已实现的执行路径（ENOTSUP）。
+            SchedError::PolicyUnsupportedDomain => Errno::ENOTSUP,
         }
     }
 }
@@ -142,6 +144,10 @@ impl From<CallError> for Errno {
             CallError::ProviderFailed => Errno::EIO,
             // Isolated caller 的出站调用：跨 AS Gate 未实现 = 能力缺失，不是 I/O 错误。
             CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
+            // provider 域没有已实现的 dispatch 机制（Sandboxed 未实现）：能力缺失。
+            CallError::UnsupportedProviderDomain => Errno::ENOTSUP,
+            // 跨 AS 邮箱放不下的扁平帧：显式拒绝（绝不截断），provider 从未执行。
+            CallError::FrameTooLarge => Errno::EMSGSIZE,
         }
     }
 }
@@ -182,6 +188,8 @@ impl From<ComponentLoadError> for Errno {
             | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
             // 组件在私有 AS 内故障（gateway 放弃）：与其它组件失败同档。
             ComponentLoadError::CreateFaulted => Errno::EIO,
+            // provider 在跨 AS service 边界内故障（gateway 放弃）：与 panic 同档。
+            ComponentLoadError::ServiceFaulted => Errno::EIO,
         }
     }
 }
@@ -398,6 +406,7 @@ mod tests {
             SchedError::NoCurrent,
             SchedError::NoDispatcher,
             SchedError::NoPolicyStack,
+            SchedError::PolicyUnsupportedDomain,
         ] {
             let expected = match error {
                 SchedError::NoPolicy => Errno::ENOTSUP,
@@ -406,6 +415,8 @@ mod tests {
                 SchedError::NoCurrent => Errno::ESRCH,
                 SchedError::NoDispatcher => Errno::ENOSYS,
                 SchedError::NoPolicyStack => Errno::ENOMEM,
+                // 策略 provider 不在 KernelNative 域：没有已实现的执行路径。
+                SchedError::PolicyUnsupportedDomain => Errno::ENOTSUP,
                 // endpoint 臂已在上面的循环里逐变体覆盖。
                 SchedError::PolicyEndpoint(_) => unreachable!("covered above"),
             };
@@ -467,6 +478,8 @@ mod tests {
             CallError::NoServiceStack,
             CallError::ProviderFailed,
             CallError::UnsupportedCallerDomain,
+            CallError::UnsupportedProviderDomain,
+            CallError::FrameTooLarge,
         ] {
             let expected = match error {
                 CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
@@ -493,6 +506,8 @@ mod tests {
                 CallError::NoServiceStack => Errno::ENOMEM,
                 CallError::ProviderFailed => Errno::EIO,
                 CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
+                CallError::UnsupportedProviderDomain => Errno::ENOTSUP,
+                CallError::FrameTooLarge => Errno::EMSGSIZE,
             };
             assert_eq!(Errno::from(error), expected, "CallError {error:?}");
         }
@@ -531,6 +546,7 @@ mod tests {
             ComponentLoadError::IsolatedPlacementFailed,
             ComponentLoadError::IsolatedConfigRejected,
             ComponentLoadError::CreateFaulted,
+            ComponentLoadError::ServiceFaulted,
         ] {
             let expected = match error {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
@@ -560,6 +576,7 @@ mod tests {
                 ComponentLoadError::IsolatedPlacementFailed
                 | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
                 ComponentLoadError::CreateFaulted => Errno::EIO,
+                ComponentLoadError::ServiceFaulted => Errno::EIO,
             };
             assert_eq!(Errno::from(error), expected, "ComponentLoadError {error:?}");
         }

@@ -1,0 +1,14 @@
+[package]
+name = "kcomp_isolated_svc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# increment 6 ArchTest 夹具：Isolated 域的服务 provider。**刻意零依赖、零 import**
+# ——Isolated 的 import 包络仍是空集；本组件只定义 ABI 入口（create / destroy /
+# 可选 service dispatch）并用 `core::arch::asm!` 读 CSR。
+[lib]
+crate-type = ["staticlib"]

@@ -32,6 +32,17 @@
 //!    caller task); a panic returns to the suspended scheduler frame, which
 //!    still owns its `IrqSaveGuard`, and the panicked stack is retained and
 //!    retired, never reused.
+//! 6. **Cross-AS service boundary** (increment 6; KernelNative caller →
+//!    Isolated provider): the provider's `kcomp_service_dispatch` runs in its own
+//!    private address space, entered by the assembly gateway
+//!    (`component/isolated_lifecycle.rs`).  Core installs the same
+//!    [`EscapeKind::ServiceCall`] guard around the gateway transition
+//!    ([`with_isolated_service_boundary`]) so principal / re-entry /
+//!    scheduling-forbidden bookkeeping is identical; the **switch** is the
+//!    gateway's, not a Core stack switch, and a provider **fault** is contained
+//!    by the gateway's trap path (`Outcome::Faulted`) rather than
+//!    `panic_escape` (an Isolated component has no `kcore_*` import surface, so
+//!    it cannot call `kcore_panic_escape`).
 //!
 //! Because control never returns through the panicking frame this is **not**
 //! Rust unwinding and remains compatible with `panic = "abort"`.
@@ -772,6 +783,58 @@ pub(crate) fn call_component_service(
     }
 }
 
+/// Cross-AS (Isolated provider) service-call **identity boundary**: installs one
+/// [`EscapeKind::ServiceCall`] guard around `f` with exactly the same principal
+/// / provenance / re-entry / scheduling-forbidden discipline as
+/// [`call_component_service`], but **no Core stack switch** — the execution
+/// switch is the assembly gateway's (`isolated::enter`), and `f` performs it.
+///
+/// The guard's context records are deliberately null: an Isolated component has
+/// **no `kcore_*` import surface**, so `kcore_panic_escape` is unreachable and
+/// there is no Core-owned context a panic could resume.  A provider **fault** is
+/// contained by the gateway's trap path (`Outcome::Faulted` → Core fault policy),
+/// not by [`panic_escape`].  [`escape_target`] refuses an escape through a guard
+/// with a null context (defensive: stay fatal rather than switch to a null
+/// context).
+///
+/// Callers must not hold any Core lock across `f` (the gateway requires the
+/// same).
+// 只被 cfg-gated 的 Isolated dispatch 路径（真机）调用；host 构建没有 Isolated
+// 实例，但 host 用例（`isolated_service_boundary_has_no_escapable_core_context`）
+// 直接驱动本边界。
+#[allow(dead_code)]
+pub(crate) fn with_isolated_service_boundary<R>(
+    owner: ComponentId,
+    endpoint: EndpointId,
+    caller_task: Option<TaskId>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let mut guard = EscapeGuard {
+        kind: EscapeKind::ServiceCall {
+            owner,
+            endpoint,
+            caller_task,
+        },
+        // 无 Core 栈切换、无可恢复的 Core 上下文（见本函数文档）。
+        from_context: core::ptr::null_mut(),
+        to_context: core::ptr::null_mut(),
+        call: IsolatedCall::None,
+        returned: 0,
+        state: GuardState::new(None),
+        // 与 `call_component_service` 同一纪律：组件代码从 depth 0 开始。
+        saved_depth: suspend_core_abi_depth(),
+    };
+    guard.state = GuardState::new(replace_active(&mut guard));
+    let result = f();
+    resume_core_abi_depth(guard.saved_depth);
+    let previous = match guard.state.previous() {
+        Some(previous) => previous,
+        None => core::ptr::null_mut(),
+    };
+    let _ = replace_active(previous);
+    result
+}
+
 /// Allocates the Core-owned stack used for **policy execution**: prepared when a
 /// policy endpoint is selected (outside policy execution), kept in the
 /// scheduler's policy slot, and reused across policy calls.
@@ -1199,6 +1262,15 @@ fn escape_target() -> Option<*mut EscapeGuard> {
         return None;
     }
     if core_abi_depth() > 0 {
+        return None;
+    }
+    // 没有可恢复的 Core 上下文（跨 AS service 边界：切换由 gateway 负责）：
+    // 拒绝逃逸，保持 fatal——绝不切到空上下文。
+    if unsafe { (*guard_ptr).from_context.is_null() } {
+        // SAFETY: [Category 2 — Data races] the record is live and this is the
+        // only execution touching it; `previous` is a plain pointer copy.
+        let previous = unsafe { (*guard_ptr).state.previous() };
+        let _ = replace_active(previous.unwrap_or(core::ptr::null_mut()));
         return None;
     }
     Some(guard_ptr)
@@ -2015,6 +2087,42 @@ mod tests {
 
         assert!(!scheduling_forbidden());
         assert!(!irq_in_chain());
+        enter_anchor();
+    }
+
+    /// 验收：跨 AS（Isolated provider）service 边界与同域 service 边界同一身份
+    /// 纪律（principal = provider、caller task = provenance、调度禁止、re-entry
+    /// 可见），但**不可逃逸**——guard 没有可恢复的 Core 上下文（切换由 gateway
+    /// 负责），`escape_target` 显式拒绝，panic 保持 fatal。
+    #[test]
+    fn isolated_service_boundary_has_no_escapable_core_context() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        enter_task(TaskId::from_raw(7), ComponentId::from_raw(3));
+        let provider = ComponentId::from_raw(0x1A);
+        let endpoint = EndpointId::from_raw(5);
+
+        with_isolated_service_boundary(provider, endpoint, Some(TaskId::from_raw(7)), || {
+            let info = active_escape().expect("isolated service boundary installed");
+            assert_eq!(info.owner(), Some(provider), "principal = provider");
+            assert_eq!(info.task(), Some(TaskId::from_raw(7)), "provenance only");
+            assert!(scheduling_forbidden(), "a service call forbids scheduling");
+            assert!(
+                provider_in_active_chain(provider),
+                "re-entry detection sees the running provider"
+            );
+            assert!(
+                escape_target().is_none(),
+                "no Core-owned context to resume: the escape must be refused"
+            );
+        });
+
+        // 边界恢复：caller 的 task 边界原样存活（拒绝逃逸不破坏链）。
+        let info = active_escape().expect("caller boundary restored");
+        assert_eq!(info.owner(), Some(ComponentId::from_raw(3)));
+        assert_eq!(info.task(), Some(TaskId::from_raw(7)));
+        assert!(!scheduling_forbidden());
+        assert!(!provider_in_active_chain(provider));
         enter_anchor();
     }
 

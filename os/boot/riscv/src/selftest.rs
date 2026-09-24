@@ -202,6 +202,14 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-lifecycle-fail" => isolated_tests::isolated_lifecycle_fail(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fault" => isolated_tests::isolated_lifecycle_fault(),
+        // increment 6：KernelNative caller → Isolated provider 的跨域 service Gate
+        // （扁平帧拷贝 + 邮箱 + gateway；容量拒绝 + 故障 containment）。
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-service" => isolated_tests::isolated_service(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-service-limits" => isolated_tests::isolated_service_limits(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-service-fault" => isolated_tests::isolated_service_fault(),
         _ => fail("unknown command"),
     }
 }
@@ -775,7 +783,14 @@ mod isolated_tests {
             base: ISOLATED_STACK_BASE,
             size: ISOLATED_STACK_SIZE,
         };
-        match isolated::prepare(handle, entry, stack, 0, interrupts_enabled, (0, 0)) {
+        match isolated::prepare(
+            handle,
+            entry,
+            stack,
+            0,
+            interrupts_enabled,
+            isolated::EntryArgs::pair(0, 0),
+        ) {
             Ok(transition) => transition,
             Err(IsolatedPrepareError::NoSuchSpace) => fail("isolated: prepare: no such space"),
             Err(IsolatedPrepareError::Retired) => fail("isolated: prepare: retired space"),
@@ -1941,6 +1956,12 @@ mod isolated_tests {
         ) {
             fail("isolated create failure: component stack mapping leaked");
         }
+        if !matches!(
+            address_space::mapping_exact(handle, &isolated_lifecycle::mailbox_range()),
+            Ok(None)
+        ) {
+            fail("isolated create failure: service mailbox mapping leaked");
+        }
         if !runtime_slot::get_slots().lock().get(id).is_null() {
             fail("isolated create failure: runtime slot was not cleared");
         }
@@ -2024,6 +2045,600 @@ mod isolated_tests {
         // Then：tombstone + 清理（与返回非零同一路径）。
         assert_failed_isolated_cleanup();
         pass("isolated-lifecycle-fault")
+    }
+
+    // -----------------------------------------------------------------------
+    // increment 6：KernelNative caller → Isolated provider 的跨域 service Gate。
+    //
+    // provider `kcomp_isolated_svc` 经生产路径创建（私有 AS + 按域镜像 + Core
+    // 预置窗口 / 邮箱）；caller 是真实 KernelNative 组件（`kcomp_smoke`）的任务
+    // 边界。Core 从自己的视图读回 provider 的上报区（窗口 backing），断言：
+    //   - 扁平帧真的被**拷贝**过边界（provider 看到的三个指针都在邮箱页内、
+    //     内容 = caller 的负载；caller 的缓冲地址在实例 AS 里不可达）；
+    //   - provider 在私有 AS 里运行（satp / tp），Core AS 每次切换后恢复；
+    //   - provider 故障（trap）被 gateway 收敛：caller 拿到类型化错误、实例
+    //     Failed + AS 退役 + 窗口归还、Core 存活。
+    // -----------------------------------------------------------------------
+
+    /// `kcomp_isolated_svc` 的上报槽号（与组件源码逐槽一致）。
+    const SVC_REPORT_OFF: usize = 512;
+    const SVC_R_MAGIC: usize = 0;
+    const SVC_R_STATE: usize = 1;
+    const SVC_R_PORT: usize = 2;
+    const SVC_R_METHOD: usize = 3;
+    const SVC_R_FRAME: usize = 4;
+    const SVC_R_ARGS: usize = 5;
+    const SVC_R_ARGS_LEN: usize = 6;
+    const SVC_R_INPUT: usize = 7;
+    const SVC_R_INPUT_LEN: usize = 8;
+    const SVC_R_OUTPUT: usize = 9;
+    const SVC_R_OUTPUT_LEN: usize = 10;
+    const SVC_R_ARG0: usize = 11;
+    const SVC_R_ARG1: usize = 12;
+    const SVC_R_IN0: usize = 13;
+    const SVC_R_IN1: usize = 14;
+    const SVC_R_TP: usize = 15;
+    const SVC_R_SATP: usize = 16;
+    const SVC_R_CALLS: usize = 17;
+    const SVC_R_CREATE_MAGIC: usize = 18;
+    const SVC_R_DESTROY_MAGIC: usize = 19;
+    const SVC_R_FAULT_TARGET: usize = 20;
+
+    const SVC_REPORT_MAGIC: usize = 0x5356_4321; // "SVC!"
+    const SVC_CREATE_MAGIC: usize = 0x4352_4541; // "CREA"
+    const SVC_DESTROY_MAGIC: usize = 0x4445_5354; // "DEST"
+    /// Core 侧登记 endpoint 时使用的 port（与组件源码一致）。
+    const SVC_PORT: u32 = 0x1001;
+    const SVC_METHOD_ECHO: u32 = 0x2001;
+    const SVC_METHOD_FAULT: u32 = 0x2002;
+    const SVC_STATUS_OK: i32 = 0x5E;
+    const SVC_ECHO_XOR: u8 = 0x5A;
+    /// 本用例的 contract / abi（组合方提供；Core 只比较）。
+    const SVC_CONTRACT: u64 = 0x4953_4F4C_5356_4301;
+    const SVC_ABI: u64 = 0x4953_4F4C_5356_4302;
+
+    static SVC_FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SVC_FAULT_CAUSE: AtomicUsize = AtomicUsize::new(0);
+    static SVC_FAULT_STVAL: AtomicUsize = AtomicUsize::new(0);
+
+    /// 一个已创建、已登记 endpoint 的 Isolated service provider。
+    struct SvcProvider {
+        id: ComponentId,
+        handle: AddressSpaceHandle,
+        window_pa: usize,
+        endpoint: kernel::component::endpoint::EndpointId,
+    }
+
+    /// 从实例窗口 backing 的 Core 视图读一个上报槽。
+    ///
+    /// # Safety
+    /// `window_pa` 必须是本用例实例窗口 backing 的基址（仍驻留）。
+    unsafe fn svc_slot(window_pa: usize, index: usize) -> usize {
+        unsafe {
+            let base = (window_pa + SVC_REPORT_OFF) as *const usize;
+            core::ptr::read_volatile(base.add(index))
+        }
+    }
+
+    /// 经生产路径创建 `kcomp_isolated_svc`，并从 Core 侧登记它的 endpoint。
+    ///
+    /// Isolated provider **不能自己 publish**（组件→Core 的 publish trampoline 属
+    /// 后续增量）：组合方（本用例，白盒）在 provider Ready 之后 stage + commit +
+    /// discover。endpoint 真相仍由 Core 拥有；`port` 由 Core 原样透传给 dispatcher。
+    fn svc_provider() -> SvcProvider {
+        use kernel::component::abi::{InterfaceAbi, InterfaceKind};
+        use kernel::component::containment::KcompCreateArgs;
+        use kernel::component::endpoint::{self, ContractId, ExecutionDomain};
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+
+        let id = match load::create_component(
+            b"kcomp_isolated_svc",
+            &KcompCreateArgs::empty(),
+            ExecutionDomain::IsolatedNative,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                kernel::log!("selftest", "isolated-service: create failed: {:?}", error);
+                fail("isolated-service: provider create failed");
+            }
+        };
+        let handle = {
+            let reg = registry::get_registry().lock();
+            match reg.get(id).and_then(|record| record.address_space) {
+                Some(handle) => handle,
+                None => fail("isolated-service: provider has no address space"),
+            }
+        };
+        let window_pa =
+            match address_space::mapping_exact(handle, &isolated_lifecycle::window_range()) {
+                Ok(Some(mapping)) => mapping.physical_range.base,
+                _ => fail("isolated-service: instance window is not mapped"),
+            };
+        // create 真的在私有 AS 里跑过（上报槽）。
+        if unsafe { svc_slot(window_pa, SVC_R_CREATE_MAGIC) } != SVC_CREATE_MAGIC {
+            fail("isolated-service: provider create did not run in its private AS");
+        }
+        let endpoint = {
+            let reg = registry::get_registry().lock();
+            let mut endpoints = endpoint::get_endpoints().lock();
+            if endpoints
+                .stage_publish(
+                    &reg,
+                    id,
+                    b"svc.isolated",
+                    ContractId::from_raw(SVC_CONTRACT),
+                    InterfaceKind::Device,
+                    InterfaceAbi::from_raw(SVC_ABI),
+                    SVC_PORT,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                )
+                .is_err()
+            {
+                fail("isolated-service: stage_publish failed");
+            }
+            if endpoints.commit_pending(&reg, id).is_err() {
+                fail("isolated-service: commit_pending failed");
+            }
+            match endpoints.discover(
+                &reg,
+                id,
+                b"svc.isolated",
+                ContractId::from_raw(SVC_CONTRACT),
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(_) => fail("isolated-service: discover failed"),
+            }
+        };
+        SvcProvider {
+            id,
+            handle,
+            window_pa,
+            endpoint,
+        }
+    }
+
+    /// 在 KernelNative caller 的任务边界里执行 `f`（ArchTest 白盒：直接装任务
+    /// 边界，与调度器同一条 `containment::enter_task` 路径）。
+    fn with_kernel_caller<R>(caller: ComponentId, task: u32, f: impl FnOnce() -> R) -> R {
+        use kernel::component::containment;
+        containment::enter_task(kernel::task::TaskId::from_raw(task), caller);
+        let result = f();
+        containment::enter_anchor();
+        result
+    }
+
+    /// 主用例：KernelNative caller → Isolated provider 端到端，帧被拷贝、结果正确、
+    /// provider 在私有 AS 里运行、caller 内存不可达、Core AS 恢复。
+    pub(super) fn isolated_service() -> ! {
+        use kernel::component::abi::InterfaceAbi;
+        use kernel::component::call;
+        use kernel::component::endpoint::{self, ContractId, ExecutionDomain, Mechanism};
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+
+        let core_satp = read_satp();
+        let provider = svc_provider();
+        let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => id,
+            Err(_) => fail("isolated-service: caller load failed"),
+        };
+
+        // bind：KernelNative caller → Isolated provider 必须选 Gate（binding 只携带
+        // opaque EndpointId + port；绝不交付 provider 域内的裸入口）。
+        let bound = {
+            let reg = registry::get_registry().lock();
+            endpoint::get_endpoints().lock().bind(
+                &reg,
+                provider.endpoint,
+                ContractId::from_raw(SVC_CONTRACT),
+                InterfaceAbi::from_raw(SVC_ABI),
+                ExecutionDomain::KernelNative,
+            )
+        };
+        match bound {
+            Ok(bound) if bound.mechanism == Mechanism::Gate => {}
+            _ => fail("isolated-service: bind did not select Gate"),
+        }
+
+        // When：caller 经 Core call gate 调用 provider（method = ECHO）。
+        let args = [0xA1u8, 0xB2];
+        let input = [0x11u8, 0x22, 0x33];
+        let mut output = [0u8; 4];
+        let mut out_status = 0i32;
+        let transport = with_kernel_caller(caller, 0x6A, || {
+            call::endpoint_call(
+                provider.endpoint,
+                SVC_METHOD_ECHO,
+                args.as_ptr(),
+                args.len(),
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut out_status,
+            )
+        });
+
+        // Then 1：传输成功、provider 返回值 = 方法状态、output 被拷回 caller 缓冲。
+        if transport != Ok(()) {
+            kernel::log!(
+                "selftest",
+                "isolated-service: transport error: {:?}",
+                transport
+            );
+            fail("isolated-service: transport failed");
+        }
+        if out_status != SVC_STATUS_OK {
+            fail("isolated-service: provider status mismatch");
+        }
+        let expected = [
+            input[0] ^ SVC_ECHO_XOR,
+            input[1] ^ SVC_ECHO_XOR,
+            input[2] ^ SVC_ECHO_XOR,
+            input[0] ^ SVC_ECHO_XOR,
+        ];
+        if output != expected {
+            fail("isolated-service: output was not copied back to the caller buffer");
+        }
+        if read_satp() != core_satp {
+            fail("isolated-service: Core satp not restored after the transition");
+        }
+
+        // Then 2：provider 的上报（从 Core 视图读回）证明帧真的被拷贝过边界。
+        let window = isolated_lifecycle::window_range();
+        let mailbox = isolated_lifecycle::mailbox_range();
+        let mailbox_pa = match address_space::mapping_exact(provider.handle, &mailbox) {
+            Ok(Some(mapping)) => mapping.physical_range.base,
+            _ => fail("isolated-service: mailbox is not mapped"),
+        };
+        let slot = |index: usize| unsafe { svc_slot(provider.window_pa, index) };
+        if slot(SVC_R_MAGIC) != SVC_REPORT_MAGIC || slot(SVC_R_CALLS) != 1 {
+            fail("isolated-service: provider dispatcher did not run exactly once");
+        }
+        if slot(SVC_R_STATE) != window.base + SVC_REPORT_OFF {
+            fail("isolated-service: provider did not receive its opaque state");
+        }
+        if slot(SVC_R_PORT) != SVC_PORT as usize || slot(SVC_R_METHOD) != SVC_METHOD_ECHO as usize {
+            fail("isolated-service: port / method were not delivered");
+        }
+        // 帧描述符与三个负载指针**全部**是邮箱页内的实例域 VA。
+        if slot(SVC_R_FRAME) != mailbox.base + kernel::component::isolated_mailbox::FRAME_OFF
+            || slot(SVC_R_ARGS) != mailbox.base + kernel::component::isolated_mailbox::ARGS_OFF
+            || slot(SVC_R_INPUT) != mailbox.base + kernel::component::isolated_mailbox::INPUT_OFF
+            || slot(SVC_R_OUTPUT) != mailbox.base + kernel::component::isolated_mailbox::OUTPUT_OFF
+        {
+            fail("isolated-service: provider frame is not the Core-owned mailbox");
+        }
+        if slot(SVC_R_ARGS_LEN) != args.len()
+            || slot(SVC_R_INPUT_LEN) != input.len()
+            || slot(SVC_R_OUTPUT_LEN) != output.len()
+        {
+            fail("isolated-service: frame lengths were not preserved");
+        }
+        if slot(SVC_R_ARG0) != args[0] as usize
+            || slot(SVC_R_ARG1) != args[1] as usize
+            || slot(SVC_R_IN0) != input[0] as usize
+            || slot(SVC_R_IN1) != input[1] as usize
+        {
+            fail("isolated-service: payload was not copied into the mailbox");
+        }
+        // provider 在私有 AS 里运行：satp = 实例 root、tp = Core 安装的 runtime slot。
+        let expected_satp = match address_space::prepare_activation(provider.handle) {
+            Ok(activation) => activation.token().satp(),
+            Err(_) => fail("isolated-service: prepare_activation failed"),
+        };
+        if slot(SVC_R_SATP) != expected_satp || expected_satp == core_satp {
+            fail("isolated-service: provider did not run on its private root");
+        }
+        if slot(SVC_R_TP) != window.base + isolated_lifecycle::WINDOW_RUNTIME_OFF {
+            fail("isolated-service: provider runtime slot (tp) mismatch");
+        }
+
+        // Then 3：caller 的缓冲在实例 AS 里**不可达**（只有邮箱是跨域通道）。
+        assert_unmapped(
+            provider.handle,
+            args.as_ptr() as usize,
+            "isolated-service: caller args buffer is reachable from the instance AS",
+        );
+        assert_unmapped(
+            provider.handle,
+            input.as_ptr() as usize,
+            "isolated-service: caller input buffer is reachable from the instance AS",
+        );
+        assert_unmapped(
+            provider.handle,
+            output.as_ptr() as usize,
+            "isolated-service: caller output buffer is reachable from the instance AS",
+        );
+        if !matches!(
+            address_space::translate(provider.handle, mailbox.base),
+            Ok(Some(pa)) if pa == mailbox_pa
+        ) {
+            fail("isolated-service: mailbox is not the instance-local window");
+        }
+
+        // Then 4：inflight 归还、实例仍 Ready、endpoint 仍 Live。
+        if registry::get_registry().lock().active_calls(provider.id) != 0 {
+            fail("isolated-service: inflight was not returned");
+        }
+        if registry::get_registry()
+            .lock()
+            .get(provider.id)
+            .map(|record| record.state)
+            != Some(kernel::component::ComponentState::Ready)
+        {
+            fail("isolated-service: provider left Ready after a successful call");
+        }
+        {
+            let reg = registry::get_registry().lock();
+            let live = endpoint::get_endpoints()
+                .lock()
+                .lookup(
+                    &reg,
+                    provider.endpoint,
+                    ContractId::from_raw(SVC_CONTRACT),
+                    InterfaceAbi::from_raw(SVC_ABI),
+                )
+                .is_ok();
+            if !live {
+                fail("isolated-service: endpoint died after a successful call");
+            }
+        }
+
+        // Then 5：生命周期仍然可用（stop 走私有 AS 里的 destroy）。
+        if kernel::component::stop_component(provider.id).is_err() {
+            fail("isolated-service: stop failed");
+        }
+        if unsafe { svc_slot(provider.window_pa, SVC_R_DESTROY_MAGIC) } != SVC_DESTROY_MAGIC {
+            fail("isolated-service: destroy entry did not run");
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-service: gate OK: id={}, mailbox={:#x}, satp={:#x}",
+            provider.id.raw(),
+            mailbox.base,
+            expected_satp
+        );
+        pass("isolated-service")
+    }
+
+    /// 容量用例：超过邮箱容量的扁平帧被显式拒绝（`FrameTooLarge` → EMSGSIZE），
+    /// **绝不截断**、provider 从未执行、实例不受影响。
+    pub(super) fn isolated_service_limits() -> ! {
+        use kernel::component::call::{self, CallError};
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_mailbox;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::errno::Errno;
+
+        let core_satp = read_satp();
+        let provider = svc_provider();
+        let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => id,
+            Err(_) => fail("isolated-service-limits: caller load failed"),
+        };
+        let before_calls = unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) };
+        let mut out_status = 0i32;
+
+        // args 超容量（指针真实可读：拒绝必须发生在**任何拷贝之前**）。
+        let big_args = [0u8; isolated_mailbox::ARGS_MAX + 1];
+        let small = [0u8; 1];
+        let mut output = [0u8; 1];
+        let cases: [(usize, usize, usize); 3] = [
+            (isolated_mailbox::ARGS_MAX + 1, 1, 1),
+            (1, isolated_mailbox::INPUT_MAX + 1, 1),
+            (1, 1, isolated_mailbox::OUTPUT_MAX + 1),
+        ];
+        for (args_len, input_len, output_len) in cases {
+            let error = with_kernel_caller(caller, 0x6B, || {
+                call::endpoint_call(
+                    provider.endpoint,
+                    SVC_METHOD_ECHO,
+                    big_args.as_ptr(),
+                    args_len,
+                    small.as_ptr(),
+                    input_len,
+                    output.as_mut_ptr(),
+                    output_len,
+                    &mut out_status,
+                )
+            })
+            .unwrap_err();
+            if error != CallError::FrameTooLarge {
+                kernel::log!(
+                    "selftest",
+                    "isolated-service-limits: unexpected error: {:?}",
+                    error
+                );
+                fail("isolated-service-limits: oversized frame was not rejected");
+            }
+            if Errno::from(error) != Errno::EMSGSIZE {
+                fail("isolated-service-limits: oversized frame errno mismatch");
+            }
+        }
+        if read_satp() != core_satp {
+            fail("isolated-service-limits: Core satp not restored");
+        }
+        // provider 从未执行；实例仍 Ready；inflight 归还。
+        if unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) } != before_calls {
+            fail("isolated-service-limits: provider ran for a rejected frame");
+        }
+        if registry::get_registry().lock().active_calls(provider.id) != 0 {
+            fail("isolated-service-limits: inflight was not returned");
+        }
+        if registry::get_registry()
+            .lock()
+            .get(provider.id)
+            .map(|record| record.state)
+            != Some(kernel::component::ComponentState::Ready)
+        {
+            fail("isolated-service-limits: provider left Ready after a rejected frame");
+        }
+        if out_status != 0 {
+            fail("isolated-service-limits: rejected call wrote out_status");
+        }
+        pass("isolated-service-limits")
+    }
+
+    /// 故障用例：provider 在 dispatch 期间访问 **caller 域内**地址 → 私有 AS 缺页
+    /// → gateway 窄故障分派（本用例策略观察后 Abandon）→ caller 拿到类型化错误、
+    /// 实例 Failed + AS 退役 + 窗口归还、Core 存活。
+    pub(super) fn isolated_service_fault() -> ! {
+        use kernel::component::call::{self, CallError};
+        use kernel::component::endpoint::ExecutionDomain;
+        use kernel::component::isolated_lifecycle;
+        use kernel::component::load;
+        use kernel::component::registry;
+        use kernel::component::runtime_slot;
+        use kernel::component::ComponentState;
+        use kernel::errno::Errno;
+
+        let core_satp = read_satp();
+        let provider = svc_provider();
+        let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
+            Ok(id) => id,
+            Err(_) => fail("isolated-service-fault: caller load failed"),
+        };
+
+        // 目标 = caller 栈上的缓冲地址：在 provider 的私有 AS 里必然缺页。
+        let target = [0xEEu8; 8];
+        let target_va = target.as_ptr() as usize;
+        let target_bytes = target_va.to_le_bytes();
+
+        SVC_FAULT_COUNT.store(0, Ordering::Release);
+        SVC_FAULT_CAUSE.store(0, Ordering::Release);
+        SVC_FAULT_STVAL.store(0, Ordering::Release);
+        FAULT_HANDLER_SATP.store(0, Ordering::Release);
+        FAULT_HANDLER_SP.store(0, Ordering::Release);
+        isolated::install();
+        if !isolated::register_fault_policy(svc_fault_policy) {
+            fail("isolated-service-fault: fault policy registration failed");
+        }
+
+        let mut out_status = 0i32;
+        let transport = with_kernel_caller(caller, 0x6C, || {
+            call::endpoint_call(
+                provider.endpoint,
+                SVC_METHOD_FAULT,
+                target_bytes.as_ptr(),
+                target_bytes.len(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut out_status,
+            )
+        });
+
+        // Then 1：caller 拿到类型化错误（EIO），不写 out_status；Core AS 恢复。
+        match transport {
+            Err(CallError::ProviderFailed) => {}
+            other => {
+                kernel::log!(
+                    "selftest",
+                    "isolated-service-fault: unexpected transport: {:?}",
+                    other
+                );
+                fail("isolated-service-fault: expected ProviderFailed");
+            }
+        }
+        if Errno::from(CallError::ProviderFailed) != Errno::EIO {
+            fail("isolated-service-fault: errno mismatch");
+        }
+        if out_status != 0 {
+            fail("isolated-service-fault: failed call wrote out_status");
+        }
+        if read_satp() != core_satp {
+            fail("isolated-service-fault: Core satp not restored after the fault");
+        }
+
+        // Then 2：故障确实发生在 provider 上下文，且被 Core 在 Core root / Core
+        // 专用 trap 栈上处理；故障地址 = caller 的缓冲（实例 AS 不可达）。
+        if SVC_FAULT_COUNT.load(Ordering::Acquire) != 1 {
+            fail("isolated-service-fault: fault policy did not run exactly once");
+        }
+        if SVC_FAULT_CAUSE.load(Ordering::Acquire) != 13 {
+            fail("isolated-service-fault: expected a load page fault (scause 0xd)");
+        }
+        if SVC_FAULT_STVAL.load(Ordering::Acquire) != target_va {
+            fail("isolated-service-fault: stval is not the caller address");
+        }
+        assert_fault_ran_on_core_context("isolated-service-fault", core_satp);
+        // provider 的上报证明它读到了 mailbox 里的目标地址（在 fault 之前）。
+        if unsafe { svc_slot(provider.window_pa, SVC_R_FAULT_TARGET) } != target_va {
+            fail("isolated-service-fault: provider did not see the fault target");
+        }
+        // caller 的缓冲没有被 provider 触碰（越界访问在页表处就失败了）。
+        if target != [0xEEu8; 8] {
+            fail("isolated-service-fault: caller buffer was modified");
+        }
+
+        // Then 3：实例逻辑死亡 + AS 退役 + Core 预置窗口（栈 / 窗口 / 邮箱）归还 +
+        // runtime slot 清空 + endpoint 永久失效 + inflight 归还。
+        if registry::get_registry()
+            .lock()
+            .get(provider.id)
+            .map(|record| record.state)
+            != Some(ComponentState::Failed)
+        {
+            fail("isolated-service-fault: provider was not marked Failed");
+        }
+        if registry::get_registry().lock().active_calls(provider.id) != 0 {
+            fail("isolated-service-fault: inflight was not returned");
+        }
+        if !runtime_slot::get_slots().lock().get(provider.id).is_null() {
+            fail("isolated-service-fault: runtime slot was not cleared");
+        }
+        match address_space::prepare_activation(provider.handle) {
+            Err(kernel::memory::address_space::MapError::Retired) => {}
+            _ => fail("isolated-service-fault: address space was not retired"),
+        }
+        for range in [
+            isolated_lifecycle::stack_range(),
+            isolated_lifecycle::window_range(),
+            isolated_lifecycle::mailbox_range(),
+        ] {
+            if !matches!(
+                address_space::mapping_exact(provider.handle, &range),
+                Ok(None)
+            ) {
+                fail("isolated-service-fault: a Core-prepared window leaked");
+            }
+        }
+        {
+            let reg = registry::get_registry().lock();
+            let dead = kernel::component::endpoint::get_endpoints()
+                .lock()
+                .resolve(&reg, provider.endpoint)
+                .is_err();
+            if !dead {
+                fail("isolated-service-fault: provider endpoint was not invalidated");
+            }
+        }
+        kernel::log!(
+            "selftest",
+            "isolated-service-fault: contained: id={}, scause={:#x}, stval={:#x}",
+            provider.id.raw(),
+            SVC_FAULT_CAUSE.load(Ordering::Acquire),
+            SVC_FAULT_STVAL.load(Ordering::Acquire)
+        );
+        pass("isolated-service-fault")
+    }
+
+    /// 只记录现场、拒绝恢复的窄策略：**组件身份本身不是可恢复的证明**；
+    /// 断言全部留在 Core（用例）侧。
+    fn svc_fault_policy(fault: &mut ComponentFault<'_>) -> FaultDecision {
+        SVC_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+        SVC_FAULT_CAUSE.store(fault.cause, Ordering::Release);
+        SVC_FAULT_STVAL.store(fault.stval, Ordering::Release);
+        FAULT_HANDLER_SATP.store(read_satp(), Ordering::Release);
+        FAULT_HANDLER_SP.store(read_sp(), Ordering::Release);
+        FaultDecision::Abandon
     }
 }
 

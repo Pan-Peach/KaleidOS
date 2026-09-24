@@ -40,7 +40,7 @@
 use crate::component::abi::InterfaceAbi;
 use crate::component::call;
 use crate::component::containment::CallOutcome;
-use crate::component::endpoint::{self, EndpointError, EndpointId};
+use crate::component::endpoint::{self, EndpointError, EndpointId, ExecutionDomain};
 use crate::component::load::ComponentLoadError;
 use crate::component::{ComponentId, containment, registry};
 use crate::generated::abi::{
@@ -80,6 +80,12 @@ pub enum SchedError {
     NoDispatcher,
     /// Core 无法为策略执行准备栈（`-ENOMEM`）；策略配置不变。
     NoPolicyStack,
+    /// 策略 provider 不在 KernelNative 域：策略回调在 **Core 拥有的栈上、共享
+    /// 内核 AS 里**执行（专用 PolicyCall 边界），Isolated / Sandbox provider 的
+    /// dispatcher 是它们自己域内的 VA，Core 不能这样调用 → 显式拒绝（`-ENOTSUP`），
+    /// 绝不静默按 KernelNative 语义执行（increment 6 的跨域 Gate 只覆盖通用
+    /// service 调用，不覆盖调度 commit 路径）。
+    PolicyUnsupportedDomain,
 }
 
 /// 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
@@ -219,6 +225,11 @@ pub fn set_policy(endpoint: EndpointId) -> Result<(), SchedError> {
         let instance = components
             .get(record.owner)
             .ok_or(SchedError::PolicyEndpoint(EndpointError::ProviderNotFound))?;
+        // 部署域门禁：策略执行边界是 Core 栈 + 共享内核 AS，Isolated / Sandbox
+        // provider 的 dispatcher VA 在那里没有意义 → 显式拒绝（绝不静默降级）。
+        if instance.execution_domain != ExecutionDomain::KernelNative {
+            return Err(SchedError::PolicyUnsupportedDomain);
+        }
         let image = images.get(instance.image).ok_or(SchedError::NoDispatcher)?;
         if image.service_dispatch.is_none() {
             return Err(SchedError::NoDispatcher);
@@ -946,6 +957,42 @@ mod tests {
         );
         assert!(policy().lock().endpoint.is_none());
         assert!(!policy().lock().retired, "从未选择过 = 未退役");
+    }
+
+    /// 验收：Isolated / Sandbox provider 不得被选为调度策略——策略回调在 Core
+    /// 拥有的栈上、共享内核 AS 里执行（专用 PolicyCall 边界），provider 域内的
+    /// dispatcher VA 在那里没有意义 → 显式拒绝（ENOTSUP），绝不静默降级。
+    #[test]
+    fn set_policy_rejects_providers_outside_kernel_native() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        let isolated = {
+            let image = image::test_support::register_test_image_with_dispatch(
+                b"sched_isolated_policy",
+                0,
+                Some(first_runnable as *const () as usize),
+            );
+            let mut reg = registry::get_registry().lock();
+            let id = reg.declare(image, ExecutionDomain::IsolatedNative).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let endpoint = publish_policy_endpoint(isolated, 0);
+
+        assert_eq!(
+            set_policy(endpoint),
+            Err(SchedError::PolicyUnsupportedDomain)
+        );
+        assert_eq!(
+            Errno::from(SchedError::PolicyUnsupportedDomain),
+            Errno::ENOTSUP
+        );
+        assert!(policy().lock().endpoint.is_none(), "拒绝的选择不得写入配置");
     }
 
     /// 验收：组合发现按 **(provider, port_name, contract)**，不是按名字——同名

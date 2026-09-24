@@ -80,6 +80,7 @@ fn main() {
         "kcomp_min",
         "kcomp_isolated",
         "kcomp_isolated_life",
+        "kcomp_isolated_svc",
     ];
     let mut objects = Vec::new();
     for name in components {

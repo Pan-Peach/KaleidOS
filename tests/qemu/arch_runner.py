@@ -101,6 +101,21 @@ CASES = (
     ("isolated-lifecycle", None, "isolated-lifecycle: private AS OK"),
     ("isolated-lifecycle-fail", None, None),
     ("isolated-lifecycle-fault", None, None),
+    # increment 6: the KernelNative -> Isolated service Gate.  A KernelNative
+    # caller invokes a real `.kcomp` provider's `kcomp_service_dispatch` in its
+    # own private AS through the assembly gateway: the flat frame is COPIED
+    # through a Core-owned mailbox (provider-side pointers are all mailbox VAs,
+    # payloads equal the caller's, output copied back), the provider runs on its
+    # own root/slot, caller memory is unreachable from the instance AS, and the
+    # Core root is restored after the transition.  `isolated-service-limits`
+    # proves an over-capacity frame is rejected (`-EMSGSIZE`) before any copy
+    # (provider never runs).  `isolated-service-fault` proves a provider fault
+    # (load from a caller-domain address) is contained: the caller gets a typed
+    # error, the instance is Failed with a retired AS and released windows, and
+    # Core survives.
+    ("isolated-service", None, "isolated-service: gate OK"),
+    ("isolated-service-limits", None, None),
+    ("isolated-service-fault", None, "isolated-service-fault: contained"),
 )
 
 

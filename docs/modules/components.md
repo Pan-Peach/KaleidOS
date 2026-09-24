@@ -23,6 +23,7 @@
 | `kcomp_panic` | `os/components/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
 | `kcomp_isolated` | `os/components/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供 increment 4 按域装载与页级权限强制用例在私有 AS 里执行 |
 | `kcomp_isolated_life` | `os/components/kcomp_isolated_life/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：实现 increment 5 的实例窗口协议（读 args / 写 `out_state` 上报 tp / satp / config；destroy 写标记），供 `isolated-lifecycle` / `isolated-lifecycle-fail` 经生产生命周期创建 / 销毁 |
+| `kcomp_isolated_svc` | `os/components/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider（increment 6）。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` 证明跨域 Gate |
 | `kcomp_min` | `os/components/kcomp_min/` | Rust staticlib（host fixture） | 手写最小生命周期入口，供 `os/core/build.rs` host 测试钉重定位布局；**不在 `KCOMP_SRCS`** |
 | `kbench` | `os/components/kbench/` | Rust `.kcomp` | 板端 benchmark：clock/query + 真实 `sched.yield_roundtrip` 交接 |
 | `logger` | `os/components/logger/` | Rust lib（workspace 成员） | 结构化日志组件 stub（M2），无 `.kcomp`、无实现 |

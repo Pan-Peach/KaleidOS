@@ -1376,6 +1376,40 @@ mod tests {
         assert_eq!(bound.record.port, 7, "Gate 经 port + dispatcher 分派");
     }
 
+    /// increment 6 的绑定方向：**KernelNative caller → Isolated provider** 在 bind
+    /// 上选 Gate（binding 只携带 opaque `EndpointId` + `port`；provider 域内的裸
+    /// 入口绝不交付给另一个域）。
+    #[test]
+    fn bind_kernel_native_caller_to_isolated_provider_selects_gate() {
+        let mut reg = Registry::new();
+        let provider = {
+            let id = reg.declare(IMAGE, ExecutionDomain::IsolatedNative).unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            id
+        };
+        let mut er = EndpointRegistry::new();
+        // Isolated provider 的发布面（组件→Core publish trampoline）未实现：
+        // endpoint 由组合方在 Core 侧登记，`api` 为空（Gate 不需要它）。
+        let endpoint = publish_ready(&mut er, &reg, provider, b"svc0", CONTRACT, 7);
+        let bound = er
+            .bind(
+                &reg,
+                endpoint,
+                CONTRACT,
+                ABI_A,
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
+        assert_eq!(bound.mechanism, Mechanism::Gate);
+        assert_eq!(bound.record.port, 7, "Gate 经 port + dispatcher 分派");
+        assert!(
+            bound.record.api.is_null(),
+            "Gate 绝不交付 provider 域内的裸入口"
+        );
+    }
+
     /// `resolve` 是 call ABI 的纯存活解析：不携带 contract / abi（id 本身是
     /// 组合期经 lookup / discover 交付的 opaque capability），只回答"还能不能调用"。
     #[test]

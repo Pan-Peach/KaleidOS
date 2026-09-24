@@ -60,7 +60,8 @@ pub struct ComponentImage {
     /// `kcomp_instance_destroy` 入口地址（停止路径在 Core-owned 栈上调用）。
     pub destroy: usize,
     /// **可选**的 `kcomp_service_dispatch` 入口地址（loader 解析 + 已分配
-    /// executable 段边界校验）。`None` = 组件不提供 endpoint 服务。
+    /// executable 段边界校验；**provider 域内**的 VA：KernelNative = Core AS，
+    /// Isolated = 该实例私有 AS）。`None` = 组件不提供 endpoint 服务。
     pub service_dispatch: Option<usize>,
     /// 装载镜像大小（loader 的放段结果；曾在此处被丢弃，拆分后保留）。
     pub text_size: usize,

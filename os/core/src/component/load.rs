@@ -94,6 +94,10 @@ pub enum ComponentLoadError {
     /// Isolated 的 `kcomp_instance_create` 在私有 AS 内故障，由 gateway 的 Core
     /// 故障分派判为不可恢复（`Outcome::Faulted`）；实例未完整构造、不调用 destroy。
     CreateFaulted,
+    /// Isolated provider 在**跨 AS service dispatch** 期间故障，由 gateway 的 Core
+    /// 故障分派判为不可恢复（`Outcome::Faulted`）：provider 逻辑死亡 + AS 退役 +
+    /// Core 预置窗口归还，caller 存活（increment 6）。
+    ServiceFaulted,
 }
 
 impl ComponentLoadError {

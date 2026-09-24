@@ -21,6 +21,17 @@
 //! destroy（`exit.rs` 按 execution_domain 分派）
 //!   └─ isolated::prepare(handle, image.destroy, stack, slot, (state, 0))
 //!      → enter → Returned(0) → retire(handle) → `complete_stop` 提交 Stopped
+//!
+//! 跨域 service dispatch（increment 6：KernelNative caller → Isolated provider）
+//!   └─ dispatch_service(provider, dispatcher, state, port, method, frame)
+//!      ├─ 帧结构 / 容量校验（超长 = `-EMSGSIZE`，绝不截断）
+//!      ├─ 拷贝 caller 的 args / input → **邮箱**（Core backing，实例域 VA）
+//!      ├─ isolated::prepare(handle, image.service_dispatch, stack, slot, false,
+//!      │     (state, port, method, mailbox.frame))
+//!      ├─ containment::with_isolated_service_boundary(provider, ...) { enter }
+//!      │     └─ 组件在自己的私有 AS 里执行 `kcomp_service_dispatch`
+//!      ├─ Returned(status) → output 拷回 caller → `*out_status`（方法状态）
+//!      └─ Faulted → fail_provider（Failed + AS 退役 + 窗口归还）→ EIO
 //! ```
 //!
 //! # Core 验证 vs 组件提议
@@ -31,13 +42,15 @@
 //! - **组件提议**：`kcomp_instance_create` 返回的 opaque state（Core 只存）与其
 //!   内部行为；`kcomp_instance_destroy` 自行收尾。
 //!
-//! # 内存路径决定（本增量）：Core 预置窗口，**无 import 面**
+//! # 内存路径决定（increment 5）：Core 预置窗口，**无 import 面**
 //!
 //! `docs/architecture/memory-and-heap.md` 的域视图契约
 //! （`kcore_memory_acquire` / `release`）要求组件能调到 Core。本增量**不引入**
 //! component→Core 的 gate-call trampoline（那需要 `ecall` 分派 + 按域 import
 //! 解析 + per-instance VA 预算，属于引入跨域 Gate 的后续增量），因此 Isolated
 //! 的 import 包络保持**空集**：任何 UNDEF 符号（含 `kcore_*`）在装载前显式拒绝。
+//! increment 6 同样没有 import 面——跨域 service 调用由 **Core 主动发起**（caller
+//! 是 KernelNative 组件），provider 不需要回调 Core。
 //!
 //! 替代机制（本增量选择、明示登记）：Core 预置一块**实例内存窗口**
 //! （[`ISOLATED_WINDOW_BASE`]；Core backing、零初始化、只映射在该实例的私有 AS
@@ -46,8 +59,14 @@
 //! 页表承载，Core 不另立账本。窗口**只在创建它的实例 AS 里可达**：同一 VA 在
 //! Core AS / 别的实例 AS 里没有任何映射（ArchTest `isolated-lifecycle` 证明）。
 //!
-//! 窗口布局（**Core 内部**；组件**不需要**知道偏移——它只用 Core 经 `a0` /
-//! `a1` / `tp` 交给它的实例内 VA）：
+//! increment 6 再预置一页**服务调用邮箱**（[`ISOLATED_MAILBOX_BASE`]；同一
+//! backing 纪律）：跨 AS 的扁平调用帧只经这里过边界——caller 的 args / input 被
+//! **拷贝**进邮箱，provider 在实例域内读它们并把 output 写回邮箱，Core 把 output
+//! 拷回 caller 缓冲。邮箱同样只在该实例的私有 AS 里可达；provider 看不到 caller
+//! 的帧 / 缓冲或任何 Core 内存（`isolated_mailbox`）。
+//!
+//! 窗口布局（**Core 内部**；组件**不需要**知道偏移——它只用 Core 经 `a0` ..
+//! `a3` / `tp` 交给它的实例内 VA）：
 //!
 //! ```text
 //! +0    KcompCreateArgs（config_abi / config / config_len）
@@ -59,15 +78,23 @@
 //!       在这里就是这份记录；可调用的 `kcore_memory_acquire` 面仍属后续增量
 //! ```
 //!
+//! 邮箱布局（**Core 内部**；provider 只见 Core 交付的实例内 VA）见
+//! [`isolated_mailbox`]：描述符 + args / input / output 三个固定容量区。
+//!
 //! # 明确不做（本增量登记）
 //!
 //! - **组件→Core 的 import 面**：没有 trampoline / `ecall` 分派，`kcore_*` 一律在
-//!   装载前拒绝（见上）。跨域 service Gate 与它一起属后续增量。
+//!   装载前拒绝（见上）。因此 Isolated provider **不能自己 publish endpoint**
+//!   （组件→Core 的 publish trampoline 属后续增量）：ArchTest 从 Core 侧登记
+//!   provider 的 endpoint（endpoint 真相仍由 Core 拥有），service dispatch 的机制
+//!   不受影响。出站 Isolated caller（Isolated → 任何域）继续显式拒绝。
 //! - **destroy 后的物理回收**：AS 退役（复用 = 新建空间）后窗口 backing 保持驻留
 //!   （phase 1 逻辑死亡 / 物理驻留，与 image 同）；页表页也没有 teardown 接口。
 //! - **同一 artifact 的第二个 Isolated 实例**：image 表按名字唯一且不区分域，
 //!   `validate_isolated_load` 仍拒绝复用（按 `(name, domain)` 索引留给后续）。
 //! - **ASID / U-mode**：ASID 恒 0 + 全量 `sfence.vma`；没有 U-mode / `ecall`。
+//! - **大负载 / 零拷贝 / 异步调用**：邮箱容量固定（`isolated_mailbox`），超长显式
+//!   拒绝；没有共享内存、没有 per-call 映射。
 //!
 //! # 诚实边界
 //!
@@ -75,22 +102,28 @@
 //!   映射。本模块不声称对抗隔离（那是 U-mode / SandboxedNative，未实现）。
 //! - **ASID 恒 0 + 全量 `sfence.vma`**（arch gateway 的既定边界）。
 //! - **CPU isolation ≠ DMA isolation**：Isolated 实例的 AS 只映射自己的镜像 /
-//!   机制页 / 栈 / 窗口，**不含**任何 MMIO / Core 段 / 页表 / 别的实例；但
-//!   Core 拥有的 DMA backing 是否可被错误复用属于 increment 6 的跨域服务边界，
-//!   本增量不声称 DMA 静默。
-//! - **失败 / 停止的物理回收**：create 失败时退役 AS 并归还 Core 预置窗口的
-//!   backing；destroy 成功后退役 AS（复用 = 新建空间），窗口 backing 保持驻留
-//!   （phase 1 逻辑死亡 / 物理驻留，与 image 同）。页表页本身没有 teardown
-//!   接口，退役后不再可达即"不 leaked AS"。
+//!   机制页 / 栈 / 窗口 / 邮箱，**不含**任何 MMIO / Core 段 / 页表 / 别的实例；
+//!   Core 拥有的 DMA backing 是否可被错误复用仍不声称 DMA 静默。
+//! - **provider panic**：Isolated 组件没有 `kcore_panic_escape` import 面，panic
+//!   handler 只能自旋；**故障**（trap）由 gateway 收敛成 `Outcome::Faulted`，
+//!   这是本增量证明的 containment 路径。
+//! - **失败 / 停止的物理回收**：create / service 故障时退役 AS 并归还 Core 预置
+//!   窗口（栈 / 实例窗口 / 邮箱）的 backing；destroy 成功后退役 AS（复用 = 新建
+//!   空间），窗口 backing 保持驻留（phase 1 逻辑死亡 / 物理驻留，与 image 同）。
+//!   页表页本身没有 teardown 接口，退役后不再可达即"不 leaked AS"。
 
 use crate::component::ComponentId;
+use crate::component::call::CallError;
 use crate::component::containment::{CallOutcome, KcompCreateArgs};
+use crate::component::endpoint::EndpointId;
 use crate::component::isolated_load;
+use crate::component::isolated_mailbox;
 use crate::component::load::ComponentLoadError;
 use crate::errno::Errno;
-use crate::generated::abi::{KCORE_MEMORY_VIEW_LOCAL_VA, MemoryView};
+use crate::generated::abi::{KCORE_MEMORY_VIEW_LOCAL_VA, KcompCallFrame, MemoryView};
 use crate::memory;
 use crate::memory::address_space::VirtualRange;
+use crate::task::TaskId;
 
 /// 组件栈（Core 预置 backing；只映射在该实例的私有 AS 里）。
 ///
@@ -105,6 +138,15 @@ pub const ISOLATED_STACK_SIZE: usize = 16 * 1024;
 /// 结束（开区间）= 栈基址；本窗口在栈之上。
 pub const ISOLATED_WINDOW_BASE: usize = 0x2200_0000;
 pub const ISOLATED_WINDOW_SIZE: usize = memory::ALLOC_GRANULE;
+
+/// **服务调用邮箱**（Core 预置 backing；只映射在该实例的私有 AS 里）。
+///
+/// 跨 AS 的扁平调用帧只经这里过边界（见 [`isolated_mailbox`]）：caller 的
+/// args / input 被**拷贝**进邮箱，provider 在实例域内读它们并把 output 写回邮箱，
+/// Core 再把 output 拷回 caller 的缓冲。provider 看不到 caller 的帧 / 缓冲，也
+/// 看不到任何 Core 内存；邮箱页与实例窗口相邻、互不重叠。
+pub const ISOLATED_MAILBOX_BASE: usize = ISOLATED_WINDOW_BASE + ISOLATED_WINDOW_SIZE;
+pub const ISOLATED_MAILBOX_SIZE: usize = memory::ALLOC_GRANULE;
 
 /// `KcompCreateArgs` 在窗口里的偏移（Core 写；组件经 `a0` 读）。
 pub const WINDOW_ARGS_OFF: usize = 0;
@@ -153,12 +195,23 @@ pub fn window_range() -> VirtualRange {
     }
 }
 
-// 布局不变量：镜像窗口（开区间结束）== 栈基址；栈与窗口不重叠。
+/// 服务调用邮箱的已映射区间。
+pub fn mailbox_range() -> VirtualRange {
+    VirtualRange {
+        base: ISOLATED_MAILBOX_BASE,
+        size: ISOLATED_MAILBOX_SIZE,
+    }
+}
+
+// 布局不变量：镜像窗口（开区间结束）== 栈基址；栈 / 窗口 / 邮箱不重叠；
+// 邮箱布局放得进邮箱页。
 const _: () = {
     let image_end =
         isolated_load::ISOLATED_IMAGE_WINDOW.base + isolated_load::ISOLATED_IMAGE_WINDOW.size;
     assert!(image_end == ISOLATED_STACK_BASE);
     assert!(ISOLATED_STACK_BASE + ISOLATED_STACK_SIZE <= ISOLATED_WINDOW_BASE);
+    assert!(ISOLATED_WINDOW_BASE + ISOLATED_WINDOW_SIZE <= ISOLATED_MAILBOX_BASE);
+    assert!(isolated_mailbox::MAILBOX_BYTES <= ISOLATED_MAILBOX_SIZE);
     assert!(WINDOW_OUT_STATE_OFF + core::mem::size_of::<usize>() <= WINDOW_RUNTIME_OFF);
     assert!(WINDOW_CONFIG_OFF + WINDOW_CONFIG_MAX <= WINDOW_VIEW_OFF);
     assert!(WINDOW_VIEW_OFF + core::mem::size_of::<MemoryView>() <= ISOLATED_WINDOW_SIZE);
@@ -175,7 +228,7 @@ mod imp {
     use crate::component::isolated::{self, IsolatedPrepareError, Outcome};
     use crate::component::isolated_load::IsolatedLoadError;
     use crate::component::load;
-    use crate::component::{failure, image, registry, runtime_slot};
+    use crate::component::{containment, failure, image, registry, runtime_slot};
     use crate::memory::address_space::{
         self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange,
     };
@@ -266,7 +319,7 @@ mod imp {
             stack_range(),
             slot,
             true,
-            (
+            isolated::EntryArgs::pair(
                 window.base + WINDOW_ARGS_OFF,
                 window.base + WINDOW_OUT_STATE_OFF,
             ),
@@ -346,7 +399,7 @@ mod imp {
             stack_range(),
             slot,
             true,
-            (state as usize, 0),
+            isolated::EntryArgs::pair(state as usize, 0),
         ) {
             Ok(transition) => transition,
             Err(error) => {
@@ -369,6 +422,127 @@ mod imp {
         // 实例已被请求停止：AS 不再可能被进入（复用 = 新建空间），一律退役。
         let _ = address_space::retire(handle);
         outcome
+    }
+
+    /// 跨域 service dispatch（increment 6）：KernelNative caller → Isolated provider。
+    ///
+    /// 顺序（**Core 验证 vs 组件提议**）：
+    ///
+    /// 1. **Core 验证帧**：结构 + 容量（[`isolated_mailbox::check_frame`]）——
+    ///    超长显式拒绝（`-EMSGSIZE`），绝不截断；
+    /// 2. **Core 拷贝**：caller 的 args / input → 邮箱（provider 域内 VA）、
+    ///    output 区清零；
+    /// 3. **Core 验证入口 / 栈 / gateway 映射**（[`isolated::prepare`]：入口必须
+    ///    落在 R+X 映射、栈被单条 R|W 映射覆盖、gateway 页精确映射）；
+    /// 4. **边界 + 进入**：[`containment::with_isolated_service_boundary`] 装上
+    ///    provider principal / caller-task provenance / re-entry / 调度门禁，然后
+    ///    [`isolated::enter`] 把组件切进它自己的 AS；组件故障由 gateway 的 trap
+    ///    路径收敛（无显式策略 = `Abandon`）；
+    /// 5. **Core 拷回**：provider 写的 output 区 → caller 的 `output` 缓冲（长度 =
+    ///    caller 声明的 `output_len`）；provider 返回值 = **方法状态**写
+    ///    `*out_status`，传输保持 `Ok`。
+    ///
+    /// provider 故障（`Outcome::Faulted`）或 Core 无法准备切换：provider 逻辑死亡
+    /// + AS 退役 + Core 预置窗口归还（与 create 失败同一套清理），caller 拿到
+    /// [`CallError::ProviderFailed`]（EIO），**caller 的 task 存活且不变**。
+    ///
+    /// # 栈（为什么这里没有 per-call 新栈）
+    ///
+    /// provider 跑在该实例 **Core 预置的组件栈**（[`stack_range`]；Core-owned
+    /// backing、只映射在该实例的私有 AS 里）上，与同域 service 边界的 per-call 栈
+    /// 目的相同、手段不同：同域栈要解决"共享 AS 里不能踩 caller 的栈"，跨 AS 的
+    /// 隔离由页表承担（provider 根本看不到 caller 的栈）。调用是**同步且串行**的
+    /// ——单 CPU、`prepare` 的 re-entry 门禁、且 Isolated provider 没有出站调用
+    /// import 面（不能嵌套回调自己）——因此复用实例栈安全；故障时实例被放弃、
+    /// AS 退役，栈不再被进入。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_service(
+        provider: ComponentId,
+        endpoint: EndpointId,
+        caller_task: Option<TaskId>,
+        dispatcher: usize,
+        instance_state: *mut (),
+        port: u32,
+        method: u32,
+        frame: &KcompCallFrame,
+        out_status: *mut i32,
+    ) -> Result<(), CallError> {
+        // (1) 帧结构 + 容量：任何拷贝之前显式拒绝（绝不截断）。
+        if let Err(error) = isolated_mailbox::check_frame(frame) {
+            registry::get_registry().lock().finish_call(provider);
+            return Err(map_mailbox_error(error));
+        }
+        // (2) 实例 AS 句柄 + 邮箱 backing 的 Core 视图（Ready 实例必有两者；
+        //     缺失 = Core 不变式破坏，按 provider 失败收尾，绝不 panic）。
+        let handle = registry::get_registry()
+            .lock()
+            .get(provider)
+            .and_then(|record| record.address_space);
+        let Some(handle) = handle else {
+            return Err(fail_provider(provider, None));
+        };
+        let Some(backing) = backing_of(handle, &mailbox_range()) else {
+            return Err(fail_provider(provider, Some(handle)));
+        };
+        // (3) 拷贝进邮箱：provider 看到的是**实例域内**的 VA（绝不共享 caller 地址）。
+        let mailbox =
+            match unsafe { isolated_mailbox::write_frame(backing, ISOLATED_MAILBOX_BASE, frame) } {
+                Ok(mailbox) => mailbox,
+                // `check_frame` 已通过：这里不可达（防御：按 provider 失败收尾）。
+                Err(_) => return Err(fail_provider(provider, Some(handle))),
+            };
+        // (4) Core 验证入口 / 栈 / gateway 映射（锁内；返回后不持锁）。组件故障
+        //     交给 Core 的窄分派：**没有显式策略就是 Abandon**。
+        isolated::install();
+        let transition = match isolated::prepare(
+            handle,
+            dispatcher,
+            stack_range(),
+            window_range().base + WINDOW_RUNTIME_OFF,
+            // 与同域 service 边界同一纪律：调用期间不开中断（provider 不可抢占）。
+            false,
+            isolated::EntryArgs {
+                a0: instance_state as usize,
+                a1: port as usize,
+                a2: method as usize,
+                a3: mailbox.frame,
+            },
+        ) {
+            Ok(transition) => transition,
+            Err(_) => return Err(fail_provider(provider, Some(handle))),
+        };
+        // (5) 身份边界 + 进入：provider 在自己的私有 AS 里执行 dispatcher。
+        let outcome =
+            containment::with_isolated_service_boundary(provider, endpoint, caller_task, || {
+                isolated::enter(transition)
+            });
+        match outcome {
+            Outcome::Returned(status) => {
+                // SAFETY: 邮箱 backing 仍驻留（本实例 Ready、未退役）；`output_len`
+                // 已由 `check_frame` 限界，caller 缓冲由 ABI 契约保证可写。
+                unsafe {
+                    isolated_mailbox::read_output(backing, frame.output, frame.output_len);
+                }
+                registry::get_registry().lock().finish_call(provider);
+                // SAFETY: `out_status` 由调用方保证可写（入口已校验非空）；
+                // unaligned 写防未对齐 UB。
+                unsafe { core::ptr::write_unaligned(out_status, status as u32 as i32) };
+                Ok(())
+            }
+            Outcome::Faulted => Err(fail_provider(provider, Some(handle))),
+        }
+    }
+
+    /// provider 在 service 边界内故障 / Core 无法准备切换：逻辑死亡 + AS 退役 +
+    /// Core 预置窗口归还（与 create 失败同一套清理），归还 inflight。
+    fn fail_provider(provider: ComponentId, handle: Option<AddressSpaceHandle>) -> CallError {
+        if let Some(handle) = handle {
+            release_instance_windows(handle);
+            let _ = address_space::retire(handle);
+        }
+        crate::component::fail_component(provider, ComponentLoadError::ServiceFaulted);
+        registry::get_registry().lock().finish_call(provider);
+        CallError::ProviderFailed
     }
 
     /// 落一段 Core 预置窗口（栈 / 实例窗口）：分配 backing、零初始化、映射 RW。
@@ -406,7 +580,8 @@ mod imp {
 
     fn map_instance_windows(handle: AddressSpaceHandle) -> Result<(), ComponentLoadError> {
         map_window(handle, stack_range())?;
-        map_window(handle, window_range())
+        map_window(handle, window_range())?;
+        map_window(handle, mailbox_range())
     }
 
     /// 把 create args / config 负载 / out_state / 域视图写进窗口 backing。
@@ -480,7 +655,7 @@ mod imp {
 
     /// 解映射并归还 Core 预置窗口（best effort：状态提交不因回收失败而回滚）。
     fn release_instance_windows(handle: AddressSpaceHandle) {
-        for range in [stack_range(), window_range()] {
+        for range in [stack_range(), window_range(), mailbox_range()] {
             if let Ok(Some(mapping)) = address_space::mapping_exact(handle, &range) {
                 let _ = address_space::unmap(handle, &range);
                 let _ = memory::free_region_raw(
@@ -539,9 +714,45 @@ mod imp {
         // 生产不可达（没有 Isolated 实例能被创建）；显式失败而不是假装成功。
         CallOutcome::Returned(Errno::ENOTSUP.code())
     }
+
+    /// 无私有 AS backend 的构建（host / NoMMU / 非 RISC-V）：没有 Isolated 实例
+    /// 能被创建，service dispatch 显式拒绝——**绝不**在共享内核 AS 里替 Isolated
+    /// provider 执行。帧结构 / 容量判据与真实路径**同一份**（host-testable），
+    /// 因此 host 用例能锁定"超长帧先于能力拒绝"。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_service(
+        provider: ComponentId,
+        _endpoint: EndpointId,
+        _caller_task: Option<TaskId>,
+        _dispatcher: usize,
+        _instance_state: *mut (),
+        _port: u32,
+        _method: u32,
+        frame: &KcompCallFrame,
+        _out_status: *mut i32,
+    ) -> Result<(), CallError> {
+        if let Err(error) = isolated_mailbox::check_frame(frame) {
+            crate::component::registry::get_registry()
+                .lock()
+                .finish_call(provider);
+            return Err(map_mailbox_error(error));
+        }
+        crate::component::registry::get_registry()
+            .lock()
+            .finish_call(provider);
+        Err(CallError::UnsupportedProviderDomain)
+    }
 }
 
-pub(crate) use imp::{create, destroy};
+pub(crate) use imp::{create, destroy, dispatch_service};
+
+/// 邮箱拒绝 → 调用传输错误（两条实现共用，唯一映射点）。
+fn map_mailbox_error(error: isolated_mailbox::MailboxError) -> CallError {
+    match error {
+        isolated_mailbox::MailboxError::InvalidFrame => CallError::InvalidFrame,
+        isolated_mailbox::MailboxError::FrameTooLarge => CallError::FrameTooLarge,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -578,13 +789,15 @@ mod tests {
         assert_eq!(view.len, ISOLATED_WINDOW_SIZE as u64);
     }
 
-    /// 实例窗口 / 栈与镜像窗口不重叠：镜像窗口开区间结束 == 栈基址，栈在窗口之下。
+    /// 实例窗口 / 栈 / 邮箱与镜像窗口不重叠：镜像窗口开区间结束 == 栈基址，
+    /// 栈在窗口之下，邮箱在窗口之上。
     #[test]
     fn instance_ranges_do_not_overlap_the_image_window() {
         let ranges = [
             isolated_load::ISOLATED_IMAGE_WINDOW,
             stack_range(),
             window_range(),
+            mailbox_range(),
         ];
         for pair in ranges.windows(2) {
             assert!(
@@ -592,6 +805,12 @@ mod tests {
                 "instance ranges must not overlap"
             );
         }
+        // 邮箱布局放得进邮箱页（`const _` 已在编译期钉住，这里再显式一次）。
+        const { assert!(isolated_mailbox::MAILBOX_BYTES <= ISOLATED_MAILBOX_SIZE) };
+        assert_eq!(
+            ISOLATED_MAILBOX_BASE,
+            ISOLATED_WINDOW_BASE + ISOLATED_WINDOW_SIZE
+        );
     }
 
     /// 无私有 AS backend 的构建（host）上，创建入口显式拒绝——绝不静默降级。

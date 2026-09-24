@@ -44,10 +44,17 @@
 //! # 显式拒绝（绝不静默）
 //!
 //! - 任何 UNDEF 符号（import 包络 = 空集）；
-//! - 定义了 `kcomp_service_dispatch`（服务分派 / trampoline 属 increment 6）；
 //! - 段 VA 超出实例窗口 / 段间重叠 / 权限不可表达（空、W^X）/ 对齐非 2 的幂；
 //! - 入口不在任何可执行段内（`EntryNotExecutable`）；
 //! - 没有私有 AS 能力的 profile（`map_into` 直接拒绝，绝不把恒等映射当 AS）。
+//!
+//! # 服务入口（increment 6）
+//!
+//! `kcomp_service_dispatch` 是**可选**的 image 级入口：定义了它的镜像会得到
+//! 一个**实例域内**的 dispatcher VA（`PlacedImage::service_dispatch`），供
+//! `component/isolated_lifecycle.rs` 经 gateway 在私有 AS 里调用。dispatcher
+//! 与 create / destroy 同一纪律：必须落在一条 `READ|EXECUTE` 段内。它**不是**
+//! import——组件仍然只能调用自己镜像内的代码（import 包络保持空集）。
 //!
 //! # 诚实边界
 //!
@@ -109,9 +116,6 @@ pub enum IsolatedLoadError {
     MachineMismatch,
     /// import 包络是空集：任何具名 UNDEF 符号（含 `kcore_*`）都在装载前拒绝。
     ImportsUnsupported,
-    /// 定义了 `kcomp_service_dispatch`：服务分派（per-domain trampoline / import
-    /// 解析）属于 increment 6，本阶段显式拒绝而不是静默忽略。
-    ServiceDispatchUnsupported,
     /// 段的 VA 区间（或装载基址）超出该实例允许的窗口。
     SegmentOutsideWindow,
     /// 两个段的 VA 区间重叠（页级权限分离的纵深防御检查；规划器按页分隔）。
@@ -156,6 +160,7 @@ pub struct PlacedImage {
     base: usize,
     create: usize,
     destroy: usize,
+    service_dispatch: Option<usize>,
     text_size: usize,
     abi: u64,
     segments: Vec<PlacedSegment>,
@@ -176,6 +181,12 @@ impl PlacedImage {
     /// `kcomp_instance_destroy` 的实例 AS 内 VA（已验证落在 R+X 段内）。
     pub fn destroy(&self) -> usize {
         self.destroy
+    }
+
+    /// **可选**的 `kcomp_service_dispatch` 实例 AS 内 VA（已验证落在 R+X 段内）。
+    /// `None` = 组件不提供 endpoint 服务（与 KernelNative image 同一语义）。
+    pub fn service_dispatch(&self) -> Option<usize> {
+        self.service_dispatch
     }
 
     /// 放段总跨度（字节；页对齐）。
@@ -223,15 +234,14 @@ impl PlacedImage {
 
     /// 转成 image 表登记所需的 [`LoadedComponent`]（lease 随本次转换归 image 表）。
     ///
-    /// Isolated image 的 `create` / `destroy` 是**实例 AS 内**的 VA；
-    /// `service_dispatch` 恒为 `None`（定义了 dispatcher 的镜像在放段前已被
-    /// [`IsolatedLoadError::ServiceDispatchUnsupported`] 拒绝）。
+    /// Isolated image 的 `create` / `destroy` / `service_dispatch` 都是**实例 AS
+    /// 内**的 VA（供 `component/isolated_lifecycle.rs` 经 gateway 调用）。
     pub fn into_loaded_component(self) -> LoadedComponent {
         LoadedComponent {
             base: self.base,
             create: self.create,
             destroy: self.destroy,
-            service_dispatch: None,
+            service_dispatch: self.service_dispatch,
             text_size: self.text_size,
             abi: self.abi,
             memory: Some(self.region),
@@ -304,12 +314,9 @@ fn place_at(
     check_empty_imports(&object)?;
 
     let symbol_table = object.symbol_table_index().map_err(elf_error)?;
-    if loader::symbol_offset(&object, symbol_table, b"kcomp_service_dispatch", STT_FUNC)
-        .map_err(IsolatedLoadError::Loader)?
-        .is_some()
-    {
-        return Err(IsolatedLoadError::ServiceDispatchUnsupported);
-    }
+    let service_dispatch =
+        loader::symbol_offset(&object, symbol_table, b"kcomp_service_dispatch", STT_FUNC)
+            .map_err(IsolatedLoadError::Loader)?;
     let relocations = object.relocations().map_err(elf_error)?;
 
     let Placement {
@@ -369,11 +376,22 @@ fn place_at(
         loader::read_abi(image, base, &seg_place, abi_symbol).map_err(IsolatedLoadError::Loader)?;
     ensure_executable_entry(&segments, create)?;
     ensure_executable_entry(&segments, destroy)?;
+    // 可选服务入口：同一纪律——必须落在一条 R+X 段内（increment 6）。
+    let service_dispatch = match service_dispatch {
+        Some(symbol) => {
+            let address = loader::resolve_symbol_address(&seg_place, base, symbol)
+                .map_err(IsolatedLoadError::Loader)?;
+            ensure_executable_entry(&segments, address)?;
+            Some(address)
+        }
+        None => None,
+    };
 
     Ok(PlacedImage {
         base,
         create,
         destroy,
+        service_dispatch,
         text_size: image_size,
         abi,
         segments,
@@ -575,6 +593,7 @@ mod tests {
     use crate::memory::test_support;
 
     const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
+    const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
     const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
 
     fn place_fixture() -> PlacedImage {
@@ -732,15 +751,45 @@ mod tests {
         );
     }
 
-    /// 定义了 `kcomp_service_dispatch` → 显式拒绝（服务分派属 increment 6）。
+    /// 服务入口必须落在 **R+X** 段内：把 dispatcher 的符号段改成非可执行段 →
+    /// 显式拒绝（`EntryNotExecutable`），绝不把数据页当可调用入口。
     #[test]
-    fn rejects_service_dispatch() {
-        let mut patched = ISOLATED_KCOMP.to_vec();
-        rename_a_func_to_dispatch(&mut patched).expect("fixture has a renamable FUNC symbol");
-        assert_eq!(
-            place(&patched),
-            Err(IsolatedLoadError::ServiceDispatchUnsupported)
-        );
+    fn rejects_service_dispatch_outside_an_executable_segment() {
+        // 放段会分配 backing（即使随后拒绝）：与其它 buddy heap 用例串行。
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let mut patched = SVC_KCOMP.to_vec();
+        let object = ElfObject::parse(&patched).expect("parse fixture");
+        let data = object
+            .sections()
+            .iter()
+            .position(|section| section.is_alloc() && !section.is_exec())
+            .expect("fixture must have a non-executable ALLOC section");
+        patch_symbol_shndx(&mut patched, b"kcomp_service_dispatch", data as u16)
+            .expect("fixture defines the dispatcher symbol");
+        assert_eq!(place(&patched), Err(IsolatedLoadError::EntryNotExecutable));
+    }
+
+    /// increment 6 夹具：真实定义了 `kcomp_service_dispatch` 的 `.kcomp` 按域放段
+    /// 成功，且 dispatcher 的解析结果随 `into_loaded_component` 进入 image 表。
+    #[test]
+    fn places_service_dispatch_fixture_and_preserves_the_entry() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let image = place(SVC_KCOMP).expect("kcomp_isolated_svc must place");
+        let dispatch = image
+            .service_dispatch()
+            .expect("fixture defines kcomp_service_dispatch");
+        let segment = image
+            .segments()
+            .iter()
+            .find(|segment| in_range(segment, dispatch))
+            .expect("dispatcher must be inside a segment");
+        assert!(segment.permission.contains(MappingPermission::EXECUTE));
+        assert!(!segment.permission.contains(MappingPermission::WRITE));
+
+        let loaded = image.into_loaded_component();
+        assert_eq!(loaded.service_dispatch, Some(dispatch));
     }
 
     /// `kcomp_abi` 值被改 → AbiMismatch（与 KernelNative loader 同一校验）。
@@ -907,34 +956,25 @@ mod tests {
         blob[at..at + 8].copy_from_slice(&align.to_le_bytes());
     }
 
-    /// 把一个已定义 FUNC 符号改名为 `kcomp_service_dispatch`（只改 strtab 名字，
-    /// 不动符号索引 / 重定位 / 段内容——镜像语义不变，只多出一个"服务入口"）。
-    fn rename_a_func_to_dispatch(blob: &mut [u8]) -> Option<()> {
-        let new_name = b"kcomp_service_dispatch";
+    /// 把某个已定义符号的 `st_shndx` 改成另一个 section（只改符号表，不动段内容 /
+    /// 重定位）：用来喂"入口不在可执行段内"这类纵深防御检查。
+    ///
+    /// 只支持 host fixture 的 ELF64（`e_shentsize` / 符号项大小都是 64/24）。
+    fn patch_symbol_shndx(blob: &mut [u8], name: &[u8], shndx: u16) -> Option<()> {
+        assert_eq!(blob[4], 2, "host fixture 预期是 ELF64");
         let object = ElfObject::parse(blob).ok()?;
         let symtab = object.symbol_table_index().ok()?;
-        let strtab = object.section(symtab).ok()?.link;
-        let strtab_offset = object.section(strtab).ok()?.offset;
-        let mut target = None;
+        let symtab_offset = object.section(symtab).ok()?.offset;
         for index in 0..object.symbol_count(symtab).ok()? {
             let symbol = object.symbol(symtab, index).ok()?;
-            if symbol.kind != STT_FUNC || symbol.shndx == 0 {
+            if object.symbol_name(symtab, symbol).ok()? != name {
                 continue;
             }
-            let section = object.section(symbol.shndx).ok()?;
-            if !section.is_alloc() || !section.is_exec() || symbol.value as usize >= section.size {
-                continue;
-            }
-            let name = object.symbol_name(symtab, symbol).ok()?;
-            if name.len() < new_name.len() {
-                continue;
-            }
-            target = Some(strtab_offset + symbol.name);
-            break;
+            // Elf64_Sym：st_name(+0) st_info(+4) st_other(+5) st_shndx(+6)。
+            let at = symtab_offset + index * 24 + 6;
+            blob[at..at + 2].copy_from_slice(&shndx.to_le_bytes());
+            return Some(());
         }
-        let at = target?;
-        blob[at..at + new_name.len()].copy_from_slice(new_name);
-        blob[at + new_name.len()] = 0;
-        Some(())
+        None
     }
 }

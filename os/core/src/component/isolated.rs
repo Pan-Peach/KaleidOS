@@ -17,14 +17,17 @@
 //!   └─ arch::riscv::gateway::enter → 汇编 …组件… → Outcome
 //! ```
 //!
-//! # 生产调用方（increment 5）
+//! # 生产调用方（increment 5 / 6）
 //!
 //! `component/isolated_lifecycle.rs` 是唯一生产调用方：Isolated 实例的
-//! `kcomp_instance_create` / `kcomp_instance_destroy` 都经这里在私有 AS 里执行。
-//! ArchTest 仍直接驱动本模块证明切换 / trap 往返 / 组件故障分派。
+//! `kcomp_instance_create` / `kcomp_instance_destroy`（increment 5）与
+//! `kcomp_service_dispatch`（increment 6 的跨域 service Gate）都经这里在私有
+//! AS 里执行。ArchTest 仍直接驱动本模块证明切换 / trap 往返 / 组件故障分派。
 //!
-//! 进入参数（组件入口 `a0` / `a1`）由 Core 解释：生命周期用它们交付 create 的
-//! `args` / `out_state`（实例内 VA）与 destroy 的 `state`；gateway 只搬运。
+//! 进入参数（组件入口 `a0` .. `a3`）由 Core 解释：生命周期用它们交付 create 的
+//! `args` / `out_state`（实例内 VA）与 destroy 的 `state`；increment 6 的跨域
+//! service dispatch 用满四个（`state` / `port` / `method` / provider 域内
+//! `frame`）；gateway 只搬运。
 //!
 //! # 协作式边界（不伪造安全承诺）
 //!
@@ -50,6 +53,32 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub use crate::memory::address_space::IsolatedPrepareError;
 pub use arch::riscv::gateway::{FaultDecision, Outcome};
 
+/// 一次组件入口调用要交付的 `a0` .. `a3`（**入口 ABI 由 Core 解释**，arch 只搬运）。
+///
+/// - create：`a0 = args`、`a1 = out_state`（`a2` / `a3` = 0）；
+/// - destroy：`a0 = state`（`a1` .. `a3` = 0）；
+/// - service dispatch：`a0 = instance_state`、`a1 = port`、`a2 = method`、
+///   `a3 = frame`（provider 域内 VA）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryArgs {
+    pub a0: usize,
+    pub a1: usize,
+    pub a2: usize,
+    pub a3: usize,
+}
+
+impl EntryArgs {
+    /// 两个参数的入口（create / destroy）。
+    pub const fn pair(a0: usize, a1: usize) -> Self {
+        Self {
+            a0,
+            a1,
+            a2: 0,
+            a3: 0,
+        }
+    }
+}
+
 /// 一次已准备、**无锁、无引用**的私有 AS 切换。
 ///
 /// 只能由 [`prepare`] 构造；`Copy`，可以在释放锁之后再传给 [`enter`]。
@@ -63,8 +92,7 @@ pub struct PreparedTransition {
     runtime_slot: usize,
     interrupts_enabled: bool,
     fault_token: usize,
-    entry_arg0: usize,
-    entry_arg1: usize,
+    entry_args: EntryArgs,
 }
 
 impl PreparedTransition {
@@ -93,8 +121,9 @@ impl PreparedTransition {
 ///
 /// - `stack`：组件栈的已映射区间；栈顶 = `base + size`，必须 16 字节对齐；
 /// - `runtime_slot`：组件运行的 `tp`（0 = 无；只搬运，不解释）；
-/// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸）；
-/// - `entry_args`：组件入口的 `a0` / `a1`（入口 ABI 由 Core 解释，arch 只搬运）。
+/// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸；
+///   service dispatch 传 `false`——与同域 service 边界同一纪律，provider 不可抢占）；
+/// - `entry_args`：组件入口的 `a0` .. `a3`（入口 ABI 由 Core 解释，arch 只搬运）。
 ///
 /// `handle` 的 owner 会作为故障归因 token 随描述符携带（Core 真相：AS owner）。
 pub fn prepare(
@@ -103,7 +132,7 @@ pub fn prepare(
     stack: VirtualRange,
     runtime_slot: usize,
     interrupts_enabled: bool,
-    entry_args: (usize, usize),
+    entry_args: EntryArgs,
 ) -> Result<PreparedTransition, IsolatedPrepareError> {
     let pages = gateway::pages();
     let activation = address_space::prepare_transition(handle, &pages, entry, stack)?;
@@ -122,8 +151,7 @@ pub fn prepare(
         runtime_slot,
         interrupts_enabled,
         fault_token: owner.raw() as usize,
-        entry_arg0: entry_args.0,
-        entry_arg1: entry_args.1,
+        entry_args,
     })
 }
 
@@ -140,8 +168,10 @@ pub fn enter(transition: PreparedTransition) -> Outcome {
         runtime_slot: transition.runtime_slot,
         interrupts_enabled: transition.interrupts_enabled,
         fault_token: transition.fault_token,
-        arg0: transition.entry_arg0,
-        arg1: transition.entry_arg1,
+        arg0: transition.entry_args.a0,
+        arg1: transition.entry_args.a1,
+        arg2: transition.entry_args.a2,
+        arg3: transition.entry_args.a3,
     })
 }
 
