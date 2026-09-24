@@ -35,8 +35,8 @@ use crate::trace::TraceRecord;
 pub struct Inspector;
 
 impl Inspector {
-    /// 仅 Core（含 crate 内测试）构造；对外由 Core 交付（见 `component/export`）。
-    // 目前只有 crate 内测试构造它；组件侧的交付入口在 Phase 4 随 export 落地。
+    /// 仅 Core（含 crate 内测试）构造；当前无组件侧交付入口。
+    // 只有 crate 内测试构造它；`pub(crate)` 保证外部拿不到"更宽"的版本。
     #[allow(dead_code)]
     pub(crate) const fn new() -> Self {
         Self

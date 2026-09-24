@@ -33,7 +33,6 @@ pub mod irq;
 pub mod machine;
 pub mod memory;
 pub mod monitor;
-pub mod object;
 #[macro_use]
 pub mod print;
 pub mod resource;

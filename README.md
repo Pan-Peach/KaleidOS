@@ -46,7 +46,7 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
                    RV64/Sv39 与 RV32/Sv32 profile 共用 RISC-V family，
                    _start → FDT discovery → MachineInfo → core::init() → Core Monitor，
                    与 core 链接成 kaleidos-<arch>（单镜像，职责分离装载合一）
-  core/            Resource Core **library**（host-testable）：task/memory/resource/object/component/irq/timer/trace/inspector/machine/print
+  core/            Resource Core **library**（host-testable）：task/memory/resource/component/irq/timer/trace/inspector/machine/print
   arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
   components/      组件 crates：生产组件（策略 / 服务 / 驱动 / 文件系统 / SDK）+ tests/（test-only fixture 与 CoreTest）
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …

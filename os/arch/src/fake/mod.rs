@@ -1,26 +1,10 @@
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
-use core::sync::atomic::{AtomicBool, Ordering};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
 extern crate std;
 use std::{io::Write, println};
 
 pub mod store;
-
-/// Host 上的 trap 模拟：记录架构初始化是否已经安装了 trap 入口。
-pub mod trap {
-    use super::{AtomicBool, Ordering};
-
-    static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-    pub fn init() {
-        INITIALIZED.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_initialized() -> bool {
-        INITIALIZED.load(Ordering::SeqCst)
-    }
-}
 
 /// Host 实现：console 直通 std stdout/stdin。
 ///
@@ -81,7 +65,7 @@ impl CpuArch for Fake {
     }
 
     fn init() {
-        trap::init();
+        // host 无真实 trap 入口：no-op 占位。
     }
 
     fn disable_irq() -> Self::IrqFlags {

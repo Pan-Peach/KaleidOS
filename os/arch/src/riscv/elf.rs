@@ -264,7 +264,7 @@ impl RelocationBackend for RiscvRelocator {
 mod tests {
     //! 生产 RiscvRelocator 的 host 测试（不是复制算法的 Fake）。
     //! 验证语义而不是几个 bit：patch 后重新解码指令，计算最终 target
-    //! 与期望符号地址比对（docs/development/testing.md §10）。
+    //! 与期望符号地址比对（docs/development/testing.md §2）。
 
     use super::*;
     use crate::component::{Relocation, RelocationBackend, WordSize};

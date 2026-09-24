@@ -431,7 +431,7 @@ mod tests {
         }
     }
 
-    // -- Property：任意字节输入永不 panic（docs/development/testing.md §8）----------------
+    // -- Property：任意字节输入永不 panic（docs/development/testing.md §2）----------------
 
     use proptest::prelude::*;
 

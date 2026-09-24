@@ -24,7 +24,7 @@
 //! `&[u8]` / `&mut [u8]`；[`BlockDeviceService::publish_endpoint`] 的安全性论证见
 //! 其文档。consumer 侧见 [`client::BlockBinding`]（Core 在 bind 时选定机制）。
 
-use crate::abi::{InterfaceAbi, InterfaceKind};
+use crate::abi::InterfaceKind;
 use crate::endpoint::Contract;
 use crate::errno::{Errno, Result};
 
@@ -61,18 +61,6 @@ pub(crate) mod tests_support;
 pub use crate::generated::block::KCOMP_BLOCK_DEVICE_NAME as BLOCK_DEVICE_NAME;
 
 use crate::generated::block::{KCOMP_BLOCK_DEVICE_ABI, KCOMP_BLOCK_DEVICE_CONTRACT};
-
-/// `block.device` 的 exact ABI fingerprint。
-///
-/// 数值 = 8 字节 ASCII tag `b"BLOCKDEV"` 的大端读数
-/// （`0x424C_4F43_4B44_4556`，可直接按字节读出拼写——与 `SCHEDULER_POLICY_ABI`
-/// 同一约定）。provider / consumer 都由本 SDK 的同一份定义编译；锚定测试把数值
-/// 钉死，任何改动必须是一次刻意的测试修改（数值漂移 = Core 直接拒绝 bind）。
-///
-/// raw `u64` 本体在生成物（[`KCOMP_BLOCK_DEVICE_ABI`]，schema 单一来源）；
-/// [`InterfaceAbi`] newtype 由手写 `abi.rs` 定义，这里做包装——生成物不会
-/// 改变公开类型。
-pub const BLOCK_DEVICE_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_BLOCK_DEVICE_ABI);
 
 /// BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
 ///

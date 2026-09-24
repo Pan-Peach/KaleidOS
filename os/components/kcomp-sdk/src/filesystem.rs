@@ -28,7 +28,7 @@
 
 use core::ffi::CStr;
 
-use crate::abi::{InterfaceAbi, InterfaceKind};
+use crate::abi::InterfaceKind;
 use crate::endpoint::Contract;
 use crate::errno::Result;
 
@@ -48,17 +48,6 @@ pub(crate) mod tests_support;
 pub use crate::generated::filesystem::KCOMP_FILESYSTEM_NAME as FILESYSTEM_NAME;
 
 use crate::generated::filesystem::{KCOMP_FILESYSTEM_ABI, KCOMP_FILESYSTEM_CONTRACT};
-
-/// filesystem 契约的 exact ABI fingerprint。
-///
-/// 数值 = 8 字节 ASCII tag `b"FILESYST"` 的大端读数
-/// （`0x4649_4C45_5359_5354`，可直接按字节读出拼写）。**同一个契约只此一个指纹**：
-/// 新增 transport（Gate 的扁平编码）不改变它——ABI 标识的是 function table /
-/// 扁平编码的逐位布局，transport 的选择是 Core 在 bind 时的机制决定。
-///
-/// raw `u64` 本体在生成物（[`KCOMP_FILESYSTEM_ABI`]，schema 单一来源）；
-/// [`InterfaceAbi`] newtype 由手写 `abi.rs` 定义，这里做包装。
-pub const FILESYSTEM_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_FILESYSTEM_ABI);
 
 /// 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 `FA_*`。
 pub use crate::generated::filesystem::KCOMP_FILESYSTEM_OPEN_READ as FILESYSTEM_OPEN_READ;

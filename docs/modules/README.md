@@ -24,7 +24,6 @@
 | `irq` | 外部中断投递入口 + 关中断临界区原语 | [`core/irq.md`](core/irq.md) |
 | `timer` | timer 机制状态（ticks / deadline / preempt 初始化） | [`core/timer.md`](core/timer.md) |
 | `component` | 组件身份与生命周期 / 镜像 / 接口绑定 / 导出 ABI / 加载 / containment | [`core/component.md`](core/component.md) |
-| `object` | 内核对象表——**仅占位 doc 注释，无实现** | [`core/object.md`](core/object.md) |
 | `machine` | 已提交的 `MachineInfo` + 纯设备发现 | [`core/machine.md`](core/machine.md) |
 
 ## 观察与诊断（`os/core/src/`）

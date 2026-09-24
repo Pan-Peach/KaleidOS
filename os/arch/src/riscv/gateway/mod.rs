@@ -135,15 +135,8 @@ const STACK_ALIGNMENT: usize = 16;
 const CORE_TRAP_STACK_BYTES: usize = 32 * 1024;
 
 // 相位值是与 `gateway64.S` / `gateway32.S` 的 `.equ PHASE_*` 共享的 ABI；
-// Rust 只直接引用 `PHASE_IDLE`（初始值），其余由汇编消费。
-#[allow(dead_code)]
+// Rust 只构造初始相位（IDLE = 0），其余相位由汇编写入。
 const PHASE_IDLE: usize = 0;
-#[allow(dead_code)]
-const PHASE_TO_COMPONENT: usize = 1;
-#[allow(dead_code)]
-const PHASE_COMPONENT: usize = 2;
-#[allow(dead_code)]
-const PHASE_TO_CORE: usize = 3;
 
 /// 同步路径上的 Core 恢复现场（进入时保存、返回 / abandon 时恢复）。
 #[repr(C)]
