@@ -5,27 +5,29 @@
 
 ## 组件 crates
 
-实际目录（`os/components/`）：`block_chain`、`core_test`、`driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp-sdk`、`kcomp_smoke`、`Kconfig`、`littlefs_chain`、`logger`、`scheduler_rr`。
+实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；测试 / 遗留 —— `block_chain`、`littlefs_chain`、`filesystems/fs_consumer`、`logger`、`Kconfig`。
+
+**test-only 与生产的分界**：test-only fixture / 组件一律放 `os/components/tests/`；`.kcomp` 名取目录 basename（`load <basename>`），所以搬路径不改组件名，`load core_test` / `load kcomp_c_smoke` 等运行时契约不变。
 
 | 组件 | 路径 | 形态 | 一句话 |
 |---|---|---|---|
-| `core_test` | `os/components/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend） |
+| `core_test` | `os/components/tests/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend） |
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；cursor 是实例状态，只提议下一个 `TaskId` |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | 协议无关设备 prober（总线角色）：opaque compatible 粗匹配；逐台以扁平 create config 下发 `(device_id, 结果端口名)`，create 返回后 pull 驱动的 `probe.result`，本地更新 cursor（**无环**，driver 不回调） |
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
 | `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
 | `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
-| `ram_blk_rw` | `os/components/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
+| `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
 | `littlefs_chain` | `os/components/littlefs_chain/` | Rust `.kcomp` | **多实例组合策略**：2× `ram_blk_rw` → 2× `littlefs`（各带独立块设备与 `lfs_t`），证明 Core endpoint/instance 模型承载两个互不干扰的 FS 实例 |
 | `vfs` | `os/components/filesystems/vfs/` | 空目录 | 占位，无文件、无 `Cargo.toml` |
-| `kcomp_smoke` | `os/components/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
-| `kcomp_c_smoke` | `os/components/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
-| `kcomp_panic` | `os/components/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
-| `kcomp_isolated` | `os/components/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供 increment 4 按域装载与页级权限强制用例在私有 AS 里执行 |
-| `kcomp_isolated_bad` | `os/components/kcomp_isolated_bad/` | Rust `.kcomp` | increment 7 的**放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 包络）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明实例 / 创建 AS / 登记 image 之前」 |
-| `kcomp_isolated_life` | `os/components/kcomp_isolated_life/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：实现 increment 5 的实例窗口协议（读 args / 写 `out_state` 上报 tp / satp / config；destroy 写标记），供 `isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-lifecycle-fault` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-restart` 经生产生命周期创建 / 销毁。increment 7 增加故障注入：`FAIL_ABI`（create 返回 `-EINVAL`）、`FAULT_ABI`（create trap）、`DESTROY_FAULT_ABI`（create 成功、destroy trap）与 destroy 进入计数（`isolated-destroy-fault` 的「绝不重试析构」证据） |
-| `kcomp_isolated_svc` | `os/components/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider（increment 6）。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` / `isolated-stale-access` / `isolated-ready-fault` 证明跨域 Gate、stale 阻断与逻辑重启 |
-| `kcomp_min` | `os/components/kcomp_min/` | Rust staticlib（host fixture） | 手写最小生命周期入口，供 `os/core/build.rs` host 测试钉重定位布局；**不在 `KCOMP_SRCS`** |
+| `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
+| `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
+| `kcomp_panic` | `os/components/tests/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
+| `kcomp_isolated` | `os/components/tests/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供 increment 4 按域装载与页级权限强制用例在私有 AS 里执行 |
+| `kcomp_isolated_bad` | `os/components/tests/kcomp_isolated_bad/` | Rust `.kcomp` | increment 7 的**放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 包络）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明实例 / 创建 AS / 登记 image 之前」 |
+| `kcomp_isolated_life` | `os/components/tests/kcomp_isolated_life/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：实现 increment 5 的实例窗口协议（读 args / 写 `out_state` 上报 tp / satp / config；destroy 写标记），供 `isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-lifecycle-fault` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-restart` 经生产生命周期创建 / 销毁。increment 7 增加故障注入：`FAIL_ABI`（create 返回 `-EINVAL`）、`FAULT_ABI`（create trap）、`DESTROY_FAULT_ABI`（create 成功、destroy trap）与 destroy 进入计数（`isolated-destroy-fault` 的「绝不重试析构」证据） |
+| `kcomp_isolated_svc` | `os/components/tests/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider（increment 6）。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` / `isolated-stale-access` / `isolated-ready-fault` 证明跨域 Gate、stale 阻断与逻辑重启 |
+| `kcomp_min` | `os/components/tests/kcomp_min/` | Rust staticlib（host fixture） | 手写最小生命周期入口，供 `os/core/build.rs` host 测试钉重定位布局；**不在 `KCOMP_SRCS`** |
 | `kbench` | `os/components/kbench/` | Rust `.kcomp` | 板端 benchmark：clock/query + 真实 `sched.yield_roundtrip` 交接 |
 | `logger` | `os/components/logger/` | Rust lib（workspace 成员） | 结构化日志组件 stub（M2），无 `.kcomp`、无实现 |
 | `kcomp-sdk` | `os/components/kcomp-sdk/` | Rust lib + C 头 / CRT | 组件 SDK/CRT，**不是可加载组件**（见下） |
@@ -59,12 +61,12 @@
 ```
 
 - **导出白名单**：`abi/core.toml` 声明 **40** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。
-- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`core_test kcomp_smoke scheduler_rr kcomp_panic kcomp_isolated kcomp_isolated_life kcomp_isolated_svc kcomp_isolated_bad drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain`）与 `KCOMP_C_SRCS`（C：`kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer`）。
+- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw block_chain littlefs_chain`）与 `KCOMP_C_SRCS`（C：`tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer`）；`.kcomp` 名取目录 basename（`load <basename>`）。
 
 ## 测试 / smoke vs 真实组件
 
 - **真实策略 / 服务 / 驱动**：`scheduler_rr`（policy）、`driver_prober`（service）、`drivers/virtio_blk`（driver）、`filesystems/fatfs`（service）；`logger` 是尚未实现的真实服务 stub。
-- **测试 / smoke / 基准**：`core_test`、`kcomp_smoke`、`kcomp_c_smoke`、`kcomp_panic`、`kcomp_isolated`（按域装载 fixture）、`kcomp_isolated_life`（Isolated 生命周期 / destroy 故障注入 fixture）、`kcomp_isolated_svc`（跨域服务 provider fixture）、`kcomp_isolated_bad`（放段失败 fixture）、`kcomp_min`（host fixture）、`kbench`（度量）。
+- **测试 / smoke / 基准**：`core_test`（CoreTest **权威**：唯一的组件 / 系统集成编排者，见 [testing.md §3](../development/testing.md)，但仍只是 test-only 镜像，故与 fixture 同放 `tests/`）、`kcomp_smoke`、`kcomp_c_smoke`、`kcomp_panic`、`kcomp_isolated`（按域装载 fixture）、`kcomp_isolated_life`（Isolated 生命周期 / destroy 故障注入 fixture）、`kcomp_isolated_svc`（跨域服务 provider fixture）、`kcomp_isolated_bad`（放段失败 fixture）、`kcomp_min`（host fixture）——全部在 `os/components/tests/`；`kbench`（度量）留在生产位置。
 - `filesystems/vfs` 是空占位，两者都不是。
 
 ## 明确不做
@@ -78,7 +80,7 @@
 
 | 路径 | 内容 |
 |---|---|
-| `os/components/<name>/` | 各组件 crate（见上表） |
+| `os/components/<name>/` | 各生产组件 crate（见上表）；test-only fixture 在 `os/components/tests/` |
 | `os/components/kcomp-sdk/` | SDK / CRT：`include/`（C 头）、`c/kcomp_rt.c`、`src/`（Rust） |
 | `tools/build-kcomp.sh` / `tools/build-kcomp-c.sh` | Rust / C 语言前端 |
 | `tools/kcomp-link.sh` | 语言无关打包器 + 契约校验 |

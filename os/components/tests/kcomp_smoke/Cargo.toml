@@ -13,4 +13,4 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-kcomp-sdk = { path = "../kcomp-sdk" }
+kcomp-sdk = { path = "../../kcomp-sdk" }

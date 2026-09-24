@@ -363,7 +363,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | 组件 | 能否 Sandbox | 原因 | 证据 |
 |---|---|---|---|
 | `virtio_blk` | **否（按现状）** | 需要裸 MMIO | `os/components/drivers/virtio_blk/src/lib.rs:302,392`（volatile 读写寄存器） |
-| `core_test` | **否（按现状）** | 需要裸 MMIO | `os/components/core_test/src/runtime/resource.rs:56,61,187-188` |
+| `core_test` | **否（按现状）** | 需要裸 MMIO | `os/components/tests/core_test/src/runtime/resource.rs:56,61,187-188` |
 | `kbench` | **否（按现状）** | 需要裸 MMIO | `os/components/kbench/src/irq.rs:104` |
 | `driver_prober` | **否（无 Core 侧 broker 时）** | 需要 Core-authority 操作：组件加载 / 任务创建 / `device_nth` | `os/components/driver_prober/src/runtime.rs:149,178,249` |
 | `scheduler_rr` | **原则上可以** | 纯逻辑，只走服务 | `os/components/scheduler_rr/src/lib.rs` |

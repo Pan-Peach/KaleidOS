@@ -44,7 +44,7 @@ IRQ 是否真的 delivery / timer 是否真的触发 / trap entry 是否正确
 - **QEMU CoreTest**：验证 Core 与 Arch / Machine Discovery 之间的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等），以普通 .kcomp 组件身份运行（无 god-mode）；
 - **Real Hardware**：最终在真机上验证。
 
-## 3. CoreTest 组件（os/components/core_test/）
+## 3. CoreTest 组件（os/components/tests/core_test/）
 
 CoreTest 是特殊的测试组件，运行在 QEMU / 真实硬件上，验证 Core 与 Arch 的**真实行为**。
 以普通 `.kcomp` 身份运行（无 god-mode），源码按**报告分组**拆为 `src/runtime/`：

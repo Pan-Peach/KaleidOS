@@ -60,7 +60,8 @@ fn main() {
     // 组件 → .kcomp 的构建管线（与 Makefile 共用脚本）：Rust 前端
     // tools/build-kcomp.sh 编出 staticlib，语言无关的 tools/kcomp-link.sh
     // 做 partial link + --gc-sections + -u 入口 → strip → 契约校验。host 测试
-    // fixture（<name>.kcomp / init.kpkg / smoke_min.kcomp）保持不变。
+    // fixture 一律在 `os/components/tests/` 下（见 AGENTS.md）；产物名仍取目录
+    // basename（<name>.kcomp / init.kpkg / smoke_min.kcomp），组件名是运行时契约。
     let script = repo.join("tools/build-kcomp.sh");
     println!("cargo:rerun-if-changed={}", script.display());
     let sdk_dir = repo.join("os/components/kcomp-sdk");
@@ -75,17 +76,17 @@ fn main() {
     }
 
     let components = [
-        "core_test",
-        "kcomp_smoke",
-        "kcomp_min",
-        "kcomp_isolated",
-        "kcomp_isolated_life",
-        "kcomp_isolated_svc",
-        "kcomp_isolated_bad",
+        ("core_test", "tests/core_test"),
+        ("kcomp_smoke", "tests/kcomp_smoke"),
+        ("kcomp_min", "tests/kcomp_min"),
+        ("kcomp_isolated", "tests/kcomp_isolated"),
+        ("kcomp_isolated_life", "tests/kcomp_isolated_life"),
+        ("kcomp_isolated_svc", "tests/kcomp_isolated_svc"),
+        ("kcomp_isolated_bad", "tests/kcomp_isolated_bad"),
     ];
     let mut objects = Vec::new();
-    for name in components {
-        let component_dir = repo.join("os/components").join(name);
+    for (name, path) in components {
+        let component_dir = repo.join("os/components").join(path);
         println!(
             "cargo:rerun-if-changed={}",
             component_dir.join("Cargo.toml").display()

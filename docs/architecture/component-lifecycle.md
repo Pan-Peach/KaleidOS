@@ -294,7 +294,7 @@ IRQ / 重入需要的同步要保留——单 CPU **不**构成放开 `&mut` 别
 4. **一起切换 loader / containment / SDK / packer**：保留嵌套调用者恢复，在现有 Core-owned 栈上传递 create/destroy 参数，更新 `tools/kcomp-link.sh` 的符号保留/校验；**重建每个组件**，不维护兼容。
 5. **迁移普通组件 + task 上下文**：在碰硬件之前，先验证"两个简单有状态实例 + 用全新 ID/ctx 重启"。scheduler/prober/诊断按组合策略保持单例。
 6. **迁移 VirtIO 与 prober，RV32/RV64 验证**：多设备启用以 §10 的 HAL-context 证明、全宽 DeviceId / MMIO 基址、独立 endpoint binding、正确的 per-instance teardown、隔离行为不变为前提。
-7. **C 生命周期 smoke 已落地，FatFs 胶水待接**：`os/components/kcomp_c_smoke` 是一个
+7. **C 生命周期 smoke 已落地，FatFs 胶水待接**：`os/components/tests/kcomp_c_smoke` 是一个
    clang 编的 freestanding C 组件，经 `tools/build-kcomp-c.sh` + SDK C 运行时
    （`kcomp-sdk/c/kcomp_rt.c`）走**同一个** packer / loader 路径；`make test-c-smoke`
    在 RV64/RV32 端到端验证 create（`kcore_log_line`）与 destroy。**仍未做**：C 侧的

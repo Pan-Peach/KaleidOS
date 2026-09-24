@@ -142,12 +142,14 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # 两段管线：语言前端（Rust: tools/build-kcomp.sh / C: tools/build-kcomp-c.sh）
 # 各自编出 .o/.a，再交给语言无关的 tools/kcomp-link.sh 做 partial link +
 # --gc-sections + -u 入口 → strip → 白名单/重定位契约校验，产出 ET_REL .kcomp。
-# 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`）。
+# 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`），
+# 因此 test-only fixture 可以整体挪进 tests/ 而不改组件名。test-only fixture/组件
+# 一律放 os/components/tests/（见 AGENTS.md），生产组件留在 os/components/。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := core_test kcomp_smoke scheduler_rr kcomp_panic kcomp_isolated kcomp_isolated_life kcomp_isolated_svc kcomp_isolated_bad drivers/virtio_blk driver_prober kbench drivers/ram_blk drivers/ram_blk_rw block_chain littlefs_chain
+KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw block_chain littlefs_chain
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
-KCOMP_C_SRCS := kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer
+KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs filesystems/fs_consumer
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -278,8 +280,8 @@ fmt:
 	cd os/components/kcomp-sdk && cargo fmt
 	cd os/components/driver_prober && cargo fmt
 	cd os/components/kbench && cargo fmt
-	cd os/components/drivers/ram_blk && cargo fmt
-	cd os/components/drivers/ram_blk_rw && cargo fmt
+	cd os/components/tests/drivers/ram_blk && cargo fmt
+	cd os/components/tests/drivers/ram_blk_rw && cargo fmt
 	cd os/components/block_chain && cargo fmt
 	cd os/components/littlefs_chain && cargo fmt
 	cd os/boot/riscv && cargo fmt
@@ -293,8 +295,8 @@ clippy:
 	cd os/components/kcomp-sdk && cargo clippy --all-targets
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
-	cd os/components/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
-	cd os/components/drivers/ram_blk_rw && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/tests/drivers/ram_blk_rw && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/littlefs_chain && cargo clippy --target $(KCFG_TARGET)
 
@@ -304,7 +306,7 @@ test-host:
 	cd os/components/kcomp-sdk && cargo test
 	cd os/components/driver_prober && cargo test
 	cd os/components/kbench && cargo test
-	cd os/components/drivers/ram_blk && cargo test
+	cd os/components/tests/drivers/ram_blk && cargo test
 	cd os/components/block_chain && cargo test
 
 # Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
@@ -441,7 +443,7 @@ check: init.kpkg
 	cd os/components/kcomp-sdk && cargo fmt -- --check
 	cd os/components/driver_prober && cargo fmt -- --check
 	cd os/components/kbench && cargo fmt -- --check
-	cd os/components/drivers/ram_blk && cargo fmt -- --check
+	cd os/components/tests/drivers/ram_blk && cargo fmt -- --check
 	cd os/components/block_chain && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
@@ -449,7 +451,7 @@ check: init.kpkg
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
-	cd os/components/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/block_chain && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	$(MAKE) test-kconfig
 	$(MAKE) abi-check

@@ -29,6 +29,7 @@ KaleidOS —— 组件化、多架构操作系统，面向学习、实验与个�
 - **标识符不带版本后缀。** 类型 / 函数 / 链接名禁止 `V1`、`v2`、`_v2` 之类版本后缀（如 `SchedulerPolicyV1`、`kcore_device_claim_v2`、`VirtioProbeV1`）。契约演进靠 **exact ABI fingerprint + 协调替换**，不靠版本化命名：契约变了就**原地替换**名字/签名，本阶段不维护 ABI 兼容，也不保留旧名（不保证陈旧 `.kcomp` 可加载）。
 - **人类是实现者。** 代码保持极简、可手写。不要为了展示架构生成大量抽象、宏、动态注册系统、复杂 trait 层级、unsafe loader 或 runtime。小模块（几十行）就是普通 module，不要强行造 crate。**测试（host test / 单元测试 / CoreTest 用例）可由 Agent 编写；实现逻辑由人类手写。**
 - **OS 源码统一收敛在 `os/` 下**（core/ arch/ components/ boot/；**驱动也是组件，统一归 `components/drivers/`**）；成品镜像在 `os/boot/<arch>/`（bin，链接 core 成 kaleidos.elf），不要散到任意位置。
+- **test-only fixture / 组件一律放 `os/components/tests/`**；`os/components/` 根只留生产组件与 SDK（`.kcomp` 名取目录 basename，故移动路径不改组件名）。
 - **外部依赖一律用 git submodule**（放 `third_party/`；克隆后先 `git submodule update --init --recursive`），不要本地 vendored 一份拷贝。
 - **构建配置以 `.config` 为唯一真相。** 配置走 Kconfig：`Kconfig` → `.config` → 生成 Make 片段（`scripts/kconfig/genmk.py`，唯一的 config→build 映射）→ Cargo features（**只是内部传输机制**）。不要手工同步各 crate 的 Cargo features，也不要让某个 crate 自己决定 profile；`#[cfg]`/`compile_error!` 是不变式与防御，不是配置来源。详见 `docs/architecture/kconfig.md`。
 - **Core 与硬件无关的 truth logic 必须 host-testable。** Core 与 Arch/硬件 的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）走 QEMU/CoreTest/真机验证；若某段 Core 逻辑只能整机测，先怀疑 Arch 耦合。CoreTest 无 god-mode，只能走真实 Core API（最多只读 `TestInspector`）。

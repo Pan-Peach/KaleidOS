@@ -4,7 +4,7 @@ members = [
     "os/core",
     "os/arch",
     "os/components/scheduler_rr",
-    "os/components/core_test",
+    "os/components/tests/core_test",
     "os/components/logger",
 ]
 exclude = [

@@ -44,7 +44,7 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
                    与 core 链接成 kaleidos-<arch>（单镜像，职责分离装载合一）
   core/            Resource Core **library**（host-testable）：task/memory/resource/object/component/irq/timer/trace/inspector/machine/print
   arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
-  components/      组件 crates（策略 / 服务 / 测试）：scheduler_rr/ core_test/ logger/ …
+  components/      组件 crates：生产组件（策略 / 服务 / 驱动 / 文件系统 / SDK）+ tests/（test-only fixture 与 CoreTest）
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
 third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）——workspace exclude，clippy 不检索
 tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，QEMU virt 真实 DTB 转储；供未来 parser 测试与人工对照）
