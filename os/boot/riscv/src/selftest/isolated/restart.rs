@@ -60,7 +60,7 @@ pub(crate) fn isolated_ready_fault() -> ! {
         fail_case("isolated-ready-fault", "healthy call was not observed");
     }
 
-    // (2) 故障：provider 读 caller 域内地址（实例 AS 缺页）。
+    // (2) 故障：provider 读未映射地址（任何 AS 都缺页）。
     SVC_FAULT_COUNT.store(0, Ordering::Release);
     SVC_FAULT_CAUSE.store(0, Ordering::Release);
     SVC_FAULT_STVAL.store(0, Ordering::Release);
@@ -68,8 +68,8 @@ pub(crate) fn isolated_ready_fault() -> ! {
     if !isolated::register_fault_policy(svc_fault_policy) {
         fail_case("isolated-ready-fault", "fault policy registration failed");
     }
-    let target = [0xEEu8; 8];
-    let target_bytes = (target.as_ptr() as usize).to_le_bytes();
+    let target_va = ISOLATED_ABANDON_VA;
+    let target_bytes = target_va.to_le_bytes();
     let transport = with_kernel_caller(caller, 0x70, || {
         call::endpoint_call(
             first.endpoint,

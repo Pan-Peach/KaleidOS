@@ -91,6 +91,24 @@ pub unsafe fn flush_tlb() {
     }
 }
 
+/// 当前 `satp` 原值（故障归因：确认被打断的执行确实在预期的实例 root 上）。
+#[cfg(all(
+    feature = "vm-mmu",
+    any(target_arch = "riscv32", target_arch = "riscv64")
+))]
+pub fn current_satp() -> usize {
+    let satp: usize;
+    // SAFETY: CSR read only; no memory / stack effects.
+    unsafe {
+        core::arch::asm!(
+            "csrr {satp}, satp",
+            satp = out(reg) satp,
+            options(nostack, preserves_flags),
+        );
+    }
+    satp
+}
+
 /// 写 satp 并 flush TLB。这是本模块唯一职责：只碰寄存器，不懂地址空间生命周期。
 /// `root_ppn` 是根页表物理页号；`asid` 是该地址空间的 ASID。
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]

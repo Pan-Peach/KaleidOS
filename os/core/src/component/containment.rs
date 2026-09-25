@@ -26,9 +26,10 @@
 //!   suspended scheduler frame, which still owns its `IrqSaveGuard`.
 //! - **Cross-AS service** (`with_isolated_service_boundary`; KernelNative
 //!   caller → Isolated provider): enters the provider's private AS through the
-//!   assembly gateway with the same `EscapeKind::ServiceCall` bookkeeping; a
-//!   provider fault is contained by the gateway trap path (`Outcome::Faulted`),
-//!   not `panic_escape` (an Isolated component has no `kcore_*` import surface).
+//!   the minimal cross-AS trampoline with the same `EscapeKind::ServiceCall`
+//!   bookkeeping; a provider fault is contained by the ordinary Core trap path
+//!   (`Outcome::Faulted` via the cross-AS recoverable context), not
+//!   `panic_escape` (an Isolated component has no `kcore_*` import surface).
 //!
 //! # Escapability gate (Core ABI depth)
 //!
@@ -435,6 +436,58 @@ fn active_guard() -> Option<*mut EscapeGuard> {
     (!guard.is_null()).then_some(guard)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-AS recoverable context (Isolated execution)
+// ---------------------------------------------------------------------------
+
+/// 跨 AS（Isolated）执行的可恢复现场：只在真实 RISC-V 目标（`isolated::enter`
+/// 消费）与 host 测试（LIFO 链）编译。
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
+pub(crate) mod cross_as {
+    /// 一次 Isolated 执行的**可恢复现场**：普通 Core trap 路径上的异常钩子据此
+    /// 判定“这次异常属于一个仍挂起的跨 AS 调用”，并能在放弃时交回进入前的 Core
+    /// 调用者。
+    ///
+    /// `context` / `abandon` 由 arch 的 trampoline 提供（类型擦除：containment 是
+    /// host-testable 的 Core 模块，不依赖 RISC-V 类型）。记录本身**每次调用独立**
+    /// （在 `isolated::enter` 的栈帧里）；这里只保存指向当前记录的指针，按 LIFO
+    /// 嵌套恢复，因此未来 A→B 的直接切换不需要单例 scratch。
+    pub(crate) struct CrossAsContext {
+        /// trampoline 的每次调用记录（arch 私有布局）。
+        pub context: *mut u8,
+        /// 放弃被打断的执行并交回挂起的 Core 调用者；永不返回。
+        pub abandon: unsafe fn(*mut u8) -> !,
+        /// 被打断执行应处的 `satp`（不匹配 = 不是这次 Isolated 调用的故障）。
+        pub expected_satp: usize,
+        /// 被打断执行所属实例的地址空间（组件私有可执行范围判定）。
+        pub space: Option<crate::memory::address_space::AddressSpaceHandle>,
+        /// 归因 token（Core 真相：AS owner raw id）。
+        pub token: usize,
+    }
+
+    static mut ACTIVE_CROSS_AS: *mut CrossAsContext = core::ptr::null_mut();
+
+    /// 安装本次 Isolated 执行的可恢复现场，返回被替换的上一个（LIFO / 嵌套安全）。
+    pub(crate) fn swap_cross_as(next: *mut CrossAsContext) -> *mut CrossAsContext {
+        // SAFETY: [Category 2 — Data races] single-active-CPU; only touched at
+        // synchronous Isolated entry/return boundaries.
+        unsafe { core::ptr::replace(core::ptr::addr_of_mut!(ACTIVE_CROSS_AS), next) }
+    }
+
+    /// 恢复 [`swap_cross_as`] 返回的上一个现场。
+    pub(crate) fn restore_cross_as(previous: *mut CrossAsContext) {
+        // SAFETY: same single-active-CPU contract as `swap_cross_as`.
+        unsafe { core::ptr::addr_of_mut!(ACTIVE_CROSS_AS).write(previous) };
+    }
+
+    /// 当前 Isolated 执行的可恢复现场；`None` = 当前不在 Isolated AS 里执行。
+    pub(crate) fn active_cross_as() -> Option<*mut CrossAsContext> {
+        // SAFETY: [Category 2 — Data races] same single-active-CPU contract.
+        let ctx = unsafe { core::ptr::addr_of!(ACTIVE_CROSS_AS).read() };
+        (!ctx.is_null()).then_some(ctx)
+    }
+}
+
 /// Reads the active escape guard without locks or allocation.  Returns `None`
 /// when the current execution is not inside a component boundary.
 pub fn active_escape() -> Option<EscapeInfo> {
@@ -664,17 +717,17 @@ pub(crate) fn call_component_service(
 /// [`EscapeKind::ServiceCall`] guard around `f` with exactly the same principal
 /// / provenance / re-entry / scheduling-forbidden discipline as
 /// [`call_component_service`], but **no Core stack switch** — the execution
-/// switch is the assembly gateway's (`isolated::enter`), and `f` performs it.
+/// switch is the cross-AS trampoline's (`isolated::enter`), and `f` performs it.
 ///
 /// The guard's context records are deliberately null: an Isolated component has
 /// **no `kcore_*` import surface**, so `kcore_panic_escape` is unreachable and
 /// there is no Core-owned context a panic could resume.  A provider **fault** is
-/// contained by the gateway's trap path (`Outcome::Faulted` → Core fault policy),
-/// not by [`panic_escape`].  [`escape_target`] refuses an escape through a guard
+/// contained by the ordinary Core trap path (`Outcome::Faulted` → the cross-AS
+/// recoverable context), not by [`panic_escape`].  [`escape_target`] refuses an escape through a guard
 /// with a null context (defensive: stay fatal rather than switch to a null
 /// context).
 ///
-/// Callers must not hold any Core lock across `f` (the gateway requires the
+/// Callers must not hold any Core lock across `f` (the trampoline requires the
 /// same).
 // 只被 cfg-gated 的 Isolated dispatch 路径（真机）调用；host 构建没有 Isolated
 // 实例，但 host 用例（`isolated_service_boundary_has_no_escapable_core_context`）
@@ -1141,7 +1194,7 @@ fn escape_target() -> Option<*mut EscapeGuard> {
     if core_abi_depth() > 0 {
         return None;
     }
-    // 没有可恢复的 Core 上下文（跨 AS service 边界：切换由 gateway 负责）：
+    // 没有可恢复的 Core 上下文（跨 AS service 边界：trap 恢复由跨 AS 现场负责，
     // 拒绝逃逸，保持 fatal——绝不切到空上下文。
     if unsafe { (*guard_ptr).from_context.is_null() } {
         // SAFETY: [Category 2 — Data races] the record is live and this is the
@@ -1164,6 +1217,20 @@ fn escape_target() -> Option<*mut EscapeGuard> {
 /// a functioning context backend because the switch resumes the Core context
 /// instead of this panic handler.
 pub fn panic_escape() -> bool {
+    // 跨 AS（Isolated）执行：恢复出口是 trampoline 的 Core 延续（`isolated::enter`
+    // 会返回 `Outcome::Faulted`，由调用方边界做清理）。组件在 Isolated AS 里
+    // panic 就是组件失败——无论有没有 EscapeGuard（create / destroy 没有 guard）。
+    // Core-critical 深度 > 0 = Core 代码在栈上：Core panic，保持 fatal。
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
+    if let Some(cross) = cross_as::active_cross_as() {
+        if core_abi_depth() > 0 {
+            return false;
+        }
+        mark_active_panicked();
+        // SAFETY: 现场仍挂起；`abandon` 永不返回本执行流。
+        unsafe { ((*cross).abandon)((*cross).context) }
+    }
+
     let Some(guard_ptr) = escape_target() else {
         return false;
     };
@@ -1171,6 +1238,17 @@ pub fn panic_escape() -> bool {
     // `switch_to_core` never returns to this frame.
     unsafe { (*guard_ptr).state.mark_panicked() };
     switch_to_core(guard_ptr)
+}
+
+/// 标记当前最内层 guard 为 panicked（若存在）。跨 AS 的 panic 恢复不经过
+/// [`escape_target`]（它会在 null-context guard 上弹链），因此单独提供。
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
+fn mark_active_panicked() {
+    if let Some(guard_ptr) = active_guard() {
+        // SAFETY: [Category 2 — Data races] single-active-CPU; the record is live
+        // and this is the only execution touching it.
+        unsafe { (*guard_ptr).state.mark_panicked() };
+    }
 }
 
 /// Renders one short panic diagnostic to a direct (lock-free) writer:
@@ -1424,11 +1502,7 @@ pub(crate) fn with_test_policy_panic<R>(f: impl FnOnce() -> R) -> R {
 /// restores the previous boundary.
 #[cfg(test)]
 pub(crate) fn test_mark_active_panicked() {
-    if let Some(guard_ptr) = active_guard() {
-        // SAFETY: [Category 2 — Data races] single active CPU / test boundary
-        // lock; the record is live and only this test mutates it.
-        unsafe { (*guard_ptr).state.mark_panicked() };
-    }
+    mark_active_panicked();
 }
 
 /// Whether the active escape record is marked panicked (test-only probe; pairs
@@ -1969,7 +2043,7 @@ mod tests {
 
     /// 验收：跨 AS（Isolated provider）service 边界与同域 service 边界同一身份
     /// 纪律（principal = provider、caller task = provenance、调度禁止、re-entry
-    /// 可见），但**不可逃逸**——guard 没有可恢复的 Core 上下文（切换由 gateway
+    /// 可见），但**不可逃逸**——guard 没有可恢复的 Core 上下文（切换由 跨 AS trampoline
     /// 负责），`escape_target` 显式拒绝，panic 保持 fatal。
     #[test]
     fn isolated_service_boundary_has_no_escapable_core_context() {
@@ -2206,5 +2280,60 @@ mod tests {
             0,
             "清除后 = 无 slot"
         );
+    }
+
+    unsafe fn test_abandon(_context: *mut u8) -> ! {
+        panic!("test context is never abandoned")
+    }
+
+    /// 跨 AS 可恢复现场是 **per-invocation + LIFO** 链：嵌套安装 / 恢复互不串扰
+    /// （未来 A→B 直接切换的前提）。
+    #[test]
+    fn cross_as_context_chain_is_per_invocation_lifo() {
+        let _boundary = test_boundary_lock();
+        let mut a = cross_as::CrossAsContext {
+            context: core::ptr::null_mut(),
+            abandon: test_abandon,
+            expected_satp: 0xA,
+            space: None,
+            token: 1,
+        };
+        let mut b = cross_as::CrossAsContext {
+            context: core::ptr::null_mut(),
+            abandon: test_abandon,
+            expected_satp: 0xB,
+            space: None,
+            token: 2,
+        };
+
+        assert!(cross_as::active_cross_as().is_none());
+        let none = cross_as::swap_cross_as(&mut a);
+        assert!(none.is_null());
+        let active = cross_as::active_cross_as().unwrap();
+        // SAFETY: 测试单线程，指针来自上面的有效记录。
+        assert_eq!(unsafe { (*active).expected_satp }, 0xA);
+        assert_eq!(unsafe { (*active).token }, 1);
+        assert!(unsafe { (*active).context.is_null() });
+        assert!(unsafe { (*active).space.is_none() });
+        assert_eq!(
+            unsafe { (*active).abandon } as usize,
+            test_abandon as *const () as usize,
+            "abandon 出口随记录走"
+        );
+
+        let previous = cross_as::swap_cross_as(&mut b);
+        assert_eq!(previous, &mut a as *mut _);
+        let active = cross_as::active_cross_as().unwrap();
+        // SAFETY: 同上。
+        assert_eq!(unsafe { (*active).expected_satp }, 0xB);
+        assert_eq!(unsafe { (*active).token }, 2);
+
+        cross_as::restore_cross_as(previous);
+        let active = cross_as::active_cross_as().unwrap();
+        // SAFETY: 同上。
+        assert_eq!(unsafe { (*active).expected_satp }, 0xA);
+
+        cross_as::restore_cross_as(none);
+        assert!(cross_as::active_cross_as().is_none());
     }
 }

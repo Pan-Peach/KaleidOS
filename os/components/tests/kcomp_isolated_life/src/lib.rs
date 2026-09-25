@@ -10,7 +10,7 @@
 //!
 //! # 与 Core 的接口（窗口协议）
 //!
-//! Core 经 gateway 把 `a0 = args`、`a1 = out_state` 交给 `kcomp_instance_create`：
+//! Core 经跨 AS trampoline 把 `a0 = args`、`a1 = out_state` 交给 `kcomp_instance_create`：
 //!
 //! ```text
 //! args     → 实例窗口基址 + 0（KcompCreateArgs：config_abi / config / config_len）
@@ -58,7 +58,7 @@ const REPORT_MAGIC: usize = 0x4C49_4645; // "LIFE"
 const DESTROY_MAGIC: usize = 0x4C49_4644; // "LIFD"
 /// 故障注入：create 见到这个 config_abi 就返回 `-EINVAL`（不写任何槽位）。
 const FAIL_ABI: u64 = 0xDEAD_BEEF;
-/// 故障注入：create 见到这个 config_abi 就执行非法指令（gateway 故障分派）。
+/// 故障注入：create 见到这个 config_abi 就执行非法指令（普通 trap 路径的故障分派）。
 const FAULT_ABI: u64 = 0xDEAD_FA11;
 /// 故障注入：create 成功，但 destroy 入口执行非法指令（destroy 故障路径）。
 const DESTROY_FAULT_ABI: u64 = 0xDEAD_DE57;

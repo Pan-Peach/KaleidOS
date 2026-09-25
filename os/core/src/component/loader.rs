@@ -153,7 +153,14 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
         }
     }
 
-    apply_relocations(&object, base, image, &seg_place, &relocations)?;
+    apply_relocations(
+        &object,
+        base,
+        image,
+        &seg_place,
+        &relocations,
+        crate::component::export::resolve,
+    )?;
 
     let create = resolve_symbol_address(&seg_place, base, create_offset)?;
     let destroy = resolve_symbol_address(&seg_place, base, destroy_offset)?;
@@ -314,12 +321,16 @@ fn place_alloc_sections(sections: &[Section]) -> Result<(usize, Vec<(usize, usiz
     Ok((put, seg_place))
 }
 
+/// 应用重定位。`resolve_import` 是**唯一**的 import 解析入口：KernelNative 传
+/// `export::resolve`（完整导出面），Isolated 传自己的支持面过滤器（见
+/// `isolated_load::resolve_import`）——绝不静默回退到裸 Core 地址。
 pub(crate) fn apply_relocations(
     object: &ElfObject<'_>,
     base: usize,
     image: &mut [u8],
     seg_place: &[(usize, usize)],
     relocations: &[ElfRelocation],
+    resolve_import: impl Fn(&[u8]) -> Option<usize>,
 ) -> Result<(), LoaderError> {
     let width = match object.class() {
         ElfClass::Bits32 => WordSize::Bits32,
@@ -336,8 +347,7 @@ pub(crate) fn apply_relocations(
             usize::try_from(symbol.value).map_err(|_| LoaderError::UnsupportedFormat)?;
         let symbol_address = if symbol.shndx == 0 {
             let name = object.symbol_name(relocation.symbol_table, symbol)?;
-            let address =
-                crate::component::export::resolve(name).ok_or(LoaderError::UnresolvedSymbol)?;
+            let address = resolve_import(name).ok_or(LoaderError::UnresolvedSymbol)?;
             ComponentRelocationImpl::normalize_symbol_address(address)
         } else {
             let section_offset = seg_place

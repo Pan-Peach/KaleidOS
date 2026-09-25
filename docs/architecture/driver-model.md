@@ -117,7 +117,7 @@ os/core/src/resource/
   dma.rs            DmaTable（allocations + mappings）；QUARANTINE
 os/core/src/memory/        MemoryLease（Core 内部 RAII）：buddy / region 分配
 os/core/src/component/{isolated.rs, isolated_load.rs, isolated_lifecycle.rs, isolated_mailbox.rs}
-                                     （受限 IsolatedNative 执行域：私有 AS + assembly gateway +
+                                     （受限 IsolatedNative 执行域：私有 AS + 跨 AS trampoline +
                                       按域放段 + Core 预置窗口/邮箱；**没有** os/core/src/execution/ 目录）
 os/core/src/component/{manager.rs, failure.rs} （manager.rs **目标**；failure.rs 现状）
 os/components/                       政策 / 服务 / 测试 Component：

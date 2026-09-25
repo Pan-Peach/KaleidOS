@@ -1,14 +1,14 @@
 //! Synchronous Core → private AS → Core round trip: register / runtime-slot
 //! discipline and the component-visible private root.
 
-/// 同步往返用例：寄存器纪律探针 → gateway → 组件 → Core 恢复。
+/// 同步往返用例：寄存器纪律探针 → trampoline → 组件 → Core 恢复。
 pub(crate) fn isolated_transition() -> ! {
     let fixture = match isolated_fixture() {
         Ok(fixture) => fixture,
         Err(reason) => fail(reason),
     };
-    // SAFETY: fixture page symbol; only used to form the entry address.
-    let entry = isolated_roundtrip_entry as *const () as usize;
+    // SAFETY: fixture page symbol → 实例私有 VA。
+    let entry = fixture_entry(isolated_roundtrip_entry as *const () as usize);
     let transition = prepare_or_fail(fixture.handle, entry, false);
     ISOLATED_INSTANCE_SATP.store(transition.satp(), Ordering::Release);
     ISOLATED_OUTCOME.store(0, Ordering::Release);
@@ -16,7 +16,7 @@ pub(crate) fn isolated_transition() -> ! {
     // SAFETY: single-threaded; the probe reads it back through the driver.
     unsafe { (*core::ptr::addr_of_mut!(ISOLATED_PENDING)).replace(transition) };
     // SAFETY: the probe sets callee-saved magic, calls the driver (which runs
-    // the gateway), then `tail`s to the resumed checker — it never returns.
+    // the trampoline), then `tail`s to the resumed checker — it never returns.
     unsafe { isolated_roundtrip_probe() };
     fail("isolated-transition: probe returned unexpectedly")
 }

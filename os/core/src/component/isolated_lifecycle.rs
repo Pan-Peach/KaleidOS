@@ -4,10 +4,10 @@
 //! create_isolated_native(name, args)                    （load.rs 的门禁之后）
 //!   ├─ isolated_image(name, blob)      ← 同域已登记则复用；否则按域放段 + 登记
 //!   │     └─ Core 验证：段 / 权限 / 入口 / abi（`isolated_load`）
-//!   ├─ registry.declare(image, IsolatedNative) → create_address_space_for(id)
+//!   ├─ registry.declare(image, IsolatedNative) → create_isolated_address_space_for(id)
 //!   ├─ map_mappings(段) + map_instance_windows()（组件栈 + 实例窗口）
 //!   ├─ resolve → begin_start；写 create args / out_state / runtime slot 进窗口
-//!   ├─ isolated::prepare(...)（Core 再验证入口 / 栈 / gateway 页）
+//!   ├─ isolated::prepare(...)（Core 再验证入口 / 栈；共享 Core 映射已落）
 //!   └─ isolated::enter(...) → Returned(0) → 提交 pending → Ready
 //!
 //! destroy（`exit.rs` 按 execution_domain 分派）
@@ -29,7 +29,7 @@
 //! # Core 验证 vs 组件提议
 //!
 //! - **Core 验证**：段规划 / 权限 / 入口 / abi（`isolated_load`）、私有 AS 能力、
-//!   生命周期状态机、入口落在可执行映射、栈被可写映射覆盖、gateway 页精确映射
+//!   生命周期状态机、入口落在可执行映射、栈被可写映射覆盖
 //!   （`isolated::prepare`）、`out_state` 由 Core 从**自己的视图**读回。
 //! - **组件提议**：`kcomp_instance_create` 返回的 opaque state（Core 只存）与其
 //!   内部行为；`kcomp_instance_destroy` 自行收尾。
@@ -282,7 +282,7 @@ mod imp {
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
 
         // (3) 私有 AS：还没有 AS 就没有可清理的，直接 Failed。
-        let handle = match address_space::create_address_space_for(id) {
+        let handle = match address_space::create_isolated_address_space_for(id) {
             Ok(handle) => handle,
             Err(error) => {
                 let error = map_space_error(error);
@@ -330,10 +330,10 @@ mod imp {
             .lock()
             .install(id, slot as *mut ());
 
-        // (7) Core 验证入口 / 栈 / gateway 映射（持锁阶段，返回后不持锁）。
-        //     先把 gateway 的组件故障分派接到 Core：**没有显式策略就是 Abandon**
-        //     （组件身份本身不是可恢复的证明），create 里的故障因此收敛成
-        //     `Outcome::Faulted` → `Failed`，而不是把 Core 打 panic。
+        // (7) Core 验证入口 / 栈（持锁阶段，返回后不持锁）。先把普通 trap 路径
+        //     的异常钩子接到 Core：**没有显式策略就是 Abandon**（组件身份本身
+        //     不是可恢复的证明），create 里的故障因此收敛成 `Outcome::Faulted`
+        //     → `Failed`，而不是把 Core 打 panic。
         isolated::install();
         let transition = match isolated::prepare(
             handle,
@@ -443,7 +443,7 @@ mod imp {
         let outcome = match load::with_current(id, || isolated::enter(transition)) {
             Outcome::Returned(0) => CallOutcome::Returned(0),
             Outcome::Returned(code) => CallOutcome::Returned(code as u32 as i32),
-            // gateway 判为不可恢复：按 destroy panic 同档（Failed + 不重试）。
+            // Core trap 路径判为不可恢复：按 destroy panic 同档（Failed + 不重试）。
             Outcome::Faulted => CallOutcome::Panicked,
         };
         // 实例已被请求停止：AS 不再可能被进入（复用 = 新建空间），一律退役。
@@ -459,11 +459,11 @@ mod imp {
     ///    超长显式拒绝（`-EMSGSIZE`），绝不截断；
     /// 2. **Core 拷贝**：caller 的 args / input → 邮箱（provider 域内 VA）、
     ///    output 区清零；
-    /// 3. **Core 验证入口 / 栈 / gateway 映射**（[`isolated::prepare`]：入口必须
-    ///    落在 R+X 映射、栈被单条 R|W 映射覆盖、gateway 页精确映射）；
+    /// 3. **Core 验证入口 / 栈**（[`isolated::prepare`]：入口必须落在可执行
+    ///    映射、栈被单条 R|W 映射覆盖）；
     /// 4. **边界 + 进入**：[`containment::with_isolated_service_boundary`] 装上
     ///    provider principal / caller-task provenance / re-entry / 调度门禁，然后
-    ///    [`isolated::enter`] 把组件切进它自己的 AS；组件故障由 gateway 的 trap
+    ///    [`isolated::enter`] 把组件切进它自己的 AS；组件故障由**普通** trap
     ///    路径收敛（无显式策略 = `Abandon`）；
     /// 5. **Core 拷回**：provider 写的 output 区 → caller 的 `output` 缓冲（长度 =
     ///    caller 声明的 `output_len`）；provider 返回值 = **方法状态**写
@@ -518,8 +518,8 @@ mod imp {
                 // `check_frame` 已通过：这里不可达（防御：按 provider 失败收尾）。
                 Err(_) => return Err(fail_provider(provider, Some(handle))),
             };
-        // (4) Core 验证入口 / 栈 / gateway 映射（锁内；返回后不持锁）。组件故障
-        //     交给 Core 的窄分派：**没有显式策略就是 Abandon**。
+        // (4) Core 验证入口 / 栈（锁内；返回后不持锁）。组件故障交给普通 trap
+        //     路径的异常钩子：**没有显式策略就是 Abandon**。
         isolated::install();
         let transition = match isolated::prepare(
             handle,

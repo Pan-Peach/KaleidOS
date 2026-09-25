@@ -16,7 +16,7 @@
 - `KernelAllocator`（Core 内部 `GlobalAlloc`，接 Core 内部对象堆，仅 Core 使用；面向组件的内存面是 `kcore_memory_acquire/release`（域视图），**不引入 Core 侧账本**，见 `docs/architecture/memory-and-heap.md`）。
 - 常量：`ALLOC_GRANULE = 4096`（物理分配粒度）、`HEAP_ORDER = 32`、`HEAP_MIN_ORDER = 12`。
 - `MemoryLease`、`MemoryError`。
-- `address_space`：`KernelAddressSpace<B>`、`AddressSpaceManager<B>`、`AddressSpaceId`、`AddressSpaceHandle`、`AddressSpaceState`（`Ready` / `Retired`）、`Mapping`、`MapError`、`IsolatedPrepareError`、`PreparedActivation`（Core 内激活描述符，不经任何 `kcore_*` 导出）、`DualMappedPage`（re-export，同 VA → 同 PA 的机制页）；生命周期 API：`map` / `unmap` / `mapping_exact`（精确区间查询）/ `translate` / `prepare_activation` / `prepare_transition`（私有 AS 切换准备——校验入口 / 栈 + 落 gateway 机制页 + 取描述符）/ `retire` / `adopt`（接管既有 backend 的 hook；boot root 尚未接线）；并重导出 `arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange}`。
+- `address_space`：`KernelAddressSpace<B>`、`AddressSpaceManager<B>`、`AddressSpaceId`、`AddressSpaceHandle`、`AddressSpaceState`（`Ready` / `Retired`）、`Mapping`、`MapError`、`IsolatedPrepareError`、`PreparedActivation`（Core 内激活描述符，不经任何 `kcore_*` 导出）、`kernel_mappings`（共享 Core 映射计划 + 私有 backing 别名排除）；生命周期 API：`map` / `unmap` / `mapping_exact`（精确区间查询）/ `translate` / `prepare_activation` / `prepare_transition`（私有 AS 切换准备——校验入口 / 栈 + 落 激活准备 + 取描述符）/ `retire` / `adopt`（接管既有 backend 的 hook；boot root 尚未接线）；并重导出 `arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange}`。
 
 ## 明确不做
 
@@ -24,7 +24,7 @@
 - 不做内存记账：无 region owner 记录、无 region id、无 Retired 表，也不做 per-instance 字节计费 / 配额（`D1` 已修订；见 `docs/architecture/memory-and-heap.md`）。per-instance `HeapState` 是 runtime 的事，不是 Core 记账。
 - `alloc_region` **不负责清零**。
 - `ALLOC_GRANULE` 与 `AddressSpaceBackend::GRANULE` 语义解耦（数值同为 4 KiB 只是巧合）。
-- `AddressSpaceManager` **没有组件可达的执行路径**：全局表只被 Core 的 Isolated 生命周期使用（`component/isolated_lifecycle.rs` 为实例建私有 AS、落按域镜像与 Core 预置窗口；门禁仍拒绝含 import 的组件，`kcore_address_space_map` 刻意不在导出白名单）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`prepare_transition` + assembly gateway 与 `component/isolated_load.rs` 的按域放段 / 逐段映射由 `isolated_lifecycle.rs` 生产消费（create / destroy / service dispatch，含 Core 预置窗口与**服务邮箱** backing）；ArchTest 另直接驱动机制用例（`isolated-transition*` / `isolated-image*` / `isolated-lifecycle*` / `isolated-service*`）。失败 / 重启矩阵（`isolated-load-reject` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-stale-access` / `isolated-ready-fault` / `isolated-restart`）把窗口生命周期钉成两条路径：create / service 故障归还 backing，destroy 路径只退役 AS（窗口驻留）。
+- `AddressSpaceManager` **没有组件可达的执行路径**：全局表只被 Core 的 Isolated 生命周期使用（`component/isolated_lifecycle.rs` 为实例建私有 AS、落按域镜像与 Core 预置窗口；门禁仍拒绝含 import 的组件，`kcore_address_space_map` 刻意不在导出白名单）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`prepare_transition` + 最小跨 AS trampoline 与 `component/isolated_load.rs` 的按域放段 / 逐段映射由 `isolated_lifecycle.rs` 生产消费（create / destroy / service dispatch，含 Core 预置窗口与**服务邮箱** backing）；ArchTest 另直接驱动机制用例（`isolated-transition*` / `isolated-image*` / `isolated-lifecycle*` / `isolated-service*`）。失败 / 重启矩阵（`isolated-load-reject` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-stale-access` / `isolated-ready-fault` / `isolated-restart`）把窗口生命周期钉成两条路径：create / service 故障归还 backing，destroy 路径只退役 AS（窗口驻留）。
 
 ## 代码在哪
 

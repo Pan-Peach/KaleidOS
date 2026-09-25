@@ -188,6 +188,22 @@ pub fn trap_stack_top() -> usize {
     trap_stack_range().1 & !(STACK_ALIGNMENT - 1)
 }
 
+/// 重新装入 trap 栈约定（`sscratch` = 安全栈顶）。
+///
+/// 放弃路径（`trampoline_return` 不 `sret`）必须显式恢复该约定：外层 trap
+/// 已被放弃，不会再由 trap 出口恢复它。
+#[cfg(all(feature = "supervisor", not(feature = "machine")))]
+pub fn install_scratch_convention() {
+    let top = trap_stack_top();
+    // SAFETY: 只写 CSR；无内存 / 栈副作用。
+    unsafe {
+        core::arch::asm!("csrw sscratch, {top}",
+            top = in(reg) top,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// cause 寄存器解码（`Scause` 名称沿用 S-mode；M-mode 下语义相同，
 /// 只是中断位位置与寄存器名不同，由 `machine` 模块自行读取）。
 pub(crate) struct Scause(usize);

@@ -6,7 +6,7 @@
 //
 // 夹具 `kcomp_isolated_life` 经 `load::create_component(..., IsolatedNative)`
 // 创建：私有 AS + 按域镜像 + Core 预置窗口（栈 / 实例窗口）由 Core 建立，
-// `kcomp_instance_create` 经 assembly gateway 在私有 AS 里执行；组件把
+// `kcomp_instance_create` 经 跨 AS trampoline 在私有 AS 里执行；组件把
 // 观察值写进自己的实例窗口，ArchTest 从 Core 视图读回并断言。destroy 同理。
 // -----------------------------------------------------------------------
 
@@ -176,10 +176,11 @@ pub(crate) fn isolated_lifecycle() -> ! {
 
     // (d) 窗口只属于本实例：另一个 AS 不映射这个 VA，窗口 VA 也不在 Core 的
     //     恒等映射 RAM 窗口里（Core AS 看不到它）。
-    let other = match address_space::create_address_space_for(ComponentId::from_raw(0x1A5E)) {
-        Ok(other) => other,
-        Err(_) => fail("isolated-lifecycle: second address space creation failed"),
-    };
+    let other =
+        match address_space::create_isolated_address_space_for(ComponentId::from_raw(0x1A5E)) {
+            Ok(other) => other,
+            Err(_) => fail("isolated-lifecycle: second address space creation failed"),
+        };
     if !matches!(address_space::translate(other, window.base), Ok(None)) {
         fail("isolated-lifecycle: instance window is reachable from another AS");
     }
@@ -344,7 +345,10 @@ pub(crate) fn kernel_native_still_works() -> bool {
                 .map(|record| record.state)
                 == Some(ComponentState::Ready)
         }
-        Err(_) => false,
+        Err(error) => {
+            kernel::log!("selftest", "kernel_native_still_works: {:?}", error);
+            false
+        }
     }
 }
 
@@ -400,7 +404,7 @@ pub(crate) fn isolated_lifecycle_fail() -> ! {
     pass("isolated-lifecycle-fail")
 }
 
-/// 失败路径（create 在私有 AS 里故障）：gateway 故障分派判不可恢复
+/// 失败路径（create 在私有 AS 里故障）：普通 trap 路径的故障分派判不可恢复
 /// （`Outcome::Faulted`）→ `CreateFaulted` + 同一套清理，绝不把 Core 打 panic。
 pub(crate) fn isolated_lifecycle_fault() -> ! {
     use kernel::component::containment::KcompCreateArgs;

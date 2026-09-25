@@ -11,7 +11,7 @@
 //! PlacedImage（段清单 + 入口 + backing region）
 //!   │  map_into / map_mappings：逐段 VA → backing PA 落进实例 AS（失败回滚本次已落段）
 //!   ▼
-//! 实例 AS 里可经 gateway 进入的镜像（由 `isolated_lifecycle` 调用）
+//! 实例 AS 里可经跨 AS trampoline 进入的镜像（由 `isolated_lifecycle` 调用）
 //! ```
 //!
 //! # 与 KernelNative loader 的关系
@@ -50,7 +50,7 @@
 //!
 //! `kcomp_service_dispatch` 是**可选**的 image 级入口：定义了它的镜像会得到一个
 //! **实例域内**的 dispatcher VA（[`PlacedImage::service_dispatch`]），供
-//! `isolated_lifecycle` 经 gateway 在私有 AS 里调用；与 create / destroy 同一
+//! `isolated_lifecycle` 经跨 AS trampoline 在私有 AS 里调用；与 create / destroy 同一
 //! 纪律（必须落在一条 `READ|EXECUTE` 段内）。它**不是** import——组件仍然只能
 //! 调用自己镜像内的代码。
 //!
@@ -95,7 +95,7 @@ const _: () = assert!(
 
 /// 私有域镜像的默认 VA 窗口（Core 策略：per-domain loader 的地址预算）。
 ///
-/// 0x2000_0000 起 16 MiB：与 gateway 机制页（Core 镜像 VA）、ArchTest 的控制页
+/// 0x2000_0000 起 16 MiB：与 Core 镜像 VA、ArchTest 的控制页
 /// / 栈（0x3000_0000 起）、KernelNative 的 shared-AS 区域都不重叠。
 pub const ISOLATED_IMAGE_WINDOW: VirtualRange = VirtualRange {
     base: 0x2000_0000,
@@ -233,7 +233,7 @@ impl PlacedImage {
     /// 转成 image 表登记所需的 [`LoadedComponent`]（lease 随本次转换归 image 表）。
     ///
     /// Isolated image 的 `create` / `destroy` / `service_dispatch` 都是**实例 AS
-    /// 内**的 VA（供 `component/isolated_lifecycle.rs` 经 gateway 调用）。
+    /// 内**的 VA（供 `component/isolated_lifecycle.rs` 经跨 AS trampoline 调用）。
     pub fn into_loaded_component(self) -> LoadedComponent {
         LoadedComponent {
             base: self.base,
@@ -264,7 +264,7 @@ pub fn place_artifact(name: &[u8]) -> Result<PlacedImage, IsolatedLoadError> {
 
 /// 把已放段的镜像逐段落进实例 AS（失败即回滚本次已落段，不留半套镜像）。
 ///
-/// 本函数**不**做 gateway 页映射（那是 `component::isolated::prepare` 的职责），
+/// 本函数**不**做激活准备（那是 `component::isolated::prepare` 的职责），
 /// 也不触碰任何生命周期路径——调用方负责持有句柄与后续的 `prepare` / `enter`。
 pub fn map_into(handle: AddressSpaceHandle, image: &PlacedImage) -> Result<(), IsolatedLoadError> {
     map_mappings(handle, &image.mappings())
@@ -299,6 +299,44 @@ pub fn map_mappings(
     Ok(())
 }
 
+/// Isolated 组件允许的 import 白名单（**唯一**的支持面）。
+///
+/// 只放**诊断 / 只读查询**与 `kcore_panic_escape`：Isolated 组件保持 S-mode，
+/// 直接调用 Core 代码（共享 Core 映射，`satp` 不切换）。内存 acquire/release、
+/// 调度入口、组件创建、设备 / DMA / IRQ 获取等**仍然显式拒绝**——它们需要
+/// Core 侧的所有权 / 生命周期裁决，不在本阶段的支持面内。
+///
+/// 任何不在白名单里的具名 UNDEF 符号都在装载前**显式拒绝**——绝不回退到裸
+/// Core 地址，也绝不静默忽略。
+pub const SUPPORTED_IMPORTS: &[&[u8]] = &[
+    b"kcore_log_line",
+    b"kcore_console_write_byte",
+    b"kcore_now",
+    b"kcore_timebase_hz",
+    b"kcore_machine_boot_hart",
+    b"kcore_machine_cpu_count",
+    b"kcore_machine_has_hart",
+    b"kcore_free_page_count",
+    b"kcore_task_count",
+    b"kcore_component_count",
+    b"kcore_panic_escape",
+];
+
+/// 该 UNDEF 符号是否是本阶段支持解析的 import（唯一判据）。
+pub fn import_supported(name: &[u8]) -> bool {
+    SUPPORTED_IMPORTS.contains(&name)
+}
+
+/// Isolated import 解析：只解析支持面内的符号，地址 = Core 导出地址（重定位时
+/// 归一化到低别名；共享 identity RAM 在每个 Isolated AS 里都映射它，因此
+/// `satp` 不切换、CALL 的 ±2 GiB 可达）。
+fn resolve_import(name: &[u8]) -> Option<usize> {
+    if !import_supported(name) {
+        return None;
+    }
+    crate::component::export::resolve(name)
+}
+
 /// 解析 + 校验 + 按域放段（host-testable 的纯逻辑 + 一次 backing 分配）。
 fn place_at(
     blob: &[u8],
@@ -309,7 +347,7 @@ fn place_at(
     if object.machine() != ComponentRelocationImpl::ELF_MACHINE {
         return Err(IsolatedLoadError::MachineMismatch);
     }
-    check_empty_imports(&object)?;
+    check_supported_imports(&object)?;
 
     let symbol_table = object.symbol_table_index().map_err(elf_error)?;
     let service_dispatch =
@@ -372,8 +410,15 @@ fn place_at(
     }
 
     // 同一份 RISC-V 重定位实现，只换 base / 段偏移（按域重算，绝不复用 Native 结果）。
-    loader::apply_relocations(&object, base, image, &seg_place, &relocations)
-        .map_err(IsolatedLoadError::Loader)?;
+    loader::apply_relocations(
+        &object,
+        base,
+        image,
+        &seg_place,
+        &relocations,
+        resolve_import,
+    )
+    .map_err(IsolatedLoadError::Loader)?;
 
     let create = loader::resolve_symbol_address(&seg_place, base, create_symbol)
         .map_err(IsolatedLoadError::Loader)?;
@@ -406,10 +451,10 @@ fn place_at(
     })
 }
 
-/// 扫描符号表：**任何具名 UNDEF 符号**都是 import（空集包络）。
+/// 扫描符号表：每个具名 UNDEF 符号都必须命中 [`SUPPORTED_IMPORTS`]。
 ///
 /// 索引 0 是 ELF 规定的 NULL 符号（UNDEF、无名），不算 import。
-fn check_empty_imports(object: &ElfObject<'_>) -> Result<(), IsolatedLoadError> {
+fn check_supported_imports(object: &ElfObject<'_>) -> Result<(), IsolatedLoadError> {
     let symbol_table = object.symbol_table_index().map_err(elf_error)?;
     let count = object.symbol_count(symbol_table).map_err(elf_error)?;
     for index in 1..count {
@@ -420,7 +465,7 @@ fn check_empty_imports(object: &ElfObject<'_>) -> Result<(), IsolatedLoadError> 
         let name = object
             .symbol_name(symbol_table, symbol)
             .map_err(elf_error)?;
-        if !name.is_empty() {
+        if !name.is_empty() && !import_supported(name) {
             return Err(IsolatedLoadError::ImportsUnsupported);
         }
     }
@@ -601,7 +646,11 @@ mod tests {
 
     const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
     const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
-    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
+    /// 支持面之外的 import 夹具（`kcore_memory_acquire`）。
+    const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/kcomp_isolated_unsupported.kcomp"
+    ));
     /// 放段失败夹具（17 MiB `.bss` 超出实例窗口）。
     const BAD_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_bad.kcomp"));
 
@@ -748,16 +797,50 @@ mod tests {
         assert_eq!(shifted.destroy(), first.destroy() + SHIFT);
     }
 
-    /// import 包络 = 空集：真实带 `kcore_*` import 的组件在装载前拒绝。
+    /// 支持面之外的 import 在装载前拒绝。
     #[test]
-    fn rejects_nonempty_imports() {
+    fn rejects_unsupported_imports() {
         let _guard = test_support::GUARD.lock();
         test_support::ensure_init();
         assert_eq!(
-            place(SMOKE_KCOMP),
+            place(UNSUPPORTED_KCOMP),
             Err(IsolatedLoadError::ImportsUnsupported),
-            "kcomp_smoke 的 kcore_* import 必须被按域装载拒绝"
+            "kcore_memory_acquire 必须被按域装载拒绝"
         );
+    }
+
+    /// 支持面过滤是纯逻辑（host-testable）；真实 `.kcomp` 的**端到端直接调用**
+    /// 由 QEMU ArchTest `isolated-direct-imports`（RV64 + RV32）证明——host 上
+    /// Core 导出地址是宿主指针，CALL 的 ±2 GiB 重定位范围不成立，因此这里只钉
+    /// 过滤面（绝不把宿主地址当成可解析目标）。
+    #[test]
+    fn supported_import_surface_is_narrow_and_explicit() {
+        for name in [
+            b"kcore_log_line".as_slice(),
+            b"kcore_console_write_byte",
+            b"kcore_now",
+            b"kcore_timebase_hz",
+            b"kcore_machine_boot_hart",
+            b"kcore_machine_cpu_count",
+            b"kcore_machine_has_hart",
+            b"kcore_free_page_count",
+            b"kcore_task_count",
+            b"kcore_component_count",
+            b"kcore_panic_escape",
+        ] {
+            assert!(import_supported(name), "{name:?} must be supported");
+        }
+        for name in [
+            b"kcore_memory_acquire".as_slice(),
+            b"kcore_memory_release",
+            b"kcore_sched_run",
+            b"kcore_component_create",
+            b"kcore_device_claim",
+            b"kcore_dma_alloc",
+            b"kcore_irq_register",
+        ] {
+            assert!(!import_supported(name), "{name:?} must be rejected");
+        }
     }
 
     /// 服务入口必须落在 **R+X** 段内：把 dispatcher 的符号段改成非可执行段 →

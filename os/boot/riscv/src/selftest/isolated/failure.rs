@@ -48,14 +48,18 @@ pub(crate) fn isolated_load_reject() -> ! {
         fail_case("isolated-load-reject", "placement rejection errno mismatch");
     }
 
-    // (b) import 包络 = 空集：真实组件的 `kcore_*` import 在装载前拒绝。
+    // (b) import 只支持诊断 / 只读查询 + panic escape：支持面之外的
+    // `kcore_memory_acquire` 在装载前显式拒绝。
     let error = match load::create_component(
-        b"kcomp_smoke",
+        b"kcomp_isolated_unsupported",
         &KcompCreateArgs::empty(),
         ExecutionDomain::IsolatedNative,
     ) {
         Err(error) => error,
-        Ok(_) => fail_case("isolated-load-reject", "kcore import artifact was accepted"),
+        Ok(_) => fail_case(
+            "isolated-load-reject",
+            "unsupported import artifact was accepted",
+        ),
     };
     if error != ComponentLoadError::IsolatedImportUnsupported {
         kernel::log!(
@@ -65,7 +69,7 @@ pub(crate) fn isolated_load_reject() -> ! {
         );
         fail_case(
             "isolated-load-reject",
-            "kcore import was not rejected before loading",
+            "unsupported import was not rejected before loading",
         );
     }
     if Errno::from(error) != Errno::ENOTSUP {

@@ -10,6 +10,8 @@
 .equ CTL_FLAG,  8
 .equ CTL_ITER,  12
 .equ CTL_DATA,  16
+# B 实例（嵌套 AS 用例）的控制页 VA。
+.equ NESTED_B_CTL_VA, 0x30004000
 
 .section .text.isolated_fixture,"ax"
 .balign 4096
@@ -86,6 +88,12 @@ isolated_abandon_entry:
     ret
 
 
+.global isolated_fixture_end
+isolated_fixture_end:
+# 页独占：对齐 + 显式多占一整页（`.balign` 不改段大小），保证首页只有夹具代码。
+.balign 4096
+.space 4096
+
 # ---------------------------------------------------------------------------
 # core-direct：Core 代码在实例 AS 里被**直接调用**（无 satp 切换）——组件调用
 # Core Rust 探针，探针记录 satp / sp / Core static 并把 marker 返回。
@@ -98,19 +106,61 @@ isolated_core_direct_entry:
     sw t1, CTL_MAGIC(t0)
     csrr t2, satp
     sw t2, CTL_SATP(t0)
-    mv s0, ra                  # preserve the gateway return address across the Core call
+    addi sp, sp, -16           # preserve the trampoline return address without touching s0
+    sw ra, 0(sp)
     call selftest_core_direct_probe
-    mv ra, s0
+    lw ra, 0(sp)
+    addi sp, sp, 16
     li t0, CTL_VA
     sw a0, CTL_DATA(t0)
     li a0, 0x5d
     ret
 
-.global isolated_fixture_end
-isolated_fixture_end:
-# 页独占：对齐 + 显式多占一整页（`.balign` 不改段大小），保证首页只有夹具代码。
-.balign 4096
-.space 4096
+
+# ---------------------------------------------------------------------------
+# 嵌套 AS（Core/AS_A → AS_B → AS_A）：A 的入口在 AS_A 里直接调用 Core helper
+# （共享 Core 映射），helper 内再 `isolated::enter(B)`；B 返回 / 被放弃后 satp
+# 必须回到 AS_A、Core 现场有效，A 正常返回。
+# ---------------------------------------------------------------------------
+.align 2
+.global isolated_nested_a_entry
+isolated_nested_a_entry:
+    li t0, CTL_VA
+    csrr t1, satp
+    sw t1, CTL_SATP(t0)          # A 观察到的 root
+    # Core dispatch 跑在**共享 Core 边界栈**上（跨 AS 现场必须能被 B 的 trap
+    # 处理器读到；A 的组件栈在 AS_B 里不可达）。
+    mv s1, ra
+    mv s2, sp
+    la t3, NESTED_CORE_STACK_TOP
+    lw t3, 0(t3)
+    mv sp, t3
+    call selftest_nested_enter_b   # Core helper：在 AS_A 里进入 AS_B
+    mv sp, s2
+    mv ra, s1
+    li t0, CTL_VA
+    sw a0, CTL_DATA(t0)          # 0 = B 正常返回，1 = B 被放弃
+    csrr t1, satp
+    sw t1, CTL_FLAG(t0)          # 嵌套返回后的 satp（必须仍是 AS_A）
+    li a0, 0x5e
+    ret
+
+.align 2
+.global isolated_nested_b_entry
+isolated_nested_b_entry:
+    li t0, NESTED_B_CTL_VA
+    csrr t1, satp
+    sw t1, CTL_SATP(t0)          # B 观察到的 root
+    li t1, 0x5f5f
+    sw t1, CTL_MAGIC(t0)
+    li a0, 0x5f
+    ret
+
+.align 2
+.global isolated_nested_b_fault_entry
+isolated_nested_b_fault_entry:
+    li t0, 0x50000000
+    jr t0                          # 未映射取指：B 被 Core 放弃
 
 # ---------------------------------------------------------------------------
 # 同步往返的寄存器纪律探针（核心 AS；Core 代码）

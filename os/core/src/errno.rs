@@ -189,9 +189,9 @@ impl From<ComponentLoadError> for Errno {
             // 按域放段失败 / config 负载不合规：镜像 / 请求不适配该域（EINVAL）。
             ComponentLoadError::IsolatedPlacementFailed
             | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
-            // 组件在私有 AS 内故障（gateway 放弃）：与其它组件失败同档。
+            // 组件在私有 AS 内故障（Core 放弃实例）：与其它组件失败同档。
             ComponentLoadError::CreateFaulted => Errno::EIO,
-            // provider 在跨 AS service 边界内故障（gateway 放弃）：与 panic 同档。
+            // provider 在跨 AS service 边界内故障（Core 放弃实例）：与 panic 同档。
             ComponentLoadError::ServiceFaulted => Errno::EIO,
         }
     }

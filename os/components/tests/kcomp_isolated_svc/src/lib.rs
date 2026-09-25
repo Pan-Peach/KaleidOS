@@ -28,7 +28,7 @@
 //! 与邮箱（Core 拥有的另一个页）都在本实例的私有 AS 里，Core 从自己的 backing
 //! 视图读回并断言。
 //!
-//! service dispatch（Core 经 gateway 交付 `a0..a3`）：
+//! service dispatch（Core 经跨 AS trampoline 交付 `a0..a3`）：
 //!
 //! ```text
 //! a0 = instance_state（= 上报区地址，本组件自己写的）
@@ -47,7 +47,7 @@
 //!
 //! `method == METHOD_FAULT` 时：把 args 的前 `usize` 字节当作目标地址
 //! `read_volatile` ——ArchTest 传的是 **caller 域内**的地址，在私有 AS 里必然
-//! 缺页（scause 13）。Core 的 gateway 故障分派把它收敛成 `Outcome::Faulted`
+//! 缺页（scause 13）。Core 的 普通 trap 路径的故障分派把它收敛成 `Outcome::Faulted`
 //! （provider 逻辑死亡 + 清理），caller 拿到类型化错误。若访问**没有** fault
 //! （机制失效），dispatcher 记录读到的值并返回 `STATUS_FAULT_NOT_TAKEN`，让
 //! ArchTest 显式失败。
@@ -202,7 +202,9 @@ pub extern "C" fn kcomp_service_dispatch(
         slots.add(R_STATE).write_volatile(state as usize);
         slots.add(R_PORT).write_volatile(port as usize);
         slots.add(R_METHOD).write_volatile(method as usize);
-        slots.add(R_FRAME).write_volatile(frame as *const CallFrame as usize);
+        slots
+            .add(R_FRAME)
+            .write_volatile(frame as *const CallFrame as usize);
         slots.add(R_ARGS).write_volatile(frame.args as usize);
         slots.add(R_ARGS_LEN).write_volatile(frame.args_len);
         slots.add(R_INPUT).write_volatile(frame.input as usize);
@@ -277,7 +279,7 @@ pub static kcomp_abi: u64 = 0x4B43_4F4D_5041_4249;
 
 /// 组件私有 panic handler：本夹具没有 panic 源，存在只为满足链接前提，且
 /// **刻意不引 `kcore_*`**（空 import 包络）。panic = 自旋（Isolated 组件没有
-/// panic-escape import 面；故障 containment 走 gateway 的 trap 路径）。
+/// panic-escape import 面；故障 containment 走 普通 Core trap 路径）。
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop {

@@ -1,0 +1,16 @@
+[package]
+name = "kcomp_isolated_direct"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# Isolated **直接 import** ArchTest 夹具：真实 `.kcomp`，只 import Isolated 支持面
+# 内的诊断 / 只读查询与 `kcore_panic_escape`（直接调用 Core，satp 不切换）。
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk", default-features = false }

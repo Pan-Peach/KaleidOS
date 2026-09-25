@@ -1,0 +1,16 @@
+[package]
+name = "kcomp_isolated_unsupported"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 组件是独立编译单元：不加入 workspace（它们的 Cargo 依赖图 ≠ 运行时组件图）。
+[workspace]
+
+# Isolated import 拒绝 ArchTest 夹具：import 明确不在支持面内的 Core 操作
+# （`kcore_memory_acquire`）——装载前必须被显式拒绝，绝不静默执行。
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk", default-features = false }

@@ -25,7 +25,7 @@
 //!
 //! - **执行上下文**：KernelNative 的 destroy 跑在 Core-owned 临时栈上（与 create
 //!   对称，见 [`containment::call_component_destroy`]）；Isolated 的 destroy 跑在
-//!   该实例的私有 AS 内经 assembly gateway（`isolated_lifecycle::destroy`），两者
+//!   该实例的私有 AS 内经 跨 AS trampoline（`isolated_lifecycle::destroy`），两者
 //!   按 `InstanceRecord::execution_domain` 分派，**绝不静默互换**。
 //! - **身份**：入口的 ambient identity = **被停止的实例**（`EscapeKind::Exit`），
 //!   不是发起 stop 的 monitor / 其他组件，也不是 `load::current_component()`。
@@ -109,9 +109,9 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
 
     // 步骤 2：必需销毁入口。参数 = 实例在 create 时记录的 opaque state
     // （可为 NULL，无状态组件合法）。身份 = 被停止实例：KernelNative 走
-    // containment 的 Exit 边界；Isolated 由 gateway 进入前的 CURRENT + AS owner 承载。
+    // containment 的 Exit 边界；Isolated 由 跨 AS trampoline 进入前的 CURRENT + AS owner 承载。
     // **按执行域分派**：KernelNative 在 Core 拥有的共享 AS 栈上调用；Isolated 在
-    // 该实例的私有 AS 内经 assembly gateway 调用（两者都绝不静默互换）。
+    // 该实例的私有 AS 内经 跨 AS trampoline 调用（两者都绝不静默互换）。
     let (image_id, instance_state, domain) = {
         let reg = registry::get_registry().lock();
         let record = reg.get(id).expect("begin_stop 后实例必然存在");

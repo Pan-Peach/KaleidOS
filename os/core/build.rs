@@ -83,6 +83,11 @@ fn main() {
         ("kcomp_isolated_life", "tests/kcomp_isolated_life"),
         ("kcomp_isolated_svc", "tests/kcomp_isolated_svc"),
         ("kcomp_isolated_bad", "tests/kcomp_isolated_bad"),
+        ("kcomp_isolated_direct", "tests/kcomp_isolated_direct"),
+        (
+            "kcomp_isolated_unsupported",
+            "tests/kcomp_isolated_unsupported",
+        ),
     ];
     let mut objects = Vec::new();
     for (name, path) in components {

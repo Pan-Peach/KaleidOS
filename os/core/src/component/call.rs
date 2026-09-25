@@ -17,7 +17,7 @@
 //!   AS），provider 得到邮箱内的实例域 VA，output 由 Core 拷回 caller 缓冲；容量
 //!   固定，超长显式 [`CallError::FrameTooLarge`]（`EMSGSIZE`），**绝不截断**。
 //!   执行边界同形（provider principal / caller-task provenance / re-entry / 调度
-//!   门禁），真正的切换是 assembly gateway 的 `satp`；provider trap →
+//!   门禁），真正的切换是跨 AS trampoline 的 `satp`；provider trap →
 //!   `Outcome::Faulted` → provider 逻辑死亡 + AS 退役 + 窗口归还。
 //! - **Sandboxed provider** → 显式拒绝（[`CallError::UnsupportedProviderDomain`]）；
 //!   **Isolated caller** → [`CallError::UnsupportedCallerDomain`]；**绝不静默降级**。
@@ -330,7 +330,7 @@ fn dispatch(
             );
             complete_call(target.provider, outcome, out_status)
         }
-        // 跨 AS：provider 在自己的私有 AS 里经 assembly gateway 执行；帧被拷贝进
+        // 跨 AS：provider 在自己的私有 AS 里经跨 AS trampoline 执行；帧被拷贝进
         // Core 拥有的邮箱，绝不共享。
         ExecutionDomain::IsolatedNative => isolated_lifecycle::dispatch_service(
             target.provider,
@@ -1410,7 +1410,7 @@ mod tests {
     /// host / 无 backend 构建显式拒绝（`UnsupportedProviderDomain` → ENOTSUP），
     /// **绝不**在共享内核 AS 里替它执行 dispatcher，也不泄漏 inflight / out_status。
     ///
-    /// 真实的跨 AS 执行（邮箱拷贝 + gateway + 故障 containment）由 QEMU ArchTest
+    /// 真实的跨 AS 执行（邮箱拷贝 + trampoline + 故障 containment）由 QEMU ArchTest
     /// `isolated-service*` 用真实 `.kcomp` 证明。
     #[test]
     fn isolated_provider_is_rejected_on_a_build_without_a_private_address_space() {

@@ -30,7 +30,7 @@
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
 
 > **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
-> （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 双映射 assembly gateway + 按域放段 +
+> （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 最小跨 AS trampoline（共享 Core 映射） + 按域放段 +
 > Core 预置窗口 / 邮箱 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
 > 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 按域 import 解析仍未实现**，边界是
 > 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。

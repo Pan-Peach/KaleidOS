@@ -101,10 +101,10 @@ pub enum ComponentLoadError {
     /// `IsolatedNative` 的 config 负载放不进实例窗口（或指针 / 长度不自洽）：
     /// 显式拒绝，绝不截断。
     IsolatedConfigRejected,
-    /// Isolated 的 `kcomp_instance_create` 在私有 AS 内故障，由 gateway 的 Core
+    /// Isolated 的 `kcomp_instance_create` 在私有 AS 内故障，由 Core 的
     /// 故障分派判为不可恢复（`Outcome::Faulted`）；实例未完整构造、不调用 destroy。
     CreateFaulted,
-    /// Isolated provider 在**跨 AS service dispatch** 期间故障，由 gateway 的 Core
+    /// Isolated provider 在**跨 AS service dispatch** 期间故障，由 Core 的
     /// 故障分派判为不可恢复（`Outcome::Faulted`）：provider 逻辑死亡 + AS 退役 +
     /// Core 预置窗口归还，caller 存活。
     ServiceFaulted,
@@ -192,7 +192,7 @@ pub fn create_component(
     match kind {
         ExecutionDomain::KernelNative => create_kernel_native(name, args),
         // Isolated 有真实执行器：`create_isolated_native` 建私有 AS、放置镜像，
-        // 再经 gateway 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
+        // 再经跨 AS trampoline 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
         // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
         ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
@@ -312,7 +312,7 @@ fn create_kernel_native(
 ///    （见 [`validate_isolated_load`]）；
 /// 3. 私有 AS + 按域放段（复用已登记 Isolated 放段结果时只映射同一份 backing）
 ///    + Core 预置窗口（栈 / 实例窗口 / 邮箱）；
-/// 4. `kcomp_instance_create` 在私有 AS 内经 assembly gateway 执行 → `Ready`；
+/// 4. `kcomp_instance_create` 在私有 AS 内经跨 AS trampoline 执行 → `Ready`；
 ///    任一步失败 = 退役 AS + 归还窗口 backing + `Failed`（半成品不留）。
 fn create_isolated_native(
     name: &[u8],
@@ -383,8 +383,9 @@ fn check_isolated_reuse(
     Ok(())
 }
 
-/// 扫描 ELF 符号表：任一 **UNDEF**（`shndx == 0`）的 `kcore_*` 符号都是未支持的
-/// Isolated import（见 [`validate_isolated_load`]）。
+/// 扫描 ELF 符号表：任一具名 UNDEF 都必须命中 Isolated 的**唯一**支持白名单
+/// （[`crate::component::isolated_load::import_supported`]）——不支持即显式拒绝，
+/// 绝不回退到裸 Core 地址。
 fn check_isolated_imports(blob: &[u8]) -> Result<(), ComponentLoadError> {
     let object =
         ElfObject::parse(blob).map_err(|error| ComponentLoadError::Loader(error.into()))?;
@@ -404,18 +405,11 @@ fn check_isolated_imports(blob: &[u8]) -> Result<(), ComponentLoadError> {
         let name = object
             .symbol_name(symbol_table, symbol)
             .map_err(|error| ComponentLoadError::Loader(error.into()))?;
-        if is_kcore_import(name) {
+        if !name.is_empty() && !crate::component::isolated_load::import_supported(name) {
             return Err(ComponentLoadError::IsolatedImportUnsupported);
         }
     }
     Ok(())
-}
-
-/// 该符号名是否属于 `kcore_*` 导出面（即 loader 在 KernelNative 下会重定位到
-/// **裸 Core 地址**的那一类）。非 `kcore_*` 的 UNDEF 不在本包络内：它们本来就
-/// 无法解析，由 loader 自己以 `UnresolvedSymbol` 拒绝。
-fn is_kcore_import(name: &[u8]) -> bool {
-    name.starts_with(b"kcore_")
 }
 
 /// KernelNative 的 image 获取（复用或装载）。
@@ -602,7 +596,11 @@ mod tests {
     // -- Isolated 部署的显式拒绝包络 --------------------------------------------
 
     /// 真实 `.kcomp` fixture（与 loader 用例同一份构建产物）。
-    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
+    /// 明确不在 Isolated 支持面内的 import（`kcore_memory_acquire`）。
+    const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/kcomp_isolated_unsupported.kcomp"
+    ));
 
     /// **平台能力拒绝**：请求 `IsolatedNative` 而当前构建没有私有 AS backend
     /// （host 构建正是如此）→ `IsolationUnsupported`（`-ENOTSUP`）。
@@ -625,26 +623,31 @@ mod tests {
         assert_eq!(current_component(), None, "拒绝路径不得残留 CURRENT");
     }
 
-    /// **import 包络拒绝**：真实组件的 `kcore_*` UNDEF 在装载前被拒绝——绝不
-    /// 回退到 KernelNative 的裸 Core 函数地址。
+    /// **import 支持面拒绝**：真实组件里不在 `SUPPORTED_IMPORTS` 内的 UNDEF
+    /// 在装载前被拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     #[test]
-    fn isolated_load_rejects_kcore_imports_before_loading() {
+    fn isolated_load_rejects_unsupported_imports_before_loading() {
         assert_eq!(
-            check_isolated_imports(SMOKE_KCOMP),
+            check_isolated_imports(UNSUPPORTED_KCOMP),
             Err(ComponentLoadError::IsolatedImportUnsupported),
-            "kcomp_smoke 的 kcore_* import 必须被 Isolated 装载拒绝"
+            "kcore_memory_acquire 必须被 Isolated 装载拒绝"
         );
     }
 
-    /// `is_kcore_import` 只认 `kcore_*` 导出面：空名 / 其它 UNDEF 由 loader
-    /// 自己的 `UnresolvedSymbol` 处理，不冒充"支持的 import"。
+    /// 唯一支持面 = 诊断 / 只读查询 + `kcore_panic_escape`：面外（内存 / 调度 /
+    /// 设备）一律不冒充"支持的 import"；空名（ELF NULL 符号）不算 import。
     #[test]
-    fn isolated_import_classifier_matches_the_kcore_export_surface() {
-        assert!(is_kcore_import(b"kcore_log_line"));
-        assert!(is_kcore_import(b"kcore_"));
-        assert!(!is_kcore_import(b""));
-        assert!(!is_kcore_import(b"kcomp_instance_create"));
-        assert!(!is_kcore_import(b"memcpy"));
+    fn isolated_import_filter_is_the_single_supported_surface() {
+        use crate::component::isolated_load::import_supported;
+        assert!(import_supported(b"kcore_log_line"));
+        assert!(import_supported(b"kcore_now"));
+        assert!(import_supported(b"kcore_panic_escape"));
+        assert!(!import_supported(b"kcore_memory_acquire"));
+        assert!(!import_supported(b"kcore_device_claim"));
+        assert!(!import_supported(b"kcore_"));
+        assert!(!import_supported(b"kcomp_instance_create"));
+        assert!(!import_supported(b"memcpy"));
+        assert!(!import_supported(b""));
     }
 
     /// **跨域复用拒绝**：Isolated 请求不得复用已登记的 KernelNative image

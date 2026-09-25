@@ -710,7 +710,7 @@ fn deny_if_failed(component: crate::component::ComponentId) -> Option<i32> {
 
 /// Isolated / Sandbox 调用者能力门禁：非 KernelNative 域**没有已实现**的
 /// MMIO / DMA / IRQ / 任务 / Core 资源路径（窄支持包络；私有 AS
-/// 只映射 gateway + 自身内存）→ `-ENOTSUP`，绝不静默按 KernelNative 语义执行。
+/// 只映射共享 Core + 自身内存）→ `-ENOTSUP`，绝不静默按 KernelNative 语义执行。
 ///
 /// 只作用于**获取 authority / 创建 work** 的入口（claim / irq register /
 /// dma alloc / dma map / task create）；teardown（release / free / unmap）仍由

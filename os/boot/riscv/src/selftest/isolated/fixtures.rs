@@ -6,6 +6,8 @@ pub(crate) const ISOLATED_CTL_VA: usize = 0x3000_0000;
 pub(crate) const ISOLATED_DATA_VA: usize = 0x3000_1000;
 pub(crate) const ISOLATED_STACK_BASE: usize = 0x3000_2000;
 pub(crate) const ISOLATED_STACK_SIZE: usize = 4096;
+/// 夹具代码页在实例 AS 里的**私有** RV 映射（页面 backing 是 Core 镜像页）。
+pub(crate) const ISOLATED_FIXTURE_VA: usize = 0x3000_3000;
 pub(crate) const ISOLATED_ABANDON_VA: usize = 0x5000_0000;
 
 /// 控制页槽号（字节偏移 = 槽号 × `size_of::<usize>()`）。
@@ -90,6 +92,22 @@ pub(crate) unsafe fn ctl_set(index: usize, value: usize) {
     unsafe { ctl_pa().add(index).write(value) };
 }
 
+/// 把一个刚分配的 heap 页登记为组件私有（摘掉所有活着 root 的 identity 别名 +
+/// 排除出后续共享计划）。
+pub(crate) fn claim_private_page(pa: usize) -> Result<(), &'static str> {
+    kernel::memory::kernel_mappings::publish_private_backing(PhysicalRange {
+        base: pa,
+        size: 4096,
+    })
+    .map_err(|_| "isolated: publish private backing failed")
+}
+
+/// 夹具入口符号地址 → 实例 AS 里的私有 VA（夹具页映射在 `ISOLATED_FIXTURE_VA`）。
+pub(crate) fn fixture_entry(symbol: usize) -> usize {
+    let start = core::ptr::addr_of!(isolated_fixture_start) as usize;
+    ISOLATED_FIXTURE_VA + (symbol - start)
+}
+
 pub(crate) fn take_pending() -> PreparedTransition {
     // SAFETY: single-threaded selftest; the probe/driver runs exactly once.
     let pending = unsafe { (*core::ptr::addr_of_mut!(ISOLATED_PENDING)).take() };
@@ -120,9 +138,6 @@ pub(crate) fn prepare_or_fail(
         Err(IsolatedPrepareError::NoSuchSpace) => fail("isolated: prepare: no such space"),
         Err(IsolatedPrepareError::Retired) => fail("isolated: prepare: retired space"),
         Err(IsolatedPrepareError::Unsupported) => fail("isolated: prepare: unsupported"),
-        Err(IsolatedPrepareError::GatewayMapping) => {
-            fail("isolated: prepare: gateway mapping conflict")
-        }
         Err(IsolatedPrepareError::EntryNotExecutable) => {
             fail("isolated: prepare: entry not executable")
         }
@@ -137,20 +152,25 @@ pub(crate) struct IsolatedFixture {
     pub(crate) handle: AddressSpaceHandle,
 }
 
-/// 建立测试实例：私有 AS + 夹具代码页 + 控制页 + 组件栈（DATA 页故意留空）。
+/// 建立测试实例：**共享 Core 映射**的私有 AS + 私有夹具代码页 + 控制页 +
+/// 组件栈（DATA 页故意留空）。夹具代码页从 Core 镜像页映射到实例私有 VA，
+/// 因此组件入口的 PC 属于"组件私有可执行范围"（故障归因）。
 pub(crate) fn isolated_fixture() -> Result<IsolatedFixture, &'static str> {
     if !address_space::isolation_capable() {
         return Err("isolated: this profile has no private address space backend");
     }
-    let handle = address_space::create_address_space_for(ComponentId::from_raw(0x150))
-        .map_err(|_| "isolated: create_address_space_for failed")?;
+    let handle = address_space::create_isolated_address_space_for(ComponentId::from_raw(0x150))
+        .map_err(|_| "isolated: create_isolated_address_space_for failed")?;
 
     let ctl_pa = kernel::memory::vm_page_alloc().map_err(|_| "isolated: ctl page alloc")?;
     let data_pa = kernel::memory::vm_page_alloc().map_err(|_| "isolated: data page alloc")?;
     let stack_pa = kernel::memory::vm_page_alloc().map_err(|_| "isolated: stack page alloc")?;
+    for page in [ctl_pa, data_pa, stack_pa] {
+        claim_private_page(page)?;
+    }
 
-    // 夹具代码页：**测试夹具**（不是普通 Core 段），`.S` 用 balign 4096 保证
-    // 整页独占；映射进实例 AS 的是同一 VA → 同一 PA。
+    // 夹具代码页：`.S` 用 balign 4096 保证整页独占；实例 AS 里映射到
+    // ISOLATED_FIXTURE_VA（同 PA），入口 VA 由 `fixture_entry` 换算。
     let fixture_va = core::ptr::addr_of!(isolated_fixture_start) as usize;
     let fixture_end = core::ptr::addr_of!(isolated_fixture_end) as usize;
     let fixture_size = fixture_end
@@ -178,7 +198,7 @@ pub(crate) fn isolated_fixture() -> Result<IsolatedFixture, &'static str> {
         .map_err(|_| "isolated: instance mapping failed")
     };
     map_page(
-        fixture_va,
+        ISOLATED_FIXTURE_VA,
         arch::physical_address_of(fixture_va),
         MappingPermission::READ | MappingPermission::EXECUTE,
     )?;

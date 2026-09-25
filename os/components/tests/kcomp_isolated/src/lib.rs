@@ -2,7 +2,7 @@
 //!
 //! 它**不被任何组件生命周期路径加载**：ArchTest（`os/boot/riscv/src/selftest.rs`）
 //! 把它的字节从内嵌 kpkg 读出，走 `component::isolated_load` 放进一个私有 AS，
-//! 再经 assembly gateway 进入 `kcomp_instance_create`。
+//! 再经 跨 AS trampoline 进入 `kcomp_instance_create`。
 //!
 //! # 为什么零依赖、零 import
 //!
@@ -152,7 +152,8 @@ fn run_command(command: usize) -> i32 {
         CMD_LOAD_TARGET => {
             // SAFETY: 故意读 Core 提供的 target VA（实例 AS 内未映射）——
             // 必须触发 load page fault。
-            let value = unsafe { core::ptr::read_volatile(ctl_read(CTL_TARGET_VA) as *const usize) };
+            let value =
+                unsafe { core::ptr::read_volatile(ctl_read(CTL_TARGET_VA) as *const usize) };
             // SAFETY: 若上面没有 fault（不应发生），把读到的值留在 status 上便于诊断。
             unsafe { ctl_write(CTL_STATUS, value) };
             STATUS_INVALID_COMMAND
@@ -163,7 +164,7 @@ fn run_command(command: usize) -> i32 {
 
 /// 组件 ABI 的必需入口。Core 视角的签名是
 /// `kcomp_instance_create(const KcompCreateArgs *, void **) -> i32`；
-/// 本夹具忽略参数（ArchTest 经 gateway 进入，不搬运 create 参数）。
+/// 本夹具忽略参数（ArchTest 经跨 AS trampoline 进入，不搬运 create 参数）。
 #[unsafe(no_mangle)]
 pub extern "C" fn kcomp_instance_create(_args: *const (), _out_state: *mut *mut ()) -> i32 {
     // 环境门禁（见模块文档）：只在 ArchTest prepare 过的私有 AS 里工作；

@@ -10,7 +10,7 @@
 //   - 扁平帧真的被**拷贝**过边界（provider 看到的三个指针都在邮箱页内、
 //     内容 = caller 的负载；caller 的缓冲地址在实例 AS 里不可达）；
 //   - provider 在私有 AS 里运行（satp / tp），Core AS 每次切换后恢复；
-//   - provider 故障（trap）被 gateway 收敛：caller 拿到类型化错误、实例
+//   - provider 故障（trap）被 Core 收敛：caller 拿到类型化错误、实例
 //     Failed + AS 退役 + 窗口归还、Core 存活。
 // -----------------------------------------------------------------------
 
@@ -292,22 +292,11 @@ pub(crate) fn isolated_service() -> ! {
         fail("isolated-service: provider runtime slot (tp) mismatch");
     }
 
-    // Then 3：caller 的缓冲在实例 AS 里**不可达**（只有邮箱是跨域通道）。
-    assert_unmapped(
-        provider.handle,
-        args.as_ptr() as usize,
-        "isolated-service: caller args buffer is reachable from the instance AS",
-    );
-    assert_unmapped(
-        provider.handle,
-        input.as_ptr() as usize,
-        "isolated-service: caller input buffer is reachable from the instance AS",
-    );
-    assert_unmapped(
-        provider.handle,
-        output.as_ptr() as usize,
-        "isolated-service: caller output buffer is reachable from the instance AS",
-    );
+    // Then 3：**Core 内存是共享的**（共享 Core 映射）：caller 的缓冲落在 Core
+    // 内存里，因此 provider 在实例 AS 里经同一 VA 也能到达——这是设计，不是漏洞。
+    // 传输仍然只走邮箱：provider 的帧 / args / input / output 指针全部是邮箱页
+    // 内的实例域 VA（上面已逐条断言），Core 从不把 caller 缓冲交给 provider。
+    // 真正不可达的是别的实例的私有映射（见 `isolated-private-unreachable`）。
     if !matches!(
         address_space::translate(provider.handle, mailbox.base),
         Ok(Some(pa)) if pa == mailbox_pa
@@ -477,9 +466,9 @@ pub(crate) fn isolated_service_limits() -> ! {
     pass("isolated-service-limits")
 }
 
-/// 故障用例：provider 在 dispatch 期间访问 **caller 域内**地址 → 私有 AS 缺页
-/// → gateway 窄故障分派（本用例策略观察后 Abandon）→ caller 拿到类型化错误、
-/// 实例 Failed + AS 退役 + 窗口归还、Core 存活。
+/// 故障用例：provider 在 dispatch 期间访问**未映射地址** → 私有 AS 缺页
+/// → 普通 trap 路径的异常钩子（本用例策略观察后 Abandon）→ caller 拿到类型化
+/// 错误、实例 Failed + AS 退役 + 窗口归还、Core 存活。
 pub(crate) fn isolated_service_fault() -> ! {
     use kernel::component::call::{self, CallError};
     use kernel::component::endpoint::{EndpointError, ExecutionDomain};
@@ -497,9 +486,9 @@ pub(crate) fn isolated_service_fault() -> ! {
         Err(_) => fail("isolated-service-fault: caller load failed"),
     };
 
-    // 目标 = caller 栈上的缓冲地址：在 provider 的私有 AS 里必然缺页。
-    let target = [0xEEu8; 8];
-    let target_va = target.as_ptr() as usize;
+    // 目标 = 未映射 VA：在任何 AS 里都缺页（caller 的 Core 栈在共享模型下对
+    // provider 可见，不能再拿它当"不可达"探针）。
+    let target_va = ISOLATED_ABANDON_VA;
     let target_bytes = target_va.to_le_bytes();
 
     SVC_FAULT_COUNT.store(0, Ordering::Release);
@@ -558,16 +547,18 @@ pub(crate) fn isolated_service_fault() -> ! {
         fail("isolated-service-fault: expected a load page fault (scause 0xd)");
     }
     if SVC_FAULT_STVAL.load(Ordering::Acquire) != target_va {
-        fail("isolated-service-fault: stval is not the caller address");
+        fail("isolated-service-fault: stval is not the unmapped target");
     }
-    assert_fault_ran_on_core_context("isolated-service-fault", core_satp);
+    // provider 真实运行在私有 AS 里：trap 处理现场 satp == 实例 root（普通 trap
+    // 路径不切回 Core root），且 != Core root。
+    let provider_satp = FAULT_HANDLER_SATP.load(Ordering::Acquire);
+    if provider_satp == 0 || provider_satp == core_satp {
+        fail("isolated-service-fault: provider did not run on a private root");
+    }
+    assert_fault_ran_in_instance_context("isolated-service-fault", provider_satp);
     // provider 的上报证明它读到了 mailbox 里的目标地址（在 fault 之前）。
     if unsafe { svc_slot(provider.window_pa, SVC_R_FAULT_TARGET) } != target_va {
         fail("isolated-service-fault: provider did not see the fault target");
-    }
-    // caller 的缓冲没有被 provider 触碰（越界访问在页表处就失败了）。
-    if target != [0xEEu8; 8] {
-        fail("isolated-service-fault: caller buffer was modified");
     }
 
     // Then 3：实例逻辑死亡 + AS 退役 + Core 预置窗口（栈 / 窗口 / 邮箱）归还 +

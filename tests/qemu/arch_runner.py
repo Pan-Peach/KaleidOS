@@ -84,7 +84,6 @@ CASES = (
     ("isolated-image-wrong-env", None, None),
     ("isolated-perm-text", None, "scause=0xf"),
     ("isolated-perm-data", None, "scause=0xc"),
-    ("isolated-core-unreachable", None, "scause=0xd"),
     # The shared-Core-mapping model: every Isolated AS carries the same Core
     # mappings at the same VA -> PA; private backing is excluded from the
     # identity aliases of every live root; Core code is callable directly from
@@ -156,6 +155,18 @@ CASES = (
     ("isolated-stale-access", None, "isolated-stale-access: blocked"),
     ("isolated-ready-fault", None, "isolated-ready-fault: contained + restarted"),
     ("isolated-restart", None, "isolated-restart: fresh instances"),
+    # Direct Core imports for Isolated components: a real .kcomp calls the
+    # supported diagnostic/read-only exports directly (satp stays the instance
+    # root; relocation targets the shared low alias) and destroys cleanly; a
+    # component panic escapes through kcore_panic_escape into the cross-AS
+    # continuation and is contained as CreateFaulted.
+    ("isolated-direct-imports", None, "[kcomp] direct-ok"),
+    ("isolated-panic-escape", None, "[kcomp] panic"),
+    # Nested AS switching: a Core helper called from AS_A enters AS_B (one
+    # switch out, one back).  The healthy path returns to A; the fault path
+    # abandons only B (attributed through B's cross-AS context) and A resumes.
+    ("isolated-nested-as", None, None),
+    ("isolated-nested-fault", None, None),
 )
 
 

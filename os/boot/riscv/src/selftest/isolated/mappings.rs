@@ -215,7 +215,7 @@ pub(crate) fn isolated_core_direct() -> ! {
         base: ISOLATED_STACK_BASE,
         size: ISOLATED_STACK_SIZE,
     };
-    let transition = match isolated::prepare_shared(
+    let transition = match isolated::prepare(
         handle,
         isolated_core_direct_entry as *const () as usize,
         stack,

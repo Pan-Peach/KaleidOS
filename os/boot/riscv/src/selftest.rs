@@ -175,7 +175,7 @@ pub fn run(info: &MachineInfo) -> ! {
         b"breakpoint" => breakpoint_fault(),
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
-        // 私有 AS assembly gateway（机制证明）。
+        // 私有 AS 跨 AS trampoline（机制证明）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-transition" => isolated_tests::isolated_transition(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
@@ -193,8 +193,6 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-perm-text" => isolated_tests::isolated_perm_text(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-perm-data" => isolated_tests::isolated_perm_data(),
-        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
-        b"isolated-core-unreachable" => isolated_tests::isolated_core_unreachable(),
         // 共享 Core 映射模型：same VA→PA、私有 backing 别名排除、Core 直接调用。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-shared-mappings" => isolated_tests::isolated_shared_mappings(),
@@ -210,7 +208,7 @@ pub fn run(info: &MachineInfo) -> ! {
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fault" => isolated_tests::isolated_lifecycle_fault(),
         // KernelNative caller → Isolated provider 的跨域 service Gate
-        // （扁平帧拷贝 + 邮箱 + gateway；容量拒绝 + 故障 containment）。
+        // （扁平帧拷贝 + 邮箱 + 跨 AS trampoline；容量拒绝 + 故障 containment）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service" => isolated_tests::isolated_service(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
@@ -233,6 +231,16 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-ready-fault" => isolated_tests::isolated_ready_fault(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-restart" => isolated_tests::isolated_restart(),
+        // 直接 Core import（支持面）+ 组件 panic 的跨 AS 收敛。
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-direct-imports" => isolated_tests::isolated_direct_imports(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-panic-escape" => isolated_tests::isolated_panic_escape(),
+        // 嵌套 AS：Core/AS_A → AS_B → AS_A（健康 + B 故障两条路径）。
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-nested-as" => isolated_tests::isolated_nested_as(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-nested-fault" => isolated_tests::isolated_nested_fault(),
         _ => fail("unknown command"),
     }
 }

@@ -5,9 +5,9 @@
 // 真实 `.kcomp` 的按域装载 + 页级权限强制。
 //
 // 夹具 `kcomp_isolated` 零依赖 / 零 import；本模块把它的字节从内嵌 kpkg 读出，
-// 走 `component::isolated_load` 放进一个只含「该镜像各段 + gateway 两页 +
-// 实例栈 + 控制页」的私有 AS，再经 assembly gateway 进入。**这条用例直接
-// 驱动机制**：不经任何组件创建路径。
+// 走 `component::isolated_load` 放进一个「共享 Core 映射 + 该镜像各段 +
+// 实例栈 + 控制页」的私有 AS，再经最小跨 AS 原语进入。**这条用例直接驱动
+// 机制**：不经任何组件创建路径。
 // -----------------------------------------------------------------------
 
 /// `kcomp_isolated` 的控制页协议槽号（与组件源码逐槽一致）。
@@ -28,7 +28,6 @@ pub(crate) const IMAGE_RODATA_MAGIC: usize = 0x524f_4441; // "RODA"
 /// 组件 `report()` 写进 data 段再读回的值（`DATA_CELL ^ 0x5555`）。
 pub(crate) const IMAGE_DATA_STORED: usize = 0x4441_5441 ^ 0x5555;
 pub(crate) const IMAGE_BSS_STORED: usize = 0x4242_5353;
-pub(crate) const IMAGE_CANARY_MAGIC: usize = 0x4341_4e41; // "CANA"
 
 pub(crate) const CMD_REPORT: usize = 0;
 pub(crate) const CMD_STORE_TEXT: usize = 1;
@@ -42,20 +41,19 @@ pub(crate) static IMAGE_FAULT_CAUSE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static IMAGE_FAULT_STVAL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static IMAGE_FAULT_PAGE_PA: AtomicUsize = AtomicUsize::new(0);
 
-/// 按域装载夹具：真实 `.kcomp` 已落进实例 AS + 控制页 + 实例栈 + 一个
-/// **Core 专属**金丝雀页（故意不映射进实例 AS）。
+/// 按域装载夹具：真实 `.kcomp` 已落进（共享 Core 映射的）实例 AS + 控制页 +
+/// 实例栈。
 pub(crate) struct IsolatedImageFixture {
     handle: AddressSpaceHandle,
     image: PlacedImage,
     ctl_pa: usize,
-    canary_pa: usize,
 }
 pub(crate) fn isolated_image_fixture() -> Result<IsolatedImageFixture, &'static str> {
     if !address_space::isolation_capable() {
         return Err("isolated-image: this profile has no private address space backend");
     }
-    let handle = address_space::create_address_space_for(ComponentId::from_raw(0x160))
-        .map_err(|_| "isolated-image: create_address_space_for failed")?;
+    let handle = address_space::create_isolated_address_space_for(ComponentId::from_raw(0x160))
+        .map_err(|_| "isolated-image: create_isolated_address_space_for failed")?;
 
     // 真实 `.kcomp`：字节来自内嵌 kpkg（store 已由 boot 挂载），按域放段。
     let image = match isolated_load::place_artifact(b"kcomp_isolated") {
@@ -73,8 +71,9 @@ pub(crate) fn isolated_image_fixture() -> Result<IsolatedImageFixture, &'static 
     let ctl_pa = kernel::memory::vm_page_alloc().map_err(|_| "isolated-image: ctl page alloc")?;
     let stack_pa =
         kernel::memory::vm_page_alloc().map_err(|_| "isolated-image: stack page alloc")?;
-    let canary_pa =
-        kernel::memory::vm_page_alloc().map_err(|_| "isolated-image: canary page alloc")?;
+    for page in [ctl_pa, stack_pa] {
+        claim_private_page(page)?;
+    }
     map_instance_page(
         handle,
         ISOLATED_CTL_VA,
@@ -87,14 +86,11 @@ pub(crate) fn isolated_image_fixture() -> Result<IsolatedImageFixture, &'static 
         stack_pa,
         MappingPermission::READ | MappingPermission::WRITE,
     )?;
-    // 金丝雀页**不映射**进实例 AS：它就是"Core 专属映射不可达"的探针。
 
-    // SAFETY: 三个页都来自 vm_page_alloc；identity/low-alias 视图可读写。
+    // SAFETY: 两个页都来自 vm_page_alloc；identity 视图可读写。
     unsafe {
         core::ptr::write_bytes(ctl_pa as *mut u8, 0, 4096);
         core::ptr::write_bytes(stack_pa as *mut u8, 0, 4096);
-        core::ptr::write_bytes(canary_pa as *mut u8, 0, 4096);
-        core::ptr::write_volatile(canary_pa as *mut usize, IMAGE_CANARY_MAGIC);
     }
     ISOLATED_CTL_PA.store(ctl_pa, Ordering::Release);
     ISOLATED_HANDLE_ID.store(handle.raw_id() as usize, Ordering::Release);
@@ -103,7 +99,6 @@ pub(crate) fn isolated_image_fixture() -> Result<IsolatedImageFixture, &'static 
         handle,
         image,
         ctl_pa,
-        canary_pa,
     })
 }
 
@@ -135,9 +130,9 @@ pub(crate) fn image_page_is_backed(
         image.mapping(&segment).physical_range.base + (page - segment.virtual_range.base);
     matches!(address_space::translate(handle, page), Ok(Some(pa)) if pa == expected)
 }
-/// 主用例：真实 `.kcomp` 的代码在私有 AS 里经 gateway 跑完并返回；data /
-/// rodata 在各自映射 VA 上可读；实例 AS 只含该镜像各段 + gateway 机制页 +
-/// 实例栈 / 控制页，Core 专属映射不可达。
+/// 主用例：真实 `.kcomp` 的代码在私有 AS 里经最小跨 AS 原语跑完并返回；data /
+/// rodata 在各自映射 VA 上可读；Core 代码 / 栈 / 全局状态经共享映射 same VA →
+/// same PA 可达，镜像窗口外 / 别的私有布局不可达。
 pub(crate) fn isolated_image() -> ! {
     let fixture = match isolated_image_fixture() {
         Ok(fixture) => fixture,
@@ -183,43 +178,27 @@ pub(crate) fn isolated_image() -> ! {
     {
         fail("isolated-image: control page is not the harness mapping");
     }
-    // Core 专属映射：Core 镜像静态 / Core 专用 trap 栈 / 金丝雀页 / 窗口外
-    // 地址都必须在实例 AS 里不可达。
-    assert_unmapped(
-        fixture.handle,
-        core::ptr::addr_of!(super::super::MAPPING_VALUE) as usize,
-        "isolated-image: a Core image static is reachable from the instance AS",
-    );
-    assert_unmapped(
-        fixture.handle,
-        arch::riscv::gateway::core_trap_stack_range().0,
-        "isolated-image: the Core trap stack is reachable from the instance AS",
-    );
-    assert_unmapped(
-        fixture.handle,
-        fixture.canary_pa,
-        "isolated-image: a Core-only heap page is reachable from the instance AS",
-    );
+    // 共享 Core 映射：Core 镜像静态 / 安全 trap 栈在实例 AS 里 same VA → same PA。
+    let core_static_va = core::ptr::addr_of!(super::super::MAPPING_VALUE) as usize;
+    match address_space::translate(fixture.handle, core_static_va) {
+        Ok(Some(pa)) if pa == arch::physical_address_of(core_static_va) => {}
+        _ => fail("isolated-image: a Core image static is not shared into the instance AS"),
+    }
+    let trap_stack_base = arch::riscv::trap::trap_stack_range().0;
+    match address_space::translate(fixture.handle, trap_stack_base) {
+        Ok(Some(pa)) if pa == arch::physical_address_of(trap_stack_base) => {}
+        _ => fail("isolated-image: the safe trap stack is not shared into the instance AS"),
+    }
+    // 镜像窗口之外仍是组件私有布局：不可达。
     assert_unmapped(
         fixture.handle,
         image.base() + image.text_size(),
         "isolated-image: memory past the image is reachable from the instance AS",
     );
 
-    // (3) 经 gateway 在私有 AS 里运行真实组件入口。
+    // (3) 经最小跨 AS 原语在私有 AS 里运行真实组件入口。
     unsafe { ctl_set(IMAGE_CTL_COMMAND, CMD_REPORT) };
     let transition = prepare_or_fail(fixture.handle, image.create(), false);
-    // gateway 两张机制页必须按同 VA → 同 PA 落成实例侧映射（准备成功即保证，
-    // 这里显式钉住"实例 AS = gateway + 镜像段 + harness 页"的真相）。
-    for page in arch::riscv::gateway::pages() {
-        match address_space::mapping_exact(fixture.handle, &page.virtual_range) {
-            Ok(Some(mapping))
-                if mapping.virtual_range == page.virtual_range
-                    && mapping.physical_range == page.physical_range
-                    && mapping.permission == page.permission => {}
-            _ => fail("isolated-image: gateway page mapping missing or mismatched"),
-        }
-    }
     ISOLATED_INSTANCE_SATP.store(transition.satp(), Ordering::Release);
     let core_satp = read_satp();
     // 组件用它做环境门禁：只在这次 prepare 的私有 AS 里工作。
@@ -291,17 +270,6 @@ pub(crate) fn isolated_image() -> ! {
         fail("isolated-image: rodata is not readable at its backing PA");
     }
 
-    // (6) 金丝雀页在组件运行后仍然只属于 Core。
-    if unsafe { core::ptr::read_volatile(fixture.canary_pa as *const usize) } != IMAGE_CANARY_MAGIC
-    {
-        fail("isolated-image: Core-only page was modified");
-    }
-    assert_unmapped(
-        fixture.handle,
-        fixture.canary_pa,
-        "isolated-image: Core-only page became visible after the run",
-    );
-
     kernel::log!(
         "selftest",
         "isolated-image: private AS OK: segments={} rx={} ro={} rw={}",
@@ -317,8 +285,8 @@ pub(crate) fn isolated_image() -> ! {
 /// （模拟 `monitor load kcomp_isolated` 这类误用——控制页 VA 在 Core AS 里
 /// 是设备 MMIO），组件必须拒绝（`-EPERM`）且**不写任何槽位**。
 ///
-/// 这条用例**不**走按域装载 / gateway：它证明夹具只在 ArchTest prepare 过的
-/// 私有 AS 里有副作用。
+/// 这条用例**不**走按域装载 / 跨 AS 原语：它证明夹具只在 ArchTest prepare 过
+/// 的私有 AS 里有副作用。
 pub(crate) fn isolated_image_wrong_env() -> ! {
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::load::{self, ComponentLoadError};
@@ -360,6 +328,7 @@ pub(crate) fn enter_expecting_fault(
         ctl_set(IMAGE_CTL_TARGET_VA, target_va);
     }
     let transition = prepare_or_fail(fixture.handle, fixture.image.create(), false);
+    let instance_satp = transition.satp();
     FAULT_COUNT.store(0, Ordering::Release);
     IMAGE_FAULT_PAGE_PA.store(0, Ordering::Release);
     isolated::install();
@@ -379,7 +348,7 @@ pub(crate) fn enter_expecting_fault(
     if FAULT_COUNT.load(Ordering::Acquire) != 1 {
         fail("isolated-perm: fault hook did not run exactly once");
     }
-    assert_fault_ran_on_core_context(name, core_satp);
+    assert_fault_ran_in_instance_context(name, instance_satp);
     FaultObservation {
         fixture,
         cause: IMAGE_FAULT_CAUSE.load(Ordering::Acquire),
@@ -469,34 +438,6 @@ pub(crate) fn isolated_perm_data() -> ! {
         observation.stval
     );
     pass("isolated-perm-data")
-}
-
-/// 读 Core 专属页 → load page fault（scause 0xd）：该页在实例 AS 里不可达。
-pub(crate) fn isolated_core_unreachable() -> ! {
-    let observation = enter_expecting_fault("isolated-core-unreachable", CMD_LOAD_TARGET, |f| {
-        f.canary_pa
-    });
-    let canary = observation.fixture.canary_pa;
-    if observation.cause != 13 {
-        fail("isolated-core-unreachable: expected a load page fault (scause 0xd)");
-    }
-    if observation.stval != canary {
-        fail("isolated-core-unreachable: stval is not the Core-only address");
-    }
-    if observation.page_pa != 0 {
-        fail("isolated-core-unreachable: the Core-only page is mapped in the instance AS");
-    }
-    // SAFETY: identity/low-alias view of the Core-owned canary page.
-    if unsafe { core::ptr::read_volatile(canary as *const usize) } != IMAGE_CANARY_MAGIC {
-        fail("isolated-core-unreachable: Core-only page was modified");
-    }
-    kernel::log!(
-        "selftest",
-        "isolated-core-unreachable: Core-only page unreachable: scause={:#x}, stval={:#x}",
-        observation.cause,
-        observation.stval
-    );
-    pass("isolated-core-unreachable")
 }
 
 use super::*;
