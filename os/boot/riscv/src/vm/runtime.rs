@@ -40,6 +40,8 @@ use arch::riscv::mmu::address_space::Sv39AddressSpace;
 use arch::riscv::mmu::sv39::{PteFlags, VM_PAGE_SIZE};
 use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
 use kernel::machine::{IoSpace, MachineInfo};
+use kernel::memory::address_space::Mapping;
+use kernel::memory::kernel_mappings::{KernelMappingPlan, MappingClass};
 use spin::{Mutex, Once};
 
 use super::layout::{KernelLayout, KERNEL_VMA};
@@ -67,6 +69,10 @@ pub enum RuntimeVmError {
 /// 长期内核地址空间（buddy 动态根）。
 pub struct RuntimeVm {
     space: Sv39AddressSpace,
+    /// 每次映射操作的语义分类（共享 Core / identity RAM / 只留内核 root），
+    /// `init` 把它交给 Core（`kernel_mappings::install`），供后续 Isolated AS
+    /// 共享同一份 same VA → same PA 的 Core 映射。
+    plan: KernelMappingPlan,
 }
 
 const fn align_up_page(addr: usize) -> usize {
@@ -96,6 +102,15 @@ fn section_perm(flags: PteFlags) -> MappingPermission {
     perm
 }
 
+/// 中断控制器（PLIC）：Core 的 trap 路径在**每个** AS 里都要 claim/complete
+/// 外部中断，因此它的 MMIO 窗口属于共享 Core 映射；其余设备窗口只留内核 root
+/// （Isolated 组件不因共享而获得设备访问权）。
+fn is_interrupt_controller(device: &kernel::machine::DeviceDescriptor) -> bool {
+    device.compatibles[..device.compat_count as usize]
+        .iter()
+        .any(|compatible| matches!(compatible.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"))
+}
+
 /// 段的高半区 VMA → 段在物理镜像内的 PA。
 fn section_pa(va_start: usize, kernel_pa: usize) -> Result<usize, RuntimeVmError> {
     let offset = va_start
@@ -120,6 +135,14 @@ impl RuntimeVm {
     ) -> Result<Self, RuntimeVmError> {
         let mut space = Sv39AddressSpace::new(kernel::memory::vm_page_alloc, 0)
             .map_err(|_| RuntimeVmError::PageTableAllocFailed)?;
+        let mut plan = KernelMappingPlan::empty();
+
+        macro_rules! record {
+            ($class:expr, $mapping:expr) => {
+                plan.add($class, $mapping, VM_PAGE_SIZE)
+                    .map_err(|_| RuntimeVmError::MapFailed)?;
+            };
+        }
 
         // 0) 低引导区高半区影子 [KERNEL_VMA, text.va_start)：bootstrap 用
         //    "Pass 1 整镜像 RW" 覆盖它；runtime 只映正式段之前的影子
@@ -128,19 +151,26 @@ impl RuntimeVm {
         let shadow_size = layout.text.va_start - KERNEL_VMA;
         if shadow_size > 0 {
             let shadow_perm = MappingPermission::READ | MappingPermission::WRITE;
+            let va = VirtualRange {
+                base: KERNEL_VMA,
+                size: shadow_size,
+            };
+            let pa = PhysicalRange {
+                base: kernel_pa,
+                size: shadow_size,
+            };
             space
-                .map(
-                    VirtualRange {
-                        base: KERNEL_VMA,
-                        size: shadow_size,
-                    },
-                    PhysicalRange {
-                        base: kernel_pa,
-                        size: shadow_size,
-                    },
-                    shadow_perm,
-                )
+                .map(va, pa, shadow_perm)
                 .map_err(|_| RuntimeVmError::MapFailed)?;
+            // 只属于内核 root：bootstrap 影子不共享进实例 AS。
+            record!(
+                MappingClass::CoreRootOnly,
+                Mapping {
+                    virtual_range: va,
+                    physical_range: pa,
+                    permission: shadow_perm,
+                }
+            );
         }
 
         // 1) identity RAM：VA == PA。bootstrap 曾用 1 GiB 大叶的粗映射，这里
@@ -163,19 +193,27 @@ impl RuntimeVm {
             if end <= start {
                 continue; // 取整后为空（非对齐 RAM 的边缘碎片）
             }
+            let range = VirtualRange {
+                base: start,
+                size: end - start,
+            };
+            let pa = PhysicalRange {
+                base: start,
+                size: end - start,
+            };
             space
-                .map(
-                    VirtualRange {
-                        base: start,
-                        size: end - start,
-                    },
-                    PhysicalRange {
-                        base: start,
-                        size: end - start,
-                    },
-                    ram_perm,
-                )
+                .map(range, pa, ram_perm)
                 .map_err(|_| RuntimeVmError::MapFailed)?;
+            // identity RAM：共享，但私有 backing 的别名必须可被整段摘除
+            // （`kernel_mappings::publish_private_backing`）。
+            record!(
+                MappingClass::SharedIdentity,
+                Mapping {
+                    virtual_range: range,
+                    physical_range: pa,
+                    permission: ram_perm,
+                }
+            );
         }
 
         // 2) 内核镜像：段 VA 高半区，PA = kernel_pa + (va_start - KERNEL_VMA)。
@@ -195,16 +233,24 @@ impl RuntimeVm {
                     .checked_sub(section.va_start)
                     .ok_or(RuntimeVmError::InvalidLayout)?,
             );
+            let va = VirtualRange {
+                base: section.va_start,
+                size,
+            };
+            let pa = PhysicalRange { base: pa, size };
+            let permission = section_perm(section.flags);
             space
-                .map(
-                    VirtualRange {
-                        base: section.va_start,
-                        size,
-                    },
-                    PhysicalRange { base: pa, size },
-                    section_perm(section.flags),
-                )
+                .map(va, pa, permission)
                 .map_err(|_| RuntimeVmError::MapFailed)?;
+            // 固定 Core 镜像段：每个 Isolated AS 共享（同 VA → 同 PA）。
+            record!(
+                MappingClass::SharedCore,
+                Mapping {
+                    virtual_range: va,
+                    physical_range: pa,
+                    permission,
+                }
+            );
         }
 
         // 3) 设备 MMIO：VA == PA，RW-NX（设备寄存器永不执行）。
@@ -222,23 +268,36 @@ impl RuntimeVm {
                     .map(align_up_page)
                     .ok_or(RuntimeVmError::InvalidLayout)?;
                 let map_size = map_end - map_base;
+                let range = VirtualRange {
+                    base: map_base,
+                    size: map_size,
+                };
+                let pa = PhysicalRange {
+                    base: map_base,
+                    size: map_size,
+                };
                 space
-                    .map(
-                        VirtualRange {
-                            base: map_base,
-                            size: map_size,
-                        },
-                        PhysicalRange {
-                            base: map_base,
-                            size: map_size,
-                        },
-                        mmio_perm,
-                    )
+                    .map(range, pa, mmio_perm)
                     .map_err(|_| RuntimeVmError::MapFailed)?;
+                // 中断控制器窗口共享（trap 路径在每个 AS 都要 claim / complete）；
+                // 其余设备窗口只留内核 root。
+                let class = if is_interrupt_controller(d) {
+                    MappingClass::SharedCore
+                } else {
+                    MappingClass::CoreRootOnly
+                };
+                record!(
+                    class,
+                    Mapping {
+                        virtual_range: range,
+                        physical_range: pa,
+                        permission: mmio_perm,
+                    }
+                );
             }
         }
 
-        Ok(Self { space })
+        Ok(Self { space, plan })
     }
 
     /// 对照 layout 逐段校验：段首地址必须能翻译回期望 PA。
@@ -272,6 +331,11 @@ impl RuntimeVm {
             .activate()
             .map_err(|_| RuntimeVmError::ActivateFailed)
     }
+
+    /// 取走映射计划（交给 Core 的共享映射真相；调用后本 VM 不再持有它）。
+    pub fn take_plan(&mut self) -> KernelMappingPlan {
+        core::mem::take(&mut self.plan)
+    }
 }
 
 /// 建立、验证、激活并安装全局长期 root（`main64.rs` 在 `kernel::init()` 后
@@ -289,9 +353,14 @@ pub fn init(
         return Err(RuntimeVmError::AlreadyInstalled);
     }
 
-    let vm = RuntimeVm::build(layout, kernel_pa, info)?;
+    let mut vm = RuntimeVm::build(layout, kernel_pa, info)?;
     vm.verify(layout, kernel_pa)?;
     vm.activate()?;
+
+    // 把映射计划交给 Core：Isolated AS 从这里取共享 Core 映射
+    // （same VA → same PA），私有 backing 的别名排除也以它为真相。
+    let plan = vm.take_plan();
+    kernel::memory::kernel_mappings::install(plan);
 
     *slot.lock() = Some(vm);
     Ok(())

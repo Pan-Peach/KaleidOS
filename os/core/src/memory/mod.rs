@@ -20,6 +20,7 @@ use slab::SlabAllocator;
 use spin::Mutex;
 
 pub mod address_space;
+pub mod kernel_mappings;
 mod slab;
 
 // ---------------------------------------------------------------------------

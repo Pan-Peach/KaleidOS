@@ -585,6 +585,12 @@ mod imp {
             // 防御：buddy 对 2 的幂请求必须原样返回（lease 随 Drop 归还）。
             return Err(ComponentLoadError::StartFailed);
         }
+        // 别名排除：Core 预置窗口是组件私有的——先摘掉所有活着的 Isolated root
+        // 里该 extent 的 identity 别名，再映射进本实例 AS。
+        crate::memory::kernel_mappings::publish_private_backing(
+            crate::memory::address_space::PhysicalRange { base, size },
+        )
+        .map_err(map_space_error)?;
         // 首次交付零初始化（与 `kcore_memory_acquire` 同一契约）。
         // SAFETY: base/size 来自 alloc_region；v1 identity / low-alias 视图下
         // 物理地址可写（与 loader / isolated_load 的放段方式相同）。

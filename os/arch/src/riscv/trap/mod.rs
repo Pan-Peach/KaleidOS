@@ -141,6 +141,53 @@ mod tests {
     }
 }
 
+/// 普通 Core trap 路径的异常钩子（Core 注册；见 `supervisor::trap_handler`）。
+///
+/// `true` = 钩子已处理（汇编按（可能被修改过的）`TrapFrame` 恢复并 `sret`）；
+/// `false` / 未注册 = fatal（保持 Core 不变式：未证明可恢复的异常一律 panic）。
+pub type ExceptionHook = fn(frame: *mut TrapFrame, cause: usize, stval: usize) -> bool;
+
+static EXCEPTION_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// 注册异常钩子（后注册覆盖先注册；Core 只注册一次）。
+pub fn register_exception_hook(hook: ExceptionHook) {
+    EXCEPTION_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// 把一次异常交给已注册的钩子；未注册 → `false`（fatal）。
+pub(crate) fn dispatch_exception(frame: *mut TrapFrame, cause: usize, stval: usize) -> bool {
+    let address = EXCEPTION_HOOK.load(Ordering::Acquire);
+    if address == 0 {
+        return false;
+    }
+    // SAFETY: 注册方保证签名与 `ExceptionHook` 一致（单一注册入口）。
+    let hook: ExceptionHook = unsafe { core::mem::transmute(address) };
+    hook(frame, cause, stval)
+}
+
+/// 安全 trap 栈：**所有** S-mode trap 先切到这里（见 `trap32.S` / `trap64.S`
+/// 的 sscratch 约定），再用调用者的栈做处理；组件栈 / 任务栈因此永远不会被
+/// trap 帧写坏。
+pub const TRAP_STACK_BYTES: usize = 32 * 1024;
+const STACK_ALIGNMENT: usize = 16;
+
+#[repr(align(16))]
+struct TrapStack([u8; TRAP_STACK_BYTES]);
+
+static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_BYTES]);
+
+/// 安全 trap 栈的半开区间 `[base, top)`（诊断 / ArchTest 断言）。
+pub fn trap_stack_range() -> (usize, usize) {
+    // SAFETY: 只取静态数组地址（不读内容、不创建引用）。
+    let base = unsafe { core::ptr::addr_of!(TRAP_STACK.0) } as usize;
+    (base, base + TRAP_STACK_BYTES)
+}
+
+/// 安全 trap 栈顶（16 字节对齐）：装在 `sscratch` 里，trap 入口据此换栈。
+pub fn trap_stack_top() -> usize {
+    trap_stack_range().1 & !(STACK_ALIGNMENT - 1)
+}
+
 /// cause 寄存器解码（`Scause` 名称沿用 S-mode；M-mode 下语义相同，
 /// 只是中断位位置与寄存器名不同，由 `machine` 模块自行读取）。
 pub(crate) struct Scause(usize);

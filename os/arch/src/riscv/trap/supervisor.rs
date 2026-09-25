@@ -13,17 +13,21 @@ global_asm!(include_str!("trap32.S"));
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("trap64.S"));
 
-/// 安装 S-mode trap 向量（`stvec` = `trap_vec`）。
+/// 安装 S-mode trap 向量（`stvec` = `trap_vec`）并装入安全 trap 栈约定：
+/// 处理之外 `sscratch` 恒为 trap 栈顶，trap 入口据此在写任何东西之前换栈
+/// （见 `trap32.S` / `trap64.S`）。
 pub fn init() {
     unsafe {
         set_trap_vector();
+        set_scratch(super::trap_stack_top());
     }
 }
 
 /// 普通 Core trap 向量（`trap_vec`）的链接地址。
 ///
-/// gateway 在组件运行期间把 `stvec` 临时换成自己的双映射入口，切回 Core 前必须
-/// 装回本地址，使嵌套 / 普通 Core trap 不走组件入口路径。
+/// 普通 S-mode 执行（Core 或组件）的 `stvec` 恒为本地址：Isolated 的 trap 也
+/// 走这条普通路径（Core 映射在每个实例 AS 里相同）。组装入口只需要在恢复
+/// Core 现场时装回本地址。
 pub fn vector_address() -> usize {
     unsafe extern "C" {
         static trap_vec: u8;
@@ -37,6 +41,16 @@ unsafe fn set_trap_vector() {
     unsafe {
         core::arch::asm!("csrw stvec, {addr}",
             addr = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// 装入 `sscratch` 的 trap 栈约定值。
+fn set_scratch(value: usize) {
+    unsafe {
+        core::arch::asm!("csrw sscratch, {value}",
+            value = in(reg) value,
             options(nostack, preserves_flags),
         );
     }
@@ -67,9 +81,16 @@ pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, st
             "unhandled interrupt: scause={:#x}, sepc={:#x}, stval={:#x}",
             raw_scause, sepc, stval
         ),
-        Trap::Exception(_) => panic!(
-            "unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}",
-            raw_scause, sepc, stval
-        ),
+        Trap::Exception(_) => {
+            // Core 的异常钩子（组件故障归属 / 恢复判决）优先；未注册或拒绝
+            // 恢复 = fatal（未证明可恢复的异常绝不静默）。
+            if super::dispatch_exception(trap_frame, raw_scause, stval) {
+                return;
+            }
+            panic!(
+                "unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}",
+                raw_scause, sepc, stval
+            )
+        }
     }
 }

@@ -1,16 +1,43 @@
 .align 2
 .global trap_vec
 trap_vec:
-    # Keep the frame 16-byte aligned for the RV32 ABI.  TrapFrame occupies
-    # the first 136 bytes; the final eight bytes are padding.
-    addi sp, sp, -144
+    # Stack-safe trap entry (RV32).  Same convention as trap64.S:
+    # outside handling `sscratch` holds the safe Core trap-stack top; while
+    # handling it is zero (nested traps stay on the safe stack).
+    #
+    # TrapFrame occupies 136 bytes; the word at 136 stores the `sscratch` value
+    # to restore on `sret`.  The allocation is 144 bytes so `sp` stays 16-byte
+    # aligned for the RV32 ABI.
+    csrrw sp, sscratch, sp
+    beqz sp, .Lnested
 
-    sw ra, 4(sp)
-    sw gp, 12(sp)
-    sw tp, 16(sp)
+    # ---- outer trap: interrupted stack is not the safe trap stack ----
+    addi sp, sp, -144
     sw t0, 20(sp)
     sw t1, 24(sp)
     sw t2, 28(sp)
+    csrr t0, sscratch            # t0 = interrupted sp
+    sw t0, 8(sp)                 # frame.x[2] = interrupted sp
+    addi t0, sp, 144             # t0 = safe trap-stack top
+    sw t0, 136(sp)               # outer: reinstall it on sret
+    csrw sscratch, zero          # nested convention while handling
+    j .Lsave_rest
+
+.Lnested:
+    # ---- nested trap: already on the safe trap stack ----
+    csrrw sp, sscratch, sp       # sp := interrupted sp, sscratch := 0
+    addi sp, sp, -144
+    sw t0, 20(sp)
+    sw t1, 24(sp)
+    sw t2, 28(sp)
+    addi t0, sp, 144
+    sw t0, 8(sp)                 # frame.x[2] = interrupted sp
+    sw zero, 136(sp)             # nested: stay on the safe stack
+
+.Lsave_rest:
+    sw ra, 4(sp)
+    sw gp, 12(sp)
+    sw tp, 16(sp)
     sw s0, 32(sp)
     sw s1, 36(sp)
     sw a0, 40(sp)
@@ -35,10 +62,6 @@ trap_vec:
     sw t4, 116(sp)
     sw t5, 120(sp)
     sw t6, 124(sp)
-
-    # x[2] = original sp; x[0] remains the zero slot.
-    addi t0, sp, 144
-    sw t0, 8(sp)
 
     csrr t0, sstatus
     sw t0, 128(sp)
@@ -86,5 +109,9 @@ trap_vec:
     lw t5, 120(sp)
     lw t6, 124(sp)
 
+    # Restore the sscratch convention, then the interrupted sp / t0.
+    lw t0, 136(sp)
+    csrw sscratch, t0
+    lw t0, 20(sp)
     lw sp, 8(sp)
     sret

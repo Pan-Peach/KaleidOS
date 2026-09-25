@@ -138,6 +138,62 @@ pub fn prepare(
     })
 }
 
+/// 准备一次**共享 Core 映射**模型下的私有 AS 切换。
+///
+/// 与 [`prepare`] 的唯一区别：**不**把双映射 gateway 机制页落进实例 AS——
+/// Core 代码 / 栈 / 全局状态已经作为共享 Core 映射在每个 Isolated AS 里
+/// same VA → same PA（见 `memory/kernel_mappings.rs`），切换只需要激活描述符。
+pub fn prepare_shared(
+    handle: AddressSpaceHandle,
+    entry: usize,
+    stack: VirtualRange,
+    runtime_slot: usize,
+    interrupts_enabled: bool,
+    entry_args: EntryArgs,
+) -> Result<PreparedTransition, IsolatedPrepareError> {
+    let stack_top = stack
+        .base
+        .checked_add(stack.size)
+        .ok_or(IsolatedPrepareError::InvalidStack)?;
+    if stack.size == 0
+        || stack_top % 16 != 0
+        || !stack.base.is_multiple_of(crate::memory::ALLOC_GRANULE)
+        || !stack.size.is_multiple_of(crate::memory::ALLOC_GRANULE)
+    {
+        return Err(IsolatedPrepareError::InvalidStack);
+    }
+    if !address_space::entry_is_executable(handle, entry)
+        .map_err(|_| IsolatedPrepareError::NoSuchSpace)?
+    {
+        return Err(IsolatedPrepareError::EntryNotExecutable);
+    }
+    if !address_space::range_is_writable(handle, &stack)
+        .map_err(|_| IsolatedPrepareError::NoSuchSpace)?
+    {
+        return Err(IsolatedPrepareError::StackNotWritable);
+    }
+    let activation = address_space::prepare_activation(handle).map_err(|error| match error {
+        MapError::NoSuchSpace => IsolatedPrepareError::NoSuchSpace,
+        MapError::Retired => IsolatedPrepareError::Retired,
+        _ => IsolatedPrepareError::Unsupported,
+    })?;
+    let owner = address_space::owner(handle).map_err(|error| match error {
+        MapError::NoSuchSpace => IsolatedPrepareError::NoSuchSpace,
+        MapError::Retired => IsolatedPrepareError::Retired,
+        _ => IsolatedPrepareError::Unsupported,
+    })?;
+    Ok(PreparedTransition {
+        handle,
+        activation,
+        entry,
+        stack_top,
+        runtime_slot,
+        interrupts_enabled,
+        fault_token: owner.raw() as usize,
+        entry_args,
+    })
+}
+
 /// 执行一次私有 AS 切换：组件运行在 `transition` 的 root 上，正常返回或由 Core
 /// 判为不可恢复后回到本调用者。
 ///
@@ -185,12 +241,26 @@ pub fn register_fault_policy(policy: FaultPolicy) -> bool {
         .is_ok()
 }
 
-/// 把 [`on_component_fault`] 接上 arch 的 gateway trap 分派。
+/// 把 [`on_component_fault`] 接上 arch 的 gateway trap 分派，并把
+/// [`on_exception`] 接上**普通** Core trap 路径的异常钩子。
 ///
-/// `isolated_lifecycle` 与 ArchTest 各自接线；未接线时 gateway 里的组件异常
-/// 保持 fatal（arch 的默认）。
+/// `isolated_lifecycle` 与 ArchTest 各自接线；未接线时普通异常保持 fatal。
 pub fn install() {
     gateway::register_component_fault_handler(on_component_fault);
+    arch::riscv::trap::register_exception_hook(on_exception);
+}
+
+/// 普通 Core trap 路径上的异常判决（Core 钩子）。
+///
+/// 组件在 Isolated AS 里运行时，异常走普通 `trap_vec`（Core 映射在每个实例 AS
+/// 里相同，Core trap 栈也共享），因此归属必须在这里做：只有存在**匹配的
+/// 可恢复上下文**时才能恢复；否则一律 fatal（返回 `false` = panic）。
+///
+/// 当前没有跨 AS 可恢复上下文（Isolated 的 create / destroy / service 边界
+/// 仍由 gateway 的专用 trap 路径收敛），因此拒绝一切异常：保持"组件身份本身
+/// 不是可恢复的证明"这一默认。
+fn on_exception(_frame: *mut TrapFrame, _cause: usize, _stval: usize) -> bool {
+    false
 }
 
 /// arch 交给 Core 的组件故障入口（窄钩子；见模块文档）。

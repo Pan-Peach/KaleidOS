@@ -340,7 +340,16 @@ fn place_at(
 
     let region = memory::alloc_region(image_size)
         .map_err(|_| IsolatedLoadError::Loader(LoaderError::OutOfMemory))?;
+    // 别名排除：镜像 backing 是组件私有的——从所有活着的 Isolated root 里摘掉它
+    // 的 identity 别名，并排除出后续 root 的共享计划（常驻 extent 跨逻辑重启保留）。
     let physical_base = region.base();
+    crate::memory::kernel_mappings::publish_private_backing(
+        crate::memory::address_space::PhysicalRange {
+            base: physical_base,
+            size: region.size(),
+        },
+    )
+    .map_err(IsolatedLoadError::Map)?;
     // SAFETY: region 刚从 buddy heap 独占分配，长度 = image_size；identity/low-alias
     // 视图在目标由 boot 建立，host 测试里就是宿主指针——与 KernelNative loader 的
     // 既有放段方式相同（`loader.rs::load_component`）。

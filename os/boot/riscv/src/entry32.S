@@ -51,7 +51,7 @@ _start:
 .section .bss.stack
 .align 12
 boot_stack:
-    .space 4096*4
+    .space 65536
 boot_stack_top:
 
 .section .bss.early_root

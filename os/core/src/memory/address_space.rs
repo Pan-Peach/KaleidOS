@@ -190,7 +190,12 @@ pub struct KernelAddressSpace<B: AddressSpaceBackend> {
     generation: u32,
     owner: ComponentId,
     state: AddressSpaceState,
+    /// 组件私有的映射（release / 生命周期语义只作用于这一份）。
     mappings: alloc::vec::Vec<Mapping>,
+    /// **共享 Core 映射**：由 boot 的映射计划落进本 AS，same VA → same PA 与
+    /// 内核 root 一致。私有 `map` 必须避开它；`mapping_exact`（release 依据）
+    /// 绝不返回它；只有别名排除事务能摘掉其中的 identity 段。
+    shared: alloc::vec::Vec<Mapping>,
     backend: B,
 }
 
@@ -202,6 +207,7 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
             owner,
             state: AddressSpaceState::Ready,
             mappings: alloc::vec::Vec::new(),
+            shared: alloc::vec::Vec::new(),
             backend,
         }
     }
@@ -229,6 +235,157 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
 
     pub fn mappings(&self) -> &[Mapping] {
         &self.mappings
+    }
+
+    /// 共享 Core 映射（诊断 / 断言 / 别名排除）。
+    pub fn shared_mappings(&self) -> &[Mapping] {
+        &self.shared
+    }
+
+    /// 共享映射里覆盖 `va` 的那一条（含包含关系；诊断用）。
+    pub fn shared_mapping_at(&self, va: usize) -> Option<&Mapping> {
+        self.shared
+            .iter()
+            .find(|m| range_contains(&m.virtual_range, va, 1))
+    }
+
+    /// `va` 是否落在一条**组件私有且可执行**的映射里（故障归属用：共享 Core
+    /// .text 里的故障是 Core bug，不是组件故障）。
+    pub fn private_executable_at(&self, va: usize) -> bool {
+        self.mappings.iter().any(|m| {
+            range_contains(&m.virtual_range, va, 1)
+                && m.permission.contains(MappingPermission::EXECUTE)
+        })
+    }
+
+    /// `va` 是否落在一条可执行映射里（私有或共享）。
+    pub fn entry_is_executable(&self, va: usize) -> bool {
+        self.mappings.iter().chain(self.shared.iter()).any(|m| {
+            range_contains(&m.virtual_range, va, 1)
+                && m.permission.contains(MappingPermission::EXECUTE)
+        })
+    }
+
+    /// `range` 是否被**单条** READ|WRITE 映射（私有或共享）完整覆盖。
+    pub fn range_is_writable(&self, range: &VirtualRange) -> bool {
+        self.mappings.iter().chain(self.shared.iter()).any(|m| {
+            range_contains(&m.virtual_range, range.base, range.size)
+                && m.permission.contains(MappingPermission::READ)
+                && m.permission.contains(MappingPermission::WRITE)
+        })
+    }
+
+    /// 登记一条共享 Core 映射（boot 计划在建立 AS 时落进 root）。
+    ///
+    /// 与私有映射同规则校验（非空、等长、页对齐、不溢出、VA 不重叠），
+    /// 额外要求不与任何**私有**映射重叠——共享计划先落，私有映射后落。
+    pub fn add_shared(&mut self, mapping: Mapping) -> Result<(), MapError> {
+        self.ensure_ready()?;
+        self.validate(&mapping)?;
+        let (va, pa, perm) = mapping.backend_parts();
+        self.backend
+            .map(va, pa, perm)
+            .map_err(|_| MapError::BackendFailed)?;
+        self.shared.push(mapping);
+        Ok(())
+    }
+
+    /// **私有 backing 别名排除**：把 `extent` 对应的 identity 段从本 AS 的共享
+    /// 映射里摘掉（后端清 PTE + 真相切段）。
+    ///
+    /// 只作用于 **VA == PA** 的共享记录；非 identity 记录与 `extent` 物理重叠
+    /// 说明共享计划本身有别名泄漏——拒绝（不触碰任何映射）。
+    ///
+    /// 返回摘除的字节数；`extent` 不属于本 AS 的共享 identity 映射时返回 `Ok(0)`。
+    pub fn exclude_identity_alias(&mut self, extent: &PhysicalRange) -> Result<usize, MapError> {
+        self.ensure_ready()?;
+        if extent.size == 0 || !is_aligned::<B>(extent.base) || !is_aligned::<B>(extent.size) {
+            return Err(MapError::Unaligned);
+        }
+        let Some(extent_end) = extent.base.checked_add(extent.size) else {
+            return Err(MapError::AddressOverflow);
+        };
+
+        // 先规划：计算每条 identity 记录要切成哪几段、要撤哪一段 PTE。
+        struct Cut {
+            index: usize,
+            remove: VirtualRange,
+            left: Option<Mapping>,
+            right: Option<Mapping>,
+        }
+        let mut cuts: alloc::vec::Vec<Cut> = alloc::vec::Vec::new();
+        let mut removed = 0usize;
+        for (index, entry) in self.shared.iter().enumerate() {
+            let vr = entry.virtual_range;
+            let pr = entry.physical_range;
+            let identity = vr.base == pr.base && vr.size == pr.size;
+            let Some(pa_end) = pr.base.checked_add(pr.size) else {
+                return Err(MapError::AddressOverflow);
+            };
+            if extent.base >= pa_end || pr.base >= extent_end {
+                continue;
+            }
+            if !identity {
+                // 真实别名泄漏：非 identity 共享映射碰到私有 extent。
+                return Err(MapError::Overlap);
+            }
+            let cut_start = extent.base.max(pr.base);
+            let cut_end = extent_end.min(pa_end);
+            let remove = VirtualRange {
+                base: cut_start,
+                size: cut_end - cut_start,
+            };
+            let left = (pr.base < cut_start).then(|| Mapping {
+                virtual_range: VirtualRange {
+                    base: pr.base,
+                    size: cut_start - pr.base,
+                },
+                physical_range: PhysicalRange {
+                    base: pr.base,
+                    size: cut_start - pr.base,
+                },
+                permission: entry.permission,
+            });
+            let right = (cut_end < pa_end).then(|| Mapping {
+                virtual_range: VirtualRange {
+                    base: cut_end,
+                    size: pa_end - cut_end,
+                },
+                physical_range: PhysicalRange {
+                    base: cut_end,
+                    size: pa_end - cut_end,
+                },
+                permission: entry.permission,
+            });
+            removed += remove.size;
+            cuts.push(Cut {
+                index,
+                remove,
+                left,
+                right,
+            });
+        }
+        if cuts.is_empty() {
+            return Ok(0);
+        }
+
+        // 后端先撤（失败不触碰真相），再从后往前切真相记录。
+        for cut in &cuts {
+            self.backend
+                .unmap(cut.remove)
+                .map_err(|_| MapError::BackendFailed)?;
+        }
+        for cut in cuts.into_iter().rev() {
+            let mut replacement: alloc::vec::Vec<Mapping> = alloc::vec::Vec::new();
+            if let Some(left) = cut.left {
+                replacement.push(left);
+            }
+            if let Some(right) = cut.right {
+                replacement.push(right);
+            }
+            self.shared.splice(cut.index..=cut.index, replacement);
+        }
+        Ok(removed)
     }
 
     /// **精确查询**：只匹配虚拟区间**完全相等**的已记录映射（不做包含 / 部分
@@ -278,6 +435,13 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
             .checked_add(pr.size)
             .ok_or(MapError::AddressOverflow)?;
         for m in &self.mappings {
+            if ranges_overlap(&m.virtual_range, &vr) {
+                return Err(MapError::Overlap);
+            }
+        }
+        // 私有映射必须避开共享 Core 映射：共享区不是组件资源，绝不能被
+        // 组件私有映射覆盖 / 挤掉（别名排除是唯一的共享区 mutation）。
+        for m in &self.shared {
             if ranges_overlap(&m.virtual_range, &vr) {
                 return Err(MapError::Overlap);
             }
@@ -445,6 +609,72 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
             .unmap(range)
     }
 
+    /// 在已登记的空间上落一条**共享 Core 映射**（boot 计划建立 AS 时用）。
+    pub fn add_shared(
+        &mut self,
+        handle: AddressSpaceHandle,
+        mapping: Mapping,
+    ) -> Result<(), MapError> {
+        self.get_mut(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .add_shared(mapping)
+    }
+
+    /// 只读：某空间的共享 Core 映射。
+    pub fn shared_mappings(&self, handle: AddressSpaceHandle) -> Result<&[Mapping], MapError> {
+        Ok(self
+            .get(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .shared_mappings())
+    }
+
+    /// 摘除某空间里 `extent` 的 identity 别名（别名排除事务的逐空间一步）。
+    pub fn exclude_identity_alias(
+        &mut self,
+        handle: AddressSpaceHandle,
+        extent: &PhysicalRange,
+    ) -> Result<usize, MapError> {
+        self.get_mut(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .exclude_identity_alias(extent)
+    }
+
+    /// `va` 是否落在该空间的组件私有可执行映射内（故障归属）。
+    pub fn private_executable_at(
+        &self,
+        handle: AddressSpaceHandle,
+        va: usize,
+    ) -> Result<bool, MapError> {
+        Ok(self
+            .get(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .private_executable_at(va))
+    }
+
+    /// `va` 是否落在可执行映射（私有或共享）内。
+    pub fn entry_is_executable(
+        &self,
+        handle: AddressSpaceHandle,
+        va: usize,
+    ) -> Result<bool, MapError> {
+        Ok(self
+            .get(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .entry_is_executable(va))
+    }
+
+    /// `range` 是否被单条可写映射（私有或共享）覆盖。
+    pub fn range_is_writable(
+        &self,
+        handle: AddressSpaceHandle,
+        range: &VirtualRange,
+    ) -> Result<bool, MapError> {
+        Ok(self
+            .get(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .range_is_writable(range))
+    }
+
     /// 精确查询一条已记录映射（只读；返回 `Copy` 快照）。
     pub fn mapping_exact(
         &self,
@@ -525,6 +755,7 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         let entry_mapping = space
             .mappings()
             .iter()
+            .chain(space.shared_mappings())
             .find(|m| range_contains(&m.virtual_range, entry, 1));
         match entry_mapping {
             Some(mapping) if mapping.permission.contains(MappingPermission::EXECUTE) => {}
@@ -533,6 +764,7 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         let stack_mapping = space
             .mappings()
             .iter()
+            .chain(space.shared_mappings())
             .find(|m| range_contains(&m.virtual_range, stack.base, stack.size));
         match stack_mapping {
             Some(mapping)
@@ -595,8 +827,9 @@ fn rollback_new_gateway_pages<B: AddressSpaceBackend>(
 ))]
 mod active {
     use super::{
-        AddressSpaceBackend, AddressSpaceHandle, AddressSpaceManager, DualMappedPage,
-        IsolatedPrepareError, MapError, Mapping, PreparedActivation, VirtualRange,
+        AddressSpaceBackend, AddressSpaceHandle, AddressSpaceManager, AddressSpaceState,
+        DualMappedPage, IsolatedPrepareError, MapError, Mapping, PhysicalRange, PreparedActivation,
+        VirtualRange,
     };
     use crate::component::ComponentId;
 
@@ -618,8 +851,9 @@ mod active {
     /// 为一个实例建立私有地址空间（Isolated 域）。后端用 Core 注入的 `PageAlloc`
     /// （`memory::vm_page_alloc`）分配页表页。
     ///
-    /// NoMMU 等没有私有 AS 能力的 profile **显式拒绝**（`MapError::Unsupported`），
-    /// 绝不把恒等翻译当成私有地址空间使用。
+    /// NoMMU 等没有私有 AS 能力的 profile **显式拒绝**（`MapError::Unsupported`）。
+    /// 本函数不落共享 Core 映射（旧执行模型）；共享模型的入口是
+    /// [`create_isolated_address_space_for`]。
     pub fn create_address_space_for(owner: ComponentId) -> Result<AddressSpaceHandle, MapError> {
         if !isolation_capable() {
             return Err(MapError::Unsupported);
@@ -628,6 +862,35 @@ mod active {
             <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
                 .map_err(|_| MapError::BackendFailed)?;
         Ok(SPACES.lock().create(owner, backend))
+    }
+
+    /// 为一个实例建立**共享 Core 映射**下的私有地址空间（Isolated 域）。
+    ///
+    /// = boot 映射计划里的共享 Core 映射（same VA → same PA 落进新 root）+
+    /// 该实例自己的私有映射（调用方随后 `map`）。共享映射先落：私有 `map`
+    /// 与共享区重叠会被 Core 拒绝（共享区不是组件资源）。
+    ///
+    /// 任一条共享映射落不进（重叠 / 后端失败）→ 退役该空间并显式失败，
+    /// 绝不留半个共享映射集。
+    pub fn create_isolated_address_space_for(
+        owner: ComponentId,
+    ) -> Result<AddressSpaceHandle, MapError> {
+        if !isolation_capable() {
+            return Err(MapError::Unsupported);
+        }
+        let backend =
+            <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
+                .map_err(|_| MapError::BackendFailed)?;
+        let handle = SPACES.lock().create(owner, backend);
+        let shared = crate::memory::kernel_mappings::shared_mappings();
+        for mapping in shared {
+            let result = SPACES.lock().add_shared(handle, mapping);
+            if let Err(error) = result {
+                let _ = SPACES.lock().retire(handle);
+                return Err(error);
+            }
+        }
+        Ok(handle)
     }
 
     /// 接管一个已存在的后端（见 [`AddressSpaceManager::adopt`]）。
@@ -646,6 +909,62 @@ mod active {
     /// 在已建立的地址空间上落一段映射（Core 验证 → 后端写 PTE → Core 记录真相）。
     pub fn map(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
         SPACES.lock().map(handle, mapping)
+    }
+
+    /// 在已建立的地址空间上落一条**共享 Core 映射**（boot 计划；Isolated AS
+    /// 创建时由 Core 逐条落进新 root）。
+    pub fn add_shared(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
+        SPACES.lock().add_shared(handle, mapping)
+    }
+
+    /// 某空间的共享 Core 映射快照（诊断 / 断言）。
+    pub fn shared_mappings(
+        handle: AddressSpaceHandle,
+    ) -> Result<alloc::vec::Vec<Mapping>, MapError> {
+        Ok(SPACES.lock().shared_mappings(handle)?.to_vec())
+    }
+
+    /// 摘除某空间里 `extent` 的 identity 别名（私有 backing 别名排除）。
+    pub fn exclude_identity_alias(
+        handle: AddressSpaceHandle,
+        extent: &PhysicalRange,
+    ) -> Result<usize, MapError> {
+        SPACES.lock().exclude_identity_alias(handle, extent)
+    }
+
+    /// `va` 是否落在该空间的组件私有可执行映射内（故障归属）。
+    pub fn is_private_executable(handle: AddressSpaceHandle, va: usize) -> Result<bool, MapError> {
+        SPACES.lock().private_executable_at(handle, va)
+    }
+
+    /// `va` 是否落在可执行映射（私有或共享）内。
+    pub fn entry_is_executable(handle: AddressSpaceHandle, va: usize) -> Result<bool, MapError> {
+        SPACES.lock().entry_is_executable(handle, va)
+    }
+
+    /// `range` 是否被单条可写映射（私有或共享）覆盖。
+    pub fn range_is_writable(
+        handle: AddressSpaceHandle,
+        range: &VirtualRange,
+    ) -> Result<bool, MapError> {
+        SPACES.lock().range_is_writable(handle, range)
+    }
+
+    /// **别名排除事务的逐空间一步**：把 `extent` 的 identity 别名从**所有**
+    /// 已存在的 Isolated root 里摘掉（创建 B 之后，A 先前装上的 identity 映射
+    /// 不能再看穿 B 的 backing）。
+    pub fn exclude_identity_alias_from_live_spaces(extent: PhysicalRange) -> Result<(), MapError> {
+        let mut spaces = SPACES.lock();
+        let handles: alloc::vec::Vec<AddressSpaceHandle> = spaces
+            .spaces()
+            .iter()
+            .filter(|space| space.state() == AddressSpaceState::Ready)
+            .map(|space| space.handle())
+            .collect();
+        for handle in handles {
+            spaces.exclude_identity_alias(handle, &extent)?;
+        }
+        Ok(())
     }
 
     /// 按精确区间解映射（release 路径按"当初 acquire 的精确 extent"回找）。
@@ -712,8 +1031,11 @@ mod active {
     )
 ))]
 pub use active::{
-    ActiveActivation, AddressSpaceImpl, adopt, create_address_space_for, isolation_capable, map,
-    mapping_exact, owner, prepare_activation, prepare_transition, retire, translate, unmap,
+    ActiveActivation, AddressSpaceImpl, add_shared, adopt, create_address_space_for,
+    create_isolated_address_space_for, entry_is_executable, exclude_identity_alias,
+    exclude_identity_alias_from_live_spaces, is_private_executable, isolation_capable, map,
+    mapping_exact, owner, prepare_activation, prepare_transition, range_is_writable, retire,
+    shared_mappings, translate, unmap,
 };
 
 /// 无后端构建（host test）：没有可用的私有地址空间实现——能力恒为 `false`，
@@ -741,6 +1063,20 @@ pub fn create_address_space_for(_owner: ComponentId) -> Result<AddressSpaceHandl
     Err(MapError::BackendFailed)
 }
 
+/// 无后端构建（host）：没有可用的共享映射私有 AS——显式失败。
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn create_isolated_address_space_for(
+    _owner: ComponentId,
+) -> Result<AddressSpaceHandle, MapError> {
+    Err(MapError::BackendFailed)
+}
+
 #[cfg(not(any(
     feature = "vm-nommu",
     all(
@@ -764,6 +1100,18 @@ pub fn map(_handle: AddressSpaceHandle, _mapping: Mapping) -> Result<(), MapErro
 )))]
 pub fn unmap(_handle: AddressSpaceHandle, _range: &VirtualRange) -> Result<(), MapError> {
     Err(MapError::BackendFailed)
+}
+
+/// 无后端构建（host）：没有活的 Isolated root，别名排除事务没有可摘的映射。
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn exclude_identity_alias_from_live_spaces(_extent: PhysicalRange) -> Result<(), MapError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1777,6 +2125,125 @@ mod tests {
         assert_eq!(
             AddressSpaceHandle::from_raw(handle.raw_id(), handle.raw_generation()),
             handle
+        );
+    }
+
+    // -- 共享 Core 映射与私有 backing 的别名排除 ------------------------------
+
+    /// 私有映射不得与共享 Core 映射重叠：共享区不是组件资源。
+    #[test]
+    fn private_map_cannot_overlap_shared_core_mapping() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let shared = mapping(0x8000_0000, 4 * VM_PAGE, rw());
+        manager.add_shared(handle, shared).unwrap();
+        assert_eq!(
+            manager.map(handle, mapping(0x8000_1000, VM_PAGE, rw())),
+            Err(MapError::Overlap)
+        );
+        // `mapping_exact` 只回答私有映射：release 依据绝不返回共享 Core 内存。
+        assert_eq!(
+            manager
+                .mapping_exact(handle, &shared.virtual_range)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            manager.shared_mappings(handle).unwrap(),
+            &[shared],
+            "共享映射可只读查询"
+        );
+    }
+
+    /// 别名排除：identity 共享映射被切成两段，被排除的页允许私有映射（创建 B
+    /// 之后 A 先前装上的 identity 映射不能看到 B 的 backing）。
+    #[test]
+    fn exclude_identity_alias_carves_the_extent_then_allows_private_mapping() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let shared = mapping(0x8000_0000, 4 * VM_PAGE, rw());
+        manager.add_shared(handle, shared).unwrap();
+
+        let extent = PhysicalRange {
+            base: 0x8000_1000,
+            size: VM_PAGE,
+        };
+        assert_eq!(
+            manager.exclude_identity_alias(handle, &extent).unwrap(),
+            VM_PAGE
+        );
+        let remaining = manager.shared_mappings(handle).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            remaining[0].virtual_range,
+            VirtualRange {
+                base: 0x8000_0000,
+                size: VM_PAGE
+            }
+        );
+        assert_eq!(
+            remaining[1].virtual_range,
+            VirtualRange {
+                base: 0x8000_2000,
+                size: 2 * VM_PAGE
+            }
+        );
+        // 后端真的撤了那一段（TLB 刷新的前提在真实 backend 里）。
+        assert_eq!(
+            manager.get(handle).unwrap().backend.unmapped,
+            alloc::vec![VirtualRange {
+                base: 0x8000_1000,
+                size: VM_PAGE
+            }]
+        );
+        // 被排除的页现在是自由的，可落私有映射（私有 backing 的正式位置）。
+        manager
+            .map(
+                handle,
+                Mapping {
+                    virtual_range: VirtualRange {
+                        base: 0x8000_1000,
+                        size: VM_PAGE,
+                    },
+                    physical_range: PhysicalRange {
+                        base: 0x9900_0000,
+                        size: VM_PAGE,
+                    },
+                    permission: rw(),
+                },
+            )
+            .unwrap();
+        // 重复排除同一 extent：无 identity 记录可摘 → Ok(0)，幂等。
+        assert_eq!(manager.exclude_identity_alias(handle, &extent).unwrap(), 0);
+    }
+
+    /// 非 identity 共享映射与排除 extent 物理重叠 = 真实别名泄漏：拒绝。
+    #[test]
+    fn exclude_identity_alias_rejects_a_real_alias_leak() {
+        let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
+        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        // VA 高半区，PA 落在 RAM：不是 identity 映射。
+        let shared = Mapping {
+            virtual_range: VirtualRange {
+                base: 0xffff_ffc0_8020_0000,
+                size: VM_PAGE,
+            },
+            physical_range: PhysicalRange {
+                base: 0x8020_0000,
+                size: VM_PAGE,
+            },
+            permission: MappingPermission::READ | MappingPermission::EXECUTE,
+        };
+        manager.add_shared(handle, shared).unwrap();
+        assert_eq!(
+            manager.exclude_identity_alias(
+                handle,
+                &PhysicalRange {
+                    base: 0x8020_0000,
+                    size: VM_PAGE
+                }
+            ),
+            Err(MapError::Overlap)
         );
     }
 

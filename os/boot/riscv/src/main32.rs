@@ -82,6 +82,21 @@ fn configure_interrupt_controller(info: &MachineInfo) {
     kernel::log!("discovery", "no PLIC found; external IRQ unavailable");
 }
 
+/// 切换到长期 RV32 root：替换 `entry32.S` 的全量 executable identity bootstrap
+/// root，并把语义分类的映射计划交给 Core（`vm-mmu` profile）。
+#[cfg(feature = "vm-mmu")]
+fn install_runtime_root(info: &MachineInfo, kernel_pa: usize) {
+    let layout = crate::vm32::layout::kernel_layout32();
+    match crate::vm32::runtime::init(&layout, kernel_pa, info) {
+        Ok(()) => kernel::log!("bootstrap", "RV32 runtime Sv32 root active"),
+        Err(error) => panic!("RV32 runtime mapping failed: {:?}", error),
+    }
+}
+
+/// NoMMU profile 没有页表：identity flat view 就是长期 root。
+#[cfg(feature = "vm-nommu")]
+fn install_runtime_root(_info: &MachineInfo, _kernel_pa: usize) {}
+
 fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
     let tree = unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) }.map_err(|_| ())?;
     let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
@@ -181,6 +196,9 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         if let Err(error) = kernel::init(&info, &reserved) {
             panic!("core init failed: {}", error);
         }
+        // 长期 root：buddy 可用后替换 bootstrap 的全量 executable identity root，
+        // 并把映射计划交给 Core（Isolated AS 只从计划取共享 Core 映射）。
+        install_runtime_root(&info, kernel_pa);
         // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
         let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
         let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
@@ -192,6 +210,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     {
         match kernel::init(&info, &reserved) {
             Ok(()) => {
+                install_runtime_root(&info, kernel_pa);
                 kernel::log!("bootstrap", "RV32 CORE OK");
                 let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
                 let pkg =

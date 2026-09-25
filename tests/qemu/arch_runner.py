@@ -85,6 +85,13 @@ CASES = (
     ("isolated-perm-text", None, "scause=0xf"),
     ("isolated-perm-data", None, "scause=0xc"),
     ("isolated-core-unreachable", None, "scause=0xd"),
+    # The shared-Core-mapping model: every Isolated AS carries the same Core
+    # mappings at the same VA -> PA; private backing is excluded from the
+    # identity aliases of every live root; Core code is callable directly from
+    # the instance root with no satp switch.
+    ("isolated-shared-mappings", None, "isolated-shared-mappings: same VA->PA"),
+    ("isolated-private-unreachable", None, "isolated-private-unreachable: privacy held"),
+    ("isolated-core-direct", None, "isolated-core-direct: direct OK"),
     # The Isolated lifecycle end-to-end through the
     # production entry points.  `isolated-lifecycle` creates a real `.kcomp`
     # instance via `create_component(.., IsolatedNative)`, proves its

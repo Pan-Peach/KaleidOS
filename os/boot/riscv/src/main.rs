@@ -20,6 +20,11 @@ mod rv64;
 #[path = "vm/mod.rs"]
 pub(crate) mod vm;
 
+// RV32 长期地址空间：bootstrap 的 4 GiB identity root 之后的真实 runtime root。
+#[cfg(all(target_arch = "riscv32", feature = "vm-mmu"))]
+#[path = "vm32/mod.rs"]
+pub(crate) mod vm32;
+
 #[cfg(feature = "selftest")]
 #[path = "selftest.rs"]
 mod selftest;

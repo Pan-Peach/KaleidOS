@@ -1,14 +1,48 @@
 .align 2
 .global trap_vec
 trap_vec:
-    addi sp, sp, -272
+    # Stack-safe trap entry (single convention for Core and component code).
+    #
+    # Outside handling `sscratch` holds the safe Core trap-stack top.  On an
+    # outer trap we switch to it BEFORE writing anything through the interrupted
+    # `sp` (whose contents may not be valid in Core context), preserving the
+    # interrupted sp in `TrapFrame.x[2]`.  While handling, `sscratch` is zero:
+    # a nested trap stays on the safe stack (no switch).
+    #
+    # The frame is 272 bytes (TrapFrame) plus one marker word at 272 holding the
+    # `sscratch` value to restore on `sret` (safe top for an outer trap, 0 for a
+    # nested one).  The allocation is 288 bytes so the ABI keeps `sp` 16-byte
+    # aligned.
+    csrrw sp, sscratch, sp
+    beqz sp, .Lnested
 
-    sd ra, 8(sp)
-    sd gp, 24(sp)
-    sd tp, 32(sp)
+    # ---- outer trap: interrupted stack is not the safe trap stack ----
+    addi sp, sp, -288
     sd t0, 40(sp)
     sd t1, 48(sp)
     sd t2, 56(sp)
+    csrr t0, sscratch            # t0 = interrupted sp
+    sd t0, 16(sp)                # frame.x[2] = interrupted sp
+    addi t0, sp, 288             # t0 = safe trap-stack top
+    sd t0, 272(sp)               # outer: reinstall it on sret
+    csrw sscratch, zero          # nested convention while handling
+    j .Lsave_rest
+
+.Lnested:
+    # ---- nested trap: already on the safe trap stack ----
+    csrrw sp, sscratch, sp       # sp := interrupted sp, sscratch := 0
+    addi sp, sp, -288
+    sd t0, 40(sp)
+    sd t1, 48(sp)
+    sd t2, 56(sp)
+    addi t0, sp, 288
+    sd t0, 16(sp)                # frame.x[2] = interrupted sp
+    sd zero, 272(sp)             # nested: stay on the safe stack
+
+.Lsave_rest:
+    sd ra, 8(sp)
+    sd gp, 24(sp)
+    sd tp, 32(sp)
     sd s0, 64(sp)
     sd s1, 72(sp)
     sd a0, 80(sp)
@@ -33,9 +67,6 @@ trap_vec:
     sd t4, 232(sp)
     sd t5, 240(sp)
     sd t6, 248(sp)
-
-    addi t0, sp, 272
-    sd t0, 16(sp)
 
     csrr t0, sstatus
     sd t0, 256(sp)
@@ -83,5 +114,10 @@ trap_vec:
     ld t5, 240(sp)
     ld t6, 248(sp)
 
+    # Restore the sscratch convention: safe top after an outer trap, 0 while
+    # nested handling continues, then the interrupted sp / t0.
+    ld t0, 272(sp)
+    csrw sscratch, t0
+    ld t0, 40(sp)
     ld sp, 16(sp)
     sret

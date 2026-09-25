@@ -1,22 +1,15 @@
-# ArchTest fixture (RV64): the "component" that runs in a
+# ArchTest fixture (RV32): the "component" that runs in a
 # private address space.
 #
-# 白色盒测试夹具：每个入口都只在**实例 AS** 里执行，只访问实例 AS 映射的 VA。
-# 整页由测试映射进实例 AS（同 VA → 同 PA），`.balign 4096` 起止保证页独占。
-#
-#   CTL  = 0x30000000  控制页（RW；Core 通过 identity PA 视图观察）
-#   DATA = 0x30001000  惰性数据页（初始不映射；fault 用例由 Core 策略补映射）
-#
-# 控制页按 usize 槽布局（本文件固定 8 字节槽；Rust 侧用槽号索引）：
-#   0  magic            1 satp（组件观察到的）  2 resume flag
-#   3  loop iterations  4 data（补映射后读回）
+# 与 isolated64.S 同形，只有 XLEN 宽度差异（sw/lw、4 字节槽）。控制页按 usize
+# 槽布局：0 magic / 1 satp / 2 resume flag / 3 iterations / 4 data。
 
 .equ CTL_VA,   0x30000000
 .equ CTL_MAGIC, 0
-.equ CTL_SATP,  8
-.equ CTL_FLAG,  16
-.equ CTL_ITER,  24
-.equ CTL_DATA,  32
+.equ CTL_SATP,  4
+.equ CTL_FLAG,  8
+.equ CTL_ITER,  12
+.equ CTL_DATA,  16
 
 .section .text.isolated_fixture,"ax"
 .balign 4096
@@ -31,9 +24,9 @@ isolated_fixture_start:
 isolated_roundtrip_entry:
     li t0, CTL_VA
     li t1, 0x5151
-    sd t1, CTL_MAGIC(t0)
+    sw t1, CTL_MAGIC(t0)
     csrr t2, satp
-    sd t2, CTL_SATP(t0)
+    sw t2, CTL_SATP(t0)
     li a0, 0x5a
     ret
 
@@ -45,13 +38,13 @@ isolated_roundtrip_entry:
 isolated_timer_entry:
     li t0, CTL_VA
     li t1, 0x5b5b
-    sd t1, CTL_MAGIC(t0)
+    sw t1, CTL_MAGIC(t0)
     csrr t2, satp
-    sd t2, CTL_SATP(t0)
+    sw t2, CTL_SATP(t0)
     li t1, 0
     li t3, 0x04000000
 .Ltimer_wait:
-    ld t2, CTL_FLAG(t0)
+    lw t2, CTL_FLAG(t0)
     bnez t2, .Ltimer_resumed
     addi t1, t1, 1
     addi t3, t3, -1
@@ -59,7 +52,7 @@ isolated_timer_entry:
     li a0, 0xdead
     ret
 .Ltimer_resumed:
-    sd t1, CTL_ITER(t0)
+    sw t1, CTL_ITER(t0)
     li a0, 0x5b
     ret
 
@@ -72,12 +65,12 @@ isolated_timer_entry:
 isolated_fault_entry:
     li t0, CTL_VA
     li t1, 0x5c5c
-    sd t1, CTL_MAGIC(t0)
+    sw t1, CTL_MAGIC(t0)
     csrr t2, satp
-    sd t2, CTL_SATP(t0)
+    sw t2, CTL_SATP(t0)
     li t2, 0x30001000
-    ld t1, 0(t2)           # 未映射 → fault；policy 补映射后本指令重试成功
-    sd t1, CTL_DATA(t0)
+    lw t1, 0(t2)           # 未映射 → fault；policy 补映射后本指令重试成功
+    sw t1, CTL_DATA(t0)
     li a0, 0x5c
     ret
 
@@ -92,6 +85,27 @@ isolated_abandon_entry:
     li a0, 0xdead
     ret
 
+
+# ---------------------------------------------------------------------------
+# core-direct：Core 代码在实例 AS 里被**直接调用**（无 satp 切换）——组件调用
+# Core Rust 探针，探针记录 satp / sp / Core static 并把 marker 返回。
+# ---------------------------------------------------------------------------
+.align 2
+.global isolated_core_direct_entry
+isolated_core_direct_entry:
+    li t0, CTL_VA
+    li t1, 0x5d5d
+    sw t1, CTL_MAGIC(t0)
+    csrr t2, satp
+    sw t2, CTL_SATP(t0)
+    mv s0, ra                  # preserve the gateway return address across the Core call
+    call selftest_core_direct_probe
+    mv ra, s0
+    li t0, CTL_VA
+    sw a0, CTL_DATA(t0)
+    li a0, 0x5d
+    ret
+
 .global isolated_fixture_end
 isolated_fixture_end:
 # 页独占：对齐 + 显式多占一整页（`.balign` 不改段大小），保证首页只有夹具代码。
@@ -99,16 +113,14 @@ isolated_fixture_end:
 .space 4096
 
 # ---------------------------------------------------------------------------
-# 同步往返的寄存器纪律探针（核心 AS；Core 代码）：
-# 设 s0-s11 / tp 为魔数 → 调 driver（内部走 gateway + 组件）→ 读回并存静态。
-# gp 只做"保存 / 比较"（本镜像没有 __global_pointer$，不故意设置它）。
+# 同步往返的寄存器纪律探针（核心 AS；Core 代码）
 # ---------------------------------------------------------------------------
 .section .text,"ax"
 .global isolated_roundtrip_probe
 .align 2
 isolated_roundtrip_probe:
     la t0, ISOLATED_GP_BEFORE
-    sd gp, 0(t0)
+    sw gp, 0(t0)
     li s0, 0x101
     li s1, 0x102
     li s2, 0x103
@@ -124,24 +136,24 @@ isolated_roundtrip_probe:
     li tp, 0x707
     call isolated_roundtrip_driver
     la t0, ISOLATED_S_REGS
-    sd s0, 0(t0)
-    sd s1, 8(t0)
-    sd s2, 16(t0)
-    sd s3, 24(t0)
-    sd s4, 32(t0)
-    sd s5, 40(t0)
-    sd s6, 48(t0)
-    sd s7, 56(t0)
-    sd s8, 64(t0)
-    sd s9, 72(t0)
-    sd s10, 80(t0)
-    sd s11, 88(t0)
+    sw s0, 0(t0)
+    sw s1, 4(t0)
+    sw s2, 8(t0)
+    sw s3, 12(t0)
+    sw s4, 16(t0)
+    sw s5, 20(t0)
+    sw s6, 24(t0)
+    sw s7, 28(t0)
+    sw s8, 32(t0)
+    sw s9, 36(t0)
+    sw s10, 40(t0)
+    sw s11, 44(t0)
     la t0, ISOLATED_TP_AFTER
-    sd tp, 0(t0)
+    sw tp, 0(t0)
     li tp, 0
     la t0, ISOLATED_GP_MATCH
     la t1, ISOLATED_GP_BEFORE
-    ld t2, 0(t1)
+    lw t2, 0(t1)
     xor t2, t2, gp
-    sd t2, 0(t0)
+    sw t2, 0(t0)
     tail selftest_isolated_roundtrip_resumed
