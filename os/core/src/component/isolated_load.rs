@@ -19,10 +19,11 @@
 //! - **共享**：ELF 解析 / 重定位 / 符号解析 / `kcomp_abi` 值校验（直接复用
 //!   `loader.rs` 的私有 API——同一份 arch 重定位实现，不复制算法）。
 //! - **不复用**：KernelNative 的放段结果（共享内核 AS 的 VA 布局与 import 目标；
-//!   `load.rs::validate_isolated_load` 已在装载前拒绝）。本模块**不调用**
-//!   `loader::load_component`。image 登记走
-//!   [`PlacedImage::into_loaded_component`]（lease 归 image 表），落段在登记之后
-//!   仍可用 [`PlacedImage::mappings`] + [`map_mappings`] 完成。
+//!   `load.rs::create_isolated_native` 已在装载前拒绝 import 面之外的符号）。
+//!   本模块**不调用** `loader::load_component`。[`PlacedImage::into_loaded_component`]
+//!   把结果（lease + 入口）交给声明它的组件（`ComponentRecord.loaded`），落段用
+//!   [`PlacedImage::mappings`] + [`map_mappings`] 完成——每次 instantiate 一份新
+//!   backing。
 //!
 //! # 权限与页分离
 //!
@@ -221,8 +222,8 @@ impl PlacedImage {
 
     /// 全部段的映射清单（按 ELF section 顺序；页级权限分离）。
     ///
-    /// 生命周期接线用它在 **image 登记之后**仍然能把同一份段
-    /// 规划落进实例 AS（lease 归 image 表，规划不携带借用）。
+    /// 生命周期接线用它在 `into_loaded_component`（lease 转移给组件记录）之后仍然
+    /// 能把同一份段规划落进实例 AS（规划不携带借用）。
     pub fn mappings(&self) -> Vec<Mapping> {
         self.segments
             .iter()
@@ -230,10 +231,10 @@ impl PlacedImage {
             .collect()
     }
 
-    /// 转成 image 表登记所需的 [`LoadedComponent`]（lease 随本次转换归 image 表）。
+    /// 转成声明组件所需的 [`LoadedComponent`]（lease 随本次转换归该组件记录）。
     ///
-    /// Isolated image 的 `create` / `destroy` / `service_dispatch` 都是**实例 AS
-    /// 内**的 VA（供 `component/isolated_lifecycle.rs` 经跨 AS trampoline 调用）。
+    /// Isolated 的 `create` / `destroy` / `service_dispatch` 都是**实例 AS 内**的
+    /// VA（供 `component/isolated_lifecycle.rs` 经跨 AS trampoline 调用）。
     pub fn into_loaded_component(self) -> LoadedComponent {
         LoadedComponent {
             base: self.base,
@@ -272,9 +273,9 @@ pub fn map_into(handle: AddressSpaceHandle, image: &PlacedImage) -> Result<(), I
 
 /// 把一条**已记录的映射清单**落进实例 AS（失败即回滚本次已落映射）。
 ///
-/// 与 [`map_into`] 同一机制，只是不携带 [`PlacedImage`]：生命周期接线在 image
-/// 登记（lease 转移给 image 表）之后用它落段。没有私有 AS 能力（NoMMU / 无
-/// backend）时显式拒绝，绝不把恒等翻译当 AS。
+/// 与 [`map_into`] 同一机制，只是不携带 [`PlacedImage`]：生命周期接线在
+/// `into_loaded_component`（lease 转移给组件记录）之后用它落段。没有私有 AS
+/// 能力（NoMMU / 无 backend）时显式拒绝，绝不把恒等翻译当 AS。
 pub fn map_mappings(
     handle: AddressSpaceHandle,
     mappings: &[Mapping],

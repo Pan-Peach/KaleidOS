@@ -107,7 +107,7 @@ pub fn init(
     timer::init_preempt(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
     #[cfg(not(feature = "preempt"))]
     timer::init().map_err(|_| "timer init failed")?;
-    component::image::init();
+
     component::registry::init();
     component::endpoint::init();
     resource::init();

@@ -61,8 +61,8 @@ pub fn create_task(
     if containment::scheduling_forbidden() {
         return Err(TaskError::InvalidTransition);
     }
-    // 锁序：registry → image（先后取得、不嵌套持有）。
-    let image = {
+    // 单锁：provider 自己的 loaded image 就在记录里，无需二次查表。
+    let inside_image = {
         let registry = crate::component::registry::get_registry().lock();
         let record = registry
             .get(requester)
@@ -73,16 +73,9 @@ pub fn create_task(
         ) {
             return Err(TaskError::RequesterNotReady);
         }
-        record.image
-    };
-    let inside_image = {
-        let images = crate::component::image::get_images().lock();
-        let Some(image) = images.get(image) else {
-            // image 未登记（不应发生：Ready 实例必然有常驻 image）。
-            return Err(TaskError::EntryOutOfImage);
-        };
-        let region = image.memory.region();
-        entry >= region.base && entry < region.base + region.size
+        let base = record.loaded.base;
+        let end = base + record.loaded.text_size;
+        entry >= base && entry < end
     };
     if !inside_image {
         return Err(TaskError::EntryOutOfImage);
@@ -144,41 +137,37 @@ fn halt() -> ! {
 mod tests {
     use super::*;
     use crate::component::endpoint::ExecutionDomain;
-    use crate::component::image::{self, ComponentImageId};
     use crate::component::registry;
     use crate::memory::test_support;
 
-    /// 全局表（registry / image / task）是进程级 `Once`，`init()` 幂等。会分配装载
-    /// 镜像 lease / kstack 的用例必须持有 memory GUARD，串行化全局堆。组件名**每例
-    /// 唯一**，避免与其它用例撞名导致 image 复用（image 身份是每名字一份）。
+    /// 全局表（registry / task）是进程级 `Once`，`init()` 幂等。会分配装载
+    /// 镜像 lease / kstack 的用例必须持有 memory GUARD，串行化全局堆。
     fn setup() -> test_support::Guard<'static> {
         registry::init();
-        image::init();
         crate::task::init();
         let guard = test_support::GUARD.lock();
         test_support::ensure_init();
         guard
     }
 
-    /// 登记一份测试 image 并声明一个 `Starting` 实例，返回 `(id, base, size)`。
-    ///
-    /// 调用方须已持有 memory GUARD（分配常驻 lease）。
+    /// 一份带真实常驻 backing 的伪造 loaded image（`base..base+text_size` 是合法
+    /// entry 区间）；调用方须已持有 memory GUARD。
+    fn test_loaded() -> crate::component::loader::LoadedComponent {
+        crate::component::registry::test_support::test_loaded_with_region(0, None)
+    }
+
+    /// 声明一个带真实 backing 的 `Starting` 组件，返回 `(id, base, size)`。
     fn starting_component(name: &[u8]) -> (ComponentId, usize, usize) {
-        let image = image::test_support::register_test_image(name, 0);
         let mut reg = registry::get_registry().lock();
         let id = reg
-            .declare(image, ExecutionDomain::KernelNative)
+            .declare(name, test_loaded(), ExecutionDomain::KernelNative)
             .expect("declare starting component");
         reg.resolve(id).expect("resolve");
         reg.begin_start(id).expect("begin_start");
         drop(reg);
-        let (base, size) = {
-            let images = image::get_images().lock();
-            let image = images.get(image).expect("registered image");
-            let region = image.memory.region();
-            (region.base, region.size)
-        };
-        (id, base, size)
+        let reg = registry::get_registry().lock();
+        let record = reg.get(id).expect("record");
+        (id, record.loaded.base, record.loaded.text_size)
     }
 
     #[test]
@@ -203,21 +192,30 @@ mod tests {
 
     #[test]
     fn create_task_rejects_requester_that_is_not_live() {
-        // Given: 三个存在但非 Starting/Ready 的实例。
+        // Given: 三个存在但非 Starting/Ready 的组件。
         let _boundary = containment::test_boundary_lock();
         let _g = setup();
         let before = get_task_table().lock().len();
-        let image = image::test_support::register_test_image(b"task_perm_states", 0);
 
         // Declared：只声明。
         let declared = registry::get_registry()
             .lock()
-            .declare(image, ExecutionDomain::KernelNative)
+            .declare(
+                b"task_perm_states",
+                test_loaded(),
+                ExecutionDomain::KernelNative,
+            )
             .unwrap();
         // Failed：走完 init 路径后逻辑死亡。
         let failed = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let id = reg
+                .declare(
+                    b"task_perm_states",
+                    test_loaded(),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.mark_failed(id).unwrap();
@@ -226,7 +224,13 @@ mod tests {
         // Stopped：完整初始化后优雅停止。
         let stopped = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let id = reg
+                .declare(
+                    b"task_perm_states",
+                    test_loaded(),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -284,33 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn create_task_rejects_unregistered_image() {
-        // Given: 一个 Starting 但 image 未登记的实例（不应发生的 Core 状态）。
-        let _boundary = containment::test_boundary_lock();
-        let _g = setup();
-        let id = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(
-                    ComponentImageId::from_raw(0xFFFF),
-                    ExecutionDomain::KernelNative,
-                )
-                .unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            id
-        };
-        let before = get_task_table().lock().len();
-
-        // When/Then: 没有 image 就没有合法 entry 区间 —— 拒绝而非猜测。
-        assert_eq!(
-            create_task(id, 0x1000, core::ptr::null_mut()),
-            Err(TaskError::EntryOutOfImage)
-        );
-        assert_eq!(get_task_table().lock().len(), before);
-    }
-
-    #[test]
     fn create_task_accepts_entry_inside_loaded_image() {
         // Given: 一个带装载镜像的 Starting 组件。
         let _boundary = containment::test_boundary_lock();
@@ -339,32 +316,17 @@ mod tests {
         get_task_table().lock().remove(task).expect("cleanup");
     }
 
-    /// 契约核心：两个共享同一 image 的实例各自拥有独立任务；owner 是实例 id。
+    /// 契约核心：同一个 artifact 的两个组件各自拥有独立任务与独立 loaded image；
+    /// owner 是组件 id。
     #[test]
-    fn instances_sharing_one_image_own_tasks_independently() {
-        // Given：同名的两份 image 登记（实为同一份）与两个 Starting 实例。
+    fn same_artifact_components_own_tasks_independently() {
+        // Given：两个独立 declare 的同名组件（各自一份 backing）。
         let _boundary = containment::test_boundary_lock();
         let _g = setup();
-        let image = image::test_support::register_test_image(b"task_share_image", 0);
-        let (first, first_base, first_size) = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            drop(reg);
-            let images = image::get_images().lock();
-            let region = images.get(image).unwrap().memory.region();
-            (id, region.base, region.size)
-        };
-        let second = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            id
-        };
+        let (first, first_base, first_size) = starting_component(b"task_share_image");
+        let (second, second_base, _second_size) = starting_component(b"task_share_image");
 
-        // When：两个实例各创建一个任务，各自携带不同 arg。
+        // When：两个组件各创建一个任务，各自携带不同 arg。
         let mut arg_a = 1u32;
         let mut arg_b = 2u32;
         let a = create_task(
@@ -375,18 +337,20 @@ mod tests {
         .unwrap();
         let b = create_task(
             second,
-            first_base + (first_size / 2),
+            second_base + 0x40,
             core::ptr::addr_of_mut!(arg_b).cast::<()>(),
         )
         .unwrap();
 
-        // Then：owner 各归其实例；两个实例各自独立持有自己的任务。
+        // Then：owner 各归其组件；两个组件各自独立持有自己的任务。
         let table = get_task_table().lock();
         assert_eq!(table.get(a).unwrap().owner(), first);
         assert_eq!(table.get(b).unwrap().owner(), second);
         assert!(table.has_live_tasks(first), "first 拥有自己的任务");
         assert!(table.has_live_tasks(second), "second 拥有自己的任务");
         drop(table);
+        assert_ne!(first_base, second_base, "两个组件各自独立 backing");
+        let _ = first_size;
 
         // 清理。
         get_task_table().lock().remove(a).unwrap();

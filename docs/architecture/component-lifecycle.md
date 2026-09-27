@@ -1,9 +1,8 @@
 # 组件生命周期与实例契约（冻结）
 
-> **状态：已冻结，实施中。** 本文件是所有并行迁移实现的**唯一依据**；与 `docs/architecture/component-model.md` 冲突时以本文件为准。
-> 决策来源：Oracle 架构评审（image/instance/domain 拆分）。**人类已确认接受评审版本**（含对原始提案的三处否决）。
+> **状态：已冻结。** 本文件是组件身份、生命周期与入口 ABI 的**唯一依据**；与 `docs/architecture/component-model.md` 冲突时以本文件为准。
 
-本文件只解决一件事：**把"一份加载的组件代码"与"一个跑起来的组件实例"分开**，并把组件 ABI 从"一次性 `kcomp_init`"改成"实例化"。
+本文件只解决一件事：**让组件 ABI 走"实例化"**——每次 instantiate 从一个 `.kcomp` artifact 得到一个完整、独立、拥有自己可写镜像状态的 `ComponentId`。
 它**不是**执行域（ExecutionDomain）里程碑，**不是**热更新/卸载里程碑。
 
 ---
@@ -12,20 +11,20 @@
 
 ### 现在做（本契约覆盖）
 
-- 拆分**镜像身份**与**实例身份**；一份常驻镜像 → N 个独立实例。
+- 每次 instantiate 从一个 `.kcomp` artifact 得到一个**完整组件**（`ComponentId`），拥有**自己的可写镜像状态**（独立放段 / 重定位的 `.text` / `.rodata` / `.data` / `.bss`）+ 常驻 MemoryLease；加载同一 artifact 两次 = 两个互不共享 `.data` / `.bss` 的组件。
 - 组件入口从 `kcomp_init`/`kcomp_exit` 协调替换为 `kcomp_instance_create`/`kcomp_instance_destroy` + 精确 ABI 指纹。
-- 每个实例拥有**自己的状态**、资源归属（device / IRQ route / DMA mapping）、任务、接口发布。
-- task entry 支持 opaque 参数（否则"从 statics 迁出"做不完整）。
-- 服务 endpoint 可按实例命名（多个实例不能都发 `block.device`）。
+- 每个组件拥有**自己的状态**、资源归属（device / IRQ route / DMA mapping）、任务、接口发布。
+- task entry 支持 opaque 参数。
+- 服务 endpoint 可按组件命名（多个组件不能都发 `block.device`）。
 
-### 明确**拒绝**在本轮构建（评审结论）
+### 明确**拒绝**在本轮构建
 
 | 拒绝项 | 原因 |
 |---|---|
 | syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 仍未实现；执行域是进行中的里程碑（`docs/development/roadmap.md`），私有 AS / 域切换的受限版本见下表后的更新 |
 | 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
 | 通用资源转移/授予图、ResourceDomain 容器、per-instance 字节计费/配额、Core 侧内存账本（region owner / region id / Retired 表） | 违反 `AGENTS.md`；所有权转移是推迟项；Core 不做内存记账，见 `docs/architecture/memory-and-heap.md` |
-| loader 复制 `.data/.bss`、跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | **见 §9：当前共享地址空间下，globals 仍是 image-global，per-instance 状态来自显式分配**。复制 BSS 不会重定向已按原 globals 完成重定位的指令 |
+| 跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | 每次 instantiate 已独立放段 / 重定位自己的 `.data` / `.bss`；text 去重是**未来 loader / MM 优化**，不是组件语义（见 §9），本轮不为此改造 |
 | 驱动注册框架、热插拔策略、依赖解析器、自动 ABI 兼容协商 | 无当下需求 |
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
 
@@ -40,14 +39,10 @@
 ## 2. 身份模型
 
 ```text
-ComponentImageId     ← 新增：一份常驻加载的代码
-  ├─ 常驻段 / MemoryLease / base
-  ├─ create 入口地址（kcomp_instance_create）
-  ├─ destroy 入口地址（kcomp_instance_destroy）
-  ├─ artifact name（不再强加"每 artifact 只能一个实例"）
-  └─ kcomp_abi 指纹
-
-ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 ComponentInstanceId）
+ComponentId          ← 唯一的运行时身份：一个完整的运行组件
+  ├─ name（artifact 名）
+  ├─ loaded: LoadedComponent（base / create / destroy / service_dispatch / text_size）
+  ├─ 常驻 MemoryLease（本组件私有的可写镜像状态：.text / .rodata / .data / .bss）
   ├─ 生命周期 state
   ├─ 资源归属（device / IRQ route / DMA owner）
   ├─ 任务归属（TaskRecord.owner）
@@ -56,19 +51,21 @@ ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 
   └─ opaque instance state 指针（由组件 create 返回）
 ```
 
-**关键点**：`ComponentId` 已经在承担实例身份（tasks/devices/routes/mappings/publications/failure 全部按它归属）。**不要**引入第二个平行实例句柄；只新增 `ComponentImageId`。改名可有可无，功能价值很小。
+**关键点**：`ComponentId` 就是唯一的一等运行时身份，承载一个**完整的运行组件**——它自己的已加载程序、常驻 backing、资源、任务、endpoint。**没有** `ComponentImageId` / `ComponentImage` / `ImageTable` 二级身份：`LoadedComponent`（base / create / destroy / service_dispatch / text_size / MemoryLease）由 `ComponentRecord` **1:1 直接拥有**，不存在 instance → image 的二级查找。
 
-### 所有权划分（现状 → 目标）
+每次 instantiate（同一 `.kcomp` artifact 或不同 artifact）都**独立**做段放置 + 重定位，得到自己的可写 image backing。加载同一 artifact 两次 = 两个 `ComponentId`，它们的 `.data` / `.bss` 互不共享、独立重定位。`.text` / `.rodata` 的物理去重是**未来 loader / MM 优化**，不是组件语义模型的一部分。
 
-| 现在挂在 `ComponentRecord`（`os/core/src/component/registry.rs:33-48`） | 目标归属 |
+### 所有权划分
+
+| 属于 `ComponentRecord`（`registry.rs`） | 归属 |
 |---|---|
-| `name` | **Image**（artifact 名；唯一性约束从"每名一实例"放宽） |
-| `base` / `entry` / `exit` / `memory`(MemoryLease) / `text_size` | **Image** |
-| `state` | **Instance** |
-| `id`（现为融合身份） | **Instance** = `ComponentId` |
+| `name` | **Component**（artifact 名；同名可并存，每次 instantiate 各自记录） |
+| `loaded.base` / `loaded.create` / `loaded.destroy` / `loaded.service_dispatch` / `loaded.text_size` / `loaded.memory`(MemoryLease) | **Component** |
+| `state` | **Component** |
+| `id` | **Component** = `ComponentId` |
 
-- `LoadedComponent`（`os/core/src/component/loader.rs:39-52`）的 `text_size` 现在被丢弃；拆到 image 记录后应保留。
-- 资源的授权表仍按 `ComponentId` 归属（`failure.rs:61-71`）——**不要**把 owner 改成 domain id。
+- `LoadedComponent`（`os/core/src/component/loader.rs`）的 `text_size` 直接保留在记录里。
+- 资源的授权表仍按 `ComponentId` 归属（`failure.rs`）——**不要**把 owner 改成 domain id。
 
 ---
 
@@ -77,10 +74,10 @@ ComponentId          ← 保持现状，语义 = 实例 ID（不新增平行的 
 状态机不变（`os/core/src/component/mod.rs:55-117`，单一真相 `ComponentState::can_transition`）：
 
 ```text
-declare instance → Resolved → Starting
-    → 在该实例身份下调用 kcomp_instance_create(args, &out_state)
+declare component → Resolved → Starting
+    → 在该组件身份下调用 kcomp_instance_create(args, &out_state)
     → Core 记录 out_state
-    → 提交该实例的 pending publications
+    → 提交该组件的 pending publications
     → Ready
 ```
 
@@ -168,8 +165,8 @@ int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len,
 
 ## 5. 服务 endpoint 命名
 
-**多个实例可以各自发布 `block.device`**：endpoint 身份 = `(provider, port_name, contract)`
-（`EndpointId`），端口名只要求在 provider 实例内唯一；同 ABI 的再次发布**绝不覆盖**任何
+**多个组件可以各自发布 `block.device`**：endpoint 身份 = `(provider ComponentId, port_name, contract)`
+（`EndpointId`），端口名只要求在 provider 组件内唯一；同 ABI 的再次发布**绝不覆盖**任何
 已有 endpoint，provider 停止 / 失败即其全部 endpoint 永久失效、绝不重定向。
 
 - **由组合策略提供**端口名（多实例场景），**ABI 指纹不变**。
@@ -231,37 +228,26 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 ---
 
-## 9. 常驻、重启与 text 共享
+## 9. 重启与 text 共享
 
-- **不实现 `image.instances == 0 → unload`。** Image 保持 pinned-until-reboot；Stopped/Failed 实例记录留作 tombstone。
-- 新创建得到**全新 instance ID** 与**全新 state**，引用同一常驻 image（若复用合法）。
-  > Isolated 域的状态：image 记录部署域 + 按域段规划，同域复用 = **逻辑重启**（前一个实例
-  > `Failed` / `Stopped` 之后创建全新实例：全新私有 AS / 全新 Core 预置窗口 / 全新 runtime slot）；
-  > 并发活跃实例与跨域复用显式拒绝。已在 RV64+RV32 QEMU 证明，见 `architecture/deployment.md` §10。
+- **不实现 `instances == 0 → unload` / 物理回收。** 组件 backing 保持 pinned-until-reboot；`Stopped` / `Failed` 的记录留作 tombstone，其 backing 仍归**旧组件**所有。
+- **重启 = 从同一 artifact 重新 instantiate**：得到**全新 `ComponentId`**、**全新可写 image state**（`.data` / `.bss` 回到 artifact 初始值）、**全新资源归属 / endpoint**。旧组件的 `Stopped` / `Failed` 记录与 backing 驻留（phase 1 不回收）。
+  > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单 / runtime slot（`tp`）/ 邮箱不变。见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
-- **逻辑重启 ≠ 设备恢复**（隔离到重启，见 §8）。
+- **重启 ≠ 设备恢复**（隔离到重启，见 §8）。
 
-### 关于 text 共享的更正
+### 关于 text 共享
 
-原始提案说"text 共享一份、`.data/.bss` 每实例一份"——**在当前架构下这是错的**：
-
-- 现在是**共享地址空间**：globals 仍是 **image-global**，per-instance 状态来自**显式分配**。
-- **只复制 BSS 不会重定向**那些已经按原 globals 完成重定位的指令。
-- 跨域共享可执行页依赖：兼容的虚拟布局、重定位、imports、传输 stub。当前重定位按**单一 load base** 解析（`loader.rs:190-243`），段放置只提供段内对齐、**没有页级权限分离**（`loader.rs:156-187`）；含重定位指针的 API 表也不自动可共享。
-
-结论：**共享 text 是未来的 loader 优化，不是"一个链接好的 KernelNative 二进制能在任何执行域原样运行"的 ABI 承诺。**
-
-> **本条结论已被取代（superseded）：** 目标方向（同一份组件代码 + 契约不按部署重写、text 何时可跨域共享的精确条件、依赖排序的缺口清单）见 `docs/architecture/deployment.md` §6。上面这段**现状事实**（单一 load base、无页级权限分离、import 只重定位一次）仍然有效；被取代的是"这不是 ABI 承诺"这个**目标层面**的判断。
+- **每次 instantiate 都重新放段 + 重新应用重定位**，因此每个组件拥有独立、可写的 image backing（`.data` / `.bss` 天然 per-component，不共享）。
+- **代码页（`.text` / `.rodata`）的物理去重是未来的 loader / MM 优化**，不是组件语义模型的一部分，也**不是** ABI / 生命周期承诺：只有当重定位后的可执行字节完全相同（same VA + same import-target VA）时才可能共享，精确条件与依赖缺口见 `docs/architecture/deployment.md` §6。
 
 ---
 
-## 10. VirtIO 多实例 gate（契约约束）
+## 10. VirtIO 多实例
 
-当前 HAL 回调**没有 receiver/ctx**，直接读全局 `DEVICE_ID` / `MMIO_BASE` 与 `DMA_MAP`（`virtio_blk/src/lib.rs`）。只把这些全局搬进 `State`，HAL **仍然找不到它们**。
+`virtio_blk` 的 `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK` 现在是**组件私有 static**——每次 instantiate 都得到独立的可写 image state，因此第二个 `virtio_blk` 组件可以独立接管第二台设备（各自私有 static，互不覆盖）。CoreTest `driver-multi-device` 已在 RV64 + RV32 上验证第二个同 artifact 驱动组件独立 attach。
 
-可接受方案：**驱动私有的 scoped HAL context**，但**仅在**满足以下条件时成立——所有入口路径显式建立它；HAL 执行**非 yield、非重入、不从 IRQ 回调进入**；panic escape **不会** unwind Rust guard，所以 stale context 必须**无害直到被显式替换/重置**，且**不得**只依赖 `Drop` 做恢复。
+**剩余的是编排缺口，不是模型限制**：prober 在第一个 `Match` 后停止，不为第二台设备 provision 第二个驱动组件。**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖编排问题。
 
-**这是 gate：在适配器被证明正确之前，不要启用多个 VirtIO 实例。** 也**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖问题。
-
-> 通用迁移模式（不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态）与各组件迁移状态属于实现进度，不入本契约；C 生命周期 smoke 已落地，FatFs 胶水仍待接。
+> 旧的 scoped HAL context gate 已随 image 私有化消失：每个组件有自己的 static，"同一份共享 static 被多实例争用"的补救不再需要。通用迁移模式（不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态）的其余部分属于实现进度，不入本契约；C 生命周期 smoke 已落地。
 

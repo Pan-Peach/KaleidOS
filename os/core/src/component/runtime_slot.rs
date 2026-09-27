@@ -44,7 +44,7 @@ struct SlotRecord {
 }
 
 // `slot` 是组件 opaque 指针：本表只存取、永不解引用。跨线程使用由外层
-// `Mutex` 串行化（与 `registry::InstanceRecord::instance_state` 同一理由）。
+// `Mutex` 串行化（与 `registry::ComponentRecord::instance_state` 同一理由）。
 unsafe impl Send for SlotRecord {}
 unsafe impl Sync for SlotRecord {}
 

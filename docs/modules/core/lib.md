@@ -10,7 +10,7 @@
 ## 暴露什么机制
 
 - `pub fn init(info: &machine::MachineInfo, reserved: &[machine::MemoryRegion]) -> Result<(), &'static str>`
-  校验 `MachineInfo` → 求帧区域 → `memory::init` + 分配/释放探测 → 依次 `task::init()`、`sched::init()`、`component::containment::init()`、`timer::init()`/`init_preempt(...)`、`component::image::init()`、`component::registry::init()`、`component::interface::init()`、`resource::init()`、`irq::init()`，最后 `monitor::mount(info)`（`MachineInfo` 在此提交）。
+  校验 `MachineInfo` → 求帧区域 → `memory::init` + 分配/释放探测 → 依次 `task::init()`、`sched::init()`、`component::containment::init()`、`timer::init()`/`init_preempt(...)`、`component::registry::init()`、`component::endpoint::init()`、`resource::init()`、`irq::init()`，最后 `monitor::mount(info)`（`MachineInfo` 在此提交）。
 - 公共模块：`bench`、`component`、`errno`、`generated`、`inspector`、`irq`、`machine`、`memory`、`monitor`、`print`（`#[macro_use]`）、`resource`、`sched`、`task`、`timer`、`trace`。
 - 宏：`printk!` / `log!`（`print.rs` 中 `#[macro_export]`）。
 - 裸机全局分配器：`#[global_allocator] static ALLOCATOR: memory::KernelAllocator`，仅在 `not(test)` + `target_os = "none"` + riscv32/64 下安装。

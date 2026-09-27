@@ -240,13 +240,9 @@ pub(crate) fn registry_state(id: ComponentId) -> Option<kernel::component::Compo
         .map(|record| record.state)
 }
 
-/// 最近一个 `Failed` 的 Isolated 实例（id / AS 句柄 / image）；扫描是 ArchTest
+/// 最近一个 `Failed` 的 Isolated 组件（id / AS 句柄）；扫描是 ArchTest
 /// 的观察手段（create 失败时调用方拿不到 id）。
-pub(crate) fn failed_isolated_instance() -> Option<(
-    ComponentId,
-    AddressSpaceHandle,
-    kernel::component::image::ComponentImageId,
-)> {
+pub(crate) fn failed_isolated_instance() -> Option<(ComponentId, AddressSpaceHandle)> {
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::registry;
     use kernel::component::ComponentState;
@@ -258,7 +254,7 @@ pub(crate) fn failed_isolated_instance() -> Option<(
             && record.state == ComponentState::Failed
         {
             if let Some(handle) = record.address_space {
-                found = Some((record.id, handle, record.image));
+                found = Some((record.id, handle));
             }
         }
     }
@@ -356,7 +352,7 @@ pub(crate) fn kernel_native_still_works() -> bool {
 /// Core 预置窗口 / 栈归还、runtime slot 清空（半成品不留）。
 pub(crate) fn assert_failed_isolated_cleanup() {
     match failed_isolated_instance() {
-        Some((id, handle, _)) => assert_failure_released("isolated create failure", id, handle),
+        Some((id, handle)) => assert_failure_released("isolated create failure", id, handle),
         None => fail("isolated create failure: no failed Isolated instance with an AS"),
     }
 }

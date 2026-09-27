@@ -318,7 +318,7 @@ pub fn select_mechanism(
 
 /// 解析一个实例的执行域（**唯一解析点**，deployment.md §1/§7.3）。
 ///
-/// 从 registry 的实例记录读取部署域（`InstanceRecord::execution_domain`）——该字段
+/// 从 registry 的组件记录读取部署域（`ComponentRecord::execution_domain`）——该字段
 /// 由创建入口（`component/load.rs::create_component`）验证部署请求后写入，是 Core
 /// owns 的部署真相。bind 对 **caller 与 provider 两端各解析一次**：合法机制同时
 /// 取决于两端，绝不只按 provider 的部署标签决策。
@@ -697,12 +697,18 @@ fn check_owner_live(components: &Registry, owner: ComponentId) -> Result<(), End
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::image::ComponentImageId;
     use crate::component::registry::{Registry, RegistryError};
     use alloc::vec::Vec;
 
-    /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
-    const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
+    /// 声明一个测试组件（伪造、无 backing 的 loaded image）。
+    fn declare(reg: &mut Registry, domain: ExecutionDomain) -> ComponentId {
+        reg.declare(
+            b"endpoint-test",
+            crate::component::registry::test_support::test_loaded(0, None),
+            domain,
+        )
+        .unwrap()
+    }
 
     const CONTRACT: ContractId = ContractId::from_raw(0xC0DE_0001);
     const OTHER_CONTRACT: ContractId = ContractId::from_raw(0xC0DE_0002);
@@ -717,7 +723,7 @@ mod tests {
         let mut reg = Registry::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+            let id = declare(&mut reg, ExecutionDomain::KernelNative);
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -815,7 +821,7 @@ mod tests {
 
         // Declared / Resolved 拒绝；Starting / Ready 接受（create 期发布 = Starting）。
         let mut state = Registry::new();
-        let declared = state.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let declared = declare(&mut state, ExecutionDomain::KernelNative);
         assert_eq!(
             er.stage_publish(
                 &state,
@@ -1365,7 +1371,7 @@ mod tests {
     fn bind_kernel_native_caller_to_isolated_provider_selects_gate() {
         let mut reg = Registry::new();
         let provider = {
-            let id = reg.declare(IMAGE, ExecutionDomain::IsolatedNative).unwrap();
+            let id = declare(&mut reg, ExecutionDomain::IsolatedNative);
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
@@ -1622,7 +1628,7 @@ mod tests {
         let (mut reg, ids) = ready_world();
 
         // Declared / Resolved / Starting 都不可服务：只有 Ready 放行。
-        let declared = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let declared = declare(&mut reg, ExecutionDomain::KernelNative);
         assert_eq!(reg.begin_call(declared), Err(RegistryError::NotReady));
         reg.resolve(declared).unwrap();
         assert_eq!(reg.begin_call(declared), Err(RegistryError::NotReady));

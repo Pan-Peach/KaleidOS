@@ -1,24 +1,23 @@
-//! 组件实例创建语义入口（ComponentManager 教学版占位）：仓库读取 → image 复用或
-//! loader 放段 → image 登记 → registry 声明实例 → resolve → begin_start（Starting）→
-//! 调用 `kcomp_instance_create(args, &out_state)` → 记录 state → 原子提交 pending
-//! endpoints → finish_start（Ready）。
+//! 组件实例创建语义入口（ComponentManager 教学版占位）：仓库读取 → loader 放段 /
+//! 重定位 → registry 声明组件（组件 1:1 拥有自己的 loaded image）→ resolve →
+//! begin_start（Starting）→ 调用 `kcomp_instance_create(args, &out_state)` → 记录
+//! state → 原子提交 pending endpoints → finish_start（Ready）。
 //!
 //! `monitor load <name>` 与组件 ABI `kcore_component_load` 都是这里的**薄 caller**——
 //! 加载流程本身属于 Core（monitor 不是 ComponentManager）。完整依赖解析、
 //! kpkg manifest requires、失败回滚留给真正的 ComponentManager 里程碑。
 //!
-//! # 一份 image，N 个实例（`docs/architecture/component-lifecycle.md` §2/§3）
+//! # 每次 instantiate = 一个完整运行组件（`docs/architecture/component-model.md`）
 //!
-//! 同名 artifact 再次创建**复用已登记的 image**（新实例、新 `ComponentId`、新
-//! state），不再拒绝；image 登记进 `component/image.rs` 的 image 表并 pinned 到重启。
-//! **image 记录部署域**：跨域复用显式拒绝（`ImageDomainMismatch`）；Isolated 的
-//! 同域复用就是**逻辑重启**——只在没有活跃实例时放行（前一个实例 `Failed` /
-//! `Stopped` 之后创建全新实例，`IsolatedInstanceLive` 拒绝并发活跃实例）。
+//! **一次 load / instantiate = 一个 `ComponentId`**：同名 artifact 再次创建会
+//! **重新放段并重定位**，得到全新的 writable image state（独立的 `.data` / `.bss`）
+//! ——不再按 artifact 名复用镜像。`.kcomp` 是 artifact（程序），不是运行实例。
+//! `restart` = 从同一个 artifact 再 instantiate 一个新组件（新 id、新 backing）。
+//! 重复代码页的共享是**未来 loader / MM 优化**，不是组件语义模型。
 
 use crate::component::containment::{self, CallOutcome, KcompCreateArgs};
 use crate::component::elf::ElfObject;
 use crate::component::endpoint::{self, EndpointError, ExecutionDomain};
-use crate::component::image::{self, ComponentImageId};
 use crate::component::isolated_lifecycle;
 use crate::component::loader::{self, LoaderError};
 use crate::component::{ComponentId, failure, registry};
@@ -37,9 +36,7 @@ pub enum ComponentLoadError {
     ReadFailed,
     /// ELF 解析 / 放段 / 重定位 / 必需符号（create/destroy/abi）校验失败。
     Loader(LoaderError),
-    /// image 登记失败（名字过长 / image id 耗尽）。
-    ImageFailed,
-    /// registry 声明实例失败（id 耗尽）。
+    /// registry 声明组件失败（id 耗尽）。
     DeclareFailed,
     /// resolve 失败（require 未满足；v1 无 requires，不应发生）。
     ResolveFailed,
@@ -81,19 +78,6 @@ pub enum ComponentLoadError {
     /// 的 import 解析（Core gate trampoline）尚未实现，任何 `kcore_*` UNDEF 都
     /// 在装载**之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     IsolatedImportUnsupported,
-    /// image 表按 artifact 名唯一且**记录部署域**：本次请求的域与已登记 image
-    /// 的域不一致 → 显式拒绝。放段 / 重定位的 VA 只在对应域里有意义——
-    /// KernelNative 的结果是共享内核 AS 的 VA + 裸 Core import 目标；Isolated 的
-    /// 结果是实例私有 AS 的 VA。复用别的域的镜像 = 静默降级，绝不发生
-    /// （两个方向都走这一条：Isolated 请求遇到 KernelNative image，
-    /// KernelNative 请求遇到 Isolated image）。
-    ImageDomainMismatch,
-    /// Isolated 的同一个 artifact 只允许一个**活跃**实例：逻辑重启（全新实例）
-    /// 只在前一个实例逻辑死亡（`Failed` / `Stopped` tombstone）之后成立。
-    /// image 的 `.data` / `.bss` 是 image-global（与 KernelNative 同一契约，
-    /// `docs/architecture/component-lifecycle.md` §9），两个活跃 Isolated 实例
-    /// 共享可写段不在当前的隔离承诺内 → 显式拒绝（`-EBUSY`），绝不静默共享。
-    IsolatedInstanceLive,
     /// `IsolatedNative` 按域放段失败（段出窗 / 重叠 / 权限不可表达 / 入口不可执行 /
     /// 地址溢出 / 含任何 UNDEF import 的空集包络 / 后端拒绝映射）：镜像不适配该域，
     /// 显式拒绝（不含 `kcore_*` import——那一类由门禁以 `-ENOTSUP` 区分）。
@@ -209,17 +193,16 @@ fn create_kernel_native(
     name: &[u8],
     args: &KcompCreateArgs,
 ) -> Result<ComponentId, ComponentLoadError> {
-    let image = get_or_load_image(name)?;
-    let create_entry = image::get_images()
-        .lock()
-        .get(image)
-        .map(|image| image.create)
-        .ok_or(ComponentLoadError::ImageFailed)?;
+    // 每次 instantiate 都**重新放段 + 重定位**：这个组件拥有自己独立的
+    // writable image state（`.data` / `.bss` 不共享）。
+    let blob = read_artifact(name)?;
+    let loaded = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
+    let create_entry = loaded.create;
 
     let id = {
         let mut reg = registry::get_registry().lock();
         let id = reg
-            .declare(image, ExecutionDomain::KernelNative)
+            .declare(name, loaded, ExecutionDomain::KernelNative)
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
         reg.resolve(id)
             .map_err(|_| ComponentLoadError::ResolveFailed)?;
@@ -331,56 +314,18 @@ fn create_isolated_native(
 }
 
 /// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
-/// 字节，调用方用同一份 blob 装载（不重复读取；复用已登记 image 时 blob 不参与）。
+/// 字节，调用方用同一份 blob 装载。
 ///
-/// - **image 复用门禁**（[`check_isolated_reuse`]）：跨域复用显式拒绝
-///   （`ImageDomainMismatch`）；同域复用**只在没有活跃实例时**放行——
-///   **逻辑重启**（前一个实例 `Failed` / `Stopped` 后创建全新实例）走这条；
-///   并发活跃实例显式拒绝（`IsolatedInstanceLive`，`-EBUSY`）。
-/// - **import 包络 = 空集**：没有 per-domain trampoline。任何 `kcore_*`
-///   UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
-///   按域装载的空集包络拒绝（`isolated_load::place`，`-EINVAL`）。
+/// **import 包络 = 空集**：没有 per-domain trampoline。任何 `kcore_*`
+/// UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
+/// 按域装载的空集包络拒绝（`isolated_load::place`，`-EINVAL`）。
+///
+/// 每个组件都从 artifact 重新放段（`isolated_lifecycle::create`）——没有
+/// 跨域 / 同域 image 复用，因此不再需要域匹配 / 活跃实例门禁。
 fn validate_isolated_load(name: &[u8]) -> Result<alloc::vec::Vec<u8>, ComponentLoadError> {
-    {
-        // 锁序：registry → images（`call.rs` 的固定顺序），两个 guard 在块尾释放。
-        let components = registry::get_registry().lock();
-        let images = image::get_images().lock();
-        check_isolated_reuse(&components, &images, name)?;
-    }
     let blob = read_artifact(name)?;
     check_isolated_imports(&blob)?;
     Ok(blob)
-}
-
-/// image 复用门禁的**纯逻辑**（host-testable；锁由调用方持有 / 顺序固定）。
-///
-/// - 未登记 → `Ok`（首次装载）。
-/// - 已登记但域不是 `IsolatedNative` → [`ComponentLoadError::ImageDomainMismatch`]。
-/// - 已登记且同域，但仍有**活跃** Isolated 实例 → [`ComponentLoadError::IsolatedInstanceLive`]。
-/// - 已登记且同域，所有实例都已是终态（`Failed` / `Stopped`）→ `Ok`（逻辑重启）。
-fn check_isolated_reuse(
-    components: &registry::Registry,
-    images: &image::ImageTable,
-    name: &[u8],
-) -> Result<(), ComponentLoadError> {
-    let Some(image_id) = images.find(name) else {
-        return Ok(());
-    };
-    let image = images
-        .get(image_id)
-        .ok_or(ComponentLoadError::ImageFailed)?;
-    if image.domain != ExecutionDomain::IsolatedNative {
-        return Err(ComponentLoadError::ImageDomainMismatch);
-    }
-    let live = components.iter().any(|record| {
-        record.image == image_id
-            && record.execution_domain == ExecutionDomain::IsolatedNative
-            && record.state.is_live()
-    });
-    if live {
-        return Err(ComponentLoadError::IsolatedInstanceLive);
-    }
-    Ok(())
 }
 
 /// 扫描 ELF 符号表：任一具名 UNDEF 都必须命中 Isolated 的**唯一**支持白名单
@@ -410,38 +355,6 @@ fn check_isolated_imports(blob: &[u8]) -> Result<(), ComponentLoadError> {
         }
     }
     Ok(())
-}
-
-/// KernelNative 的 image 获取（复用或装载）。
-///
-/// image 表按 artifact 名唯一且**记录部署域**：复用时先复验域——KernelNative
-/// 请求绝不能复用按 Isolated 放段 / 重定位的结果（其 VA 只在实例私有 AS 里有
-/// 意义，在共享内核 AS 里是未映射地址或别的东西）→ [`ComponentLoadError::ImageDomainMismatch`]。
-/// 首次装载 = store 读取 + KernelNative 放段 + 登记（域 = `KernelNative`、
-/// 按域段规划为空）。
-fn get_or_load_image(name: &[u8]) -> Result<ComponentImageId, ComponentLoadError> {
-    {
-        let images = image::get_images().lock();
-        if let Some(id) = images.find(name) {
-            let image = images.get(id).ok_or(ComponentLoadError::ImageFailed)?;
-            if image.domain != ExecutionDomain::KernelNative {
-                return Err(ComponentLoadError::ImageDomainMismatch);
-            }
-            return Ok(id);
-        }
-    }
-
-    let blob = read_artifact(name)?;
-    let comp = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
-    image::get_images()
-        .lock()
-        .register(
-            name,
-            comp,
-            ExecutionDomain::KernelNative,
-            alloc::vec::Vec::new(),
-        )
-        .map_err(|_| ComponentLoadError::ImageFailed)
 }
 
 /// 从仓库读取 `<name>.kcomp` 的原始字节（`KernelNative` 与 `IsolatedNative`
@@ -479,16 +392,16 @@ mod tests {
     /// rank = LOAD（模块本地、最外层；见 [`crate::test_support`]）。
     static LOAD_TEST_LOCK: TestLock = TestLock::new(Rank::Load);
 
-    /// 完整有序场景：NotFound → 成功到 `Ready` → 同名再创建得到**共享 image 的
-    /// 新实例** → CURRENT 恢复。
+    /// 完整有序场景：NotFound → 成功到 `Ready` → 同名再创建得到**独立组件**
+    /// （各自的 writable image）→ CURRENT 恢复。
     ///
-    /// 为什么全放在一个测试里：store / image / registry 是进程级 `Once`，无法重置，
+    /// 为什么全放在一个测试里：store / registry 是进程级 `Once`，无法重置，
     /// 拆开会引入执行顺序依赖。host 边界（`arch::fake`）：`context_switch` 是
     /// no-op，组件入口体永不执行、trampoline 永不进入，`call_component_create` 恒
     /// 返回 `CallOutcome::Returned(0)`——因此能断言生命周期链走到 `Ready`，但不能
     /// 断言组件代码真实跑过（真实执行由 QEMU CoreTest 覆盖）。
     #[test]
-    fn load_and_start_shares_one_image_across_instances() {
+    fn same_artifact_loads_produce_independent_components() {
         let _serial = LOAD_TEST_LOCK.lock();
         // `load_and_start` → `create_kernel_native` 经 `call_component_create`
         // 安装组件边界（Init guard）覆盖进程全局 `ACTIVE_GUARD`，必须持
@@ -500,13 +413,12 @@ mod tests {
         // 只有 boot 的 main32/main64），所以仓库内容必然是 REAL_KPKG——先挂载，
         // `kcomp_smoke.kcomp` 的查找才是确定性的。
         crate::component::store::init(REAL_KPKG);
-        image::init();
         registry::init();
         endpoint::init();
         crate::resource::init();
 
-        // Given：没有实例正在创建。
-        assert_eq!(current_component(), None, "create 之外没有当前实例");
+        // Given：没有组件正在创建。
+        assert_eq!(current_component(), None, "create 之外没有当前组件");
 
         // When：创建 store 中不存在的名字。
         // Then：NotFound（仓库已挂载，因此不是 StoreNotMounted）。
@@ -523,34 +435,31 @@ mod tests {
         // Then：生命周期提交到 Ready（Declared → Resolved → Starting → Ready）。
         let first = load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative)
             .expect("kcomp_smoke 必须创建成功");
-        assert_eq!(
-            registry::get_registry().lock().get(first).map(|r| r.state),
-            Some(ComponentState::Ready)
-        );
-        let first_image = registry::get_registry()
-            .lock()
-            .get(first)
-            .expect("first instance")
-            .image;
         assert_eq!(current_component(), None, "create 之后 CURRENT 必须恢复");
 
-        // When：同名 artifact 再次创建（一份 image、两个实例）。
-        // Then：新实例、新 id、共享同一 image，两者都 Ready。
+        // When：同名 artifact 再次创建。
+        // Then：**全新组件**，拥有自己独立的 loaded image backing（不共享
+        // `.data` / `.bss`）——这是新模型的核心不变量。
         let second = load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative)
             .expect("同名再次创建必须成功");
-        assert_ne!(first, second, "每次创建都是全新实例 id");
+        assert_ne!(first, second, "每次 instantiate 都是全新组件 id");
         let reg = registry::get_registry().lock();
-        assert_eq!(
-            reg.get(second).unwrap().image,
-            first_image,
-            "共享同一 image"
+        let a = reg.get(first).expect("first");
+        let b = reg.get(second).expect("second");
+        assert_eq!(a.state, ComponentState::Ready);
+        assert_eq!(b.state, ComponentState::Ready);
+        assert_eq!(a.name, b"kcomp_smoke");
+        assert_eq!(b.name, b"kcomp_smoke");
+        assert_ne!(
+            a.loaded.memory.as_ref().map(|m| m.region().base),
+            b.loaded.memory.as_ref().map(|m| m.region().base),
+            "两次 instantiate 必须得到独立的常驻 backing"
         );
-        assert_eq!(reg.get(first).unwrap().state, ComponentState::Ready);
-        assert_eq!(reg.get(second).unwrap().state, ComponentState::Ready);
-        // image 表按名字唯一：`find` 仍解析到同一份（全局表里可能有其它测试的 image）。
-        assert_eq!(
-            image::get_images().lock().find(b"kcomp_smoke"),
-            Some(first_image)
+        let (a_base, a_end) = (a.loaded.base, a.loaded.base + a.loaded.text_size);
+        let (b_base, b_end) = (b.loaded.base, b.loaded.base + b.loaded.text_size);
+        assert!(
+            a_end <= b_base || b_end <= a_base,
+            "两次 instantiate 的镜像区间不得重叠：a=[{a_base:#x},{a_end:#x}) b=[{b_base:#x},{b_end:#x})"
         );
 
         // 未覆盖分支（host 不可确定性到达，不伪造）：
@@ -584,8 +493,8 @@ mod tests {
 
     /// Sandbox 执行器未实现（`todo!()` 占位），不是静默降级成 native。
     ///
-    /// 独立于 store / image：分派发生在 `get_or_load_image` 之前，因此本用例不需要
-    /// 挂载仓库。仍取 LOAD_TEST_LOCK 与上面的全局真相用例串行。
+    /// 独立于 store：分派发生在装载之前，因此本用例不需要挂载仓库。仍取
+    /// LOAD_TEST_LOCK 与上面的全局真相用例串行。
     #[test]
     #[should_panic(expected = "Sandbox 执行器未实现")]
     fn sandboxed_deployment_is_an_unimplemented_placeholder() {
@@ -648,149 +557,5 @@ mod tests {
         assert!(!import_supported(b"kcomp_instance_create"));
         assert!(!import_supported(b"memcpy"));
         assert!(!import_supported(b""));
-    }
-
-    /// **跨域复用拒绝**：Isolated 请求不得复用已登记的 KernelNative image
-    /// （其 import 目标是裸 Core 地址、VA 按共享内核 AS 选定）。
-    #[test]
-    fn isolated_load_rejects_reusing_a_kernel_native_image() {
-        let _serial = LOAD_TEST_LOCK.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        image::init();
-
-        // Given：一份按 KernelNative 放段 / 重定位的已登记 image（测试替身）。
-        image::test_support::register_test_image(b"isolated_reuse_probe", 0);
-
-        // When / Then：Isolated 装载在域检查处拒绝，不读仓库、不装载。
-        assert_eq!(
-            validate_isolated_load(b"isolated_reuse_probe"),
-            Err(ComponentLoadError::ImageDomainMismatch)
-        );
-    }
-
-    /// **反向跨域复用拒绝**：KernelNative 请求不得复用已登记的 Isolated image
-    /// （其 VA 只在实例私有 AS 里有意义，在共享内核 AS 里是未映射地址 / 别的
-    /// 东西）——绝不静默把别的域的 VA 布局当自己的。
-    #[test]
-    fn kernel_native_load_rejects_reusing_an_isolated_image() {
-        let _serial = LOAD_TEST_LOCK.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        image::init();
-        registry::init();
-        crate::resource::init();
-
-        // Given：一份按 Isolated 放段的已登记 image（测试替身）。
-        image::test_support::register_test_image_in_domain(
-            b"kernel_reuse_probe",
-            0,
-            None,
-            ExecutionDomain::IsolatedNative,
-        );
-
-        // When / Then：KernelNative 装载在域检查处拒绝（不读仓库、不装载）。
-        assert_eq!(
-            get_or_load_image(b"kernel_reuse_probe"),
-            Err(ComponentLoadError::ImageDomainMismatch)
-        );
-    }
-
-    /// **逻辑重启门禁**（纯逻辑，不经仓库）：
-    ///
-    /// - 未登记 → 放行（首次装载）；
-    /// - 同域 + 只有终态（`Failed` / `Stopped`）实例 → 放行（逻辑重启）；
-    /// - 同域 + 有活跃实例 → `IsolatedInstanceLive`（并发活跃实例显式拒绝）；
-    /// - 别的域 → `ImageDomainMismatch`。
-    #[test]
-    fn isolated_reuse_gate_allows_restart_and_rejects_live_or_foreign_images() {
-        let _serial = LOAD_TEST_LOCK.lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        image::init();
-        registry::init();
-
-        // 未登记：放行（本用例不读仓库，只查门禁）。
-        {
-            let components = registry::get_registry().lock();
-            let images = image::get_images().lock();
-            assert_eq!(
-                check_isolated_reuse(&components, &images, b"reuse_gate_absent"),
-                Ok(())
-            );
-        }
-
-        // KernelNative image：跨域拒绝。
-        image::test_support::register_test_image(b"reuse_gate_kernel", 0);
-        {
-            let components = registry::get_registry().lock();
-            let images = image::get_images().lock();
-            assert_eq!(
-                check_isolated_reuse(&components, &images, b"reuse_gate_kernel"),
-                Err(ComponentLoadError::ImageDomainMismatch)
-            );
-        }
-
-        // Isolated image + 活跃实例：拒绝并发。
-        let isolated_image = image::test_support::register_test_image_in_domain(
-            b"reuse_gate_isolated",
-            0,
-            None,
-            ExecutionDomain::IsolatedNative,
-        );
-        let live = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(isolated_image, ExecutionDomain::IsolatedNative)
-                .unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            id
-        };
-        {
-            let components = registry::get_registry().lock();
-            let images = image::get_images().lock();
-            assert_eq!(
-                check_isolated_reuse(&components, &images, b"reuse_gate_isolated"),
-                Err(ComponentLoadError::IsolatedInstanceLive)
-            );
-        }
-
-        // 活跃实例逻辑死亡（Failed）→ 放行：逻辑重启。
-        registry::get_registry().lock().mark_failed(live).unwrap();
-        {
-            let components = registry::get_registry().lock();
-            let images = image::get_images().lock();
-            assert_eq!(
-                check_isolated_reuse(&components, &images, b"reuse_gate_isolated"),
-                Ok(()),
-                "前一个实例 Failed 之后，同域复用 = 逻辑重启"
-            );
-        }
-
-        // 另一个实例走到 Stopped（优雅停止 tombstone）→ 同样放行。
-        let stopped = {
-            let mut reg = registry::get_registry().lock();
-            let id = reg
-                .declare(isolated_image, ExecutionDomain::IsolatedNative)
-                .unwrap();
-            reg.resolve(id).unwrap();
-            reg.begin_start(id).unwrap();
-            reg.finish_start(id).unwrap();
-            reg.begin_stop(id).unwrap();
-            reg.finish_stop(id).unwrap();
-            id
-        };
-        assert_ne!(live, stopped);
-        {
-            let components = registry::get_registry().lock();
-            let images = image::get_images().lock();
-            assert_eq!(
-                check_isolated_reuse(&components, &images, b"reuse_gate_isolated"),
-                Ok(()),
-                "Stopped tombstone 不阻止逻辑重启"
-            );
-        }
     }
 }

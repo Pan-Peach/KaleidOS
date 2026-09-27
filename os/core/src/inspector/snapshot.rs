@@ -7,7 +7,7 @@
 //! `TaskState::Running(cpu)` 投影成 `running_on`，或把实例引用的 image 字段
 //! 投影进实例快照），但绝不引入第二条真相。
 
-use crate::component::{ComponentId, ComponentImageId, ComponentState};
+use crate::component::{ComponentId, ComponentState};
 use crate::machine::CpuId;
 use crate::task::{TaskId, TaskState};
 
@@ -24,29 +24,16 @@ pub struct TaskSnapshot {
     pub running_on: Option<CpuId>,
 }
 
-/// 一个组件**实例**的只读快照：实例真相 + 其常驻 image 的投影。
+/// 一个组件（`ComponentId`）的只读快照：生命周期真相 + 它自己 loaded image 的
+/// 投影。loaded image 1:1 归属该组件，不存在第二层 image 身份。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentSnapshot {
     pub id: ComponentId,
     pub state: ComponentState,
-    /// 实例引用的常驻 image 身份（一份 image 可以有多个实例）。
-    pub image: ComponentImageId,
     /// `kcomp_instance_create` 写回的 opaque state 指针，**只作为数值观察**
     /// （快照是值拷贝；Core 与观察者都绝不解引用）。
     pub instance_state: usize,
-    /// 以下为 image 投影：判断"还是不是同一份代码/入口"。
-    pub base: usize,
-    pub create: usize,
-    pub destroy: usize,
-    pub text_size: usize,
-    pub abi: u64,
-}
-
-/// 一份常驻加载组件代码（image）的只读快照。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageSnapshot {
-    pub id: ComponentImageId,
-    /// 段放置基址；`[base, base + text_size)` 是装载镜像区间。
+    /// 以下为 loaded image 投影：判断"这段代码/入口在哪"。
     pub base: usize,
     pub create: usize,
     pub destroy: usize,

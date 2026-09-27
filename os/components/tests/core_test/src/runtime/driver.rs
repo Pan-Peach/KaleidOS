@@ -16,7 +16,8 @@
 //! 断言全部来自 Core 真相，且分支在**机器拓扑事实**（参考真值）上，CoreTest 不
 //! 接收"场景"参数：有块设备 → 出生事件数与尝试数吻合、attached 设备被驱动持有
 //! （再次 claim `-EBUSY`）、只有 attached 实例有可读的 `block.device` endpoint、
-//! 第二台块设备被拒（`-EBUSY`，image-global 单 attachment）；无块设备 → 每个候选
+//! 同一 artifact 的第二台块设备可再 instantiate 一个独立组件（独立镜像状态）；
+//! 无块设备 → 每个候选
 //! 得到 report-only 实例（`probe.result` `outcome=1`、无 `block.device`）、设备无
 //! 残留持有；两种拓扑共有 stale NoMatch 路径（非 virtio-blk 设备作为候选）。
 //!
@@ -292,9 +293,17 @@ fn nth_stale() -> Result<u32, i32> {
     if rc == 0 { Ok(device) } else { Err(rc) }
 }
 
-/// 多设备行为：对**第二台**块设备再 create 一个 `virtio_blk` → 驱动拒绝第二个
-/// attachment（`-EBUSY`）。只有一台块设备时退化为对 attached 设备本身再 create
-/// （claim 阶段即 `-EBUSY`）。
+/// 多设备行为（新模型）：同一 `virtio_blk` artifact 为**第二台**块设备再
+/// instantiate 一个组件——每次 instantiate 得到独立的 writable image（独立的
+/// `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK`），因此第二个 attachment 被接受
+/// （旧模型下被 image-global `BLK` 拒绝成 `-EBUSY`）。
+///
+/// 只有一台块设备时退化为对 attached 设备本身再 create：新组件 claim 已归属的
+/// 设备 → `-EBUSY`（归属检查，不是共享 static）。
+///
+/// 诚实边界：prober 当前在首个 Match 后停止，不会主动 provision 第二台设备；
+/// 这里验证的是**模型**允许同 artifact 的第二个驱动组件（独立镜像状态），而不是
+/// "系统已完成多设备编排"。
 fn check_multi_device(state: &State, attached: u32) -> bool {
     let mut device = attached;
     for ordinal in 0..state.candidate_count {
@@ -306,12 +315,18 @@ fn check_multi_device(state: &State, attached: u32) -> bool {
             break;
         }
     }
+    let different = device != attached;
     let mut name_buf = [0u8; probe::RESULT_PORT_NAME_MAX];
     let Ok(name_len) = probe::result_port_name(2, &mut name_buf) else {
         return false;
     };
     let mut instance = 0u32;
-    create_driver(device, &name_buf[..name_len], &mut instance) == Errno::EBUSY.code()
+    let rc = create_driver(device, &name_buf[..name_len], &mut instance);
+    if different {
+        rc == 0
+    } else {
+        rc == Errno::EBUSY.code()
+    }
 }
 
 /// 该实例是否发布了 `probe.result` 且 pull 到 `NO_MATCH`（按 attempt 命名查找；

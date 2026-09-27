@@ -74,7 +74,7 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 - **instance 死亡**：
   - KernelNative → **无记录、不回收**。这正是"逻辑死亡、物理驻留"的结果；将来若要给 KernelNative 做物理回收，需要另立机制（那时才需要账本，不在本契约内）。
   - Isolated → **create / service 故障**（Core 中止实例）解映射并归还 Core 预置窗口 backing；**destroy 路径**（优雅停止或 destroy 入口故障）只退役 AS，窗口 backing 驻留（AS 退役后不可再进入）。页表页没有 teardown 接口，"不 leaked AS" = 退役后不再可达。
-- **逻辑重启** = 全新 instance、全新 `HeapState`，**绝不复用**失败堆。
+- **重启 = 重新 instantiate**：全新组件、全新 `HeapState`，**绝不复用**失败堆。
 - 优雅销毁可把私有对象还进本地 free list；但**不得**释放仍通过 Direct binding / 任务参数暴露的存储。
 
 > **诚实边界**：KernelNative 的 release / failure 只保证**逻辑失效**，不承诺撤销裸指针或物理回收。真正的访问强制与安全复用依赖真实执行域（私有 AS + 页表）及 DMA 静默条件。
@@ -83,7 +83,7 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 
 > **这是本契约能成立的前提**，不是后续优化。
 
-`component/image.rs` 的 `ImageTable` 按 artifact 名**复用 image**，所以 image 的可写 static（含 `#[global_allocator]` 的内部状态）**不是** per-instance 存储。把 `CoreHeap` 换成 SDK static allocator 会得到一个 **image-global** 堆，违反本契约。
+每次 instantiate 都从 artifact **独立**放段 / 重定位，得到本组件自己的可写 image backing（`.data` / `.bss` 私有，含 `#[global_allocator]` 的内部 static）——**不存在**"同一份 image backing 被多个组件共享"的 image-global 状态，因此组件的可写 static 天然 per-component。per-instance runtime context 仍不可跳过：它把**运行时状态**（堆句柄 / opaque 状态）绑定到当前执行边界。
 
 - Core 为每个 instance 关联一个**稳定的 runtime slot**（内含 runtime 自有的 opaque 状态指针；Core **从不解释**它）。
 - 组件每个入口（create、task 切换、Gate 进入、**Direct provider 入口**、panic escape）都 **建立**正确的 runtime context；每个出口 / 非局部逃逸都 **恢复**。
@@ -121,4 +121,4 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 - **先行条件**：§5 的 per-instance runtime context（`tp`）。
 > **Isolated 回收的诚实边界**：私有 backing 的**别名排除**保证 A 不能经 identity 看见 B 的 backing（`kernel_mappings::publish_private_backing` 对**所有活着的** root 逐条摘除 + 后续 root 的计划排除）；但页表页没有 teardown 接口，"退役 AS"只保证**不可再进入**，不承诺物理回收。create / service 故障解映射并归还预置窗口 extent；destroy 路径窗口驻留。KernelNative 无隔离，失败只是逻辑失效。
 
-- 映射机制复用 `os/core/src/memory/address_space.rs`（`AddressSpaceManager` 已**有意重启**为 per-instance 表：`create_isolated_address_space_for`（共享 Core 映射 + 私有区）/ `map` / `unmap` / `mapping_exact` / `retire` / `prepare_activation` / `prepare_transition`，以及 `memory/kernel_mappings.rs` 的映射计划 + 私有 backing 别名排除事务，含 host 测试与 `Retired` 状态。私有 AS 切换机制在 `component/isolated.rs` + `arch/src/riscv/trampoline/`（双映射汇编、trap 往返、窄故障分派）；按域放段 / 逐段映射在 `component/isolated_load.rs`（页级权限分离 + 按域重定位 + 显式拒绝）；实例生命周期在 `component/isolated_lifecycle.rs`：私有 AS + 按域镜像 + **Core 预置的组件栈 / 实例内存窗口 / 服务邮箱**（Core backing、零初始化、只映射在该实例的 AS 里）经 跨 AS trampoline 执行 `kcomp_instance_create` / `destroy` / `kcomp_service_dispatch`（`component/isolated_mailbox.rs` 承载跨 AS 的扁平帧拷贝）。窗口生命周期两条路径：**create / service 故障 = Core 中止实例**（解映射并归还预置窗口 backing，半成品不留）；**destroy 路径**（入口成功或故障）只**退役 AS**，窗口 backing 保持驻留（phase 1 契约；AS 退役后不可再进入）。**逻辑重启**复用 image 常驻 backing（同域 image 复用，全新 AS / 全新窗口 / 全新 slot；并发活跃实例显式拒绝）。**内存路径决定**：`kcore_memory_acquire/release` 的组件可调用面（component→Core gate-call trampoline）**未做**——Isolated 组件只拿 Core 预置的实例窗口（以 `kcore_memory_view`（`LOCAL_VA`）编码预交付；表示仍是**实例内 VA**，与本节 §3 的域视图同形），归属由该实例的页表承载。上述行为由 ArchTest 在 RV64/RV32 证明（`isolated-*` 系列）。boot 的单一 `RUNTIME_VM` 仍是独立真相，`adopt` hook 尚未接线——不要把它当现成的 per-component AS 执行路径）。
+- 映射机制复用 `os/core/src/memory/address_space.rs`（`AddressSpaceManager` 已**有意重启**为 per-instance 表：`create_isolated_address_space_for`（共享 Core 映射 + 私有区）/ `map` / `unmap` / `mapping_exact` / `retire` / `prepare_activation` / `prepare_transition`，以及 `memory/kernel_mappings.rs` 的映射计划 + 私有 backing 别名排除事务，含 host 测试与 `Retired` 状态。私有 AS 切换机制在 `component/isolated.rs` + `arch/src/riscv/trampoline/`（双映射汇编、trap 往返、窄故障分派）；按域放段 / 逐段映射在 `component/isolated_load.rs`（页级权限分离 + 按域重定位 + 显式拒绝）；实例生命周期在 `component/isolated_lifecycle.rs`：私有 AS + 按域镜像 + **Core 预置的组件栈 / 实例内存窗口 / 服务邮箱**（Core backing、零初始化、只映射在该实例的 AS 里）经 跨 AS trampoline 执行 `kcomp_instance_create` / `destroy` / `kcomp_service_dispatch`（`component/isolated_mailbox.rs` 承载跨 AS 的扁平帧拷贝）。窗口生命周期两条路径：**create / service 故障 = Core 中止实例**（解映射并归还预置窗口 backing，半成品不留）；**destroy 路径**（入口成功或故障）只**退役 AS**，窗口 backing 保持驻留（phase 1 契约；AS 退役后不可再进入）。**重启 = 重新 instantiate**：每次全新按域放置到全新私有 backing / 全新 AS / 全新窗口 / 全新 slot（**没有** same-image backing 复用；同一 artifact 可并发多个组件）。**内存路径决定**：`kcore_memory_acquire/release` 的组件可调用面（component→Core gate-call trampoline）**未做**——Isolated 组件只拿 Core 预置的实例窗口（以 `kcore_memory_view`（`LOCAL_VA`）编码预交付；表示仍是**实例内 VA**，与本节 §3 的域视图同形），归属由该实例的页表承载。上述行为由 ArchTest 在 RV64/RV32 证明（`isolated-*` 系列）。boot 的单一 `RUNTIME_VM` 仍是独立真相，`adopt` hook 尚未接线——不要把它当现成的 per-component AS 执行路径）。

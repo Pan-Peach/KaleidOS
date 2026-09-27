@@ -42,14 +42,19 @@
 //! DMA 回调去 `DMA_MAP.take`，所以 exit 里 drop 必须在 `BLK` 锁内执行。
 //! `DEVICE_ID` / `MMIO_BASE` 刻意用原子而不是锁：Hal 回调可能在 `BLK` 锁内运行。
 //!
-//! # 已知限制（如实登记）
+//! # 多设备模型（新：一个组件 = 一份独立 writable image）
 //!
-//! - `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK` 仍是 **image-global**：image 被
-//!   多个实例复用时它们不隔离。保证的是：**拒绝第二个 attachment**、报告数据
-//!   **按实例**保存、report-only 实例的 destroy **绝不复位**已 attach 实例的设备。
-//! - `CoreHal` 的回调是**无上下文的**（`Hal` 不接收 per-instance ctx），因此 DMA
-//!   归属只能锚在全局 `DEVICE_ID` 上；没有 per-instance HAL 回调上下文。
-//! - 因此**不声称多设备支持**：一个 virtio_blk 镜像在同一时刻只 attach 一台设备。
+//! `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK` 是**组件私有**的 statics：每次
+//! instantiate 都重新放段 / 重定位，因此两个 `virtio_blk` 组件各自拥有独立的一套
+//! static（独立设备身份 / MMIO 窗口 / DMA map / transport）。**一个设备 = 一个
+//! 驱动组件 = 一个 `block.device` endpoint**；多设备 = 多次 instantiate。
+//!
+//! - `BLK.lock().is_some()` 现在只是**组件内**的二次 attach 守卫（一个组件不该
+//!   attach 两台设备），不再阻止另一个组件 attach 另一台设备。
+//! - `CoreHal` 的回调仍是**无上下文的**（`Hal` 不接收 per-instance ctx）；因为
+//!   每个组件只 attach 一台设备，全局 `DEVICE_ID` 在组件内是唯一的，DMA 归属正确。
+//! - **系统编排仍未做**：prober 在首个 Match 后停止，不会主动为第二台设备
+//!   instantiate 第二个驱动组件——这是编排缺口，不是模型限制。
 
 #![no_std]
 
@@ -244,7 +249,8 @@ kcomp_instance_create!(|args, out_state| {
         return 0;
     }
 
-    // (5) 镜像全局设备状态单设备：拒绝第二个 attachment（本步不声称多设备支持）。
+    // (5) 组件内二次 attach 守卫：一个组件只 attach 一台设备。statics 是组件
+    //     私有的（每次 instantiate 独立），因此这不阻止别的组件 attach 别的设备。
     if BLK.lock().is_some() {
         klog!(
             "virtio_blk: device already attached; rejecting second attachment (device_id={})",

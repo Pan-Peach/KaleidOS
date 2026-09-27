@@ -114,11 +114,7 @@ impl BlockDeviceProvider for RamBlkRwProvider {
         let (start, _) = self.range(lba, buf.len())?;
         // SAFETY: 同 read；方向相反，仍不重叠。
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                (*self.state).buf.add(start),
-                buf.len(),
-            );
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), (*self.state).buf.add(start), buf.len());
         }
         Ok(())
     }
@@ -186,13 +182,14 @@ kcomp_instance_create!(|_args, out_state| {
     unsafe {
         core::ptr::write(
             service_ptr.cast::<BlockDeviceService<RamBlkRwProvider>>(),
-            BlockDeviceService::new(RamBlkRwProvider { state: state.cast() }),
+            BlockDeviceService::new(RamBlkRwProvider {
+                state: state.cast(),
+            }),
         );
     }
     // SAFETY: service 永不回收（实例存储保留），'static 因此成立；provider
     // 内的 state 指针在实例存活期内有效。
-    let service: &'static BlockDeviceService<RamBlkRwProvider> =
-        unsafe { &*service_ptr.cast() };
+    let service: &'static BlockDeviceService<RamBlkRwProvider> = unsafe { &*service_ptr.cast() };
 
     // 发布 endpoint（staged：Core 在 create 返回 0 后原子提交）：
     // port_name = 契约名（单例固定名，组合策略据此发现），port = 本 provider 的

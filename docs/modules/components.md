@@ -22,9 +22,9 @@
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
 | `kcomp_panic` | `os/components/tests/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
 | `kcomp_isolated` | `os/components/tests/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供按域装载与页级权限强制用例在私有 AS 里执行 |
-| `kcomp_isolated_bad` | `os/components/tests/kcomp_isolated_bad/` | Rust `.kcomp` | **放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 包络）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明实例 / 创建 AS / 登记 image 之前」 |
+| `kcomp_isolated_bad` | `os/components/tests/kcomp_isolated_bad/` | Rust `.kcomp` | **放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 包络）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明组件 / 创建 AS / 登记之前」 |
 | `kcomp_isolated_life` | `os/components/tests/kcomp_isolated_life/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：实现实例窗口协议（读 args / 写 `out_state` 上报 tp / satp / config；destroy 写标记），供 `isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-lifecycle-fault` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-restart` 经生产生命周期创建 / 销毁。故障注入：`FAIL_ABI`（create 返回 `-EINVAL`）、`FAULT_ABI`（create trap）、`DESTROY_FAULT_ABI`（create 成功、destroy trap）与 destroy 进入计数（`isolated-destroy-fault` 的「绝不重试析构」证据） |
-| `kcomp_isolated_svc` | `os/components/tests/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` / `isolated-stale-access` / `isolated-ready-fault` 证明跨域 Gate、stale 阻断与逻辑重启 |
+| `kcomp_isolated_svc` | `os/components/tests/kcomp_isolated_svc/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：Isolated 服务 provider。create 把 `out_state` 指向上报区；`kcomp_service_dispatch` 记录 Core 交付的邮箱帧（port / method / frame / args / input / output / tp / satp）、按 method 回显（echo）或对 caller 域地址注入缺页（fault），供 `isolated-service` / `isolated-service-limits` / `isolated-service-fault` / `isolated-stale-access` / `isolated-ready-fault` 证明跨域 Gate、stale 阻断与重新 instantiate（重启） |
 | `kcomp_min` | `os/components/tests/kcomp_min/` | Rust staticlib（host fixture） | 手写最小生命周期入口，供 `os/core/build.rs` host 测试钉重定位布局；**不在 `KCOMP_SRCS`** |
 | `kbench` | `os/components/kbench/` | Rust `.kcomp` | 板端 benchmark：clock/query + 真实 `sched.yield_roundtrip` 交接 |
 | `kcomp-sdk` | `os/components/kcomp-sdk/` | Rust lib + C 头 / CRT | 组件 SDK/CRT，**不是可加载组件**（见下） |
@@ -54,7 +54,7 @@
 内嵌
   boot 以 include_bytes! 收进 .initpkg 段（__initpkg_start / __initpkg_end）
 加载
-  store（cpio newc 解析）→ loader（段放置 + 重定位 + 入口校验）→ registry（生命周期）→ image（常驻镜像）
+  store（cpio newc 解析）→ loader（段放置 + 重定位 + 入口校验）→ registry（生命周期，`ComponentRecord` 直接持有 loaded）
 ```
 
 - **导出白名单**：`abi/core.toml` 声明 **40** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。
@@ -81,5 +81,5 @@
 | `tools/build-kcomp.sh` / `tools/build-kcomp-c.sh` | Rust / C 语言前端 |
 | `tools/kcomp-link.sh` | 语言无关打包器 + 契约校验 |
 | `tools/kabi/kabi_gen.py` | ABI schema 生成器（源 `abi/*.toml`） |
-| `os/core/src/component/{store,loader,registry,image,export}.rs` | store / loader / registry / image / 导出白名单 |
+| `os/core/src/component/{store,loader,registry,export}.rs` | store / loader / registry / 导出白名单 |
 | `os/core/build.rs` | host fixture 组件构建 + `.initpkg` 内嵌 |

@@ -2,22 +2,22 @@
 //!
 //! ```text
 //! create_isolated_native(name, args)                    （load.rs 的门禁之后）
-//!   ├─ isolated_image(name, blob)      ← 同域已登记则复用；否则按域放段 + 登记
+//!   ├─ isolated_load::place(blob)      ← 每次 instantiate 都重新按域放段
 //!   │     └─ Core 验证：段 / 权限 / 入口 / abi（`isolated_load`）
-//!   ├─ registry.declare(image, IsolatedNative) → create_isolated_address_space_for(id)
+//!   ├─ registry.declare(name, loaded, IsolatedNative) → create_isolated_address_space_for(id)
 //!   ├─ map_mappings(段) + map_instance_windows()（组件栈 + 实例窗口）
 //!   ├─ resolve → begin_start；写 create args / out_state / runtime slot 进窗口
 //!   ├─ isolated::prepare(...)（Core 再验证入口 / 栈；共享 Core 映射已落）
 //!   └─ isolated::enter(...) → Returned(0) → 提交 pending → Ready
 //!
 //! destroy（`exit.rs` 按 execution_domain 分派）
-//!   └─ prepare(handle, image.destroy, ...) → enter → Returned(0) → retire(handle)
+//!   └─ prepare(handle, record.loaded.destroy, ...) → enter → Returned(0) → retire(handle)
 //!      → `complete_stop` 提交 Stopped
 //!
-//! 逻辑重启：前一个实例 Failed / Stopped（tombstone）后，同名 create 复用同一份
-//! **常驻 image**，但拿到**全新**实例（新 ComponentId / 新私有 AS / 新窗口 /
-//! 新 runtime slot）；`load.rs` 拒绝跨域复用与**并发活跃**实例（同一 image 的
-//! `.data` / `.bss` 是 image-global，与 KernelNative 同一契约）。
+//! restart：前一个组件 Failed / Stopped（tombstone）后，同名 create 从 artifact
+//! **重新 instantiate**——全新 ComponentId / 全新私有 AS / 全新 backing / 新窗口 /
+//! 新 runtime slot，且 writable image state 回到 artifact 初始状态。同一 artifact
+//! 可以并发存在多个组件（各自私有 AS + backing）。
 //!
 //! service dispatch（KernelNative caller → Isolated provider）
 //!   └─ dispatch_service(...)：容量校验（超长 `-EMSGSIZE`，绝不截断）→ 帧拷进
@@ -75,14 +75,13 @@
 //! **destroy 路径 = 实例已走到生命尽头**（无论入口成功或故障都只退役 AS，窗口
 //! backing 驻留——AS 退役后不可再进入，页表页无 teardown 接口）。任何终态之后：
 //! endpoint 永久失效（`failure` 兜底），stale 调用在 Core 边界被 `resolve` 拒绝
-//! （先于任何进入），同 image 可**逻辑重启**。
+//! （先于任何进入），同一 artifact 可**重新 instantiate**（全新组件）。
 //!
 //! # 明确不做（当前边界）
 //!
 //! Isolated provider **不能自己 publish endpoint**（没有组件→Core import 面；
 //! endpoint 真相仍由 Core 拥有；出站 Isolated caller 继续显式拒绝）。destroy 后
-//! 不做物理回收（窗口 / image 驻留）。同一 image 的并发活跃实例显式拒绝
-//! （`load.rs` 的 `IsolatedInstanceLive`）。ASID 恒 0 + 全量 `sfence.vma`；没有
+//! 不做物理回收（窗口 / backing 驻留）。ASID 恒 0 + 全量 `sfence.vma`；没有
 //! U-mode / `ecall`。邮箱容量固定，没有共享内存、没有 per-call 映射。
 //! **组件内 Rust `panic!` 不是被收敛的故障**：Isolated 组件没有
 //! `kcore_panic_escape` import 面，panic handler 只能自旋（同步调用 = 挂住调用
@@ -95,11 +94,10 @@
 //! - **CPU isolation ≠ DMA isolation**：Isolated 实例的 AS 只映射自己的镜像 /
 //!   机制页 / 栈 / 窗口 / 邮箱，**不含**任何 MMIO / Core 段 / 页表 / 别的实例；
 //!   Core 拥有的 DMA backing 是否可被错误复用仍不声称 DMA 静默。
-//! - **同 image 多实例的 `.data` / `.bss`**：image-global（与 KernelNative 同一
-//!   契约，`docs/architecture/component-lifecycle.md` §9）；per-instance 状态由
-//!   Core 预置窗口承载。逻辑重启复用同一份 backing，因此**不**回收失败实例写过
-//!   的镜像可写段——重启的独立性来自新 AS / 新窗口 / 新 slot，不是"镜像字节被
-//!   重置"。
+//! - **每个组件拥有私有 backing**：同 artifact 两次 instantiate 各自按域放段 /
+//!   重定位到独立 backing（writable `.data` / `.bss` 回到 artifact 初始状态），
+//!   再经 Core 预置窗口承载实例级交付。**不回收**旧组件的 backing（phase 1：
+//!   物理驻留）——ownership 明确归属旧组件。
 
 use crate::component::ComponentId;
 use crate::component::call::CallError;
@@ -217,68 +215,34 @@ mod imp {
     use crate::component::isolated::{self, IsolatedPrepareError, Outcome};
     use crate::component::isolated_load::IsolatedLoadError;
     use crate::component::load;
-    use crate::component::{containment, failure, image, registry, runtime_slot};
+    use crate::component::{containment, failure, registry, runtime_slot};
     use crate::memory::address_space::{
         self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange,
     };
 
-    /// 取本次实例要用的 Isolated image：已登记（同域）→ 复用其常驻 backing 与
-    /// 入口（逻辑重启）；未登记 → 按域放段 + 登记（lease 归 image 表）。
+    /// 创建并启动一个 Isolated 组件（`load.rs::create_isolated_native` 的实现）。
     ///
-    /// 返回 `(image id, create 入口, 段规划)`。复用路径不重新读取 / 放段：段规划
-    /// 与入口 VA 都是 image 真相（`ComponentImage::placement` / `create`），第二个
-    /// 实例只是把**同一份** backing 映射进自己的私有 AS。
-    fn isolated_image(
-        name: &[u8],
-        blob: &[u8],
-    ) -> Result<(image::ComponentImageId, usize, alloc::vec::Vec<Mapping>), ComponentLoadError>
-    {
-        {
-            let images = image::get_images().lock();
-            if let Some(id) = images.find(name) {
-                let record = images.get(id).ok_or(ComponentLoadError::ImageFailed)?;
-                if record.domain != ExecutionDomain::IsolatedNative {
-                    return Err(ComponentLoadError::ImageDomainMismatch);
-                }
-                return Ok((id, record.create, record.placement.clone()));
-            }
-        }
-        // (1) 按域放段：段 / 权限 / 入口 / kcomp_abi 全部 Core 验证。
-        let placed = isolated_load::place(blob).map_err(map_placement_error)?;
-        let mappings = placed.mappings();
-        let create_entry = placed.create();
-        // (2) image 登记：lease 归 image 表（pinned-until-reboot）；规划副本留在本地。
-        let id = image::get_images()
-            .lock()
-            .register(
-                name,
-                placed.into_loaded_component(),
-                ExecutionDomain::IsolatedNative,
-                mappings.clone(),
-            )
-            .map_err(|_| ComponentLoadError::ImageFailed)?;
-        Ok((id, create_entry, mappings))
-    }
-
-    /// 创建并启动一个 Isolated 实例（`load.rs::create_isolated_native` 的实现）。
-    ///
-    /// 任何一步失败都走"半成品不留"：退役 AS + 归还 Core 预置窗口 backing +
-    /// `Failed`（实例一旦声明就一定有终态）。
+    /// 每次 instantiate 都从 artifact **重新按域放段 + 重定位**，得到这个组件
+    /// 自己私有的 backing（不再有同域 image 复用）。任何一步失败都走"半成品不留"：
+    /// 退役 AS + 归还 Core 预置窗口 backing + `Failed`（组件一旦声明就一定有终态）。
     pub(crate) fn create(
         name: &[u8],
         blob: &[u8],
         args: &KcompCreateArgs,
     ) -> Result<ComponentId, ComponentLoadError> {
-        // (1) image：复用已登记的 Isolated 放段结果（**逻辑重启**：同一镜像、
-        //     全新实例——全新 AS / 窗口 / slot），否则按域放段 + 登记。
-        //     跨域复用 / 并发活跃实例已由 `load.rs` 的门禁拒绝；这里仍复验域
-        //     （Core 不信任调用方顺序：绝不在错误的 VA 布局上落段）。
-        let (image_id, create_entry, mappings) = isolated_image(name, blob)?;
+        // (1) 按域放段：段 / 权限 / 入口 / kcomp_abi 全部 Core 验证。
+        let placed = isolated_load::place(blob).map_err(map_placement_error)?;
+        let mappings = placed.mappings();
+        let create_entry = placed.create();
 
-        // (2) 实例声明（Isolated 域 = 创建入口的分派结果，不是组件自报）。
+        // (2) 声明组件：它 1:1 拥有这次加载结果（lease 随 loaded 常驻）。
         let id = registry::get_registry()
             .lock()
-            .declare(image_id, ExecutionDomain::IsolatedNative)
+            .declare(
+                name,
+                placed.into_loaded_component(),
+                ExecutionDomain::IsolatedNative,
+            )
             .map_err(|_| ComponentLoadError::DeclareFailed)?;
 
         // (3) 私有 AS：还没有 AS 就没有可清理的，直接 Failed。

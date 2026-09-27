@@ -12,7 +12,6 @@ pub mod endpoint;
 pub mod exit;
 pub mod export;
 pub mod failure;
-pub mod image;
 /// 私有 AS 切换网关的 Core 侧准备（`isolated_lifecycle` 生产调用；仅
 /// S-mode + MMU + RISC-V 目标有意义，其余 profile 不提供、也不降级）。
 #[cfg(all(
@@ -42,7 +41,6 @@ pub mod store;
 pub use containment::panic_escape;
 pub use exit::{ComponentStopError, stop_component};
 pub use failure::fail_component;
-pub use image::{ComponentImage, ComponentImageId};
 
 /// Core 真相门禁：`id` 是否为 `Failed`（逻辑死亡）实例。
 ///
@@ -149,21 +147,6 @@ impl ComponentState {
                 | (Self::Stopping, Self::Stopped)
         )
     }
-
-    /// 实例是否仍**活着**（未到终态）：`Declared` / `Resolved` / `Starting` /
-    /// `Ready` / `Stopping`。
-    ///
-    /// 终态 = `Stopped` / `Failed`（tombstone，记录保留）。
-    /// 用途：Isolated 的同 image 并发门禁（`component/load.rs`）——逻辑重启只在
-    /// 前一个实例**逻辑死亡之后**成立；两个活跃实例会共享 image 的
-    /// `.data` / `.bss`（image-global，与 KernelNative 同一契约），不在当前
-    /// 承诺的隔离模型内。
-    pub const fn is_live(self) -> bool {
-        matches!(
-            self,
-            Self::Declared | Self::Resolved | Self::Starting | Self::Ready | Self::Stopping
-        )
-    }
 }
 
 #[cfg(test)]
@@ -195,19 +178,6 @@ mod tests {
                     "{from:?} -> {to:?} legality"
                 );
             }
-        }
-    }
-
-    /// `is_live` 与状态机终态精确互补：只有 `Stopped` / `Failed` 是 tombstone。
-    #[test]
-    fn is_live_marks_exactly_the_non_terminal_states() {
-        use ComponentState::{Declared, Failed, Ready, Resolved, Starting, Stopped, Stopping};
-
-        for state in [Declared, Resolved, Starting, Ready, Stopping] {
-            assert!(state.is_live(), "{state:?} must be live");
-        }
-        for state in [Stopped, Failed] {
-            assert!(!state.is_live(), "{state:?} must be a tombstone");
         }
     }
 }

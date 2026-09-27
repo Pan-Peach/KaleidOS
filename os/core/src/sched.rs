@@ -212,7 +212,6 @@ pub fn set_policy(endpoint: EndpointId) -> Result<(), SchedError> {
     {
         let components = registry::get_registry().lock();
         let endpoints = endpoint::get_endpoints().lock();
-        let images = crate::component::image::get_images().lock();
         let record = endpoints
             .lookup(
                 &components,
@@ -229,8 +228,7 @@ pub fn set_policy(endpoint: EndpointId) -> Result<(), SchedError> {
         if instance.execution_domain != ExecutionDomain::KernelNative {
             return Err(SchedError::PolicyUnsupportedDomain);
         }
-        let image = images.get(instance.image).ok_or(SchedError::NoDispatcher)?;
-        if image.service_dispatch.is_none() {
+        if instance.loaded.service_dispatch.is_none() {
             return Err(SchedError::NoDispatcher);
         }
     }
@@ -620,7 +618,6 @@ mod tests {
     use crate::component::call::CallError;
     use crate::component::containment;
     use crate::component::endpoint::{ContractId, EndpointError, ExecutionDomain};
-    use crate::component::image::{self, ComponentImageId};
     use crate::component::registry;
     use crate::errno::Errno;
     use crate::generated::abi::KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT;
@@ -628,9 +625,6 @@ mod tests {
     use crate::test_support::{Rank, TestLock};
     use core::ptr;
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-
-    /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
-    const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
     /// 串行化触碰进程全局 task table / registry / 调度策略配置的调度测试。
     ///
@@ -653,7 +647,6 @@ mod tests {
         init();
         registry::init();
         endpoint::init();
-        image::init();
         crate::resource::init();
         clear_policy();
         reset_cpu();
@@ -685,26 +678,37 @@ mod tests {
     // 实例 / endpoint / 任务
     // ------------------------------------------------------------------
 
-    /// 全局 registry 里的一个 `Ready` 活实例（同一 image 可无限复用，id 跨用例累积）。
-    fn ready_component(_name: &[u8]) -> ComponentId {
+    /// 全局 registry 里的一个 `Ready` 活组件（id 跨用例累积）。
+    fn ready_component(name: &[u8]) -> ComponentId {
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let id = reg
+            .declare(
+                name,
+                crate::component::registry::test_support::test_loaded(0, None),
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
         id
     }
 
-    /// 一个 Ready 的策略 provider：image 表登记（可选）dispatcher，registry 记录
-    /// opaque instance state。
+    /// 一个 Ready 的策略 provider：loaded image 带（可选）dispatcher，registry
+    /// 记录 opaque instance state。
     fn ready_policy_provider(
         name: &[u8],
         dispatcher: Option<usize>,
         state: *mut (),
     ) -> ComponentId {
-        let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+        let id = reg
+            .declare(
+                name,
+                crate::component::registry::test_support::test_loaded(0, dispatcher),
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -967,13 +971,17 @@ mod tests {
         init_world();
 
         let isolated = {
-            let image = image::test_support::register_test_image_with_dispatch(
-                b"sched_isolated_policy",
-                0,
-                Some(first_runnable as *const () as usize),
-            );
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::IsolatedNative).unwrap();
+            let id = reg
+                .declare(
+                    b"sched_isolated_policy",
+                    crate::component::registry::test_support::test_loaded(
+                        0,
+                        Some(first_runnable as *const () as usize),
+                    ),
+                    ExecutionDomain::IsolatedNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();

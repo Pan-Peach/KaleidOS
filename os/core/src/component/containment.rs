@@ -638,9 +638,10 @@ pub fn call_component_create(
 /// `load::current_component()`).  Panic routing is the same as create: the
 /// escape switches back to `stop_component`, which classifies the outcome.
 pub fn call_component_destroy(entry: usize, state: *mut (), owner: ComponentId) -> CallOutcome {
-    // SAFETY: `entry` comes from `ComponentImage::destroy`, which the loader
-    // resolved and relocated from the component's own symbol table (same
-    // contract as `call_component_create`).
+    // SAFETY: `entry` comes from the component's own loaded image
+    // (`ComponentRecord.loaded.destroy`), which the loader resolved and
+    // relocated from the component's symbol table (same contract as
+    // `call_component_create`).
     call_on_isolated_stack_with(
         IsolatedCall::Destroy { entry, state },
         EscapeKind::Exit { owner },
@@ -1081,9 +1082,10 @@ extern "C" fn trampoline() -> ! {
             create(args, out_state)
         }
         IsolatedCall::Destroy { entry, state } => {
-            // SAFETY: `entry` comes from `ComponentImage::destroy` (loader
-            // validated + relocated the symbol); `state` is the instance's
-            // opaque pointer (Core never dereferences it).
+            // SAFETY: `entry` comes from the component's loaded image
+            // (`ComponentRecord.loaded.destroy`; loader validated + relocated
+            // the symbol); `state` is the component's opaque pointer (Core
+            // never dereferences it).
             let destroy: InstanceDestroy = unsafe { core::mem::transmute(entry) };
             destroy(state)
         }
@@ -1094,8 +1096,9 @@ extern "C" fn trampoline() -> ! {
             method,
             frame,
         } => {
-            // SAFETY: `dispatcher` comes from `ComponentImage::service_dispatch`
-            // (loader validated + relocated the symbol); `instance_state` /
+            // SAFETY: `dispatcher` comes from the component's loaded image
+            // (`ComponentRecord.loaded.service_dispatch`; loader validated +
+            // relocated the symbol); `instance_state` /
             // `frame` belong to the suspended caller (`call.rs` released every
             // lock before entering the boundary, and the frame stays valid for
             // the duration of the call).

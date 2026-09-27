@@ -147,49 +147,22 @@ pub fn load(args: &[u8]) {
         return;
     }
     let name = String::from_utf8_lossy(name);
-    // Monitor 单实例便利语义：同名 artifact 已有 Ready/Starting 实例时不再新建
-    // （组件 ABI 的 `kcore_component_create` 仍支持多实例；这是交互式 load 的 UX）。
-    // `image → instance` 的匹配与 `components` 命令同源。
-    //
-    // 注意："already loaded" 检查不看**请求的 kind**——同名 Native 实例会让
-    // Isolated 请求短路（反之亦然）。
-    {
-        let images = crate::component::image::get_images().lock();
-        if let Some(image) = images.find(name.as_bytes()) {
-            drop(images);
-            let reg = crate::component::registry::get_registry().lock();
-            let already = reg.iter().any(|record| {
-                record.image == image
-                    && matches!(
-                        record.state,
-                        crate::component::ComponentState::Ready
-                            | crate::component::ComponentState::Starting
-                    )
-            });
-            if already {
-                printk!("load {name}: already loaded\n");
-                return;
-            }
-        }
-    }
+    // 每次 `load` 都创建**全新组件**（独立 writable image）；同名再次 load 不再
+    // 短路——多实例是合法语义（组件 ABI 的 `kcore_component_create` 同理）。
     match crate::component::load::load_and_start(name.as_bytes(), kind) {
         Ok(id) => {
-            let (image, create) = {
+            let create = {
                 let reg = crate::component::registry::get_registry().lock();
                 let Some(record) = reg.get(id) else {
-                    printk!("load {name}: instance vanished\n");
+                    printk!("load {name}: component vanished\n");
                     return;
                 };
-                let image = record.image;
-                drop(reg);
-                let images = crate::component::image::get_images().lock();
-                (image, images.get(image).map_or(0, |image| image.create))
+                record.loaded.create
             };
             printk!(
-                "load {}: OK (id={}, image={}, create={:#x})\n",
+                "load {}: OK (id={}, create={:#x})\n",
                 name,
                 id.raw(),
-                image.raw(),
                 create
             );
             // 组合动作：该实例若发布了调度策略 endpoint，**显式**发现 + 选择它
@@ -223,9 +196,9 @@ pub fn load(args: &[u8]) {
 /// `unload <name>`：优雅停止该 artifact 的实例（`Ready → Stopping → Stopped`）。
 ///
 /// 薄 caller：停止编排在 `component/exit.rs::stop_component`（拒绝拥有未退出
-/// 任务的实例；调用 `kcomp_instance_destroy`；Core 兜底回收）。一份 image 可以有
-/// 多个实例，本命令停掉该 name 的**全部**实例。记录保留——不回收段内存、
-/// 不退役实例，`components` 仍能看到 `state=Stopped`。
+/// 任务的组件；调用 `kcomp_instance_destroy`；Core 兜底回收）。同名 artifact 可以
+/// 有多个组件，本命令停掉该 name 的**全部**组件。记录保留——不回收 backing、
+/// 不退役组件，`components` 仍能看到 `state=Stopped`。
 pub fn unload(args: &[u8]) {
     let name = args.trim_ascii();
     if name.is_empty() {
@@ -235,13 +208,8 @@ pub fn unload(args: &[u8]) {
     let name = String::from_utf8_lossy(name);
     let ids: Vec<crate::component::ComponentId> = {
         let reg = crate::component::registry::get_registry().lock();
-        let images = crate::component::image::get_images().lock();
         reg.iter()
-            .filter(|record| {
-                images
-                    .get(record.image)
-                    .is_some_and(|image| image.name.as_slice() == name.as_bytes())
-            })
+            .filter(|record| record.name.as_slice() == name.as_bytes())
             .map(|record| record.id)
             .collect()
     };
@@ -257,28 +225,19 @@ pub fn unload(args: &[u8]) {
     }
 }
 
-/// `components`：已声明实例列表（实例 id + image 投影）。
+/// `components`：已声明组件列表（id + name + loaded image 投影）。
 pub fn components(_line: &[u8]) {
     let reg = crate::component::registry::get_registry().lock();
-    let images = crate::component::image::get_images().lock();
     printk!("components: {}\n", reg.len());
     for rec in reg.iter() {
-        match images.get(rec.image) {
-            Some(image) => printk!(
-                "  id={} state={:?} image={} create={:#x} base={:#x}\n",
-                rec.id.raw(),
-                rec.state,
-                String::from_utf8_lossy(&image.name),
-                image.create,
-                image.base
-            ),
-            None => printk!(
-                "  id={} state={:?} image={} (unregistered)\n",
-                rec.id.raw(),
-                rec.state,
-                rec.image.raw()
-            ),
-        }
+        printk!(
+            "  id={} state={:?} name={} create={:#x} base={:#x}\n",
+            rec.id.raw(),
+            rec.state,
+            String::from_utf8_lossy(&rec.name),
+            rec.loaded.create,
+            rec.loaded.base
+        );
     }
 }
 
@@ -297,13 +256,13 @@ pub fn catalog(_line: &[u8]) {
             return;
         }
     };
-    let images = crate::component::image::get_images().lock();
+    let reg = crate::component::registry::get_registry().lock();
     let mut count = 0usize;
     for entry in &entries {
         let Some(stem) = entry.name.strip_suffix(b".kcomp") else {
             continue;
         };
-        let loaded = images.find(stem).is_some();
+        let loaded = reg.iter().any(|record| record.name.as_slice() == stem);
         printk!(
             "  {} ({} bytes){}\n",
             String::from_utf8_lossy(stem),

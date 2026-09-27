@@ -1377,7 +1377,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(1),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1448,7 +1449,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(1),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     ExecutionDomain::IsolatedNative,
                 )
                 .unwrap();
@@ -1505,7 +1507,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(2),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1535,12 +1538,12 @@ mod tests {
 
         registry::init();
 
-        let image = crate::component::image::ComponentImageId::from_raw(9001);
         let failed = {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    image,
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1553,7 +1556,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    image,
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1762,7 +1766,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(1),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1915,7 +1920,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(2),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -1998,7 +2004,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(4),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -2089,7 +2096,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(5),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -2269,7 +2277,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(3),
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     crate::component::endpoint::ExecutionDomain::KernelNative,
                 )
                 .unwrap();

@@ -379,12 +379,9 @@ fn panic_component() -> ! {
     }
     let failed = {
         let reg = kernel::component::registry::get_registry().lock();
-        let images = kernel::component::image::get_images().lock();
         // 先取出 bool，避免块尾表达式把 `reg` 的借用拖过局部变量析构。
         let any = reg.iter().any(|record| {
-            images
-                .get(record.image)
-                .is_some_and(|img| img.name.as_slice() == b"kcomp_panic")
+            record.name.as_slice() == b"kcomp_panic"
                 && record.state == kernel::component::ComponentState::Failed
         });
         any

@@ -126,8 +126,6 @@ impl From<CallError> for Errno {
             CallError::Endpoint(error) => Errno::from(error),
             // provider 不在 Ready / inflight 溢出：当前拒绝，稍后可能可用。
             CallError::ProviderBusy => Errno::EBUSY,
-            // owner → image 引用断了（Core 不变式破坏，不应发生）：与设备缺席同档。
-            CallError::ImageMissing => Errno::ENODEV,
             // provider 没有 dispatcher：组件不提供 endpoint 服务（能力缺失）。
             CallError::NoDispatcher => Errno::ENOSYS,
             // 重入：provider 已在当前同步链上（不是"稍后重试"，是同步环）。
@@ -159,7 +157,6 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::NotFound => Errno::ENOENT,
             ComponentLoadError::ReadFailed => Errno::EIO,
             ComponentLoadError::Loader(_) => Errno::ENOEXEC,
-            ComponentLoadError::ImageFailed => Errno::EEXIST,
             ComponentLoadError::DeclareFailed => Errno::EEXIST,
             ComponentLoadError::ResolveFailed => Errno::ENOENT,
             ComponentLoadError::StartFailed => Errno::EIO,
@@ -181,11 +178,7 @@ impl From<ComponentLoadError> for Errno {
             // 部署能力不足 / Isolated 装载包络拒绝：能力缺失（不是 I/O 错误）。
             // 都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的 I/O。
             ComponentLoadError::IsolationUnsupported
-            | ComponentLoadError::IsolatedImportUnsupported
-            | ComponentLoadError::ImageDomainMismatch => Errno::ENOTSUP,
-            // 同 image 已有**活跃** Isolated 实例：资源在用（不是能力缺失），
-            // 逻辑重启必须等前一个实例到达终态 → `EBUSY`。
-            ComponentLoadError::IsolatedInstanceLive => Errno::EBUSY,
+            | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
             // 按域放段失败 / config 负载不合规：镜像 / 请求不适配该域（EINVAL）。
             ComponentLoadError::IsolatedPlacementFailed
             | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
@@ -472,7 +465,6 @@ mod tests {
             CallError::Endpoint(EndpointError::DuplicatePort),
             CallError::Endpoint(EndpointError::IdExhausted),
             CallError::ProviderBusy,
-            CallError::ImageMissing,
             CallError::NoDispatcher,
             CallError::Reentrant,
             CallError::InIrqContext,
@@ -500,7 +492,6 @@ mod tests {
                 CallError::Endpoint(EndpointError::DuplicatePort) => Errno::EEXIST,
                 CallError::Endpoint(EndpointError::IdExhausted) => Errno::ENOSPC,
                 CallError::ProviderBusy => Errno::EBUSY,
-                CallError::ImageMissing => Errno::ENODEV,
                 CallError::NoDispatcher => Errno::ENOSYS,
                 CallError::Reentrant => Errno::EBUSY,
                 CallError::InIrqContext => Errno::EINVAL,
@@ -545,8 +536,6 @@ mod tests {
             ComponentLoadError::InPolicyContext,
             ComponentLoadError::IsolationUnsupported,
             ComponentLoadError::IsolatedImportUnsupported,
-            ComponentLoadError::ImageDomainMismatch,
-            ComponentLoadError::IsolatedInstanceLive,
             ComponentLoadError::IsolatedPlacementFailed,
             ComponentLoadError::IsolatedConfigRejected,
             ComponentLoadError::CreateFaulted,
@@ -557,7 +546,6 @@ mod tests {
                 ComponentLoadError::NotFound => Errno::ENOENT,
                 ComponentLoadError::ReadFailed => Errno::EIO,
                 ComponentLoadError::Loader(_) => Errno::ENOEXEC,
-                ComponentLoadError::ImageFailed => Errno::EEXIST,
                 ComponentLoadError::DeclareFailed => Errno::EEXIST,
                 ComponentLoadError::ResolveFailed => Errno::ENOENT,
                 ComponentLoadError::StartFailed => Errno::EIO,
@@ -575,9 +563,7 @@ mod tests {
                 ComponentLoadError::PolicyRejected => Errno::EIO,
                 ComponentLoadError::InPolicyContext => Errno::EINVAL,
                 ComponentLoadError::IsolationUnsupported
-                | ComponentLoadError::IsolatedImportUnsupported
-                | ComponentLoadError::ImageDomainMismatch => Errno::ENOTSUP,
-                ComponentLoadError::IsolatedInstanceLive => Errno::EBUSY,
+                | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
                 ComponentLoadError::IsolatedPlacementFailed
                 | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,
                 ComponentLoadError::CreateFaulted => Errno::EIO,

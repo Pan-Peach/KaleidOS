@@ -67,12 +67,21 @@ mod tests {
     use crate::component::ComponentState;
     use crate::component::abi::{InterfaceAbi, InterfaceKind};
     use crate::component::endpoint::{ContractId, EndpointError, EndpointState, ExecutionDomain};
-    use crate::component::image::ComponentImageId;
     use crate::component::registry;
     use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
     use crate::resource::{RequestContext, device, dma, irq};
 
     extern "C" fn demo_irq(_ctx: *mut ()) {}
+
+    /// 一份伪造 loaded image（无 backing）与 Ready 组件声明辅助。
+    fn test_loaded() -> crate::component::loader::LoadedComponent {
+        crate::component::registry::test_support::test_loaded(0, None)
+    }
+
+    fn declare(reg: &mut registry::Registry, name: &[u8]) -> ComponentId {
+        reg.declare(name, test_loaded(), ExecutionDomain::KernelNative)
+            .unwrap()
+    }
 
     fn commit_device(device_index: usize, compatible: &[u8]) {
         use crate::machine::{self, CpuId, CpuInfo, MachineInfo, MemoryRegion};
@@ -116,15 +125,13 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
-        crate::component::image::init();
         endpoint::init();
         crate::resource::init();
         commit_device(24, b"fail,mmio");
 
-        let image = crate::component::image::test_support::register_test_image(b"fail_demo", 0);
         let id = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let id = declare(&mut reg, b"fail_demo");
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             id
@@ -181,14 +188,9 @@ mod tests {
         device::get_table().lock().clear_quarantine();
     }
 
-    /// 声明一个 Ready 实例（endpoint 测试只把 image 当身份键，不需要真实 image）。
+    /// 声明一个 Ready 组件（endpoint 测试不需要真实 backing）。
     fn ready_instance(reg: &mut registry::Registry) -> ComponentId {
-        let id = reg
-            .declare(
-                ComponentImageId::from_raw(0xFA11),
-                ExecutionDomain::KernelNative,
-            )
-            .unwrap();
+        let id = declare(reg, b"ready_instance");
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -203,7 +205,6 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
-        crate::component::image::init();
         endpoint::init();
         crate::resource::init();
 
@@ -304,7 +305,6 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
-        crate::component::image::init();
         endpoint::init();
         crate::resource::init();
 
@@ -355,19 +355,16 @@ mod tests {
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         registry::init();
-        crate::component::image::init();
         endpoint::init();
         crate::resource::init();
 
-        let image =
-            crate::component::image::test_support::register_test_image(b"slot_fail_demo", 0);
         let (id, other) = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let id = declare(&mut reg, b"slot_fail_demo");
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
-            let other = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let other = declare(&mut reg, b"slot_fail_demo");
             reg.resolve(other).unwrap();
             reg.begin_start(other).unwrap();
             reg.finish_start(other).unwrap();

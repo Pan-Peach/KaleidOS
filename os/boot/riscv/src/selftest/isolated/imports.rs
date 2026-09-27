@@ -168,7 +168,7 @@ pub(crate) fn isolated_panic_escape() -> ! {
     if read_satp() != core_satp {
         fail("isolated-panic-escape: Core satp not restored after the panic");
     }
-    let (id, handle, _) = match failed_isolated_instance() {
+    let (id, handle) = match failed_isolated_instance() {
         Some(found) => found,
         None => fail("isolated-panic-escape: no failed instance recorded"),
     };

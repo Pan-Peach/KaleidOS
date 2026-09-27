@@ -29,8 +29,9 @@
 //! 其所属的**已分配 executable 段**内，否则整个加载失败
 //! （[`LoaderError::DispatcherOutOfBounds`]——损坏的镜像不进入系统）。
 //!
-//! `LoadedComponent` 是一次加载的**未登记**结果；登记进镜像表（`component/image.rs`）
-//! 后由 `ComponentImage` 持有常驻 lease 与入口地址。
+//! `LoadedComponent` 是一次加载的结果，1:1 归声明它的组件（`registry.rs` 的
+//! `ComponentRecord.loaded`）：常驻 lease、入口地址与 `kcomp_abi` 都在这里。
+//! 同一个 artifact 加载两次 = 两份独立的 `LoadedComponent`（独立 writable state）。
 
 use super::containment::KCOMP_ABI;
 use super::elf::{ElfClass, ElfError, ElfObject, Relocation as ElfRelocation, Section};
@@ -98,12 +99,6 @@ pub struct LoadedComponent {
     /// 已校验的 `kcomp_abi` 值（必等于 [`KCOMP_ABI`]）。
     pub abi: u64,
     pub(crate) memory: Option<memory::MemoryLease>,
-}
-
-impl LoadedComponent {
-    pub(crate) fn take_memory(&mut self) -> Option<memory::MemoryLease> {
-        self.memory.take()
-    }
 }
 
 /// 解析 ET_REL、放置 ALLOC 段、应用当前 ABI 重定位，并定位实例入口与契约指纹。
@@ -770,7 +765,7 @@ mod tests {
         let mut minimal = crate::bench::Bench::new("loader.load_component.min");
         minimal.run(100, || {
             let mut comp = load_component(SMOKE_MIN_KCOMP).unwrap();
-            if let Some(lease) = comp.take_memory() {
+            if let Some(lease) = comp.memory.take() {
                 crate::memory::free_region(lease).unwrap();
             }
             comp.create
@@ -780,7 +775,7 @@ mod tests {
         let mut full = crate::bench::Bench::new("loader.load_component.core_test");
         full.run(100, || {
             let mut comp = load_component(CORETEST_KCOMP).unwrap();
-            if let Some(lease) = comp.take_memory() {
+            if let Some(lease) = comp.memory.take() {
                 crate::memory::free_region(lease).unwrap();
             }
             comp.text_size

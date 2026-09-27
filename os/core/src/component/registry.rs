@@ -1,15 +1,16 @@
-//! 组件**实例**注册表：已声明实例的真相 + 生命周期状态机。
+//! 组件注册表：一个 `ComponentId` 对应一个**完整运行组件** + 生命周期状态机。
 //!
-//! 身份模型（`docs/architecture/component-lifecycle.md` §2）：`ComponentId` 就是实例 ID
-//! （不新增平行的 `ComponentInstanceId`）；常驻代码身份在 `component/image.rs`
-//! （`ComponentImageId`）。一个 image 可以有 N 个实例。
+//! 身份模型：`ComponentId` 是 Core runtime 中唯一的一级运行身份。它同时拥有
+//! 自己那份**加载并重定位后的镜像**（`LoadedComponent`：段基址 / 入口 / 镜像
+//! 大小 / `kcomp_abi` / `MemoryLease`）——`artifact` 只是被加载的字节，
+//! 每次 load/instantiate 都得到一份独立的 writable image state。
 //!
 //! 现行状态机（实现即契约，见 docs/architecture/component-model.md §5 全量生命周期）：
 //!
 //! ```text
 //! Declared --resolve--> Resolved --begin_start--> Starting --finish_start--> Ready
 //!     Ready --begin_stop--> Stopping --finish_stop--> Stopped   （stop 编排：component/exit.rs）
-//!     any state --mark_failed--> Failed   （恢复 = 全新实例）
+//!     any state --mark_failed--> Failed   （恢复 = 全新组件）
 //!     （无 unload：Stopped/Failed 记录留作 tombstone，见契约 §8/§9）
 //! ```
 //!
@@ -22,36 +23,44 @@
 //! 正在执行 `kcomp_instance_create(args, &out_state)`（此期间 `kcore_endpoint_publish`
 //! 只记录 pending，不创建 endpoint）。`finish_start` 由 Core 在 create 返回 0、
 //! Core 记录 `instance_state`、且 pending endpoints 原子提交后调用（见
-//! `component/load.rs`）。id 单调递增、不回收：组件实例 = 身份——失败恢复 =
-//! 全新实例（新 id），`ComponentId` 永不复用（docs/architecture/component-model.md）。
+//! `component/load.rs`）。id 单调递增、不回收：组件 = 身份——失败恢复 =
+//! 全新组件（新 id），`ComponentId` 永不复用（docs/architecture/component-model.md）。
 //!
-//! In-flight call 记账：`InstanceRecord::inflight` 记录该实例尚未返回的调用数
-//! （`begin_call` / `finish_call` / `active_calls`）。只有 `Ready` 实例可以
-//! `begin_call`；`finish_call` 不设门禁——实例离开 `Ready`（停止 / 失败）时
+//! `restart` 语义：从同一个 artifact **重新 instantiate** 一个全新组件——全新
+//! `ComponentId`、全新 writable image state（`.data` / `.bss` 回到 artifact 初始
+//! 状态）、全新资源 / endpoint。旧组件的 tombstone 记录保留。
+//!
+//! In-flight call 记账：`ComponentRecord::inflight` 记录该组件尚未返回的调用数
+//! （`begin_call` / `finish_call` / `active_calls`）。只有 `Ready` 组件可以
+//! `begin_call`；`finish_call` 不设门禁——组件离开 `Ready`（停止 / 失败）时
 //! 已在飞行的调用仍须能归还计数。
 
 use alloc::vec::Vec;
 
 use crate::component::endpoint::ExecutionDomain;
-use crate::component::image::ComponentImageId;
+use crate::component::loader::LoadedComponent;
 use crate::component::{ComponentId, ComponentState};
 use crate::memory::address_space::AddressSpaceHandle;
 use spin::{Mutex, Once};
 
-/// 一个组件实例（load 路径在 image 登记后填充）。
+/// 一个组件（`declare` 时一次性填充：它拥有自己的 loaded image）。
 ///
-/// - `state` 归实例（Core 状态机唯一真相）；
-/// - `image` 指向常驻代码（`ComponentImageId`；name / base / 入口 / MemoryLease
-///   都在 image 记录上）；
+/// - `state` 归组件（Core 状态机唯一真相）；
+/// - `loaded` 是**这个组件自己的**加载结果（段放置 / 重定位 / `MemoryLease`），
+///   1:1 归属——没有共享镜像表；
 /// - `instance_state` 是 `kcomp_instance_create` 写回的 opaque 指针：Core
 ///   只存/传，不解释、不释放；`NULL` = 无状态组件。
 #[derive(Debug, PartialEq)]
-pub struct InstanceRecord {
+pub struct ComponentRecord {
     pub id: ComponentId,
+    /// artifact 名（不含 `.kcomp` 后缀）；诊断 / monitor 用。
+    pub name: Vec<u8>,
     pub state: ComponentState,
-    pub image: ComponentImageId,
     pub execution_domain: ExecutionDomain,
     pub address_space: Option<AddressSpaceHandle>,
+    /// 这一个组件自己的 loaded program（base / create / destroy /
+    /// service_dispatch / text_size / abi / MemoryLease）。
+    pub loaded: LoadedComponent,
     pub instance_state: *mut (),
     /// 未完成的 consumer→provider 调用计数（`begin_call` / `finish_call`）。
     pub inflight: u32,
@@ -59,8 +68,8 @@ pub struct InstanceRecord {
 
 // `instance_state` 是组件 opaque 指针：Registry 只存取、永不解引用。
 // 跨线程使用由外层 `Mutex` 串行化（与 endpoint.rs 的 EndpointRecord 同一理由）。
-unsafe impl Send for InstanceRecord {}
-unsafe impl Sync for InstanceRecord {}
+unsafe impl Send for ComponentRecord {}
+unsafe impl Sync for ComponentRecord {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryError {
@@ -76,9 +85,9 @@ pub enum RegistryError {
     IdExhausted,
 }
 
-/// 组件实例注册表（Core 保留的实例真相）。可构造（测试友好），生产用全局 `init`。
+/// 组件注册表（Core 保留的组件真相）。可构造（测试友好），生产用全局 `init`。
 pub struct Registry {
-    records: Vec<InstanceRecord>,
+    records: Vec<ComponentRecord>,
     next_id: u64,
 }
 
@@ -90,26 +99,28 @@ impl Registry {
         }
     }
 
-    /// 声明一个实例（image 已登记 → Declared）。
+    /// 声明一个组件（`Declared`）。`loaded` 是这个组件自己的加载结果，
+    /// 1:1 归它所有；`name` 只是诊断 / monitor 用的 artifact 名。
     ///
-    /// `image` 是**已登记**的镜像身份（生产路径先经 `component::image::ImageTable`
-    /// 登记；registry 只把它当身份键保存，不重复验证——两份真相各归其表）。
-    /// 同一 image 可声明任意多个实例（契约：不再"每 artifact 只能一个实例"）。
+    /// 每次 load / instantiate 都是一次 `declare`——同名 artifact 加载两次会得到
+    /// **两个独立组件**（各自的 writable image state），不再按名字复用镜像。
     pub(crate) fn declare(
         &mut self,
-        image: ComponentImageId,
+        name: &[u8],
+        loaded: LoadedComponent,
         kind: ExecutionDomain,
     ) -> Result<ComponentId, RegistryError> {
         let id = ComponentId::from_raw(
             u32::try_from(self.next_id).map_err(|_| RegistryError::IdExhausted)?,
         );
         self.next_id += 1;
-        self.records.push(InstanceRecord {
+        self.records.push(ComponentRecord {
             id,
+            name: name.to_vec(),
             state: ComponentState::Declared,
-            image,
             execution_domain: kind,
             address_space: None,
+            loaded,
             instance_state: core::ptr::null_mut(),
             inflight: 0,
         });
@@ -262,11 +273,11 @@ impl Registry {
         self.get(id).map_or(0, |record| record.inflight)
     }
 
-    pub fn get(&self, id: ComponentId) -> Option<&InstanceRecord> {
+    pub fn get(&self, id: ComponentId) -> Option<&ComponentRecord> {
         self.records.iter().find(|r| r.id == id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &InstanceRecord> {
+    pub fn iter(&self) -> impl Iterator<Item = &ComponentRecord> {
         self.records.iter()
     }
 
@@ -278,7 +289,7 @@ impl Registry {
         self.records.is_empty()
     }
 
-    fn record_mut(&mut self, id: ComponentId) -> Result<&mut InstanceRecord, RegistryError> {
+    fn record_mut(&mut self, id: ComponentId) -> Result<&mut ComponentRecord, RegistryError> {
         self.records
             .iter_mut()
             .find(|r| r.id == id)
@@ -306,20 +317,83 @@ pub fn get_registry() -> &'static Mutex<Registry> {
     REGISTRY.get().expect("registry not initialized")
 }
 
+/// 测试专用：伪造一份已加载组件与声明辅助。**不分配 backing**（`memory` 为
+/// `None`）——纯逻辑用例（状态机 / endpoint / inspector 投影）不需要真实 lease；
+/// 需要真实 backing 的用例走生产 loader 或自行 `alloc_region`。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::component::containment::KCOMP_ABI;
+
+    /// 一份伪造的 loaded component（`.text` 段 64 字节；入口 = base + 8）。
+    pub(crate) fn test_loaded(destroy: usize, service_dispatch: Option<usize>) -> LoadedComponent {
+        LoadedComponent {
+            base: 0x1000,
+            create: 0x1008,
+            destroy,
+            service_dispatch,
+            text_size: 64,
+            abi: KCOMP_ABI,
+            memory: None,
+        }
+    }
+
+    /// 一份伪造、**带真实常驻 backing** 的 loaded component（需要 region 的
+    /// 用例用；调用方须持有 memory GUARD）。
+    pub(crate) fn test_loaded_with_region(
+        destroy: usize,
+        service_dispatch: Option<usize>,
+    ) -> LoadedComponent {
+        let lease = crate::memory::alloc_region(crate::memory::ALLOC_GRANULE).unwrap();
+        let base = lease.region().base;
+        let size = lease.region().size;
+        LoadedComponent {
+            base,
+            create: base + 8,
+            destroy,
+            service_dispatch,
+            // 伪造镜像覆盖整块 region：`base..base+text_size` 是合法 entry 区间。
+            text_size: size,
+            abi: KCOMP_ABI,
+            memory: Some(lease),
+        }
+    }
+
+    /// 在**全局** registry 声明一个测试组件并返回 id。
+    pub(crate) fn declare_test_component(
+        name: &[u8],
+        destroy: usize,
+        service_dispatch: Option<usize>,
+        domain: ExecutionDomain,
+    ) -> ComponentId {
+        get_registry()
+            .lock()
+            .declare(name, test_loaded(destroy, service_dispatch), domain)
+            .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 测试用镜像身份：registry 只把它当身份键（image 表是另一份真相）。
-    const IMAGE: ComponentImageId = ComponentImageId::from_raw(1);
 
     fn r() -> Registry {
         Registry::new()
     }
 
-    /// 驱一个实例走完 init 路径到 `Ready`（stop 路径唯一合法的起点）。
+    /// 声明一个测试组件（伪造 loaded image；调用方须持 memory GUARD）。
+    fn declare(reg: &mut Registry, name: &[u8]) -> ComponentId {
+        reg.declare(
+            name,
+            test_support::test_loaded(0, None),
+            ExecutionDomain::KernelNative,
+        )
+        .unwrap()
+    }
+
+    /// 驱一个组件走完 init 路径到 `Ready`（stop 路径唯一合法的起点）。
     fn ready(reg: &mut Registry) -> ComponentId {
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let id = declare(reg, b"ready");
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -329,30 +403,36 @@ mod tests {
     #[test]
     fn declare_assigns_increasing_ids() {
         let mut reg = r();
-        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let a = declare(&mut reg, b"a");
+        let b = declare(&mut reg, b"b");
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
     }
 
-    /// 契约核心：同名 artifact（同一 image）可以声明任意多个实例。
+    /// 每次 declare 得到的组件拥有**自己**的 loaded image（不是共享镜像）。
     #[test]
-    fn one_image_backs_many_instances() {
+    fn each_component_owns_its_loaded_image() {
         let mut reg = r();
-        let first = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        let second = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let first = declare(&mut reg, b"same");
+        let second = declare(&mut reg, b"same");
         assert_ne!(first, second);
-        assert_eq!(reg.get(first).unwrap().image, IMAGE);
-        assert_eq!(reg.get(second).unwrap().image, IMAGE);
+        // 同名 artifact 两次 declare：各自一份独立 loaded image backing。
+        let a = reg.get(first).unwrap();
+        let b = reg.get(second).unwrap();
+        assert_eq!(a.name, b"same");
+        assert_eq!(b.name, b"same");
+        // 这两份是测试替身（无 backing），但 loaded image 作为独立值各自持有。
+        assert!(a.loaded.memory.is_none());
+        assert!(b.loaded.memory.is_none());
         assert_eq!(reg.len(), 2);
     }
 
-    /// 每个实例有**自己的** opaque state 指针；一个变不影响另一个。
+    /// 每个组件有**自己的** opaque state 指针；一个变不影响另一个。
     #[test]
     fn instance_state_is_per_instance() {
         let mut reg = r();
-        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let a = declare(&mut reg, b"a");
+        let b = declare(&mut reg, b"b");
         let mut state_a = 1u8;
         let mut state_b = 2u8;
         let ptr_a = core::ptr::addr_of_mut!(state_a).cast::<()>();
@@ -365,7 +445,7 @@ mod tests {
         assert_eq!(reg.get(a).unwrap().instance_state, ptr_a);
         assert_eq!(reg.get(b).unwrap().instance_state, ptr_b);
 
-        // 无状态组件可记录 NULL；另一个实例的 state 不受影响。
+        // 无状态组件可记录 NULL；另一个组件的 state 不受影响。
         reg.record_instance_state(a, core::ptr::null_mut()).unwrap();
         assert!(reg.get(a).unwrap().instance_state.is_null());
         assert_eq!(reg.get(b).unwrap().instance_state, ptr_b);
@@ -380,12 +460,12 @@ mod tests {
         );
     }
 
-    /// 生命周期按实例独立推进：一个失败不改变共享 image 的另一个实例。
+    /// 生命周期按组件独立推进：一个失败不改变另一个组件。
     #[test]
-    fn lifecycle_is_per_instance_while_sharing_one_image() {
+    fn lifecycle_is_per_component() {
         let mut reg = r();
-        let a = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
-        let b = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let a = declare(&mut reg, b"a");
+        let b = declare(&mut reg, b"b");
 
         // b 在 init 中失败 → 只有 b 变成 Failed；a 仍可走完生命周期。
         reg.mark_failed(b).unwrap();
@@ -397,7 +477,7 @@ mod tests {
         reg.begin_start(a).unwrap();
         reg.finish_start(a).unwrap();
         assert!(reg.may_run(a));
-        assert!(!reg.may_run(b), "Failed 实例不得运行任务");
+        assert!(!reg.may_run(b), "Failed 组件不得运行任务");
         assert_eq!(reg.get(b).unwrap().state, ComponentState::Failed);
     }
 
@@ -409,29 +489,21 @@ mod tests {
     #[test]
     fn rejected_transition_leaves_truth_unchanged() {
         init();
-        let id = get_registry()
-            .lock()
-            .declare(IMAGE, ExecutionDomain::KernelNative)
-            .unwrap();
+        let mut reg = get_registry().lock();
+        let id = declare(&mut reg, b"rejected");
 
         // Declared → Ready 非法（跳过 Resolved / Starting）。
+        assert_eq!(reg.finish_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(
-            get_registry().lock().finish_start(id),
-            Err(RegistryError::InvalidTransition)
-        );
-        assert_eq!(
-            get_registry().lock().get(id).unwrap().state,
+            reg.get(id).unwrap().state,
             crate::component::ComponentState::Declared,
             "被拒绝的转换不得改变真相"
         );
 
         // 其它非法边（Declared → Starting）同样不动真相。
+        assert_eq!(reg.begin_start(id), Err(RegistryError::InvalidTransition));
         assert_eq!(
-            get_registry().lock().begin_start(id),
-            Err(RegistryError::InvalidTransition)
-        );
-        assert_eq!(
-            get_registry().lock().get(id).unwrap().state,
+            reg.get(id).unwrap().state,
             crate::component::ComponentState::Declared
         );
     }
@@ -439,7 +511,7 @@ mod tests {
     #[test]
     fn is_failed_only_reports_failed_instances() {
         let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let id = declare(&mut reg, b"failed");
         assert!(!reg.is_failed(id));
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
@@ -459,7 +531,7 @@ mod tests {
     #[test]
     fn may_run_matches_liveness_on_every_state() {
         let mut reg = r();
-        let id = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let id = declare(&mut reg, b"may_run");
         assert!(!reg.may_run(id), "Declared does not run work");
         reg.resolve(id).unwrap();
         assert!(!reg.may_run(id), "Resolved does not run work");
@@ -489,15 +561,15 @@ mod tests {
         let stopped = ready(&mut reg);
         reg.begin_stop(stopped).unwrap();
         reg.finish_stop(stopped).unwrap();
-        let failed = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        let failed = declare(&mut reg, b"failed_tombstone");
         reg.mark_failed(failed).unwrap();
 
         assert_eq!(reg.len(), 2, "tombstone 记录保留");
         assert_eq!(reg.get(stopped).unwrap().state, ComponentState::Stopped);
         assert_eq!(reg.get(failed).unwrap().state, ComponentState::Failed);
 
-        // 新实例拿全新 id，不复用 tombstone 的 id。
-        let fresh = reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap();
+        // 新组件拿全新 id，不复用 tombstone 的 id。
+        let fresh = declare(&mut reg, b"fresh_tombstone");
         assert_ne!(fresh, stopped);
         assert_ne!(fresh, failed);
         assert_eq!(fresh.raw(), failed.raw() + 1);
@@ -526,7 +598,7 @@ mod tests {
     // finish_stop / mark_failed 序列，逐操作验证：
     //   1. 合法性精确：Ok ⟺ 当前状态按文档转移表放行；非法 → Err 且真相不变
     //   2. 不可复活：Stopped / Failed 之后任何成功操作都不得回到活状态
-    //   3. declare 恒成功：同一 image 的实例数无上限，id 全局唯一且单调
+    //   3. declare 恒成功：组件数无上限，id 全局唯一且单调
     //   4. 精确前驱：resolve 仅自 Declared，其余各步仅自其文档前驱
     //   5. mark_failed 从任意状态可达且为终态
     //   6. 观察到的 registry 真相逐步等于模型
@@ -588,7 +660,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum Op {
-        /// 声明一个新实例（image 恒为 `IMAGE`；同名不再拒绝）。
+        /// 声明一个新组件（同名不再拒绝；各自独立 loaded image）。
         Declare,
         /// 对一个"声明序号"引用实例执行生命周期操作；序号越界 = 未声明 id。
         Lifecycle { target: usize, op: LifecycleOp },
@@ -666,13 +738,17 @@ mod tests {
     fn apply_and_check(model: &mut Model, reg: &mut Registry, op: Op) {
         match op {
             Op::Declare => {
-                // When：声明一个新实例（同一 image 不限实例数）。
-                let result = reg.declare(IMAGE, ExecutionDomain::KernelNative);
+                // When：声明一个新组件（同名不限组件数）。
+                let result = reg.declare(
+                    b"prop",
+                    test_support::test_loaded(0, None),
+                    ExecutionDomain::KernelNative,
+                );
 
-                // Then：分配下一单调 id，状态 Declared，image 是同一个。
+                // Then：分配下一单调 id，状态 Declared。
                 let expected_id = ComponentId::from_raw(model.next_id);
                 assert_eq!(result, Ok(expected_id), "declare 恒成功且 id 单调");
-                assert_eq!(reg.get(expected_id).unwrap().image, IMAGE);
+                assert_eq!(reg.get(expected_id).unwrap().name, b"prop");
                 model.records.push(ModelRecord {
                     id: expected_id,
                     state: ComponentState::Declared,
@@ -774,7 +850,7 @@ mod tests {
             let mut reg = r();
             let mut ids = alloc::vec::Vec::new();
             for _ in 0..count {
-                ids.push(reg.declare(IMAGE, ExecutionDomain::KernelNative).unwrap());
+                ids.push(declare(&mut reg, b"bench"));
             }
             let probe = ids[count / 2];
             let mut bench = crate::bench::Bench::new(name);

@@ -124,7 +124,7 @@ log crate     → component-local logger      → kcore_log_line
 panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸）
 ```
 
-`#[global_allocator]` 的 static 状态不是 per-instance 存储，必须由 per-instance runtime context 提供。C 组件没有这些 Rust adapter，只 `#include "kcomp.h"` 直调 `kcore_*`，外加 SDK 的 freestanding `mem*` / `strlen` / `strchr`；边界刻意收紧，**不朝 libc 扩张**，也不是 shared runtime。契约见 `docs/architecture/memory-and-heap.md`。
+每次 instantiate 都从 artifact 独立放段 / 重定位，所以 `#[global_allocator]` 的 static 状态**天然 per-component**（各组件有自己的可写 image backing）；运行时仍经 per-instance runtime context（`tp`）绑定当前组件的堆句柄。C 组件没有这些 Rust adapter，只 `#include "kcomp.h"` 直调 `kcore_*`，外加 SDK 的 freestanding `mem*` / `strlen` / `strchr`；边界刻意收紧，**不朝 libc 扩张**，也不是 shared runtime。契约见 `docs/architecture/memory-and-heap.md`。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
@@ -320,15 +320,16 @@ pub enum ExecutionDomain {
 
 > **契约不能 ABI 锁定**：Interface 和 device claim / IRQ / DMA 机制必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
 
-### 4.1 不塞进 InstanceRecord
+### 4.1 不塞进 ComponentRecord
 
-组件记录（**现状**：`InstanceRecord`，见 `docs/architecture/component-lifecycle.md`；旧的 `ComponentRecord` 已随 image/instance 拆分删除）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
+组件记录（`registry::ComponentRecord`，见 `docs/architecture/component-lifecycle.md`）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
 
 ```rust
-pub struct InstanceRecord {
-    pub id: ComponentId,          // 实例身份
+pub struct ComponentRecord {
+    pub id: ComponentId,          // 唯一的一等运行时身份
+    pub name: Vec<u8>,            // artifact 名
+    pub loaded: LoadedComponent,  // 本组件自己的已加载程序 + 常驻 MemoryLease
     pub state: ComponentState,
-    pub image: ComponentImageId,  // 代码 / 入口 / MemoryLease 归 image
     pub execution_domain: ExecutionDomain, // 部署域（创建入口验证后写入；今天 KernelNative 与受限 IsolatedNative 可执行）
     pub instance_state: *mut (),  // 组件私有的实例状态（create 返回）
 }
@@ -339,12 +340,14 @@ pub struct InstanceRecord {
 // 执行模型 / runtime（native machine code vs Wasm）是正交维度，**不进本记录**（见 §4 顶部）。
 ```
 
+组件记录**直接拥有** `LoadedComponent`（`base` / `create` / `destroy` / `service_dispatch` / `text_size` / MemoryLease）——代码 / 入口 / 常驻 backing 全属于这个 `ComponentId`，**没有** instance → image 的二级查找。加载同一 `.kcomp` 两次就是两个 `ComponentId`，各自独立放段 / 重定位，可写 image state（`.data` / `.bss`）互不共享；`ImageTable` / `ComponentImageId` 二级身份已删除。
+
 真正 runtime：
 
 ```rust
 pub struct ComponentRuntime {
   pub id: ComponentId,
-  pub image: LoadedComponent,
+  pub loaded: LoadedComponent,
   pub execution: ExecutionDomain,
 }
 ```
@@ -387,10 +390,10 @@ endpoint）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，mo
 
 ### 4.3 KernelNative 具体是什么
 
-`KernelNative` 只需要保存已加载镜像和执行种类，调用方式与现在一致：
+`KernelNative` 只需要保存已加载程序和执行种类，调用方式与现在一致：
 
 ```rust
-let ret = containment::call_component_create(runtime.image.create, args, &mut out_state);
+let ret = containment::call_component_create(runtime.loaded.create, args, &mut out_state);
 ```
 
 ### 4.4 私有 AddressSpace 与执行域（C10）
@@ -455,7 +458,7 @@ revoke_owner(id)   ← 只是保险："还有没释放的归属？有就 Core �
 
 ## 5. 生命周期
 
-> **组件生命周期与组件 ABI 的冻结契约在 `docs/architecture/component-lifecycle.md`**（instance-aware 入口 `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定、`ComponentImageId` + `InstanceRecord` 身份模型）。本节只保留失败谱系与退出语义要点；冲突时以冻结契约为准。
+> **组件生命周期与组件 ABI 的冻结契约在 `docs/architecture/component-lifecycle.md`**（instance-aware 入口 `kcomp_instance_create` / `kcomp_instance_destroy`、`0 / -errno` 返回约定、`ComponentRecord` 直接拥有 `LoadedComponent` 的身份模型：一个 `ComponentId` = 一个完整运行组件）。本节只保留失败谱系与退出语义要点；冲突时以冻结契约为准。
 
 所有组件共享统一生命周期（但**不共享**业务接口），单一真相 = `ComponentState::can_transition`：
 

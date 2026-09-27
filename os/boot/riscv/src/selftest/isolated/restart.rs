@@ -1,5 +1,5 @@
-//! Fault containment on an already-serving instance and logical restart of the
-//! same image as a genuinely independent fresh instance.
+//! Fault containment on an already-serving component and re-instantiation of the
+//! same artifact as a genuinely independent fresh component.
 
 /// （新 AS / 新窗口 / 新 slot / 新 endpoint）并再次服务。
 pub(crate) fn isolated_ready_fault() -> ! {
@@ -144,7 +144,7 @@ pub(crate) fn isolated_ready_fault() -> ! {
         fail_case("isolated-ready-fault", "stale call leaked inflight");
     }
 
-    // (4) 逻辑重启：同一 image 的全新实例（fresh AS / window / slot）。
+    // (4) 重新 instantiate：同一 artifact 的全新组件（fresh AS / backing / window / slot）。
     let second = svc_provider();
     if second.id == first.id {
         fail_case("isolated-ready-fault", "restart reused the ComponentId");
@@ -234,9 +234,10 @@ pub(crate) fn isolated_ready_fault() -> ! {
     pass("isolated-ready-fault")
 }
 
-/// 逻辑重启：前一个实例 create 失败（`Failed` tombstone）之后同名 artifact
-/// 创建**全新实例**（同一常驻 image，全新 AS / 窗口 / slot）；两个 tombstone
-/// 类型（`Failed` / `Stopped`）都不阻止重启；并发活跃实例显式拒绝。
+/// 重新 instantiate：前一个组件 create 失败（`Failed` tombstone）之后同名 artifact
+/// 创建**全新组件**（重新按域放段，全新私有 AS / backing / 窗口 / slot）；两个
+/// tombstone 类型（`Failed` / `Stopped`）都不阻止重启；同一 artifact 并发存在
+/// 多个组件（各自私有 AS + backing）。
 pub(crate) fn isolated_restart() -> ! {
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
@@ -245,7 +246,6 @@ pub(crate) fn isolated_restart() -> ! {
     use kernel::component::registry;
     use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
-    use kernel::errno::Errno;
     use kernel::memory::address_space;
 
     let core_satp = read_satp();
@@ -272,13 +272,13 @@ pub(crate) fn isolated_restart() -> ! {
         );
         fail_case("isolated-restart", "unexpected create error");
     }
-    let (failed_id, failed_handle, failed_image) = match failed_isolated_instance() {
+    let (failed_id, failed_handle) = match failed_isolated_instance() {
         Some(found) => found,
         None => fail_case("isolated-restart", "no failed Isolated instance"),
     };
     assert_failure_released("isolated-restart", failed_id, failed_handle);
 
-    // (2) 重启：同一 image 的全新实例。
+    // (2) 重新 instantiate：同一个 artifact 的全新组件（新 AS / backing / 窗口）。
     let second = match load::create_component(
         b"kcomp_isolated_life",
         &KcompCreateArgs::empty(),
@@ -287,20 +287,20 @@ pub(crate) fn isolated_restart() -> ! {
         Ok(id) => id,
         Err(error) => {
             kernel::log!("selftest", "isolated-restart: restart failed: {:?}", error);
-            fail_case("isolated-restart", "logical restart failed");
+            fail_case("isolated-restart", "restart failed");
         }
     };
-    let (second_handle, second_image, second_window_pa) = {
+    let (second_handle, second_window_pa) = {
         let reg = registry::get_registry().lock();
         let record = match reg.get(second) {
             Some(record) => record,
-            None => fail_case("isolated-restart", "restarted instance record missing"),
+            None => fail_case("isolated-restart", "restarted component record missing"),
         };
         let handle = match record.address_space {
             Some(handle) => handle,
             None => fail_case(
                 "isolated-restart",
-                "restarted instance has no address space",
+                "restarted component has no address space",
             ),
         };
         let window = isolated_lifecycle::window_range();
@@ -308,10 +308,10 @@ pub(crate) fn isolated_restart() -> ! {
             Ok(Some(mapping)) => mapping.physical_range.base,
             _ => fail_case(
                 "isolated-restart",
-                "restarted instance window is not mapped",
+                "restarted component window is not mapped",
             ),
         };
-        (handle, record.image, window_pa)
+        (handle, window_pa)
     };
     if second == failed_id {
         fail_case("isolated-restart", "restart reused the ComponentId");
@@ -319,11 +319,8 @@ pub(crate) fn isolated_restart() -> ! {
     if second_handle.raw_id() == failed_handle.raw_id() {
         fail_case("isolated-restart", "restart reused the address space");
     }
-    if second_image != failed_image {
-        fail_case("isolated-restart", "restart did not reuse the image");
-    }
     if registry_state(second) != Some(ComponentState::Ready) {
-        fail_case("isolated-restart", "restarted instance is not Ready");
+        fail_case("isolated-restart", "restarted component is not Ready");
     }
     // create 真的在私有 AS 里跑过（窗口上报）。
     if unsafe { life_slot(second_window_pa, LIFE_R_MAGIC) } != LIFE_REPORT_MAGIC {
@@ -333,37 +330,81 @@ pub(crate) fn isolated_restart() -> ! {
         );
     }
 
-    // (3) 并发活跃实例显式拒绝（同一 image 的第二个活跃实例）。
-    let error = match load::create_component(
+    // (3) 并发组件：同一 artifact 的第二个**活跃**组件是合法的——它拿到全新
+    //     私有 AS / backing，与 second 相互独立。
+    let concurrent = match load::create_component(
         b"kcomp_isolated_life",
         &KcompCreateArgs::empty(),
         ExecutionDomain::IsolatedNative,
     ) {
-        Err(error) => error,
-        Ok(_) => fail_case(
-            "isolated-restart",
-            "a concurrent live instance was accepted",
-        ),
+        Ok(id) => id,
+        Err(error) => {
+            kernel::log!(
+                "selftest",
+                "isolated-restart: concurrent create failed: {:?}",
+                error
+            );
+            fail_case(
+                "isolated-restart",
+                "a concurrent same-artifact component was rejected",
+            );
+        }
     };
-    if error != ComponentLoadError::IsolatedInstanceLive {
-        kernel::log!(
-            "selftest",
-            "isolated-restart: unexpected concurrency error: {:?}",
-            error
-        );
+    let (concurrent_handle, concurrent_window_pa) = {
+        let reg = registry::get_registry().lock();
+        let record = match reg.get(concurrent) {
+            Some(record) => record,
+            None => fail_case("isolated-restart", "concurrent component record missing"),
+        };
+        let handle = match record.address_space {
+            Some(handle) => handle,
+            None => fail_case(
+                "isolated-restart",
+                "concurrent component has no address space",
+            ),
+        };
+        let window = isolated_lifecycle::window_range();
+        let window_pa = match address_space::mapping_exact(handle, &window) {
+            Ok(Some(mapping)) => mapping.physical_range.base,
+            _ => fail_case("isolated-restart", "concurrent window is not mapped"),
+        };
+        (handle, window_pa)
+    };
+    if concurrent == second {
         fail_case(
             "isolated-restart",
-            "concurrent live instance was not rejected",
+            "concurrent component reused the ComponentId",
         );
     }
-    if Errno::from(error) != Errno::EBUSY {
-        fail_case("isolated-restart", "concurrency rejection errno mismatch");
-    }
-    if registry_state(second) != Some(ComponentState::Ready) {
+    if concurrent_handle.raw_id() == second_handle.raw_id() {
         fail_case(
             "isolated-restart",
-            "rejected concurrency changed the live instance",
+            "concurrent component reused the address space",
         );
+    }
+    if concurrent_window_pa == second_window_pa {
+        fail_case(
+            "isolated-restart",
+            "concurrent component reused the resident window backing",
+        );
+    }
+    if registry_state(second) != Some(ComponentState::Ready)
+        || registry_state(concurrent) != Some(ComponentState::Ready)
+    {
+        fail_case(
+            "isolated-restart",
+            "concurrent components are not both Ready",
+        );
+    }
+    if unsafe { life_slot(concurrent_window_pa, LIFE_R_MAGIC) } != LIFE_REPORT_MAGIC {
+        fail_case(
+            "isolated-restart",
+            "concurrent create did not run in its private AS",
+        );
+    }
+    // 收尾：停止并发组件（destroy 真的跑过）。
+    if kernel::component::stop_component(concurrent).is_err() {
+        fail_case("isolated-restart", "concurrent stop failed");
     }
 
     // (4) 优雅停止 second（Stopped tombstone、窗口驻留）→ 再次重启。

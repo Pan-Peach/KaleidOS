@@ -26,7 +26,7 @@
 //! - **执行上下文**：KernelNative 的 destroy 跑在 Core-owned 临时栈上（与 create
 //!   对称，见 [`containment::call_component_destroy`]）；Isolated 的 destroy 跑在
 //!   该实例的私有 AS 内经 跨 AS trampoline（`isolated_lifecycle::destroy`），两者
-//!   按 `InstanceRecord::execution_domain` 分派，**绝不静默互换**。
+//!   按 `ComponentRecord::execution_domain` 分派，**绝不静默互换**。
 //! - **身份**：入口的 ambient identity = **被停止的实例**（`EscapeKind::Exit`），
 //!   不是发起 stop 的 monitor / 其他组件，也不是 `load::current_component()`。
 //!   这是本文件与 `containment` 协同保证的契约（host 测试锁定）。
@@ -54,7 +54,6 @@
 
 use crate::component::containment::{self, CallOutcome};
 use crate::component::endpoint::ExecutionDomain;
-use crate::component::image;
 use crate::component::isolated_lifecycle;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::{self, RegistryError};
@@ -112,16 +111,15 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     // containment 的 Exit 边界；Isolated 由 跨 AS trampoline 进入前的 CURRENT + AS owner 承载。
     // **按执行域分派**：KernelNative 在 Core 拥有的共享 AS 栈上调用；Isolated 在
     // 该实例的私有 AS 内经 跨 AS trampoline 调用（两者都绝不静默互换）。
-    let (image_id, instance_state, domain) = {
+    let (destroy, instance_state, domain) = {
         let reg = registry::get_registry().lock();
-        let record = reg.get(id).expect("begin_stop 后实例必然存在");
-        (record.image, record.instance_state, record.execution_domain)
+        let record = reg.get(id).expect("begin_stop 后组件必然存在");
+        (
+            record.loaded.destroy,
+            record.instance_state,
+            record.execution_domain,
+        )
     };
-    let destroy = image::get_images()
-        .lock()
-        .get(image_id)
-        .map(|image| image.destroy)
-        .expect("实例的 image 必然常驻登记（pinned-until-reboot）");
     let outcome = match domain {
         ExecutionDomain::KernelNative => {
             containment::call_component_destroy(destroy, instance_state, id)
@@ -179,40 +177,36 @@ mod tests {
     use super::*;
     use crate::component::ComponentState;
     use crate::component::endpoint::ExecutionDomain;
-    use crate::component::image::{self, ComponentImageId};
     use crate::resource::RequestContext;
     use crate::task::TaskState;
 
-    /// 登记一份测试 image（同名复用），带指定的 destroy 入口。
-    ///
-    /// 调用方须已持有 memory GUARD（分配常驻 lease）。
-    fn test_image(name: &[u8], destroy: usize) -> ComponentImageId {
-        image::test_support::register_test_image(name, destroy)
+    /// 一份伪造 loaded image（无 backing），带指定的 destroy 入口。
+    fn test_loaded(destroy: usize) -> crate::component::loader::LoadedComponent {
+        crate::component::registry::test_support::test_loaded(destroy, None)
     }
 
-    /// 测试用实例：登记一份 image，声明实例并走到 `Ready`。
+    /// 测试用组件：声明并走到 `Ready`。
     fn ready_component(name: &[u8], destroy: usize) -> ComponentId {
-        let image = test_image(name, destroy);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+        let id = reg
+            .declare(name, test_loaded(destroy), ExecutionDomain::KernelNative)
+            .unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
         id
     }
 
-    /// 只声明（不 resolve）的实例，用于拒绝门测试。
+    /// 只声明（不 resolve）的组件，用于拒绝门测试。
     fn declared_component(name: &[u8]) -> ComponentId {
-        let image = test_image(name, 0);
         registry::get_registry()
             .lock()
-            .declare(image, ExecutionDomain::KernelNative)
+            .declare(name, test_loaded(0), ExecutionDomain::KernelNative)
             .unwrap()
     }
 
     fn setup() -> crate::memory::test_support::Guard<'static> {
         registry::init();
-        image::init();
         crate::task::init();
         crate::resource::init();
         crate::component::endpoint::init();
@@ -449,25 +443,37 @@ mod tests {
             .clear_quarantine();
     }
 
-    /// 契约核心：停止**只影响被选中的实例**——共享同一 image 的另一个实例
-    /// 保持 Ready，其设备 ownership 不受影响。
+    /// 契约核心：停止**只影响被选中的组件**——同 artifact 的另一个组件保持
+    /// Ready，其设备 ownership 不受影响。
     #[test]
     fn stop_affects_only_the_selected_instance() {
         // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
         // 安装 Exit 边界，必须持 BOUNDARY 锁（rank 0，先于 machine / memory GUARD）。
         let _boundary = containment::test_boundary_lock();
-        // Given：两个共享同一 image 的 Ready 实例，各自认领一台设备。
+        // Given：同一 artifact 的两个 Ready 组件，各自认领一台设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
         commit_devices(&[(10, b"exit,mmio0"), (11, b"exit,mmio1")]);
-        let image = test_image(b"exit_two_instances", destroy_hook_ok as *const () as usize);
+        let destroy = destroy_hook_ok as *const () as usize;
         let (first, second) = {
             let mut reg = registry::get_registry().lock();
-            let first = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let first = reg
+                .declare(
+                    b"exit_two_instances",
+                    test_loaded(destroy),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(first).unwrap();
             reg.begin_start(first).unwrap();
             reg.finish_start(first).unwrap();
-            let second = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let second = reg
+                .declare(
+                    b"exit_two_instances",
+                    test_loaded(destroy),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(second).unwrap();
             reg.begin_start(second).unwrap();
             reg.finish_start(second).unwrap();
@@ -591,21 +597,33 @@ mod tests {
     }
 
     /// 优雅停止（teardown）清除 runtime slot（执行状态，不是内存记账）：
-    /// `Stopped` 实例不再有 slot，共享同一 image 的其它实例不受影响。
+    /// `Stopped` 组件不再有 slot，同 artifact 的其它组件不受影响。
     #[test]
     fn stop_clears_runtime_slot() {
         // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
         // 安装 Exit 边界，必须持 BOUNDARY 锁。
         let _boundary = containment::test_boundary_lock();
         let _heap = setup();
-        let image = test_image(b"exit_slot", destroy_hook_ok as *const () as usize);
+        let destroy = destroy_hook_ok as *const () as usize;
         let (id, other) = {
             let mut reg = registry::get_registry().lock();
-            let id = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let id = reg
+                .declare(
+                    b"exit_slot",
+                    test_loaded(destroy),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(id).unwrap();
             reg.begin_start(id).unwrap();
             reg.finish_start(id).unwrap();
-            let other = reg.declare(image, ExecutionDomain::KernelNative).unwrap();
+            let other = reg
+                .declare(
+                    b"exit_slot",
+                    test_loaded(destroy),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
             reg.resolve(other).unwrap();
             reg.begin_start(other).unwrap();
             reg.finish_start(other).unwrap();

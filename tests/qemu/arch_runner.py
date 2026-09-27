@@ -130,7 +130,7 @@ CASES = (
     # and the KernelNative path keeps working.
     #   isolated-load-reject    placement failure (17 MiB .bss beyond the image
     #                           window) and the empty import envelope are rejected
-    #                           BEFORE any instance/AS/image exists;
+    #                           BEFORE any component/AS is declared;
     #   isolated-config-reject  an over-capacity config fails the create stage
     #                           with the same cleanup as other create failures;
     #   isolated-prepare-reject the gateway prepare rejects a non-executable
@@ -141,13 +141,15 @@ CASES = (
     #                           current contract) and is never retried;
     #   isolated-stale-access   a resolved-but-dead endpoint is blocked at the
     #                           Core boundary (the provider never runs again);
-    #   isolated-ready-fault    a fault on an instance that already served a call
-    #                           is contained, then the same image restarts as a
-    #                           genuinely independent fresh instance;
-    #   isolated-restart        a fresh instance of the same image runs to Ready
-    #                           after Failed/Stopped tombstones, with fresh AS /
-    #                           window / slot, while a concurrent live instance is
-    #                           explicitly rejected.
+    #   isolated-ready-fault    a fault on a component that already served a call
+    #                           is contained, then the same artifact is
+    #                           re-instantiated as a genuinely independent
+    #                           component (fresh AS / backing / window / slot);
+    #   isolated-restart        re-instantiating the same artifact runs to Ready
+    #                           after Failed/Stopped tombstones (fresh AS / backing
+    #                           / window / slot), and a second concurrent component
+    #                           of the same artifact is accepted with its own
+    #                           independent AS / backing.
     ("isolated-load-reject", None, "isolated-load-reject: rejected before declare"),
     ("isolated-config-reject", None, None),
     ("isolated-prepare-reject", None, "isolated-prepare-reject: typed rejections held"),

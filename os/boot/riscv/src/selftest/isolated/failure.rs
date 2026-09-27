@@ -15,14 +15,12 @@
 pub(crate) fn isolated_load_reject() -> ! {
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
-    use kernel::component::image;
     use kernel::component::load::{self, ComponentLoadError};
     use kernel::component::registry;
     use kernel::errno::Errno;
 
     let core_satp = read_satp();
     let instances_before = registry::get_registry().lock().iter().count();
-    let images_before = image::get_images().lock().len();
 
     // (a) 按域放段失败：17 MiB `.bss` 段超出实例镜像窗口（16 MiB）。
     let error = match load::create_component(
@@ -86,13 +84,7 @@ pub(crate) fn isolated_load_reject() -> ! {
     if registry::get_registry().lock().iter().count() != instances_before {
         fail_case(
             "isolated-load-reject",
-            "a rejected load declared an instance",
-        );
-    }
-    if image::get_images().lock().len() != images_before {
-        fail_case(
-            "isolated-load-reject",
-            "a rejected load registered an image",
+            "a rejected load declared a component",
         );
     }
 
@@ -174,7 +166,6 @@ pub(crate) fn isolated_config_reject() -> ! {
 pub(crate) fn isolated_prepare_reject() -> ! {
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
-    use kernel::component::image;
     use kernel::component::isolated::{self, IsolatedPrepareError};
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
@@ -192,23 +183,15 @@ pub(crate) fn isolated_prepare_reject() -> ! {
         Ok(id) => id,
         Err(_) => fail_case("isolated-prepare-reject", "instance create failed"),
     };
-    let (handle, image_id) = {
+    let (handle, create_entry) = {
         let reg = registry::get_registry().lock();
         match reg.get(id) {
             Some(record) => match record.address_space {
-                Some(handle) => (handle, record.image),
+                Some(handle) => (handle, record.loaded.create),
                 None => fail_case("isolated-prepare-reject", "instance has no address space"),
             },
             None => fail_case("isolated-prepare-reject", "instance record missing"),
         }
-    };
-    let create_entry = match image::get_images()
-        .lock()
-        .get(image_id)
-        .map(|record| record.create)
-    {
-        Some(entry) => entry,
-        None => fail_case("isolated-prepare-reject", "image is missing"),
     };
     let stack = isolated_lifecycle::stack_range();
     let window = isolated_lifecycle::window_range();

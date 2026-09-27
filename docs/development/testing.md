@@ -43,6 +43,7 @@ Host Test（宿主单测 —— 主体，日常主力）
 - **对抗性测试与功能测试同等重要**：Core 的"拒绝错误提案"行为必须显式测试。
   - 目标类别：double free / wrong owner / stale 资源身份 / invalid task transition / duplicate claim / illegal map / invalid scheduler proposal；
   - 已落地子集：重复 `device_claim` → `-EBUSY`、quarantine 后再 claim → `-EBUSY`、仍有 live IRQ route / DMA mapping 时 `device_release` → `-EBUSY`、非 owner `irq_register` / `dma_map` → `-EACCES`、顺序错误 → `-EINVAL`、ordinal 越界 → `-ENOENT`、stale mapping id → `-ENOENT`。
+- **同一 artifact 多组件的独立 backing（关键不变量）**：host `same_artifact_loads_produce_independent_components`（同名 artifact 连续 load 两次 → 两个 `ComponentId`、独立常驻 backing、镜像区间不重叠、`.data` / `.bss` 不共享）；CoreTest `driver-multi-device`（第二个同 artifact `virtio_blk` 组件独立 attach 第二台设备，RV64+RV32）；ArchTest `isolated-restart`（同 artifact 的并发 Isolated 组件各自独立私有 AS / backing）。
 - Core 的 API 每多一个，就多一份必须验证的承诺——这反过来约束 Core 词汇表保持最小。
 
 ## 4. 如何运行与观察
@@ -65,6 +66,6 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 ## 6. 长期陷阱与工具
 
 - **IRQ 电平触发**：`external-irq` 用 UART **THRE** 拉线；**先 claim 再关设备源**——先关 `IER` 会让 PLIC pending 随电平撤销，claim 取到 0。
-- **身份模型限制**：`ComponentId` 只在单个 `Registry` 实例内唯一，trace ring 是进程 / 整机全局；断言锚在"本组件刚加载的实例 id + 该次 load 前的游标"，这是当前身份模型允许的最强形式（全局唯一 ComponentId / boot epoch 未做）。
+- **身份模型限制**：`ComponentId` 只在单个 `Registry` 实例内唯一，trace ring 是进程 / 整机全局；断言锚在"本组件刚加载的 `ComponentId` + 该次 load 前的游标"，这是当前身份模型允许的最强形式（全局唯一 ComponentId / boot epoch 未做）。
 - **DMA 归属**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是该设备 owner。**未决**：组件可 claim PLIC 等设备（"认领一台设备 = 拿到它的全部语义，含控制其他设备的中断线"），该边界问题无人回答，记录而非"修"。
 - 未来工具链：CHESS / Test Scheduler / Hunt Mode（确定性并发）、Kani / Loom / Miri / Verus（模型检查 / UB / 演绎验证）、FSCQ（FS 崩溃一致性）。见 `references.md`。

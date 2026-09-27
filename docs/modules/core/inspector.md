@@ -10,11 +10,10 @@
 ## 暴露什么机制
 
 - `Inspector::task(TaskId) -> Option<TaskSnapshot>`
-- `Inspector::component(ComponentId) -> Option<ComponentSnapshot>`
-- `Inspector::component_image(ComponentImageId) -> Option<ImageSnapshot>`
+- `Inspector::component(ComponentId) -> Option<ComponentSnapshot>`（`ComponentSnapshot` 投影该组件**自己**的 `loaded`：`base` / `create` / `destroy` / `text_size` / `abi`，没有独立的 image 快照字段）
 - `Inspector::memory_region(base) -> Option<MemoryRegionSnapshot>`
 - `Inspector::visit_trace_since(seq, visitor)`
-- 快照类型：`TaskSnapshot`、`ComponentSnapshot`、`ImageSnapshot`、`MemoryRegionSnapshot`。
+- 快照类型：`TaskSnapshot`、`ComponentSnapshot`、`MemoryRegionSnapshot`。
 
 ## 明确不做
 
@@ -27,4 +26,4 @@
 | 文件 | 内容 |
 |---|---|
 | `os/core/src/inspector/mod.rs` | `Inspector`（ZST）与查询方法 |
-| `os/core/src/inspector/snapshot.rs` | `TaskSnapshot` / `ComponentSnapshot` / `ImageSnapshot` / `MemoryRegionSnapshot` |
+| `os/core/src/inspector/snapshot.rs` | `TaskSnapshot` / `ComponentSnapshot` / `MemoryRegionSnapshot` |

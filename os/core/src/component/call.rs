@@ -37,8 +37,8 @@
 //!
 //! # 锁纪律（不可动摇）
 //!
-//! 准备阶段可以同时持有 registry / endpoint / image 锁（**固定顺序**
-//! `registry → endpoints → images`，无反向路径），但**任何锁都不得跨 provider
+//! 准备阶段可以同时持有 registry / endpoint 锁（**固定顺序**
+//! `registry → endpoints`，无反向路径），但**任何锁都不得跨 provider
 //! 调用**：dispatcher 地址、`instance_state`、`port` 在锁内拷贝进
 //! [`DispatchTarget`]，全部 guard 释放后才执行组件代码。组件 dispatcher 在调用
 //! 期间可以自由进入 Core（日志 / task / device…），"持锁调用组件" = 自死锁。
@@ -65,11 +65,10 @@ use crate::component::containment::{self, CallOutcome, ServiceDispatch};
 use crate::component::endpoint::{
     ContractId, EndpointError, EndpointId, EndpointRegistry, ExecutionDomain,
 };
-use crate::component::image::ImageTable;
 use crate::component::isolated_lifecycle;
 use crate::component::load::ComponentLoadError;
 use crate::component::registry::Registry;
-use crate::component::{ComponentId, endpoint, image, registry};
+use crate::component::{ComponentId, endpoint, registry};
 use crate::generated::abi::{
     KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT, KCOMP_SCHEDULER_POLICY_ABI,
     KCOMP_SCHEDULER_POLICY_CONTRACT, KcompCallFrame,
@@ -91,9 +90,7 @@ pub enum CallError {
     Endpoint(EndpointError),
     /// provider 不在 `Ready`（停止 / 失败）或 inflight 计数溢出 → `EBUSY`。
     ProviderBusy,
-    /// owner 实例记录指向的 image 不在镜像表（Core 不变式破坏，不应发生）→ `ENODEV`。
-    ImageMissing,
-    /// provider image 没有 `kcomp_service_dispatch`：组件不提供 endpoint 服务
+    /// provider 的 loaded image 没有 `kcomp_service_dispatch`：组件不提供 endpoint 服务
     /// （能力缺失，不是故障）→ `ENOSYS`。
     NoDispatcher,
     /// provider 实例已在当前**同步调用链**上运行（它自己的 task / 外层 service
@@ -149,14 +146,13 @@ pub(crate) struct DispatchTarget {
     pub(crate) domain: ExecutionDomain,
 }
 
-/// 锁内准备：存活解析 → re-entry 门禁 → `begin_call` → 取 image dispatcher。
+/// 锁内准备：存活解析 → re-entry 门禁 → `begin_call` → 取 dispatcher。
 ///
-/// 调用方必须在一个**作用域**里同时持有 registry / endpoint / image guard 并
+/// 调用方必须在一个**作用域**里同时持有 registry / endpoint guard 并
 /// 在离开作用域后（guard 释放后）才进入 [`containment::call_component_service`]。
 fn prepare(
     components: &mut Registry,
     endpoints: &EndpointRegistry,
-    images: &ImageTable,
     id: EndpointId,
 ) -> Result<DispatchTarget, CallError> {
     // (1) 存活解析：死 endpoint / 死 owner 绝不派发（`resolve` 只查存活，
@@ -176,15 +172,18 @@ fn prepare(
         return Err(CallError::Reentrant);
     }
 
-    // (3) owner 的 image / opaque state 在此刻拷贝（`resolve` 刚校验过 owner
-    //     存在，故这里是纯读取；拷贝后不再借用 record 之外的记录）。
-    let Some(instance) = components.get(record.owner) else {
-        return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
+    // (3) provider 自己的 loaded image / opaque state 在此刻拷贝（`resolve`
+    //     刚校验过 owner 存在，故这里是纯读取；拷贝后不再借用其它记录）。
+    let (dispatcher_opt, instance_state, domain) = {
+        let Some(instance) = components.get(record.owner) else {
+            return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
+        };
+        (
+            instance.loaded.service_dispatch,
+            instance.instance_state,
+            instance.execution_domain,
+        )
     };
-    let image_id = instance.image;
-    let instance_state = instance.instance_state;
-    // 部署真相（Core 拥有）：provider 的执行域决定 dispatch 机制。
-    let domain = instance.execution_domain;
 
     // (4) inflight 记账门禁：只有 Ready provider 可以开始服务调用；拒绝
     //     （不在 Ready / 溢出 / 未知）统一映射成 EBUSY。此后任何提前返回
@@ -193,19 +192,15 @@ fn prepare(
         .begin_call(record.owner)
         .map_err(|_| CallError::ProviderBusy)?;
 
-    // (5) image + **可选** dispatcher：缺失 = 组件不提供 endpoint 服务。
-    let Some(image) = images.get(image_id) else {
-        components.finish_call(record.owner);
-        return Err(CallError::ImageMissing);
-    };
-    let Some(dispatcher) = image.service_dispatch else {
+    // (5) **可选** dispatcher：缺失 = 组件不提供 endpoint 服务。
+    let Some(dispatcher) = dispatcher_opt else {
         components.finish_call(record.owner);
         return Err(CallError::NoDispatcher);
     };
 
     Ok(DispatchTarget {
         // `service_dispatch` 只由 loader 写入（放段后解析 `STT_FUNC` 符号 +
-        // 已分配 executable 段边界校验），组件无法伪造；image 常驻
+        // 已分配 executable 段边界校验），组件无法伪造；组件常驻
         // （pinned-until-reboot），地址在调用期间有效。**域内 VA**：只有
         // `domain` 对应的 dispatch 路径可以把它变成可调用物。
         dispatcher,
@@ -302,8 +297,7 @@ fn dispatch(
     let target = {
         let mut components = registry::get_registry().lock();
         let endpoints = endpoint::get_endpoints().lock();
-        let images = image::get_images().lock();
-        prepare(&mut components, &endpoints, &images, id)?
+        prepare(&mut components, &endpoints, id)?
     };
 
     // (4) 无锁派发：按 **provider 执行域**选已实现的机制（Core 真相；
@@ -383,13 +377,12 @@ pub(crate) struct PolicyTarget {
 /// 锁内准备一次策略调用：endpoint 校验（**contract + abi exact-match** + 存活）
 /// → `begin_call` 记账 → 取 image dispatcher。
 ///
-/// 锁序与 [`prepare`] 相同（`registry → endpoints → images`），三个 guard 在返回前
+/// 锁序与 [`prepare`] 相同（`registry → endpoints`），两个 guard 在返回前
 /// 全部释放；`begin_call` 之后的任何失败路径都归还 inflight。返回的目标交给
 /// [`call_policy`] 在无锁状态下调用。
 pub(crate) fn prepare_policy(id: EndpointId) -> Result<PolicyTarget, CallError> {
     let mut components = registry::get_registry().lock();
     let endpoints = endpoint::get_endpoints().lock();
-    let images = image::get_images().lock();
 
     // (1) 契约 + abi + 存活：选择时已校验，每次调用重新核对（死 endpoint /
     //     provider 离开 Ready 一律拒绝；绝不重定向到新实例）。
@@ -400,25 +393,23 @@ pub(crate) fn prepare_policy(id: EndpointId) -> Result<PolicyTarget, CallError> 
         InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI),
     )?;
 
-    // (2) owner 的 image / opaque state（`lookup` 刚校验过 owner 存在且 Ready）。
-    let Some(instance) = components.get(record.owner) else {
-        return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
+    // (2) provider 自己的 loaded image / opaque state（`lookup` 刚校验过 owner
+    //     存在且 Ready）。
+    let (dispatcher_opt, state) = {
+        let Some(instance) = components.get(record.owner) else {
+            return Err(CallError::Endpoint(EndpointError::ProviderNotFound));
+        };
+        (instance.loaded.service_dispatch, instance.instance_state)
     };
-    let image_id = instance.image;
-    let state = instance.instance_state;
 
     // (3) inflight 记账门禁：只有 Ready provider 可以开始策略调用。
     components
         .begin_call(record.owner)
         .map_err(|_| CallError::ProviderBusy)?;
 
-    // (4) image + **必需** dispatcher：策略 provider 必须提供 image 级入口
+    // (4) **必需** dispatcher：策略 provider 必须提供 loaded image 级入口
     //     （选择时已校验，这里是每次调用的存活复验）。
-    let Some(image) = images.get(image_id) else {
-        components.finish_call(record.owner);
-        return Err(CallError::ImageMissing);
-    };
-    let Some(dispatcher) = image.service_dispatch else {
+    let Some(dispatcher) = dispatcher_opt else {
         components.finish_call(record.owner);
         return Err(CallError::NoDispatcher);
     };
@@ -429,7 +420,7 @@ pub(crate) fn prepare_policy(id: EndpointId) -> Result<PolicyTarget, CallError> 
         state,
         port: record.port,
         // SAFETY: 同 `prepare`：`service_dispatch` 只由 loader 写入（放段后解析
-        // `STT_FUNC` 符号 + 已执行段边界校验），组件无法伪造；image 常驻。
+        // `STT_FUNC` 符号 + 已执行段边界校验），组件无法伪造；组件常驻。
         dispatch: unsafe { core::mem::transmute::<usize, ServiceDispatch>(dispatcher) },
     })
 }
@@ -612,8 +603,8 @@ mod tests {
         output_len: 0,
     };
 
-    /// 初始化全局真相，在全局 image 表登记一份测试 image，声明一个 Ready 实例
-    /// （记录 `instance_state`），返回 provider 实例 id。
+    /// 初始化全局真相，声明一个 Ready 组件（带可选 dispatcher）并记录
+    /// `instance_state`，返回 provider id。
     fn ready_provider(
         name: &[u8],
         dispatcher: Option<usize>,
@@ -636,10 +627,14 @@ mod tests {
     ) -> ComponentId {
         registry::init();
         endpoint::init();
-        image::init();
-        let image = image::test_support::register_test_image_with_dispatch(name, 0, dispatcher);
         let mut reg = registry::get_registry().lock();
-        let id = reg.declare(image, domain).unwrap();
+        let id = reg
+            .declare(
+                name,
+                crate::component::registry::test_support::test_loaded(0, dispatcher),
+                domain,
+            )
+            .unwrap();
         reg.resolve(id).unwrap();
         reg.begin_start(id).unwrap();
         reg.finish_start(id).unwrap();
@@ -876,7 +871,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(0xCA11),
+                    b"call_failed_caller",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     ExecutionDomain::KernelNative,
                 )
                 .unwrap();
@@ -927,7 +923,8 @@ mod tests {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    crate::component::image::ComponentImageId::from_raw(0x1501),
+                    b"call_isolated_caller",
+                    crate::component::registry::test_support::test_loaded(0, None),
                     ExecutionDomain::IsolatedNative,
                 )
                 .unwrap();

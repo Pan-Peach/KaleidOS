@@ -326,7 +326,7 @@ Component
 ```
 
 - **ResourceDomain**：组件拥有的资源**归属集合**，由 Core 统一记录。它只记设备所有权（claimed `DeviceId`）、IRQ route、DMA allocation/mapping，**不**记受管内存（Core 不做内存记账；per-instance `HeapState` 属 runtime，不是 ResourceDomain 资源）。**不设 struct**：它是"所有 `owner == ComponentId` 的归属记录"这一**视图**，owner 字段落在各资源表（device/irq/dma）的 record 上，回收 = `revoke_owner(id)`。组件停止时 Core 保证最终撤销归属并 teardown / quarantine。
-- **ExecutionDomain**：回答"在哪运行、什么特权 / 地址空间"：`KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。执行模型 / ISA / runtime（native vs Wasm）是**正交维度**，不属于这里（Wasm 是未来 Component 的一种执行后端，不是第四个执行域）。image 与 instance 已分离（`InstanceRecord` 带 `execution_domain`，由创建入口验证后写入）；`KernelNative` 与受限 `IsolatedNative` 都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。
+- **ExecutionDomain**：回答"在哪运行、什么特权 / 地址空间"：`KernelNative` / `IsolatedNative(AddressSpaceId)`（未来可加 `SandboxedNative`）。执行模型 / ISA / runtime（native vs Wasm）是**正交维度**，不属于这里（Wasm 是未来 Component 的一种执行后端，不是第四个执行域）。一个 `ComponentId` = 一个完整运行组件（`ComponentRecord` 直接拥有自己的 `LoadedComponent`），其 `execution_domain` 由创建入口验证后写入；`KernelNative` 与受限 `IsolatedNative` 都有真实执行器，`SandboxedNative` 是 `todo!()` 占位。
 
 **三个组件信任域与 ABI 分离：**
 
