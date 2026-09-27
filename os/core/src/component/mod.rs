@@ -24,14 +24,11 @@ pub mod isolated;
 /// runtime slot，经跨 AS trampoline 执行 `kcomp_instance_create` /
 /// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
 /// 同一模块还承载跨域 service dispatch（KernelNative caller → Isolated
-/// provider，经扁平帧邮箱 + 跨 AS trampoline）。
+/// provider，经 caller 帧直接交付 + 跨 AS trampoline）。
 pub mod isolated_lifecycle;
 /// 按域装载：把一个已解析的 `.kcomp` 的段按页级权限放进实例的私有 AS。
 /// 由 `isolated_lifecycle` 调用。
 pub mod isolated_load;
-/// Isolated 跨域 service 的**扁平调用帧邮箱**：caller frame → Core 拥有的邮箱
-/// backing → provider 域内 VA；容量固定、超长显式拒绝。
-pub mod isolated_mailbox;
 pub mod load;
 pub mod loader;
 pub mod registry;

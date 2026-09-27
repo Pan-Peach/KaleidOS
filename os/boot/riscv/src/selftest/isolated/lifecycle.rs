@@ -262,7 +262,7 @@ pub(crate) fn failed_isolated_instance() -> Option<(ComponentId, AddressSpaceHan
 }
 
 /// 失败清理断言（**Core 中止实例**的路径：create / service 故障）：
-/// `Failed` + AS 退役 + Core 预置窗口（栈 / 实例窗口 / 邮箱）归还 backing +
+/// `Failed` + AS 退役 + Core 预置窗口（栈 / 实例窗口）归还 backing +
 /// runtime slot 清除。
 pub(crate) fn assert_failure_released(case: &str, id: ComponentId, handle: AddressSpaceHandle) {
     use kernel::component::isolated_lifecycle;
@@ -280,7 +280,6 @@ pub(crate) fn assert_failure_released(case: &str, id: ComponentId, handle: Addre
     for range in [
         isolated_lifecycle::stack_range(),
         isolated_lifecycle::window_range(),
-        isolated_lifecycle::mailbox_range(),
     ] {
         if !matches!(address_space::mapping_exact(handle, &range), Ok(None)) {
             fail_case(case, "a Core-prepared window leaked");
@@ -310,13 +309,11 @@ pub(crate) fn assert_destroy_path_retired(
     if !matches!(address_space::mapping_exact(handle, window), Ok(Some(_))) {
         fail_case(case, "destroy path must keep the prepared window resident");
     }
-    for range in [
-        isolated_lifecycle::stack_range(),
-        isolated_lifecycle::mailbox_range(),
-    ] {
-        if !matches!(address_space::mapping_exact(handle, &range), Ok(Some(_))) {
-            fail_case(case, "destroy path must keep the prepared window resident");
-        }
+    if !matches!(
+        address_space::mapping_exact(handle, &isolated_lifecycle::stack_range()),
+        Ok(Some(_))
+    ) {
+        fail_case(case, "destroy path must keep the prepared window resident");
     }
     if !runtime_slot::get_slots().lock().get(id).is_null() {
         fail_case(case, "runtime slot was not cleared");

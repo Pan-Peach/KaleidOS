@@ -30,7 +30,7 @@
 
 > **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
 > （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 最小跨 AS trampoline（共享 Core 映射） + 按域放段 +
-> Core 预置窗口 / 邮箱 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
+> Core 预置窗口 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
 > 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 更宽的按域 import 面仍未实现**（支持面 import 已落地），边界是
 > 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。
 
@@ -232,7 +232,7 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 - **不实现 `instances == 0 → unload` / 物理回收。** 组件 backing 保持 pinned-until-reboot；`Stopped` / `Failed` 的记录留作 tombstone，其 backing 仍归**旧组件**所有。
 - **重启 = 从同一 artifact 重新 instantiate**：得到**全新 `ComponentId`**、**全新可写 image state**（`.data` / `.bss` 回到 artifact 初始值）、**全新资源归属 / endpoint**。旧组件的 `Stopped` / `Failed` 记录与 backing 驻留（phase 1 不回收）。
-  > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单 / runtime slot（`tp`）/ 邮箱不变。见 `architecture/deployment.md` §10。
+  > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单 / runtime slot（`tp`）不变。见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
 - **重启 ≠ 设备恢复**（隔离到重启，见 §8）。
 

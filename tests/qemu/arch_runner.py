@@ -110,17 +110,14 @@ CASES = (
     # The KernelNative -> Isolated service Gate.  A KernelNative
     # caller invokes a real `.kcomp` provider's `kcomp_service_dispatch` in its
     # own private AS through the minimal cross-AS trampoline: the flat frame is
-    # COPIED through a Core-owned mailbox (provider-side pointers are all mailbox
-    # VAs, payloads equal the caller's, output copied back), the provider runs on
-    # its own root/slot, caller memory is unreachable from the instance AS, and
-    # the Core root is restored after the transition.  `isolated-service-limits`
-    # proves an over-capacity frame is rejected (`-EMSGSIZE`) before any copy
-    # (provider never runs).  `isolated-service-fault` proves a provider fault
-    # (load from a caller-domain address) is contained: the caller gets a typed
-    # error, the instance is Failed with a retired AS and released windows, and
-    # Core survives.
+    # delivered DIRECTLY (shared Core mappings put the caller's descriptor and
+    # buffers at the same VA->PA in the provider AS -- provider-side pointers are
+    # the caller's, payloads read in place, output written in place), the provider
+    # runs on its own root/slot, and the Core root is restored after the
+    # transition.  `isolated-service-fault` proves a provider fault (load from an
+    # unmapped VA) is contained: the caller gets a typed error, the instance is
+    # Failed with a retired AS and released windows, and Core survives.
     ("isolated-service", None, "isolated-service: gate OK"),
-    ("isolated-service-limits", None, None),
     ("isolated-service-fault", None, "isolated-service-fault: contained"),
     # The failure/restart acceptance matrix.  Every row asserts the
     # AGENTS.md failure contract ("组件失败 = 逻辑死亡、物理驻留"): the instance

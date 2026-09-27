@@ -11,7 +11,7 @@
 //! traps      私有 AS 内的 trap 往返（timer / 可恢复缺页 / 拒绝恢复）
 //! image      真实 `.kcomp` 的按域装载 + 段权限强制
 //! lifecycle  生产 create → Ready → destroy 与 create/destroy 失败终态
-//! service    KernelNative → Isolated 跨域 service（邮箱帧 + 故障收敛）
+//! service    KernelNative → Isolated 跨域 service（caller 帧直接交付 + 故障收敛）
 //! failure    放段 / config / prepare 拒绝、destroy 故障、stale 访问阻断
 //! restart    已服务实例的故障收敛 + 同镜像逻辑重启
 //! ```

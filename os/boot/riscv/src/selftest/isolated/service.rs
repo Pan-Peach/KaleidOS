@@ -1,14 +1,16 @@
-//! KernelNative caller → Isolated provider cross-AS service dispatch: mailbox
-//! frame copy, capacity rejection, and provider fault containment.
+//! KernelNative caller → Isolated provider cross-AS service dispatch: the caller
+//! frame is delivered directly (shared Core mappings), and provider faults are
+//! contained.
 
 // -----------------------------------------------------------------------
 // KernelNative caller → Isolated provider 的跨域 service Gate。
 //
 // provider `kcomp_isolated_svc` 经生产路径创建（私有 AS + 按域镜像 + Core
-// 预置窗口 / 邮箱）；caller 是真实 KernelNative 组件（`kcomp_smoke`）的任务
-// 边界。Core 从自己的视图读回 provider 的上报区（窗口 backing），断言：
-//   - 扁平帧真的被**拷贝**过边界（provider 看到的三个指针都在邮箱页内、
-//     内容 = caller 的负载；caller 的缓冲地址在实例 AS 里不可达）；
+// 预置窗口）；caller 是真实 KernelNative 组件（`kcomp_smoke`）的任务边界。
+// Core 从自己的视图读回 provider 的上报区（窗口 backing），断言：
+//   - 扁平帧**没有中间页**：provider 看到的 frame / args / input / output 指针
+//     就是 caller 的地址，三个缓冲在 provider 的 AS 里 same VA → same PA
+//     直接可读（无拷贝）；
 //   - provider 在私有 AS 里运行（satp / tp），Core AS 每次切换后恢复；
 //   - provider 故障（trap）被 Core 收敛：caller 拿到类型化错误、实例
 //     Failed + AS 退役 + 窗口归还、Core 存活。
@@ -242,13 +244,8 @@ pub(crate) fn isolated_service() -> ! {
         fail("isolated-service: Core satp not restored after the transition");
     }
 
-    // Then 2：provider 的上报（从 Core 视图读回）证明帧真的被拷贝过边界。
+    // Then 2：provider 的上报（从 Core 视图读回）证明帧**直接**交付、没有拷贝。
     let window = isolated_lifecycle::window_range();
-    let mailbox = isolated_lifecycle::mailbox_range();
-    let mailbox_pa = match address_space::mapping_exact(provider.handle, &mailbox) {
-        Ok(Some(mapping)) => mapping.physical_range.base,
-        _ => fail("isolated-service: mailbox is not mapped"),
-    };
     let slot = |index: usize| unsafe { svc_slot(provider.window_pa, index) };
     if slot(SVC_R_MAGIC) != SVC_REPORT_MAGIC || slot(SVC_R_CALLS) != 1 {
         fail("isolated-service: provider dispatcher did not run exactly once");
@@ -259,13 +256,21 @@ pub(crate) fn isolated_service() -> ! {
     if slot(SVC_R_PORT) != SVC_PORT as usize || slot(SVC_R_METHOD) != SVC_METHOD_ECHO as usize {
         fail("isolated-service: port / method were not delivered");
     }
-    // 帧描述符与三个负载指针**全部**是邮箱页内的实例域 VA。
-    if slot(SVC_R_FRAME) != mailbox.base + kernel::component::isolated_mailbox::FRAME_OFF
-        || slot(SVC_R_ARGS) != mailbox.base + kernel::component::isolated_mailbox::ARGS_OFF
-        || slot(SVC_R_INPUT) != mailbox.base + kernel::component::isolated_mailbox::INPUT_OFF
-        || slot(SVC_R_OUTPUT) != mailbox.base + kernel::component::isolated_mailbox::OUTPUT_OFF
+    // 三个负载指针就是 caller 的地址（无拷贝）；帧描述符不是实例私有页。
+    if slot(SVC_R_ARGS) != args.as_ptr() as usize
+        || slot(SVC_R_INPUT) != input.as_ptr() as usize
+        || slot(SVC_R_OUTPUT) != output.as_mut_ptr() as usize
     {
-        fail("isolated-service: provider frame is not the Core-owned mailbox");
+        fail("isolated-service: provider pointers are not the caller's buffers");
+    }
+    let frame_ptr = slot(SVC_R_FRAME);
+    let instance_stack_end =
+        isolated_lifecycle::ISOLATED_STACK_BASE + isolated_lifecycle::ISOLATED_STACK_SIZE;
+    if frame_ptr == 0
+        || (frame_ptr >= window.base && frame_ptr < window.base + window.size)
+        || (frame_ptr >= isolated_lifecycle::ISOLATED_STACK_BASE && frame_ptr < instance_stack_end)
+    {
+        fail("isolated-service: provider frame is not a shared Core pointer");
     }
     if slot(SVC_R_ARGS_LEN) != args.len()
         || slot(SVC_R_INPUT_LEN) != input.len()
@@ -278,7 +283,7 @@ pub(crate) fn isolated_service() -> ! {
         || slot(SVC_R_IN0) != input[0] as usize
         || slot(SVC_R_IN1) != input[1] as usize
     {
-        fail("isolated-service: payload was not copied into the mailbox");
+        fail("isolated-service: provider could not read the caller payload in place");
     }
     // provider 在私有 AS 里运行：satp = 实例 root、tp = Core 安装的 runtime slot。
     let expected_satp = match address_space::prepare_activation(provider.handle) {
@@ -292,16 +297,19 @@ pub(crate) fn isolated_service() -> ! {
         fail("isolated-service: provider runtime slot (tp) mismatch");
     }
 
-    // Then 3：**Core 内存是共享的**（共享 Core 映射）：caller 的缓冲落在 Core
-    // 内存里，因此 provider 在实例 AS 里经同一 VA 也能到达——这是设计，不是漏洞。
-    // 传输仍然只走邮箱：provider 的帧 / args / input / output 指针全部是邮箱页
-    // 内的实例域 VA（上面已逐条断言），Core 从不把 caller 缓冲交给 provider。
-    // 真正不可达的是别的实例的私有映射（见 `isolated-private-unreachable`）。
-    if !matches!(
-        address_space::translate(provider.handle, mailbox.base),
-        Ok(Some(pa)) if pa == mailbox_pa
-    ) {
-        fail("isolated-service: mailbox is not the instance-local window");
+    // Then 3：**共享 Core 映射**让 caller 的缓冲在 provider 的 AS 里直接有效
+    // （same VA → same PA）——这正是 KernelNative caller 能直接交付帧的原因；
+    // 同 PA 由原地读写证明（payload 逐字节相等 + output 原地回显），这里只钉
+    // "provider 的页表真的翻译这些 caller VA"。真正不可达的是别的实例的私有
+    // 映射（见 `isolated-private-unreachable`）。
+    for va in [
+        args.as_ptr() as usize,
+        input.as_ptr() as usize,
+        output.as_mut_ptr() as usize,
+    ] {
+        if !matches!(address_space::translate(provider.handle, va), Ok(Some(_))) {
+            fail("isolated-service: caller buffer is not mapped in the provider AS");
+        }
     }
 
     // Then 4：inflight 归还、实例仍 Ready、endpoint 仍 Live。
@@ -341,129 +349,12 @@ pub(crate) fn isolated_service() -> ! {
     }
     kernel::log!(
         "selftest",
-        "isolated-service: gate OK: id={}, mailbox={:#x}, satp={:#x}",
+        "isolated-service: gate OK: id={}, frame={:#x}, satp={:#x}",
         provider.id.raw(),
-        mailbox.base,
+        frame_ptr,
         expected_satp
     );
     pass("isolated-service")
-}
-
-/// 容量用例：超过邮箱容量的扁平帧被显式拒绝（`FrameTooLarge` → EMSGSIZE），
-/// **绝不截断**、provider 从未执行、实例不受影响。
-pub(crate) fn isolated_service_limits() -> ! {
-    use kernel::component::call::{self, CallError};
-    use kernel::component::endpoint::ExecutionDomain;
-    use kernel::component::isolated_lifecycle;
-    use kernel::component::isolated_mailbox;
-    use kernel::component::load;
-    use kernel::component::registry;
-    use kernel::errno::Errno;
-    use kernel::memory::address_space;
-
-    let core_satp = read_satp();
-    let provider = svc_provider();
-    let caller = match load::load_and_start(b"kcomp_smoke", ExecutionDomain::KernelNative) {
-        Ok(id) => id,
-        Err(_) => fail("isolated-service-limits: caller load failed"),
-    };
-    let before_calls = unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) };
-    let mut out_status = 0i32;
-
-    // args 超容量（指针真实可读：拒绝必须发生在**任何拷贝之前**）。
-    let big_args = [0u8; isolated_mailbox::ARGS_MAX + 1];
-    let small = [0u8; 1];
-    let mut output = [0u8; 1];
-    let cases: [(usize, usize, usize); 3] = [
-        (isolated_mailbox::ARGS_MAX + 1, 1, 1),
-        (1, isolated_mailbox::INPUT_MAX + 1, 1),
-        (1, 1, isolated_mailbox::OUTPUT_MAX + 1),
-    ];
-    for (args_len, input_len, output_len) in cases {
-        let error = with_kernel_caller(caller, 0x6B, || {
-            call::endpoint_call(
-                provider.endpoint,
-                SVC_METHOD_ECHO,
-                big_args.as_ptr(),
-                args_len,
-                small.as_ptr(),
-                input_len,
-                output.as_mut_ptr(),
-                output_len,
-                &mut out_status,
-            )
-        })
-        .unwrap_err();
-        if error != CallError::FrameTooLarge {
-            kernel::log!(
-                "selftest",
-                "isolated-service-limits: unexpected error: {:?}",
-                error
-            );
-            fail("isolated-service-limits: oversized frame was not rejected");
-        }
-        if Errno::from(error) != Errno::EMSGSIZE {
-            fail("isolated-service-limits: oversized frame errno mismatch");
-        }
-    }
-    if read_satp() != core_satp {
-        fail("isolated-service-limits: Core satp not restored");
-    }
-    // provider 从未执行；实例仍 Ready；inflight 归还。
-    if unsafe { svc_slot(provider.window_pa, SVC_R_CALLS) } != before_calls {
-        fail("isolated-service-limits: provider ran for a rejected frame");
-    }
-    if registry::get_registry().lock().active_calls(provider.id) != 0 {
-        fail("isolated-service-limits: inflight was not returned");
-    }
-    if registry::get_registry()
-        .lock()
-        .get(provider.id)
-        .map(|record| record.state)
-        != Some(kernel::component::ComponentState::Ready)
-    {
-        fail("isolated-service-limits: provider left Ready after a rejected frame");
-    }
-    if out_status != 0 {
-        fail("isolated-service-limits: rejected call wrote out_status");
-    }
-    // endpoint 仍 Live（拒绝是**每次调用**的容量判定，不是实例故障）。
-    {
-        use kernel::component::abi::InterfaceAbi;
-        use kernel::component::endpoint::ContractId;
-        let reg = registry::get_registry().lock();
-        let live = kernel::component::endpoint::get_endpoints()
-            .lock()
-            .lookup(
-                &reg,
-                provider.endpoint,
-                ContractId::from_raw(SVC_CONTRACT),
-                InterfaceAbi::from_raw(SVC_ABI),
-            )
-            .is_ok();
-        if !live {
-            fail("isolated-service-limits: endpoint died on a rejected frame");
-        }
-    }
-    // 邮箱从未被触碰（拒绝发生在任何拷贝之前）：描述符仍是零。
-    let mailbox = isolated_lifecycle::mailbox_range();
-    let mailbox_pa = match address_space::mapping_exact(provider.handle, &mailbox) {
-        Ok(Some(mapping)) => mapping.physical_range.base,
-        _ => fail("isolated-service-limits: mailbox is not mapped"),
-    };
-    // SAFETY: 邮箱 backing 由 Core 独占且仍驻留；只读描述符首字。
-    if unsafe {
-        core::ptr::read_volatile(
-            (mailbox_pa + kernel::component::isolated_mailbox::FRAME_OFF) as *const usize,
-        )
-    } != 0
-    {
-        fail("isolated-service-limits: a rejected frame wrote the mailbox");
-    }
-    if !kernel_native_still_works() {
-        fail("isolated-service-limits: KernelNative path broke after rejections");
-    }
-    pass("isolated-service-limits")
 }
 
 /// 故障用例：provider 在 dispatch 期间访问**未映射地址** → 私有 AS 缺页
@@ -556,12 +447,12 @@ pub(crate) fn isolated_service_fault() -> ! {
         fail("isolated-service-fault: provider did not run on a private root");
     }
     assert_fault_ran_in_instance_context("isolated-service-fault", provider_satp);
-    // provider 的上报证明它读到了 mailbox 里的目标地址（在 fault 之前）。
+    // provider 的上报证明它读到了 caller 帧里的目标地址（在 fault 之前）。
     if unsafe { svc_slot(provider.window_pa, SVC_R_FAULT_TARGET) } != target_va {
         fail("isolated-service-fault: provider did not see the fault target");
     }
 
-    // Then 3：实例逻辑死亡 + AS 退役 + Core 预置窗口（栈 / 窗口 / 邮箱）归还 +
+    // Then 3：实例逻辑死亡 + AS 退役 + Core 预置窗口（栈 / 窗口）归还 +
     // runtime slot 清空 + endpoint 永久失效 + inflight 归还。
     if registry::get_registry()
         .lock()
@@ -584,7 +475,6 @@ pub(crate) fn isolated_service_fault() -> ! {
     for range in [
         isolated_lifecycle::stack_range(),
         isolated_lifecycle::window_range(),
-        isolated_lifecycle::mailbox_range(),
     ] {
         if !matches!(
             address_space::mapping_exact(provider.handle, &range),

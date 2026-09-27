@@ -144,8 +144,6 @@ impl From<CallError> for Errno {
             CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
             // provider 域没有已实现的 dispatch 机制（Sandboxed 未实现）：能力缺失。
             CallError::UnsupportedProviderDomain => Errno::ENOTSUP,
-            // 跨 AS 邮箱放不下的扁平帧：显式拒绝（绝不截断），provider 从未执行。
-            CallError::FrameTooLarge => Errno::EMSGSIZE,
         }
     }
 }
@@ -475,7 +473,6 @@ mod tests {
             CallError::ProviderFailed,
             CallError::UnsupportedCallerDomain,
             CallError::UnsupportedProviderDomain,
-            CallError::FrameTooLarge,
         ] {
             let expected = match error {
                 CallError::NoCaller | CallError::CallerFailed => Errno::EPERM,
@@ -502,7 +499,6 @@ mod tests {
                 CallError::ProviderFailed => Errno::EIO,
                 CallError::UnsupportedCallerDomain => Errno::ENOTSUP,
                 CallError::UnsupportedProviderDomain => Errno::ENOTSUP,
-                CallError::FrameTooLarge => Errno::EMSGSIZE,
             };
             assert_eq!(Errno::from(error), expected, "CallError {error:?}");
         }

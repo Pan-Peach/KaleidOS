@@ -7,13 +7,13 @@
 //!
 //! # 零依赖、零 import
 //!
-//! Isolated 的 import 包络是**空集**（没有 per-domain trampoline）：
 //! 本夹具没有任何 UNDEF 符号，只用 `core::arch::asm!` 读 CSR 与自己镜像内的
-//! load/store。**provider 不能调用 Core**——它只能读 Core 交付给它的邮箱与实例
-//! 窗口。Core 侧没有 endpoint publication（组件→Core 的 publish trampoline），
+//! load/store。Isolated 的 import 白名单只放诊断 / 只读查询与
+//! `kcore_panic_escape`（本夹具不需要其中任何一个），因此它不调用 Core。
+//! Core 侧没有 endpoint publication（组件→Core 的 publish 面不在白名单里），
 //! 因此 ArchTest 从 Core 侧登记本 provider 的 endpoint（见 selftest）。
 //!
-//! # 与 Core 的接口（窗口 + 邮箱协议）
+//! # 与 Core 的接口（窗口 + 直接帧协议）
 //!
 //! create（同一窗口协议）：
 //!
@@ -25,8 +25,7 @@
 //!
 //! 本组件把 `*out_state` 指向**上报区**（`args + REPORT_OFF`）；Core 把它记成
 //! 实例的 opaque state，并在每次 service dispatch 时作为第一个参数交回。上报区
-//! 与邮箱（Core 拥有的另一个页）都在本实例的私有 AS 里，Core 从自己的 backing
-//! 视图读回并断言。
+//! 在实例窗口内（本实例的私有 AS 里），Core 从自己的 backing 视图读回并断言。
 //!
 //! service dispatch（Core 经跨 AS trampoline 交付 `a0..a3`）：
 //!
@@ -34,20 +33,21 @@
 //! a0 = instance_state（= 上报区地址，本组件自己写的）
 //! a1 = port（Core 从 endpoint 记录解析）
 //! a2 = method（caller 的标量参数）
-//! a3 = frame（**实例域内**的 KcompCallFrame 描述符；args/input/output 也都是
-//!      实例域内的邮箱 VA——caller 的缓冲在另一个 AS 里，本组件看不见）
+//! a3 = frame（caller 的 KcompCallFrame 描述符地址；caller 是 KernelNative，
+//!      运行在共享 Core AS 里，共享 Core 映射让该帧与 args/input/output 三个
+//!      caller 缓冲在 provider 的 AS 里 same VA → same PA **直接有效**——
+//!      没有拷贝、没有中间页，本组件原地读写 caller 缓冲）
 //! ```
 //!
-//! dispatcher 把观察值写进上报区，ArchTest 从 Core 视图读回：它证明扁平帧真的
-//! 被**拷贝**过边界（provider 看到的三个指针都在邮箱页内、内容等于 caller 的
-//! 负载）、`port` / `method` / `state` / `tp` / `satp` 正确、并且它确实跑在私有
-//! AS 里。
+//! dispatcher 把观察值写进上报区，ArchTest 从 Core 视图读回：它证明扁平帧
+//! **直接**交付（provider 看到的指针就是 caller 的地址、内容原地可读）、
+//! `port` / `method` / `state` / `tp` / `satp` 正确、并且它确实跑在私有 AS 里。
 //!
 //! # 故障注入
 //!
 //! `method == METHOD_FAULT` 时：把 args 的前 `usize` 字节当作目标地址
-//! `read_volatile` ——ArchTest 传的是 **caller 域内**的地址，在私有 AS 里必然
-//! 缺页（scause 13）。Core 的 普通 trap 路径的故障分派把它收敛成 `Outcome::Faulted`
+//! `read_volatile` ——ArchTest 传的是**未映射 VA**，在私有 AS 里必然缺页
+//! （scause 13）。Core 的 普通 trap 路径的故障分派把它收敛成 `Outcome::Faulted`
 //! （provider 逻辑死亡 + 清理），caller 拿到类型化错误。若访问**没有** fault
 //! （机制失效），dispatcher 记录读到的值并返回 `STATUS_FAULT_NOT_TAKEN`，让
 //! ArchTest 显式失败。
@@ -108,7 +108,7 @@ const DESTROY_MAGIC: usize = 0x4445_5354; // "DEST"
 pub const PORT_EXPECTED: u32 = 0x1001;
 /// echo：`output[i] = input[i % input_len] ^ ECHO_XOR`（input 为空时填 ECHO_FILL）。
 pub const METHOD_ECHO: u32 = 0x2001;
-/// 故障注入：读 args[0..usize] 给出的地址（caller 域内，本 AS 不可达）。
+/// 故障注入：读 args[0..usize] 给出的地址（ArchTest 传未映射 VA）。
 pub const METHOD_FAULT: u32 = 0x2002;
 
 const ECHO_XOR: u8 = 0x5A;
@@ -191,8 +191,8 @@ pub extern "C" fn kcomp_service_dispatch(
         return STATUS_BAD_PORT;
     }
     let slots = state as *mut usize;
-    // SAFETY: frame 是 Core 写进本实例邮箱的描述符（本 AS 内可读）；三个负载区
-    // 也都在邮箱页内。所有访问都在本实例的私有 AS 里。
+    // SAFETY: frame 是 caller 的共享 Core 描述符（本 AS 内 same VA → same PA
+    // 可读）；args / input / output 也是 caller 的缓冲地址，同样直接可读。
     let frame = unsafe { &*frame };
     // SAFETY: 上报区在实例窗口内（Core 预置）；槽号与 ArchTest 一致。
     unsafe {
@@ -239,8 +239,8 @@ pub extern "C" fn kcomp_service_dispatch(
     }
     match method {
         METHOD_ECHO => {
-            // SAFETY: output 区在邮箱页内、长度 = caller 声明的 output_len
-            // （Core 已按容量拒绝超长帧）。
+            // SAFETY: output 缓冲是 caller 的地址（共享 Core 映射，本 AS 内
+            // 直接可写）、长度 = caller 声明的 output_len。
             unsafe {
                 for index in 0..frame.output_len {
                     let byte = if frame.input_len == 0 {
@@ -254,7 +254,7 @@ pub extern "C" fn kcomp_service_dispatch(
             STATUS_OK
         }
         METHOD_FAULT => {
-            // SAFETY: 故意访问 caller 域内的地址——在私有 AS 里必须缺页。
+            // SAFETY: 故意访问未映射地址——在私有 AS 里必须缺页。
             let target = unsafe { (frame.args as *const usize).read_volatile() };
             // SAFETY: 上报槽（实例窗口内）。
             unsafe {
@@ -278,8 +278,9 @@ pub extern "C" fn kcomp_service_dispatch(
 pub static kcomp_abi: u64 = 0x4B43_4F4D_5041_4249;
 
 /// 组件私有 panic handler：本夹具没有 panic 源，存在只为满足链接前提，且
-/// **刻意不引 `kcore_*`**（空 import 包络）。panic = 自旋（Isolated 组件没有
-/// panic-escape import 面；故障 containment 走 普通 Core trap 路径）。
+/// **刻意不引 `kcore_*`**（本夹具不需要 import 白名单里的任何一项）。
+/// panic = 自旋（Isolated 组件没有普通的 Core panic 面；故障 containment 走
+/// 普通 Core trap 路径；`kcore_panic_escape` 本夹具未使用）。
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop {

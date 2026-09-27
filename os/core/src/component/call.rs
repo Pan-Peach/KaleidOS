@@ -13,9 +13,10 @@
 //!   caller 拿到 [`CallError::ProviderFailed`] 且 task 存活（绝不为 caller
 //!   `abort_current_task`）。
 //! - **IsolatedNative provider** → [`isolated_lifecycle::dispatch_service`]：caller
-//!   的 `args` / `input` 拷贝进 Core 拥有的**邮箱页**（只映射在 provider 私有
-//!   AS），provider 得到邮箱内的实例域 VA，output 由 Core 拷回 caller 缓冲；容量
-//!   固定，超长显式 [`CallError::FrameTooLarge`]（`EMSGSIZE`），**绝不截断**。
+//!   是 KernelNative，运行在共享 Core AS 里；共享 Core 映射让 caller 的
+//!   `KcompCallFrame` 与三个负载缓冲在 provider 的私有 AS 里**直接有效**
+//!   （same VA → same PA），因此描述符指针原样交给 dispatcher，provider 原地
+//!   读写 caller 缓冲——没有拷贝、没有中间页。
 //!   执行边界同形（provider principal / caller-task provenance / re-entry / 调度
 //!   门禁），真正的切换是跨 AS trampoline 的 `satp`；provider trap →
 //!   `Outcome::Faulted` → provider 逻辑死亡 + AS 退役 + 窗口归还。
@@ -123,9 +124,6 @@ pub enum CallError {
     /// 与 IsolatedNative 有；SandboxedNative provider 未实现）→ `ENOTSUP`。
     /// 绝不静默降级成同域调用。
     UnsupportedProviderDomain,
-    /// 扁平调用帧超过跨 AS 传输的邮箱容量（`isolated_mailbox`）：显式拒绝 →
-    /// `EMSGSIZE`——**绝不截断**，provider 从未执行。
-    FrameTooLarge,
 }
 
 impl From<EndpointError> for CallError {
@@ -324,8 +322,8 @@ fn dispatch(
             );
             complete_call(target.provider, outcome, out_status)
         }
-        // 跨 AS：provider 在自己的私有 AS 里经跨 AS trampoline 执行；帧被拷贝进
-        // Core 拥有的邮箱，绝不共享。
+        // 跨 AS：provider 在自己的私有 AS 里经跨 AS trampoline 执行；caller 帧在
+        // 共享 Core 映射里 same VA → same PA，provider 原地读写（无拷贝）。
         ExecutionDomain::IsolatedNative => isolated_lifecycle::dispatch_service(
             target.provider,
             id,
@@ -1407,7 +1405,7 @@ mod tests {
     /// host / 无 backend 构建显式拒绝（`UnsupportedProviderDomain` → ENOTSUP），
     /// **绝不**在共享内核 AS 里替它执行 dispatcher，也不泄漏 inflight / out_status。
     ///
-    /// 真实的跨 AS 执行（邮箱拷贝 + trampoline + 故障 containment）由 QEMU ArchTest
+    /// 真实的跨 AS 执行（caller 帧直接交付 + trampoline + 故障 containment）由 QEMU ArchTest
     /// `isolated-service*` 用真实 `.kcomp` 证明。
     #[test]
     fn isolated_provider_is_rejected_on_a_build_without_a_private_address_space() {
@@ -1447,53 +1445,6 @@ mod tests {
         );
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
         assert_eq!(out_status, 0, "失败调用不写 out_status");
-
-        containment::enter_anchor();
-    }
-
-    /// 验收（host 面）：超过邮箱容量的扁平帧在**任何拷贝 / 派发之前**显式拒绝
-    /// （`FrameTooLarge` → EMSGSIZE），绝不截断；inflight 归还、provider 从未执行。
-    #[test]
-    fn oversized_frame_is_rejected_before_any_dispatch() {
-        let _serial = containment::test_boundary_lock();
-        let _heap = crate::memory::test_support::GUARD.lock();
-        crate::memory::test_support::ensure_init();
-        let provider = ready_provider_in_domain(
-            b"call_isolated_oversize_provider",
-            Some(dispatch_counting as *const () as usize),
-            core::ptr::null_mut(),
-            ExecutionDomain::IsolatedNative,
-        );
-        let endpoint = publish(provider, b"svc.isolated.oversize");
-        enter_caller(52);
-        let before = DISPATCH_CALLS.load(Ordering::SeqCst);
-        let mut out_status = 0i32;
-        let args = [0u8; crate::component::isolated_mailbox::ARGS_MAX + 1];
-        let mut output = [0u8; 1];
-
-        let error = endpoint_call(
-            endpoint,
-            0,
-            args.as_ptr(),
-            args.len(),
-            core::ptr::null(),
-            0,
-            output.as_mut_ptr(),
-            output.len(),
-            &mut out_status,
-        )
-        .unwrap_err();
-
-        assert_eq!(error, CallError::FrameTooLarge);
-        assert_eq!(Errno::from(error), Errno::EMSGSIZE);
-        assert_eq!(
-            DISPATCH_CALLS.load(Ordering::SeqCst),
-            before,
-            "超长帧绝不派发"
-        );
-        assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
-        assert_eq!(out_status, 0, "失败调用不写 out_status");
-        assert_eq!(output, [0u8; 1], "拒绝的调用不触碰 caller 缓冲");
 
         containment::enter_anchor();
     }

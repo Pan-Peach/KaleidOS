@@ -293,7 +293,7 @@ fn create_kernel_native(
 /// 1. **平台能力**：当前 profile 必须有私有地址空间 backend（NoMMU / 无后端 → 拒绝）；
 /// 2. **import 白名单**：不得含未支持的 `kcore_*` / 具名 UNDEF 符号
 ///    （见 [`validate_isolated_load`]）；
-/// 3. 私有 AS + 按域放段 + Core 预置窗口（栈 / 实例窗口 / 邮箱）；
+/// 3. 私有 AS + 按域放段 + Core 预置窗口（栈 / 实例窗口）；
 /// 4. `kcomp_instance_create` 在私有 AS 内经跨 AS trampoline 执行 → `Ready`；
 ///    任一步失败 = 退役 AS + 归还窗口 backing + `Failed`（半成品不留）。
 fn create_isolated_native(

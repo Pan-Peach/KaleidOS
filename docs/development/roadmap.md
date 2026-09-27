@@ -25,7 +25,7 @@ Component Endpoint Registry：ContractId / InterfaceAbi（exact fingerprint）/ 
   Core propose→validate→commit（RR 交替）→ yield/exit；core_test 端到端自检全 PASS
 组件 panic containment（init / task 边界，协作式）：独立 Core 栈 + stack-switch 回 Core，
   标记 Failed 后重调度；panic=abort、无 unwinding、不承诺内存回收
-受限 IsolatedNative：私有 AS + **共享 Core 映射** + 最小跨 AS trampoline + 按域放段 + **支持面 import（诊断 / 只读 + panic escape）** + Core 预置窗口 / 邮箱 +
+受限 IsolatedNative：私有 AS + **共享 Core 映射** + 最小跨 AS trampoline + 按域放段 + **支持面 import（诊断 / 只读 + panic escape）** + Core 预置窗口 +
   KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU 证明）；
   仍缺 ASID / U-mode / ecall / 出站 Isolated 调用 / 更宽的按域 import 面（支持面已落地；见 deployment.md §7/§10）
 测试体系：make check（fmt/clippy/host 单测/构建）、make test-host、make test-qemu（boot smoke +

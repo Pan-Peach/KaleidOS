@@ -4,7 +4,7 @@
 //! 它**只**做机制：保存 / 恢复调用者的同步 ABI 现场（`ra/sp/gp/tp/s0-s11` +
 //! `sstatus` + `satp`）、按需切 `satp` + 全量 `sfence.vma`、装目标栈 / `tp`、
 //! 交付入口参数 `a0..a3`、收集返回值。它**不**知道 endpoint / service /
-//! lifecycle / mailbox / registry，也没有 trap 帧、相位机、故障策略或 `stvec`
+//! lifecycle / registry，也没有 trap 帧、相位机、故障策略或 `stvec`
 //! 切换：Core 代码 / 栈 / 全局状态在每个 Isolated AS 里 same VA → same PA
 //! （`memory/kernel_mappings.rs`），因此 `stvec` 保持 `trap::vector_address()`
 //! 不变、trap 走**普通** Core trap 路径。

@@ -208,11 +208,9 @@ pub fn run(info: &MachineInfo) -> ! {
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fault" => isolated_tests::isolated_lifecycle_fault(),
         // KernelNative caller → Isolated provider 的跨域 service Gate
-        // （扁平帧拷贝 + 邮箱 + 跨 AS trampoline；容量拒绝 + 故障 containment）。
+        // （caller 帧直接交付 + 跨 AS trampoline；故障 containment）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service" => isolated_tests::isolated_service(),
-        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
-        b"isolated-service-limits" => isolated_tests::isolated_service_limits(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-service-fault" => isolated_tests::isolated_service_fault(),
         // 失败 / 重启矩阵（每个阶段失败的不变量 + stale 访问阻断 +
