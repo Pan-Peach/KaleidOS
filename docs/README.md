@@ -31,7 +31,6 @@ docs/
 ├── development/               怎么在上面干活
 │   ├── testing.md
 │   ├── benchmark.md
-│   ├── roadmap.md
 │   └── docs-guide.md
 └── notes/                     历史与归档：非权威，不代表现状
     ├── resource-model-review.md
@@ -67,7 +66,7 @@ docs/
 | 每个模块的真实行为与代码位置 | `modules/` | 描述现状；不确定就写"未实现/目标"，不臆造 |
 | 测试策略 | `development/testing.md` | —— |
 | 性能基准 | `development/benchmark.md` | —— |
-| 里程碑与进度 | `development/roadmap.md` | 现状快照会随时间变化 |
+| 里程碑与进度 | `STATUS.md`（仓库根） | 状态与计划的单一入口；现状快照会随时间变化 |
 | 参考系统借鉴 | `philosophy/references.md` | 设计阅读清单 |
 
 > **`notes/` 不参与权威判定。** 其中 `resource-model-review.md` 是对**已删除的**旧 Handle/Slot/authority 模型的审查记录，其中所有 `Handle` / `Lease` / `authority` 词汇**均属废弃模型**；`arch-context.md` 是归档的开源调研。需要理解现状请走 `architecture/`。

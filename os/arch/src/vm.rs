@@ -54,7 +54,7 @@ pub trait AddressSpaceBackend {
     /// trait，但 `VA == PA`、无页表、无 satp——无法承载 Isolated 域，声明
     /// `false`。Core 的部署/装载路径据此**显式拒绝**（绝不把 NoMMU 当私有 AS
     /// 用）。除了"私有 AS 存在"，本常量**不**表达任何安全承诺：S-mode 换页表
-    /// 是协作式、非对抗边界（见 `docs/development/roadmap.md` §10.1）。
+    /// 是协作式、非对抗边界（见 `STATUS.md` 3.16 与 `docs/architecture/driver-model.md`）。
     const PRIVATE_ADDRESS_SPACE: bool;
 
     /// 切换汇编所需的原始数据：由 backend 打包，Core **只搬运、不解释**。

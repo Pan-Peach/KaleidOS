@@ -21,7 +21,7 @@
 
 | 拒绝项 | 原因 |
 |---|---|
-| syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 仍未实现；执行域是进行中的里程碑（`docs/development/roadmap.md`），私有 AS / 域切换的受限版本见下表后的更新 |
+| syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 仍未实现；执行域是进行中的里程碑（`STATUS.md`），私有 AS / 域切换的受限版本见下表后的更新 |
 | 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
 | 通用资源转移/授予图、ResourceDomain 容器、per-instance 字节计费/配额、Core 侧内存账本（region owner / region id / Retired 表） | 违反 `AGENTS.md`；所有权转移是推迟项；Core 不做内存记账，见 `docs/architecture/memory-and-heap.md` |
 | 跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | 每次 instantiate 已独立放段 / 重定位自己的 `.data` / `.bss`；text 去重是**未来 loader / MM 优化**，不是组件语义（见 §9），本轮不为此改造 |

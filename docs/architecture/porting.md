@@ -310,4 +310,4 @@ components/
 - `docs/architecture/component-model.md`：`.kcomp` 是语言无关组件程序、third-party crate 是组件私有实现（§2.2、§2.3）；
 - `docs/interfaces/README.md`：ABI / 接口契约的归属与导航；
 - `docs/modules/components.md`：SDK、C 运行时、`.kcomp` 流水线现状；
-- `docs/development/roadmap.md`：移植能力（porting）作为**方向**的登记处。
+- `STATUS.md`（仓库根）第 8 节：移植能力（porting）作为**方向**的登记处（上层能力地图 + 可复用组件目录）。

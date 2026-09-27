@@ -119,5 +119,5 @@ make olddefconfig               # 用新默认值刷新 .config
 | `docs/modules/README.md` | 模块地图：每个 Core 模块 owns 什么真相、代码在哪 |
 | `docs/development/testing.md` | 测试策略（host test / CoreTest / trace） |
 | `docs/development/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
-| `docs/development/roadmap.md` | 路线图（M0–M4 与后续方向） |
+| `STATUS.md`（仓库根） | 状态与计划：现状快照 + 里程碑 + 路线图（单一入口） |
 | `docs/philosophy/references.md` | 参考资料与借鉴方向 |

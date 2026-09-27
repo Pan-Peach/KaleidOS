@@ -21,7 +21,7 @@
 - **不认识 SBI / CLINT 细节**：走 `arch::TimerImpl` backend。
 - 在协作式 profile 下**不自动产生周期 tick**。
 - 无 per-component `TimerHandle`。
-- 抢占尚未完成：`sched::on_timer_tick` 仍是 `todo!`（C5 未落地，见 `docs/development/roadmap.md`）。
+- 抢占尚未完成：`sched::on_timer_tick` 仍是 `todo!`（C5 未落地，见 `STATUS.md` 3.6）。
 
 ## 代码在哪
 

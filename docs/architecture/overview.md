@@ -187,7 +187,7 @@ OpenSBI → kaleidos.elf
 ```
 
 - **Resource Core 不依赖具体 ISA 实现和 Discovery backend**（core-lib 只依赖 `os/arch` 的稳定 contract，不依赖 fdt；bootstrap 负责组合具体实现）；
-- **Bootstrap 与 Core 职责分离、装载合一**——两者都只在启动时加载一次、永不热替换，所以链接成一个 `kaleidos.elf`（职责边界 ≠ 装载边界；单镜像 + 高半区问题由链接脚本两段 + 页表双映射解决，Linux 同款，见 roadmap）；
+- **Bootstrap 与 Core 职责分离、装载合一**——两者都只在启动时加载一次、永不热替换，所以链接成一个 `kaleidos.elf`（职责边界 ≠ 装载边界；单镜像 + 高半区问题由链接脚本两段 + 页表双映射解决，Linux 同款，见 `STATUS.md`）；
 - **Component 才需要独立装载边界**（`.kcomp` = ELF 可重定位文件 + 符号表，Linux `.ko` 模式）；打包用 **cpio 归档**（`initramfs` 模式）而非自定义二进制格式；manifest 是纯文本（`modules.dep` 模式）；
 - **Cargo 依赖图 ≠ Component 图**：Cargo 边是编译期构建关系，运行时组件组合由 Component Manager 决定——组件热替换是 KaleidOS 的核心目标，但只在组件层（bootstrap/core 不做）。
 
@@ -384,5 +384,5 @@ Scheduler（Component）         Core
 - `component-model.md`：组件的完整模型（生命周期、关系、替换）；
 - `driver-model.md`：驱动 / device claim / 执行域 / teardown 安全的设计契约；
 - `testing.md`：如何保证 Core 可信；
-- `roadmap.md`：按里程碑怎么一步步长出来；
+- `STATUS.md`（仓库根）：状态与计划（里程碑、依赖链、路线图）；
 - `references.md`：每个参考系统借鉴什么、怎么用。

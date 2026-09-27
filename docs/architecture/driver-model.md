@@ -1,6 +1,6 @@
 # 驱动与执行域模型（driver-model.md）
 
-> 本文件是**驱动 / 设备认领 / 执行域 / IRQ 与 DMA 机制**的设计契约。它是设计文档，不是进度快照——哪些已落地见 `roadmap.md`。与 `architecture.md` / `component-model.md` 在驱动与执行域细节上冲突时，以本文件为准。
+> 本文件是**驱动 / 设备认领 / 执行域 / IRQ 与 DMA 机制**的设计契约。它是设计文档，不是进度快照——哪些已落地见 `STATUS.md`（仓库根）。与 `architecture.md` / `component-model.md` 在驱动与执行域细节上冲突时，以本文件为准。
 
 ## 1. 定位与基线
 
@@ -446,5 +446,5 @@ runtime:
 
 - `architecture.md`：分层、Core 边界、ResourceDomain / ExecutionDomain 总览；
 - `component-model.md`：组件生命周期、ResourceDomain 视图、AddressSpaceManager；
-- `roadmap.md`：执行域/隔离的里程碑位置（C10 进行中；IsolatedNative 是可选实验、非承诺里程碑）；
+- `STATUS.md`（仓库根）：执行域/隔离的里程碑位置（C10 进行中；IsolatedNative 是可选实验、非承诺里程碑）；
 - `references.md`：seL4 typed capability、Theseus 状态归属等借鉴来源（注意 KaleidOS **不**实现 capability 系统，只借用"资源真相在 Core"的思想）。
