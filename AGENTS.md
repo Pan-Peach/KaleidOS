@@ -32,7 +32,7 @@ KaleidOS —— 组件化、多架构操作系统，面向学习、实验与个�
 - **test-only fixture / 组件一律放 `os/components/tests/`**；`os/components/` 根只留生产组件与 SDK（`.kcomp` 名取目录 basename，故移动路径不改组件名）。
 - **外部依赖一律用 git submodule**（放 `third_party/`；克隆后先 `git submodule update --init --recursive`），不要本地 vendored 一份拷贝。
 - **构建配置以 `.config` 为唯一真相。** 配置走 Kconfig：`Kconfig` → `.config` → 生成 Make 片段（`scripts/kconfig/genmk.py`，唯一的 config→build 映射）→ Cargo features（**只是内部传输机制**）。不要手工同步各 crate 的 Cargo features，也不要让某个 crate 自己决定 profile；`#[cfg]`/`compile_error!` 是不变式与防御，不是配置来源。详见 `docs/architecture/kconfig.md`。
-- **Core 与硬件无关的 truth logic 必须 host-testable。** Core 与 Arch/硬件 的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）走 QEMU/CoreTest/真机验证；若某段 Core 逻辑只能整机测，先怀疑 Arch 耦合。CoreTest 无 god-mode，只能走真实 Core API（最多只读 `TestInspector`）。
+- **Core 与硬件无关的 truth logic 必须 host-testable。** Core 与 Arch/硬件 的真实契约（寄存器保存、页表生效、IRQ/timer 实际触发等）走 QEMU/CoreTest/真机验证；若某段 Core 逻辑只能整机测，先怀疑 Arch 耦合。CoreTest 无 god-mode，只能走真实 Core API。
 - **Wasm 只是未来 Component 的执行后端之一，永远不是整个内核。** Core/Arch 保持 native Rust。
 
 ## 维护本文件的规则

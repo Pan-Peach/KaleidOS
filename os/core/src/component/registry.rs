@@ -318,7 +318,7 @@ pub fn get_registry() -> &'static Mutex<Registry> {
 }
 
 /// 测试专用：伪造一份已加载组件与声明辅助。**不分配 backing**（`memory` 为
-/// `None`）——纯逻辑用例（状态机 / endpoint / inspector 投影）不需要真实 lease；
+/// `None`）——纯逻辑用例（状态机 / endpoint）不需要真实 lease；
 /// 需要真实 backing 的用例走生产 loader 或自行 `alloc_region`。
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -357,19 +357,6 @@ pub(crate) mod test_support {
             abi: KCOMP_ABI,
             memory: Some(lease),
         }
-    }
-
-    /// 在**全局** registry 声明一个测试组件并返回 id。
-    pub(crate) fn declare_test_component(
-        name: &[u8],
-        destroy: usize,
-        service_dispatch: Option<usize>,
-        domain: ExecutionDomain,
-    ) -> ComponentId {
-        get_registry()
-            .lock()
-            .declare(name, test_loaded(destroy, service_dispatch), domain)
-            .unwrap()
     }
 }
 

@@ -729,7 +729,7 @@ mod tests {
     //
     // 守卫分析：**所有会改动全局任务表的测试都持有 `memory::test_support::GUARD`**
     // （task/mod.rs 与本文件的 setup、sched.rs 绝大多数用例、exit.rs / failure.rs /
-    // inspector.rs 的 setup、export.rs 的合格用例——见各文件）。本用例主线程在
+    // export.rs 的合格用例——见各文件）。本用例主线程在
     // spawn 之前就取下同一把 GUARD（外加 `ensure_init`），把其它测试整体排除；
     // worker 线程绝不再取 GUARD（否则与主线程自锁），互斥交给 Core 自己的
     // `TASK_TABLE: spin::Mutex`。

@@ -18,7 +18,7 @@ use std::sync::Once;
 
 /// 测试互斥：同一时间只允许一个使用全局堆的测试执行。
 ///
-/// rank = MEMORY（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+/// rank = MEMORY（规范顺序 `SCHED → LOAD → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
 /// [`crate::test_support`]）。
 pub(crate) static GUARD: TestLock = TestLock::new(Rank::Memory);
 

@@ -591,6 +591,11 @@ mod tests {
 
     #[test]
     fn rejects_abi_mismatch() {
+        // 放段会在读 ABI 之前分配 backing（即使随后拒绝）：与其它 buddy heap
+        // 用例串行（见 memory::test_support）。
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
         // Given：定位 `kcomp_abi` 在 **ELF 文件**里的字节（section 文件偏移 + st_value）。
         let object = ElfObject::parse(SMOKE_KCOMP).expect("parse");
         let symtab = object.symbol_table_index().unwrap();
@@ -610,6 +615,10 @@ mod tests {
 
     #[test]
     fn rejects_unknown_symbol() {
+        // 重定位失败发生在放段分配之后：必须与其它 buddy heap 用例串行。
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
         let mut patched = SMOKE_KCOMP.to_vec();
         let name = b"kcore_console_write_byte";
         let pos = patched
@@ -622,6 +631,10 @@ mod tests {
 
     #[test]
     fn rejects_component_to_component_flat_symbol() {
+        // 重定位失败发生在放段分配之后：必须与其它 buddy heap 用例串行。
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
         // 组件→组件 依赖禁止走 flat ELF symbol namespace（endpoint 模型定案）：
         // 即使符号名存在（core 侧有同名接口），Core 的 flat resolver 也只认
         // `kcore_*` 白名单，其他未定义符号一律 UnresolvedSymbol。

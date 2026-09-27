@@ -418,8 +418,8 @@ mod imp {
     ///    拷贝、没有中间页。provider 返回值 = **方法状态**写 `*out_status`，
     ///    传输保持 `Ok`。
     ///
-    /// provider 故障（`Outcome::Faulted`）或 Core 无法准备切换：provider 逻辑死亡
-    /// + AS 退役 + Core 预置窗口归还（与 create 失败同一套清理），caller 拿到
+    /// provider 故障（`Outcome::Faulted`）或 Core 无法准备切换：provider 逻辑死亡、
+    /// AS 退役、Core 预置窗口归还（与 create 失败同一套清理），caller 拿到
     /// [`CallError::ProviderFailed`]（EIO），**caller 的 task 存活且不变**。
     ///
     /// # 传输边界（诚实）
@@ -564,8 +564,7 @@ mod imp {
     /// `args.config` 是 Core 指针（config 负载），Core 只搬运不解释；长度超过
     /// 窗口固定区或指针 / 长度不自洽时显式拒绝，绝不截断。
     fn write_create_args(backing: usize, args: &KcompCreateArgs) -> Result<(), ComponentLoadError> {
-        let len = usize::try_from(args.config_len)
-            .map_err(|_| ComponentLoadError::IsolatedConfigRejected)?;
+        let len = args.config_len;
         if len > WINDOW_CONFIG_MAX || (len > 0 && args.config.is_null()) {
             return Err(ComponentLoadError::IsolatedConfigRejected);
         }

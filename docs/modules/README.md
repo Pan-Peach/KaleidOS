@@ -31,7 +31,6 @@
 | 模块 | 一句话 | 页面 |
 |---|---|---|
 | `trace` | 结构化事件环：`seq` / 掩码 / 固定容量 / 统计 | [`core/trace.md`](core/trace.md) |
-| `inspector` | 只读快照门面（`TestInspector`），无 god-mode | [`core/inspector.md`](core/inspector.md) |
 | `print` | 核心日志格式化；传输交给 arch `Console` | [`core/print.md`](core/print.md) |
 | `monitor` | Core Monitor 交互 shell（`core>`）：命令、行编辑 | [`core/monitor.md`](core/monitor.md) |
 

@@ -81,6 +81,15 @@ pub type AddressSpace = address_space::Sv39AddressSpace;
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 pub type AddressSpace = address_space::Sv32AddressSpace;
 
+/// Flush this hart's TLB (`sfence.vma`).
+///
+/// # Safety
+///
+/// `SFENCE.VMA` is an S-mode (or higher) instruction. The caller must run with
+/// sufficient privilege, and must have published any page-table edits this
+/// flush is meant to order (the stores happen-before the flush on this hart).
+/// The flush only covers this hart's translations; a hart that will use the
+/// updated tables must flush for itself.
 #[cfg(all(
     feature = "vm-mmu",
     any(target_arch = "riscv32", target_arch = "riscv64")
@@ -111,6 +120,17 @@ pub fn current_satp() -> usize {
 
 /// 写 satp 并 flush TLB。这是本模块唯一职责：只碰寄存器，不懂地址空间生命周期。
 /// `root_ppn` 是根页表物理页号；`asid` 是该地址空间的 ASID。
+///
+/// # Safety
+///
+/// `CSRW satp` is an S-mode (or higher) instruction, and the write takes effect
+/// immediately for this hart (after the surrounding `sfence.vma`). The caller
+/// must run with sufficient privilege and must pass the PPN of a page-aligned,
+/// valid root page table that keeps the caller's own current execution
+/// reachable (code, stack, and any memory touched after this call) — otherwise
+/// the next fetch faults. `asid` must be the ASID the root was built for and
+/// must match the surrounding address-space switching discipline (currently
+/// always 0).
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv64"))]
 pub unsafe fn activate(root_ppn: usize, asid: u16) {
     let satp = satp_value(root_ppn, asid);
@@ -127,6 +147,13 @@ pub unsafe fn activate(root_ppn: usize, asid: u16) {
 }
 
 /// Write an Sv32 `satp` value and flush stale translations.
+///
+/// # Safety
+///
+/// Same obligations as the RV64 variant: S-mode (or higher) only; `root_ppn`
+/// must reference a page-aligned, valid Sv32 root page table that keeps the
+/// caller's current execution reachable; `asid` must match the root and the
+/// surrounding address-space switching discipline (currently always 0).
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
 pub unsafe fn activate(root_ppn: usize, asid: u16) {
     let satp = satp_value(root_ppn, asid);

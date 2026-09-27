@@ -274,7 +274,7 @@ pub(crate) mod test_support {
     /// 串行化「提交全局 MachineInfo」的测试：`COMMITTED` 是进程全局，并行测试
     /// 各自 commit 一份会互相覆盖。测试很短，用自旋锁串起来即可。
     ///
-    /// rank = MACHINE（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+    /// rank = MACHINE（规范顺序 `SCHED → LOAD → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
     /// [`crate::test_support`]）。
     pub(crate) static GUARD: TestLock = TestLock::new(Rank::Machine);
 }

@@ -32,7 +32,7 @@ Host Test（宿主单测 —— 主体，日常主力）
 
 边界：
 
-- **CoreTest 无 god-mode**：只走 `kcore_*` 白名单，最多一个只读 `TestInspector`；**不得**修改 Core 私有状态。CoreTest 只断言 Core 自己报告的返回值 / 状态编码 / trace 事件。
+- **CoreTest 无 god-mode**：只走 `kcore_*` 白名单；**不得**修改 Core 私有状态。CoreTest 只断言 Core 自己报告的返回值 / 状态编码 / trace 事件。
 - **平台白盒事实属于 ArchTest**（QEMU virt 的 PLIC 线号、S-mode context 公式、控制器 enable bit 布局与读回）——同一事实只在一个层次证明。
 - **host fake 上下文后端不执行组件入口体**，只覆盖边界记账；任何"已隔离 / 已跨域"的结论必须由 QEMU / 真机的真实页表与特权级切换证明。
 - Trace 断言强度是**"操作 → 事件"**：操作前取游标（`kcore_trace_stats.next_seq`）→ 执行**一个**受控 Core 操作 → 用该操作返回的 id 精确匹配载荷；不用"有类似事件"。
@@ -55,7 +55,7 @@ make test-qemu    boot smoke + 加载 core_test 并判定 [core-test] all: PASS
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```
 
-观察面：结构化 trace ring（`TraceEvent`，固定容量、无分配、`seq` 单调；`kcore_trace_stats` 只读）+ `inspector::Inspector` 只读快照。host 测试的 ring 是**线程本地替身**，不覆盖生产的锁 / 并发语义（SMP 行为由 QEMU / 真机承担）。
+观察面：结构化 trace ring（`TraceEvent`，固定容量、无分配、`seq` 单调；`kcore_trace_stats` 只读）。host 测试的 ring 是**线程本地替身**，不覆盖生产的锁 / 并发语义（SMP 行为由 QEMU / 真机承担）。
 
 ## 5. 新增功能测试纪律
 

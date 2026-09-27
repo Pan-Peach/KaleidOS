@@ -28,7 +28,6 @@ pub mod bench;
 pub mod component;
 pub mod errno;
 pub mod generated;
-pub mod inspector;
 pub mod irq;
 pub mod machine;
 pub mod memory;

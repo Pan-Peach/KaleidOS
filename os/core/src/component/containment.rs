@@ -1302,7 +1302,7 @@ fn halt() -> ! {
 
 /// Serializes tests that mutate the process-global active boundary.
 ///
-/// rank = BOUNDARY（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+/// rank = BOUNDARY（规范顺序 `SCHED → LOAD → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
 /// [`crate::test_support`]）。
 #[cfg(test)]
 static TEST_BOUNDARY_LOCK: crate::test_support::TestLock =

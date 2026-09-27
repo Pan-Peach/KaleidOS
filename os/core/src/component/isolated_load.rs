@@ -655,12 +655,6 @@ mod tests {
     /// 放段失败夹具（17 MiB `.bss` 超出实例窗口）。
     const BAD_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_bad.kcomp"));
 
-    fn place_fixture() -> PlacedImage {
-        let _guard = test_support::GUARD.lock();
-        test_support::ensure_init();
-        place(ISOLATED_KCOMP).expect("kcomp_isolated must place")
-    }
-
     fn in_range(segment: &PlacedSegment, address: usize) -> bool {
         address >= segment.virtual_range.base
             && address < segment.virtual_range.base + segment.virtual_range.size
@@ -669,7 +663,11 @@ mod tests {
     /// 真实夹具：段按权限分类放段，每段独占页范围（页级权限分离）。
     #[test]
     fn places_fixture_with_page_separated_permissions() {
-        let image = place_fixture();
+        // 放段分配 backing，且 image 在用例结束时才释放：GUARD 必须覆盖整个
+        // 用例（不能只在 helper 内取锁后把 lease 带出来）。
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let image = place(ISOLATED_KCOMP).expect("kcomp_isolated must place");
         assert_eq!(image.base(), ISOLATED_IMAGE_BASE);
         assert_eq!(image.abi(), KCOMP_ABI, "kcomp_abi 必须逐位等于 Core 指纹");
         assert_eq!(image.text_size() % PAGE, 0);
@@ -888,6 +886,11 @@ mod tests {
     /// `kcomp_abi` 值被改 → AbiMismatch（与 KernelNative loader 同一校验）。
     #[test]
     fn rejects_abi_mismatch() {
+        // 放段会在读 ABI 之前分配 backing（即使随后拒绝）：与其它 buddy heap
+        // 用例串行（见 memory::test_support）。
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+
         let object = ElfObject::parse(ISOLATED_KCOMP).expect("parse fixture");
         let symtab = object.symbol_table_index().expect("symtab");
         let (shndx, value) = loader::symbol_offset(&object, symtab, b"kcomp_abi", STT_OBJECT)
@@ -1037,7 +1040,10 @@ mod tests {
     /// 没有私有 AS 能力（host / NoMMU）→ `map_into` 显式拒绝，绝不静默落映射。
     #[test]
     fn map_into_rejects_profiles_without_private_address_space() {
-        let image = place_fixture();
+        // image 在用例结束时释放：GUARD 必须覆盖整个用例。
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let image = place(ISOLATED_KCOMP).expect("kcomp_isolated must place");
         let handle = AddressSpaceHandle::from_raw(1, 1);
         assert_eq!(
             map_into(handle, &image),

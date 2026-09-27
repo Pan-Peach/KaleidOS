@@ -1,6 +1,6 @@
 //! ring 的 host 测试：游标边界、覆盖缺口、锁外 visitor（可 emit / 查 stats）。
 //!
-//! 全局 ring 是单例，测试必须串行（与 Inspector 的读侧测试共用同一把锁）。
+//! 全局 ring 是单例，测试必须串行。
 
 use super::*;
 use crate::component::ComponentId;

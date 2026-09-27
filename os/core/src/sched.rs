@@ -1413,6 +1413,8 @@ mod tests {
     fn yield_and_exit_without_current_task_are_rejected() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
+        // `init_world` 会释放上一个用例遗留的策略执行栈（全局堆）：持 memory GUARD。
+        let _heap = crate::memory::test_support::GUARD.lock();
         init_world();
 
         assert_eq!(current_task(), None);
@@ -1428,6 +1430,8 @@ mod tests {
     fn scheduler_operations_are_rejected_in_irq_context() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
+        // `init_world` 会释放上一个用例遗留的策略执行栈（全局堆）：持 memory GUARD。
+        let _heap = crate::memory::test_support::GUARD.lock();
         init_world();
 
         containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
@@ -1455,6 +1459,8 @@ mod tests {
     fn scheduler_operations_are_rejected_under_a_service_call_ancestor() {
         let _sched = SCHED_TEST_LOCK.lock();
         let _boundary = containment::test_boundary_lock();
+        // `init_world` 会释放上一个用例遗留的策略执行栈（全局堆）：持 memory GUARD。
+        let _heap = crate::memory::test_support::GUARD.lock();
         init_world();
 
         containment::with_test_service_boundary(
@@ -1587,6 +1593,8 @@ mod tests {
         // `init_world` 回到锚点边界（`enter_anchor` 写进程全局 `ACTIVE_GUARD`），
         // 必须持 BOUNDARY 锁。
         let _boundary = containment::test_boundary_lock();
+        // `init_world` 还会释放上一个用例遗留的策略执行栈（全局堆）：持 memory GUARD。
+        let _heap = crate::memory::test_support::GUARD.lock();
         init_world();
 
         assert!(!owner_still_runnable(TaskId::from_raw(0x0BAD_F00D)));

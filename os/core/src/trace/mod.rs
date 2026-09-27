@@ -11,7 +11,7 @@
 //! 不允许静默丢事件导致断言误导。
 //!
 //! 第一阶段只实现一条链：
-//! `Core event producer → fixed-size TraceRing → Inspector / Benchmark / CoreTest reader`。
+//! `Core event producer → fixed-size TraceRing → Benchmark / CoreTest reader`。
 //! 运行时过滤是最小的 11 位事件使能掩码（Core 管理路径 / Monitor 控制，见
 //! [`ring`]）；不做动态订阅系统、filter engine、磁盘 trace、用户态 daemon。
 //! ring 容量由 Kconfig `TRACE_CAPACITY` 决定（见 [`capacity`]）。
@@ -20,7 +20,7 @@
 //! - [`event`]：事件类型与 payload（[`TraceEvent`]）。
 //! - [`ring`]：固定容量环形缓冲与读写语义（[`emit`] / [`visit_since`]）。
 //!
-//! 用法（Core 内部 chokepoint 生产 → 测试 / Inspector 消费）：
+//! 用法（Core 内部 chokepoint 生产 → 测试消费）：
 //! ```ignore
 //! trace::emit(TraceEvent::ComponentState { component, from, to });
 //! trace::visit_since(0, |record| { /* 断言 record.event */ });
@@ -52,9 +52,9 @@ pub(crate) mod test_support {
     use super::TraceEvent;
     use crate::test_support::{Rank, TestLock};
 
-    /// 串行化会 `clear()` / 需要独占读窗口的测试（ring 自身与 Inspector 读侧）。
+    /// 串行化会 `clear()` / 需要独占读窗口的测试（ring 自身）。
     ///
-    /// rank = TRACE（规范顺序 `SCHED → LOAD → INSPECTOR → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
+    /// rank = TRACE（规范顺序 `SCHED → LOAD → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
     /// [`crate::test_support`]）。
     pub(crate) static GUARD: TestLock = TestLock::new(Rank::Trace);
 

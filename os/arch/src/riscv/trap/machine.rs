@@ -35,8 +35,13 @@ unsafe fn set_trap_vector() {
     }
 }
 
+/// # Safety
+///
+/// 仅供汇编 trap 向量（`machine64.S` / `machine32.S`）调用：`trap_frame` 必须
+/// 指向一个已完整保存、调用期间独占且保持有效的 `TrapFrame`（trap 栈上的现场），
+/// 且 CPU 处于该现场对应的 trap 上下文。Rust 侧不得直接调用本入口。
 #[unsafe(no_mangle)]
-pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_mcause: usize, mtval: usize) {
+pub unsafe extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_mcause: usize, mtval: usize) {
     let mcause = Scause::from_bits(raw_mcause);
     let trap = mcause.cause();
     let mepc = unsafe { (*trap_frame).epc };

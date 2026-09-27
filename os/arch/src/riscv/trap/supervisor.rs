@@ -64,8 +64,14 @@ fn set_scratch(value: usize) {
 ///
 /// `SupervisorTimer` / `SupervisorExternal` 分发给 Core 注册的 handler；
 /// 未注册的 handler 是 Core 不变式破坏（handler 内显式 panic）。
+///
+/// # Safety
+///
+/// 仅供汇编 trap 向量（`trap64.S` / `trap32.S`）调用：`trap_frame` 必须指向
+/// 一个已完整保存、调用期间独占且保持有效的 `TrapFrame`（trap 栈上的现场），
+/// 且 CPU 处于该现场对应的 trap 上下文。Rust 侧不得直接调用本入口。
 #[unsafe(no_mangle)]
-pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, stval: usize) {
+pub unsafe extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, stval: usize) {
     let scause = Scause::from_bits(raw_scause);
     let trap = scause.cause();
     let sepc = unsafe { (*trap_frame).epc };

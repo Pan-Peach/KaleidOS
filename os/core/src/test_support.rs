@@ -15,13 +15,13 @@
 //! # 规范获取顺序（严格递增）
 //!
 //! ```text
-//! SCHED(-5) → LOAD(-4) → INSPECTOR(-3) → IRQ(-2) → TIMER(-1)
+//! SCHED(-4) → LOAD(-3) → IRQ(-2) → TIMER(-1)
 //!   → BOUNDARY(0) → MACHINE(1) → MEMORY(2) → TRACE(3)
 //! ```
 //!
 //! 负 rank 是**模块本地、最外层**的测试锁（`SCHED_TEST_LOCK` / `LOAD_TEST_LOCK`
-//! / `INSPECTOR_TEST_LOCK` / `IRQ_TEST_LOCK` / `TIMER_TEST_LOCK`）：它们在每个
-//! 调用点都先于所有规范锁获取，且由检测器强制——不再是"约定"。
+//! / `IRQ_TEST_LOCK` / `TIMER_TEST_LOCK`）：它们在每个调用点都先于所有规范锁
+//! 获取，且由检测器强制——不再是"约定"。
 //!
 //! 任何**新增**测试锁都必须在 `Rank` 里拿到一个新 rank 并插入这个顺序（需要时
 //! 重编号，保持严格递增）；绝不允许以其他顺序持有两把测试锁。模块本地、最外层
@@ -32,17 +32,15 @@ use spin::{Mutex, MutexGuard};
 
 /// 测试锁的规范 rank：数值严格递增，只能按此顺序嵌套获取。
 ///
-/// 负 rank（-5..=-1）是**模块本地、最外层**的测试锁，必须先于所有 `0..=3` 的
+/// 负 rank（-4..=-1）是**模块本地、最外层**的测试锁，必须先于所有 `0..=3` 的
 /// 共享规范锁获取；`0..=3` 是既有的规范顺序（值保持不变）。
 #[repr(i8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Rank {
     /// 调度测试锁（`sched::tests::SCHED_TEST_LOCK`），最外层。
-    Sched = -5,
+    Sched = -4,
     /// 组件加载测试锁（`component::load::tests::LOAD_TEST_LOCK`），最外层。
-    Load = -4,
-    /// Inspector 测试锁（`inspector::tests::INSPECTOR_TEST_LOCK`），最外层。
-    Inspector = -3,
+    Load = -3,
     /// IRQ 表测试锁（`irq::tests::IRQ_TEST_LOCK`），最外层。
     Irq = -2,
     /// timer 全局测试锁（`timer::tests::TIMER_TEST_LOCK`），最外层。
@@ -62,7 +60,6 @@ impl core::fmt::Display for Rank {
         let name = match self {
             Rank::Sched => "SCHED",
             Rank::Load => "LOAD",
-            Rank::Inspector => "INSPECTOR",
             Rank::Irq => "IRQ",
             Rank::Timer => "TIMER",
             Rank::Boundary => "BOUNDARY",
@@ -145,7 +142,7 @@ impl TestLock {
         if let Some(held) = HELD.with(|held| held.borrow().conflict(self.rank)) {
             panic!(
                 "test lock order violation: attempted to acquire {} (rank {}) while holding {} \
-                 (rank {}); canonical acquisition order is SCHED -> LOAD -> INSPECTOR -> IRQ -> \
+                 (rank {}); canonical acquisition order is SCHED -> LOAD -> IRQ -> \
                  TIMER -> BOUNDARY -> MACHINE -> MEMORY -> TRACE",
                 self.rank, self.rank as i8, held, held as i8,
             );
