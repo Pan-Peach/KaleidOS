@@ -4,7 +4,7 @@
 //! ```text
 //! .kcomp 字节
 //!   │  ElfObject::parse（复用 Core 私有 ELF API）
-//!   │  import 包络检查（空集：任何 UNDEF 符号都拒绝）
+//!   │  import 白名单检查（只放诊断 / 只读查询 + kcore_panic_escape；面外拒绝）
 //!   │  plan_sections：ALLOC 段 → 页对齐 VA + 权限（R+X / R / R+W），逐段独占页
 //!   │  loader::apply_relocations（同一份 RISC-V 重定位实现，按域 base 重算）
 //!   ▼
@@ -42,7 +42,7 @@
 //!
 //! # 显式拒绝（绝不静默）
 //!
-//! 任何 UNDEF 符号（import 包络 = 空集）；段 VA 超出实例窗口 / 段间重叠 / 权限
+//! import 白名单之外的具名 UNDEF 符号；段 VA 超出实例窗口 / 段间重叠 / 权限
 //! 不可表达（空、W^X）/ 对齐非 2 的幂；入口不在任何可执行段内
 //! （`EntryNotExecutable`）；没有私有 AS 能力的 profile（`map_into` 拒绝，绝不把
 //! 恒等映射当 AS）。
@@ -113,7 +113,7 @@ pub enum IsolatedLoadError {
     Loader(LoaderError),
     /// `e_machine` 与当前目标不一致。
     MachineMismatch,
-    /// import 包络是空集：任何具名 UNDEF 符号（含 `kcore_*`）都在装载前拒绝。
+    /// import 白名单之外的具名 UNDEF 符号在装载前显式拒绝。
     ImportsUnsupported,
     /// 段的 VA 区间（或装载基址）超出该实例允许的窗口。
     SegmentOutsideWindow,
@@ -741,7 +741,7 @@ mod tests {
         }
     }
 
-    /// 生命周期接线的转换：`PlacedImage` → image 表登记的
+    /// 生命周期接线的转换：`PlacedImage` → 组件记录登记的
     /// `LoadedComponent`（lease 随转换转移；create / destroy 是实例内 VA；
     /// Isolated image 没有 `service_dispatch`）。
     #[test]
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(loaded.service_dispatch, None, "Isolated image 无服务入口");
         assert_eq!(loaded.text_size, text_size);
         assert_eq!(loaded.abi, abi);
-        assert!(loaded.memory.is_some(), "lease 必须随转换转移给 image 表");
+        assert!(loaded.memory.is_some(), "lease 必须随转换转移给组件记录");
     }
 
     /// 放段是确定性的；换基址只平移 VA（重定位按域重算），偏移不变。
@@ -864,7 +864,7 @@ mod tests {
     }
 
     /// `kcomp_service_dispatch` 夹具：真实定义了该入口的 `.kcomp` 按域放段
-    /// 成功，且 dispatcher 的解析结果随 `into_loaded_component` 进入 image 表。
+    /// 成功，且 dispatcher 的解析结果随 `into_loaded_component` 进入组件记录。
     #[test]
     fn places_service_dispatch_fixture_and_preserves_the_entry() {
         let _guard = test_support::GUARD.lock();
@@ -911,10 +911,10 @@ mod tests {
         assert_eq!(place(&patched), Err(IsolatedLoadError::MachineMismatch));
     }
 
-    /// **放段失败夹具**：一份通过 packer 契约校验与 import 包络、
+    /// **放段失败夹具**：一份通过 packer 契约校验与 import 白名单、
     /// 但段超出实例窗口的真实 `.kcomp` → `SegmentOutsideWindow`。ArchTest
     /// `isolated-load-reject` 用同一份夹具证明生产创建入口把它拒绝成
-    /// `IsolatedPlacementFailed`（声明 / AS / image 登记之前）。
+    /// `IsolatedPlacementFailed`（声明 / AS 创建之前）。
     #[test]
     fn rejects_the_oversized_fixture_before_any_allocation() {
         let _guard = test_support::GUARD.lock();

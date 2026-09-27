@@ -233,15 +233,6 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
             .find(|m| range_contains(&m.virtual_range, va, 1))
     }
 
-    /// `va` 是否落在一条**组件私有且可执行**的映射里（故障归属用：共享 Core
-    /// .text 里的故障是 Core bug，不是组件故障）。
-    pub fn private_executable_at(&self, va: usize) -> bool {
-        self.mappings.iter().any(|m| {
-            range_contains(&m.virtual_range, va, 1)
-                && m.permission.contains(MappingPermission::EXECUTE)
-        })
-    }
-
     /// `va` 是否落在一条可执行映射里（私有或共享）。
     pub fn entry_is_executable(&self, va: usize) -> bool {
         self.mappings.iter().chain(self.shared.iter()).any(|m| {
@@ -494,16 +485,7 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         })
     }
 
-    /// 把本地址空间激活为当前 satp（委托后端写 satp + sfence）。
-    ///
-    /// **没有任何运行期调用方**；保留它给 boot 等已激活路径，退役的空间
-    /// 不允许再激活。
-    pub fn activate(&self) -> Result<(), MapError> {
-        self.ensure_ready()?;
-        self.backend.activate().map_err(|_| MapError::BackendFailed)
-    }
-
-    /// 标记该地址空间**退役**：此后 map / unmap / prepare_activation / activate
+    /// 标记该地址空间**退役**：此后 map / unmap / prepare_activation
     /// 一律 `MapError::Retired`，translate 返回 `None`。幂等（重复退役是 no-op）。
     ///
     /// 复用 = 新建空间；退役的空间不再有任何"复活"语义。
@@ -621,18 +603,6 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         self.get_mut(handle)
             .ok_or(MapError::NoSuchSpace)?
             .exclude_identity_alias(extent)
-    }
-
-    /// `va` 是否落在该空间的组件私有可执行映射内（故障归属）。
-    pub fn private_executable_at(
-        &self,
-        handle: AddressSpaceHandle,
-        va: usize,
-    ) -> Result<bool, MapError> {
-        Ok(self
-            .get(handle)
-            .ok_or(MapError::NoSuchSpace)?
-            .private_executable_at(va))
     }
 
     /// `va` 是否落在可执行映射（私有或共享）内。
@@ -818,61 +788,9 @@ mod active {
         Ok(handle)
     }
 
-    /// 接管一个已存在的后端（见 [`AddressSpaceManager::adopt`]）。
-    ///
-    /// **当前无调用方**：boot 的长期 root 仍由 boot 的 `RuntimeVm` 按值持有；
-    /// 搬迁 boot 的 backend 所有权需要先重构 boot（无 host 测试的路径），当前
-    /// 只保留这个 seam，不强制搬迁。
-    pub fn adopt(
-        owner: ComponentId,
-        backend: AddressSpaceImpl,
-        mappings: alloc::vec::Vec<Mapping>,
-    ) -> AddressSpaceHandle {
-        SPACES.lock().adopt(owner, backend, mappings)
-    }
-
     /// 在已建立的地址空间上落一段映射（Core 验证 → 后端写 PTE → Core 记录真相）。
     pub fn map(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
         SPACES.lock().map(handle, mapping)
-    }
-
-    /// 在已建立的地址空间上落一条**共享 Core 映射**（boot 计划；Isolated AS
-    /// 创建时由 Core 逐条落进新 root）。
-    pub fn add_shared(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
-        SPACES.lock().add_shared(handle, mapping)
-    }
-
-    /// 某空间的共享 Core 映射快照（诊断 / 断言）。
-    pub fn shared_mappings(
-        handle: AddressSpaceHandle,
-    ) -> Result<alloc::vec::Vec<Mapping>, MapError> {
-        Ok(SPACES.lock().shared_mappings(handle)?.to_vec())
-    }
-
-    /// 摘除某空间里 `extent` 的 identity 别名（私有 backing 别名排除）。
-    pub fn exclude_identity_alias(
-        handle: AddressSpaceHandle,
-        extent: &PhysicalRange,
-    ) -> Result<usize, MapError> {
-        SPACES.lock().exclude_identity_alias(handle, extent)
-    }
-
-    /// `va` 是否落在该空间的组件私有可执行映射内（故障归属）。
-    pub fn is_private_executable(handle: AddressSpaceHandle, va: usize) -> Result<bool, MapError> {
-        SPACES.lock().private_executable_at(handle, va)
-    }
-
-    /// `va` 是否落在可执行映射（私有或共享）内。
-    pub fn entry_is_executable(handle: AddressSpaceHandle, va: usize) -> Result<bool, MapError> {
-        SPACES.lock().entry_is_executable(handle, va)
-    }
-
-    /// `range` 是否被单条可写映射（私有或共享）覆盖。
-    pub fn range_is_writable(
-        handle: AddressSpaceHandle,
-        range: &VirtualRange,
-    ) -> Result<bool, MapError> {
-        SPACES.lock().range_is_writable(handle, range)
     }
 
     /// **别名排除事务的逐空间一步**：把 `extent` 的 identity 别名从**所有**
@@ -908,15 +826,6 @@ mod active {
     /// 翻译虚拟地址（后端真相；未映射是 `Ok(None)`）。
     pub fn translate(handle: AddressSpaceHandle, va: usize) -> Result<Option<usize>, MapError> {
         SPACES.lock().translate(handle, va)
-    }
-
-    /// 空间的 owner（Core 真相；故障归因 / 诊断用）。
-    pub fn owner(handle: AddressSpaceHandle) -> Result<ComponentId, MapError> {
-        SPACES
-            .lock()
-            .get(handle)
-            .map(|space| space.owner())
-            .ok_or(MapError::NoSuchSpace)
     }
 
     /// 准备一次私有 AS 进入：全部校验在锁内完成，返回 `Copy` 描述符；
@@ -958,16 +867,14 @@ mod active {
     )
 ))]
 pub use active::{
-    ActiveActivation, AddressSpaceImpl, add_shared, adopt, create_isolated_address_space_for,
-    entry_is_executable, exclude_identity_alias, exclude_identity_alias_from_live_spaces,
-    is_private_executable, isolation_capable, map, mapping_exact, owner, prepare_activation,
-    prepare_transition, range_is_writable, retire, shared_executable_at, shared_mappings,
-    translate, unmap,
+    ActiveActivation, AddressSpaceImpl, create_isolated_address_space_for,
+    exclude_identity_alias_from_live_spaces, isolation_capable, map, mapping_exact,
+    prepare_activation, prepare_transition, retire, shared_executable_at, translate, unmap,
 };
 
 /// 无后端构建（host test）：没有可用的私有地址空间实现——能力恒为 `false`，
-/// 绝不静默降级成"native 也能跑"。`adopt` / `unmap` / `retire` /
-/// `prepare_activation` 只对真实 backend 有意义，因此不在本构建暴露。
+/// 绝不静默降级成"native 也能跑"。`unmap` / `retire` / `prepare_activation`
+/// 只对真实 backend 有意义，因此不在本构建暴露。
 #[cfg(not(any(
     feature = "vm-nommu",
     all(

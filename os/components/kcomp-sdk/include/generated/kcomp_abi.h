@@ -209,7 +209,7 @@ uint32_t kcore_free_page_count(void);
 uint32_t kcore_task_count(void);
 uint32_t kcore_component_count(void);
 /* -- Component lifecycle -- */
-/* Core 侧的最小创建操作：按 artifact 名创建新实例（同一 image 允许多实例）。 */
+/* Core 侧的最小创建操作：按 artifact 名创建新实例（同一 artifact 允许多实例）。 */
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, const struct KcompCreateArgs *args, uint32_t *out_instance);
 int32_t kcore_component_load(const uint8_t *name, size_t len);
 /* -- Task control -- */

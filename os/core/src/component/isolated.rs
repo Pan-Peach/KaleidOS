@@ -29,9 +29,7 @@
 //! `sfence.vma`。
 
 use crate::component::containment::{self, cross_as::CrossAsContext};
-use crate::memory::address_space::{
-    self, AddressSpaceHandle, MapError, PreparedActivation, VirtualRange,
-};
+use crate::memory::address_space::{self, AddressSpaceHandle, PreparedActivation, VirtualRange};
 use arch::riscv::trampoline::{self, Transition};
 use arch::riscv::trap::TrapFrame;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -84,7 +82,6 @@ pub struct PreparedTransition {
     stack_top: usize,
     runtime_slot: usize,
     interrupts_enabled: bool,
-    fault_token: usize,
     entry_args: EntryArgs,
 }
 
@@ -98,16 +95,6 @@ impl PreparedTransition {
     pub fn satp(&self) -> usize {
         self.activation.token().satp()
     }
-
-    /// 组件入口 VA（Core 已验证在可执行映射内）。
-    pub fn entry(&self) -> usize {
-        self.entry
-    }
-
-    /// 组件栈顶 VA（Core 已验证被可写映射覆盖且 16 字节对齐）。
-    pub fn stack_top(&self) -> usize {
-        self.stack_top
-    }
 }
 
 /// 准备一次私有 AS 进入（**锁内完成，返回时锁已释放**）。
@@ -117,8 +104,6 @@ impl PreparedTransition {
 /// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸；
 ///   service dispatch 传 `false`——与同域 service 边界同一纪律）；
 /// - `entry_args`：组件入口的 `a0` .. `a3`（入口 ABI 由 Core 解释）。
-///
-/// `handle` 的 owner 作为故障归因 token 随记录携带（Core 真相：AS owner）。
 pub fn prepare(
     handle: AddressSpaceHandle,
     entry: usize,
@@ -128,11 +113,6 @@ pub fn prepare(
     entry_args: EntryArgs,
 ) -> Result<PreparedTransition, IsolatedPrepareError> {
     let activation = address_space::prepare_transition(handle, entry, stack)?;
-    let owner = address_space::owner(handle).map_err(|error| match error {
-        MapError::NoSuchSpace => IsolatedPrepareError::NoSuchSpace,
-        MapError::Retired => IsolatedPrepareError::Retired,
-        _ => IsolatedPrepareError::Unsupported,
-    })?;
     // `prepare_transition` 已校验非空 + 不溢出；这里只做算术。
     let stack_top = stack.base + stack.size;
     Ok(PreparedTransition {
@@ -142,7 +122,6 @@ pub fn prepare(
         stack_top,
         runtime_slot,
         interrupts_enabled,
-        fault_token: owner.raw() as usize,
         entry_args,
     })
 }
@@ -176,7 +155,6 @@ pub fn enter(transition: PreparedTransition) -> Outcome {
         abandon: abandon_cross_as,
         expected_satp: context.instance_satp(),
         space: Some(transition.handle),
-        token: transition.fault_token,
     };
 
     // 安装可恢复现场（LIFO；返回 / 放弃后恢复上一个）。
@@ -204,8 +182,6 @@ pub struct ComponentFault<'a> {
     pub cause: usize,
     /// `stval`（故障地址 / 指令）。
     pub stval: usize,
-    /// 故障归因 token = 该实例 AS 的 owner raw id（Core 真相）。
-    pub token: usize,
 }
 
 /// Core 的窄故障策略：**组件身份本身不构成"可恢复"的证明**，恢复必须由策略
@@ -280,7 +256,6 @@ fn on_exception(frame: *mut TrapFrame, cause: usize, stval: usize) -> bool {
             frame: frame_ref,
             cause,
             stval,
-            token: cross.token,
         };
         policy(&mut fault)
     };

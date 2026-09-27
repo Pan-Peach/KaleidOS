@@ -293,7 +293,7 @@ unsafe extern "C" {
     #[link_name = "kcore_component_count"]
     pub fn kcore_component_count() -> u32;
     // -- Component lifecycle --
-    /// 按 artifact 名创建新实例（同一 image 允许多实例）。成功 = `0` 且
+    /// 按 artifact 名创建新实例（同一 artifact 允许多实例，各自独立放段 / 重定位）。成功 = `0` 且
     /// `*out_instance` 写 instance id（`ComponentId` raw）；失败 = `-Errno`。
     #[link_name = "kcore_component_create"]
     pub fn kcore_component_create(

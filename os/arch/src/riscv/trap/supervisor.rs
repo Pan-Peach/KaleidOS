@@ -58,12 +58,12 @@ fn set_scratch(value: usize) {
 
 /// 统一 trap 处理器（汇编入口调用）。
 ///
-/// **返回语义（C5 起）**：`trap64.S`/`trap32.S` 保存完整 TrapFrame 后调用本
-/// 函数；**本函数正常返回**时，汇编侧恢复现场并 `sret` 回被打断的上下文
+/// **返回语义**：`trap64.S`/`trap32.S` 保存完整 TrapFrame 后调用本函数；
+/// **本函数正常返回**时，汇编侧恢复现场并 `sret` 回被打断的上下文
 /// （返回路径已就绪）。异常与未知中断仍是 fatal（panic = 永不返回）。
 ///
-/// 当前 `SupervisorTimer` 分支是 C5 的骨架位（`todo!()`）：在时钟中断真正
-/// 开闸（`sie.STIE` + `sstatus.SIE`）之前不会被触达。
+/// `SupervisorTimer` / `SupervisorExternal` 分发给 Core 注册的 handler；
+/// 未注册的 handler 是 Core 不变式破坏（handler 内显式 panic）。
 #[unsafe(no_mangle)]
 pub extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: usize, stval: usize) {
     let scause = Scause::from_bits(raw_scause);

@@ -26,10 +26,11 @@
 //!   suspended scheduler frame, which still owns its `IrqSaveGuard`.
 //! - **Cross-AS service** (`with_isolated_service_boundary`; KernelNative
 //!   caller → Isolated provider): enters the provider's private AS through the
-//!   the minimal cross-AS trampoline with the same `EscapeKind::ServiceCall`
+//!   minimal cross-AS trampoline with the same `EscapeKind::ServiceCall`
 //!   bookkeeping; a provider fault is contained by the ordinary Core trap path
-//!   (`Outcome::Faulted` via the cross-AS recoverable context), not
-//!   `panic_escape` (an Isolated component has no `kcore_*` import surface).
+//!   (`Outcome::Faulted` via the cross-AS recoverable context), and a provider
+//!   panic escapes through the same cross-AS context (`kcore_panic_escape`),
+//!   not through this guard's (null) Core context.
 //!
 //! # Escapability gate (Core ABI depth)
 //!
@@ -461,8 +462,6 @@ pub(crate) mod cross_as {
         pub expected_satp: usize,
         /// 被打断执行所属实例的地址空间（组件私有可执行范围判定）。
         pub space: Option<crate::memory::address_space::AddressSpaceHandle>,
-        /// 归因 token（Core 真相：AS owner raw id）。
-        pub token: usize,
     }
 
     static mut ACTIVE_CROSS_AS: *mut CrossAsContext = core::ptr::null_mut();
@@ -720,17 +719,18 @@ pub(crate) fn call_component_service(
 /// [`call_component_service`], but **no Core stack switch** — the execution
 /// switch is the cross-AS trampoline's (`isolated::enter`), and `f` performs it.
 ///
-/// The guard's context records are deliberately null: an Isolated component has
-/// **no `kcore_*` import surface**, so `kcore_panic_escape` is unreachable and
-/// there is no Core-owned context a panic could resume.  A provider **fault** is
-/// contained by the ordinary Core trap path (`Outcome::Faulted` → the cross-AS
-/// recoverable context), not by [`panic_escape`].  [`escape_target`] refuses an escape through a guard
-/// with a null context (defensive: stay fatal rather than switch to a null
-/// context).
+/// The guard's context records are deliberately null: the cross-AS execution
+/// owns its recoverable context (`cross_as::CrossAsContext`), so an Isolated
+/// panic or fault is contained there — never by resuming a Core context through
+/// this guard.  A provider **fault** is contained by the ordinary Core trap path
+/// (`Outcome::Faulted` → the cross-AS recoverable context), and a provider
+/// **panic** (`kcore_panic_escape`) escapes through the same cross-AS context.
+/// [`escape_target`] refuses an escape through a guard with a null context
+/// (defensive: stay fatal rather than switch to a null context).
 ///
 /// Callers must not hold any Core lock across `f` (the trampoline requires the
 /// same).
-// 只被 cfg-gated 的 Isolated dispatch 路径（真机）调用；host 构建没有 Isolated
+// 只被 Isolated dispatch 路径（`isolated_lifecycle`）调用；host 构建没有 Isolated
 // 实例，但 host 用例（`isolated_service_boundary_has_no_escapable_core_context`）
 // 直接驱动本边界。
 #[allow(dead_code)]
@@ -2299,14 +2299,12 @@ mod tests {
             abandon: test_abandon,
             expected_satp: 0xA,
             space: None,
-            token: 1,
         };
         let mut b = cross_as::CrossAsContext {
             context: core::ptr::null_mut(),
             abandon: test_abandon,
             expected_satp: 0xB,
             space: None,
-            token: 2,
         };
 
         assert!(cross_as::active_cross_as().is_none());
@@ -2315,7 +2313,6 @@ mod tests {
         let active = cross_as::active_cross_as().unwrap();
         // SAFETY: 测试单线程，指针来自上面的有效记录。
         assert_eq!(unsafe { (*active).expected_satp }, 0xA);
-        assert_eq!(unsafe { (*active).token }, 1);
         assert!(unsafe { (*active).context.is_null() });
         assert!(unsafe { (*active).space.is_none() });
         assert_eq!(
@@ -2329,7 +2326,6 @@ mod tests {
         let active = cross_as::active_cross_as().unwrap();
         // SAFETY: 同上。
         assert_eq!(unsafe { (*active).expected_satp }, 0xB);
-        assert_eq!(unsafe { (*active).token }, 2);
 
         cross_as::restore_cross_as(previous);
         let active = cross_as::active_cross_as().unwrap();

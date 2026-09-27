@@ -57,29 +57,29 @@ CASES = (
     ("tlb-invalidate", 13, None),
     ("timer", None, None),
     ("external-irq", None, None),
-    # The Isolated-domain assembly gateway.  `isolated-transition`
+    # The Isolated-domain minimal cross-AS trampoline.  `isolated-transition`
     # proves the Core -> private AS -> Core round-trip (register/tp/gp save-
     # restore + component-visible private root); `isolated-timer` proves a
     # returning timer interrupt taken inside the private AS, handled on the
-    # Core AS / Core trap stack, then resumed; `isolated-fault` proves a
-    # recoverable component page fault (Core policy maps the missing page and
-    # the component retries); `isolated-fault-abandon` proves component
-    # identity alone is NOT recoverable (Core refuses, the gateway abandons).
+    # normal Core trap path / Core trap stack, then resumed; `isolated-fault`
+    # proves a recoverable component page fault (Core policy maps the missing
+    # page and the component retries); `isolated-fault-abandon` proves component
+    # identity alone is NOT recoverable (Core refuses, the trampoline returns
+    # to the suspended Core caller).
     ("isolated-transition", None, None),
     ("isolated-timer", None, None),
     ("isolated-fault", None, None),
     ("isolated-fault-abandon", None, None),
     # Per-domain loading of a real `.kcomp` into a private address
     # space with page-separated permissions.  `isolated-image` proves the placed
-    # image executes through the gateway in its own root (only image segments +
-    # gateway + harness pages mapped; Core-only mappings unreachable).
+    # image executes through the minimal cross-AS trampoline in its own root
+    # (shared Core mappings same VA->PA + image segments + harness pages;
+    # other instances' private backing unreachable).
     # `isolated-perm-text` / `isolated-perm-data` prove the page tables really
     # enforce segment permissions: a store to the R+X text page faults with
     # scause 15 and an instruction fetch from the R+W data page faults with
     # scause 12 — both observed by the Core fault policy and then abandoned.
-    # `isolated-core-unreachable` proves a Core-only page is unreachable from
-    # the instance AS (load page fault, scause 13).  The required substrings
-    # carry the observed scause into the runner verdict.
+    # The required substrings carry the observed scause into the runner verdict.
     ("isolated-image", None, "isolated-image: private AS OK"),
     ("isolated-image-wrong-env", None, None),
     ("isolated-perm-text", None, "scause=0xf"),
@@ -102,18 +102,18 @@ CASES = (
     # substring carries the observed instance window into the runner verdict.
     # `isolated-lifecycle-fail` / `isolated-lifecycle-fault` prove both
     # create-entry failure modes (non-zero return and an in-AS fault caught by
-    # the gateway's narrow fault dispatch) leave a `Failed` tombstone with a
+    # the normal Core trap path's containment) leave a `Failed` tombstone with a
     # retired AS and the Core-prepared window/stack released.
     ("isolated-lifecycle", None, "isolated-lifecycle: private AS OK"),
     ("isolated-lifecycle-fail", None, None),
     ("isolated-lifecycle-fault", None, None),
     # The KernelNative -> Isolated service Gate.  A KernelNative
     # caller invokes a real `.kcomp` provider's `kcomp_service_dispatch` in its
-    # own private AS through the assembly gateway: the flat frame is COPIED
-    # through a Core-owned mailbox (provider-side pointers are all mailbox VAs,
-    # payloads equal the caller's, output copied back), the provider runs on its
-    # own root/slot, caller memory is unreachable from the instance AS, and the
-    # Core root is restored after the transition.  `isolated-service-limits`
+    # own private AS through the minimal cross-AS trampoline: the flat frame is
+    # COPIED through a Core-owned mailbox (provider-side pointers are all mailbox
+    # VAs, payloads equal the caller's, output copied back), the provider runs on
+    # its own root/slot, caller memory is unreachable from the instance AS, and
+    # the Core root is restored after the transition.  `isolated-service-limits`
     # proves an over-capacity frame is rejected (`-EMSGSIZE`) before any copy
     # (provider never runs).  `isolated-service-fault` proves a provider fault
     # (load from a caller-domain address) is contained: the caller gets a typed
@@ -129,11 +129,11 @@ CASES = (
     # endpoint (if any) is dead, the caller gets a typed error, Core stays alive,
     # and the KernelNative path keeps working.
     #   isolated-load-reject    placement failure (17 MiB .bss beyond the image
-    #                           window) and the empty import envelope are rejected
-    #                           BEFORE any component/AS is declared;
+    #                           window) and the unsupported-import envelope are
+    #                           rejected BEFORE any component/AS is declared;
     #   isolated-config-reject  an over-capacity config fails the create stage
     #                           with the same cleanup as other create failures;
-    #   isolated-prepare-reject the gateway prepare rejects a non-executable
+    #   isolated-prepare-reject `isolated::prepare` rejects a non-executable
     #                           entry / unwritable stack / retired AS with typed
     #                           errors and never mutates the instance truth;
     #   isolated-destroy-fault  a destroy-entry trap yields DestroyPanicked +

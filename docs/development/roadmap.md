@@ -27,7 +27,7 @@ Component Endpoint Registry：ContractId / InterfaceAbi（exact fingerprint）/ 
   标记 Failed 后重调度；panic=abort、无 unwinding、不承诺内存回收
 受限 IsolatedNative：私有 AS + **共享 Core 映射** + 最小跨 AS trampoline + 按域放段 + **支持面 import（诊断 / 只读 + panic escape）** + Core 预置窗口 / 邮箱 +
   KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU 证明）；
-  仍缺 ASID / U-mode / ecall / 出站 Isolated 调用 / 按域 import 解析（见 deployment.md §7/§10）
+  仍缺 ASID / U-mode / ecall / 出站 Isolated 调用 / 更宽的按域 import 面（支持面已落地；见 deployment.md §7/§10）
 测试体系：make check（fmt/clippy/host 单测/构建）、make test-host、make test-qemu（boot smoke +
   core_test 判定）、make test-arch（ArchTest 白盒 selftest，每 case 独立 QEMU）
 ```
@@ -52,7 +52,7 @@ DeviceTable / device claim / IRQ / DMA → 第一个 Driver Component
 - **任务化组件（C9）**：`kcomp_task` + 任务参数 + `kcomp_instance_destroy` / 卸载协议（逻辑层先行；
   物理回收仍不在本阶段）。
 - **执行域（C10，进行中）**：在已落地的受限 IsolatedNative 上继续补 ASID / U-mode / `ecall` /
-  出站 Isolated 调用 / 按域 import 解析；`SandboxedNative`（U-mode + 私有 AS）仍是未来强制边界
+  出站 Isolated 调用 / 更宽的按域 import 面（支持面已落地）；`SandboxedNative`（U-mode + 私有 AS）仍是未来强制边界
   （`todo!()` 占位）。IsolatedNative 是**可选实验、非承诺里程碑**；其缺口清单见
   `docs/architecture/deployment.md` §7/§10。
 - **timer / 抢占（C5）**：SBI TIME + 时钟中断的 trap 可返回路径、Timer/Irq 原语与 sched seam 已就位，
@@ -99,7 +99,7 @@ P1 任务系统：context_switch 实机验证、调度执行链   —— 已完�
 P2 中断/驱动：timer / 抢占（C5）、设备·IRQ·DMA（C6）→ 第一个 driver   —— 部分
 P3 组件化进阶：区域分配（C7）、域视图交付（C8）、任务化组件（C9）        —— 部分
 P4 执行域/隔离（C10）：受限 IsolatedNative 已落地；ASID / U-mode / ecall / 出站
-        Isolated / 按域 import / SandboxedNative 未完成
+        Isolated / 更宽的按域 import 面 / SandboxedNative 未完成
 ```
 
 - **物理帧分配是 Core 内部机制**，不是策略流；`MemoryPolicy`（未来）只能提议偏好，

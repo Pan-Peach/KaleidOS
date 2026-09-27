@@ -183,14 +183,6 @@ impl KernelMappingPlan {
         })
     }
 
-    pub fn entries(&self) -> &[PlanEntry] {
-        &self.entries
-    }
-
-    pub fn exclusions(&self) -> &[PhysicalRange] {
-        &self.exclusions
-    }
-
     /// 生成要落进一个 Isolated AS 的共享映射集合：`SharedCore` / `Device` 原样，
     /// `SharedIdentity` 按已发布私有 extent **切段**（不覆盖任何私有字节）。
     pub fn shared_mappings(&self) -> Vec<Mapping> {
@@ -253,8 +245,8 @@ fn slice_identity_piece(piece: Mapping, base: usize, size: usize) -> Mapping {
 }
 
 // ---------------------------------------------------------------------------
-// 全局安装（boot 的 runtime builder 记录计划后交给 Core；CP4 的 Isolated AS
-// 创建从这里取共享映射）。
+// 全局安装（boot 的 runtime builder 记录计划后交给 Core；Isolated AS 创建
+// 从这里取共享映射）。
 // ---------------------------------------------------------------------------
 
 static PLAN: spin::Mutex<Option<KernelMappingPlan>> = spin::Mutex::new(None);
@@ -275,18 +267,6 @@ pub fn shared_mappings() -> Vec<Mapping> {
         .as_ref()
         .map(KernelMappingPlan::shared_mappings)
         .unwrap_or_default()
-}
-
-/// 探测某个物理 extent 是否已发布为私有（诊断 / 断言）。
-pub fn is_private_extent(extent: PhysicalRange) -> bool {
-    PLAN.lock()
-        .as_ref()
-        .is_some_and(|plan| plan.is_excluded(extent))
-}
-
-/// 计划是否已安装（boot 是否已交棒）。
-pub fn is_installed() -> bool {
-    PLAN.lock().is_some()
 }
 
 /// **私有 backing 别名排除事务**：把一个刚分配、即将发布为组件私有的物理

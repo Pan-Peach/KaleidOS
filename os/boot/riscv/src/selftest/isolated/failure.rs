@@ -6,12 +6,12 @@
 //
 // 逐条证明"组件失败 = 逻辑死亡、物理驻留"：每个阶段失败之后实例状态 / AS /
 // Core 预置窗口 / runtime slot / endpoint / caller 错误 / Core 存活 /
-// KernelNative 不受影响都有可观察断言；失败之后同一 image 可以**逻辑重启**
+// KernelNative 不受影响都有可观察断言；失败之后同一 artifact 可以**逻辑重启**
 // （全新实例、全新 AS / 窗口 / slot）。
 // -----------------------------------------------------------------------
 
-/// 装载拒绝：放段失败 / import 包络在**声明实例之前**显式拒绝，不留实例 /
-/// AS / image；KernelNative 路径不受影响。
+/// 装载拒绝：放段失败 / import 白名单外符号在**声明实例之前**显式拒绝，不留
+/// 实例 / AS；KernelNative 路径不受影响。
 pub(crate) fn isolated_load_reject() -> ! {
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
@@ -547,7 +547,4 @@ pub(crate) fn isolated_stale_access() -> ! {
     pass("isolated-stale-access")
 }
 
-/// Ready 期故障 + 逻辑重启：实例**已经成功服务过调用**之后在 dispatch 里
-/// 故障 → 同一套 containment（Failed + AS 退役 + 窗口归还 + endpoint 永久
-/// 失效）；随后 stale endpoint 被拒绝；同一 image 创建的全新实例真正独立
 use super::*;

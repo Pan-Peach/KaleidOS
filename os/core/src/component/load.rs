@@ -74,13 +74,14 @@ pub enum ComponentLoadError {
     /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
     /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
     IsolationUnsupported,
-    /// `IsolatedNative` 装载发现**未支持的 `kcore_*` import**：Isolated 当前
-    /// 的 import 解析（Core gate trampoline）尚未实现，任何 `kcore_*` UNDEF 都
-    /// 在装载**之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
+    /// `IsolatedNative` 装载发现**不在支持白名单里的 `kcore_*` import**：
+    /// 只有诊断 / 只读查询与 `kcore_panic_escape` 可解析
+    /// （[`crate::component::isolated_load::SUPPORTED_IMPORTS`]），面外符号在装载
+    /// **之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     IsolatedImportUnsupported,
     /// `IsolatedNative` 按域放段失败（段出窗 / 重叠 / 权限不可表达 / 入口不可执行 /
-    /// 地址溢出 / 含任何 UNDEF import 的空集包络 / 后端拒绝映射）：镜像不适配该域，
-    /// 显式拒绝（不含 `kcore_*` import——那一类由门禁以 `-ENOTSUP` 区分）。
+    /// 地址溢出 / import 白名单之外的具名 UNDEF 符号 / 后端拒绝映射）：镜像不适配
+    /// 该域，显式拒绝（`kcore_*` 面外 import 由门禁以 `-ENOTSUP` 区分）。
     IsolatedPlacementFailed,
     /// `IsolatedNative` 的 config 负载放不进实例窗口（或指针 / 长度不自洽）：
     /// 显式拒绝，绝不截断。
@@ -152,12 +153,12 @@ pub fn load_and_start(
 ///
 /// `kind` 是**部署请求**（Policy proposes）：本函数**按执行域分派**创建路径——
 /// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative`
-/// 走 [`create_isolated_native`] 的门禁（能力 / import 包络 / image 复用任一不满足
-/// 即显式拒绝）后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 尚无占位实现
+/// 走 [`create_isolated_native`] 的门禁（能力 / import 白名单任一不满足即显式拒绝）
+/// 后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 尚无占位实现
 /// （`todo!()`）。任何域都**绝不静默降级成 native 跑**
 /// （`docs/architecture/deployment.md` §2 ⑤/§10）。
 ///
-/// 锁纪律：registry / image 锁只覆盖各自的查询与提交；`kcomp_instance_create`
+/// 锁纪律：registry / endpoint 锁只覆盖各自的查询与提交；`kcomp_instance_create`
 /// 在**无锁**状态下调用（组件 create 可能再创建别的组件、publish 接口、创建任务，
 /// 都各自拿锁——不能有任何锁跨组件调用持有）。
 pub fn create_component(
@@ -187,8 +188,8 @@ pub fn create_component(
 ///
 /// 生命周期：`Declared → resolve → Resolved → begin_start → Starting →
 /// kcomp_instance_create → { failure → Failed | success → record state →
-/// commit pending endpoints → Ready }`。同名 artifact 复用已登记的
-/// image；不存在则先走 store → loader → image 登记。
+/// commit pending endpoints → Ready }`。每次 instantiate 都从 artifact 重新放段 /
+/// 重定位；组件 1:1 拥有自己的 loaded image。
 fn create_kernel_native(
     name: &[u8],
     args: &KcompCreateArgs,
@@ -286,15 +287,13 @@ fn create_kernel_native(
 
 /// `IsolatedNative` 的创建路径（真正创建、启动、销毁）。
 ///
-/// 本函数只做**装载前置门禁**（能力 / image 复用 / import 包络），随后把
-/// 创建编排交给 [`isolated_lifecycle::create`]：
+/// 本函数只做**装载前置门禁**（平台能力 + import 白名单），随后把创建编排交给
+/// [`isolated_lifecycle::create`]：
 ///
 /// 1. **平台能力**：当前 profile 必须有私有地址空间 backend（NoMMU / 无后端 → 拒绝）；
-/// 2. **image 复用 + import 包络**：跨域复用显式拒绝；同域复用（逻辑重启）只在
-///    前一个实例已是终态后放行；不得含未支持的 `kcore_*` import
+/// 2. **import 白名单**：不得含未支持的 `kcore_*` / 具名 UNDEF 符号
 ///    （见 [`validate_isolated_load`]）；
-/// 3. 私有 AS + 按域放段（复用已登记 Isolated 放段结果时只映射同一份 backing）
-///    + Core 预置窗口（栈 / 实例窗口 / 邮箱）；
+/// 3. 私有 AS + 按域放段 + Core 预置窗口（栈 / 实例窗口 / 邮箱）；
 /// 4. `kcomp_instance_create` 在私有 AS 内经跨 AS trampoline 执行 → `Ready`；
 ///    任一步失败 = 退役 AS + 归还窗口 backing + `Failed`（半成品不留）。
 fn create_isolated_native(
@@ -316,9 +315,10 @@ fn create_isolated_native(
 /// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
 /// 字节，调用方用同一份 blob 装载。
 ///
-/// **import 包络 = 空集**：没有 per-domain trampoline。任何 `kcore_*`
+/// **import 白名单**（[`crate::component::isolated_load::SUPPORTED_IMPORTS`]）：
+/// 只有诊断 / 只读查询与 `kcore_panic_escape` 可解析；白名单外的 `kcore_*`
 /// UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
-/// 按域装载的空集包络拒绝（`isolated_load::place`，`-EINVAL`）。
+/// 按域装载的白名单检查拒绝（`isolated_load::place`，`-EINVAL`）。
 ///
 /// 每个组件都从 artifact 重新放段（`isolated_lifecycle::create`）——没有
 /// 跨域 / 同域 image 复用，因此不再需要域匹配 / 活跃实例门禁。

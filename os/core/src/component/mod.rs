@@ -12,7 +12,7 @@ pub mod endpoint;
 pub mod exit;
 pub mod export;
 pub mod failure;
-/// 私有 AS 切换网关的 Core 侧准备（`isolated_lifecycle` 生产调用；仅
+/// 私有 AS 进入的 Core 侧准备（`isolated_lifecycle` 生产调用；仅
 /// S-mode + MMU + RISC-V 目标有意义，其余 profile 不提供、也不降级）。
 #[cfg(all(
     feature = "vm-mmu",
@@ -21,7 +21,7 @@ pub mod failure;
 ))]
 pub mod isolated;
 /// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口 +
-/// runtime slot，经 跨 AS trampoline 执行 `kcomp_instance_create` /
+/// runtime slot，经跨 AS trampoline 执行 `kcomp_instance_create` /
 /// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
 /// 同一模块还承载跨域 service dispatch（KernelNative caller → Isolated
 /// provider，经扁平帧邮箱 + 跨 AS trampoline）。

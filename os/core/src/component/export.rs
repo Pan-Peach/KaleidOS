@@ -354,7 +354,7 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
     }
 }
 
-/// 请求 Core 用**默认配置**创建组件实例（store → image 复用/加载 → registry →
+/// 请求 Core 用**默认配置**创建组件实例（store → loader 放段/重定位 → registry →
 /// `kcomp_instance_create` 全链，与 monitor `load` 同源）。
 ///
 /// 这是 `kcore_component_create` 的便利入口（`config_abi = 0`，无 config 负载）。
@@ -378,8 +378,8 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 
 
 /// 用指定 config 负载创建一个新实例（`docs/architecture/component-lifecycle.md` §4）。
 ///
-/// 同名 artifact 复用已登记的常驻 image（新实例、新 id、新 state）；否则
-/// store → loader → image 登记。`args` 是组件自定义的 C 布局小结构，Core 视为
+/// 每次 instantiate 都从 artifact 重新放段 / 重定位（新实例、新 id、独立
+/// writable image state）。`args` 是组件自定义的 C 布局小结构，Core 视为
 /// **不透明字节**（只在调用期间借用，不持久化、不解释）。
 ///
 /// 成功 = 0，实例 id（`u32`）写入 `*out_instance`（调用方保证可写，任意对齐）；
@@ -644,7 +644,7 @@ extern "C" fn kcore_endpoint_bind(
 /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`
 /// （`EFAULT` `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或
 /// caller 已 `Failed`；`ENOTSUP` caller 不在 KernelNative 域（Isolated 出站调用
-/// 需要未实现的跨 AS Gate）；`ENOENT` endpoint 未发布或已死；`ENODEV` owner /
+/// 未实现）；`ENOENT` endpoint 未发布或已死；`ENODEV` owner /
 /// image 已不存在；`EBUSY` provider 不在 `Ready`、inflight 溢出或**重入**（provider
 /// 已在当前同步链上）；`EINVAL` 调用链上有 **IRQ 作用域**；`ENOMEM` Core 无法
 /// 分配 service stack；`EIO` provider 在边界内 **panic**（已被标记 `Failed` 且

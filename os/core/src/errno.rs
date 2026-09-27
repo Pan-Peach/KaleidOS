@@ -175,8 +175,9 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::PolicyRejected => Errno::EIO,
             // 上下文种类拒绝：policy 回调内不得创建组件（与调度拒绝同档）。
             ComponentLoadError::InPolicyContext => Errno::EINVAL,
-            // 部署能力不足 / Isolated 装载包络拒绝：能力缺失（不是 I/O 错误）。
-            // 都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的 I/O。
+            // 部署能力不足 / Isolated import 白名单外符号：能力缺失（不是 I/O
+            // 错误）。都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的
+            // I/O。
             ComponentLoadError::IsolationUnsupported
             | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
             // 按域放段失败 / config 负载不合规：镜像 / 请求不适配该域（EINVAL）。

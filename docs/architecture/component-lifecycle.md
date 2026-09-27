@@ -31,7 +31,7 @@
 > **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
 > （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 最小跨 AS trampoline（共享 Core 映射） + 按域放段 +
 > Core 预置窗口 / 邮箱 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
-> 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 按域 import 解析仍未实现**，边界是
+> 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 更宽的按域 import 面仍未实现**（支持面 import 已落地），边界是
 > 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。
 
 ---

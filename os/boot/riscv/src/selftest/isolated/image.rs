@@ -1,5 +1,5 @@
 //! Per-domain loading of a real `.kcomp` into a private AS: segment placement,
-//! page-level permission enforcement, and Core-only mappings staying unreachable.
+//! page-level permission enforcement, and the shared-Core mapping model in place.
 
 // -----------------------------------------------------------------------
 // 真实 `.kcomp` 的按域装载 + 页级权限强制。
@@ -32,7 +32,6 @@ pub(crate) const IMAGE_BSS_STORED: usize = 0x4242_5353;
 pub(crate) const CMD_REPORT: usize = 0;
 pub(crate) const CMD_STORE_TEXT: usize = 1;
 pub(crate) const CMD_FETCH_DATA: usize = 2;
-pub(crate) const CMD_LOAD_TARGET: usize = 3;
 
 pub(crate) const R_X: MappingPermission = MappingPermission::READ.union(MappingPermission::EXECUTE);
 pub(crate) const R_W: MappingPermission = MappingPermission::READ.union(MappingPermission::WRITE);
@@ -301,8 +300,7 @@ pub(crate) fn isolated_image_wrong_env() -> ! {
 /// `Faulted`。返回现场观察值（cause / stval / 故障页翻译结果）。
 ///
 /// `target` 由夹具创建后决定 Core 提供给组件的目标地址（`target_va` 槽）：
-/// 权限用例用 0（组件只用自身上报的地址），`isolated-core-unreachable` 用
-/// 夹具内的 Core 专属金丝雀页。
+/// 权限用例用 0（组件只用自身上报的地址）。
 pub(crate) struct FaultObservation {
     fixture: IsolatedImageFixture,
     cause: usize,

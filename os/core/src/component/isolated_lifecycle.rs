@@ -34,16 +34,19 @@
 //! - **组件提议**：`kcomp_instance_create` 返回的 opaque state（Core 只存）与其
 //!   内部行为；`kcomp_instance_destroy` 自行收尾。
 //!
-//! # 内存路径：Core 预置窗口，**无 import 面**
+//! # 内存路径：窄 import 面 + Core 预置窗口
 //!
-//! Isolated 没有 component→Core gate-call trampoline，import 包络保持**空集**：
-//! 任何 UNDEF 符号（含 `kcore_*`）在装载前显式拒绝；跨域 service 调用由 **Core
-//! 主动发起**，provider 不需要回调 Core。替代机制是 Core 预置的**实例内存窗口**
-//! （[`ISOLATED_WINDOW_BASE`]：Core backing、零初始化、只映射在该实例私有 AS），
-//! 交付 create args / out_state / runtime context；窗口表示是**实例内 VA**（归属
-//! 由该实例页表承载，Core 不另立账本），同一 VA 在 Core AS / 别的实例 AS 里没有
-//! 任何映射。service 邮箱（[`ISOLATED_MAILBOX_BASE`]）同一 backing 纪律：扁平
-//! 调用帧只经这里过边界（拷贝，绝不共享），邮箱只在该实例私有 AS 里可达。
+//! Isolated 组件保持 S-mode，Core 代码 / 栈 / 全局状态在每个 Isolated AS 里
+//! same VA → same PA，因此 **Isolated → Core 是普通直接调用**（`satp` 不切换）；
+//! 装载前的 import 白名单只放诊断 / 只读查询与 `kcore_panic_escape`
+//! （[`isolated_load::SUPPORTED_IMPORTS`]），其余具名 UNDEF 显式拒绝。
+//! 跨域 service 调用仍由 **Core 主动发起**，provider 不需要回调 Core。create 的
+//! 交付面是 Core 预置的**实例内存窗口**（[`ISOLATED_WINDOW_BASE`]：Core backing、
+//! 零初始化、只映射在该实例私有 AS），交付 create args / out_state / runtime
+//! context；窗口表示是**实例内 VA**（归属由该实例页表承载，Core 不另立账本），
+//! 同一 VA 在别的实例 AS 里没有任何映射。service 邮箱
+//! （[`ISOLATED_MAILBOX_BASE`]）同一 backing 纪律：扁平调用帧只经这里过边界
+//! （拷贝，绝不共享），邮箱只在该实例私有 AS 里可达。
 //!
 //! 窗口布局（**Core 内部**；组件只用 Core 经 `a0` .. `a3` / `tp` 交给它的实例内
 //! VA，不需要知道偏移）：
@@ -79,21 +82,22 @@
 //!
 //! # 明确不做（当前边界）
 //!
-//! Isolated provider **不能自己 publish endpoint**（没有组件→Core import 面；
-//! endpoint 真相仍由 Core 拥有；出站 Isolated caller 继续显式拒绝）。destroy 后
-//! 不做物理回收（窗口 / backing 驻留）。ASID 恒 0 + 全量 `sfence.vma`；没有
-//! U-mode / `ecall`。邮箱容量固定，没有共享内存、没有 per-call 映射。
-//! **组件内 Rust `panic!` 不是被收敛的故障**：Isolated 组件没有
-//! `kcore_panic_escape` import 面，panic handler 只能自旋（同步调用 = 挂住调用
-//! 者）；被收敛的是 **trap**（非法指令 / 缺页 / 权限 fault）。
+//! Isolated provider **不能自己 publish endpoint**：import 白名单只放诊断 / 只读
+//! 查询与 `kcore_panic_escape`，endpoint 真相仍由 Core 拥有；出站 Isolated caller
+//! 继续显式拒绝。destroy 后不做物理回收（窗口 / backing 驻留）。ASID 恒 0 + 全量
+//! `sfence.vma`；没有 U-mode / `ecall`。邮箱容量固定，没有共享内存、没有 per-call
+//! 映射。**组件内 Rust `panic!` 经 `kcore_panic_escape` 逃逸**（跨 AS 现场 →
+//! trampoline 交回挂起的 Core 调用者，`Outcome::Faulted` 由调用方边界清理）；
+//! 组件没有其他 Core import 面，真正的强制边界仍是 U-mode（未实现）。
 //!
 //! # 诚实边界
 //!
 //! - **协作式、非对抗**：S-mode 组件与 Core 同特权级，可以直接改 `satp` / 自己的
 //!   映射；本模块不声称对抗隔离（那是 U-mode / SandboxedNative，未实现）。
-//! - **CPU isolation ≠ DMA isolation**：Isolated 实例的 AS 只映射自己的镜像 /
-//!   机制页 / 栈 / 窗口 / 邮箱，**不含**任何 MMIO / Core 段 / 页表 / 别的实例；
-//!   Core 拥有的 DMA backing 是否可被错误复用仍不声称 DMA 静默。
+//! - **CPU isolation ≠ DMA isolation**：Isolated 实例 AS = 共享 Core 映射
+//!   （same VA → same PA）+ 该实例自己的镜像 / 栈 / 窗口 / 邮箱；**不含**别的
+//!   实例的私有映射（页表保证 A 看不到 B 的 backing）。Core 拥有的 DMA backing
+//!   是否可被错误复用仍不声称 DMA 静默。
 //! - **每个组件拥有私有 backing**：同 artifact 两次 instantiate 各自按域放段 /
 //!   重定位到独立 backing（writable `.data` / `.bss` 回到 artifact 初始状态），
 //!   再经 Core 预置窗口承载实例级交付。**不回收**旧组件的 backing（phase 1：

@@ -517,7 +517,7 @@ mod tests {
     }
 
     /// 停止路径（与失败路径共用 Core 兜底）使被停实例的 endpoint 永久失效；
-    /// 共享同一 image 的其它实例的 endpoint 不受影响。
+    /// 其它实例的 endpoint 不受影响。
     #[test]
     fn stop_invalidates_only_the_stopped_instances_endpoints() {
         use crate::component::abi::{InterfaceAbi, InterfaceKind};
