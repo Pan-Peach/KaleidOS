@@ -75,6 +75,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         (*state).filesystem.littlefs_multi = false;
         (*state).filesystem.littlefs_isolation = false;
         (*state).filesystem.littlefs_direct = false;
+        (*state).filesystem.component_multi_instance = false;
         (*state).driver.prober_id = -1;
         (*state).driver.cursor = 0;
         (*state).driver.candidate_count = 0;

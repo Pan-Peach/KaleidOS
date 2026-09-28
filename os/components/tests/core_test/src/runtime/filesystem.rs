@@ -10,6 +10,9 @@
 //!   format + selftest）并从自己的 filesystem endpoint 读回 selftest 文件。
 //! - **littlefs isolation**：把实例 A 的**原始存储**整段擦成 0xFF 后，A 的
 //!   selftest 文件不再读得出，而 B 的实例仍逐字节正确——两个实例的状态不共享。
+//! - **component multi-instance（block 级直证）**：同一 `ram_blk_rw` artifact 的
+//!   两个实例，各自对同一扇区写不同 pattern——A 的写不出现在 B 的读回里、B 的写
+//!   不影响 A，不经文件系统直接证明 per-instance backing 不共享（身份断言走 trace）。
 //!
 //! 全部在 task context 执行（块调用契约要求 task；消费者必须是 task）。task 只把
 //! 结果写回 [`State`]，报告在 create 上下文里、调度返回后统一发出。
@@ -80,6 +83,8 @@ pub struct State {
     pub littlefs_isolation: bool,
     /// littlefs 业务绑定机制是 Direct（block + filesystem）。
     pub littlefs_direct: bool,
+    /// 同一 `ram_blk_rw` artifact 的两个实例（block 级）存储互不相干。
+    pub component_multi_instance: bool,
 }
 
 /// 无 config 负载的 create args（`ram_blk` / `ram_blk_rw` 不需要配置）。
@@ -135,6 +140,43 @@ fn read_exact(binding: &FileSystemBinding, path: &CStr, expected: &[u8]) -> bool
         Err(_) => false,
     };
     content_ok && closed
+}
+
+/// block 级多实例直证：两个同源 `ram_blk_rw` 实例对同一扇区的读写互不可见。
+///
+/// 先各自读回原始内容，再向 `a` 写 pattern、断言 `b` 读回仍等于自己的原始内容
+/// 且不含 pattern；随后向 `b` 写不同 pattern、断言 `a` 仍持有自己的写入。pattern
+/// 刻意与对应实例的原始内容不同（取反码），因此"写没生效 / 内容恰好相同"不可能
+/// 蒙混过关。若两实例共享同一 backing，A（或 B）的写会出现在对方的读回里，本
+/// 函数必然失败。
+fn blocks_independent(a: &Endpoint<BlockDevice>, b: &Endpoint<BlockDevice>) -> bool {
+    let (Ok(a), Ok(b)) = (a.bind(), b.bind()) else {
+        return false;
+    };
+    let lba = 0u64;
+    let mut a_before = [0u8; SECTOR];
+    let mut b_before = [0u8; SECTOR];
+    let originals = a.read(lba, &mut a_before).is_ok() && b.read(lba, &mut b_before).is_ok();
+
+    // A 的 pattern 与 A、B 的原始内容都不同（各取一个字节的反码）：写后 A 必须
+    // 等于它，而 B 必须仍等于自己的原始内容。
+    let mut pattern_a = [0xA5u8; SECTOR];
+    pattern_a[0] = b_before[0] ^ 0xFF;
+    pattern_a[1] = a_before[1] ^ 0xFF;
+    let wrote_a = a.write(lba, &pattern_a).is_ok();
+    let mut b_after_a = [0u8; SECTOR];
+    let b_untouched =
+        b.read(lba, &mut b_after_a).is_ok() && b_after_a == b_before && b_after_a != pattern_a;
+
+    // B 写入不同 pattern：B 自己读回新内容，A 仍持有自己的 pattern。
+    let pattern_b = [0x5Au8; SECTOR];
+    let wrote_b = b.write(lba, &pattern_b).is_ok();
+    let mut b_after_b = [0u8; SECTOR];
+    let mut a_after_b = [0u8; SECTOR];
+    let b_holds = b.read(lba, &mut b_after_b).is_ok() && b_after_b == pattern_b;
+    let a_holds = a.read(lba, &mut a_after_b).is_ok() && a_after_b == pattern_a;
+
+    originals && wrote_a && b_untouched && wrote_b && b_holds && a_holds
 }
 
 /// block chain：provider → fatfs → filesystem endpoint → 精确内容。
@@ -212,8 +254,9 @@ fn block_chain() -> (bool, bool) {
     )
 }
 
-/// littlefs 多实例 + 隔离。返回 (多实例成功, 存储隔离成立, 绑定机制 Direct)。
-fn littlefs_multi() -> (bool, bool, bool) {
+/// littlefs 多实例 + 隔离 + block 级多实例直证。
+/// 返回 (多实例成功, 存储隔离成立, 绑定机制 Direct, block 级两实例独立)。
+fn littlefs_multi() -> (bool, bool, bool, bool) {
     let window = trace::cursor();
     let mut providers = [0u32; CHAINS];
     let mut instances = [0u32; CHAINS];
@@ -335,7 +378,27 @@ fn littlefs_multi() -> (bool, bool, bool) {
         false
     };
 
-    (multi, isolation, block_direct && fs_direct)
+    // (7) 组件多实例（block 级直证）：同一 `ram_blk_rw` artifact 的两个实例，身份
+    //     互异（trace 里有出生记录、各自走完 Ready 生命周期、block EndpointId 不同）
+    //     且扇区存储互不相干。比 littlefs 层更直接：不经文件系统，直接对两个
+    //     provider 的同一扇区读写——共享 backing 会让 A 的写出现在 B 的读回里。
+    let multi_instance = match (block_endpoints[0], block_endpoints[1]) {
+        (Some(a), Some(b)) => {
+            let mut declared = [0u32; CHAINS * 2];
+            let declared_count = trace::declared_components(window, &mut declared);
+            let declared_both = declared[..declared_count].contains(&providers[0])
+                && declared[..declared_count].contains(&providers[1]);
+            declared_both
+                && providers[0] != providers[1]
+                && trace::component_lifecycle(window, providers[0] as i32)
+                && trace::component_lifecycle(window, providers[1] as i32)
+                && a.id() != b.id()
+                && blocks_independent(&a, &b)
+        }
+        _ => false,
+    };
+
+    (multi, isolation, block_direct && fs_direct, multi_instance)
 }
 
 /// 场景 task：全部文件系统集成动作都在 task context 里跑。
@@ -346,10 +409,11 @@ extern "C" fn task(arg: *mut ()) {
     let (block_chain_ok, block_chain_direct) = block_chain();
     state.block_chain = block_chain_ok;
     state.block_chain_direct = block_chain_direct;
-    let (multi, isolation, direct) = littlefs_multi();
+    let (multi, isolation, direct, multi_instance) = littlefs_multi();
     state.littlefs_multi = multi;
     state.littlefs_isolation = isolation;
     state.littlefs_direct = direct;
+    state.component_multi_instance = multi_instance;
 
     unsafe { kcomp_sdk::abi::kcore_task_exit() };
     // task_exit 永不返回本任务；防御性驻留（不可达）。
@@ -383,5 +447,10 @@ pub fn report(checks: &mut Checks, state: &State) {
     checks.check(31, "block-chain-direct", state.block_chain_direct);
     checks.check(32, "littlefs-multi-instance", state.littlefs_multi);
     checks.check(33, "littlefs-isolation", state.littlefs_isolation);
+    checks.check(
+        42,
+        "component-multi-instance",
+        state.component_multi_instance,
+    );
     checks.check(34, "littlefs-direct", state.littlefs_direct);
 }

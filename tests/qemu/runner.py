@@ -97,6 +97,7 @@ CORE_TEST_CASES = (
     "block-chain-direct",
     "littlefs-multi-instance",
     "littlefs-isolation",
+    "component-multi-instance",
     "littlefs-direct",
     "driver-candidates",
     "driver-prober-load",
