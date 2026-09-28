@@ -1,0 +1,7 @@
+# KaleidOS profile: x86_64 / supervisor / MMU.
+# SKELETON ONLY: os/arch/src/x86_64 and os/boot/x86_64 are `todo!()`.  This
+# profile resolves and cross-builds; it does not boot until implemented.
+
+CONFIG_ARCH_X86_64=y
+CONFIG_PRIVILEGE_SUPERVISOR=y
+CONFIG_VM_MMU=y

@@ -30,12 +30,26 @@ except ImportError:
     sys.exit("error: kconfiglib not found; run "
              "`git submodule update --init --recursive`")
 
-# Architecture -> (KCFG_ARCH, KCFG_TARGET, KCFG_LINKER, KCFG_QEMU, KCFG_QEMU_MEM).
+# Architecture -> (KCFG_ARCH, KCFG_TARGET, KCFG_LINKER, KCFG_QEMU, KCFG_QEMU_MEM,
+#                   KCFG_BOOT_DIR).
+# KCFG_BOOT_DIR is the per-arch boot/binary crate directory (see docs/modules/boot.md).
 ARCH_MAP = {
     "CONFIG_ARCH_RISCV32": ("rv32", "riscv32imac-unknown-none-elf",
-                            "linker32.ld", "qemu-system-riscv32", "1G"),
+                            "linker32.ld", "qemu-system-riscv32", "1G",
+                            "os/boot/riscv"),
     "CONFIG_ARCH_RISCV64": ("rv64", "riscv64gc-unknown-none-elf",
-                            "linker.ld", "qemu-system-riscv64", "4G"),
+                            "linker.ld", "qemu-system-riscv64", "4G",
+                            "os/boot/riscv"),
+    # New-ISA skeletons (os/boot/<arch> are todo!() until brought up).
+    "CONFIG_ARCH_X86_64": ("x86_64", "x86_64-unknown-none",
+                           "linker.ld", "qemu-system-x86_64", "512M",
+                           "os/boot/x86_64"),
+    "CONFIG_ARCH_AARCH64": ("aarch64", "aarch64-unknown-none",
+                            "linker.ld", "qemu-system-aarch64", "1G",
+                            "os/boot/aarch64"),
+    "CONFIG_ARCH_LOONGARCH64": ("loongarch64", "loongarch64-unknown-none",
+                                "linker.ld", "qemu-system-loongarch64", "1G",
+                                "os/boot/loongarch64"),
 }
 
 # Privilege / VM symbol -> the boot-crate feature spelling.
@@ -85,18 +99,21 @@ def variables(kconf):
     features = [PRIV_MAP[priv], VM_MAP[vm]]
     if is_y(kconf, "CONFIG_PREEMPT"):
         features.append("preempt")
+    if is_y(kconf, "CONFIG_SMP"):
+        features.append("smp")
     if is_y(kconf, "CONFIG_TRACE"):
         features.append("trace")
     if is_y(kconf, "CONFIG_SELFTEST"):
         features.append("selftest")
 
-    arch_name, target, linker, qemu, qemu_mem = ARCH_MAP[arch]
+    arch_name, target, linker, qemu, qemu_mem, boot_dir = ARCH_MAP[arch]
     lines = [
         ("KCFG_ARCH", arch_name),
         ("KCFG_TARGET", target),
         ("KCFG_LINKER", linker),
         ("KCFG_QEMU", qemu),
         ("KCFG_QEMU_MEM", qemu_mem),
+        ("KCFG_BOOT_DIR", boot_dir),
         ("KCFG_BOOT_FEATURES", ",".join(features)),
         ("KCFG_SELFTEST", "y" if is_y(kconf, "CONFIG_SELFTEST") else "n"),
     ]

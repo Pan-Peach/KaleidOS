@@ -347,13 +347,13 @@ mod tests {
         };
         devices[1] = pio;
         crate::machine::commit(crate::machine::MachineInfo {
-            boot_hart: 0,
+            boot_hardware_id: crate::machine::HardwareCpuId::from_raw(0),
             timebase_frequency: 10_000_000,
             cpu_count: 1,
             cpu_info: [crate::machine::CpuInfo {
                 boot_cpu: true,
-                hart_id: crate::machine::CpuId::from_raw(0),
-            }; 8],
+                hardware_id: crate::machine::HardwareCpuId::from_raw(0),
+            }; crate::machine::MAX_CPUS],
             mem_count: 1,
             memory_regions: [crate::machine::MemoryRegion {
                 base: 0x8000_0000,

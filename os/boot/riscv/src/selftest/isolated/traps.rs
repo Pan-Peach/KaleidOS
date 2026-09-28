@@ -62,7 +62,7 @@ pub(crate) fn isolated_timer() -> ! {
     pass("isolated-timer")
 }
 
-pub(crate) extern "C" fn isolated_timer_handler() {
+pub(crate) fn isolated_timer_handler(_cpu: kernel::machine::CpuId) {
     TIMER_COUNT.fetch_add(1, Ordering::AcqRel);
     TIMER_HANDLER_SATP.store(read_satp(), Ordering::Release);
     TIMER_HANDLER_SP.store(read_sp(), Ordering::Release);

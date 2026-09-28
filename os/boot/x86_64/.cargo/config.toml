@@ -1,0 +1,9 @@
+# NOTE: no `[build] target` default.  The build target is part of the Kconfig
+# profile and is always passed explicitly (`--target $(KCFG_TARGET)`) by the
+# Makefile, so a stray `cargo build` here cannot silently pick an architecture.
+# Only the per-target linker script below is kept.
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+]

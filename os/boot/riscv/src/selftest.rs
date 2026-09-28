@@ -1,7 +1,7 @@
 use arch::{CpuArch, InterruptController, ResetType, SystemReset, Timer};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::global_asm, mem::MaybeUninit};
-use kernel::machine::{IoSpace, MachineInfo};
+use kernel::machine::{CpuId, IoSpace, MachineInfo};
 
 const STACK_BYTES: usize = 4096;
 const UNMAPPED_ADDRESS: usize = 0x4000_0000;
@@ -175,6 +175,13 @@ pub fn run(info: &MachineInfo) -> ! {
         b"breakpoint" => breakpoint_fault(),
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
+        // SMP（CONFIG_SMP）：骨架用例，实现待手写；只在 opt-in 的 SMP 测试目标里跑。
+        #[cfg(feature = "smp")]
+        b"smp-boot" => smp_boot(),
+        #[cfg(feature = "smp")]
+        b"smp-ipi" => smp_ipi(),
+        #[cfg(feature = "smp")]
+        b"smp-percpu" => smp_percpu(),
         // 私有 AS 跨 AS trampoline（机制证明）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-transition" => isolated_tests::isolated_transition(),
@@ -590,7 +597,7 @@ fn timer() -> ! {
     pass("timer")
 }
 
-extern "C" fn timer_handler() {
+fn timer_handler(_cpu: CpuId) {
     TIMER_HANDLER_COUNT.fetch_add(1, Ordering::AcqRel);
     arch::TimerImpl::cancel_deadline();
 }
@@ -609,7 +616,7 @@ fn external_irq(info: &MachineInfo) -> ! {
     const IER_THRE: u8 = 0x02;
     const WAIT_TICKS: u64 = 10_000_000;
 
-    let (plic_base, _) = find_mmio(
+    let _ = find_mmio(
         info,
         &[b"riscv,plic0".as_slice(), b"sifive,plic-1.0.0".as_slice()],
     )
@@ -618,7 +625,8 @@ fn external_irq(info: &MachineInfo) -> ! {
     let uart_line = find_irq(info, &[b"ns16550a".as_slice()]).expect("UART irq not found");
     let ier = uart_base + UART_IER_OFFSET;
 
-    <arch::InterruptImpl as arch::InterruptController>::configure(plic_base, info.boot_hart);
+    // PLIC 已由 boot 全局配置（`configure` 在 UP 阶段只允许一次）；此用例只注册
+    // handler 并使能线，不再重复 configure。
     arch::InterruptImpl::register_external_handler(external_irq_handler);
     arch::InterruptImpl::enable(uart_line);
 
@@ -651,10 +659,11 @@ fn external_irq(info: &MachineInfo) -> ! {
     pass("external-irq")
 }
 
-extern "C" fn external_irq_handler() {
+fn external_irq_handler(_cpu: CpuId) {
     // 顺序要紧：**先 claim 再关源**。claim 读走 pending 并置 in-service、才拿得到 id；
     // 若先关设备（UART 电平触发），pending 随电平撤销，claim 会返回 0。
-    if let Some(line) = arch::InterruptImpl::claim() {
+    if let Some(claim) = arch::InterruptImpl::claim() {
+        let line = arch::InterruptImpl::claim_line(&claim);
         EXTERNAL_IRQ_LINE.store(line as usize, Ordering::Release);
         // 关中断源（THRE 电平触发：不关的话 complete 后立刻又 pending = 风暴）
         let ier = UART_IER_ADDR.load(Ordering::Acquire);
@@ -662,9 +671,27 @@ extern "C" fn external_irq_handler() {
             // SAFETY: 已发现 UART 的 IER 寄存器（字节宽）。
             unsafe { core::ptr::write_volatile(ier as *mut u8, 0) };
         }
-        arch::InterruptImpl::complete(line);
+        arch::InterruptImpl::complete(claim);
     }
     EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// SMP 骨架用例：启动次 CPU 并证明其 online（实现待手写）。
+#[cfg(feature = "smp")]
+fn smp_boot() -> ! {
+    todo!("SMP: bring up a secondary CPU via Core and prove it reaches Online")
+}
+
+/// SMP 骨架用例：发 IPI 并证明目标 CPU 处理了它（实现待手写）。
+#[cfg(feature = "smp")]
+fn smp_ipi() -> ! {
+    todo!("SMP: send an IPI and prove the target drains the pending work")
+}
+
+/// SMP 骨架用例：证明 per-CPU 状态彼此独立（实现待手写）。
+#[cfg(feature = "smp")]
+fn smp_percpu() -> ! {
+    todo!("SMP: prove per-CPU state (sched/timer/containment) is distinct per CPU")
 }
 
 // ---------------------------------------------------------------------------

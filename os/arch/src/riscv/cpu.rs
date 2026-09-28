@@ -111,8 +111,19 @@ impl CpuArch for Riscv {
         context.tp = slot;
     }
 
-    fn init() {
+    fn init_cpu() {
         trap::init();
+    }
+
+    fn enable_irq() {
+        // 打开当前 CPU 的全局中断使能位（S-mode `sstatus.SIE` / M-mode `mstatus.MIE`）。
+        // 各本地中断源（timer/external/IPI）应先各自 unmask，最后再调这里。
+        unsafe {
+            #[cfg(all(feature = "supervisor", not(feature = "machine")))]
+            asm!("csrs sstatus, {mask}", mask = in(reg) IRQ_ENABLE_BIT);
+            #[cfg(all(feature = "machine", not(feature = "supervisor")))]
+            asm!("csrs mstatus, {mask}", mask = in(reg) IRQ_ENABLE_BIT);
+        }
     }
 
     fn disable_irq() -> Self::IrqFlags {
@@ -156,9 +167,37 @@ impl CpuArch for Riscv {
             asm!("wfi", options(nomem, nostack, preserves_flags));
         }
     }
+
+    // ——— SMP：CPU-local 身份与基址（骨架，实现待手写）———
+    //
+    // 设计定案（见 docs/modules/arch.md）：`sscratch` 目前承载「安全 trap 栈」
+    // 约定（`trap/supervisor.rs`），不能被简单改成 per-CPU 指针。正确做法是把它
+    // 升级为 **arch 私有的 CPU 入口记录**（`core_base` + `logical/hardware` id +
+    // trap 栈状态），并同步改普通 trap、嵌套 trap、containment 非局部返回路径。
+    // 在那之前这三个方法保持 `todo!()`，不得偷偷用 `mscratch` 或占用通用寄存器。
+    //
+    // `tp`（runtime slot）与 per-CPU 基址严格分离：本方法不动 `tp`。
+
+    fn current_cpu() -> Option<crate::cpu::CpuId> {
+        todo!("SMP: read the Core-assigned logical CPU identity from the arch entry record")
+    }
+
+    fn per_cpu_base() -> Option<core::ptr::NonNull<()>> {
+        todo!("SMP: return the Core local storage pointer from the arch entry record")
+    }
+
+    unsafe fn install_per_cpu_base(_cpu: crate::cpu::CpuId, _base: core::ptr::NonNull<()>) {
+        todo!("SMP: publish the Core local storage into the arch entry record on this CPU")
+    }
 }
 
 impl Timer for Riscv {
+    fn init_cpu() -> Result<(), crate::smp::InitError> {
+        // UP：无 per-CPU timer 状态；deadline 编程见 `firmware::set_timer`。
+        // SMP：实现时在此初始化本 CPU 的 `mtimecmp` 路径。
+        Ok(())
+    }
+
     fn now() -> u64 {
         firmware::time()
     }
@@ -171,7 +210,7 @@ impl Timer for Riscv {
         firmware::cancel_timer();
     }
 
-    fn register_timer_handler(handler: extern "C" fn()) {
+    fn register_timer_handler(handler: crate::cpu::LocalInterruptHandler) {
         trap::register_timer_handler(handler);
     }
 

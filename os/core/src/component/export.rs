@@ -274,8 +274,11 @@ extern "C" fn kcore_trace_stats(out: *mut crate::trace::TraceStatsAbi) -> i32 {
 // Category 3：Machine query（已提交机器真相的只读查询；counts/ids → u32）
 // ---------------------------------------------------------------------------
 
+// NOTE(SMP): 硬件身份已是 u64（`HardwareCpuId`）。这里暂时保留 u32 的组件 ABI
+// 形状（QEMU hartid 都在 u32 内）；把 ABI 原地加宽到 u64 需要同步重生成
+// abi/* 产物（`make abi-gen`），作为独立的组件边界任务。
 extern "C" fn kcore_machine_boot_hart() -> u32 {
-    with_core_critical(|| machine::committed().map_or(0, |m| m.boot_hart as u32))
+    with_core_critical(|| machine::committed().map_or(0, |m| m.boot_hardware_id.raw() as u32))
 }
 
 /// 单调时钟（`rdtime` 的原始 tick）——组件侧计时用，无 authority 语义。
@@ -302,7 +305,7 @@ extern "C" fn kcore_machine_has_hart(hart_id: u32) -> i32 {
         };
         machine.cpu_info[..machine.cpu_count.min(machine.cpu_info.len())]
             .iter()
-            .any(|cpu| cpu.hart_id.raw() == hart_id as usize) as i32
+            .any(|cpu| cpu.hardware_id.raw() == hart_id as u64) as i32
     })
 }
 

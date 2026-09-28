@@ -12,6 +12,10 @@ machine = []
 vm-mmu = []
 vm-nommu = []
 
+# SMP 后端机制（CPU 启动 + IPI 传输）。SMP 骨架：接口已定、实现 todo!()。
+# 由 Kconfig 的 CONFIG_SMP 经 genmk.py 映射进来（见 docs/architecture/kconfig.md）。
+smp = []
+
 [dependencies]
 bitflags = { version = "2", default-features = false }
 

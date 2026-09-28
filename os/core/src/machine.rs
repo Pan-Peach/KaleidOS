@@ -41,30 +41,28 @@ impl core::fmt::Debug for CompatStr {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CpuId(pub usize);
+// 逻辑 CPU 身份（`CpuId`）与硬件 CPU 身份（`HardwareCpuId`）定义在 `arch`：
+// arch 的 trait 签名需要逻辑 id，而 arch 不依赖 core。这里 re-export，
+// `core::machine::CpuId` 仍是 Core 侧唯一入口（契约不变）。
+pub use arch::cpu::{CpuId, HardwareCpuId};
 
-impl core::fmt::Display for CpuId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "CPU{}", self.0)
-    }
-}
-
-impl CpuId {
-    pub const fn from_raw(raw: usize) -> Self {
-        Self(raw)
-    }
-
-    pub const fn raw(self) -> usize {
-        self.0
-    }
-}
-
+/// 一个被发现的 CPU：Core 按数组下标赋**逻辑** id（`CpuInfo` 的顺序即逻辑序），
+/// 而 `hardware_id` 是 discovery 报来的**硬件**身份（hartid/APIC/MPIDR/CPUID）。
+///
+/// 二者不同：硬件 id 可能稀疏、非零起点，**绝不能**当数组下标用。
 #[derive(Debug, Clone, Copy)]
 pub struct CpuInfo {
     pub boot_cpu: bool,
-    pub hart_id: CpuId,
+    pub hardware_id: HardwareCpuId,
 }
+
+/// Discovery 能承载的最大 CPU 数（`MachineInfo.cpu_info` 的容量）。
+///
+/// 这是**编译期容量**（定长数组大小），不是运行时真值：真实 CPU 数一律由
+/// `MachineInfo.cpu_count`（bootstrap 从 FDT/ACPI 发现后填写）决定。SMP 的
+/// `CpuMask` / per-CPU 索引以本常量为上界；Core 只使用 `[..cpu_count]` 前缀。
+/// 要支持更多 CPU，只改这一处（连同 `cpu_info` 的数组类型）。
+pub const MAX_CPUS: usize = 8;
 
 #[derive(Clone, Copy)]
 pub struct MemoryRegion {
@@ -230,10 +228,11 @@ impl core::fmt::Debug for DeviceDescriptor {
 /// 所有字段都是值，无借用 → DTB 可丢，MachineInfo 可自由传递/持久化。
 #[derive(Clone, Copy)]
 pub struct MachineInfo {
-    pub boot_hart: usize,
+    /// BSP 的**硬件**身份（不是逻辑 `CpuId`；逻辑 id 由 Core 按下标赋）。
+    pub boot_hardware_id: HardwareCpuId,
     pub timebase_frequency: u64,
     pub cpu_count: usize,
-    pub cpu_info: [CpuInfo; 8],
+    pub cpu_info: [CpuInfo; MAX_CPUS],
     pub mem_count: usize,
     pub memory_regions: [MemoryRegion; 16],
     pub dev_count: usize,
@@ -243,7 +242,7 @@ pub struct MachineInfo {
 impl core::fmt::Debug for MachineInfo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MachineInfo")
-            .field("boot_hart", &self.boot_hart)
+            .field("boot_hardware_id", &self.boot_hardware_id)
             .field("timebase_frequency", &self.timebase_frequency)
             .field("cpu_count", &self.cpu_count)
             .field("cpu_info", &&self.cpu_info[..self.cpu_count])
@@ -295,13 +294,13 @@ mod tests {
 
     fn info(devices: [DeviceDescriptor; 26], dev_count: usize) -> MachineInfo {
         MachineInfo {
-            boot_hart: 0,
+            boot_hardware_id: HardwareCpuId::from_raw(0),
             timebase_frequency: 10_000_000,
             cpu_count: 1,
             cpu_info: [CpuInfo {
                 boot_cpu: true,
-                hart_id: CpuId::from_raw(0),
-            }; 8],
+                hardware_id: HardwareCpuId::from_raw(0),
+            }; MAX_CPUS],
             mem_count: 1,
             memory_regions: [MemoryRegion {
                 base: 0x8000_0000,
@@ -541,7 +540,10 @@ mod tests {
 
         // Then: 身份 + 计数 + 声明设备可见，尾部空槽不可见。
         assert!(text.contains("MachineInfo"), "{text}");
-        assert!(text.contains("boot_hart: 0"), "{text}");
+        assert!(
+            text.contains("boot_hardware_id: HardwareCpuId(0)"),
+            "{text}"
+        );
         assert!(text.contains("cpu_count: 1"), "{text}");
         assert!(text.contains("mem_count: 1"), "{text}");
         assert!(text.contains("memory_regions"), "{text}");

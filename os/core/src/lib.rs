@@ -36,6 +36,7 @@ pub mod monitor;
 pub mod print;
 pub mod resource;
 pub mod sched;
+pub mod smp;
 pub mod task;
 pub mod timer;
 pub mod trace;
@@ -70,7 +71,7 @@ pub fn init(
     }
     if !info.cpu_info[..info.cpu_count]
         .iter()
-        .any(|cpu| cpu.hart_id.raw() == info.boot_hart)
+        .any(|cpu| cpu.hardware_id == info.boot_hardware_id)
     {
         return Err("boot hart is not present in cpu info");
     }

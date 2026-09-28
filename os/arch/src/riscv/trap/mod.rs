@@ -10,25 +10,47 @@
 //! `Interrupt` 与 `Scause`（cause 编码在 S/M 模式一致，只差寄存器名与
 //! 中断位位置的处理方式）。
 
+use crate::cpu::{CpuId, LocalInterruptHandler};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// 当前执行 CPU 的**逻辑**身份。
+///
+/// UP 阶段恒 `CpuId(0)`（调度器当前也是单例身份）；SMP 阶段从 CPU-local 入口
+/// 记录读取已绑定的逻辑 id。**不**需要改 trap 汇编——分发点在 Rust 侧。
+fn current_logical_cpu() -> CpuId {
+    #[cfg(feature = "smp")]
+    {
+        use crate::CpuArch;
+        // SMP：未绑定的 AP 是**不变式破坏**，绝不能回退成 CpuId(0)——那会把
+        // 定时器/调度/containment 操作指向错误的 CPU。
+        crate::CpuImpl::current_cpu()
+            .expect("SMP: current CPU is not bound during interrupt dispatch")
+    }
+    #[cfg(not(feature = "smp"))]
+    {
+        // UP 约定：唯一逻辑 CPU 恒为 CpuId(0)。这个例外**不得**带进 SMP。
+        CpuId::from_raw(0)
+    }
+}
 
 static TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-pub fn register_timer_handler(handler: extern "C" fn()) {
+pub fn register_timer_handler(handler: LocalInterruptHandler) {
     TIMER_HANDLER.store(handler as usize, Ordering::Release);
 }
 
 pub fn dispatch_timer() {
     let address = TIMER_HANDLER.load(Ordering::Acquire);
     assert!(address != 0, "timer interrupt handler is not registered");
-    let handler: extern "C" fn() = unsafe { core::mem::transmute(address) };
-    handler();
+    // SAFETY: 注册方保证签名与 `LocalInterruptHandler` 一致（单一注册入口）。
+    let handler: LocalInterruptHandler = unsafe { core::mem::transmute(address) };
+    handler(current_logical_cpu());
 }
 
 /// 外部中断回调（Core 在 `irq::init` 时注册 `crate::irq::on_external`）。
 static EXTERNAL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-pub fn register_external_handler(handler: extern "C" fn()) {
+pub fn register_external_handler(handler: LocalInterruptHandler) {
     EXTERNAL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
@@ -37,8 +59,9 @@ pub fn register_external_handler(handler: extern "C" fn()) {
 pub fn dispatch_external() {
     let address = EXTERNAL_HANDLER.load(Ordering::Acquire);
     assert!(address != 0, "external interrupt handler is not registered");
-    let handler: extern "C" fn() = unsafe { core::mem::transmute(address) };
-    handler();
+    // SAFETY: 注册方保证签名与 `LocalInterruptHandler` 一致（单一注册入口）。
+    let handler: LocalInterruptHandler = unsafe { core::mem::transmute(address) };
+    handler(current_logical_cpu());
 }
 
 #[repr(C)]

@@ -1,3 +1,5 @@
+use crate::cpu::{CpuId, HardwareCpuId};
+use crate::smp::{CpuStartError, InitError, IpiError, LocalInterruptHandler, SecondaryBoot, Smp};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
@@ -19,6 +21,14 @@ pub struct Fake;
 std::thread_local! {
     static IRQ_ENABLED: Cell<bool> = const { Cell::new(true) };
     static LAST_SWITCH_IRQ_ENABLED: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+// SMP 骨架：host 用一个线程本地绑定模拟「本 CPU 的 CPU-local 状态」。
+// 真机语义（sscratch / GS / TPIDR_EL1 / KSAVE）见各 ISA 后端；host 只作为
+// 可观察的占位，让 Core 的 per-CPU 骨架在 host 上可编译、可测试。
+std::thread_local! {
+    static CPU_ID: Cell<Option<usize>> = const { Cell::new(None) };
+    static CPU_BASE: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
 }
 
 #[doc(hidden)]
@@ -82,8 +92,13 @@ impl CpuArch for Fake {
         context.regs[4] = slot;
     }
 
-    fn init() {
+    fn init_cpu() {
         // host 无真实 trap 入口：no-op 占位。
+    }
+
+    fn enable_irq() {
+        // host 无真实全局中断使能：把模拟状态置为启用，供 irq-save 测试观察。
+        IRQ_ENABLED.with(|enabled| enabled.set(true));
     }
 
     fn disable_irq() -> Self::IrqFlags {
@@ -98,9 +113,63 @@ impl CpuArch for Fake {
     fn wait_for_interrupt() {
         // host 无中断/时钟硬件：no-op（真机语义见 Riscv 实现）。
     }
+
+    fn current_cpu() -> Option<CpuId> {
+        CPU_ID.with(|id| id.get()).map(CpuId::from_raw)
+    }
+
+    fn per_cpu_base() -> Option<core::ptr::NonNull<()>> {
+        CPU_BASE.with(|base| core::ptr::NonNull::new(base.get()))
+    }
+
+    unsafe fn install_per_cpu_base(cpu: CpuId, base: core::ptr::NonNull<()>) {
+        // host 无真实入口记录：线程本地占位，供 Core per-CPU 骨架测试观察。
+        CPU_ID.with(|id| id.set(Some(cpu.raw())));
+        CPU_BASE.with(|slot| slot.set(base.as_ptr()));
+    }
+}
+
+// SMP 骨架：host 没有真实次 CPU / IPI 硬件。方法体一律 `todo!()`，因为任何
+// host 测试都不应真的启动 CPU 或发 IPI；它们的存在只是让 `SmpImpl` 在 host 上
+// 满足 trait bound，并让 Core 的 smp 骨架可编译。
+impl Smp for Fake {
+    type BootConfig = ();
+
+    unsafe fn prepare(_config: &'static Self::BootConfig) -> Result<(), InitError> {
+        todo!("SMP: host fake has no secondary CPU startup")
+    }
+
+    unsafe fn start_cpu(
+        _target: HardwareCpuId,
+        _boot: &'static SecondaryBoot,
+    ) -> Result<(), CpuStartError> {
+        todo!("SMP: host fake has no secondary CPU startup")
+    }
+
+    fn init_cpu() -> Result<(), InitError> {
+        Ok(())
+    }
+
+    fn register_ipi_handler(_handler: LocalInterruptHandler) -> Result<(), InitError> {
+        todo!("SMP: host fake has no IPI transport")
+    }
+
+    fn enable_ipi_interrupt() {}
+
+    fn send_ipi(_target: HardwareCpuId) -> Result<(), IpiError> {
+        todo!("SMP: host fake has no IPI transport")
+    }
+
+    fn send_ipi_mask(_targets: &[HardwareCpuId]) -> Result<(), IpiError> {
+        todo!("SMP: host fake has no IPI transport")
+    }
 }
 
 impl Timer for Fake {
+    fn init_cpu() -> Result<(), InitError> {
+        Ok(())
+    }
+
     fn now() -> u64 {
         // host 占位时间源（C5 骨架）：非单调 0，仅供编译/接线占位。
         0
@@ -112,21 +181,37 @@ impl Timer for Fake {
 
     fn cancel_deadline() {}
 
-    fn register_timer_handler(_handler: extern "C" fn()) {}
+    fn register_timer_handler(_handler: LocalInterruptHandler) {}
 
     fn enable_timer_interrupt() {}
 }
 
 // host 无中断硬件：控制器全是 no-op，claim 恒 None（永远不会投递外部中断）。
 impl InterruptController for Fake {
-    fn configure(_base: usize, _hart_id: usize) {}
+    type Config = ();
+    type Claim = u32;
+
+    unsafe fn configure(_config: ()) -> Result<(), InitError> {
+        Ok(())
+    }
+
+    fn init_cpu() -> Result<(), InitError> {
+        Ok(())
+    }
+
     fn enable(_line: u32) {}
     fn disable(_line: u32) {}
+
     fn claim() -> Option<u32> {
         None
     }
-    fn complete(_line: u32) {}
-    fn register_external_handler(_handler: extern "C" fn()) {}
+
+    fn claim_line(claim: &u32) -> u32 {
+        *claim
+    }
+
+    fn complete(_claim: u32) {}
+    fn register_external_handler(_handler: LocalInterruptHandler) {}
     fn enable_external_interrupt() {}
 }
 

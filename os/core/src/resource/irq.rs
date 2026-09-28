@@ -227,9 +227,10 @@ pub fn enable(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
         let table = get_table().lock();
         table.number_for(device_index).ok_or(IrqError::NoHandler)?
     };
-    // 先开控制器上的线，再开 CPU 闸门（顺序反了容易吃到伪中断）。
+    // 只开控制器上的**这条线**。本 CPU 的外部中断投递源与全局闸门在
+    // `irq::init`（`InterruptController::init_cpu`）与 boot 的 `enable_irq` 里
+    // 处理——`enable(line)` 不得在**任意调用者 CPU** 上开本地投递。
     arch::InterruptImpl::enable(number);
-    arch::InterruptImpl::enable_external_interrupt();
     Ok(())
 }
 

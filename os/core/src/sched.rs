@@ -105,12 +105,23 @@ fn deny_scheduling_forbidden() -> Result<(), SchedError> {
 /// `anchor` = 任务之外执行流（monitor / 组件 init 调用栈）的挂起上下文；
 /// 全部任务退出后 CPU 回到这里。首次 `run()` 时捕获，之后每次耗尽任务
 /// 都回到同一份（Box 地址稳定，跨切换有效）。
+///
+/// **SMP**：`CpuState` 是天然 per-CPU 单元——`CONFIG_SMP` 下每个逻辑 CPU 一份
+/// （`CPU_TABLE`），彼此独立；任务表仍是全局共享真相，跨 CPU 互斥由 commit
+/// 路径负责（见 `docs/modules/arch.md`）。
 struct CpuState {
     anchor: Option<Box<ContextImpl>>,
     current: Option<TaskId>,
 }
 
+#[cfg(not(feature = "smp"))]
 static CPU: Once<Mutex<CpuState>> = Once::new();
+
+/// SMP（CONFIG_SMP）：每逻辑 CPU 一份调度真相，索引 = 逻辑 `CpuId`。
+///
+/// 这是 SMP 骨架的**接口接缝**：非 SMP 构建走上面的单一 `CPU`，行为完全不变。
+#[cfg(feature = "smp")]
+static CPU_TABLE: Once<crate::smp::PerCpu<Mutex<CpuState>>> = Once::new();
 
 /// 调度策略配置（Core truth）：**只记 EndpointId** + 选择时为策略执行准备的
 /// Core-owned 栈。
@@ -130,11 +141,22 @@ struct PolicySlot {
 static POLICY: Once<Mutex<PolicySlot>> = Once::new();
 
 pub fn init() {
+    #[cfg(not(feature = "smp"))]
     CPU.call_once(|| {
         Mutex::new(CpuState {
             anchor: None,
             current: None,
         })
+    });
+    #[cfg(feature = "smp")]
+    CPU_TABLE.call_once(|| {
+        crate::smp::PerCpu::new(crate::machine::MAX_CPUS, |_| {
+            Mutex::new(CpuState {
+                anchor: None,
+                current: None,
+            })
+        })
+        .expect("sched per-cpu table allocation failed")
     });
     POLICY.call_once(|| {
         Mutex::new(PolicySlot {
@@ -145,8 +167,44 @@ pub fn init() {
     });
 }
 
+/// 当前执行 CPU 的逻辑身份。非 SMP 恒为 CPU0；SMP 下由 arch 入口记录解析。
+#[cfg(not(feature = "smp"))]
+fn current_cpu_id() -> CpuId {
+    CpuId(0)
+}
+
+#[cfg(feature = "smp")]
+fn current_cpu_id() -> CpuId {
+    crate::smp::current_cpu()
+}
+
+#[cfg(not(feature = "smp"))]
 fn cpu() -> &'static Mutex<CpuState> {
     CPU.get().expect("sched not initialized")
+}
+
+/// SMP：取**当前执行 CPU** 的调度真相。锁纪律不变（调用点仍只短暂持锁）。
+#[cfg(feature = "smp")]
+fn cpu() -> &'static Mutex<CpuState> {
+    CPU_TABLE
+        .get()
+        .expect("sched not initialized")
+        .get(current_cpu_id())
+        .expect("current cpu outside the per-cpu scheduler table")
+}
+
+/// SMP：初始化某个 CPU 的调度状态（AP 在本地启动时调用）。
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) fn init_cpu(_cpu: CpuId) -> Result<(), SchedError> {
+    todo!("SMP: initialize this CPU's scheduler state (anchor/current) locally")
+}
+
+/// SMP：请求目标 CPU 在**安全边界**重新调度（不在 IPI 回调里切上下文）。
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) fn request_reschedule(_cpu: CpuId) -> Result<(), SchedError> {
+    todo!("SMP: mark a reschedule request for the target CPU")
 }
 
 fn policy() -> &'static Mutex<PolicySlot> {
@@ -493,7 +551,7 @@ fn schedule_next_with_guard(
                 // owner 先取（Copy），再可变借 table 推进状态。
                 let owner = table.get(id).ok_or(SchedError::NotFound)?.owner();
                 table
-                    .transition(id, TaskState::Running(CpuId(0)))
+                    .transition(id, TaskState::Running(current_cpu_id()))
                     .map_err(|_| SchedError::InvalidTransition)?;
                 cpu_guard.current = Some(id);
                 let rec = table.get_mut(id).ok_or(SchedError::NotFound)?;

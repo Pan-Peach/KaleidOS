@@ -81,6 +81,11 @@ def check_profiles_and_archtest_stack_resolve(tmp):
         ("qemu_rv64", "rv64", "riscv64gc-unknown-none-elf"),
         ("qemu_rv32", "rv32", "riscv32imac-unknown-none-elf"),
         ("qemu_rv32_nommu", "rv32", "riscv32imac-unknown-none-elf"),
+        # New-ISA skeletons: the profiles must resolve and map to the right
+        # KCFG_TARGET (they are not built by CI until brought up).
+        ("qemu_x86_64", "x86_64", "x86_64-unknown-none"),
+        ("qemu_aarch64", "aarch64", "aarch64-unknown-none"),
+        ("qemu_loongarch64", "loongarch64", "loongarch64-unknown-none"),
     ):
         config = build_config(os.path.join(tmp, board), board)
         text = read(config + ".mk")

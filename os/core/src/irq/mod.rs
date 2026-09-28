@@ -17,18 +17,26 @@
 //! 工作量需要时再上。
 
 use crate::component::{ComponentId, containment};
+use crate::machine::CpuId;
 use crate::resource::irq::IrqHandler;
 use arch::{CpuArch, CpuImpl, InterruptController, InterruptImpl};
 
 /// irq-save 临界区 guard：进入时保存并关中断，退出时恢复。
+///
+/// `_cpu_local` 让本 guard **不是 `Send`/`Sync`**：它保存的是**创建它的 CPU**
+/// 的中断状态，跨 CPU / 跨线程 restore 会恢复错误的状态。
 pub struct IrqSaveGuard {
     flags: Option<<CpuImpl as CpuArch>::IrqFlags>,
+    _cpu_local: core::marker::PhantomData<*mut ()>,
 }
 
 impl IrqSaveGuard {
     pub fn new() -> Self {
         let flags = CpuImpl::disable_irq();
-        Self { flags: Some(flags) }
+        Self {
+            flags: Some(flags),
+            _cpu_local: core::marker::PhantomData,
+        }
     }
 }
 
@@ -53,6 +61,19 @@ impl Drop for IrqSaveGuard {
 /// [`crate::resource::irq::enable`] 触发（避免 boot 期无谓开闸）。
 pub fn init() {
     InterruptImpl::register_external_handler(on_external);
+    // 本 CPU 的外部中断投递源（本地）；全局使能由 boot 在 `kernel::init` 之后
+    // 用 `CpuArch::enable_irq` 单独负责。设备线 enable 不再碰投递源。
+    let _ = <InterruptImpl as InterruptController>::init_cpu();
+}
+
+/// SMP：初始化**当前执行 CPU** 的本地中断嵌套状态（AP 在本地启动时调用）。
+///
+/// 非 SMP 构建没有这个接缝。SMP 实现时，`on_external` 要带上硬件 CPU 身份，
+/// `IrqSaveGuard` 的保存标志只属于创建它的 CPU（并应标记为 non-`Send`/`Sync`）。
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), arch::smp::InitError> {
+    todo!("SMP: initialize this CPU's local external-interrupt nesting state")
 }
 
 /// 外部中断入口（trap 分发调用；中断上下文，已关中断）。
@@ -63,8 +84,9 @@ pub fn init() {
 ///
 /// handler 在 Core 建立的 **IRQ 归属作用域**内执行（[`dispatch_callback`]）：
 /// principal = 该线 owner，`task = None`；作用域同步、不可 yield。
-pub extern "C" fn on_external() {
-    while let Some(line) = InterruptImpl::claim() {
+pub fn on_external(_cpu: CpuId) {
+    while let Some(claim) = InterruptImpl::claim() {
+        let line = InterruptImpl::claim_line(&claim);
         crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq: line });
         let target = route(line);
         let owner = target.map(|(owner, _, _)| owner);
@@ -79,7 +101,7 @@ pub extern "C" fn on_external() {
             dispatch_callback(handler, ctx, owner);
         }
         crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq: line });
-        InterruptImpl::complete(line);
+        InterruptImpl::complete(claim);
     }
 }
 

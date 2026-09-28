@@ -23,6 +23,9 @@ PROJECT_ROOT := $(abspath $(CURDIR))
 # checkout path while retaining the boot crate's linker script when RUSTFLAGS
 # from the environment overrides Cargo's target-specific flags.
 REMAP_RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(PROJECT_ROOT)=.
+# Per-arch boot/binary crate dir.  Default is the RISC-V one so config-free
+# goals (clean/fmt) still work without a .config; build goals override it from
+# the generated fragment's KCFG_BOOT_DIR (the single config -> build mapping).
 BOOT_DIR := os/boot/riscv
 
 KCONFIG_CONFIG ?= .config
@@ -67,6 +70,10 @@ endif
 KCFG_GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),kernel)
 ifneq ($(strip $(filter-out $(CONFIG_FREE_GOALS) $(CONFIG_ONLY_GOALS),$(KCFG_GOALS))),)
 include $(KCONFIG_MK)
+# Build goals select the boot dir from the resolved config (KCFG_BOOT_DIR is
+# emitted by genmk.py).  `override` keeps a stray command-line BOOT_DIR from
+# creating a second source of truth, mirroring the KCFG_* discipline.
+override BOOT_DIR := $(KCFG_BOOT_DIR)
 endif
 
 # Explicit default goal: the generated-fragment rule above must not become it.
@@ -267,7 +274,7 @@ distclean: clean
 #   make test-qemu  自动 QEMU（RV64 + RV32；boot smoke + 自动 CoreTest）
 #   make test-arch  ArchTest 白盒 selftest（RV64 + RV32）
 # 其余测试目标都是内部助手：`_` 前缀，不进 `make help`，也不是对外契约。
-.PHONY: fmt clippy check abi-gen abi-check test test-host test-qemu _test-qemu-rv64 _test-qemu-rv32 _test-qemu-one test-arch _test-arch-rv64 _test-arch-rv32 _test-arch-one _test-build _test-kconfig bench boot-build boot-check
+.PHONY: fmt clippy check abi-gen abi-check test test-host test-qemu _test-qemu-rv64 _test-qemu-rv32 _test-qemu-one test-arch _test-arch-rv64 _test-arch-rv32 _test-arch-one _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64 test-arch-x86_64 test-arch-aarch64 test-arch-loongarch64 test-arch-new _test-arch-core-one _test-arch-smp-rv64 _test-arch-smp-one test-arch-smp-rv64 smp_defconfig _test-build _test-kconfig bench boot-build boot-check
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test
@@ -281,6 +288,9 @@ fmt:
 	cd os/components/tests/drivers/ram_blk && cargo fmt
 	cd os/components/tests/drivers/ram_blk_rw && cargo fmt
 	cd os/boot/riscv && cargo fmt
+	cd os/boot/x86_64 && cargo fmt
+	cd os/boot/aarch64 && cargo fmt
+	cd os/boot/loongarch64 && cargo fmt
 
 # lint（clippy，只查我们自己：third_party 已 exclude，失败即失败）
 # core_test / scheduler_rr 的 lib 是 staticlib（最终产物，需裸机 panic handler），
@@ -387,6 +397,52 @@ _test-arch-one: kernel
 # 公开入口：两个架构都跑。
 test-arch: _test-arch-rv64 _test-arch-rv32
 
+# Opt-in new-ISA ArchTest (skeleton).  These FAIL until the ISA boot path
+# (os/boot/<arch>) is implemented — that is the point.  Deliberately NOT part of
+# `test-arch` / `test` / `check`, so the RISC-V baseline and CI stay green.
+# New-ISA targets use the Core-only image: `.kcomp` components are still
+# RISC-V-relocation-only, so building the full `kernel` (init.kpkg) for a new ISA
+# would fail.  The skeleton selftest cases need no components.
+_test-arch-core-one: core
+	@python3 tests/qemu/arch_runner.py --arch $(KCFG_ARCH) --kernel $(CORE_OUTPUT)
+
+_test-arch-x86_64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-x86_64/.config qemu_x86_64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-x86_64/.config selftest_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-x86_64/.config _test-arch-core-one
+
+_test-arch-aarch64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-aarch64/.config qemu_aarch64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-aarch64/.config selftest_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-aarch64/.config _test-arch-core-one
+
+_test-arch-loongarch64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-loongarch64/.config qemu_loongarch64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-loongarch64/.config selftest_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-loongarch64/.config _test-arch-core-one
+
+test-arch-x86_64: _test-arch-x86_64
+test-arch-aarch64: _test-arch-aarch64
+test-arch-loongarch64: _test-arch-loongarch64
+# All three skeleton ISAs at once (expected to fail until implemented).
+test-arch-new: _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64
+
+# Opt-in RISC-V SMP ArchTest (CONFIG_SMP=y).  The three `smp-*` cases are
+# `todo!()` until SMP is implemented, so this is NOT part of `test-arch`.
+smp_defconfig:
+	@$(CONFIGURE) --base $(KCONFIG_CONFIG) --fragment configs/smp.fragment --out $(KCONFIG_CONFIG)
+
+_test-arch-smp-rv64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config qemu_rv64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config selftest_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config smp_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config _test-arch-smp-one
+
+_test-arch-smp-one: kernel
+	@python3 tests/qemu/arch_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --smp
+
+test-arch-smp-rv64: _test-arch-smp-rv64
+
 # 完整测试：host 单测 + 两个架构的 QEMU CoreTest + ArchTest。
 test: test-host test-qemu test-arch
 
@@ -398,6 +454,9 @@ check: init.kpkg
 	cd os/components/kbench && cargo fmt -- --check
 	cd os/components/tests/drivers/ram_blk && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
+	cd os/boot/x86_64 && cargo fmt -- --check
+	cd os/boot/aarch64 && cargo fmt -- --check
+	cd os/boot/loongarch64 && cargo fmt -- --check
 	cargo clippy --workspace --all-targets --exclude core_test --exclude scheduler_rr -- -D warnings
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings

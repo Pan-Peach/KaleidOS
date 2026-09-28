@@ -84,7 +84,7 @@ mod tests {
     }
 
     fn commit_device(device_index: usize, compatible: &[u8]) {
-        use crate::machine::{self, CpuId, CpuInfo, MachineInfo, MemoryRegion};
+        use crate::machine::{self, CpuInfo, HardwareCpuId, MachineInfo, MemoryRegion};
         let mut devices = [DeviceDescriptor::empty(); 26];
         devices[device_index] = DeviceDescriptor {
             space: IoSpace::Mmio {
@@ -101,13 +101,13 @@ mod tests {
             compat_count: 1,
         };
         machine::commit(MachineInfo {
-            boot_hart: 0,
+            boot_hardware_id: HardwareCpuId::from_raw(0),
             timebase_frequency: 10_000_000,
             cpu_count: 1,
             cpu_info: [CpuInfo {
                 boot_cpu: true,
-                hart_id: CpuId::from_raw(0),
-            }; 8],
+                hardware_id: HardwareCpuId::from_raw(0),
+            }; crate::machine::MAX_CPUS],
             mem_count: 1,
             memory_regions: [MemoryRegion {
                 base: 0x8000_0000,

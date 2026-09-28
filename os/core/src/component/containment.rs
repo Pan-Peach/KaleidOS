@@ -415,6 +415,37 @@ pub fn init() {
     }
 }
 
+/// Per-CPU containment state（SMP 骨架接缝，`CONFIG_SMP`）。
+///
+/// 今天这一整块是**单活动 CPU**的进程级 `static mut`（`ACTIVE_GUARD` /
+/// `ANCHOR_GUARD` / `TASK_REGION` / `CORE_ABI_DEPTH` / abort 与 scratch 上下文 /
+/// `TASK_GUARD` / `ACTIVE_CROSS_AS`）。SMP 下它们必须变成**每 CPU 一份**保存在
+/// 本结构里（Oracle：只搬 CPU-local 的当前执行/escape 状态，不按 CPU 复制身份表），
+/// 且 panic 路径的访问仍必须无锁、不得跨组件调用 / IRQ 嵌套 / 上下文切换持有
+/// Rust 可变引用。
+///
+/// 骨架先留空壳：字段在把上述 `static mut` 迁进来时补。**它不是组件 runtime slot。**
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) struct CpuContainment {
+    _reserved: (),
+}
+
+/// SMP：初始化**当前执行 CPU** 的 containment 本地状态（AP 在本地启动时调用）。
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), ContainmentInitError> {
+    todo!("SMP: move the containment static-mut set into a per-CPU CpuContainment")
+}
+
+/// [`init_cpu`] 的失败原因。
+#[cfg(feature = "smp")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainmentInitError {
+    /// 本地栈 / 上下文准备失败。
+    NoStack,
+}
+
 fn abort_stack_top() -> usize {
     // SAFETY: [Category 1 — Initialization] only forms the one-past-end address
     // of the static abort stack; no reference is created.

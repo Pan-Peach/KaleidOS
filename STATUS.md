@@ -140,11 +140,11 @@ Hardware                                    目前只有 QEMU virt
 
 #### 3.12 Arch 层 `▰▰▰▱▱` EXPERIMENTAL（层是 ACTIVE，不是 stable）
 
-现状：backend trait（`CpuArch`/`Timer`/`InterruptController`/`Console`/`SystemReset`）加 `riscv`/`fake`/`nommu` 实现；Sv32/Sv39 页表、trap、trampoline 都在 `os/arch/src/`。RISC-V backend 验证充分：host 直驱生产实现测编解码与 walk、`RiscvRelocator`；QEMU ArchTest 覆盖 trap、页表权限、context switch、timer、PLIC。
+现状：backend trait（`CpuArch`/`Timer`/`InterruptController`/`Smp`/`Console`/`SystemReset`）加 `riscv`/`fake`/`nommu` 实现；多个 ISA 骨架；`CpuId`（逻辑）与 `HardwareCpuId`（硬件）分离（定义在 arch，Core re-export）；中断回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 已原地改为 `Config`/`Claim` + `init_cpu`；`ComponentRelocationImpl` 按 ISA 选择。RISC-V backend 验证充分：host 直驱生产实现测编解码与 walk、`RiscvRelocator`；QEMU ArchTest 覆盖 trap、页表权限、context switch、timer、PLIC。
 
-缺口：跨架构抽象没有被第二个 ISA 验证，"arch 是抽象"目前只是主张；没有真机；机器差异欠验证；AArch64/x86_64/LoongArch 零代码。RISC-V bring-up 进展可观，但层本身还在动。
+缺口：跨架构抽象**已有骨架但未被第二个 ISA 验证**——`os/arch/src/{x86_64,aarch64,loongarch64}` 与 `os/boot/<isa>` 已建（同形，实现体 `todo!()`），能编译、未启动、未验证；没有真机；机器差异欠验证。SMP 接口已收敛（`Smp` trait / `LocalInterruptHandler` / `InterruptController` 的 `Config`+`Claim` / `CpuArch::init_cpu`+`enable_irq`），但实现与 CPU-local 存储（`sscratch` 入口记录、per-CPU trap 栈）都是 `todo!()`，属协调 trap bring-up 的工作。RISC-V bring-up 进展可观，但层本身还在动。
 
-下一步：Core 词汇稳定后按 x86_64 → aarch64 → loongarch64 的顺序补第二 ISA。M-mode 补 boot harness 之后才有意义。
+下一步：实现 SMP（per-CPU 状态 + AP 启动 + IPI，先 RISC-V）；按 x86_64 → aarch64 → loongarch64 顺序做第二 ISA 的真实 bring-up。新 ISA 的 ArchTest 入口已就绪但 opt-in（`make test-arch-{x86_64,aarch64,loongarch64}`，boot 未实现前会失败）；`.kcomp` 组件目前仍是 RISC-V 重定位专用，新 ISA 先用 Core-only 镜像。M-mode 补 boot harness 之后才有意义。
 
 ### 组件与执行域
 

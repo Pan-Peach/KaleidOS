@@ -1,0 +1,32 @@
+[package]
+name = "bootstrap"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace, like os/boot/riscv: managed kernel builds state their
+# profile explicitly and never rely on a default.
+[workspace]
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+test = false
+
+[features]
+# No `default` on purpose: `.config` is the single source of truth.
+supervisor = ["arch/supervisor", "kernel/supervisor"]
+machine = ["arch/machine", "kernel/machine"]
+vm-mmu = ["arch/vm-mmu", "kernel/vm-mmu"]
+vm-nommu = ["arch/vm-nommu", "kernel/vm-nommu"]
+preempt = ["kernel/preempt"]
+smp = ["arch/smp", "kernel/smp"]
+trace = ["kernel/trace"]
+selftest = []
+
+[dependencies]
+arch = { path = "../../arch", default-features = false }
+kernel = { path = "../../core", default-features = false }
+spin = { version = "0.12.1", default-features = false, features = ["spin_mutex", "once"] }
+
+[profile.release]
+panic = "abort"

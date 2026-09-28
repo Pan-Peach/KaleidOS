@@ -31,8 +31,19 @@ CASE_TIMEOUT_S = 30
 EXIT_TIMEOUT_S = 10
 
 ARCH_CONF = {
-    "rv64": {"qemu": "qemu-system-riscv64", "mem": "4G"},
-    "rv32": {"qemu": "qemu-system-riscv32", "mem": "1G"},
+    "rv64": {"qemu": "qemu-system-riscv64", "mem": "4G",
+             "extra": ["-machine", "virt", "-bios", "default"]},
+    "rv32": {"qemu": "qemu-system-riscv32", "mem": "1G",
+             "extra": ["-machine", "virt", "-bios", "default"]},
+    # New-ISA skeletons: NOT part of the default `test-arch` aggregate; only the
+    # opt-in `test-arch-<arch>` targets run these, so the RISC-V baseline stays
+    # green while the boot paths are still `todo!()`.
+    "x86_64": {"qemu": "qemu-system-x86_64", "mem": "512M",
+               "extra": ["-machine", "q35", "-cpu", "qemu64"]},
+    "aarch64": {"qemu": "qemu-system-aarch64", "mem": "1G",
+                "extra": ["-machine", "virt", "-cpu", "cortex-a57", "-bios", "default"]},
+    "loongarch64": {"qemu": "qemu-system-loongarch64", "mem": "1G",
+                    "extra": ["-machine", "virt"]},
 }
 
 # (case name, expected scause, required serial substring)
@@ -168,6 +179,25 @@ CASES = (
     ("isolated-nested-fault", None, None),
 )
 
+# New-ISA ArchTest cases.  They FAIL until the ISA boot path is implemented
+# (os/boot/<arch> is all `todo!()`), which is the point: after hand-implementing
+# the boot path, run the opt-in `test-arch-<arch>` target and watch these pass.
+# Never run by the default `test-arch` aggregate.
+NEW_ARCH_CASES = (
+    ("smp-boot", None, None),
+    ("timer", None, None),
+    ("external-irq", None, None),
+)
+
+# RISC-V SMP cases (CONFIG_SMP).  Run only with `--smp`; the default `test-arch`
+# leaves CONFIG_SMP off, so these `todo!()`-backed cases never affect the
+# RISC-V baseline.
+SMP_CASES = (
+    ("smp-boot", None, None),
+    ("smp-ipi", None, None),
+    ("smp-percpu", None, None),
+)
+
 
 class RunFailure(Exception):
     """A QEMU case did not meet its observable serial-output contract."""
@@ -266,10 +296,9 @@ def run_case(
     conf = ARCH_CONF[arch]
     command = [
         conf["qemu"],
-        "-machine", "virt",
+        *conf["extra"],
         "-smp", "2",
         "-m", conf["mem"],
-        "-bios", "default",
         "-kernel", kernel,
         "-nographic",
     ]
@@ -316,6 +345,8 @@ def parse_args():
                         help="profile arch: selects the QEMU binary")
     parser.add_argument("--kernel", required=True, metavar="PATH",
                         help="boot artifact to test (the Makefile passes $(OUTPUT))")
+    parser.add_argument("--smp", action="store_true",
+                        help="also run the optional RISC-V SMP cases (CONFIG_SMP build)")
     return parser.parse_args()
 
 
@@ -330,8 +361,11 @@ def main() -> int:
         return 1
 
     os.makedirs(LOGS_DIR, exist_ok=True)
+    cases = CASES if arch in ("rv64", "rv32") else NEW_ARCH_CASES
+    if args.smp:
+        cases = cases + SMP_CASES
     failures = 0
-    for name, expected_scause, required_text in CASES:
+    for name, expected_scause, required_text in cases:
         try:
             run_case(arch, kernel, name, expected_scause, required_text)
         except RunFailure:

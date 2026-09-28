@@ -21,6 +21,7 @@
 //!    见 `arch::riscv::trap::supervisor::trap_handler` 的 TODO）；
 //! 4. 中断开闸：`sie.STIE` + `sstatus.SIE`（`CpuImpl` 侧原语）；
 //! 5. 可选抢占：仅 `preempt` profile 由 `init_preempt` 使用周期 deadline。
+use crate::machine::CpuId;
 use arch::Timer;
 use spin::Mutex;
 
@@ -52,6 +53,8 @@ pub enum TimerError {
     AlreadyInitialized,
     /// 未初始化（`on_trap` / `ticks` 先于 `init`）。
     NotInitialized,
+    /// 后端本地初始化失败（`arch::Timer::init_cpu`）。
+    BackendInit,
 }
 
 /// 初始化 one-shot timer 机制：登记时钟回调并打开 timer interrupt。
@@ -67,9 +70,21 @@ pub fn init() -> Result<(), TimerError> {
         state.initialized = true;
     }
 
+    <arch::TimerImpl as Timer>::init_cpu().map_err(|_| TimerError::BackendInit)?;
     arch::TimerImpl::register_timer_handler(on_trap);
     arch::TimerImpl::enable_timer_interrupt();
     Ok(())
+}
+
+/// SMP：初始化**当前执行 CPU** 的 timer 本地状态（AP 在本地启动时调用）。
+///
+/// 非 SMP 构建没有这个接缝。SMP 实现时，`STATE` 全局量要拆成 per-CPU
+/// （`TimerState` 按 `CpuId` 索引，各自 `next_deadline`），`on_trap` 也要带上
+/// 硬件 CPU 身份——本地 timer 本地编程，不需要远端接口。
+#[cfg(feature = "smp")]
+#[allow(dead_code)]
+pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), TimerError> {
+    todo!("SMP: initialize this CPU's local timer state and unmask its timer source")
 }
 
 /// 编程下一次 one-shot deadline。
@@ -114,7 +129,7 @@ pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
 /// （`crate::sched::on_timer_tick`）。
 ///
 /// 抢占模型（延迟重调度 vs trap 内直接切换）见 [`crate::sched::on_timer_tick`]。
-pub extern "C" fn on_trap() {
+pub fn on_trap(_cpu: CpuId) {
     #[cfg(feature = "preempt")]
     let now = arch::TimerImpl::now();
     let next = {
@@ -182,7 +197,7 @@ mod tests {
         assert_eq!(ticks(), 0);
 
         // When: 未初始化时时钟 trap 到达。
-        on_trap();
+        on_trap(CpuId::from_raw(0));
 
         // Then: not-initialized 早退路径不改变 tick 计数。
         assert_eq!(ticks(), 0);
@@ -202,9 +217,9 @@ mod tests {
         assert_eq!(STATE.lock().next_deadline, Some(500));
 
         // When: 时钟 trap 连续到达 3 次。
-        on_trap();
-        on_trap();
-        on_trap();
+        on_trap(CpuId::from_raw(0));
+        on_trap(CpuId::from_raw(0));
+        on_trap(CpuId::from_raw(0));
 
         // Then: 每次 trap 都推进 tick 计数。
         assert_eq!(ticks(), 3);
@@ -213,7 +228,7 @@ mod tests {
         // deadline（one-shot 语义），后续 trap 继续计数。
         #[cfg(not(feature = "preempt"))]
         assert_eq!(STATE.lock().next_deadline, None);
-        on_trap();
+        on_trap(CpuId::from_raw(0));
         assert_eq!(ticks(), 4);
     }
 }

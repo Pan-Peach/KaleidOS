@@ -23,7 +23,30 @@ config ARCH_RISCV32
 config ARCH_RISCV64
 	bool "RISC-V 64-bit (RV64)"
 
+config ARCH_X86_64
+	bool "x86_64"
+	help
+	  Skeleton backend only (os/arch/src/x86_64 + os/boot/x86_64 are all
+	  `todo!()`).  It compiles and exposes the HAL contract; it does not boot
+	  or pass ArchTest until a human implements it.
+
+config ARCH_AARCH64
+	bool "AArch64"
+	help
+	  Skeleton backend only (os/arch/src/aarch64 + os/boot/aarch64 are all
+	  `todo!()`).  Compiles; not bootable yet.
+
+config ARCH_LOONGARCH64
+	bool "LoongArch64"
+	help
+	  Skeleton backend only (os/arch/src/loongarch64 + os/boot/loongarch64 are
+	  all `todo!()`).  Compiles; not bootable yet.  See DragonOS / Linux
+	  arch/loongarch for the abstraction to implement.
+
 endchoice
+
+comment "The PRIVILEGE_* / VM_* choices below are RISC-V-flavored transport; \
+new ISAs select the same defaults (supervisor + MMU) for now"
 
 endmenu
 

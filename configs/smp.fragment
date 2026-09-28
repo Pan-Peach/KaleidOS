@@ -1,0 +1,5 @@
+# SMP opt-in fragment (CONFIG_SMP=y).  Layered only by the opt-in SMP ArchTest
+# target; never part of a default profile.  There is deliberately no NR_CPUS:
+# the CPU count is read from the discovered MachineInfo at boot.
+
+CONFIG_SMP=y

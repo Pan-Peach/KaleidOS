@@ -5,7 +5,8 @@ use core::panic::PanicInfo;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{
-    CompatStr, CpuId, CpuInfo, DeviceDescriptor, IoSpace, MachineInfo, MemoryRegion,
+    CompatStr, CpuId, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
+    MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -81,7 +82,47 @@ fn configure_interrupt_controller(info: &MachineInfo) {
         let IoSpace::Mmio { base, .. } = device.space else {
             continue;
         };
-        <arch::InterruptImpl as arch::InterruptController>::configure(base, info.boot_hart);
+        // 板级 PLIC context 计算留在 boot（QEMU virt：S-mode = hart*2+1，
+        // M-mode = hart*2）；逐 CPU 填映射表，arch 不再写死该假设。
+        let plic_context = |hardware: HardwareCpuId| -> usize {
+            #[cfg(feature = "supervisor")]
+            {
+                hardware.raw() as usize * 2 + 1
+            }
+            #[cfg(feature = "machine")]
+            {
+                hardware.raw() as usize * 2
+            }
+        };
+        // TODO(boot): parse `riscv,ndev` from the PLIC node instead of a constant.
+        const PLIC_SOURCE_COUNT: u32 = 1024;
+        let mut contexts = [arch::riscv::plic::PlicCpuContext {
+            cpu: CpuId::from_raw(0),
+            context: 0,
+        }; arch::riscv::plic::MAX_PLIC_CONTEXTS];
+        let count = info.cpu_count.min(arch::riscv::plic::MAX_PLIC_CONTEXTS);
+        for (i, slot) in contexts.iter_mut().enumerate().take(count) {
+            *slot = arch::riscv::plic::PlicCpuContext {
+                cpu: CpuId::from_raw(i),
+                context: plic_context(info.cpu_info[i].hardware_id),
+            };
+        }
+        // SAFETY: base 来自已发现的 PLIC MMIO 窗口。
+        if unsafe {
+            <arch::InterruptImpl as arch::InterruptController>::configure(
+                arch::riscv::plic::PlicConfig {
+                    base,
+                    contexts,
+                    context_count: count,
+                    external_cpu: CpuId::from_raw(0),
+                    source_count: PLIC_SOURCE_COUNT,
+                },
+            )
+        }
+        .is_err()
+        {
+            kernel::log!("discovery", "PLIC configure rejected");
+        }
         return;
     }
     kernel::log!("discovery", "no PLIC found; external IRQ unavailable");
@@ -158,7 +199,7 @@ static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
 /// OpenSBI 选定的 boot hart 进入 payload；其它 hart 留在 firmware 的 warm-boot 路径。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) -> ! {
-    arch::CpuImpl::init();
+    arch::CpuImpl::init_cpu();
     kernel::log!("bootstrap", "arch init OK");
     kernel::log!("bootstrap", "KaleidOS bootstrap");
     kernel::log!("bootstrap", "========================================");
@@ -173,8 +214,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
             let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
             let mut cpu_info = [CpuInfo {
                 boot_cpu: false,
-                hart_id: CpuId(0),
-            }; 8];
+                hardware_id: HardwareCpuId::from_raw(0),
+            }; MAX_CPUS];
             let mut devices = [DeviceDescriptor::empty(); 26];
 
             let mut mem_count = 0usize;
@@ -200,7 +241,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 let hart = cpu.reg::<u64>().first().unwrap_or(0);
                 cpu_info[cpu_count] = CpuInfo {
                     boot_cpu: hart == hart_id as u64,
-                    hart_id: CpuId(hart as usize),
+                    hardware_id: HardwareCpuId::from_raw(hart),
                 };
                 cpu_count += 1;
             }
@@ -217,7 +258,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
             }
 
             let info = MachineInfo {
-                boot_hart: hart_id,
+                boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
                 timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
                 cpu_count,
                 cpu_info,
@@ -316,7 +357,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 /// VMA, with their bytes loaded at the low physical LMA.
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
-    arch::CpuImpl::init();
+    arch::CpuImpl::init_cpu();
 
     let context = unsafe { &*(context_ptr as *const BootContext) };
     kernel::log!("bootstrap", "entered high-half kernel");
@@ -341,6 +382,8 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         let pkg =
             unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
         kernel::component::store::init(pkg);
+        // 显式开全局中断：各本地源已在 kernel::init 中解源。
+        arch::CpuImpl::enable_irq();
         crate::selftest::run(&context.info);
     }
 
@@ -384,6 +427,8 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
                     kernel::log!("store", "store: not initialized");
                 }
 
+                // 显式开全局中断：各本地源已在 kernel::init 中解源。
+                arch::CpuImpl::enable_irq();
                 // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                 kernel::monitor::run();
             }

@@ -1,62 +1,87 @@
 # arch（os/arch/）
 
-> `os/arch` 是 **ISA / firmware backend crate**：定义 backend contract（trait），并由 cfg 选择 RISC-V 或 host `Fake` 实现。
+> `os/arch` 是 **ISA / firmware backend crate**：定义 backend contract（trait），并由 cfg 选择 RISC-V / x86_64 / AArch64 / LoongArch64 / host `Fake` 实现。
 > 它只提供**机制**，不拥有策略、不拥有启动页表布局、不拥有地址空间生命周期。
 
 ## owns 什么真相
 
 `os/arch` 不持有 OS 资源真相；它持有的是**与指令集 / 固件相关的能力契约与具体机制**：
 
-- 后端 trait（定义在 `os/arch/src/lib.rs`）：
+- **CPU 身份类型**（`os/arch/src/cpu.rs`，Core `re-export` 为 `core::machine::CpuId` / `HardwareCpuId`）：
+  - `CpuId`：**逻辑**身份，稠密、从 0 连续，由 Core 从 discovery 赋号；用作 per-CPU 下标。
+  - `HardwareCpuId`：**硬件**身份（hartid / APIC ID / MPIDR / CPUID），稀疏、非数组下标。
+  - `LocalInterruptHandler = fn(CpuId)`：timer / external / IPI 回调的**唯一**注册形状。
+- 后端 trait（`os/arch/src/lib.rs`）：
 
 | trait | 契约方法 | Riscv 实现 | Fake 实现 |
 |---|---|---|---|
-| `CpuArch` | `Context`、`IrqFlags`、`context_switch`、`new_context`、`init`、`disable_irq`、`restore_irq`、`wait_for_interrupt` | `riscv/cpu.rs` | `fake/mod.rs` |
-| `Timer` | `now`、`set_deadline`、`cancel_deadline`、`register_timer_handler`、`enable_timer_interrupt` | `riscv/cpu.rs` | `fake/mod.rs` |
-| `InterruptController` | `configure`、`enable`、`disable`、`claim`、`complete`、`register_external_handler`、`enable_external_interrupt` | `riscv/plic.rs` | `fake/mod.rs` |
-| `Console` | `write_byte`、`getc` | `riscv/cpu.rs` | `fake/mod.rs` |
+| `CpuArch` | `Context`、`IrqFlags`、`context_switch`、`new_context`、`init_cpu`、`enable_irq`、`runtime_slot`/`install_runtime_slot`/`set_context_slot`、`disable_irq`/`restore_irq`、`wait_for_interrupt`、`current_cpu`/`per_cpu_base`/`install_per_cpu_base` | `riscv/cpu.rs` | `fake/mod.rs` |
+| `Timer` | `init_cpu`（本地、disarmed、masked）、`now`、`set_deadline`、`cancel_deadline`、`register_timer_handler(LocalInterruptHandler)`、`enable_timer_interrupt`（只解源） | `riscv/cpu.rs` | `fake/mod.rs` |
+| `InterruptController` | `Config`、`Claim`、`unsafe configure`、`init_cpu`、`enable`/`disable`、`claim`/`claim_line`/`complete`、`register_external_handler(LocalInterruptHandler)`、`enable_external_interrupt` | `riscv/plic.rs`（`PlicConfig` / `PlicClaim`） | `fake/mod.rs` |
+| `Smp` | `BootConfig`、`unsafe prepare`、`unsafe start_cpu`、`init_cpu`、`register_ipi_handler`、`enable_ipi_interrupt`、`send_ipi`、`send_ipi_mask` | `riscv/smp.rs`（骨架） | `fake/mod.rs` |
+| `Console` | `write_byte`、`getc` | `riscv/console.rs` | `fake/mod.rs` |
 | `SystemReset` | `system_reset(ResetType) -> !` | `riscv/cpu.rs` | `fake/mod.rs` |
 
 - 通用地址方案原语：`HIGH_HALF_OFFSET`、`physical_address_of`（RV64 高半区 → 物理；否则恒等）。
-- 架构中立 VM contract（`os/arch/src/vm.rs`）：`AddressSpaceBackend`（`const GRANULE`、`map` / `unmap` / `translate` / `activate`）、`VirtualRange` / `PhysicalRange` / `MappingPermission` / `PageAlloc`。
+- 架构中立 VM contract（`os/arch/src/vm.rs`）：`AddressSpaceBackend`（`GRANULE` / `PRIVATE_ADDRESS_SPACE` / `map` / `unmap` / `translate` / `activate` / `prepare_activation`）。
 - 组件传输 / 对象 ABI 机制：`ComponentStore` / `StoreEntry`（`store.rs`）、`RelocationBackend` / `Relocation` / `WordSize`（`component.rs`）。
-- 具体 RISC-V 机制：trap 入口与分发、context switch、Sv39 / Sv32 页表编码与 walk、NoMMU identity backend、SBI 边界、PLIC、`RiscvRelocator`、私有 AS 的 跨 AS trampoline（双映射 `satp` 切换 / trap 往返）。
+- 具体 ISA 机制：RISC-V trap / context switch / Sv39·Sv32 页表 / SBI / PLIC / `RiscvRelocator` / 跨 AS trampoline；新 ISA 为同形骨架（见下）。
 
 ## 暴露什么机制
 
-- 类型别名（按 cfg 选定具体实现）：`CpuImpl`、`ConsoleImpl`、`ResetImpl`、`TimerImpl`、`InterruptImpl`、`ContextImpl`、`AddressSpaceImpl`、`ComponentRelocationImpl`。
-- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset`（`lib.rs`）、`AddressSpaceBackend`（`vm.rs`）、`ComponentStore`（`store.rs`）、`RelocationBackend`（`component.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`NoMmuAddressSpace`（`nommu.rs`）、`activate` / `flush_tlb`（`riscv/mmu/mod.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`trampoline_enter` / `trampoline_return`（`riscv/trampoline/`，`Transition` 携带入口 `arg0..a3`）、`trap_stack_range` / `register_exception_hook`（`riscv/trap/`）。
+- 类型别名（按 cfg 选定具体实现）：`CpuImpl`、`ConsoleImpl`、`ResetImpl`、`TimerImpl`、`InterruptImpl`、`SmpImpl`、`ContextImpl`、`AddressSpaceImpl`、`ComponentRelocationImpl`。
+- 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Smp` / `Console` / `SystemReset`（`lib.rs`）、`CpuId` / `HardwareCpuId` / `LocalInterruptHandler`（`cpu.rs`）、`Smp` 契约类型（`smp.rs`）、`AddressSpaceBackend`（`vm.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`PlicConfig` / `PlicClaim`（`riscv/plic.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`trampoline_enter` / `trampoline_return`（`riscv/trampoline/`）。
+
+## SMP 骨架状态（`CONFIG_SMP`）
+
+`CONFIG_SMP` 打开 Core 的 per-CPU 路径；**接口已收敛，实现待手写**：
+
+- **已固化（原地替换，无版本后缀）**：`CpuId`/`HardwareCpuId` 分离；回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 的 `Config`/`Claim` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；`CpuArch::init_cpu` + `enable_irq`；`Timer::init_cpu`；**中断使能生命周期显式化**（本地 `init_cpu`/解源 与全局 `enable_irq` 分离，boot 在 `kernel::init` 后显式开闸）；per-ISA 重定位别名。
+- **仍是 `todo!()`（实现阶段）**：`Smp::*`、`CpuArch::current_cpu`/`per_cpu_base`/`install_per_cpu_base`、`InterruptController::init_cpu`、各 ISA 后端内部机制。
+- **协调项（不能只改签名）**：真正的 CPU-local 存储（RISC-V 的 `sscratch` 要升级成 arch 私有入口记录）、per-CPU trap 栈、嵌套 trap / containment 非局部返回约定——这些与 trap bring-up 一起做。
+- **测试入口**：`make test-arch`（rv64+rv32，默认）；`make test-arch-smp-rv64`（opt-in，`smp-*` 用例现在会失败）；`make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（opt-in 新 ISA，boot 未实现前会失败）。
+
+## 新 ISA 骨架（x86_64 / aarch64 / loongarch64）
+
+每个新 ISA 与 riscv **同形**（`<isa>/mod.rs` + `encoding.rs` + `elf.rs` + `console.rs` + `cpu.rs` + `smp.rs` + `trap/` + `context/` + `mmu/`），**实现体一律 `todo!()`**；纯编码模块（`encoding.rs`）可在 host `test` 下编译与单测（当前以 `#[ignore]` 保留，实现后去掉）。
+
+- `encoding.rs`：APIC/ICR（x86_64）、MPIDR/PSCI/SGI（aarch64）、CSR/IOCSR mailbox/IPI（loongarch64）等纯格式。
+- `elf.rs`：各 ISA 的 `RelocationBackend`，`ELF_MACHINE` = 62 / 183 / 258；未实现时 `apply` 返回 `RelocationError::Unsupported`，**绝不误用 RISC-V 语义**。
+- `AddressSpaceImpl`：新 ISA 未实现前用显式占位 `stub_vm::StubAddressSpace`（`PRIVATE_ADDRESS_SPACE = false`），不假装成 Sv39。
+- boot：`os/boot/{x86_64,aarch64,loongarch64}` 骨架（`_start` `todo!()`）；`.kcomp` 组件目前仍是 RISC-V 重定位专用，所以新 ISA ArchTest 用 **Core-only** 镜像。
 
 ## 明确不做
 
-- **不拥有 boot / kernel 页表策略**：identity + high-half 双映射、段权限、临时 root、`enter_high_half` 全在 boot crate 的 `vm/`；arch **不认识** `KERNEL_VMA` / `.text` / `.initpkg` / bootstrap hand-off。
-- **不拥有地址空间生命周期**：`activate` 只碰寄存器；mapping ledger / 所有权在 Core（`memory::address_space`）。
-- **不解析 ELF 文件格式**：ELF 解析在 Core（`component/elf.rs`）；arch 只拥有自己的对象 ABI、重定位种类、指令 patch、链接地址归一化。
-- **不拥有 SBI 语义身份**：SBI 是 firmware ABI，不是 ISA primitive，隔离在 `riscv/firmware.rs`。
+- **不拥有 boot / kernel 页表策略**：identity + high-half 双映射、段权限、临时 root 全在 boot crate 的 `vm/`。
+- **不拥有地址空间生命周期**：`activate` 只碰寄存器；mapping ledger / 所有权在 Core。
+- **不解析 ELF 文件格式**：ELF 解析在 Core；arch 只拥有自己的对象 ABI 与重定位。
+- **不拥有 SBI 语义身份**：SBI 隔离在 `riscv/firmware.rs`。
 - **不拥有设备所有权 / IRQ route / DMA 记账**：那些在 Core。
-- NoMMU 不伪装成 Sv32：无页表、无 `satp`，`GRANULE = 1`，Core 的对齐校验自动退化为 no-op。
+- NoMMU 不伪装成 Sv32：无页表、无 `satp`，`GRANULE = 1`。
+- **不做**调度策略、负载均衡、跨 CPU RPC、远端 timer 编程、通用 `ack_ipi`（见 `smp.rs` 边界）。
 
-## cfg 选择（riscv vs fake）
+## cfg 选择（ISA 后端）
 
 两条独立轴：
 
-1. **target triple**：`riscv32` / `riscv64` → `Riscv` + Sv39/Sv32；否则 → `fake::Fake`（host 测试默认），`pub mod fake` 只在非 RISC-V target 编译。
-2. **Kconfig → Cargo features**：`supervisor` / `machine` 二选一、`vm-mmu` / `vm-nommu` 二选一，由 `compile_error!` 强制；映射集中在 `scripts/kconfig/genmk.py`（`PRIV_MAP` / `VM_MAP` / `ARCH_MAP`），`.config` 是唯一真相。
-   - `AddressSpaceImpl`：NoMMU → `NoMmuAddressSpace`；MMU + riscv64 → `Sv39AddressSpace`；MMU + riscv32 → `Sv32AddressSpace`。
-   - `ComponentRelocationImpl = RiscvRelocator` 在**所有** target 上，因为重定位是纯编码逻辑，host 测试直接驱动生产实现。
+1. **target triple + `target_os`**：
+   - `riscv32`/`riscv64` → `Riscv`；
+   - `all(target_arch = "x86_64", target_os = "none")` → `X86_64`，aarch64 / loongarch64 同理；
+   - **host（`not(target_os = "none")`）→ `Fake`**（host 上的 `x86_64` 必须落到 `Fake`，不能按 `target_arch` 单独判）；
+   - 未支持的裸机目标 → 显式 `compile_error!`。
+2. **Kconfig → Cargo features**：`supervisor`/`machine` 二选一、`vm-mmu`/`vm-nommu` 二选一、`smp`（CONFIG_SMP）；映射集中在 `scripts/kconfig/genmk.py`（`ARCH_MAP` / `PRIV_MAP` / `VM_MAP`），`.config` 是唯一真相。`KCFG_BOOT_DIR` 也由 `ARCH_MAP` 给出（Makefile 不再写死 `os/boot/riscv`）。
 
 ## 代码在哪
 
 | 路径 | 内容 |
 |---|---|
-| `os/arch/src/lib.rs` | 后端 trait、`ResetType`、cfg 别名、`HIGH_HALF_OFFSET` / `physical_address_of` |
+| `os/arch/src/lib.rs` | 后端 trait、`ResetType`、cfg 别名、`physical_address_of` |
+| `os/arch/src/cpu.rs` | `CpuId` / `HardwareCpuId` / `LocalInterruptHandler` |
+| `os/arch/src/smp.rs` | `Smp` trait、`SecondaryBoot`、`InitError`/`CpuStartError`/`IpiError` |
 | `os/arch/src/vm.rs` | `AddressSpaceBackend` 与范围 / 权限类型 |
 | `os/arch/src/component.rs` / `store.rs` | 重定位契约 / 组件 store 契约 |
-| `os/arch/src/nommu.rs` | NoMMU identity backend |
-| `os/arch/src/fake/mod.rs` / `fake/store.rs` | host `Fake` backend / `FakeStore` |
-| `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf}.rs` | RISC-V family 机制 |
-| `os/arch/src/riscv/context/{mod,switch32.S,switch64.S}` | 上下文切换 |
-| `os/arch/src/riscv/trap/{mod,supervisor,machine}.rs` + `trap*.S` | trap 入口 / 分发 / S-mode handler |
-| `os/arch/src/riscv/trampoline/{mod,trampoline32.S,trampoline64.S}` | **最小跨 AS 执行原语**：同步 ABI 保存 / 恢复、按需 `satp` + 全量 `sfence.vma`、目标栈 / `tp` 安装、`a0..a3` 交付；per-invocation `Context`（无 trap 帧 / 相位机 / stvec 切换 / 故障策略）。trap 走普通 `trap/` 路径（安全 trap 栈 + Core 异常钩子）；由 `component/isolated_lifecycle.rs` 生产调用，失败矩阵走同一路径 |
-| `os/arch/src/riscv/mmu/{mod,address_space,sv32,sv39,test_pool}.rs` | Sv32 / Sv39 页表机制 |
-| `os/arch/Kconfig` | `ARCH_*` / `PRIVILEGE_*` / `VM_*` choice |
+| `os/arch/src/stub_vm.rs` | 新 ISA 的显式占位地址空间 |
+| `os/arch/src/nommu.rs` / `fake/` | NoMMU identity backend / host `Fake` backend |
+| `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf,smp}.rs` | RISC-V family 机制 |
+| `os/arch/src/riscv/{context,trap,mmu,trampoline}/` | 上下文 / trap / 页表 / 跨 AS 原语 |
+| `os/arch/src/{x86_64,aarch64,loongarch64}/` | 新 ISA 同形骨架（`todo!()`） |

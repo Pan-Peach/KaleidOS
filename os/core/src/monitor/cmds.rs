@@ -32,12 +32,12 @@ pub fn machine(_line: &[u8]) {
         printk!("machine: not mounted\n");
         return;
     };
-    printk!("boot hart: hart{}\n", info.boot_hart);
+    printk!("boot hart: hart{}\n", info.boot_hardware_id.raw());
     printk!("cpus: {}\n", info.cpu_count);
     for i in 0..info.cpu_count {
         let c = &info.cpu_info[i];
-        // raw()：CpuId 的 Display 是 "CPU0"；这里要裸 hart 号（hart0）。
-        printk!("  hart{} boot={}\n", c.hart_id.raw(), c.boot_cpu);
+        // raw()：HardwareCpuId 的 Display 是 "hwcpuN"；这里要裸 hart 号（hartN）。
+        printk!("  hart{} boot={}\n", c.hardware_id.raw(), c.boot_cpu);
     }
     printk!("memory regions: {}\n", info.mem_count);
     for i in 0..info.mem_count {

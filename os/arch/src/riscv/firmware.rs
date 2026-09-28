@@ -134,34 +134,24 @@ pub fn cancel_timer() {
 
 #[cfg(feature = "supervisor")]
 pub fn enable_timer_interrupt() {
+    // 只解源（`sie.STIE`）；全局 `sstatus.SIE` 由 `CpuArch::enable_irq` 显式打开。
     unsafe {
         core::arch::asm!(
             "csrs sie, {mask}",
             mask = in(reg) (1usize << 5),
             options(nostack, preserves_flags),
         );
-        core::arch::asm!(
-            "csrs sstatus, {mask}",
-            mask = in(reg) (1usize << 1),
-            options(nostack, preserves_flags),
-        );
     }
 }
 
-/// 打开 S-mode 外部中断使能（`sie.SEIE` + `sstatus.SIE`，C6 骨架）。
-///
-/// 只开"闸门"：具体哪条线能中断由中断控制器（PLIC）的 enable bit 决定。
+/// 只开 S-mode 外部中断**源**（`sie.SEIE`）；全局 `sstatus.SIE` 由
+/// `CpuArch::enable_irq` 显式打开。具体哪条线能中断仍由 PLIC enable bit 决定。
 #[cfg(feature = "supervisor")]
 pub fn enable_external_interrupt() {
     unsafe {
         core::arch::asm!(
             "csrs sie, {mask}",
             mask = in(reg) (1usize << 9),
-            options(nostack, preserves_flags),
-        );
-        core::arch::asm!(
-            "csrs sstatus, {mask}",
-            mask = in(reg) (1usize << 1),
             options(nostack, preserves_flags),
         );
     }
@@ -228,32 +218,24 @@ pub fn cancel_timer() {
 
 #[cfg(feature = "machine")]
 pub fn enable_timer_interrupt() {
+    // 只解源（`mie.MTIE`）；全局 `mstatus.MIE` 由 `CpuArch::enable_irq` 显式打开。
     unsafe {
         core::arch::asm!(
             "csrs mie, {mask}",
             mask = in(reg) (1usize << 7),
             options(nostack, preserves_flags),
         );
-        core::arch::asm!(
-            "csrs mstatus, {mask}",
-            mask = in(reg) (1usize << 3),
-            options(nostack, preserves_flags),
-        );
     }
 }
 
-/// 打开 M-mode 外部中断使能（`mie.MEIE` + `mstatus.MIE`，C6 骨架）。
+/// 只开 M-mode 外部中断**源**（`mie.MEIE`）；全局 `mstatus.MIE` 由
+/// `CpuArch::enable_irq` 显式打开。
 #[cfg(feature = "machine")]
 pub fn enable_external_interrupt() {
     unsafe {
         core::arch::asm!(
             "csrs mie, {mask}",
             mask = in(reg) (1usize << 11),
-            options(nostack, preserves_flags),
-        );
-        core::arch::asm!(
-            "csrs mstatus, {mask}",
-            mask = in(reg) (1usize << 3),
             options(nostack, preserves_flags),
         );
     }
