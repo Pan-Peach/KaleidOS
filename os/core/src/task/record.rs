@@ -12,9 +12,11 @@ pub struct TaskRecord {
     /// 创建该任务的组件**实例**。任务运行时的 caller identity 从这里解析，
     /// 不依赖 create 调用上下文。多个实例共享一个 image 时，owner 仍是实例。
     owner: ComponentId,
-    /// Core-controlled truth：状态只能通过 Core 内部入口改变，组件（外部 crate）
-    /// 无法直接赋值。调度器里程碑落地后在此之上加验证式 transition API。
+    /// Core-controlled truth：状态只能由 `TaskTable::transition` 验证后改变，
+    /// 组件（外部 crate）无法直接赋值。
     state: TaskState,
+    /// `unpark` 早于 `park` 时暂存的一次通知；重复通知合并为一个 permit。
+    park_pending: bool,
     /// 组件任务入口（`KcompTaskEntry`：`void (*)(void *)`），由
     /// `kcore_task_create` 提供并验证落在 owner 的装载镜像内。
     entry: usize,
@@ -43,6 +45,7 @@ impl TaskRecord {
         Self {
             owner,
             state: TaskState::Created,
+            park_pending: false,
             entry,
             arg,
             context,
@@ -59,6 +62,15 @@ impl TaskRecord {
     /// 只读观察状态（monitor / trace / 调度器读侧）。
     pub fn state(&self) -> TaskState {
         self.state.clone()
+    }
+
+    pub(crate) fn park_pending(&self) -> bool {
+        self.park_pending
+    }
+
+    /// Core 内部写入点：permit 与任务状态由同一张 TaskTable 管理。
+    pub(crate) fn set_park_pending(&mut self, pending: bool) {
+        self.park_pending = pending;
     }
 
     /// 组件任务入口地址（Core trampoline 读取后调用）。

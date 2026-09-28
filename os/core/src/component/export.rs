@@ -775,6 +775,38 @@ extern "C" fn kcore_task_yield() -> i32 {
     with_core_critical(|| status(sched::yield_current()))
 }
 
+/// 阻塞当前任务，等它被 unpark 并再次调度后从此调用返回。
+extern "C" fn kcore_task_park() -> i32 {
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(ctx.component) {
+            return denied;
+        }
+        status(sched::park_current())
+    })
+}
+
+/// 让同 owner 的任务变为 Runnable，或为它保留一次提前到达的 unpark permit。
+extern "C" fn kcore_task_unpark(id: u32) -> i32 {
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(ctx.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(ctx.component) {
+            return denied;
+        }
+        status(sched::unpark_task(ctx.component, TaskId::from_raw(id)))
+    })
+}
+
 /// 退出：Running → Exited + 调度切换。**控制权永不回到本任务**——若还有
 /// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
 /// 的上下文）。返回 0 / `-Errno`。
@@ -1163,6 +1195,8 @@ mod tests {
             &b"kcore_task_create"[..],
             &b"kcore_task_start"[..],
             &b"kcore_task_yield"[..],
+            &b"kcore_task_park"[..],
+            &b"kcore_task_unpark"[..],
             &b"kcore_task_exit"[..],
             &b"kcore_task_state"[..],
             &b"kcore_panic_escape"[..],

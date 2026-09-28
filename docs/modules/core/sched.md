@@ -1,40 +1,41 @@
-# sched（os/core/src/sched.rs）
+# task（os/core/src/task/）
 
-> **每 CPU 调度真相 + propose→validate→commit 路径**：Core 提供机制，策略组件只"提议"下一个任务；Core 验证存在 / Runnable / 未在别 CPU 后提交。
-> 这是 "Policy proposes, Core validates and commits" 的规范实现。
-> 调度策略走**专用执行路径**（`PolicyCall` 边界，Core 是 caller），不是通用 service call。
+> 任务**身份与生命周期真相**：谁存在、属于谁、处于什么状态、跑在哪个 CPU、用哪个内核栈、上下文在哪。
+> 这里的"上下文"是执行状态；**调度策略**（下一个跑谁）不在这里。
 
 ## owns 什么真相
 
-- 每 CPU 调度状态：`CpuState { anchor, current }`（当前任务锚点）。
-- **调度策略配置**（`PolicySlot`）：选中的 `EndpointId` + 为策略执行准备的 Core 栈 + `retired` 标志。`endpoint == None` = 从未配置（`NoPolicy`）；已安装策略失败 / 失效后 Core 用确定性回退继续调度，**不**退化成 `NoPolicy`。
-- 从"提议"到"提交"的最终裁决：验证 task 存在 / Runnable / 不在别的 CPU；提交后记录 trace。
-- SchedulerPolicy 的契约身份来自 `abi/scheduler.toml`（生成常量）：name `scheduler.policy` / ABI fingerprint / contract id / `CHOOSE_NEXT` wire 格式。
+- Task 身份（`TaskId`）与 owner（`ComponentId`）。
+- 任务状态机（`TaskState`：Created / Runnable / Running(CpuId) / Blocked / Exited）。
+- 内核栈（`Kernelstack`）与任务执行上下文。
+- 每个任务最多一份 pending unpark permit（提前通知会被下一次 park 消费；重复通知合并）。
+- 任务归属：`TaskRecord.owner`（组件停止 / 失败时按 owner 回收）。
 
 ## 暴露什么机制
 
-- `set_policy(EndpointId)`（导出 `kcore_sched_set_policy`）：校验活 endpoint + contract + abi + provider 有 `kcomp_service_dispatch`，**只提交 EndpointId**（不发布）。IRQ / service-call / policy 执行内拒绝。
-- `select_provider(ComponentId)`：组合辅助（monitor / ArchTest）——显式 discover + select。
-- `SchedError`（含 `PolicyEndpoint` / `NoDispatcher` / `NoPolicyStack`）。
-- `init()`、`current_task()`。
-- `run()`：从锚点进入调度循环。
-- `yield_current()` / `exit_current()`。
-- `on_timer_tick()`（`todo!`，抢占未落地）、`abort_current_task()`。
+- `create_task(requester, entry, arg)` / `start_task(requester, task)`：语义入口，只接受 Core 导出的白名单；入口必须落在调用者已加载的镜像内。
+- 静态 `TASK_TABLE`（`TaskTable`）；`TaskTable::create/start/transition/remove/get/has_live_tasks`。
+- `consume_park_pending` / `unpark` 实现每任务一位 permit、owner 校验与 `Blocked→Runnable`；调度层还需把 permit 快速路径与 block commit 正确衔接。
+- Core 拥有的 `task_entry_trampoline`（组件任务从 Core 边界进入）。
+- 类型：`TaskId`、`TaskState`、`TaskRecord`、`TaskTable`、`Kernelstack`、`TaskError`。
 
 ## 明确不做
 
-- **不实现任何调度算法**：RR / CFS 在 `scheduler_rr` 等组件里。
-- **没有内建 / 兜底调度器**：从未选择过策略时返回 `NoPolicy`；已安装策略失败后的确定性回退（id 序首项，提交前验证 owner）只是"Core 不被坏组件挂起"的机制，不是算法。
-- **不按名字发现调度器**：组合方显式 `(provider, port_name, contract)` 发现 + select；Core 不持有全局名字。
-- 拒绝在 IRQ / service-call / policy 执行上下文 `run` / `yield` / `exit` / `set_policy`。
-- 不持有任务 handle：策略只收候选 `TaskId` 并提议。
-- 通用 `kcore_endpoint_call` 拒绝 `scheduler.policy` 契约（保留契约）。
+- **不做调度**：runqueue / vruntime / cursor 属于 `sched` + Scheduler 组件；task 只提供状态与执行原语。
+- 不拥有 event、waitqueue 或 condition 语义；组件按自己的条件维护等待者 `TaskId`，再调用 park/unpark。
+- `unpark` 允许从 IRQ 回调调用；任务表锁必须在 irq-save 保护下获取，并在释放表锁后才恢复 IRQ。
+- 拒绝在 IRQ 上下文创建 / 启动任务（`TaskError::InvalidTransition` → `-EINVAL`）。
+- 非 owner 操作任务被拒（`WrongOwner`）；入口越出 owner 镜像被拒（`EntryOutOfImage`）。
+- 不跨组件共享任务真相：`TaskId` 只在 Core 内唯一，组件拿不到自报告 identity。
 
 ## 代码在哪
 
 | 文件 | 内容 |
 |---|---|
-| `os/core/src/sched.rs` | `PolicySlot`、`set_policy` / `select_provider`、`CpuState`、`run` / `yield_current` / `exit_current`、`pick_next` 验证与提交 |
-| `os/core/src/component/call.rs` | `PolicyTarget`、`prepare_policy` / `call_policy`（锁内准备 + 无锁调用） |
-| `os/core/src/component/containment.rs` | `EscapeKind::PolicyCall`、`call_component_policy`（专用执行边界） |
-| `abi/scheduler.toml` | `scheduler.policy` 契约常量 + `CHOOSE_NEXT` wire 格式（单一来源） |
+| `os/core/src/task/mod.rs` | 语义入口 `create_task` / `start_task` + 边界测试 |
+| `os/core/src/task/id.rs` | `TaskId` |
+| `os/core/src/task/state.rs` | `TaskState`（含 `Running(CpuId)`） |
+| `os/core/src/task/record.rs` | `TaskRecord`（owner / state / pending permit / stack / context） |
+| `os/core/src/task/table.rs` | `TaskTable`（`BTreeMap<TaskId, TaskRecord>`）、状态转换 |
+| `os/core/src/task/kstack.rs` | `Kernelstack` |
+| `os/core/src/task/error.rs` | `TaskError` |

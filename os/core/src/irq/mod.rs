@@ -112,6 +112,23 @@ mod tests {
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    /// Nested irq-save guards restore the state they observed, so only the outer
+    /// guard that observed IRQs enabled may turn them back on.
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+    #[test]
+    fn nested_irq_save_guards_restore_the_outer_state() {
+        assert!(arch::fake::irq_enabled_for_test());
+        let outer = IrqSaveGuard::new();
+        assert!(!arch::fake::irq_enabled_for_test());
+        {
+            let _inner = IrqSaveGuard::new();
+            assert!(!arch::fake::irq_enabled_for_test());
+        }
+        assert!(!arch::fake::irq_enabled_for_test());
+        drop(outer);
+        assert!(arch::fake::irq_enabled_for_test());
+    }
+
     /// 序列化触碰全局 IRQ 表的测试。
     ///
     /// rank = IRQ（模块本地、最外层；见 [`crate::test_support`]）。

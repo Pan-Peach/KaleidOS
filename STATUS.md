@@ -66,19 +66,19 @@ Hardware                                    目前只有 QEMU virt
 
 #### 3.3 任务对象 `▰▰▰▰▱` IMPLEMENTED
 
-现状：`TaskId`、`TaskTable`、owner、kernel stack、状态机（`Created`/`Runnable`/`Running(CpuId)`/`Blocked`/`Exited`，合法边只有 4 条）。host 覆盖非法迁移、owner、`EntryOutOfImage`、property `random_transition_sequence_preserves_task_truth`；QEMU 有 `task-create`/`task-switch`/`task-exit`，ArchTest 有 `task-panic`。
+现状：`TaskId`、`TaskTable`、owner、kernel stack、状态机（`Created`/`Runnable`/`Running(CpuId)`/`Blocked`/`Exited`，合法边 6 条）。host 覆盖非法迁移、owner、`EntryOutOfImage`、property `random_transition_sequence_preserves_task_truth`；QEMU 有 `task-create`/`task-switch`/`task-exit`，ArchTest 有 `task-panic`。
 
-缺口：`Blocked` 不可达，没有 `block`/`wake` API；`TaskRecord` 与 `AddressSpaceId` 没有绑定，`Running(CpuId)` 没有 AS 概念。
+缺口：`TaskRecord` 与 `AddressSpaceId` 没有绑定，`Running(CpuId)` 没有 AS 概念。
 
-下一步：先做通用 block/wake（见 3.4），再做 task 与 AS 的绑定语义。
+下一步：完成通用 park/unpark（见 3.4），再做 task 与 AS 的绑定语义。
 
-#### 3.4 block/wake 原语 `▱▱▱▱▱` NOT IMPLEMENTED
+#### 3.4 park/unpark 原语 `▱▱▱▱▱` IMPLEMENTATION IN PROGRESS
 
-现状：不存在。`TaskState::Blocked` 不在合法状态机边里，`TaskBlock`/`TaskWake` trace 事件刻意未定义（`os/core/src/trace/event.rs`）。
+现状：ABI、每任务 pending permit、owner 校验与 `Blocked→Runnable` 已实现；host `proptest!` 验证 permit 状态模型，CoreTest 新增组件侧提前 unpark 与 64 轮 park/unpark 调度；host 集成测试当前在“schedule_next 前任务表锁已释放”的断言失败。每任务最多一个 pending permit；Core 不定义 EventId / waitqueue，等待队列和条件由组件持有。
 
-缺口：任何等待型负载（IRQ 等待、FS I/O、POSIX）都会逼 Core 新增对象类型。
+缺口：当前 host 调度集成测试发现 `park_current` 持有 TaskTable 锁调用 `schedule_next`，触发 fail-fast 不变量；外层 irq-save guard 也不能跨 context switch。RV64 CoreTest 已构建并启动，报告到 `park-early-unpark-accepted` 后没有完成后续阻塞/唤醒场景，runner 判失败。`TaskBlock`/`TaskWake` trace 事件尚未定义（`os/core/src/trace/event.rs`）。
 
-下一步：设计通用 event/wait/cancel，先覆盖调度器与 IRQ 等待；不要把 POSIX 信号语义塞进来。
+下一步：把 permit 检查和 Blocked 提交纳入调度临界区、释放 TaskTable 锁后再调度，并确保 context switch 前 IRQ 恢复；随后运行 `cargo test -p kernel --lib park -- --test-threads=1` 与 `make test-qemu`。
 
 #### 3.5 调度机制 `▰▰▰▰▱` IMPLEMENTED（协作式）
 
@@ -220,7 +220,7 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.21 测试体系 `▰▰▰▰▱` IMPLEMENTED
 
-现状：host 单测含 proptest；CoreTest 是板内集成，41 项检查（bit 0 到 41，bit 23 未用）；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；CI 三个 job（check/qemu/archtest）。
+现状：host 单测含 proptest；CoreTest 是板内集成，49 项检查（bit 0 到 49，bit 23 未用）；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；CI 三个 job（check/qemu/archtest）。
 
 缺口：NoMMU 不在任何测试入口或 CI 里构建与启动，只有 Kconfig 解析用例；M-mode 无验证；runner 只显式断言 12 条，其余靠 `all: PASS`；host ring 是线程本地替身，不覆盖并发语义。
 
@@ -270,7 +270,7 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
-1. block/wake 缺失，最高优先。`TaskState::Blocked` 不可达，没有 block/wake 原语，trace 事件刻意未定义。一旦出现任何等待型负载，Core 就会被逼着新增 block/wake/event/notification 之类的对象类型。先设计通用 event/wait/cancel，不要提前造 `core::signal`。
+1. block/wake 尚未通过集成验证，最高优先。TaskTable permit / owner 路径已实现；调度测试当前发现 park 持表锁进入 schedule_next，且 irq-save guard 跨 context switch。组件持有条件和等待者列表，Core 只提供按任务 park/unpark 机制。
 2. task 与地址空间没有绑定。`TaskRecord` 和 `AddressSpaceId` 之间没有关系，`Running(CpuId)` 没有 AS 概念。将来一个 POSIX 进程等于一个 AS 加 N 个 task，这个语义必须由 Core 先提供，否则进程语义会漏进 Core。
 3. 抢占没接线。`timer::on_trap` 不调用 `sched::on_timer_tick`，后者是 `todo!()`。纯协作模型下，不协作或死循环的执行域拿不回控制权。
 4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。unload 是 tombstone，backing 驻留到 reboot，没有 drain。consumer 缓存的裸 function table 在 provider `Stopped`/`Failed` 后仍能调用成功，这是物理驻留的直接后果，不是 bug，但 teardown 正确性不能建立在它上面。
@@ -314,7 +314,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 当前未完成项按依赖顺序排，前一项不成立，后一项无从谈起。
 
 1. Timer 与抢占接线：让 `timer::on_trap` 真正到达调度。先决定用延迟重调度标志还是 trap 内直接切换，并正面回答 `sstatus.SIE` 的保存恢复。
-2. Task block/wake：给 `Blocked` 做出可达状态与 wake 路径，补上对应 trace 事件。先做通用 event/wait/cancel，不要把 POSIX 信号或等待语义提前塞进 Core。
+2. Task block/wake：修复当前失败的调度集成测试，验证 permit 快速路径、阻塞后唤醒及 IRQ 恢复，再决定 trace 事件。等待条件与等待者列表留在组件。
 3. Task 与 AddressSpace：定义绑定语义，为将来的 POSIX "Process = AS + N Task" 铺路。
 4. 组件生命周期收敛：drain 协调协议，`kcomp_task`，卸载与重载的语义矩阵。
 5. IsolatedNative 收敛或冻结：补 ASID、U-mode、出站调用、更宽 import 面，或者明确冻结成教学实验。
@@ -761,7 +761,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | A | Driver：真设备 → claim → MMIO/IRQ/DMA → driver component → Endpoint，最好在真 SoC 上 | PARTIAL | 机制齐全，`virtio_blk` 加 `driver_prober` 在 QEMU 跑通；无真 SoC；IRQ 单线；无 PCIe/USB/NVMe |
 | B | 多实例：一个 artifact 到实例 A/B，各自 state/resources/endpoints/tasks，无串扰 | PARTIAL | 已证：host `same_artifact_loads_produce_independent_components`、CoreTest `driver-multi-device`、ArchTest `isolated-restart`（并发同 artifact）、`ram_blk_rw` 每实例 buffer；endpoint/task 全维度无串扰与卸载后语义未系统证明 |
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；无 VFS、namespace、File service、两级缓存 |
-| D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | 缺 block/wake（`Blocked` 不可达）与 preemption（`on_timer_tick` 是 `todo!()` 且未接线）；只有 Created/Runnable/Running/Exited 加协作式 yield/exit |
+| D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit 路径已实现，但 host 调度集成测试因锁跨 schedule_next 失败；preemption（`on_timer_tick` 是 `todo!()` 且未接线）也缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | NOT-SATISFIED | 没有 POSIX personality；前置的 task↔AS 与 block/wake 也不满足 |
 | F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | K→I Gate 已真实验证（ArchTest `isolated-service*`：自定义 contract 加测试 provider，Core 侧代登记 endpoint）；没有任何生产契约（`scheduler_rr`、`block.device`、filesystem）在 Isolated 上运行过；Isolated provider 不能自己 publish endpoint；资源型契约全被 `-ENOTSUP` 拒绝 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
@@ -773,7 +773,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 - SandboxedNative（U-mode 加私有 AS 加 `ecall`）：`todo!()`（`load.rs:183`、`exit.rs:129`），没有 syscall wire ABI。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
-- block/wake 任务原语：不存在，`Blocked` 不可达，trace 事件未定义。NOT IMPLEMENTED。
+- block/wake 任务原语：ABI 与 TaskTable permit/owner 已实现；host property test 已启用，调度集成测试当前失败于 TaskTable 锁跨 `schedule_next`，IRQ 恢复路径仍待修正。trace 事件未定义。IN PROGRESS。
 - SMP：没有 `CONFIG_SMP`，单 hart，`Running(CpuId)` 的跨 CPU 互斥未实现。NOT IMPLEMENTED。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
@@ -792,4 +792,4 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 - `docs/modules/components.md` 漏登记两个已在 `KCOMP_SRCS` 里的 fixture：`tests/kcomp_isolated_direct`、`tests/kcomp_isolated_unsupported`，全 `docs/` 没有引用。
 - `README.md` 目录说明列了 `components/drivers/ uart/ virtio_blk/ …`，但 `uart/` 不存在，`driver-model.md` §4 明说 uart 未实现；README 的 monitor 命令列表漏了 `unload` 和 `trace`，`docs/modules/core/monitor.md` 有。
 - 源码注释陈旧，不改 Core 代码：`os/core/src/component/endpoint.rs:234` 仍写 IsolatedNative"未实现：无私有 AS / `satp` 切换"，与已落地的私有 AS、trampoline、生命周期代码矛盾；`os/core/src/memory/address_space.rs:2030` 的"对应 roadmap 的 NoMMU 验收点"失去所指（路线图文档已删除，NoMMU 现状见 3.23 与第 7 节）。
-- 计数校验：CoreTest 有 41 项 distinct 检查（bit 0 到 41，bit 23 未用）；ArchTest 有 41 个 case。个别历史提交信息写作 42/42，与代码实测差 1。
+- 计数校验：CoreTest 当前有 49 项 distinct 检查（bit 0 到 49，bit 23 未用；2026-09-27 的 41/41 日志是旧快照）；ArchTest 有 41 个 case。

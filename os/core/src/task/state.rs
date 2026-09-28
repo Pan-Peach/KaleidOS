@@ -11,7 +11,7 @@ pub enum TaskState {
     Runnable,
     /// 任务正在运行（在某个 CPU 上）。
     Running(CpuId),
-    /// 任务已被阻塞（等待事件）。
+    /// 任务暂不参与调度，等待 owner 再次 unpark。
     Blocked,
     /// 任务已完成（退出）。
     Exited,

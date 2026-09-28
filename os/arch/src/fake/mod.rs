@@ -2,7 +2,7 @@ use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
 extern crate std;
-use std::{io::Write, println};
+use std::{cell::Cell, io::Write, println};
 
 pub mod store;
 
@@ -13,6 +13,23 @@ pub mod store;
 /// - `Console::getc`：恒返回 `None`。`core::print::read_line()` 会忙等轮询，
 ///   host 测试中调用它会挂死——需要交互输入时走 QEMU 层，不在 fake 里读 stdin。
 pub struct Fake;
+
+// Host-only observable irq state: fake context switches do not change host stacks,
+// but tests can still verify irq-save nesting and that a switch occurs with IRQs on.
+std::thread_local! {
+    static IRQ_ENABLED: Cell<bool> = const { Cell::new(true) };
+    static LAST_SWITCH_IRQ_ENABLED: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn irq_enabled_for_test() -> bool {
+    IRQ_ENABLED.with(Cell::get)
+}
+
+#[doc(hidden)]
+pub fn take_last_switch_irq_enabled_for_test() -> Option<bool> {
+    LAST_SWITCH_IRQ_ENABLED.with(|enabled| enabled.replace(None))
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +54,7 @@ impl CpuArch for Fake {
     type IrqFlags = usize;
 
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
+        LAST_SWITCH_IRQ_ENABLED.with(|last| last.set(Some(irq_enabled_for_test())));
         // Placeholder for context switch logic
         println!("Switching context from {:?} to {:?}", from, to);
     }
@@ -69,12 +87,12 @@ impl CpuArch for Fake {
     }
 
     fn disable_irq() -> Self::IrqFlags {
-        // host 无真实中断：no-op 占位（irq-save 语义在真机上由 Riscv 实现）。
-        0
+        // Host 没有真实中断，但模拟嵌套 save/restore 状态供 Core 测试断言。
+        IRQ_ENABLED.with(|enabled| enabled.replace(false) as usize)
     }
 
-    fn restore_irq(_flags: Self::IrqFlags) {
-        // host 无真实中断：no-op 占位。
+    fn restore_irq(flags: Self::IrqFlags) {
+        IRQ_ENABLED.with(|enabled| enabled.set(flags != 0));
     }
 
     fn wait_for_interrupt() {

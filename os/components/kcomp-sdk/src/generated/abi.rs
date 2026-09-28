@@ -314,6 +314,17 @@ unsafe extern "C" {
     pub fn kcore_task_start(id: u32) -> i32;
     #[link_name = "kcore_task_yield"]
     pub fn kcore_task_yield() -> i32;
+    /// 阻塞当前任务，直到它被 `kcore_task_unpark` 唤醒后再次获得 CPU 才返回。
+    /// 若已有 pending permit，则消费它并立即返回；否则提交 Blocked 并切走。只能从任务上下文调用。
+    #[link_name = "kcore_task_park"]
+    pub fn kcore_task_park() -> i32;
+    /// 请求唤醒 `id`：目标若为 Blocked，则提交为 Runnable；若为 Created、Runnable 或
+    /// Running，则记一份 pending permit，下一次 park 消费，重复 permit 合并；Exited 返回
+    /// `-EINVAL`。不直接切换 CPU。Core 验证 caller 是任务 owner；IRQ 回调可代表其线路
+    /// owner 调用；相关任务表锁路径必须防止 IRQ 重入死锁。`TaskId` 是 identity，不是权限。
+    /// 组件自己维护等待队列与条件。
+    #[link_name = "kcore_task_unpark"]
+    pub fn kcore_task_unpark(id: u32) -> i32;
     #[link_name = "kcore_task_exit"]
     pub fn kcore_task_exit() -> i32;
     #[link_name = "kcore_task_state"]

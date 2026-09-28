@@ -63,7 +63,21 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 - CoreTest 只走真实 Core API；host fake 上下文后端不算跨域证明。
 - 同一事实只在一个层次证明，避免三层重复断言。
 
-## 6. 长期陷阱与工具
+## 6. Task park/unpark 契约测试
+
+`TaskTable` 有 active `proptest!`，随机生成 unpark、错误 owner、consume 序列并与一位 permit 模型比对。host 调度集成测试检查提前 unpark 快速路径、阻塞唤醒、任务表锁释放和 IRQ 恢复。
+
+CoreTest 还从普通组件 ABI 侧覆盖同一契约：启动前重复 unpark、permit 只消费一次，以及两个组件任务完成 64 轮“park → 查询 Blocked → unpark → 重新调度”。该场景位于精确 `sched-trace` 检查之后，不污染其事件窗口。
+
+```sh
+cargo test -p kernel --lib park -- --test-threads=1
+cargo test -p kernel --lib irq::tests::nested_irq_save_guards_restore_the_outer_state -- --exact --test-threads=1
+make test-qemu
+```
+
+host 调度集成用例失败时会 fail-fast，并用 RAII 清理全局任务/调度状态；CoreTest 的调度调用返回后，失败路径会尽力唤醒并跑完自身任务，避免污染后续场景。
+
+## 7. 长期陷阱与工具
 
 - **IRQ 电平触发**：`external-irq` 用 UART **THRE** 拉线；**先 claim 再关设备源**——先关 `IER` 会让 PLIC pending 随电平撤销，claim 取到 0。
 - **身份模型限制**：`ComponentId` 只在单个 `Registry` 实例内唯一，trace ring 是进程 / 整机全局；断言锚在"本组件刚加载的 `ComponentId` + 该次 load 前的游标"，这是当前身份模型允许的最强形式（全局唯一 ComponentId / boot epoch 未做）。

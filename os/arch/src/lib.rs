@@ -107,7 +107,7 @@ pub enum ResetType {
 pub trait CpuArch {
     /// 寄存器上下文类型。
     type Context;
-    /// 中断开关的保存状态（RISC-V：`sstatus.SIE`；host fake：`()`）。
+    /// 中断开关的保存状态（RISC-V：状态寄存器；host fake：模拟的启用位）。
     /// C5 骨架：irq-save 临界区的状态载体。
     type IrqFlags;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
@@ -132,9 +132,9 @@ pub trait CpuArch {
     fn set_context_slot(context: &mut Self::Context, slot: usize);
 
     /// 关中断并返回先前状态（irq-save 临界区进入）。
-    /// Riscv 实现 = `sstatus.SIE` 保存 + 清零；fake = no-op。
+    /// Riscv 保存状态寄存器；host fake 模拟嵌套状态供测试检查。
     fn disable_irq() -> Self::IrqFlags;
-    /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）。
+    /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）；嵌套 guard 必须恢复进入时状态。
     fn restore_irq(flags: Self::IrqFlags);
     /// 等待下一次中断（RISC-V `wfi`；host fake = no-op）。
     ///

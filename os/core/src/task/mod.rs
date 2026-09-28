@@ -17,14 +17,84 @@ pub use state::TaskState;
 pub use table::TaskTable;
 
 use crate::component::{ComponentId, ComponentState, containment};
+use crate::irq::IrqSaveGuard;
+use core::ops::{Deref, DerefMut};
 
-pub static TASK_TABLE: spin::Once<spin::Mutex<TaskTable>> = spin::Once::new();
-
-pub fn init() {
-    TASK_TABLE.call_once(|| spin::Mutex::new(TaskTable::new()));
+/// Task table lock that masks local IRQs before locking.
+///
+/// `unpark` is callable from IRQ callbacks, so every ordinary table access must avoid
+/// same-hart interrupt re-entry while the underlying spin mutex is held.
+pub struct TaskTableLock {
+    inner: spin::Mutex<TaskTable>,
 }
 
-pub fn get_task_table() -> &'static spin::Mutex<TaskTable> {
+pub struct TaskTableGuard<'a> {
+    inner: Option<spin::MutexGuard<'a, TaskTable>>,
+    irq: Option<IrqSaveGuard>,
+}
+
+impl TaskTableLock {
+    fn new(table: TaskTable) -> Self {
+        Self {
+            inner: spin::Mutex::new(table),
+        }
+    }
+
+    pub fn lock(&self) -> TaskTableGuard<'_> {
+        let irq = IrqSaveGuard::new();
+        let inner = self.inner.lock();
+        TaskTableGuard {
+            inner: Some(inner),
+            irq: Some(irq),
+        }
+    }
+
+    pub fn try_lock(&self) -> Option<TaskTableGuard<'_>> {
+        let irq = IrqSaveGuard::new();
+        match self.inner.try_lock() {
+            Some(inner) => Some(TaskTableGuard {
+                inner: Some(inner),
+                irq: Some(irq),
+            }),
+            None => {
+                drop(irq);
+                None
+            }
+        }
+    }
+}
+
+impl Deref for TaskTableGuard<'_> {
+    type Target = TaskTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_deref().expect("task table guard is active")
+    }
+}
+
+impl DerefMut for TaskTableGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_deref_mut()
+            .expect("task table guard is active")
+    }
+}
+
+impl Drop for TaskTableGuard<'_> {
+    fn drop(&mut self) {
+        // Release the mutex before restoring IRQs, so an interrupt handler can lock it.
+        drop(self.inner.take());
+        drop(self.irq.take());
+    }
+}
+
+pub static TASK_TABLE: spin::Once<TaskTableLock> = spin::Once::new();
+
+pub fn init() {
+    TASK_TABLE.call_once(|| TaskTableLock::new(TaskTable::new()));
+}
+
+pub fn get_task_table() -> &'static TaskTableLock {
     TASK_TABLE.get().expect("task table not initialized")
 }
 
@@ -148,6 +218,20 @@ mod tests {
         let guard = test_support::GUARD.lock();
         test_support::ensure_init();
         guard
+    }
+
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+    #[test]
+    fn task_table_lock_saves_and_restores_irq_state() {
+        crate::task::init();
+        assert!(arch::fake::irq_enabled_for_test());
+        {
+            let _table = get_task_table().lock();
+            assert!(!arch::fake::irq_enabled_for_test());
+            assert!(get_task_table().try_lock().is_none());
+            assert!(!arch::fake::irq_enabled_for_test());
+        }
+        assert!(arch::fake::irq_enabled_for_test());
     }
 
     /// 一份带真实常驻 backing 的伪造 loaded image（`base..base+text_size` 是合法

@@ -18,6 +18,15 @@ pub struct TaskTable {
     next_id: AtomicU32,
 }
 
+/// `unpark` 改变的 Core 真相；多次提前 unpark 合并为一个 permit。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnparkOutcome {
+    /// 目标原本阻塞，已改为 Runnable。
+    Woke,
+    /// 目标尚未阻塞，已为它记录 pending permit。
+    Deferred,
+}
+
 impl Default for TaskTable {
     fn default() -> Self {
         Self::new()
@@ -113,12 +122,56 @@ impl TaskTable {
         self.transition(id, TaskState::Runnable)
     }
 
+    /// 取走当前任务的一次 pending unpark permit。
+    ///
+    /// 只由 `sched::park_current` 在其 irq-save 交接中调用。若返回 true，任务应
+    /// 直接从 park 返回；若 false，调用方才可以把它提交为 Blocked 并切走。
+    /// permit 的检查与 Blocked 提交必须由同一个调度临界区保护。
+    pub(crate) fn consume_park_pending(&mut self, id: TaskId) -> Result<bool, TaskError> {
+        let record = self.get(id).ok_or(TaskError::NotFound)?;
+        if record.park_pending() {
+            self.get_mut(id).unwrap().set_park_pending(false);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 将任务唤醒，或为尚未 park 的任务暂存一个 permit。
+    ///
+    /// `TaskId` 是 identity；这里必须检查 `requester` 与记录 owner 一致。
+    /// 全局表由 `TaskTableLock` 串行化，并在获取底层 mutex 前保存 / 关闭本地 IRQ；
+    /// 此方法只更新表内真相，不负责加锁。
+    pub(crate) fn unpark(
+        &mut self,
+        requester: ComponentId,
+        id: TaskId,
+    ) -> Result<UnparkOutcome, TaskError> {
+        let record = self.get(id).ok_or(TaskError::NotFound)?;
+        if requester != record.owner() {
+            return Err(TaskError::WrongOwner);
+        }
+        match record.state() {
+            TaskState::Blocked => {
+                self.transition(id, TaskState::Runnable)?;
+                Ok(UnparkOutcome::Woke)
+            }
+            TaskState::Exited => Err(TaskError::InvalidTransition),
+            _ => {
+                self.get_mut(id).unwrap().set_park_pending(true);
+                Ok(UnparkOutcome::Deferred)
+            }
+        }
+    }
+
     /// 状态推进的唯一入口（Core 校验合法转换后才落笔；调度器 commit 路径调用）。
     ///
-    /// 合法转换（v1 状态机）：
+    /// 合法转换：
     /// - `Created → Runnable`（start：任务首次交给调度器）
     /// - `Runnable → Running(cpu)`（dispatch：被调度器选中）
-    /// - `Running → Runnable`（yield / 时间片到）
+    /// - `Running → Runnable`（yield）
+    /// - `Running → Blocked`（park）
+    /// - `Blocked → Runnable`（unpark）
     /// - `Running → Exited`（exit：任务自行退出）
     ///
     /// 其余一律 `InvalidTransition`（Exited 终态、Created 直接 Running 等）。
@@ -130,6 +183,8 @@ impl TaskTable {
             (TaskState::Created, TaskState::Runnable)
                 | (TaskState::Runnable, TaskState::Running(_))
                 | (TaskState::Running(_), TaskState::Runnable)
+                | (TaskState::Running(_), TaskState::Blocked)
+                | (TaskState::Blocked, TaskState::Runnable)
                 | (TaskState::Running(_), TaskState::Exited)
         );
         if !legal {
@@ -234,9 +289,11 @@ mod tests {
             Err(TaskError::NotFound)
         );
 
-        // 合法全链：Created → Runnable → Running → Runnable → Running → Exited。
+        // 合法全链含阻塞/唤醒：Created → Runnable → Running → Blocked → Runnable
+        // → Running → Exited。
         t.transition(id, TaskState::Runnable).unwrap();
         t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(id, TaskState::Blocked).unwrap();
         t.transition(id, TaskState::Runnable).unwrap();
         t.transition(id, TaskState::Running(CpuId(0))).unwrap();
         t.transition(id, TaskState::Exited).unwrap();
@@ -350,6 +407,39 @@ mod tests {
     }
 
     #[test]
+    fn unpark_before_park_leaves_one_consumable_permit() {
+        let _g = setup();
+        let mut t = TaskTable::new();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        t.start(OWNER, id).unwrap();
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+
+        assert_eq!(t.unpark(OWNER, id), Ok(UnparkOutcome::Deferred));
+        assert_eq!(t.unpark(OWNER, id), Ok(UnparkOutcome::Deferred));
+        assert!(t.consume_park_pending(id).unwrap());
+        assert!(!t.consume_park_pending(id).unwrap(), "permit is one-shot");
+        assert_eq!(t.get(id).unwrap().state(), TaskState::Running(CpuId(0)));
+    }
+
+    #[test]
+    fn unpark_wakes_blocked_task_and_rejects_wrong_owner() {
+        let _g = setup();
+        let mut t = TaskTable::new();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        t.start(OWNER, id).unwrap();
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(id, TaskState::Blocked).unwrap();
+
+        assert_eq!(t.unpark(OTHER_OWNER, id), Err(TaskError::WrongOwner));
+        assert_eq!(t.get(id).unwrap().state(), TaskState::Blocked);
+        assert_eq!(t.unpark(OWNER, id), Ok(UnparkOutcome::Woke));
+        assert_eq!(t.get(id).unwrap().state(), TaskState::Runnable);
+        t.transition(id, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(id, TaskState::Exited).unwrap();
+        assert_eq!(t.unpark(OWNER, id), Err(TaskError::InvalidTransition));
+    }
+
+    #[test]
     fn has_live_tasks_counts_only_owned_unfinished_tasks() {
         let _g = setup();
 
@@ -365,9 +455,13 @@ mod tests {
             "foreign owner must not block"
         );
 
-        // When/Then：Exited 是唯一终态；yield 只提交 Runnable，不自然退出。
+        // When/Then：阻塞任务仍是 live task，直到 Exited 才能停止 owner。
         t.transition(created, TaskState::Runnable).unwrap();
         assert!(t.has_live_tasks(OWNER), "Runnable is unfinished");
+        t.transition(created, TaskState::Running(CpuId(0))).unwrap();
+        t.transition(created, TaskState::Blocked).unwrap();
+        assert!(t.has_live_tasks(OWNER), "Blocked is unfinished");
+        t.transition(created, TaskState::Runnable).unwrap();
         t.transition(created, TaskState::Running(CpuId(0))).unwrap();
         t.transition(created, TaskState::Exited).unwrap();
         assert!(!t.has_live_tasks(OWNER), "Exited does not block stop");
@@ -417,13 +511,15 @@ mod tests {
 
     /// 文档化状态机的唯一真相（与 `transition` 的 doc comment 逐条对应）：
     /// `Created→Runnable`、`Runnable→Running(_)`、`Running(_)→Runnable`、
-    /// `Running(_)→Exited`；其余一律非法（含 Exited 终态）。
+    /// `Running(_)→Blocked`、`Blocked→Runnable`、`Running(_)→Exited`；其余非法。
     fn is_legal(from: &TaskState, to: &TaskState) -> bool {
         matches!(
             (from, to),
             (TaskState::Created, TaskState::Runnable)
                 | (TaskState::Runnable, TaskState::Running(_))
                 | (TaskState::Running(_), TaskState::Runnable)
+                | (TaskState::Running(_), TaskState::Blocked)
+                | (TaskState::Blocked, TaskState::Runnable)
                 | (TaskState::Running(_), TaskState::Exited)
         )
     }
@@ -463,6 +559,31 @@ mod tests {
     /// 上限压到 80，避免在持有全局堆 GUARD 时放大 proptest 用例开销。
     fn op_seq() -> impl Strategy<Value = Vec<Op>> {
         proptest::collection::vec(op_kind_strategy(), 1..=80)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PermitOp {
+        Park,
+        Unpark,
+        WrongOwnerUnpark,
+        Yield,
+        Dispatch,
+        Exit,
+    }
+
+    fn permit_op_strategy() -> impl Strategy<Value = PermitOp> {
+        prop_oneof![
+            Just(PermitOp::Park),
+            Just(PermitOp::Unpark),
+            Just(PermitOp::WrongOwnerUnpark),
+            Just(PermitOp::Yield),
+            Just(PermitOp::Dispatch),
+            Just(PermitOp::Exit),
+        ]
+    }
+
+    fn permit_op_seq() -> impl Strategy<Value = Vec<PermitOp>> {
+        proptest::collection::vec(permit_op_strategy(), 1..=128)
     }
 
     /// 被测对象 + 独立模型：两个任务分属不同 owner（A=OWNER，B=OTHER_OWNER）。
@@ -645,6 +766,82 @@ mod tests {
 
     proptest! {
         #[test]
+        fn random_park_unpark_sequences_match_task_model(ops in permit_op_seq()) {
+            let _g = setup();
+            let mut table = TaskTable::new();
+            let id = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+            table.start(OWNER, id).unwrap();
+            table.transition(id, TaskState::Running(CpuId(0))).unwrap();
+
+            // Independent reference model for the observable TaskTable contract.
+            let mut state = TaskState::Running(CpuId(0));
+            let mut pending = false;
+            for op in ops {
+                match op {
+                    PermitOp::Park if state == TaskState::Running(CpuId(0)) => {
+                        let consumed = table.consume_park_pending(id);
+                        prop_assert_eq!(consumed, Ok(pending));
+                        if pending {
+                            pending = false;
+                        } else {
+                            prop_assert_eq!(table.transition(id, TaskState::Blocked), Ok(()));
+                            state = TaskState::Blocked;
+                        }
+                    }
+                    PermitOp::Unpark => {
+                        match state {
+                            TaskState::Blocked => {
+                                prop_assert_eq!(table.unpark(OWNER, id), Ok(UnparkOutcome::Woke));
+                                state = TaskState::Runnable;
+                            }
+                            TaskState::Exited => {
+                                prop_assert_eq!(
+                                    table.unpark(OWNER, id),
+                                    Err(TaskError::InvalidTransition)
+                                );
+                            }
+                            _ => {
+                                prop_assert_eq!(
+                                    table.unpark(OWNER, id),
+                                    Ok(UnparkOutcome::Deferred)
+                                );
+                                pending = true;
+                            }
+                        }
+                    }
+                    PermitOp::WrongOwnerUnpark => {
+                        prop_assert_eq!(
+                            table.unpark(OTHER_OWNER, id),
+                            Err(TaskError::WrongOwner)
+                        );
+                    }
+                    PermitOp::Yield if state == TaskState::Running(CpuId(0)) => {
+                        prop_assert_eq!(table.transition(id, TaskState::Runnable), Ok(()));
+                        state = TaskState::Runnable;
+                    }
+                    PermitOp::Dispatch if state == TaskState::Runnable => {
+                        prop_assert_eq!(
+                            table.transition(id, TaskState::Running(CpuId(0))),
+                            Ok(())
+                        );
+                        state = TaskState::Running(CpuId(0));
+                    }
+                    PermitOp::Exit if state == TaskState::Running(CpuId(0)) => {
+                        prop_assert_eq!(table.transition(id, TaskState::Exited), Ok(()));
+                        state = TaskState::Exited;
+                    }
+                    _ => {}
+                }
+
+                let record = table.get(id).expect("task remains present");
+                prop_assert_eq!(record.park_pending(), pending);
+                prop_assert_eq!(record.state(), state.clone());
+            }
+
+            table.remove(id).expect("remove task");
+        }
+
+        #[test]
         fn random_transition_sequence_preserves_task_truth(ops in op_seq()) {
             // Given：全局堆一次初始化 + 进程级互斥（create 会分配真实 kstack region）。
             let _g = setup();
@@ -664,7 +861,7 @@ mod tests {
 
     #[test]
     fn is_legal_matches_documented_edges_exhaustively() {
-        // 防呆：独立 oracle 本身必须恰好等于文档化的 4 条边（5×5 穷举）。
+        // 防呆：独立 oracle 本身必须恰好等于文档化的 6 条边（5×5 穷举）。
         let states = [
             TaskState::Created,
             TaskState::Runnable,
@@ -676,6 +873,8 @@ mod tests {
             (TaskState::Created, TaskState::Runnable),
             (TaskState::Runnable, TaskState::Running(CpuId(0))),
             (TaskState::Running(CpuId(0)), TaskState::Runnable),
+            (TaskState::Running(CpuId(0)), TaskState::Blocked),
+            (TaskState::Blocked, TaskState::Runnable),
             (TaskState::Running(CpuId(0)), TaskState::Exited),
         ];
         for from in &states {

@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 40] = [
+pub(super) static EXPORTS: [Export; 42] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -151,6 +151,20 @@ pub(super) static EXPORTS: [Export; 40] = [
         name: b"kcore_task_yield",
         address: ExportAddress({
             let implementation: extern "C" fn() -> i32 = super::kcore_task_yield;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_task_park",
+        address: ExportAddress({
+            let implementation: extern "C" fn() -> i32 = super::kcore_task_park;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_task_unpark",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_task_unpark;
             implementation as *const ()
         }),
     },

@@ -106,6 +106,13 @@ CORE_TEST_CASES = (
     "driver-no-match",
     "driver-multi-device",
     "c-frontend",
+    "task-unpark-missing",
+    "park-early-unpark-accepted",
+    "park-early-permit-fast-path",
+    "park-permit-consumed-once",
+    "park-early-task-completion",
+    "park-unpark-64-rounds",
+    "park-unpark-task-completion",
 )
 SHUTDOWN_CMD = "shutdown\n"
 

@@ -433,6 +433,20 @@ fn schedule_next(
     abort: Option<(TaskId, ComponentId)>,
 ) -> Result<(), SchedError> {
     let guard = IrqSaveGuard::new();
+    schedule_next_with_guard(from, after, abort, guard)
+}
+
+fn schedule_next_with_guard(
+    from: Option<TaskId>,
+    after: Option<TaskState>,
+    abort: Option<(TaskId, ComponentId)>,
+    guard: IrqSaveGuard,
+) -> Result<(), SchedError> {
+    #[cfg(test)]
+    assert!(
+        task::get_task_table().try_lock().is_some(),
+        "schedule_next must not be entered while holding the TaskTable lock"
+    );
     // Phase 0：收集 + 提议（策略调用的准备锁在 `call::prepare_policy` 内，短暂；
     // 组件调用本身在 PolicyCall 边界内、无锁）。
     let runnable = collect_runnable();
@@ -447,10 +461,8 @@ fn schedule_next(
         next = None;
     }
 
-    // 锁内 commit 状态 + 取上下文指针。
-    //
-    // 抢占安全：本临界区未 irq-save——时钟中断若在此打断，trap 处理器会再取
-    // cpu/table 锁（自死锁）。因此抢占未启用（见 `on_timer_tick`）。
+    // 锁内 commit 状态 + 取上下文指针。`guard` 此时仍关闭本地 IRQ，防止 trap
+    // 重入并再次获取 cpu/task-table 锁；具体锁仍只在这个短作用域内持有。
     let (from_ptr, to_ptr, next_owner): (*mut ContextImpl, *mut ContextImpl, Option<ComponentId>) = {
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
@@ -594,6 +606,46 @@ pub fn exit_current() -> Result<(), SchedError> {
     deny_scheduling_forbidden()?;
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Exited), None)
+}
+
+/// 阻塞当前任务，直到其它执行流调用 [`unpark_task`]。
+///
+/// 只有任务上下文可以 park；成功切走后，本调用会在任务被重新调度时返回。
+/// pending permit 检查和 `Running → Blocked` 提交共用一个 irq-save guard，避免
+/// IRQ 在检查与提交之间发出 unpark。guard 移交给调度器，在状态提交后、切换前释放。
+pub fn park_current() -> Result<(), SchedError> {
+    deny_scheduling_forbidden()?;
+    let guard = IrqSaveGuard::new();
+    let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
+    let has_permit = {
+        let mut table = task::get_task_table().lock();
+        table
+            .consume_park_pending(current)
+            .map_err(|_| SchedError::NotFound)?
+    };
+    if has_permit {
+        return Ok(());
+    }
+    schedule_next_with_guard(Some(current), Some(TaskState::Blocked), None, guard)
+}
+
+/// 唤醒同一 owner 的任务，或为尚未 park 的任务记一份 pending permit。
+///
+/// 不在此处切换 CPU，因此可从 IRQ 回调调用；策略回调不得修改任务状态。
+/// 实现时不仅本路径要在取任务表锁前 irq-save，所有可能被此 IRQ 打断并持有
+/// TaskTable 锁的路径也必须避免同核重入死锁。
+pub fn unpark_task(
+    requester: ComponentId,
+    task_id: TaskId,
+) -> Result<(), crate::task::error::TaskError> {
+    if containment::policy_call_in_chain() {
+        return Err(crate::task::error::TaskError::InvalidTransition);
+    }
+    let _guard = IrqSaveGuard::new();
+    task::get_task_table()
+        .lock()
+        .unpark(requester, task_id)
+        .map(|_| ())
 }
 
 /// 时钟抢占入口（`timer::on_trap` 调用；中断上下文）。
@@ -784,6 +836,163 @@ mod tests {
 
     fn remove_task(task: TaskId) {
         assert!(crate::task::get_task_table().lock().remove(task).is_ok());
+    }
+
+    struct TaskCleanup(alloc::vec::Vec<TaskId>);
+
+    impl TaskCleanup {
+        fn new() -> Self {
+            Self(alloc::vec::Vec::new())
+        }
+
+        fn track(&mut self, task: TaskId) {
+            self.0.push(task);
+        }
+    }
+
+    impl Drop for TaskCleanup {
+        fn drop(&mut self) {
+            containment::enter_anchor();
+            reset_cpu();
+            clear_policy();
+            let mut table = crate::task::get_task_table().lock();
+            for task in self.0.drain(..) {
+                let _ = table.remove(task);
+            }
+        }
+    }
+
+    /// 真实调度候选必须排除 Blocked；unpark 提交为 Runnable 后才重新可选。
+    #[test]
+    fn blocked_task_is_excluded_until_runnable_again() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        let owner = ready_component(b"sched_blocked_candidate");
+        let a = runnable_task(owner);
+        let b = runnable_task(owner);
+        crate::task::get_task_table()
+            .lock()
+            .transition(a, TaskState::Running(CpuId(0)))
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(a, TaskState::Blocked)
+            .unwrap();
+        assert_eq!(collect_runnable(), alloc::vec![b]);
+
+        crate::task::get_task_table()
+            .lock()
+            .transition(a, TaskState::Runnable)
+            .unwrap();
+        assert_eq!(collect_runnable(), alloc::vec![a, b]);
+
+        remove_task(a);
+        remove_task(b);
+    }
+
+    /// 端到端调度提交：A park 后 B 接手；unpark(A) 后 B yield，A 成为下一个 Running。
+    /// Fake 后端不执行任务入口，但会检查切换时 IRQ 已恢复、任务表锁已释放。
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+    #[test]
+    fn park_then_unpark_switches_to_other_task_and_back() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+        let mut cleanup = TaskCleanup::new();
+
+        install_policy(
+            b"sched_park_unpark_policy",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
+        let owner = ready_component(b"sched_park_unpark_owner");
+        let a = runnable_task(owner);
+        cleanup.track(a);
+        let b = runnable_task(owner);
+        cleanup.track(b);
+        crate::task::get_task_table()
+            .lock()
+            .transition(a, TaskState::Running(CpuId(0)))
+            .unwrap();
+        set_current(Some(a));
+        containment::enter_task(a, owner);
+
+        assert_eq!(park_current(), Ok(()));
+        assert_eq!(
+            arch::fake::take_last_switch_irq_enabled_for_test(),
+            Some(true),
+            "IRQ must be restored before switching away from A"
+        );
+        assert_eq!(state_of(a), TaskState::Blocked);
+        assert_eq!(state_of(b), TaskState::Running(CpuId(0)));
+        assert_eq!(current_task(), Some(b));
+
+        assert_eq!(unpark_task(owner, a), Ok(()));
+        assert_eq!(state_of(a), TaskState::Runnable);
+        assert_eq!(yield_current(), Ok(()));
+        assert_eq!(
+            arch::fake::take_last_switch_irq_enabled_for_test(),
+            Some(true),
+            "IRQ must be restored before switching back to A"
+        );
+        assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
+        assert_eq!(state_of(b), TaskState::Runnable);
+        assert_eq!(current_task(), Some(a));
+    }
+
+    /// 提前 unpark 的 permit 必须由真实 park_current 快速路径消费，不能调度走 A。
+    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+    #[test]
+    fn park_consumes_pending_permit_without_switching() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+        let mut cleanup = TaskCleanup::new();
+
+        let owner = ready_component(b"sched_early_unpark_owner");
+        let a = runnable_task(owner);
+        cleanup.track(a);
+        let b = runnable_task(owner);
+        cleanup.track(b);
+        crate::task::get_task_table()
+            .lock()
+            .transition(a, TaskState::Running(CpuId(0)))
+            .unwrap();
+        set_current(Some(a));
+        containment::enter_task(a, owner);
+
+        assert_eq!(unpark_task(owner, a), Ok(()));
+        assert!(
+            arch::fake::irq_enabled_for_test(),
+            "nested unpark guards must restore the caller's IRQ state"
+        );
+        assert!(
+            crate::task::get_task_table()
+                .lock()
+                .get(a)
+                .unwrap()
+                .park_pending()
+        );
+        assert_eq!(park_current(), Ok(()));
+        assert!(
+            arch::fake::irq_enabled_for_test(),
+            "park's fast path must restore IRQ state before returning"
+        );
+        assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
+        assert_eq!(state_of(b), TaskState::Runnable);
+        assert_eq!(current_task(), Some(a));
+        assert!(
+            !crate::task::get_task_table()
+                .lock()
+                .get(a)
+                .unwrap()
+                .park_pending()
+        );
     }
 
     /// endpoint 是否已永久失效（`EndpointDead`）。

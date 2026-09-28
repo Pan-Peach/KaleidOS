@@ -18,3 +18,5 @@ __pycache__/
 
 # `make savedefconfig` default output.
 defconfig.out
+# Locally generated proptest regression seed.
+/os/core/proptest-regressions/task/table.txt

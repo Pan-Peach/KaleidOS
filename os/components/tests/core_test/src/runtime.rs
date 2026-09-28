@@ -24,6 +24,7 @@ mod filesystem;
 mod report;
 mod resource;
 mod sched;
+mod sched_park;
 mod trace;
 
 use kcomp_sdk::abi::{MemoryView, kcore_sched_run};
@@ -93,6 +94,8 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     });
     let resource = resource::group(&mut checks);
     trace::group(&mut checks, &sched, &resource);
+    // 单独放在 trace 精确窗口之后，避免压测产生的切换事件污染 sched-trace。
+    sched_park::group(&mut checks);
 
     // 文件系统场景：task context 里跑（块/文件调用契约要求 task）。
     filesystem::spawn(unsafe { core::ptr::addr_of_mut!((*state).filesystem) });
