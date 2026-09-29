@@ -417,6 +417,12 @@ fn idle_loop(cpu: CpuId) -> ! {
     loop {
         ipi::drain_pending(cpu);
         let _ = take_resched(cpu);
+        // TODO(手写)：containment per-CPU 落地后，在此进入本 CPU 的调度——
+        //   if crate::sched::has_claimable_for(cpu) {
+        //       let _ = crate::sched::run();
+        //   }
+        // `sched::run` 目前依赖**进程级** containment（`ACTIVE_GUARD` 等 static mut），
+        // AP 并发调用会与 BSP 抢状态，故在 containment per-CPU 之前不启用。
         <arch::CpuImpl as arch::CpuArch>::wait_for_interrupt();
     }
 }

@@ -206,18 +206,27 @@ pub fn current_task() -> Option<TaskId> {
     cpu().lock().current
 }
 
-/// 收集全部 Runnable 且 **owner 仍是活实例**的任务（BTreeMap 迭代序 = id 升序；
-/// 列表内容由 Core 决定，调度器只读这份裁剪过的输入）。
+/// 收集**本 CPU 可认领**的 Runnable 且 **owner 仍是活实例**的任务（BTreeMap 迭代序
+/// = id 升序；列表内容由 Core 决定，调度器只读这份裁剪过的输入）。
+///
+/// 「可认领」见 [`TaskRecord::claimable_by`]：未运行过的任务任何 CPU 可认领，
+/// 运行过的只认其上次所在 CPU——这样同一任务不会被两个 CPU 同时取走，且规避了
+/// 离场上下文尚未保存完成就跨 CPU 迁移的竞态。
 ///
 /// 组件失败 = 逻辑死亡：`Failed` 组件的任务必须从候选中剔除，否则调度器会把 CPU
 /// 交给一个已经死掉的实例。两把锁**先后分开**取（先 task 表快照 owner、再 registry
 /// 判定），不做嵌套，避免与 create_task（registry → task_table）的锁序冲突。
 fn collect_runnable() -> Vec<TaskId> {
+    collect_claimable_for(current_cpu_id())
+}
+
+/// 收集逻辑 CPU `cpu` 可认领的 Runnable 任务（owner 存活）。
+fn collect_claimable_for(cpu: CpuId) -> Vec<TaskId> {
     let candidates: Vec<(TaskId, ComponentId)> = {
         let table = task::get_task_table().lock();
         table
             .iter()
-            .filter(|(_, r)| r.state() == TaskState::Runnable)
+            .filter(|(_, r)| r.state() == TaskState::Runnable && r.claimable_by(cpu))
             .map(|(id, r)| (*id, r.owner()))
             .collect()
     };
@@ -227,6 +236,20 @@ fn collect_runnable() -> Vec<TaskId> {
         .filter(|(_, owner)| reg.may_run(*owner))
         .map(|(id, _)| id)
         .collect()
+}
+
+/// 逻辑 CPU `cpu` 是否有可认领的 Runnable 任务——AP 空闲循环「要不要进调度」的门。
+///
+/// 只看可认领性（不判 owner 存活，避免与 registry 的锁嵌套）；真正的调度
+/// （`run`）仍会做 owner 门禁，所以这里宽松一点不会让死实例的任务被执行。
+///
+/// 骨架接缝：`smp::idle_loop` 在 containment per-CPU 落地后调用它（见那里的 TODO）。
+#[allow(dead_code)]
+pub(crate) fn has_claimable_for(cpu: CpuId) -> bool {
+    task::get_task_table()
+        .lock()
+        .iter()
+        .any(|(_, r)| r.state() == TaskState::Runnable && r.claimable_by(cpu))
 }
 
 /// Commit-time 门禁：任务 owner 此刻是否仍允许运行。
@@ -957,6 +980,36 @@ mod tests {
             init_cpu(CpuId::from_raw(1)),
             Err(SchedError::InvalidTransition)
         );
+    }
+
+    /// 可认领性过滤：未运行过的任务任何 CPU 可认领；跑过一次的只认其上次 CPU。
+    #[test]
+    fn claimable_filter_pins_ran_tasks_to_their_cpu() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        let owner = ready_component(b"sched_claim_owner");
+        let task = runnable_task(owner);
+
+        // 从未运行过：任何 CPU 都能认领。
+        assert!(has_claimable_for(CpuId::from_raw(0)));
+        assert!(has_claimable_for(CpuId::from_raw(1)));
+
+        // 在 CPU1 上跑过再 yield：只认 CPU1。
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Running(CpuId::from_raw(1)))
+            .unwrap();
+        crate::task::get_task_table()
+            .lock()
+            .transition(task, TaskState::Runnable)
+            .unwrap();
+        assert!(!has_claimable_for(CpuId::from_raw(0)), "ran on CPU1");
+        assert!(has_claimable_for(CpuId::from_raw(1)));
+
+        remove_task(task);
     }
 
     /// 端到端调度提交：A park 后 B 接手；unpark(A) 后 B yield，A 成为下一个 Running。

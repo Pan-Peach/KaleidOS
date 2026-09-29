@@ -1,6 +1,7 @@
 //! 任务记录：Core 真相的载体。
 
 use crate::component::ComponentId;
+use crate::machine::CpuId;
 use crate::memory::MemoryLease;
 use crate::task::Kernelstack;
 use crate::task::state::TaskState;
@@ -15,6 +16,13 @@ pub struct TaskRecord {
     /// Core-controlled truth：状态只能由 `TaskTable::transition` 验证后改变，
     /// 组件（外部 crate）无法直接赋值。
     state: TaskState,
+    /// 任务上次运行所在的逻辑 CPU。
+    ///
+    /// `None` = 尚未运行过：它的上下文是创建时的 fresh 上下文，**任何 CPU 都可
+    /// 认领**；`Some(cpu)` = 已在该 CPU 上跑过，**只能由该 CPU 再认领**。这条规则
+    /// 规避「离场任务的上下文尚未保存完成就被另一 CPU 取走」的竞态（plan / Oracle
+    /// #1）——首次运行前的上下文不需要保存，所以可以安全跨 CPU。
+    last_cpu: Option<CpuId>,
     /// `unpark` 早于 `park` 时暂存的一次通知；重复通知合并为一个 permit。
     park_pending: bool,
     /// 组件任务入口（`KcompTaskEntry`：`void (*)(void *)`），由
@@ -45,6 +53,7 @@ impl TaskRecord {
         Self {
             owner,
             state: TaskState::Created,
+            last_cpu: None,
             park_pending: false,
             entry,
             arg,
@@ -57,6 +66,24 @@ impl TaskRecord {
     /// 只读观察任务归属。owner 是 Core 真相，不能由组件或调度策略修改。
     pub fn owner(&self) -> ComponentId {
         self.owner
+    }
+
+    /// 任务上次运行的逻辑 CPU（`None` = 从未运行过）。
+    pub fn last_cpu(&self) -> Option<CpuId> {
+        self.last_cpu
+    }
+
+    /// 该任务此刻能否被逻辑 CPU `cpu` 认领（`Runnable → Running` 的前置条件）。
+    ///
+    /// - 从未运行（`last_cpu == None`）：任何 CPU 可认领（上下文 fresh）；
+    /// - 运行过：只有其上次所在 CPU 可再认领（跨 CPU 认领会踩离场上下文竞态）。
+    pub fn claimable_by(&self, cpu: CpuId) -> bool {
+        self.last_cpu.is_none_or(|last| last == cpu)
+    }
+
+    /// Core 内部写入点：任务被提交为 `Running(cpu)` 时记录/更新归属 CPU。
+    pub(crate) fn set_last_cpu(&mut self, cpu: CpuId) {
+        self.last_cpu = Some(cpu);
     }
 
     /// 只读观察状态（monitor / trace / 调度器读侧）。

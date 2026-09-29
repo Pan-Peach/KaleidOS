@@ -175,9 +175,18 @@ impl TaskTable {
     /// - `Running → Exited`（exit：任务自行退出）
     ///
     /// 其余一律 `InvalidTransition`（Exited 终态、Created 直接 Running 等）。
-    /// Running(cpu) 互斥、跨 CPU 检查留给 SMP 里程碑。
+    ///
+    /// **跨 CPU 认领门禁（SMP）**：`Runnable → Running(cpu)` 还要满足
+    /// [`TaskRecord::claimable_by`]——从未运行过的任务任何 CPU 可认领，运行过的
+    /// 只认它上次所在的 CPU。不满足即 `InvalidTransition`（fail-closed）。这是
+    /// 「离场任务上下文尚未保存完成就被另一 CPU 取走」竞态的 Core 侧守门。
     pub fn transition(&mut self, id: TaskId, to: TaskState) -> Result<(), TaskError> {
         let record = self.get_mut(id).ok_or(TaskError::NotFound)?;
+        if let TaskState::Running(cpu) = to
+            && !record.claimable_by(cpu)
+        {
+            return Err(TaskError::InvalidTransition);
+        }
         let legal = matches!(
             (&record.state(), &to),
             (TaskState::Created, TaskState::Runnable)
@@ -189,6 +198,9 @@ impl TaskTable {
         );
         if !legal {
             return Err(TaskError::InvalidTransition);
+        }
+        if let TaskState::Running(cpu) = to {
+            record.set_last_cpu(cpu);
         }
         record.set_state(to);
         Ok(())
@@ -265,6 +277,35 @@ mod tests {
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Runnable));
         t.transition(id, TaskState::Running(CpuId(0))).unwrap();
         assert!(matches!(t.get(id).unwrap().state(), TaskState::Running(_)));
+    }
+
+    #[test]
+    fn running_pins_the_task_to_its_cpu() {
+        let _g = setup();
+
+        let mut t = TaskTable::new();
+        let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        t.transition(id, TaskState::Runnable).unwrap();
+
+        // 从未运行过：任何 CPU 都可认领。
+        assert_eq!(t.get(id).unwrap().last_cpu(), None);
+        assert!(t.get(id).unwrap().claimable_by(CpuId(0)));
+        assert!(t.get(id).unwrap().claimable_by(CpuId(1)));
+
+        // 提交到 CPU1 再 yield：钉在 CPU1。
+        t.transition(id, TaskState::Running(CpuId(1))).unwrap();
+        t.transition(id, TaskState::Runnable).unwrap();
+        assert_eq!(t.get(id).unwrap().last_cpu(), Some(CpuId(1)));
+        assert!(t.get(id).unwrap().claimable_by(CpuId(1)));
+        assert!(!t.get(id).unwrap().claimable_by(CpuId(0)));
+
+        // 已钉在 CPU1：不能被另一 CPU 提交为 Running（fail-closed）。
+        assert_eq!(
+            t.transition(id, TaskState::Running(CpuId(0))),
+            Err(TaskError::InvalidTransition)
+        );
+        // 但被它自己的 CPU 再次取走是允许的。
+        t.transition(id, TaskState::Running(CpuId(1))).unwrap();
     }
 
     #[test]
