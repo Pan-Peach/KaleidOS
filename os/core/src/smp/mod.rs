@@ -81,6 +81,8 @@ pub(crate) struct CpuRecord {
     pending_ipi: AtomicUsize,
     /// 已消费 pending、等待在安全边界真正重调度的标志（由 `drain_pending` 置位）。
     resched: AtomicBool,
+    /// 本地启动时是否验证过自己的逻辑身份（`current_cpu() == argument`）。
+    identity_ok: AtomicBool,
     /// 已发布的本地存储地址；远端 CPU **不得**解引用，只作发布/查询。
     local: AtomicPtr<CpuLocal>,
 }
@@ -92,6 +94,7 @@ impl CpuRecord {
             boot_state: AtomicU8::new(CpuBootState::Offline.as_raw()),
             pending_ipi: AtomicUsize::new(0),
             resched: AtomicBool::new(false),
+            identity_ok: AtomicBool::new(false),
             local: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -104,6 +107,16 @@ impl CpuRecord {
     /// 消费「需要重调度」标志（调度安全的边界调用）。
     pub(crate) fn take_resched(&self) -> bool {
         self.resched.swap(false, Ordering::AcqRel)
+    }
+
+    /// 记录 AP 已在本 CPU 上验证过逻辑身份（`secondary_entry` 调用）。
+    fn set_identity_ok(&self) {
+        self.identity_ok.store(true, Ordering::Release);
+    }
+
+    /// 该 CPU 是否验证过自己的逻辑身份。
+    pub(crate) fn identity_ok(&self) -> bool {
+        self.identity_ok.load(Ordering::Acquire)
     }
 
     /// 本记录的硬件身份。
@@ -260,6 +273,15 @@ impl CpuRegistry {
 /// 全局 Core CPU 真相表（`init` 发布一次）。
 static RECORDS: Once<CpuRegistry> = Once::new();
 
+/// BSP ↔ AP 启动屏障（Core 拥有）：AP 在 Ready 后自旋等待，BSP 在全部就绪后放行。
+static GATE: BootGate = BootGate::new();
+
+/// 启动期记录的 timebase 频率，用于 AP bring-up 超时（0 = 未知）。
+static TIMEBASE_HZ: AtomicUsize = AtomicUsize::new(0);
+
+/// AP bring-up 超时的兜底 tick 上限（timebase 未知时使用）。
+const AP_BOOT_TIMEOUT_FALLBACK: u64 = 20_000_000;
+
 /// BSP 启动流程（M1，机械）：校验拓扑 → 发布记录 → 注册 Core IPI 回调 →
 /// 置 BSP Online。
 ///
@@ -269,6 +291,8 @@ static RECORDS: Once<CpuRegistry> = Once::new();
 pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
     let registry = CpuRegistry::build(machine)?;
     let bsp = registry.bsp();
+
+    TIMEBASE_HZ.store(machine.timebase_frequency as usize, Ordering::Release);
 
     // Core IPI 回调必须在**任何 CPU 打开 IPI 接收之前**注册（覆盖语义）。
     // 只在真有多 CPU 时触碰后端：UP 无 IPI，也让 host/单核 profile 免于后端差异。
@@ -312,7 +336,9 @@ pub(crate) fn record(cpu: CpuId) -> Option<&'static CpuRecord> {
 }
 
 /// 请求启动某个 AP（Core 真相：`Offline → Starting`）。见 [`CpuRegistry::request_start`]。
-pub(crate) fn request_start(cpu: CpuId) -> Result<(), SmpInitError> {
+///
+/// boot 在请求硬件启动某个 AP **之前**调用；`pub` 供 boot crate 使用。
+pub fn request_start(cpu: CpuId) -> Result<(), SmpInitError> {
     RECORDS
         .get()
         .ok_or(SmpInitError::InvalidTopology)?
@@ -329,18 +355,73 @@ pub(crate) fn take_resched(cpu: CpuId) -> bool {
     record(cpu).is_some_and(CpuRecord::take_resched)
 }
 
+/// 该 CPU 是否在本 CPU 上验证过自己的逻辑身份（`smp-percpu` 证据）。
+pub fn cpu_identity_ok(cpu: CpuId) -> bool {
+    record(cpu).is_some_and(CpuRecord::identity_ok)
+}
+
 /// AP 入口：由 arch 启动 trampoline 进入，每个 AP 一次。
 ///
-/// `argument` = Core 校验过的逻辑 CPU 下标。
+/// `argument` = Core 校验过的逻辑 CPU 下标。顺序：绑定本地入口记录 → 本 CPU 子系统
+/// （sched/timer/irq/ipi）→ 验证身份 → Ready → 等 BSP 放行（BootGate）→ Online →
+/// 打开 IPI 源与全局中断 → Core 空闲循环。
 ///
 /// # Safety
 /// 只能由 arch 启动 trampoline 进入，且满足文档要求的执行环境（地址空间、栈、
 /// ABI、关中断、runtime slot = 0）。
-pub unsafe extern "C" fn secondary_entry(_argument: usize) -> ! {
-    todo!("SMP: AP entry (bind local storage, init cpu/controller/timer/ipi, wait gate, go online)")
+pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
+    let cpu = CpuId::from_raw(argument);
+
+    // 1) 绑定本 CPU 的入口记录（`sscratch`）：trap 入口据此换栈 + 解析身份。
+    //    真实 Core-owned `CpuLocal` 尚未定义，先用 dangling 占位（Core 只存 / 传）。
+    // SAFETY: 由 arch 启动 trampoline 进入，仅本 CPU、关中断、online 之前。
+    unsafe {
+        <arch::CpuImpl as arch::CpuArch>::install_per_cpu_base(cpu, core::ptr::NonNull::dangling());
+    }
+    <arch::CpuImpl as arch::CpuArch>::init_cpu(); // stvec / trap 入口
+
+    // 2) 本 CPU 的 Core 子系统。containment 尚未 per-CPU 化（plan M2）——本里程碑
+    //    AP 不运行组件任务，故不调用 `containment::init_cpu`（保持其 `todo!()` 不被触发）。
+    let _ = crate::sched::init_cpu(cpu);
+    let _ = crate::timer::init_cpu(cpu);
+    let _ = crate::irq::init_cpu(cpu);
+    let _ = <Backend as Smp>::init_cpu();
+
+    // 3) 身份证据 + 门禁：AP 必须读到自己被赋予的逻辑 id，否则是 Core 不变式破坏，
+    //    标记 Failed 并 park（绝不进入调度）。
+    if current_cpu() == cpu {
+        if let Some(record) = record(cpu) {
+            record.set_identity_ok();
+        }
+    } else {
+        if let Some(record) = record(cpu) {
+            record.set_boot_state(CpuBootState::Failed);
+        }
+        idle_loop(cpu);
+    }
+
+    // 4) Ready，并在 BootGate 上关中断自旋（全局 SIE 尚未开）。
+    let _ = mark_ready(cpu);
+    let _ = wait_for_release(cpu);
+
+    // 5) Online；打开本 CPU 的 IPI 源与全局中断，进入 Core 空闲循环。
+    let _ = set_online(cpu);
+    <Backend as Smp>::enable_ipi_interrupt();
+    <arch::CpuImpl as arch::CpuArch>::enable_irq();
+    idle_loop(cpu)
 }
 
-/// AP 完成本地初始化后置 Ready（由人类实现的 `secondary_entry` 调用）。
+/// CPU 的 Core 空闲循环：自旋 + `wfi`；IPI 只在硬件回调里标记 pending，在这里
+/// （安全边界）drain。本里程碑 AP 无跨 CPU 任务，故不进入 `sched::run`。
+fn idle_loop(cpu: CpuId) -> ! {
+    loop {
+        ipi::drain_pending(cpu);
+        let _ = take_resched(cpu);
+        <arch::CpuImpl as arch::CpuArch>::wait_for_interrupt();
+    }
+}
+
+/// AP 完成本地初始化后置 Ready。
 fn mark_ready(cpu: CpuId) -> Result<(), SmpInitError> {
     RECORDS
         .get()
@@ -348,16 +429,86 @@ fn mark_ready(cpu: CpuId) -> Result<(), SmpInitError> {
         .mark_ready(cpu)
 }
 
+/// 置某逻辑 CPU Online。
+fn set_online(cpu: CpuId) -> Result<(), SmpInitError> {
+    RECORDS
+        .get()
+        .ok_or(SmpInitError::InvalidTopology)?
+        .set_online(cpu)
+}
+
+/// AP 在启动屏障上自旋等待放行（调用方保证中断关闭）。
 fn wait_for_release(_cpu: CpuId) -> Result<(), SmpInitError> {
-    todo!("SMP: AP waits on the boot gate with interrupts disabled")
+    GATE.wait();
+    Ok(())
 }
 
-fn release_secondaries() -> Result<(), SmpInitError> {
-    todo!("SMP: release the boot gate so every Ready AP may proceed to Online")
+/// BSP 等所有已请求的 AP 到达 Ready（或失败）后放行屏障，并打开 BSP 自己的 IPI 源。
+///
+/// fail-closed：任一 AP `Failed` 或超时即返回错误，绝不发明“部分成功”。
+pub fn release_secondaries() -> Result<(), SmpInitError> {
+    let registry = RECORDS.get().ok_or(SmpInitError::InvalidTopology)?;
+    let bsp = registry.bsp();
+    let deadline = boot_deadline();
+
+    for (cpu, record) in registry.records.iter() {
+        if cpu == bsp {
+            continue;
+        }
+        loop {
+            match record.boot_state() {
+                CpuBootState::Starting => {
+                    if <arch::TimerImpl as arch::Timer>::now() >= deadline {
+                        return Err(SmpInitError::Timeout { cpu });
+                    }
+                    core::hint::spin_loop();
+                }
+                // Ready/Online = 已就绪；Offline = 未请求（单 CPU / 未启动的 AP）。
+                CpuBootState::Ready | CpuBootState::Online | CpuBootState::Offline => break,
+                CpuBootState::Failed => {
+                    return Err(SmpInitError::StartRejected {
+                        cpu,
+                        reason: arch::smp::CpuStartError::Rejected,
+                    });
+                }
+            }
+        }
+    }
+
+    GATE.release();
+    // BSP 现在可接收远端 Reschedule：打开自己的 IPI 源（全局 SIE 由 boot 负责）。
+    // UP（只有 BSP）没有 IPI 接收者，也没有注册 handler，故不打开。
+    if registry.records.len() > 1 {
+        <Backend as Smp>::enable_ipi_interrupt();
+    }
+    Ok(())
 }
 
-fn wait_until_online(_cpus: &CpuMask, _deadline: u64) -> Result<(), SmpInitError> {
-    todo!("SMP: BSP waits for the requested APs to reach Online")
+/// BSP 等待一组 CPU 到达 Online。
+pub fn wait_until_online(targets: &CpuMask, deadline: u64) -> Result<(), SmpInitError> {
+    loop {
+        let Some(cpu) = targets
+            .iter()
+            .find(|cpu| cpu_state(*cpu) != Ok(CpuBootState::Online))
+        else {
+            return Ok(());
+        };
+        if <arch::TimerImpl as arch::Timer>::now() >= deadline {
+            return Err(SmpInitError::Timeout { cpu });
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// AP bring-up / online 的超时时刻（timebase 未知时用兜底窗口）。
+fn boot_deadline() -> u64 {
+    let hz = TIMEBASE_HZ.load(Ordering::Acquire) as u64;
+    let window = if hz == 0 {
+        AP_BOOT_TIMEOUT_FALLBACK
+    } else {
+        hz.saturating_mul(2)
+    };
+    <arch::TimerImpl as arch::Timer>::now().saturating_add(window)
 }
 
 #[cfg(test)]

@@ -102,9 +102,9 @@ pub(crate) fn take_pending(cpu: CpuId) -> usize {
 /// 硬件回调里切上下文。
 pub(crate) fn drain_pending(cpu: CpuId) {
     let bits = take_pending(cpu);
-    if bits & RESCHEDULE_BIT != 0 {
-        if let Some(record) = crate::smp::record(cpu) {
-            record.set_resched();
-        }
+    if bits & RESCHEDULE_BIT != 0
+        && let Some(record) = crate::smp::record(cpu)
+    {
+        record.set_resched();
     }
 }

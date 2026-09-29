@@ -68,11 +68,14 @@ pub fn init() {
 
 /// 初始化**当前执行 CPU** 的本地中断嵌套状态（AP 在本地启动时调用；UP 不调用）。
 ///
-/// 实现时，`on_external` 要带上硬件 CPU 身份，`IrqSaveGuard` 的保存标志只属于
-/// 创建它的 CPU（并应标记为 non-`Send`/`Sync`）。
-#[allow(dead_code)]
-pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), arch::smp::InitError> {
-    todo!("SMP: initialize this CPU's local external-interrupt nesting state")
+/// 本里程碑：外部 IRQ 固定路由到 BSP，AP 没有本地嵌套状态需要初始化——
+/// irq-save 的中断状态由 `CpuArch::disable_irq` / `restore_irq` 直接承载，
+/// `IrqSaveGuard` 本身已标记 non-`Send`/`Sync`（CPU-local）。
+pub(crate) fn init_cpu(cpu: crate::machine::CpuId) -> Result<(), arch::smp::InitError> {
+    if crate::smp::current_cpu() != cpu {
+        return Err(arch::smp::InitError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 /// 外部中断入口（trap 分发调用；中断上下文，已关中断）。

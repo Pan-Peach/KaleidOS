@@ -677,62 +677,66 @@ fn external_irq_handler(_cpu: CpuId) {
     EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
-/// SMP 用例：启动次 CPU 并证明它进入了 `secondary_main`（milestone 1）。
+/// `0..cpu_count` 的逻辑 CPU 集合（helper）。
+#[cfg(target_arch = "riscv64")]
+fn all_cpus(info: &MachineInfo) -> kernel::smp::CpuMask {
+    let mut mask = kernel::smp::CpuMask::empty();
+    for i in 0..info.cpu_count {
+        mask.insert(CpuId::from_raw(i))
+            .expect("cpu within capacity");
+    }
+    mask
+}
+
+/// SMP 用例：AP 进入 **Core** 并 Online（Core 拥有启动真相）。
 ///
-/// 触发 boot 侧的 AP bring-up（`start_secondaries`），然后等 `ONLINE` 计数达到
-/// 非 boot CPU 数；超时即失败。`-smp 2` 由 `arch_runner.py --smp` 提供。
+/// `start_secondaries` 现在驱动 Core：`request_start` → 物理启动 → Core 等全部
+/// Ready 后放行启动屏障；AP 在 `secondary_entry` 里走到 Online。这里等 Core 的
+/// online 集合覆盖全部 CPU。`-smp 2` 由 `arch_runner.py --smp` 提供。
 #[cfg(target_arch = "riscv64")]
 fn smp_boot(info: &MachineInfo) -> ! {
-    let want = info.cpu_count.saturating_sub(1); // 非 boot CPU 数
-    if want == 0 {
+    if info.cpu_count <= 1 {
         fail("smp-boot: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
 
     let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
-    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
-        core::hint::spin_loop();
+    if kernel::smp::wait_until_online(&all_cpus(info), deadline).is_err() {
+        kernel::log!(
+            "selftest",
+            "smp-boot online={} want={}",
+            kernel::smp::online_cpus().count(),
+            info.cpu_count
+        );
+        fail("smp-boot: CPU never reached Core Online");
     }
-    let online = crate::smp::ONLINE.load(Ordering::Acquire);
-    if online < want {
-        kernel::log!("selftest", "smp-boot online={} want={}", online, want);
-        fail("smp-boot: secondary CPU never reached secondary_main");
+    if kernel::smp::online_cpus().count() != info.cpu_count {
+        fail("smp-boot: online set != cpu_count");
     }
     pass("smp-boot")
 }
 
-/// SMP 用例：BSP 给每个 AP 发一个 IPI 门铃，证明目标 CPU 真的处理了它。
-///
-/// 白盒驱动 arch 的 IPI 机制（类似 `external-irq`）：注册全局 handler → 等 AP
-/// 完成本地初始化（`Smp::init_cpu` / `enable_ipi_interrupt` / `enable_irq`）→
-/// 发门铃 → 等目标 CPU 上的 handler 计数。
+/// SMP 用例：BSP 给每个 AP 发一个 IPI 门铃，证明目标 CPU 真的处理了它，且
+/// **恰好一次**（缺 SSIP ack 会中断风暴）。
 #[cfg(target_arch = "riscv64")]
 fn smp_ipi(info: &MachineInfo) -> ! {
     use arch::smp::Smp;
 
-    let want = info.cpu_count.saturating_sub(1);
-    if want == 0 {
+    if info.cpu_count <= 1 {
         fail("smp-ipi: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
 
-    // BSP 注册全局 IPI handler，并打开自己的 IPI 接收（必须在任何 CPU 开接收之前）。
+    // BSP 覆盖注册本用例的 handler（Core 已在 `smp::init` 注册过；覆盖语义）。
     <arch::SmpImpl as Smp>::register_ipi_handler(bsp_ipi_handler)
         .expect("register_ipi_handler failed");
-    <arch::SmpImpl as Smp>::init_cpu().expect("Smp::init_cpu failed");
-    <arch::SmpImpl as Smp>::enable_ipi_interrupt();
 
-    // **先等所有 AP online** 再发门铃：AP 的 `Smp::init_cpu` 会清 `sip.SSIP`，
-    // 若门铃早于它到达就会被清掉、永远不投递（真实的启动期竞态）。
     let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
-    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
-        core::hint::spin_loop();
-    }
-    if crate::smp::ONLINE.load(Ordering::Acquire) < want {
-        fail("smp-ipi: AP did not reach secondary_main");
+    if kernel::smp::wait_until_online(&all_cpus(info), deadline).is_err() {
+        fail("smp-ipi: AP did not reach Core Online");
     }
 
-    // 给每个非 boot CPU 发门铃。
+    // 给每个非 boot CPU 发门铃（Core `notify` 走同一 arch 机制）。
     for cpu in &info.cpu_info[..info.cpu_count] {
         if cpu.hardware_id == info.boot_hardware_id {
             continue;
@@ -740,6 +744,7 @@ fn smp_ipi(info: &MachineInfo) -> ! {
         <arch::SmpImpl as Smp>::send_ipi(cpu.hardware_id).expect("send_ipi failed");
     }
 
+    let want = info.cpu_count - 1;
     let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
     while crate::smp::IPI_SEEN.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
         core::hint::spin_loop();
@@ -770,33 +775,27 @@ fn bsp_ipi_handler(cpu: CpuId) {
     }
 }
 
-/// SMP 用例：证明 per-CPU 身份彼此独立——每个 AP 读到的 `current_cpu()` 必须
-/// 等于它自己的逻辑下标。
+/// SMP 用例：每个 CPU 都在**本地**验证过自己的逻辑身份（`secondary_entry` 记录）。
 ///
-/// 依赖 `secondary_main` 装自己的入口记录（已实现）。Core 的 per-CPU
-/// sched/timer/containment 状态（各 `init_cpu`）是后续一步。
+/// Core 的 `secondary_entry` 要求 `current_cpu() == argument`，验证通过才置 Online；
+/// 因此 `cpu_identity_ok` 对每个 Online CPU 为真，且 BSP 的 `current_cpu()` 为 0。
 #[cfg(target_arch = "riscv64")]
 fn smp_percpu(info: &MachineInfo) -> ! {
-    let want = info.cpu_count.saturating_sub(1);
-    if want == 0 {
+    if info.cpu_count <= 1 {
         fail("smp-percpu: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
 
     let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
-    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
-        core::hint::spin_loop();
+    if kernel::smp::wait_until_online(&all_cpus(info), deadline).is_err() {
+        fail("smp-percpu: AP did not reach Core Online");
     }
-    if crate::smp::ONLINE.load(Ordering::Acquire) < want {
-        fail("smp-percpu: AP did not reach secondary_main");
-    }
-
     for i in 1..info.cpu_count {
-        if crate::smp::PERCPU_IDS[i].load(Ordering::Acquire) != i {
-            fail("smp-percpu: AP current_cpu() != its logical id");
+        if !kernel::smp::cpu_identity_ok(CpuId::from_raw(i)) {
+            fail("smp-percpu: AP did not verify its own logical id");
         }
     }
-    if arch::CpuImpl::current_cpu().map(|c| c.raw()) != Some(0) {
+    if kernel::smp::current_cpu().raw() != 0 {
         fail("smp-percpu: BSP current_cpu() != 0");
     }
     pass("smp-percpu")

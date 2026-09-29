@@ -23,8 +23,6 @@
 //! host / rv64 / rv32 测试保持全绿。
 
 use crate::vm::bootstrap;
-use arch::smp::Smp;
-use arch::CpuArch;
 use core::arch::global_asm;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
@@ -36,11 +34,6 @@ unsafe extern "C" {
     /// `secondary64.S` 里的 AP 物理入口。
     fn _secondary_start();
 }
-
-pub static ONLINE: AtomicUsize = AtomicUsize::new(0);
-
-/// 每个 AP 读到的逻辑身份（`smp-percpu` 的证据）；索引 = 逻辑下标。
-pub static PERCPU_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 /// 已在**非 boot CPU** 上跑过 IPI handler 的次数（`smp-ipi` 的证据）。
 #[allow(dead_code)] // 只被 selftest 的 `smp-ipi` 用例读
@@ -113,48 +106,19 @@ pub fn secondary_entry_address() -> usize {
 
 /// AP 的高半区 Rust 入口：由 `secondary64.S` 在长期地址空间生效后跳入。
 ///
-/// 职责是把控制权交给 Core 的 `secondary_entry`（逻辑身份绑定 + 本地子系统
-/// 初始化）；boot 只保证「站在高半区、关中断、runtime slot = 0、栈已就位」。
+/// boot 只保证「站在高半区、关中断、runtime slot = 0、栈已就位」；其余
+/// （入口记录绑定、本地子系统、就绪 / 门控 / Online、空闲循环）全部交给 Core 的
+/// `smp::secondary_entry`。它**永不返回**。
 pub extern "C" fn secondary_main(argument: usize) -> ! {
-    // AP 侧本地初始化（Core 的 `secondary_entry` 最终会接管这里）：
-    //   1) 装自己的入口记录（`sscratch` = &entry = 本 CPU 的 trap 栈顶）；
-    //   2) 设 `stvec`（`CpuArch::init_cpu`）；
-    //   3) 开本 CPU 的 IPI 接收源（`Smp::init_cpu` + `enable_ipi_interrupt`）+ 全局 SIE。
-    unsafe {
-        <arch::CpuImpl as arch::CpuArch>::install_per_cpu_base(
-            kernel::machine::CpuId::from_raw(argument),
-            core::ptr::NonNull::dangling(),
-        );
-    }
-    <arch::CpuImpl as arch::CpuArch>::init_cpu();
-
-    // 记录本 CPU 读到的逻辑身份（`smp-percpu` 的证据）。
-    if let Some(cpu) = <arch::CpuImpl as arch::CpuArch>::current_cpu() {
-        PERCPU_IDS[argument].store(cpu.raw(), Ordering::Release);
-    }
-
-    <arch::SmpImpl as Smp>::init_cpu().expect("SMP(riscv): init_cpu() failed");
-    <arch::SmpImpl as Smp>::enable_ipi_interrupt();
-
-    // 先打印、再置 `ONLINE`：BSP 在 `ONLINE` 上等待 AP 就绪，若先 `ONLINE++`，
-    // BSP 可能在 AP 仍在写串口时打印结果——串口无跨 CPU 锁，两条流会交错，
-    // 把 `[selftest] <case>: PASS` 标记打散，令 ArchTest 判定 flaky（已实测）。
-    // 打印时全局中断仍关着，避免嵌套 trap 再进 console。
-    arch::riscv::console::write_fmt(format_args!(
-        "[SMP] CPU {argument}: secondary_main() called\n"
-    ));
-    <arch::CpuImpl as arch::CpuArch>::enable_irq();
-
-    ONLINE.fetch_add(1, Ordering::AcqRel);
-    loop {
-        arch::CpuImpl::wait_for_interrupt();
-    }
+    // SAFETY: `secondary64.S` 已建立 `SecondaryEntry` 契约要求的入口环境。
+    unsafe { kernel::smp::secondary_entry(argument) }
 }
 
 /// 主 hart 启动所有次 CPU。
 ///
-/// 前置：`kernel::init` 已完成、长期内核地址空间（runtime root）已建立并激活、
-/// 全局中断已开。此后才发布 AP 描述符并逐个请求 arch 启动。
+/// 前置：`kernel::init` 已完成、长期内核地址空间（runtime root）已建立并激活。
+/// boot 只负责物理启动；**Core 拥有启动真相**（`request_start` 置 `Starting`），
+/// 并在 [`kernel::smp::release_secondaries`] 里等全部 AP Ready 后放行启动屏障。
 pub fn start_secondaries(info: &MachineInfo) {
     let satp = arch::riscv::mmu::current_satp();
     let entry = secondary_main as *const () as usize;
@@ -164,6 +128,10 @@ pub fn start_secondaries(info: &MachineInfo) {
         if cpu.hardware_id == info.boot_hardware_id {
             continue;
         }
+        // Core 记「已请求启动」（Offline → Starting）；boot 随后才做物理启动。
+        kernel::smp::request_start(kernel::machine::CpuId::from_raw(i))
+            .expect("SMP: request_start rejected");
+
         let ap = ApBoot {
             boot_stack_top: stack_low_top(i),
             kernel_stack_top: stack_high_top(i),
@@ -187,4 +155,7 @@ pub fn start_secondaries(info: &MachineInfo) {
             );
         }
     }
+
+    // 等所有已请求的 AP Ready 后放行启动屏障（并打开 BSP 的 IPI 源）。fail-closed。
+    kernel::smp::release_secondaries().expect("SMP: secondary bring-up failed");
 }
