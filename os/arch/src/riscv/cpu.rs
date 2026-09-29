@@ -19,6 +19,10 @@ const IRQ_ENABLE_BIT: usize = 1 << 3;
 #[cfg(all(feature = "machine", feature = "supervisor"))]
 const IRQ_ENABLE_BIT: usize = 0;
 
+/// 编译期 per-CPU 容量：唯一定义在 crate 根（`arch/build.rs` 从 Kconfig
+/// `MAX_CPUS` 生成），这里 re-export 供本模块与 `plic` 复用。
+pub use crate::MAX_CPUS;
+
 /// RISC-V 寄存器上下文记录（`__switch` 的保存 / 恢复形状）。
 ///
 /// 布局即 ABI：字段顺序 / 偏移必须与 `context/switch64.S`（`sd`/`ld`，8 字节）
@@ -46,6 +50,65 @@ pub struct RiscvContext {
     tp: usize,
 }
 
+#[repr(C)]
+pub struct CpuEntry {
+    pub trap_stack_top: usize,
+    pub core_base: usize,
+    pub logical_id: usize,
+    pub hardware_id: usize,
+}
+
+impl CpuEntry {
+    pub const fn empty() -> Self {
+        Self {
+            trap_stack_top: 0,
+            core_base: 0,
+            logical_id: 0,
+            hardware_id: 0,
+        }
+    }
+}
+
+/// 每 CPU 的入口记录 + 它自己的安全 trap 栈。
+///
+/// `entry` 紧贴在 `stack` 之上，所以 **`&entry` 就等于这张栈的栈顶**。
+/// 于是 `sscratch`（= `&entry`）**一个值**同时给出「入口记录指针」和
+/// 「trap 栈顶」——trap 入口不需要任何临时寄存器就能换栈并解析身份。
+///
+/// 布局即 ABI：trap 入口假定 `sscratch` 即栈顶（`T = &entry`）。
+#[cfg(target_arch = "riscv64")]
+#[repr(C, align(16))]
+struct PerCpu {
+    stack: [u8; super::trap::TRAP_STACK_BYTES],
+    entry: CpuEntry,
+}
+
+#[cfg(target_arch = "riscv64")]
+static mut PER_CPU: [PerCpu; MAX_CPUS] = [const {
+    PerCpu {
+        stack: [0; super::trap::TRAP_STACK_BYTES],
+        entry: CpuEntry::empty(),
+    }
+}; MAX_CPUS];
+
+/// 逻辑 CPU `i` 的入口记录地址（== 它的 trap 栈顶）。
+#[cfg(target_arch = "riscv64")]
+fn entry_ptr(i: usize) -> *mut CpuEntry {
+    // SAFETY: 只取静态数组元素地址（不创建引用）。
+    unsafe { core::ptr::addr_of_mut!(PER_CPU[i].entry) }
+}
+
+/// 逻辑 CPU `i` 的安全 trap 栈半开区间 `[base, top)`。
+///
+/// `entry` 紧贴 `stack` 之上，所以 `top == &entry`（trap 入口据此换栈）。
+#[cfg(target_arch = "riscv64")]
+pub fn trap_stack_range_for(i: usize) -> (usize, usize) {
+    // SAFETY: 只取静态数组元素地址。
+    let base = unsafe { core::ptr::addr_of!(PER_CPU[i].stack) } as usize;
+    let top = unsafe { core::ptr::addr_of!(PER_CPU[i].entry) } as usize;
+    (base, top)
+}
+
 // 布局即 ABI：把字段偏移钉死在 `__switch` 的 `.S` 常量上（112 / 56 = 14 个字）。
 // 断言失败 = 结构体与汇编已经漂移，绝不允许。
 const _: () = {
@@ -54,6 +117,20 @@ const _: () = {
     assert!(core::mem::offset_of!(RiscvContext, s) == 2 * core::mem::size_of::<usize>());
     assert!(core::mem::offset_of!(RiscvContext, tp) == 14 * core::mem::size_of::<usize>());
 };
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn read_scratch() -> usize {
+    let value: usize;
+    unsafe {
+        asm!(
+            "csrr {value}, sscratch",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value
+}
 
 impl CpuArch for Riscv {
     type Context = RiscvContext;
@@ -168,26 +245,82 @@ impl CpuArch for Riscv {
         }
     }
 
-    // ——— SMP：CPU-local 身份与基址（骨架，实现待手写）———
+    // ——— CPU-local 身份与基址 ———
     //
-    // 设计定案（见 docs/modules/arch.md）：`sscratch` 目前承载「安全 trap 栈」
-    // 约定（`trap/supervisor.rs`），不能被简单改成 per-CPU 指针。正确做法是把它
-    // 升级为 **arch 私有的 CPU 入口记录**（`core_base` + `logical/hardware` id +
-    // trap 栈状态），并同步改普通 trap、嵌套 trap、containment 非局部返回路径。
-    // 在那之前这三个方法保持 `todo!()`，不得偷偷用 `mscratch` 或占用通用寄存器。
+    // 统一约定（rv64）：`sscratch` 恒 = 本 CPU 的 `CpuEntry*`，而 `PerCpu` 把
+    // `entry` 紧贴在 trap 栈之上，所以这个指针**同时**是「入口记录指针」和
+    // 「安全 trap 栈顶」。trap 入口、`current_cpu`、`per_cpu_base` 都只读它。
+    // UP 是「只有 CPU0 的 SMP」：boot 无条件给 CPU0 装一次记录即可，不再有
+    // `smp` feature 的语义分叉。RV32 目前无 SMP，保持旧约定（见下）。
     //
     // `tp`（runtime slot）与 per-CPU 基址严格分离：本方法不动 `tp`。
 
     fn current_cpu() -> Option<crate::cpu::CpuId> {
-        todo!("SMP: read the Core-assigned logical CPU identity from the arch entry record")
+        #[cfg(target_arch = "riscv64")]
+        {
+            // `sscratch` 装的是入口记录**指针**（不是下标）：0 = 未绑定。
+            let p = read_scratch();
+            if p == 0 {
+                None
+            } else {
+                // SAFETY: 非 0 即指向本 CPU 的 `CpuEntry`（只由 install 写入）。
+                let entry = unsafe { &*(p as *const CpuEntry) };
+                Some(crate::cpu::CpuId::from_raw(entry.logical_id))
+            }
+        }
+        #[cfg(target_arch = "riscv32")]
+        {
+            // RV32 无 SMP：恒为唯一逻辑 CPU，不读 `sscratch`（仍是旧约定）。
+            Some(crate::cpu::CpuId::from_raw(0))
+        }
     }
 
     fn per_cpu_base() -> Option<core::ptr::NonNull<()>> {
-        todo!("SMP: return the Core local storage pointer from the arch entry record")
+        #[cfg(target_arch = "riscv64")]
+        {
+            let p = read_scratch();
+            if p == 0 {
+                None
+            } else {
+                // SAFETY: 同上；core_base 由 Core 提供的非空指针写入。
+                let entry = unsafe { &*(p as *const CpuEntry) };
+                core::ptr::NonNull::new(entry.core_base as *mut ())
+            }
+        }
+        #[cfg(target_arch = "riscv32")]
+        {
+            None
+        }
     }
 
-    unsafe fn install_per_cpu_base(_cpu: crate::cpu::CpuId, _base: core::ptr::NonNull<()>) {
-        todo!("SMP: publish the Core local storage into the arch entry record on this CPU")
+    unsafe fn install_per_cpu_base(cpu: crate::cpu::CpuId, base: core::ptr::NonNull<()>) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let i = cpu.raw();
+            assert!(
+                i < MAX_CPUS,
+                "logical CpuId {} exceeds arch MAX_CPUS {}",
+                i,
+                MAX_CPUS
+            );
+
+            // SAFETY: 只在本 CPU、关中断、online 之前写自己的槽（trait 契约）。
+            let entry = entry_ptr(i);
+            unsafe {
+                (*entry).core_base = base.as_ptr() as usize;
+                (*entry).logical_id = i;
+                // `&entry` 就是本 CPU 的 trap 栈顶（见 `PerCpu`）。
+                (*entry).trap_stack_top = entry as usize;
+                // hardware_id 暂不填（trait 未携带硬件身份；读者也不需要）。
+
+                // 把入口记录指针装进 `sscratch`：trap 入口据此换栈 + 解析身份。
+                asm!("csrw sscratch, {}", in(reg) entry as usize, options(nostack, preserves_flags));
+            }
+        }
+        #[cfg(target_arch = "riscv32")]
+        {
+            let _ = (cpu, base);
+        }
     }
 }
 

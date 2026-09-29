@@ -19,7 +19,7 @@ machine = ["arch/machine", "kernel/machine"]
 vm-mmu = ["arch/vm-mmu", "kernel/vm-mmu"]
 vm-nommu = ["arch/vm-nommu", "kernel/vm-nommu"]
 preempt = ["kernel/preempt"]
-smp = ["arch/smp", "kernel/smp"]
+smp = []
 trace = ["kernel/trace"]
 selftest = []
 

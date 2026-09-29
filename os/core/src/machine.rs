@@ -61,8 +61,11 @@ pub struct CpuInfo {
 /// 这是**编译期容量**（定长数组大小），不是运行时真值：真实 CPU 数一律由
 /// `MachineInfo.cpu_count`（bootstrap 从 FDT/ACPI 发现后填写）决定。SMP 的
 /// `CpuMask` / per-CPU 索引以本常量为上界；Core 只使用 `[..cpu_count]` 前缀。
-/// 要支持更多 CPU，只改这一处（连同 `cpu_info` 的数组类型）。
-pub const MAX_CPUS: usize = 8;
+///
+/// 定义在叶子 crate `arch`（由 Kconfig `MAX_CPUS` 经 `arch/build.rs` 生成），
+/// 这里只 re-export：`core` 依赖 `arch`，常量必须落在 `arch` 才能被两边共用。
+/// 要支持更多 CPU，改 Kconfig `MAX_CPUS` 一处即可。
+pub use arch::MAX_CPUS;
 
 #[derive(Clone, Copy)]
 pub struct MemoryRegion {

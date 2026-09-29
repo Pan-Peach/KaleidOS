@@ -66,11 +66,10 @@ pub fn init() {
     let _ = <InterruptImpl as InterruptController>::init_cpu();
 }
 
-/// SMP：初始化**当前执行 CPU** 的本地中断嵌套状态（AP 在本地启动时调用）。
+/// 初始化**当前执行 CPU** 的本地中断嵌套状态（AP 在本地启动时调用；UP 不调用）。
 ///
-/// 非 SMP 构建没有这个接缝。SMP 实现时，`on_external` 要带上硬件 CPU 身份，
-/// `IrqSaveGuard` 的保存标志只属于创建它的 CPU（并应标记为 non-`Send`/`Sync`）。
-#[cfg(feature = "smp")]
+/// 实现时，`on_external` 要带上硬件 CPU 身份，`IrqSaveGuard` 的保存标志只属于
+/// 创建它的 CPU（并应标记为 non-`Send`/`Sync`）。
 #[allow(dead_code)]
 pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), arch::smp::InitError> {
     todo!("SMP: initialize this CPU's local external-interrupt nesting state")

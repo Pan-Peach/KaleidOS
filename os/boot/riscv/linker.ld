@@ -28,6 +28,18 @@ SECTIONS
     __text_entry_lma_start = LOADADDR(.text.entry);
     __text_entry_lma_end = LOADADDR(.text.entry) + SIZEOF(.text.entry);
 
+    /*
+     * AP 入口 trampoline（secondary64.S）自成一节：它**不能**进 .text.entry，
+     * 否则会与 _start 争抢镜像基址（_start 用 auipc 把自身地址当 kernel_pa）。
+     * 仍在低引导区（VMA == PA），AP 在 satp=0 时可按物理地址取指。
+     * ALIGN(16)（不是 4k）：该节在非 SMP 构建里为空，避免插入整页 padding。
+     */
+    . = ALIGN(16);
+    .text.secondary :
+    {
+        KEEP(*(.text.secondary))
+    }
+
     . = ALIGN(8);
     .rodata.entry :
     {

@@ -115,7 +115,8 @@ impl CpuArch for Fake {
     }
 
     fn current_cpu() -> Option<CpuId> {
-        CPU_ID.with(|id| id.get()).map(CpuId::from_raw)
+        // host 恒为 CPU0（UP = 只有第 0 项的 SMP）；`install_per_cpu_base` 可覆盖。
+        Some(CpuId::from_raw(CPU_ID.with(|id| id.get()).unwrap_or(0)))
     }
 
     fn per_cpu_base() -> Option<core::ptr::NonNull<()>> {

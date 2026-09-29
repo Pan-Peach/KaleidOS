@@ -114,13 +114,8 @@ struct CpuState {
     current: Option<TaskId>,
 }
 
-#[cfg(not(feature = "smp"))]
-static CPU: Once<Mutex<CpuState>> = Once::new();
-
-/// SMP（CONFIG_SMP）：每逻辑 CPU 一份调度真相，索引 = 逻辑 `CpuId`。
-///
-/// 这是 SMP 骨架的**接口接缝**：非 SMP 构建走上面的单一 `CPU`，行为完全不变。
-#[cfg(feature = "smp")]
+/// 每逻辑 CPU 一份调度真相，索引 = 逻辑 `CpuId`。**UP = 只有第 0 项的 SMP**，
+/// 不再有单独的单一 `CPU`（见 `docs/modules/arch.md` 的 UP = SMP-1）。
 static CPU_TABLE: Once<crate::smp::PerCpu<Mutex<CpuState>>> = Once::new();
 
 /// 调度策略配置（Core truth）：**只记 EndpointId** + 选择时为策略执行准备的
@@ -141,14 +136,6 @@ struct PolicySlot {
 static POLICY: Once<Mutex<PolicySlot>> = Once::new();
 
 pub fn init() {
-    #[cfg(not(feature = "smp"))]
-    CPU.call_once(|| {
-        Mutex::new(CpuState {
-            anchor: None,
-            current: None,
-        })
-    });
-    #[cfg(feature = "smp")]
     CPU_TABLE.call_once(|| {
         crate::smp::PerCpu::new(crate::machine::MAX_CPUS, |_| {
             Mutex::new(CpuState {
@@ -167,24 +154,12 @@ pub fn init() {
     });
 }
 
-/// 当前执行 CPU 的逻辑身份。非 SMP 恒为 CPU0；SMP 下由 arch 入口记录解析。
-#[cfg(not(feature = "smp"))]
-fn current_cpu_id() -> CpuId {
-    CpuId(0)
-}
-
-#[cfg(feature = "smp")]
+/// 当前执行 CPU 的逻辑身份（由 arch 入口记录解析；UP 恒为 CPU0）。
 fn current_cpu_id() -> CpuId {
     crate::smp::current_cpu()
 }
 
-#[cfg(not(feature = "smp"))]
-fn cpu() -> &'static Mutex<CpuState> {
-    CPU.get().expect("sched not initialized")
-}
-
-/// SMP：取**当前执行 CPU** 的调度真相。锁纪律不变（调用点仍只短暂持锁）。
-#[cfg(feature = "smp")]
+/// 取**当前执行 CPU** 的调度真相。锁纪律不变（调用点仍只短暂持锁）。
 fn cpu() -> &'static Mutex<CpuState> {
     CPU_TABLE
         .get()
@@ -193,15 +168,13 @@ fn cpu() -> &'static Mutex<CpuState> {
         .expect("current cpu outside the per-cpu scheduler table")
 }
 
-/// SMP：初始化某个 CPU 的调度状态（AP 在本地启动时调用）。
-#[cfg(feature = "smp")]
+/// 初始化某个 CPU 的调度状态（AP 在本地启动时调用；UP 不调用）。
 #[allow(dead_code)]
 pub(crate) fn init_cpu(_cpu: CpuId) -> Result<(), SchedError> {
     todo!("SMP: initialize this CPU's scheduler state (anchor/current) locally")
 }
 
-/// SMP：请求目标 CPU 在**安全边界**重新调度（不在 IPI 回调里切上下文）。
-#[cfg(feature = "smp")]
+/// 请求目标 CPU 在**安全边界**重新调度（不在 IPI 回调里切上下文；UP 不调用）。
 #[allow(dead_code)]
 pub(crate) fn request_reschedule(_cpu: CpuId) -> Result<(), SchedError> {
     todo!("SMP: mark a reschedule request for the target CPU")

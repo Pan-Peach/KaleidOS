@@ -425,21 +425,18 @@ pub fn init() {
 /// Rust 可变引用。
 ///
 /// 骨架先留空壳：字段在把上述 `static mut` 迁进来时补。**它不是组件 runtime slot。**
-#[cfg(feature = "smp")]
 #[allow(dead_code)]
 pub(crate) struct CpuContainment {
     _reserved: (),
 }
 
-/// SMP：初始化**当前执行 CPU** 的 containment 本地状态（AP 在本地启动时调用）。
-#[cfg(feature = "smp")]
+/// 初始化**当前执行 CPU** 的 containment 本地状态（AP 在本地启动时调用；UP 不调用）。
 #[allow(dead_code)]
 pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), ContainmentInitError> {
     todo!("SMP: move the containment static-mut set into a per-CPU CpuContainment")
 }
 
 /// [`init_cpu`] 的失败原因。
-#[cfg(feature = "smp")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainmentInitError {
     /// 本地栈 / 上下文准备失败。

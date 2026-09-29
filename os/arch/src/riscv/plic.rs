@@ -24,8 +24,9 @@ use super::Riscv;
 
 /// 配置能表达的 PLIC context 上限。
 ///
-/// 必须 >= Core 的 `machine::MAX_CPUS`（当前都是 8）；boot 负责保证这一点。
-pub const MAX_PLIC_CONTEXTS: usize = 8;
+/// 每个 CPU 至少一个 context，所以上限 = 编译期 CPU 容量
+/// （`arch::MAX_CPUS`，Kconfig `MAX_CPUS`）。
+pub const MAX_PLIC_CONTEXTS: usize = crate::MAX_CPUS;
 
 /// 一个逻辑 CPU 对应的 PLIC context 编号。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,13 +114,8 @@ fn context_of(cpu: CpuId) -> Option<usize> {
 
 /// **当前执行 CPU** 的 claim/complete context。
 fn cpu_context() -> usize {
-    #[cfg(feature = "smp")]
-    let cpu = {
-        use crate::CpuArch;
-        Riscv::current_cpu().expect("SMP: current CPU is not bound during PLIC claim")
-    };
-    #[cfg(not(feature = "smp"))]
-    let cpu = CpuId::from_raw(PLIC_EXTERNAL_CPU.load(Ordering::Acquire));
+    use crate::CpuArch;
+    let cpu = Riscv::current_cpu().expect("current CPU is not bound during PLIC claim");
     context_of(cpu).expect("current CPU's PLIC context is not configured")
 }
 
@@ -185,13 +181,9 @@ impl InterruptController for Riscv {
     }
 
     fn init_cpu() -> Result<(), smp::InitError> {
-        // 选择本 CPU 的 context（UP：configure 已确定唯一 context；SMP：按
-        // `current_cpu` 查表），并解开本 CPU 的外部中断**投递源**；全局使能由
-        // `CpuArch::enable_irq` 单独负责。
-        #[cfg(feature = "smp")]
-        {
-            let _ = cpu_context();
-        }
+        // 选择本 CPU 的 context（按 `current_cpu` 查表；UP 恒为 CPU0），并解开本
+        // CPU 的外部中断**投递源**；全局使能由 `CpuArch::enable_irq` 单独负责。
+        let _ = cpu_context();
         super::firmware::enable_external_interrupt();
         Ok(())
     }

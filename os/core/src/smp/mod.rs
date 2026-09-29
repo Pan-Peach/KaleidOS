@@ -88,9 +88,10 @@ pub fn init(_machine: &MachineInfo) -> Result<(), SmpInitError> {
     todo!("SMP: BSP bring-up (validate topology, publish records, start APs, boot gate)")
 }
 
-/// 当前执行 CPU 的逻辑身份。仅在该 CPU 完成本地绑定后有效。
+/// 当前执行 CPU 的逻辑身份。由 arch 的 CPU-local 入口记录解析（UP 恒为 CPU0）。
 pub fn current_cpu() -> CpuId {
-    todo!("SMP: resolve the logical CpuId from the arch CPU-local entry record")
+    <arch::CpuImpl as arch::CpuArch>::current_cpu()
+        .expect("current CPU is not bound (install_per_cpu_base was not called)")
 }
 
 /// 已 Online 的逻辑 CPU 集合。

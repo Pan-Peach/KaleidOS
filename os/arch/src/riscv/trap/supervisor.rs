@@ -19,6 +19,10 @@ global_asm!(include_str!("trap64.S"));
 pub fn init() {
     unsafe {
         set_trap_vector();
+        // rv64：`sscratch` 由 `install_per_cpu_base` 装成入口记录（见 cpu.rs），
+        // 这里不能再写 trap 栈顶——那会覆盖记录指针。rv32：仍是旧约定
+        // （`sscratch` = 全局 trap 栈顶）。
+        #[cfg(target_arch = "riscv32")]
         set_scratch(super::trap_stack_top());
     }
 }
@@ -46,7 +50,8 @@ unsafe fn set_trap_vector() {
     }
 }
 
-/// 装入 `sscratch` 的 trap 栈约定值。
+/// 装入 `sscratch` 的 trap 栈约定值（仅 rv32：rv64 的 `sscratch` 由入口记录占用）。
+#[cfg(target_arch = "riscv32")]
 fn set_scratch(value: usize) {
     unsafe {
         core::arch::asm!("csrw sscratch, {value}",

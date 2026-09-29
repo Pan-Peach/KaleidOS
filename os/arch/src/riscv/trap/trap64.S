@@ -1,45 +1,26 @@
 .align 2
 .global trap_vec
 trap_vec:
-    # Stack-safe trap entry (single convention for Core and component code).
+    # 统一约定（rv64）：`sscratch` 恒 = 本 CPU 的 `CpuEntry*`。
     #
-    # Outside handling `sscratch` holds the safe Core trap-stack top.  On an
-    # outer trap we switch to it BEFORE writing anything through the interrupted
-    # `sp` (whose contents may not be valid in Core context), preserving the
-    # interrupted sp in `TrapFrame.x[2]`.  While handling, `sscratch` is zero:
-    # a nested trap stays on the safe stack (no switch).
+    # `PerCpu` 把 `entry` 紧贴在它的 trap 栈之上，所以这个指针**同时**是
+    # 「入口记录指针」和「安全 trap 栈顶」——一个寄存器够用，不需要任何临时
+    # 寄存器。UP 与 SMP 走同一条路径（UP = 只有 CPU0 的 SMP）。
     #
-    # The frame is 272 bytes (TrapFrame) plus one marker word at 272 holding the
-    # `sscratch` value to restore on `sret` (safe top for an outer trap, 0 for a
-    # nested one).  The allocation is 288 bytes so the ABI keeps `sp` 16-byte
-    # aligned.
+    # 换栈：sp := &entry（即 trap 栈顶），sscratch := 被打断的 sp。
     csrrw sp, sscratch, sp
-    beqz sp, .Lnested
+    beqz sp, .Lunbound          # sscratch == 0 => 本 CPU 未绑定（不该发生）
 
-    # ---- outer trap: interrupted stack is not the safe trap stack ----
+    # 在 trap 栈上分配 TrapFrame（272 字节）+ 16 对齐 = 288 字节。
     addi sp, sp, -288
     sd t0, 40(sp)
     sd t1, 48(sp)
     sd t2, 56(sp)
-    csrr t0, sscratch            # t0 = interrupted sp
-    sd t0, 16(sp)                # frame.x[2] = interrupted sp
-    addi t0, sp, 288             # t0 = safe trap-stack top
-    sd t0, 272(sp)               # outer: reinstall it on sret
-    csrw sscratch, zero          # nested convention while handling
-    j .Lsave_rest
+    csrr t0, sscratch           # t0 = 被打断的 sp
+    sd t0, 16(sp)               # frame.x[2] = 被打断的 sp
+    addi t0, sp, 288            # t0 = &entry（== trap 栈顶）
+    csrw sscratch, t0           # 恢复 sscratch = &entry（处理期间保持稳定）
 
-.Lnested:
-    # ---- nested trap: already on the safe trap stack ----
-    csrrw sp, sscratch, sp       # sp := interrupted sp, sscratch := 0
-    addi sp, sp, -288
-    sd t0, 40(sp)
-    sd t1, 48(sp)
-    sd t2, 56(sp)
-    addi t0, sp, 288
-    sd t0, 16(sp)                # frame.x[2] = interrupted sp
-    sd zero, 272(sp)             # nested: stay on the safe stack
-
-.Lsave_rest:
     sd ra, 8(sp)
     sd gp, 24(sp)
     sd tp, 32(sp)
@@ -114,10 +95,10 @@ trap_vec:
     ld t5, 240(sp)
     ld t6, 248(sp)
 
-    # Restore the sscratch convention: safe top after an outer trap, 0 while
-    # nested handling continues, then the interrupted sp / t0.
-    ld t0, 272(sp)
-    csrw sscratch, t0
-    ld t0, 40(sp)
+    # sscratch 全程未变（= &entry），无需恢复；直接还原 sp / sret。
     ld sp, 16(sp)
     sret
+
+.Lunbound:
+    wfi
+    j .Lunbound

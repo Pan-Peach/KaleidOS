@@ -25,10 +25,26 @@ config SMP
 	  scheduler/timer/IRQ state, AP bring-up).  Arch CPU startup + IPI
 	  transport live behind the `Smp` contract in os/arch.
 
-	  There is deliberately no NR_CPUS symbol: the real CPU count is read from
-	  the discovered MachineInfo (cpu_count) at boot, and the compile-time
-	  capacity is the single `machine::MAX_CPUS` constant.  A Kconfig knob
-	  would be a second source of truth for that same capacity.
+	  There is no runtime CPU-count knob: the real count is read from the
+	  discovered MachineInfo (cpu_count) at boot.  The compile-time
+	  **capacity** is the `MAX_CPUS` symbol below.
+
+config MAX_CPUS
+	int "Maximum number of CPUs (compile-time capacity)"
+	default 8
+	range 1 64
+	help
+	  Compile-time capacity for the per-CPU arrays: Core's `MachineInfo`
+	  (`cpu_info`) and arch's per-CPU entry records / trap stacks.  It is a
+	  **capacity**, not the detected count -- the real count comes from the
+	  discovered MachineInfo at boot and must be <= this value.
+
+	  It is a build config (not a plain crate constant) because both `arch`
+	  (the leaf) and `core` need the same value, but `core` depends on `arch`
+	  and not the other way around, so the constant must live below `core`.
+	  `arch/build.rs` turns this symbol into the Rust constant `arch::MAX_CPUS`
+	  (mirrored as CONFIG_MAX_CPUS by genmk.py), and `core::machine` re-exports
+	  it, so there is exactly one definition.
 
 endmenu
 

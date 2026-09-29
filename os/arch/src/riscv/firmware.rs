@@ -240,3 +240,10 @@ pub fn enable_external_interrupt() {
         );
     }
 }
+
+pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> Result<(), ()> {
+    sbi_rt::hart_start(hart_id, start_addr, opaque)
+        .is_ok()
+        .then_some(())
+        .ok_or(())
+}

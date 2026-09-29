@@ -196,11 +196,12 @@ init.kpkg:
 	@echo "packed: tools/qemu/init.kpkg ($(KCOMP_SRCS) $(KCOMP_C_SRCS))"
 
 # 发布形态：kaleidos.elf = bootstrap + core + .initpkg(kpkg 编译期内嵌)
-# CONFIG_TRACE_CAPACITY：Kconfig 的 TRACE_CAPACITY 由生成的片段镜像成
-# CONFIG_TRACE_CAPACITY；这不是 Cargo feature，作为环境变量传给 os/core/build.rs
-# 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一真相，见 docs/architecture/kconfig.md）。
+# CONFIG_TRACE_CAPACITY / CONFIG_MAX_CPUS：Kconfig 的 TRACE_CAPACITY / MAX_CPUS 由
+# 生成的片段镜像成同名 CONFIG_*；这不是 Cargo feature，作为环境变量分别传给
+# os/core/build.rs 与 os/arch/build.rs 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一
+# 真相，见 docs/architecture/kconfig.md）。
 kernel: init.kpkg
-	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
@@ -216,7 +217,7 @@ kernel: init.kpkg
 core:
 	@mkdir -p $(CURDIR)/tools/qemu
 	printf '' | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
-	cd $(BOOT_DIR) && KALEIDOS_CORE_ONLY=1 CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && KALEIDOS_CORE_ONLY=1 CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(CORE_OUTPUT)
 	@echo "built: $(CORE_OUTPUT) (core-only, features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 	@echo "WARNING: tools/qemu/init.kpkg is now EMPTY; the next 'make kernel' rebuilds the real one (init.kpkg is .PHONY)."
@@ -344,10 +345,10 @@ bench:
 
 # 交叉构建门禁：每个 profile 用一份私有 .config（互不污染，也不动用户的 .config）。
 boot-build:
-	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 boot-check:
-	cd $(BOOT_DIR) && CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 # 内部：两个架构的交叉构建门禁（`make check` 的一步）。
 _test-build:

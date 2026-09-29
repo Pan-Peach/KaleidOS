@@ -25,6 +25,12 @@ pub(crate) mod vm;
 #[path = "vm32/mod.rs"]
 pub(crate) mod vm32;
 
+// SMP 的 boot 侧骨架（AP trampoline + 栈 + 描述符 + 调用点）。仅 RV64 MMU；
+// 默认（单 CPU）构建不含它，见 src/smp.rs 的边界说明。
+#[cfg(all(target_arch = "riscv64", feature = "vm-mmu", feature = "smp"))]
+#[path = "smp.rs"]
+pub(crate) mod smp;
+
 #[cfg(feature = "selftest")]
 #[path = "selftest.rs"]
 mod selftest;

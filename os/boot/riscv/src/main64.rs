@@ -200,6 +200,15 @@ static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::CpuImpl::init_cpu();
+    // 统一 trap 约定：给 CPU0 装入口记录（`sscratch` = `&entry` = trap 栈顶）。
+    // UP 与 SMP 同一条路径；SMP 时每个 AP 在 Core 的 `secondary_entry` 各自装。
+    // 必须在任何可能 trap 之前完成。`base` 暂用占位（Core 的 per-CPU 存储尚未接）。
+    unsafe {
+        <arch::CpuImpl as arch::CpuArch>::install_per_cpu_base(
+            CpuId::from_raw(0),
+            core::ptr::NonNull::dangling(),
+        );
+    }
     kernel::log!("bootstrap", "arch init OK");
     kernel::log!("bootstrap", "KaleidOS bootstrap");
     kernel::log!("bootstrap", "========================================");
@@ -429,6 +438,10 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
 
                 // 显式开全局中断：各本地源已在 kernel::init 中解源。
                 arch::CpuImpl::enable_irq();
+                // SMP：boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
+                // （见 src/smp.rs；默认单 CPU 构建不含此调用）。
+                #[cfg(feature = "smp")]
+                crate::smp::start_secondaries(&context.info);
                 // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                 kernel::monitor::run();
             }

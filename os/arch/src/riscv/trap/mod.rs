@@ -15,22 +15,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 当前执行 CPU 的**逻辑**身份。
 ///
-/// UP 阶段恒 `CpuId(0)`（调度器当前也是单例身份）；SMP 阶段从 CPU-local 入口
-/// 记录读取已绑定的逻辑 id。**不**需要改 trap 汇编——分发点在 Rust 侧。
+/// 从 CPU-local 入口记录读取已绑定的逻辑 id（UP 恒为 CPU0）。**不**需要改 trap
+/// 汇编——分发点在 Rust 侧。
 fn current_logical_cpu() -> CpuId {
-    #[cfg(feature = "smp")]
-    {
-        use crate::CpuArch;
-        // SMP：未绑定的 AP 是**不变式破坏**，绝不能回退成 CpuId(0)——那会把
-        // 定时器/调度/containment 操作指向错误的 CPU。
-        crate::CpuImpl::current_cpu()
-            .expect("SMP: current CPU is not bound during interrupt dispatch")
-    }
-    #[cfg(not(feature = "smp"))]
-    {
-        // UP 约定：唯一逻辑 CPU 恒为 CpuId(0)。这个例外**不得**带进 SMP。
-        CpuId::from_raw(0)
-    }
+    use crate::CpuArch;
+    // 未绑定的 CPU 是**不变式破坏**，绝不能回退成 `CpuId(0)`——那会把定时器 /
+    // 调度 / containment 操作指向错误的 CPU。
+    crate::CpuImpl::current_cpu().expect("current CPU is not bound during interrupt dispatch")
 }
 
 static TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -191,24 +182,47 @@ pub(crate) fn dispatch_exception(frame: *mut TrapFrame, cause: usize, stval: usi
 /// 安全 trap 栈：**所有** S-mode trap 先切到这里（见 `trap32.S` / `trap64.S`
 /// 的 sscratch 约定），再用调用者的栈做处理；组件栈 / 任务栈因此永远不会被
 /// trap 帧写坏。
+///
+/// rv64 的 trap 栈是 **per-CPU** 的（在 `cpu::PerCpu` 里，`entry` 紧贴栈顶），
+/// 由 boot 装进 `sscratch`；下面的 `TRAP_STACK` 仅供 rv32（无 SMP，单张栈）。
 pub const TRAP_STACK_BYTES: usize = 32 * 1024;
+
+#[cfg(target_arch = "riscv32")]
 const STACK_ALIGNMENT: usize = 16;
 
+#[cfg(target_arch = "riscv32")]
 #[repr(align(16))]
 struct TrapStack([u8; TRAP_STACK_BYTES]);
 
+#[cfg(target_arch = "riscv32")]
 static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_BYTES]);
 
 /// 安全 trap 栈的半开区间 `[base, top)`（诊断 / ArchTest 断言）。
+///
+/// rv64：CPU0 的 per-CPU trap 栈（ArchTest / isolated 都跑在 CPU0 上）。
 pub fn trap_stack_range() -> (usize, usize) {
-    // SAFETY: 只取静态数组地址（不读内容、不创建引用）。
-    let base = unsafe { core::ptr::addr_of!(TRAP_STACK.0) } as usize;
-    (base, base + TRAP_STACK_BYTES)
+    #[cfg(target_arch = "riscv64")]
+    {
+        super::cpu::trap_stack_range_for(0)
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        // SAFETY: 只取静态数组地址（不读内容、不创建引用）。
+        let base = unsafe { core::ptr::addr_of!(TRAP_STACK.0) } as usize;
+        (base, base + TRAP_STACK_BYTES)
+    }
 }
 
 /// 安全 trap 栈顶（16 字节对齐）：装在 `sscratch` 里，trap 入口据此换栈。
 pub fn trap_stack_top() -> usize {
-    trap_stack_range().1 & !(STACK_ALIGNMENT - 1)
+    #[cfg(target_arch = "riscv64")]
+    {
+        trap_stack_range().1
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        trap_stack_range().1 & !(STACK_ALIGNMENT - 1)
+    }
 }
 
 /// 重新装入 trap 栈约定（`sscratch` = 安全栈顶）。
@@ -217,13 +231,21 @@ pub fn trap_stack_top() -> usize {
 /// 已被放弃，不会再由 trap 出口恢复它。
 #[cfg(all(feature = "supervisor", not(feature = "machine")))]
 pub fn install_scratch_convention() {
-    let top = trap_stack_top();
-    // SAFETY: 只写 CSR；无内存 / 栈副作用。
-    unsafe {
-        core::arch::asm!("csrw sscratch, {top}",
-            top = in(reg) top,
-            options(nostack, preserves_flags),
-        );
+    #[cfg(target_arch = "riscv64")]
+    {
+        // 统一约定下 `sscratch` 恒 = `&entry`（trap 入口装入、处理期间不变），
+        // 放弃路径无需恢复它。
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        let top = trap_stack_top();
+        // SAFETY: 只写 CSR；无内存 / 栈副作用。
+        unsafe {
+            core::arch::asm!("csrw sscratch, {top}",
+                top = in(reg) top,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 

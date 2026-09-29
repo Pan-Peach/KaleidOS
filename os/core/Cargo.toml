@@ -12,9 +12,6 @@ machine = ["arch/machine"]
 vm-mmu = ["arch/vm-mmu"]
 vm-nommu = ["arch/vm-nommu"]
 preempt = []
-# SMP（CONFIG_SMP）：启用 Core 的 per-CPU 调度/中断状态与 AP 启动流程。
-# 刻意不进 `default`：host 测试基线仍是单 CPU；target 构建由 KCFG_BOOT_FEATURES 传入。
-smp = ["arch/smp"]
 # Structured Core trace (CONFIG_TRACE).  `default` so host tests can assert on
 # event sequences; target builds get it only through KCFG_BOOT_FEATURES.
 trace = []

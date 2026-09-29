@@ -76,12 +76,11 @@ pub fn init() -> Result<(), TimerError> {
     Ok(())
 }
 
-/// SMP：初始化**当前执行 CPU** 的 timer 本地状态（AP 在本地启动时调用）。
+/// 初始化**当前执行 CPU** 的 timer 本地状态（AP 在本地启动时调用；UP 不调用）。
 ///
-/// 非 SMP 构建没有这个接缝。SMP 实现时，`STATE` 全局量要拆成 per-CPU
-/// （`TimerState` 按 `CpuId` 索引，各自 `next_deadline`），`on_trap` 也要带上
-/// 硬件 CPU 身份——本地 timer 本地编程，不需要远端接口。
-#[cfg(feature = "smp")]
+/// 实现时，`STATE` 全局量要拆成 per-CPU（`TimerState` 按 `CpuId` 索引，各自
+/// `next_deadline`），`on_trap` 也要带上硬件 CPU 身份——本地 timer 本地编程，
+/// 不需要远端接口。
 #[allow(dead_code)]
 pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), TimerError> {
     todo!("SMP: initialize this CPU's local timer state and unmask its timer source")

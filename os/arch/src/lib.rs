@@ -25,6 +25,15 @@ compile_error!("arch requires exactly one VM feature: `vm-mmu` or `vm-nommu`");
 #[cfg(test)]
 extern crate std;
 
+// Kconfig → Rust 的窄运输契约（`MAX_CPUS` 解析 / 校验）只在 host test 下编译进
+// lib：测试锁定的是 build.rs 实际用的那一份实现（见 `src/build_config.rs`）。
+#[cfg(test)]
+mod build_config;
+
+// 编译期 per-CPU 容量：由 `arch/build.rs` 从 Kconfig `MAX_CPUS` 生成。
+// 这里是它的**唯一定义**；`core::machine::MAX_CPUS` 只是 re-export。
+include!(concat!(env!("OUT_DIR"), "/max_cpus.rs"));
+
 pub mod component;
 /// 架构中立的 CPU 身份类型（`HardwareCpuId`）与回调形状。
 pub mod cpu;
