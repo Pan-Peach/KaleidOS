@@ -167,10 +167,26 @@ fn cpu() -> &'static Mutex<CpuState> {
         .expect("current cpu outside the per-cpu scheduler table")
 }
 
+/// 按逻辑 CPU 取调度真相槽（`PerCpu` 已为全部 `MAX_CPUS` 构造，故恒存在）。
+fn cpu_slot(cpu: CpuId) -> Option<&'static Mutex<CpuState>> {
+    CPU_TABLE.get().and_then(|table| table.get(cpu))
+}
+
 /// 初始化某个 CPU 的调度状态（AP 在本地启动时调用；UP 不调用）。
+///
+/// 每 CPU `CpuState` 已在 [`init`] 里为全部槽位构造；本函数把**本 CPU** 的
+/// `anchor` / `current` 复位为空（AP 首次进入调度前的干净起点）。必须由目标
+/// CPU 自己调用——`CpuState` 是 CPU-local 执行状态，不能跨 CPU 初始化。
 #[allow(dead_code)]
-pub(crate) fn init_cpu(_cpu: CpuId) -> Result<(), SchedError> {
-    todo!("SMP: initialize this CPU's scheduler state (anchor/current) locally")
+pub(crate) fn init_cpu(cpu: CpuId) -> Result<(), SchedError> {
+    if current_cpu_id() != cpu {
+        return Err(SchedError::InvalidTransition);
+    }
+    let slot = cpu_slot(cpu).ok_or(SchedError::NotFound)?;
+    let mut state = slot.lock();
+    state.anchor = None;
+    state.current = None;
+    Ok(())
 }
 
 /// 请求目标 CPU 在**安全边界**重新调度（不在 IPI 回调里切上下文；UP 不调用）。
@@ -921,6 +937,26 @@ mod tests {
 
         remove_task(a);
         remove_task(b);
+    }
+
+    /// `init_cpu` 只复位**当前** CPU 的调度槽；跨 CPU 调用被拒，且不动远端槽位。
+    #[test]
+    fn init_cpu_resets_only_the_current_cpu_slot() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+
+        // 污染当前 CPU（host = CPU0）的 `current`：init_cpu 必须清回空锚点。
+        set_current(Some(TaskId::from_raw(1)));
+        assert_eq!(init_cpu(CpuId::from_raw(0)), Ok(()));
+        assert_eq!(current_task(), None);
+
+        // 跨 CPU 调用被拒（host 当前 CPU 恒为 0）。
+        assert_eq!(
+            init_cpu(CpuId::from_raw(1)),
+            Err(SchedError::InvalidTransition)
+        );
     }
 
     /// 端到端调度提交：A park 后 B 接手；unpark(A) 后 B yield，A 成为下一个 Running。

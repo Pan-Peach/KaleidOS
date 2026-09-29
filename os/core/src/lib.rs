@@ -112,6 +112,10 @@ pub fn init(
     component::endpoint::init();
     resource::init();
     irq::init();
+    // SMP：BSP 侧 Core 初始化（发布 CPU 记录、注册 Core IPI 回调、BSP Online）。
+    // **不**启动 AP、**不**开 IPI 源——物理启动仍由 boot 在长期地址空间就绪后触发，
+    // 且接收端应答/drain 落地前不得开源（见 `os/core/src/smp/mod.rs` 模块文档）。
+    smp::init(info).map_err(|_| "smp init failed")?;
     log!("core", "init OK");
     monitor::mount(info);
     Ok(())

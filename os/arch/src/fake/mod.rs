@@ -29,6 +29,13 @@ std::thread_local! {
 std::thread_local! {
     static CPU_ID: Cell<Option<usize>> = const { Cell::new(None) };
     static CPU_BASE: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
+    static IPI_HANDLER: Cell<Option<LocalInterruptHandler>> = const { Cell::new(None) };
+}
+
+/// 最近一次经 [`Fake`] 注册的 IPI 回调（host 无 IPI 传输，只作可观察占位）。
+#[doc(hidden)]
+pub fn registered_ipi_handler_for_test() -> Option<LocalInterruptHandler> {
+    IPI_HANDLER.with(Cell::get)
 }
 
 #[doc(hidden)]
@@ -151,8 +158,12 @@ impl Smp for Fake {
         Ok(())
     }
 
-    fn register_ipi_handler(_handler: LocalInterruptHandler) -> Result<(), InitError> {
-        todo!("SMP: host fake has no IPI transport")
+    fn register_ipi_handler(handler: LocalInterruptHandler) -> Result<(), InitError> {
+        // Host 没有真实 IPI 传输，但 Core 的 `smp::init` 在 `cpu_count > 1` 时会
+        // 注册回调；这里**记住**它而不是 `todo!()`，让 Core 的 SMP 骨架在 host 上
+        // 可被单测。（真正投递 `send_ipi*` 仍是 `todo!()`：host 测试不应发门铃。）
+        IPI_HANDLER.with(|slot| slot.set(Some(handler)));
+        Ok(())
     }
 
     fn enable_ipi_interrupt() {}

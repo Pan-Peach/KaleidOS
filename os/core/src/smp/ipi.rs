@@ -10,19 +10,39 @@
 //! 门铃可合并、可重复投递；`send_ipi_mask` 可能**部分投递**后才返回错误——
 //! Core 必须保留 pending work，不得把失败理解为“什么都没送到”。
 //!
-//! # 骨架状态
+//! # 接通程度
+//!
+//! - **已机械实现**：[`ipi_interrupt`]（接收回调只标记）、[`take_pending`]
+//!   （安全边界的原子 take）。
+//! - **仍 `todo!()`（人类）**：[`notify`]（“先发布再响铃”的并发排序）与
+//!   [`drain_pending`]（安全边界的重调度）。在 arch 补齐 **SSIP 应答**之前
+//!   **不得**打开 IPI 源，否则会中断风暴（见 `.omo/plans/smp-production-integration.md`
+//!   与 Oracle 评审）。
 //!
 //! 先只做实际需要的 `Reschedule`。**不**预先塞一个“无载荷 TLB shootdown 标志”
 //! 就宣称完成：正确的 shootdown 需要受影响的地址空间/范围、确认与生存期规则。
 
 use crate::machine::CpuId;
 use crate::smp::CpuMask;
+use core::sync::atomic::Ordering;
+
+/// [`IpiRequest::Reschedule`] 在 pending 位集里的位。
+pub(crate) const RESCHEDULE_BIT: usize = 1;
 
 /// 一次 IPI 请求（Core 语义；arch 只传门铃，不解释这些值）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpiRequest {
     /// 请求目标 CPU 在安全边界重新调度。
     Reschedule,
+}
+
+impl IpiRequest {
+    /// 在 pending 位集里的位掩码（人类实现 [`notify`] 时使用）。
+    fn bit(self) -> usize {
+        match self {
+            IpiRequest::Reschedule => RESCHEDULE_BIT,
+        }
+    }
 }
 
 /// [`notify`] 的失败原因。
@@ -36,14 +56,31 @@ pub enum NotifyError {
 
 /// 向一组 CPU 发布并投递一次 IPI 请求。
 pub(crate) fn notify(_targets: &CpuMask, _request: IpiRequest) -> Result<(), NotifyError> {
+    // 人类实现时的形状（不是机械接线，属并发关键逻辑）：
+    //   1) 对每个有效目标先 `record.pending_ipi.fetch_or(request.bit(), Release)`；
+    //   2) 收集有效目标的 `HardwareCpuId`，调 `Backend::send_ipi_mask`；
+    //   3) 后端失败**保留** pending 位（不得回滚成“什么都没送到”）。
+    // 在 arch 的 SSIP 应答与 `drain_pending` 落地前，本函数不得被启用。
     todo!("SMP: publish pending work then ring each target's doorbell")
 }
 
 /// 本 CPU 的 IPI 硬件回调（由 `arch::Smp::register_ipi_handler` 注册）。
 ///
 /// 只标记 pending，不在此处做调度切换。
-pub(crate) fn ipi_interrupt(_cpu: CpuId) {
-    todo!("SMP: mark this CPU's pending IPI work from the hardware callback")
+pub(crate) fn ipi_interrupt(cpu: CpuId) {
+    if let Some(record) = crate::smp::record(cpu) {
+        record
+            .pending_ipi
+            .fetch_or(RESCHEDULE_BIT, Ordering::Release);
+    }
+}
+
+/// 在安全边界原子的取走某 CPU 的全部 pending work 位。
+///
+/// `swap(0)` 保证“取走”与“清除”不可分割：不与并发的 `ipi_interrupt` 丢更新。
+/// 语义消费（`Reschedule → 重调度`）由人类实现的 [`drain_pending`] 承担。
+pub(crate) fn take_pending(cpu: CpuId) -> usize {
+    crate::smp::record(cpu).map_or(0, |record| record.pending_ipi.swap(0, Ordering::AcqRel))
 }
 
 /// 在安全边界处理并清空某 CPU 的 pending work。

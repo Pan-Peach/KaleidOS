@@ -12,18 +12,23 @@
 //! `arch::TimerImpl`（`Timer` trait：`now` / `set_deadline`），Core 不感知
 //! SBI/CLINT 细节；当前只有 Core 自己消费（组件 `TimerHandle` 未实现）。
 //!
+//! # per-CPU（SMP）
+//!
+//! `TimerState` 每逻辑 CPU 一份（[`crate::smp::PerCpu`]）。硬件已是本地的
+//! （SBI `set_timer` 作用于调用 hart；M-mode 用 `mhartid` 选 `mtimecmp`），
+//! per-CPU 软件状态补上 Core 缺失的真相：**一台 CPU 的 trap 不再推进/清除
+//! 另一台 CPU 的 `next_deadline` / `ticks`**。UP = 只有第 0 项的 SMP。
+//!
 //! # 接线点
 //!
-//! 1. `init`：登记 trap 回调并打开 timer interrupt，不自动产生周期 tick；
-//! 2. `arm_deadline`：为下一个 sleep/timeout/event 编程 one-shot deadline；
-//! 3. 时钟中断回调注册：把 [`on_trap`] 接到 arch 的 trap 分发
-//!    （机制待定——arch 不依赖 Core，注册式 hook 或 boot 注入均可，
-//!    见 `arch::riscv::trap::supervisor::trap_handler` 的 TODO）；
+//! 1. `init`：在当前 CPU 上登记 trap 回调并解开本 CPU timer 源，不自动产生周期 tick；
+//! 2. `arm_deadline`：为本 CPU 的下一个 sleep/timeout/event 编程 one-shot deadline；
+//! 3. `init_cpu`：AP 在本地启动时初始化本 CPU（必须由该 CPU 自己调用）；
 //! 4. 中断开闸：`sie.STIE` + `sstatus.SIE`（`CpuImpl` 侧原语）；
 //! 5. 可选抢占：仅 `preempt` profile 由 `init_preempt` 使用周期 deadline。
 use crate::machine::CpuId;
 use arch::Timer;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 struct TimerState {
     initialized: bool,
@@ -33,13 +38,28 @@ struct TimerState {
     preempt_period: Option<u64>,
 }
 
-static STATE: Mutex<TimerState> = Mutex::new(TimerState {
-    initialized: false,
-    ticks: 0,
-    next_deadline: None,
-    #[cfg(feature = "preempt")]
-    preempt_period: None,
-});
+impl TimerState {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            ticks: 0,
+            next_deadline: None,
+            #[cfg(feature = "preempt")]
+            preempt_period: None,
+        }
+    }
+}
+
+/// 每逻辑 CPU 一份 timer 软件真相（懒构造，容量 = `MAX_CPUS`）。
+static STATE: Once<crate::smp::PerCpu<Mutex<TimerState>>> = Once::new();
+
+fn table() -> &'static crate::smp::PerCpu<Mutex<TimerState>> {
+    STATE.call_once(|| {
+        crate::smp::PerCpu::new(crate::machine::MAX_CPUS, |_| Mutex::new(TimerState::new()))
+            .expect("timer per-cpu table allocation failed")
+    });
+    STATE.get().expect("timer per-cpu table just initialized")
+}
 
 #[cfg(feature = "preempt")]
 const PREEMPT_HZ: u64 = 100;
@@ -55,42 +75,49 @@ pub enum TimerError {
     NotInitialized,
     /// 后端本地初始化失败（`arch::Timer::init_cpu`）。
     BackendInit,
+    /// [`init_cpu`] 只能在其目标 CPU 上本地执行。
+    WrongCpu,
 }
 
-/// 初始化 one-shot timer 机制：登记时钟回调并打开 timer interrupt。
+/// 初始化**当前执行 CPU** 的 one-shot timer 机制：登记时钟回调并只解本 CPU
+/// timer 源。不自动编程 deadline（cooperative profile 因此没有周期 IRQ）。
 ///
-/// 此函数不会自动编程 deadline；没有事件时，cooperative profile 不会产生
-/// 周期性 timer IRQ。事件机制通过 [`arm_deadline`] 编程下一次到期时间。
+/// `init` 是 BSP 的便捷入口；AP 在 `secondary_entry` 里调用 [`init_cpu`]。
 pub fn init() -> Result<(), TimerError> {
-    {
-        let mut state = STATE.lock();
-        if state.initialized {
-            return Err(TimerError::AlreadyInitialized);
-        }
-        state.initialized = true;
+    let cpu = crate::smp::current_cpu();
+    let slot = table()
+        .get(cpu)
+        .expect("current cpu index within timer capacity");
+    if slot.lock().initialized {
+        return Err(TimerError::AlreadyInitialized);
     }
-
-    <arch::TimerImpl as Timer>::init_cpu().map_err(|_| TimerError::BackendInit)?;
     arch::TimerImpl::register_timer_handler(on_trap);
+    init_cpu(cpu)
+}
+
+/// 初始化**指定 CPU**（必须是调用者本人）的本地 timer：后端本地初始化 + 解开
+/// 本 CPU timer 源。`initialized` 只在后端成功后发布（此前是提前置位）。
+pub(crate) fn init_cpu(cpu: CpuId) -> Result<(), TimerError> {
+    if crate::smp::current_cpu() != cpu {
+        return Err(TimerError::WrongCpu);
+    }
+    let slot = table().get(cpu).expect("cpu index within timer capacity");
+    <arch::TimerImpl as Timer>::init_cpu().map_err(|_| TimerError::BackendInit)?;
+    // 只解本 CPU 的 timer 源（`sie.STIE`）；全局使能由 boot 的 `enable_irq` 负责。
     arch::TimerImpl::enable_timer_interrupt();
+    slot.lock().initialized = true;
     Ok(())
 }
 
-/// 初始化**当前执行 CPU** 的 timer 本地状态（AP 在本地启动时调用；UP 不调用）。
-///
-/// 实现时，`STATE` 全局量要拆成 per-CPU（`TimerState` 按 `CpuId` 索引，各自
-/// `next_deadline`），`on_trap` 也要带上硬件 CPU 身份——本地 timer 本地编程，
-/// 不需要远端接口。
-#[allow(dead_code)]
-pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), TimerError> {
-    todo!("SMP: initialize this CPU's local timer state and unmask its timer source")
-}
-
-/// 编程下一次 one-shot deadline。
+/// 为**当前 CPU** 编程下一次 one-shot deadline。
 pub fn arm_deadline(deadline: u64) -> Result<(), TimerError> {
     let _irq_guard = crate::irq::IrqSaveGuard::new();
+    let cpu = crate::smp::current_cpu();
+    let slot = table()
+        .get(cpu)
+        .expect("current cpu index within timer capacity");
     {
-        let mut state = STATE.lock();
+        let mut state = slot.lock();
         if !state.initialized {
             return Err(TimerError::NotInitialized);
         }
@@ -101,7 +128,7 @@ pub fn arm_deadline(deadline: u64) -> Result<(), TimerError> {
 }
 
 #[cfg(feature = "preempt")]
-/// 为抢占 profile 初始化周期性调度 tick。
+/// 为抢占 profile 在**当前 CPU** 上初始化周期性调度 tick。
 pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
     let timebase_hz = u64::try_from(timebase_hz).map_err(|_| TimerError::InvalidFrequency)?;
     if timebase_hz < PREEMPT_HZ {
@@ -116,23 +143,30 @@ pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
         .ok_or(TimerError::InvalidFrequency)?;
     init()?;
     {
-        let mut state = STATE.lock();
-        state.preempt_period = Some(period);
+        let cpu = crate::smp::current_cpu();
+        table()
+            .get(cpu)
+            .expect("current cpu index within timer capacity")
+            .lock()
+            .preempt_period = Some(period);
     }
     arm_deadline(first_deadline)
 }
 
 /// 时钟中断入口（trap 分发调用；中断上下文，已关中断）。
 ///
-/// 职责：重编程下一次 deadline + tick 计数 + 触发调度抢占 seam
-/// （`crate::sched::on_timer_tick`）。
+/// `cpu` 是 arch 传下的**逻辑**身份；只作用于该 CPU 自己的槽位。职责：重编程
+/// 下一次 deadline + tick 计数 + 触发调度抢占 seam（`crate::sched::on_timer_tick`）。
 ///
 /// 抢占模型（延迟重调度 vs trap 内直接切换）见 [`crate::sched::on_timer_tick`]。
-pub fn on_trap(_cpu: CpuId) {
+pub fn on_trap(cpu: CpuId) {
+    let Some(slot) = table().get(cpu) else {
+        return;
+    };
     #[cfg(feature = "preempt")]
     let now = arch::TimerImpl::now();
     let next = {
-        let mut state = STATE.lock();
+        let mut state = slot.lock();
         if !state.initialized {
             return;
         }
@@ -159,10 +193,11 @@ pub fn on_trap(_cpu: CpuId) {
     }
 }
 
-/// 已过去的 tick 数（观测/测试用）。
+/// **当前 CPU** 已过去的 tick 数（观测/测试用）。
 pub fn ticks() -> u64 {
     let _irq_guard = crate::irq::IrqSaveGuard::new();
-    STATE.lock().ticks
+    let cpu = crate::smp::current_cpu();
+    table().get(cpu).map_or(0, |slot| slot.lock().ticks)
 }
 
 #[cfg(test)]
@@ -172,12 +207,16 @@ mod tests {
 
     /// 序列化触碰进程级 timer 全局的测试。
     ///
-    /// `STATE` 是进程级 `static`，`init()` 每个进程只能成功一次且无法重置，
+    /// `STATE` 是进程级 `Once`，`init()` 每个 CPU 只能成功一次且无法重置，
     /// 所以整条生命周期必须放在单个 `#[test]` 里。锁本身沿用 irq / sched /
     /// containment / trace 的纪律，防止新增测试并发改动同一全局。
     ///
     /// rank = TIMER（模块本地、最外层；见 [`crate::test_support`]）。
     static TIMER_TEST_LOCK: TestLock = TestLock::new(Rank::Timer);
+
+    fn cpu0() -> &'static Mutex<TimerState> {
+        table().get(CpuId::from_raw(0)).unwrap()
+    }
 
     /// 验收：one-shot timer 机制在 host 上的完整生命周期（未初始化 → init →
     /// 编程 deadline → trap 计数 → 一次性清除 deadline）。
@@ -186,7 +225,7 @@ mod tests {
         let _serial = TIMER_TEST_LOCK.lock();
 
         // Given: 机制尚未初始化。
-        assert!(!STATE.lock().initialized);
+        assert!(!cpu0().lock().initialized);
 
         // When: 未初始化时编程 deadline。
         let armed = arm_deadline(123);
@@ -213,7 +252,7 @@ mod tests {
 
         // Then: 这次被接受并记录（One-shot 语义：只等这一次）。
         assert_eq!(armed, Ok(()));
-        assert_eq!(STATE.lock().next_deadline, Some(500));
+        assert_eq!(cpu0().lock().next_deadline, Some(500));
 
         // When: 时钟 trap 连续到达 3 次。
         on_trap(CpuId::from_raw(0));
@@ -226,8 +265,21 @@ mod tests {
         // When/Then: 默认（非 preempt）profile 下 on_trap 清除待处理的
         // deadline（one-shot 语义），后续 trap 继续计数。
         #[cfg(not(feature = "preempt"))]
-        assert_eq!(STATE.lock().next_deadline, None);
+        assert_eq!(cpu0().lock().next_deadline, None);
         on_trap(CpuId::from_raw(0));
         assert_eq!(ticks(), 4);
+    }
+
+    /// `init_cpu` 强制 CPU 本地：跨 CPU 调用被拒（`WrongCpu`），不触碰远端槽位。
+    #[test]
+    fn init_cpu_rejects_non_current_cpu() {
+        let _serial = TIMER_TEST_LOCK.lock();
+        assert_eq!(
+            init_cpu(CpuId::from_raw(1)),
+            Err(TimerError::WrongCpu),
+            "an AP's timer must be initialized by that AP, not remotely"
+        );
+        // 被拒的远程调用不得把 CPU1 的槽位置为 initialized。
+        assert!(!table().get(CpuId::from_raw(1)).unwrap().lock().initialized);
     }
 }
