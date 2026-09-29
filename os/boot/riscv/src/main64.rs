@@ -438,9 +438,8 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
 
                 // 显式开全局中断：各本地源已在 kernel::init 中解源。
                 arch::CpuImpl::enable_irq();
-                // SMP：boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
-                // （见 src/smp.rs；默认单 CPU 构建不含此调用）。
-                #[cfg(feature = "smp")]
+                // boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
+                // （见 src/smp.rs）。单 CPU 机器上自然空转。
                 crate::smp::start_secondaries(&context.info);
                 // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                 kernel::monitor::run();

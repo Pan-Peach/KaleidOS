@@ -415,7 +415,7 @@ pub fn init() {
     }
 }
 
-/// Per-CPU containment state（SMP 骨架接缝，`CONFIG_SMP`）。
+/// Per-CPU containment state（SMP 骨架接缝）。
 ///
 /// 今天这一整块是**单活动 CPU**的进程级 `static mut`（`ACTIVE_GUARD` /
 /// `ANCHOR_GUARD` / `TASK_REGION` / `CORE_ABI_DEPTH` / abort 与 scratch 上下文 /

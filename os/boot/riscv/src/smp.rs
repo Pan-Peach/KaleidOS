@@ -22,13 +22,11 @@
 //! `riscv64 + vm-mmu + smp` 下编译，默认（单 CPU）构建路径不包含它，因此现有
 //! host / rv64 / rv32 测试保持全绿。
 
-#![allow(dead_code)] // 骨架：入口点由 selftest 的 `smp_boot()` 稍后接线
-
 use crate::vm::bootstrap;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
 use kernel::machine::{MachineInfo, MAX_CPUS};
 
 global_asm!(include_str!("secondary64.S"));
@@ -38,9 +36,19 @@ unsafe extern "C" {
     fn _secondary_start();
 }
 
+pub static ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// 每个 AP 读到的逻辑身份（`smp-percpu` 的证据）；索引 = 逻辑下标。
+pub static PERCPU_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// 已在**非 boot CPU** 上跑过 IPI handler 的次数（`smp-ipi` 的证据）。
+#[allow(dead_code)] // 只被 selftest 的 `smp-ipi` 用例读
+pub static IPI_SEEN: AtomicUsize = AtomicUsize::new(0);
+
 /// 每个 AP 在进入 Rust 之后的初始内核栈大小。
 const AP_STACK_BYTES: usize = 16 * 1024;
 
+#[allow(dead_code)] // 只取它的地址（栈顶），字段本身不读
 #[repr(align(16))]
 struct ApStack([u8; AP_STACK_BYTES]);
 
@@ -94,10 +102,12 @@ fn stack_low_top(i: usize) -> usize {
     bootstrap::physical_address_of(stack_high_top(i))
 }
 
-/// `_secondary_start` 的物理地址：`arch::SmpImpl` 需要它作为 SBI `hart_start` 的
-/// 入口。它位于 `.text.secondary`（低 VMA == PA），所以取到的就是可用物理地址。
+/// `_secondary_start` 的**物理**地址：SBI `hart_start` 的入口。
+///
+/// 它在正式 `.text`（高 VMA、低 LMA）：物理入口 = VMA - `HIGH_HALF_OFFSET`，
+/// 也就是它的装载 LMA；AP 从那里执行（satp=0）。
 pub fn secondary_entry_address() -> usize {
-    _secondary_start as *const () as usize
+    bootstrap::physical_address_of(_secondary_start as *const () as usize)
 }
 
 /// AP 的高半区 Rust 入口：由 `secondary64.S` 在长期地址空间生效后跳入。
@@ -105,6 +115,24 @@ pub fn secondary_entry_address() -> usize {
 /// 职责是把控制权交给 Core 的 `secondary_entry`（逻辑身份绑定 + 本地子系统
 /// 初始化）；boot 只保证「站在高半区、关中断、runtime slot = 0、栈已就位」。
 pub extern "C" fn secondary_main(argument: usize) -> ! {
+    // AP 侧本地初始化（Core 的 `secondary_entry` 最终会接管这里）：
+    //   1) 装自己的入口记录（`sscratch` = &entry = 本 CPU 的 trap 栈顶）；
+    //   2) 设 `stvec`（`CpuArch::init_cpu`）。
+    // IPI 接收源（`SmpImpl::init_cpu` / `enable_ipi_interrupt`）留给 `smp-ipi`
+    // 那一轮补——它们现在是 `todo!()`，提前调用会打断 `smp-boot`。
+    unsafe {
+        <arch::CpuImpl as arch::CpuArch>::install_per_cpu_base(
+            kernel::machine::CpuId::from_raw(argument),
+            core::ptr::NonNull::dangling(),
+        );
+    }
+    arch::CpuImpl::init_cpu();
+
+    // 记录本 CPU 读到的逻辑身份（`smp-percpu` 的证据）。
+    if let Some(cpu) = <arch::CpuImpl as arch::CpuArch>::current_cpu() {
+        PERCPU_IDS[argument].store(cpu.raw(), Ordering::Release);
+    }
+    ONLINE.fetch_add(1, Ordering::AcqRel);
     arch::riscv::console::write_fmt(format_args!(
         "[SMP] CPU {argument}: secondary_main() called\n"
     ));

@@ -1,15 +1,16 @@
 # AP（次 CPU）入口 trampoline —— SMP 骨架，步骤体待手写（人类实现）。
 #
 # 由 SBI HSM `hart_start` 进入，入口环境由固件固定：
-#   pc            = 本符号（物理地址：它位于 .text.secondary，低 VMA == PA）
+#   pc            = 本符号的**物理地址**（= 链接 LMA；见 smp.rs::secondary_entry_address）
 #   a0            = hartid
 #   a1            = &ApBoot（**物理**地址；布局见 src/smp.rs）
 #   satp          = 0        （MMU 关闭 —— 因此下面全程只能用物理地址）
 #   sstatus.SIE   = 0        （本地中断关闭）
 #
-# 注意：本文件**不能**放进 `.text.entry` —— 那会与 `_start` 争抢镜像基址，
-# 把 `_start` 挤离 `PHYS_BASE`（`_start` 用 `auipc` 把自身地址当 kernel_pa）。
-# 因此它自成一节，由 linker.ld 放在 `.text.entry` 之后。
+# 它放在**正式 `.text`**（高 VMA、低 LMA）：AP 从它的 LMA（= 物理地址）执行；而
+# 高半区代码引用它时是高→高 PC 相对，不会 PCREL 超范围。它**不能**进
+# `.text.entry`——那会与 `_start` 争抢镜像基址（`_start` 用 `auipc` 把自身地址
+# 当 kernel_pa）。
 #
 # 目标：把 AP 从物理世界带进长期内核地址空间（satp → 高半区），再跳进高半区的
 #       Rust 入口 secondary_main(argument)。
@@ -21,7 +22,7 @@
 #   ApBoot.entry            = 24  高半区 Rust 入口 (secondary_main)
 #   ApBoot.argument         = 32  传给入口的不透明值（逻辑 CPU 稠密下标）
 
-.section .text.secondary
+.section .text
 .globl _secondary_start
 
 _secondary_start:

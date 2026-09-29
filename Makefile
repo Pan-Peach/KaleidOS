@@ -275,7 +275,7 @@ distclean: clean
 #   make test-qemu  自动 QEMU（RV64 + RV32；boot smoke + 自动 CoreTest）
 #   make test-arch  ArchTest 白盒 selftest（RV64 + RV32）
 # 其余测试目标都是内部助手：`_` 前缀，不进 `make help`，也不是对外契约。
-.PHONY: fmt clippy check abi-gen abi-check test test-host test-qemu _test-qemu-rv64 _test-qemu-rv32 _test-qemu-one test-arch _test-arch-rv64 _test-arch-rv32 _test-arch-one _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64 test-arch-x86_64 test-arch-aarch64 test-arch-loongarch64 test-arch-new _test-arch-core-one _test-arch-smp-rv64 _test-arch-smp-one test-arch-smp-rv64 smp_defconfig _test-build _test-kconfig bench boot-build boot-check
+.PHONY: fmt clippy check abi-gen abi-check test test-host test-qemu _test-qemu-rv64 _test-qemu-rv32 _test-qemu-one test-arch _test-arch-rv64 _test-arch-rv32 _test-arch-one _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64 test-arch-x86_64 test-arch-aarch64 test-arch-loongarch64 test-arch-new _test-arch-core-one _test-arch-smp-rv64 _test-arch-smp-one test-arch-smp-rv64 _test-build _test-kconfig bench boot-build boot-check
 
 # 自己的 crate（显式列出；third_party 是 submodule，不归我们 fmt/clippy）
 OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test
@@ -428,15 +428,13 @@ test-arch-loongarch64: _test-arch-loongarch64
 # All three skeleton ISAs at once (expected to fail until implemented).
 test-arch-new: _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64
 
-# Opt-in RISC-V SMP ArchTest (CONFIG_SMP=y).  The three `smp-*` cases are
-# `todo!()` until SMP is implemented, so this is NOT part of `test-arch`.
-smp_defconfig:
-	@$(CONFIGURE) --base $(KCONFIG_CONFIG) --fragment configs/smp.fragment --out $(KCONFIG_CONFIG)
-
+# Opt-in RISC-V SMP ArchTest: runs the `smp-*` cases with `--smp` (multi-CPU
+# QEMU).  The cases are always compiled now -- only the runner's case list gates
+# whether they run -- so no extra config fragment is needed.  `smp-ipi` /
+# `smp-percpu` stay `todo!()` until the IPI / per-CPU bring-up lands.
 _test-arch-smp-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config qemu_rv64_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config selftest_defconfig
-	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config smp_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config _test-arch-smp-one
 
 _test-arch-smp-one: kernel

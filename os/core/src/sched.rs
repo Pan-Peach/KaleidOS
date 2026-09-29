@@ -106,9 +106,8 @@ fn deny_scheduling_forbidden() -> Result<(), SchedError> {
 /// 全部任务退出后 CPU 回到这里。首次 `run()` 时捕获，之后每次耗尽任务
 /// 都回到同一份（Box 地址稳定，跨切换有效）。
 ///
-/// **SMP**：`CpuState` 是天然 per-CPU 单元——`CONFIG_SMP` 下每个逻辑 CPU 一份
-/// （`CPU_TABLE`），彼此独立；任务表仍是全局共享真相，跨 CPU 互斥由 commit
-/// 路径负责（见 `docs/modules/arch.md`）。
+/// `CpuState` 是天然 per-CPU 单元——每个逻辑 CPU 一份（`CPU_TABLE`），彼此独立；
+/// 任务表仍是全局共享真相，跨 CPU 互斥由 commit 路径负责（见 `docs/modules/arch.md`）。
 struct CpuState {
     anchor: Option<Box<ContextImpl>>,
     current: Option<TaskId>,

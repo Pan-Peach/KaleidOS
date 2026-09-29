@@ -189,9 +189,9 @@ NEW_ARCH_CASES = (
     ("external-irq", None, None),
 )
 
-# RISC-V SMP cases (CONFIG_SMP).  Run only with `--smp`; the default `test-arch`
-# leaves CONFIG_SMP off, so these `todo!()`-backed cases never affect the
-# RISC-V baseline.
+# RISC-V SMP cases.  Run only with `--smp` (multi-CPU QEMU); the default
+# `test-arch` never sends these names, so the `todo!()`-backed cases (smp-ipi /
+# smp-percpu) never affect the RISC-V baseline.
 SMP_CASES = (
     ("smp-boot", None, None),
     ("smp-ipi", None, None),
@@ -346,7 +346,7 @@ def parse_args():
     parser.add_argument("--kernel", required=True, metavar="PATH",
                         help="boot artifact to test (the Makefile passes $(OUTPUT))")
     parser.add_argument("--smp", action="store_true",
-                        help="also run the optional RISC-V SMP cases (CONFIG_SMP build)")
+                        help="also run the optional RISC-V SMP cases (multi-CPU QEMU)")
     return parser.parse_args()
 
 

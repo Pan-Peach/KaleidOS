@@ -99,8 +99,6 @@ def variables(kconf):
     features = [PRIV_MAP[priv], VM_MAP[vm]]
     if is_y(kconf, "CONFIG_PREEMPT"):
         features.append("preempt")
-    if is_y(kconf, "CONFIG_SMP"):
-        features.append("smp")
     if is_y(kconf, "CONFIG_TRACE"):
         features.append("trace")
     if is_y(kconf, "CONFIG_SELFTEST"):

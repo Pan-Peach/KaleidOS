@@ -13,22 +13,9 @@ config PREEMPT
 	  of switching only cooperatively at explicit yield points.  Off by
 	  default: cooperative round-robin is the current baseline.
 
-config SMP
-	bool "Symmetric multi-processing (SMP)"
-	default n
-	help
-	  Bring up secondary CPUs and let Core schedule on more than one CPU.
-	  Off by default: the current baseline is single-CPU, and the SMP path is
-	  a skeleton (arch CPU startup / IPI transport bodies are not wired yet).
-
-	  This is a Core-level switch: it changes Core's own behaviour (per-CPU
-	  scheduler/timer/IRQ state, AP bring-up).  Arch CPU startup + IPI
-	  transport live behind the `Smp` contract in os/arch.
-
-	  There is no runtime CPU-count knob: the real count is read from the
-	  discovered MachineInfo (cpu_count) at boot.  The compile-time
-	  **capacity** is the `MAX_CPUS` symbol below.
-
+# SMP is not a build switch: UP is just "SMP with one CPU" -- per-CPU state is
+# always compiled and degenerates to CPU 0.  The compile-time **capacity** is
+# `MAX_CPUS` below; the runtime count comes from MachineInfo at boot.
 config MAX_CPUS
 	int "Maximum number of CPUs (compile-time capacity)"
 	default 8

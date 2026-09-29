@@ -175,13 +175,14 @@ pub fn run(info: &MachineInfo) -> ! {
         b"breakpoint" => breakpoint_fault(),
         b"timer" => timer(),
         b"external-irq" => external_irq(info),
-        // SMP（CONFIG_SMP）：骨架用例，实现待手写；只在 opt-in 的 SMP 测试目标里跑。
-        #[cfg(feature = "smp")]
-        b"smp-boot" => smp_boot(),
-        #[cfg(feature = "smp")]
-        b"smp-ipi" => smp_ipi(),
-        #[cfg(feature = "smp")]
-        b"smp-percpu" => smp_percpu(),
+        // SMP 用例（rv64 only）：由 arch_runner 的 `--smp` 名单驱动（默认 `test-arch`
+        // 不发送这些名字，所以它们恒编译也无害）。
+        #[cfg(target_arch = "riscv64")]
+        b"smp-boot" => smp_boot(info),
+        #[cfg(target_arch = "riscv64")]
+        b"smp-ipi" => smp_ipi(info),
+        #[cfg(target_arch = "riscv64")]
+        b"smp-percpu" => smp_percpu(info),
         // 私有 AS 跨 AS trampoline（机制证明）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-transition" => isolated_tests::isolated_transition(),
@@ -676,22 +677,109 @@ fn external_irq_handler(_cpu: CpuId) {
     EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
-/// SMP 骨架用例：启动次 CPU 并证明其 online（实现待手写）。
-#[cfg(feature = "smp")]
-fn smp_boot() -> ! {
-    todo!("SMP: bring up a secondary CPU via Core and prove it reaches Online")
+/// SMP 用例：启动次 CPU 并证明它进入了 `secondary_main`（milestone 1）。
+///
+/// 触发 boot 侧的 AP bring-up（`start_secondaries`），然后等 `ONLINE` 计数达到
+/// 非 boot CPU 数；超时即失败。`-smp 2` 由 `arch_runner.py --smp` 提供。
+#[cfg(target_arch = "riscv64")]
+fn smp_boot(info: &MachineInfo) -> ! {
+    let want = info.cpu_count.saturating_sub(1); // 非 boot CPU 数
+    if want == 0 {
+        fail("smp-boot: only one CPU discovered (QEMU needs -smp 2)");
+    }
+    crate::smp::start_secondaries(info);
+
+    let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
+    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
+        core::hint::spin_loop();
+    }
+    let online = crate::smp::ONLINE.load(Ordering::Acquire);
+    if online < want {
+        kernel::log!("selftest", "smp-boot online={} want={}", online, want);
+        fail("smp-boot: secondary CPU never reached secondary_main");
+    }
+    pass("smp-boot")
 }
 
-/// SMP 骨架用例：发 IPI 并证明目标 CPU 处理了它（实现待手写）。
-#[cfg(feature = "smp")]
-fn smp_ipi() -> ! {
-    todo!("SMP: send an IPI and prove the target drains the pending work")
+/// SMP 用例：BSP 给每个 AP 发一个 IPI 门铃，证明目标 CPU 真的处理了它。
+///
+/// 白盒驱动 arch 的 IPI 机制（类似 `external-irq`）。**需要**：
+///   - arch `Smp`：`init_cpu` / `register_ipi_handler` / `enable_ipi_interrupt`
+///     / `send_ipi`（当前仍是 `todo!()`）；
+///   - AP 侧在 `secondary_main` 里开 IPI 接收（`SmpImpl::init_cpu` +
+///     `enable_ipi_interrupt`）——现在故意没加，免得打断 `smp-boot`。
+#[cfg(target_arch = "riscv64")]
+fn smp_ipi(info: &MachineInfo) -> ! {
+    use arch::smp::Smp;
+
+    let want = info.cpu_count.saturating_sub(1);
+    if want == 0 {
+        fail("smp-ipi: only one CPU discovered (QEMU needs -smp 2)");
+    }
+    crate::smp::start_secondaries(info);
+
+    // BSP 注册全局 IPI handler，并打开自己的 IPI 接收。
+    <arch::SmpImpl as Smp>::register_ipi_handler(bsp_ipi_handler)
+        .expect("register_ipi_handler failed");
+    <arch::SmpImpl as Smp>::init_cpu().expect("Smp::init_cpu failed");
+    <arch::SmpImpl as Smp>::enable_ipi_interrupt();
+
+    // 给每个非 boot CPU 发门铃。
+    for cpu in &info.cpu_info[..info.cpu_count] {
+        if cpu.hardware_id == info.boot_hardware_id {
+            continue;
+        }
+        <arch::SmpImpl as Smp>::send_ipi(cpu.hardware_id).expect("send_ipi failed");
+    }
+
+    let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
+    while crate::smp::IPI_SEEN.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
+        core::hint::spin_loop();
+    }
+    if crate::smp::IPI_SEEN.load(Ordering::Acquire) < want {
+        fail("smp-ipi: target CPU did not handle the IPI");
+    }
+    pass("smp-ipi")
 }
 
-/// SMP 骨架用例：证明 per-CPU 状态彼此独立（实现待手写）。
-#[cfg(feature = "smp")]
-fn smp_percpu() -> ! {
-    todo!("SMP: prove per-CPU state (sched/timer/containment) is distinct per CPU")
+/// IPI handler：在**目标** CPU 上运行，只计数（证明门铃投递到了非 boot CPU）。
+#[cfg(target_arch = "riscv64")]
+fn bsp_ipi_handler(cpu: CpuId) {
+    if cpu.raw() != 0 {
+        crate::smp::IPI_SEEN.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// SMP 用例：证明 per-CPU 身份彼此独立——每个 AP 读到的 `current_cpu()` 必须
+/// 等于它自己的逻辑下标。
+///
+/// 依赖 `secondary_main` 装自己的入口记录（已实现）。Core 的 per-CPU
+/// sched/timer/containment 状态（各 `init_cpu`）是后续一步。
+#[cfg(target_arch = "riscv64")]
+fn smp_percpu(info: &MachineInfo) -> ! {
+    let want = info.cpu_count.saturating_sub(1);
+    if want == 0 {
+        fail("smp-percpu: only one CPU discovered (QEMU needs -smp 2)");
+    }
+    crate::smp::start_secondaries(info);
+
+    let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
+    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
+        core::hint::spin_loop();
+    }
+    if crate::smp::ONLINE.load(Ordering::Acquire) < want {
+        fail("smp-percpu: AP did not reach secondary_main");
+    }
+
+    for i in 1..info.cpu_count {
+        if crate::smp::PERCPU_IDS[i].load(Ordering::Acquire) != i {
+            fail("smp-percpu: AP current_cpu() != its logical id");
+        }
+    }
+    if arch::CpuImpl::current_cpu().map(|c| c.raw()) != Some(0) {
+        fail("smp-percpu: BSP current_cpu() != 0");
+    }
+    pass("smp-percpu")
 }
 
 // ---------------------------------------------------------------------------
