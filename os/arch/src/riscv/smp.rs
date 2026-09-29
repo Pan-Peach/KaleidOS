@@ -16,8 +16,10 @@
 //! 所有方法体为 `todo!()`；接口/错误类型/配置形状已定，留给人类实现。
 
 use super::Riscv;
+use super::trap;
 use crate::cpu::HardwareCpuId;
 use crate::smp::{CpuStartError, InitError, IpiError, LocalInterruptHandler, SecondaryBoot, Smp};
+use core::arch::asm;
 
 /// RISC-V 启动配置，**由 boot 填充**（不是通用 Core 能构造的）。
 ///
@@ -44,22 +46,31 @@ impl Smp for Riscv {
     }
 
     fn init_cpu() -> Result<(), InitError> {
-        todo!("SMP(riscv): enable this hart's IPI receive path (SIP.SSIP / MSIP), still masked")
+        unsafe { asm!("csrc sip, {}", in(reg) (1usize << 1), options(nostack)) };
+        Ok(())
     }
 
-    fn register_ipi_handler(_handler: LocalInterruptHandler) -> Result<(), InitError> {
-        todo!("SMP(riscv): register the global IPI dispatch callback exactly once")
+    fn register_ipi_handler(handler: LocalInterruptHandler) -> Result<(), InitError> {
+        trap::register_ipi_handler(handler);
+        Ok(())
     }
 
     fn enable_ipi_interrupt() {
-        todo!("SMP(riscv): unmask this hart's software-interrupt source only")
+        unsafe { asm!("csrs sie, {}", in(reg) (1usize << 1), options(nostack)) };
     }
 
-    fn send_ipi(_target: HardwareCpuId) -> Result<(), IpiError> {
-        todo!("SMP(riscv): ring one hart's doorbell (sbi_send_ipi or CLINT MSIP)")
+    fn send_ipi(target: HardwareCpuId) -> Result<(), IpiError> {
+        let mask = sbi_rt::HartMask::from_mask_base(1, target.raw() as usize);
+        if sbi_rt::send_ipi(mask).is_err() {
+            return Err(IpiError::DeliveryFailed);
+        }
+        Ok(())
     }
 
-    fn send_ipi_mask(_targets: &[HardwareCpuId]) -> Result<(), IpiError> {
-        todo!("SMP(riscv): ring a set of harts (may partially deliver before erroring)")
+    fn send_ipi_mask(targets: &[HardwareCpuId]) -> Result<(), IpiError> {
+        for t in targets {
+            Self::send_ipi(*t)?;
+        }
+        Ok(())
     }
 }

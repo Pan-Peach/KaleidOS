@@ -55,6 +55,20 @@ pub fn dispatch_external() {
     handler(current_logical_cpu());
 }
 
+static IPI_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_ipi_handler(handler: LocalInterruptHandler) {
+    IPI_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+pub fn dispatch_ipi() {
+    let address = IPI_HANDLER.load(Ordering::Acquire);
+    assert!(address != 0, "IPI handler is not registered");
+    // SAFETY: 注册方保证签名与 `LocalInterruptHandler` 一致（单一注册入口）。
+    let handler: LocalInterruptHandler = unsafe { core::mem::transmute(address) };
+    handler(current_logical_cpu());
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {

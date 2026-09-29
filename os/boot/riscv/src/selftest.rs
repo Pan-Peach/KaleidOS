@@ -703,11 +703,9 @@ fn smp_boot(info: &MachineInfo) -> ! {
 
 /// SMP 用例：BSP 给每个 AP 发一个 IPI 门铃，证明目标 CPU 真的处理了它。
 ///
-/// 白盒驱动 arch 的 IPI 机制（类似 `external-irq`）。**需要**：
-///   - arch `Smp`：`init_cpu` / `register_ipi_handler` / `enable_ipi_interrupt`
-///     / `send_ipi`（当前仍是 `todo!()`）；
-///   - AP 侧在 `secondary_main` 里开 IPI 接收（`SmpImpl::init_cpu` +
-///     `enable_ipi_interrupt`）——现在故意没加，免得打断 `smp-boot`。
+/// 白盒驱动 arch 的 IPI 机制（类似 `external-irq`）：注册全局 handler → 等 AP
+/// 完成本地初始化（`Smp::init_cpu` / `enable_ipi_interrupt` / `enable_irq`）→
+/// 发门铃 → 等目标 CPU 上的 handler 计数。
 #[cfg(target_arch = "riscv64")]
 fn smp_ipi(info: &MachineInfo) -> ! {
     use arch::smp::Smp;
@@ -718,11 +716,21 @@ fn smp_ipi(info: &MachineInfo) -> ! {
     }
     crate::smp::start_secondaries(info);
 
-    // BSP 注册全局 IPI handler，并打开自己的 IPI 接收。
+    // BSP 注册全局 IPI handler，并打开自己的 IPI 接收（必须在任何 CPU 开接收之前）。
     <arch::SmpImpl as Smp>::register_ipi_handler(bsp_ipi_handler)
         .expect("register_ipi_handler failed");
     <arch::SmpImpl as Smp>::init_cpu().expect("Smp::init_cpu failed");
     <arch::SmpImpl as Smp>::enable_ipi_interrupt();
+
+    // **先等所有 AP online** 再发门铃：AP 的 `Smp::init_cpu` 会清 `sip.SSIP`，
+    // 若门铃早于它到达就会被清掉、永远不投递（真实的启动期竞态）。
+    let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
+    while crate::smp::ONLINE.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
+        core::hint::spin_loop();
+    }
+    if crate::smp::ONLINE.load(Ordering::Acquire) < want {
+        fail("smp-ipi: AP did not reach secondary_main");
+    }
 
     // 给每个非 boot CPU 发门铃。
     for cpu in &info.cpu_info[..info.cpu_count] {

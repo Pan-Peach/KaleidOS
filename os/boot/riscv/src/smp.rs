@@ -23,6 +23,7 @@
 //! host / rv64 / rv32 测试保持全绿。
 
 use crate::vm::bootstrap;
+use arch::smp::Smp;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::mem::MaybeUninit;
@@ -117,21 +118,25 @@ pub fn secondary_entry_address() -> usize {
 pub extern "C" fn secondary_main(argument: usize) -> ! {
     // AP 侧本地初始化（Core 的 `secondary_entry` 最终会接管这里）：
     //   1) 装自己的入口记录（`sscratch` = &entry = 本 CPU 的 trap 栈顶）；
-    //   2) 设 `stvec`（`CpuArch::init_cpu`）。
-    // IPI 接收源（`SmpImpl::init_cpu` / `enable_ipi_interrupt`）留给 `smp-ipi`
-    // 那一轮补——它们现在是 `todo!()`，提前调用会打断 `smp-boot`。
+    //   2) 设 `stvec`（`CpuArch::init_cpu`）；
+    //   3) 开本 CPU 的 IPI 接收源（`Smp::init_cpu` + `enable_ipi_interrupt`）+ 全局 SIE。
     unsafe {
         <arch::CpuImpl as arch::CpuArch>::install_per_cpu_base(
             kernel::machine::CpuId::from_raw(argument),
             core::ptr::NonNull::dangling(),
         );
     }
-    arch::CpuImpl::init_cpu();
+    <arch::CpuImpl as arch::CpuArch>::init_cpu();
 
     // 记录本 CPU 读到的逻辑身份（`smp-percpu` 的证据）。
     if let Some(cpu) = <arch::CpuImpl as arch::CpuArch>::current_cpu() {
         PERCPU_IDS[argument].store(cpu.raw(), Ordering::Release);
     }
+
+    <arch::SmpImpl as Smp>::init_cpu().expect("SMP(riscv): init_cpu() failed");
+    <arch::SmpImpl as Smp>::enable_ipi_interrupt();
+    <arch::CpuImpl as arch::CpuArch>::enable_irq();
+
     ONLINE.fetch_add(1, Ordering::AcqRel);
     arch::riscv::console::write_fmt(format_args!(
         "[SMP] CPU {argument}: secondary_main() called\n"
