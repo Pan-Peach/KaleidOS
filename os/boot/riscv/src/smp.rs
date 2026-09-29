@@ -135,12 +135,17 @@ pub extern "C" fn secondary_main(argument: usize) -> ! {
 
     <arch::SmpImpl as Smp>::init_cpu().expect("SMP(riscv): init_cpu() failed");
     <arch::SmpImpl as Smp>::enable_ipi_interrupt();
-    <arch::CpuImpl as arch::CpuArch>::enable_irq();
 
-    ONLINE.fetch_add(1, Ordering::AcqRel);
+    // 先打印、再置 `ONLINE`：BSP 在 `ONLINE` 上等待 AP 就绪，若先 `ONLINE++`，
+    // BSP 可能在 AP 仍在写串口时打印结果——串口无跨 CPU 锁，两条流会交错，
+    // 把 `[selftest] <case>: PASS` 标记打散，令 ArchTest 判定 flaky（已实测）。
+    // 打印时全局中断仍关着，避免嵌套 trap 再进 console。
     arch::riscv::console::write_fmt(format_args!(
         "[SMP] CPU {argument}: secondary_main() called\n"
     ));
+    <arch::CpuImpl as arch::CpuArch>::enable_irq();
+
+    ONLINE.fetch_add(1, Ordering::AcqRel);
     loop {
         arch::CpuImpl::wait_for_interrupt();
     }

@@ -180,6 +180,14 @@ fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
         }
     }
 
+    // 归一化：逻辑 CPU0 = boot hart（与 RV64 同一条不变式）。RV32 单活动 CPU，
+    // `current_cpu()` 恒为 0，PLIC 的 claim / external context 都取 `contexts[0]`；
+    // OpenSBI 抽签使 boot hart 不一定是 discovery 下标 0，不归一化时外部中断会被
+    // 固定路由到错误的 hart（`external-irq` 实测 flaky）。
+    if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
+        cpu_info.swap(0, boot_index);
+    }
+
     let mut dev_count = 0;
     collect_devices(
         tree.root().as_node().children(),

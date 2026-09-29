@@ -255,6 +255,15 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
                 cpu_count += 1;
             }
 
+            // 归一化：逻辑 CPU id = 数组下标（从 0 稠密），并强制 **boot hart = 逻辑
+            // CPU0**。OpenSBI 用抽签选 boot hart，它不一定是 discovery 下标 0；不归一
+            // 化时 BSP 会绑到 CPU0 的入口记录/trap 栈，而某个 AP 之后又占用 CPU0 →
+            // 逻辑身份互相别名（smp-percpu 因此 flaky）。保持「BSP = 逻辑 0」这一
+            // 既有不变式，PLIC 外部固定路由、`trap_stack_*`、per-CPU 表全部继续正确。
+            if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
+                cpu_info.swap(0, boot_index);
+            }
+
             // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
             let mut dev_count = 0usize;
             collect_devices(
