@@ -86,9 +86,9 @@ Hardware                                    目前只有 QEMU virt
 
 现状：每 CPU `CpuState`，`PolicySlot` 存选中的 `EndpointId` 与 Core 栈，`run`/`yield_current`/`exit_current` 走 `propose → validate → commit`。host 22 项测试覆盖非法提议拒绝、策略失败回退、IRQ 与 service-call 门禁、trace；QEMU 有 `scheduler-load`/`scheduler-select`/`scheduler-rr`；`kbench` 量 `sched.yield_roundtrip`。
 
-缺口：没有抢占（`on_timer_tick` 是 `todo!()`）；SMP 只有骨架（`CONFIG_SMP` 与 `os/core/src/smp/` 已落地，per-CPU 调度状态、AP 启动、IPI 投递、`sscratch` 入口记录是 `todo!()`，未接线）；没有 priority/CFS，这属于策略组件。
+缺口：没有抢占（`on_timer_tick` 是 `todo!()`）；SMP 的 **Core 编排 M1 已接线**（`core::init` 调 `smp::init`；per-CPU 记录/状态/online、`sched::init_cpu`、per-CPU `timer::STATE`、IPI mark/take 已落地并有 host 单测），但 **AP 尚未进入 Core 调度**：`secondary_entry`/门控/`ipi::notify`/`drain_pending`/arch SSIP 应答仍 `todo!()`；没有 priority/CFS，这属于策略组件。
 
-下一步：接抢占，见 3.6；实现 SMP（per-CPU 状态 + AP 启动 + IPI，先 RISC-V）。priority/CFS 留在组件。
+下一步：接抢占，见 3.6；SMP 按 `.omo/plans/smp-production-integration.md` 推进（M2 并发安全 → M3 AP 进入 Core → M4 统一启动 seam；先 RISC-V）。priority/CFS 留在组件。
 
 #### 3.6 时钟 / 抢占 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -323,7 +323,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 4. 组件生命周期收敛：drain 协调协议，`kcomp_task`，卸载与重载的语义矩阵。
 5. IsolatedNative 收敛或冻结：补 ASID、U-mode、出站调用、更宽 import 面，或者明确冻结成教学实验。
 6. 消费路径 ABI 的文档收敛：代码侧没有缺口，`validate` 与 `bind` 都做 exact contract 加 abi 加存活，SDK 已接。要做的是把 `deployment.md` §7.4/§11 的"consumer exact ABI 未做"改到和代码一致，或明确声明 lookup 永远 contract-only。
-7. SMP 与第二 ISA：`arch` 接口已收敛（`Smp` trait；逻辑 `CpuId` / 硬件 `HardwareCpuId`；回调 `fn(CpuId)`；`InterruptController` 的 `Config`/`Claim`；per-ISA 重定位；`CONFIG_SMP` 与 per-CPU seams），实现与 CPU-local 存储（RISC-V `sscratch` 入口记录、per-CPU trap 栈、containment 本地状态）待做，属与 trap bring-up 协调的工作。见 3.12 / 3.24 与 `docs/modules/arch.md`。
+7. SMP 与第二 ISA：`arch` 接口已收敛（`Smp` trait；逻辑 `CpuId` / 硬件 `HardwareCpuId`；回调 `fn(CpuId)`；`InterruptController` 的 `Config`/`Claim`；per-ISA 重定位；per-CPU seams）。**SMP 不是构建开关**（无 `smp` feature）。Core 编排 M1 已接线（`core::init`→`smp::init`、记录/状态/online、`sched::init_cpu`、per-CPU `timer::STATE`、IPI mark/take），boot 归一化 **boot hart = 逻辑 CPU0**；剩余为并发关键实现（`secondary_entry`/门控、arch `start_cpu`/SSIP 应答、`ipi::notify`/`drain_pending`、containment per-CPU、离场上下文交接），见 `.omo/plans/smp-production-integration.md`。第二 ISA 仍待 bring-up。见 3.12 / 3.24 与 `docs/modules/arch.md`。
 
 三条贯穿约束（合并自原路线图 §3，仍在生效）：
 
@@ -779,7 +779,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 - SandboxedNative（U-mode 加私有 AS 加 `ecall`）：`todo!()`（`load.rs:183`、`exit.rs:129`），没有 syscall wire ABI。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
 - block/wake 任务原语：ABI 与 TaskTable permit/owner 已实现；host property test 已启用，调度集成测试当前失败于 TaskTable 锁跨 `schedule_next`，IRQ 恢复路径仍待修正。trace 事件未定义。IN PROGRESS。
-- SMP：`CONFIG_SMP`、`os/core/src/smp/`（`CpuMask` / `PerCpu` / `BootGate` / `CpuBootState` 已实现并有 host 单测）、arch 的 `Smp` trait、per-CPU seams（sched/timer/irq/containment）与显式中断使能生命周期已落地；per-CPU 状态、AP 启动、IPI 投递、`sscratch` 入口记录、跨 CPU `Running(CpuId)` 互斥仍 `todo!()`。IN PROGRESS。
+- SMP：**不是构建开关**（无 `smp` feature；`.config` 的 `CONFIG_SMP` 是悬空符号，Kconfig 未定义）。已落地：`os/core/src/smp/`（`CpuMask`/`PerCpu`/`BootGate`/`CpuBootState` + 记录表 `CpuRegistry`；`init` BSP 侧、`cpu_state`/`online_cpus`/`request_start`/`mark_ready`、`ipi_interrupt`/`take_pending`，含 host 单测）、`timer::STATE` per-CPU、`sched::init_cpu`、`core::init` 调 `smp::init`、arch `Smp` 的 `init_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；boot 归一化 **boot hart = 逻辑 CPU0** 与 AP 打印顺序，修掉 OpenSBI 抽签导致的 `smp-percpu`/`external-irq` flaky。仍 `todo!()`（人类，并发关键）：`Smp::prepare`/`start_cpu`、Core `secondary_entry`/门控/`wait_until_online`、`ipi::notify`/`drain_pending`、arch SSIP 应答（**未补齐前不得开 IPI 源**）、containment per-CPU、跨 CPU `Running(CpuId)` 与离场上下文交接。IN PROGRESS。详见 `.omo/plans/smp-production-integration.md`。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
 - 内存物理回收与 instance 退役回收：不承诺，逻辑死亡、物理驻留。NOT IMPLEMENTED。

@@ -32,14 +32,17 @@
 - 类型别名（按 cfg 选定具体实现）：`CpuImpl`、`ConsoleImpl`、`ResetImpl`、`TimerImpl`、`InterruptImpl`、`SmpImpl`、`ContextImpl`、`AddressSpaceImpl`、`ComponentRelocationImpl`。
 - 关键符号（`os/arch/src/`）：`CpuArch` / `Timer` / `InterruptController` / `Smp` / `Console` / `SystemReset`（`lib.rs`）、`CpuId` / `HardwareCpuId` / `LocalInterruptHandler`（`cpu.rs`）、`Smp` 契约类型（`smp.rs`）、`AddressSpaceBackend`（`vm.rs`）、`RiscvRelocator`（`riscv/elf.rs`）、`Sv39PageTable` / `Sv32PageTable` / `Sv39AddressSpace` / `Sv32AddressSpace`（`riscv/mmu/`）、`PlicConfig` / `PlicClaim`（`riscv/plic.rs`）、`trap_handler`（`riscv/trap/supervisor.rs`）、`trampoline_enter` / `trampoline_return`（`riscv/trampoline/`）。
 
-## SMP 骨架状态（`CONFIG_SMP`）
+## SMP 状态（不是构建开关）
 
-`CONFIG_SMP` 打开 Core 的 per-CPU 路径；**接口已收敛，实现待手写**：
+**SMP 不是构建开关**：没有 `smp` Cargo feature，boot 的 SMP 模块按 `riscv64 + vm-mmu` 无条件编译（`.config` 里的 `CONFIG_SMP` 是历史残留，任何 Kconfig 都未定义它）。UP = 只有 CPU0 的 SMP。
 
-- **已固化（原地替换，无版本后缀）**：`CpuId`/`HardwareCpuId` 分离；回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 的 `Config`/`Claim` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；`CpuArch::init_cpu` + `enable_irq`；`Timer::init_cpu`；**中断使能生命周期显式化**（本地 `init_cpu`/解源 与全局 `enable_irq` 分离，boot 在 `kernel::init` 后显式开闸）；per-ISA 重定位别名。
-- **仍是 `todo!()`（实现阶段）**：`Smp::*`、`CpuArch::current_cpu`/`per_cpu_base`/`install_per_cpu_base`、`InterruptController::init_cpu`、各 ISA 后端内部机制。
-- **协调项（不能只改签名）**：真正的 CPU-local 存储（RISC-V 的 `sscratch` 要升级成 arch 私有入口记录）、per-CPU trap 栈、嵌套 trap / containment 非局部返回约定——这些与 trap bring-up 一起做。
-- **测试入口**：`make test-arch`（rv64+rv32，默认）；`make test-arch-smp-rv64`（opt-in，`smp-*` 用例现在会失败）；`make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（opt-in 新 ISA，boot 未实现前会失败）。
+**不变式：逻辑 CPU0 = boot hart。** OpenSBI 用**抽签**选 boot hart，它不一定是 DTB 里第一个 CPU；boot 在 discovery 后**归一化**（`main64.rs` / `main32.rs`），使 BSP 恒为逻辑 0。PLIC 外部固定路由、`trap_stack_range()`、per-CPU 表都依赖这条不变式（不归一化时 `smp-percpu` / `external-irq` 实测 flaky）。
+
+- **已实现（RISC-V / Fake）**：`CpuId`/`HardwareCpuId` 分离；回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 的 `Config`/`Claim` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；`CpuArch::init_cpu`/`enable_irq`/`current_cpu`/`per_cpu_base`/`install_per_cpu_base`；`Timer::init_cpu`；`Smp::init_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；中断使能生命周期显式化（本地 `init_cpu`/解源 与全局 `enable_irq` 分离）。
+- **Core 侧（`os/core/src/smp/`，已落地）**：`CpuMask`/`PerCpu`/`CpuBootState`/`BootGate`；记录表 `CpuRegistry` + `init`（BSP 侧：校验拓扑、注册 Core IPI 回调、BSP Online；**不**启动 AP、**不**开 IPI 源）+ `cpu_state`/`online_cpus`/`request_start`/`mark_ready`；`ipi_interrupt`/`take_pending`；`timer::STATE` 已 per-CPU。`core::init` 调 `smp::init`。
+- **仍是 `todo!()`（人类，关键并发路径）**：`Smp::prepare`/`start_cpu`；Core `secondary_entry`/`wait_for_release`/`release_secondaries`/`wait_until_online`；`ipi::notify`/`drain_pending`。⚠️ **arch 补齐 SSIP 应答（`sip.SSIP` ack）之前不得 `enable_ipi_interrupt`**，否则会中断风暴。
+- **协调项（并发关键）**：AP `sscratch` 入口记录 / per-CPU trap 栈已就位；`containment` 的进程级 `static mut` 拆 per-CPU、任务表 `Running(CpuId)` 跨 CPU 互斥、**离场任务上下文保存完成前不得对外可运行**（`sched.rs`）仍是实现阶段工作。详见 `.omo/plans/smp-production-integration.md`。
+- **测试入口**：`make test-arch`（rv64+rv32，默认）；`make test-arch-smp-rv64`（`smp-boot`/`smp-ipi`/`smp-percpu`，已确定性通过）；`make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（opt-in 新 ISA，boot 未实现前会失败）。
 
 ## 新 ISA 骨架（x86_64 / aarch64 / loongarch64）
 
