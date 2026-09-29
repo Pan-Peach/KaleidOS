@@ -60,6 +60,9 @@ impl Smp for Riscv {
     }
 
     fn send_ipi(target: HardwareCpuId) -> Result<(), IpiError> {
+        // 发布 → 通知排序（Oracle 评审）：Core 已用 Release 发布 pending 位；在触发
+        // 固件通知前再加一道全序 `fence`，确保该存储在门铃之前对目标 CPU 可见。
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let mask = sbi_rt::HartMask::from_mask_base(1, target.raw() as usize);
         if sbi_rt::send_ipi(mask).is_err() {
             return Err(IpiError::DeliveryFailed);

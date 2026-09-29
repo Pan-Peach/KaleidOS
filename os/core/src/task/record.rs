@@ -22,7 +22,7 @@ pub struct TaskRecord {
     /// 认领**；`Some(cpu)` = 已在该 CPU 上跑过，**只能由该 CPU 再认领**。这条规则
     /// 规避「离场任务的上下文尚未保存完成就被另一 CPU 取走」的竞态（plan / Oracle
     /// #1）——首次运行前的上下文不需要保存，所以可以安全跨 CPU。
-    last_cpu: Option<CpuId>,
+    home_cpu: Option<CpuId>,
     /// `unpark` 早于 `park` 时暂存的一次通知；重复通知合并为一个 permit。
     park_pending: bool,
     /// 组件任务入口（`KcompTaskEntry`：`void (*)(void *)`），由
@@ -53,7 +53,7 @@ impl TaskRecord {
         Self {
             owner,
             state: TaskState::Created,
-            last_cpu: None,
+            home_cpu: None,
             park_pending: false,
             entry,
             arg,
@@ -69,21 +69,21 @@ impl TaskRecord {
     }
 
     /// 任务上次运行的逻辑 CPU（`None` = 从未运行过）。
-    pub fn last_cpu(&self) -> Option<CpuId> {
-        self.last_cpu
+    pub fn home_cpu(&self) -> Option<CpuId> {
+        self.home_cpu
     }
 
     /// 该任务此刻能否被逻辑 CPU `cpu` 认领（`Runnable → Running` 的前置条件）。
     ///
-    /// - 从未运行（`last_cpu == None`）：任何 CPU 可认领（上下文 fresh）；
+    /// - 从未运行（`home_cpu == None`）：任何 CPU 可认领（上下文 fresh）；
     /// - 运行过：只有其上次所在 CPU 可再认领（跨 CPU 认领会踩离场上下文竞态）。
     pub fn claimable_by(&self, cpu: CpuId) -> bool {
-        self.last_cpu.is_none_or(|last| last == cpu)
+        self.home_cpu.is_none_or(|last| last == cpu)
     }
 
     /// Core 内部写入点：任务被提交为 `Running(cpu)` 时记录/更新归属 CPU。
-    pub(crate) fn set_last_cpu(&mut self, cpu: CpuId) {
-        self.last_cpu = Some(cpu);
+    pub(crate) fn set_home_cpu(&mut self, cpu: CpuId) {
+        self.home_cpu = Some(cpu);
     }
 
     /// 只读观察状态（monitor / trace / 调度器读侧）。

@@ -193,6 +193,12 @@ impl CpuRegistry {
             })
             .ok_or(SmpInitError::InvalidTopology)?;
 
+        // 不变式（boot 归一化保证）：BSP 必须是逻辑 CPU0。入口记录、`trap_stack_range()`、
+        // PLIC 外部固定路由都依赖它；Core 在这里守住，防止 boot 漂移后静默错绑。
+        if bsp != 0 {
+            return Err(SmpInitError::InvalidTopology);
+        }
+
         let records = PerCpu::new(count, |cpu| CpuRecord::new(cpus[cpu.raw()].hardware_id))
             .map_err(|_| SmpInitError::AllocationFailed)?;
         Ok(Self {
@@ -255,11 +261,23 @@ impl CpuRegistry {
         }
     }
 
-    /// 置 Online（BSP 直接；AP 在 `secondary_entry` 放行后）。
-    fn set_online(&self, cpu: CpuId) -> Result<(), SmpInitError> {
+    /// BSP 发布：`init` 在 BSP 上直接置 Online（BSP 不走 AP 入口）。
+    fn publish_bsp_online(&self, cpu: CpuId) -> Result<(), SmpInitError> {
         let record = self.records.get(cpu).ok_or(SmpInitError::InvalidTopology)?;
         record.set_boot_state(CpuBootState::Online);
         Ok(())
+    }
+
+    /// AP 置 Online：只允许 `Ready → Online`（fail-closed；Failed 终态不可复活）。
+    fn mark_online(&self, cpu: CpuId) -> Result<(), SmpInitError> {
+        let record = self.records.get(cpu).ok_or(SmpInitError::InvalidTopology)?;
+        if record.try_transition(CpuBootState::Ready, CpuBootState::Online)
+            || record.boot_state() == CpuBootState::Online
+        {
+            Ok(())
+        } else {
+            Err(SmpInitError::InvalidTopology)
+        }
     }
 
     /// 标记失败（终态；迟到入口不得复活）。
@@ -302,7 +320,7 @@ pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
         <Backend as Smp>::init_cpu().map_err(SmpInitError::BackendInit)?;
     }
 
-    registry.set_online(bsp)?;
+    registry.publish_bsp_online(bsp)?;
     RECORDS.call_once(|| registry);
     Ok(())
 }
@@ -380,34 +398,41 @@ pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
     }
     <arch::CpuImpl as arch::CpuArch>::init_cpu(); // stvec / trap 入口
 
-    // 2) 本 CPU 的 Core 子系统。containment 尚未 per-CPU 化（plan M2）——本里程碑
+    // 2) 本 CPU 的 Core 子系统。containment 尚未 per-CPU 化（plan）——本里程碑
     //    AP 不运行组件任务，故不调用 `containment::init_cpu`（保持其 `todo!()` 不被触发）。
-    let _ = crate::sched::init_cpu(cpu);
-    let _ = crate::timer::init_cpu(cpu);
-    let _ = crate::irq::init_cpu(cpu);
-    let _ = <Backend as Smp>::init_cpu();
+    //    **任一本地子系统初始化失败即 fail-closed**：不得宣称 Online（Oracle 评审）。
+    let init_ok = crate::sched::init_cpu(cpu).is_ok()
+        && crate::timer::init_cpu(cpu).is_ok()
+        && crate::irq::init_cpu(cpu).is_ok()
+        && <Backend as Smp>::init_cpu().is_ok();
 
-    // 3) 身份证据 + 门禁：AP 必须读到自己被赋予的逻辑 id，否则是 Core 不变式破坏，
-    //    标记 Failed 并 park（绝不进入调度）。
-    if current_cpu() == cpu {
-        if let Some(record) = record(cpu) {
-            record.set_identity_ok();
-        }
-    } else {
-        if let Some(record) = record(cpu) {
-            record.set_boot_state(CpuBootState::Failed);
-        }
-        idle_loop(cpu);
+    // 3) 身份 + 初始化门禁：任一失败即标记 Failed 并 park，绝不进入调度。
+    if !init_ok || current_cpu() != cpu {
+        ap_failed(cpu);
+    }
+    if let Some(record) = record(cpu) {
+        record.set_identity_ok();
     }
 
     // 4) Ready，并在 BootGate 上关中断自旋（全局 SIE 尚未开）。
-    let _ = mark_ready(cpu);
-    let _ = wait_for_release(cpu);
+    if mark_ready(cpu).is_err() || wait_for_release(cpu).is_err() {
+        ap_failed(cpu);
+    }
 
-    // 5) Online；打开本 CPU 的 IPI 源与全局中断，进入 Core 空闲循环。
-    let _ = set_online(cpu);
+    // 5) 只允许 Ready→Online；失败即 fail-closed。成功后开 IPI 源与全局中断，进入空闲循环。
+    if set_online(cpu).is_err() {
+        ap_failed(cpu);
+    }
     <Backend as Smp>::enable_ipi_interrupt();
     <arch::CpuImpl as arch::CpuArch>::enable_irq();
+    idle_loop(cpu)
+}
+
+/// AP 启动失败（终态 `Failed`）后 park——绝不进入调度。
+fn ap_failed(cpu: CpuId) -> ! {
+    if let Some(record) = record(cpu) {
+        record.set_boot_state(CpuBootState::Failed);
+    }
     idle_loop(cpu)
 }
 
@@ -415,15 +440,18 @@ pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
 /// （安全边界）drain。本里程碑 AP 无跨 CPU 任务，故不进入 `sched::run`。
 fn idle_loop(cpu: CpuId) -> ! {
     loop {
+        // 「检查-睡眠」原子化（Oracle 评审：防丢唤醒）：先关本 CPU 中断再 drain；
+        // 此后到达的门铃让 `sip.SSIP` 保持 pending，而 SIE 关闭下的 `wfi` 会立即
+        // 返回（pending 即唤醒），不会出现“drain 完就睡、门铃被吞”的永久睡眠。
+        let flags = <arch::CpuImpl as arch::CpuArch>::disable_irq();
         ipi::drain_pending(cpu);
         let _ = take_resched(cpu);
         // TODO(手写)：containment per-CPU 落地后，在此进入本 CPU 的调度——
         //   if crate::sched::has_claimable_for(cpu) {
         //       let _ = crate::sched::run();
         //   }
-        // `sched::run` 目前依赖**进程级** containment（`ACTIVE_GUARD` 等 static mut），
-        // AP 并发调用会与 BSP 抢状态，故在 containment per-CPU 之前不启用。
         <arch::CpuImpl as arch::CpuArch>::wait_for_interrupt();
+        <arch::CpuImpl as arch::CpuArch>::restore_irq(flags);
     }
 }
 
@@ -435,12 +463,12 @@ fn mark_ready(cpu: CpuId) -> Result<(), SmpInitError> {
         .mark_ready(cpu)
 }
 
-/// 置某逻辑 CPU Online。
+/// 置某逻辑 CPU Online（AP：只允许 `Ready → Online`，fail-closed）。
 fn set_online(cpu: CpuId) -> Result<(), SmpInitError> {
     RECORDS
         .get()
         .ok_or(SmpInitError::InvalidTopology)?
-        .set_online(cpu)
+        .mark_online(cpu)
 }
 
 /// AP 在启动屏障上自旋等待放行（调用方保证中断关闭）。
@@ -583,10 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn bsp_is_reported_and_others_start_offline() {
-        let info = machine(&[(false, 0), (true, 1)]);
+    fn bsp_is_logical_zero_and_others_start_offline() {
+        let info = machine(&[(true, 0), (false, 1)]);
         let registry = CpuRegistry::build(&info).unwrap();
-        assert_eq!(registry.bsp(), CpuId::from_raw(1));
+        assert_eq!(registry.bsp(), CpuId::from_raw(0));
         assert_eq!(
             registry.state(CpuId::from_raw(0)),
             Ok(CpuBootState::Offline)
@@ -602,6 +630,16 @@ mod tests {
         assert_eq!(
             registry.hardware_id(CpuId::from_raw(1)),
             Some(HardwareCpuId::from_raw(1))
+        );
+    }
+
+    /// BSP 不在逻辑 CPU0（boot 未归一化）即拒绝——入口记录 / PLIC 路由依赖该不变式。
+    #[test]
+    fn build_rejects_boot_hart_not_at_logical_zero() {
+        let info = machine(&[(false, 0), (true, 1)]);
+        assert_eq!(
+            CpuRegistry::build(&info).err(),
+            Some(SmpInitError::InvalidTopology)
         );
     }
 
@@ -622,7 +660,7 @@ mod tests {
         assert_eq!(registry.mark_ready(ap), Ok(()));
 
         // Ready → Online。
-        assert_eq!(registry.set_online(ap), Ok(()));
+        assert_eq!(registry.mark_online(ap), Ok(()));
         assert_eq!(registry.state(ap), Ok(CpuBootState::Online));
         assert_eq!(registry.mark_ready(ap), Ok(()));
 
@@ -651,10 +689,10 @@ mod tests {
     fn online_scan_reflects_only_online_records() {
         let info = machine(&[(true, 0), (false, 1), (false, 2)]);
         let registry = CpuRegistry::build(&info).unwrap();
-        registry.set_online(CpuId::from_raw(0)).unwrap();
+        registry.publish_bsp_online(CpuId::from_raw(0)).unwrap();
         registry.request_start(CpuId::from_raw(1)).unwrap();
         registry.mark_ready(CpuId::from_raw(1)).unwrap();
-        registry.set_online(CpuId::from_raw(1)).unwrap();
+        registry.mark_online(CpuId::from_raw(1)).unwrap();
 
         let mask = registry.online();
         assert!(mask.contains(CpuId::from_raw(0)));

@@ -182,8 +182,8 @@ impl TaskTable {
     /// 「离场任务上下文尚未保存完成就被另一 CPU 取走」竞态的 Core 侧守门。
     pub fn transition(&mut self, id: TaskId, to: TaskState) -> Result<(), TaskError> {
         let record = self.get_mut(id).ok_or(TaskError::NotFound)?;
-        if let TaskState::Running(cpu) = to
-            && !record.claimable_by(cpu)
+        if let TaskState::Running(cpu) = &to
+            && !record.claimable_by(*cpu)
         {
             return Err(TaskError::InvalidTransition);
         }
@@ -199,8 +199,8 @@ impl TaskTable {
         if !legal {
             return Err(TaskError::InvalidTransition);
         }
-        if let TaskState::Running(cpu) = to {
-            record.set_last_cpu(cpu);
+        if let TaskState::Running(cpu) = &to {
+            record.set_home_cpu(*cpu);
         }
         record.set_state(to);
         Ok(())
@@ -288,14 +288,14 @@ mod tests {
         t.transition(id, TaskState::Runnable).unwrap();
 
         // 从未运行过：任何 CPU 都可认领。
-        assert_eq!(t.get(id).unwrap().last_cpu(), None);
+        assert_eq!(t.get(id).unwrap().home_cpu(), None);
         assert!(t.get(id).unwrap().claimable_by(CpuId(0)));
         assert!(t.get(id).unwrap().claimable_by(CpuId(1)));
 
         // 提交到 CPU1 再 yield：钉在 CPU1。
         t.transition(id, TaskState::Running(CpuId(1))).unwrap();
         t.transition(id, TaskState::Runnable).unwrap();
-        assert_eq!(t.get(id).unwrap().last_cpu(), Some(CpuId(1)));
+        assert_eq!(t.get(id).unwrap().home_cpu(), Some(CpuId(1)));
         assert!(t.get(id).unwrap().claimable_by(CpuId(1)));
         assert!(!t.get(id).unwrap().claimable_by(CpuId(0)));
 

@@ -56,23 +56,29 @@ pub enum NotifyError {
 }
 
 /// 向一组 CPU 发布并投递一次 IPI 请求。
+///
+/// 顺序（Oracle 评审）：**先整体校验目标集合**（任一无效即整体拒绝，绝不出现
+/// “前面目标已置 pending 却没响铃”），再对全部目标发布 pending 位（Release），
+/// 最后响铃。后端失败**保留** pending 位——失败表示“可能已部分投递”，不是“没送到”。
 pub(crate) fn notify(targets: &CpuMask, request: IpiRequest) -> Result<(), NotifyError> {
-    // 人类实现时的形状（不是机械接线，属并发关键逻辑）：
-    //   1) 对每个有效目标先 `record.pending_ipi.fetch_or(request.bit(), Release)`；
-    //   2) 收集有效目标的 `HardwareCpuId`，调 `Backend::send_ipi_mask`；
-    //   3) 后端失败**保留** pending 位（不得回滚成“什么都没送到”）。
-    // 在 arch 的 SSIP 应答与 `drain_pending` 落地前，本函数不得被启用。
-    let mut hw = [arch::cpu::HardwareCpuId::from_raw(0); crate::machine::MAX_CPUS];
+    // 第一遍：解析全部目标（records + 硬件 id）。任一无效 → 整体拒绝，零副作用。
+    let mut hardware = [arch::cpu::HardwareCpuId::from_raw(0); crate::machine::MAX_CPUS];
     let mut n = 0;
     for cpu in targets {
         let Some(rec) = record(cpu) else {
             return Err(NotifyError::InvalidTarget);
         };
-        rec.pending_ipi.fetch_or(request.bit(), Ordering::Release);
-        hw[n] = rec.hardware_id();
+        hardware[n] = rec.hardware_id();
         n += 1;
     }
-    <Backend as Smp>::send_ipi_mask(&hw[..n]).map_err(|_| NotifyError::DeliveryFailed)
+
+    // 第二遍：发布 pending 位（Release），再让后端响铃。
+    for cpu in targets {
+        if let Some(rec) = record(cpu) {
+            rec.pending_ipi.fetch_or(request.bit(), Ordering::Release);
+        }
+    }
+    <Backend as Smp>::send_ipi_mask(&hardware[..n]).map_err(|_| NotifyError::DeliveryFailed)
 }
 
 /// 本 CPU 的 IPI 硬件回调（由 `arch::Smp::register_ipi_handler` 注册）。
