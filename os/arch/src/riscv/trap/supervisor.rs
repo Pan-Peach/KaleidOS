@@ -89,6 +89,7 @@ pub unsafe extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: us
             super::dispatch_external();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            super::ack_ipi();
             super::dispatch_ipi(); // 暂时先只处理ipi
         }
         Trap::Interrupt(_) => panic!(

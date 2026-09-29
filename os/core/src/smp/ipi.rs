@@ -23,7 +23,8 @@
 //! 就宣称完成：正确的 shootdown 需要受影响的地址空间/范围、确认与生存期规则。
 
 use crate::machine::CpuId;
-use crate::smp::CpuMask;
+use crate::smp::{Backend, CpuMask, record};
+use arch::smp::Smp;
 use core::sync::atomic::Ordering;
 
 /// [`IpiRequest::Reschedule`] 在 pending 位集里的位。
@@ -55,13 +56,23 @@ pub enum NotifyError {
 }
 
 /// 向一组 CPU 发布并投递一次 IPI 请求。
-pub(crate) fn notify(_targets: &CpuMask, _request: IpiRequest) -> Result<(), NotifyError> {
+pub(crate) fn notify(targets: &CpuMask, request: IpiRequest) -> Result<(), NotifyError> {
     // 人类实现时的形状（不是机械接线，属并发关键逻辑）：
     //   1) 对每个有效目标先 `record.pending_ipi.fetch_or(request.bit(), Release)`；
     //   2) 收集有效目标的 `HardwareCpuId`，调 `Backend::send_ipi_mask`；
     //   3) 后端失败**保留** pending 位（不得回滚成“什么都没送到”）。
     // 在 arch 的 SSIP 应答与 `drain_pending` 落地前，本函数不得被启用。
-    todo!("SMP: publish pending work then ring each target's doorbell")
+    let mut hw = [arch::cpu::HardwareCpuId::from_raw(0); crate::machine::MAX_CPUS];
+    let mut n = 0;
+    for cpu in targets {
+        let Some(rec) = record(cpu) else {
+            return Err(NotifyError::InvalidTarget);
+        };
+        rec.pending_ipi.fetch_or(request.bit(), Ordering::Release);
+        hw[n] = rec.hardware_id();
+        n += 1;
+    }
+    <Backend as Smp>::send_ipi_mask(&hw[..n]).map_err(|_| NotifyError::DeliveryFailed)
 }
 
 /// 本 CPU 的 IPI 硬件回调（由 `arch::Smp::register_ipi_handler` 注册）。
@@ -84,6 +95,16 @@ pub(crate) fn take_pending(cpu: CpuId) -> usize {
 }
 
 /// 在安全边界处理并清空某 CPU 的 pending work。
-pub(crate) fn drain_pending(_cpu: CpuId) {
-    todo!("SMP: drain pending IPI work at a safe scheduling boundary")
+///
+/// 只做**不可分割的取走 + 意图落地**：`Reschedule` 转成该 CPU 的「需要重调度」
+/// 标志（[`crate::smp::take_resched`]），真正的 context switch 由调度安全边界
+/// （任务 yield/park/exit 后、或 AP 空闲循环顶部）消费标志后执行——绝不在 IPI
+/// 硬件回调里切上下文。
+pub(crate) fn drain_pending(cpu: CpuId) {
+    let bits = take_pending(cpu);
+    if bits & RESCHEDULE_BIT != 0 {
+        if let Some(record) = crate::smp::record(cpu) {
+            record.set_resched();
+        }
+    }
 }

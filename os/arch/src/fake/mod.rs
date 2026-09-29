@@ -4,7 +4,12 @@ use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer
 
 // 本 crate 整体 no_std；fake 仅在 host 编译（cfg 非 RV32/RV64），显式引入 std 供 console 直通。
 extern crate std;
-use std::{cell::Cell, io::Write, println};
+use std::{
+    cell::{Cell, RefCell},
+    io::Write,
+    println,
+    vec::Vec,
+};
 
 pub mod store;
 
@@ -29,13 +34,23 @@ std::thread_local! {
 std::thread_local! {
     static CPU_ID: Cell<Option<usize>> = const { Cell::new(None) };
     static CPU_BASE: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
-    static IPI_HANDLER: Cell<Option<LocalInterruptHandler>> = const { Cell::new(None) };
+    static SENT_IPIS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
+
+/// 已注册的全局 IPI 回调（进程级：注册是全局的，不随测试线程变）。
+static IPI_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// 最近一次经 [`Fake`] 注册的 IPI 回调（host 无 IPI 传输，只作可观察占位）。
 #[doc(hidden)]
 pub fn registered_ipi_handler_for_test() -> Option<LocalInterruptHandler> {
-    IPI_HANDLER.with(Cell::get)
+    let address = IPI_HANDLER.load(core::sync::atomic::Ordering::Acquire);
+    (address != 0).then(|| unsafe { core::mem::transmute::<usize, LocalInterruptHandler>(address) })
+}
+
+/// 取走并清空 host 记录的「已发出 IPI」目标硬件 id 列表（`Core::smp::ipi::notify` 可测）。
+#[doc(hidden)]
+pub fn take_sent_ipis_for_test() -> Vec<usize> {
+    SENT_IPIS.with(|sent| core::mem::take(&mut *sent.borrow_mut()))
 }
 
 #[doc(hidden)]
@@ -137,9 +152,9 @@ impl CpuArch for Fake {
     }
 }
 
-// SMP 骨架：host 没有真实次 CPU / IPI 硬件。方法体一律 `todo!()`，因为任何
-// host 测试都不应真的启动 CPU 或发 IPI；它们的存在只是让 `SmpImpl` 在 host 上
-// 满足 trait bound，并让 Core 的 smp 骨架可编译。
+// SMP：host 没有真实次 CPU，`prepare` / `start_cpu` 保持 `todo!()`（host 测试不应
+// 真的启动 CPU）。`register_ipi_handler` / `send_ipi*` 只做**可观察记录**（不真的
+// 投递），让 Core 的 IPI 注册与 `notify` 发布路径可在 host 单测。
 impl Smp for Fake {
     type BootConfig = ();
 
@@ -161,19 +176,25 @@ impl Smp for Fake {
     fn register_ipi_handler(handler: LocalInterruptHandler) -> Result<(), InitError> {
         // Host 没有真实 IPI 传输，但 Core 的 `smp::init` 在 `cpu_count > 1` 时会
         // 注册回调；这里**记住**它而不是 `todo!()`，让 Core 的 SMP 骨架在 host 上
-        // 可被单测。（真正投递 `send_ipi*` 仍是 `todo!()`：host 测试不应发门铃。）
-        IPI_HANDLER.with(|slot| slot.set(Some(handler)));
+        // 可被单测。（真正投递见 `send_ipi*`：host 只做可观察记录。）
+        IPI_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
         Ok(())
     }
 
     fn enable_ipi_interrupt() {}
 
-    fn send_ipi(_target: HardwareCpuId) -> Result<(), IpiError> {
-        todo!("SMP: host fake has no IPI transport")
+    fn send_ipi(target: HardwareCpuId) -> Result<(), IpiError> {
+        // Host 无 IPI 硬件：把目标记进可观察列表，让 Core 的 `notify` 可被测。
+        SENT_IPIS.with(|sent| sent.borrow_mut().push(target.raw() as usize));
+        Ok(())
     }
 
-    fn send_ipi_mask(_targets: &[HardwareCpuId]) -> Result<(), IpiError> {
-        todo!("SMP: host fake has no IPI transport")
+    fn send_ipi_mask(targets: &[HardwareCpuId]) -> Result<(), IpiError> {
+        SENT_IPIS.with(|sent| {
+            sent.borrow_mut()
+                .extend(targets.iter().map(|t| t.raw() as usize));
+        });
+        Ok(())
     }
 }
 

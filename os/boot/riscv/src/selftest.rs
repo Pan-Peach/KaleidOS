@@ -747,6 +747,18 @@ fn smp_ipi(info: &MachineInfo) -> ! {
     if crate::smp::IPI_SEEN.load(Ordering::Acquire) < want {
         fail("smp-ipi: target CPU did not handle the IPI");
     }
+
+    // 应答契约：一次门铃只应被处理一次。缺 SSIP ack 时 AP 的 `sret` 后会立即再
+    // trap，计数持续增长；静默一个窗口后要求计数**恰好** == want（无中断风暴）。
+    let settle = arch::TimerImpl::now().saturating_add(2_000_000);
+    while arch::TimerImpl::now() < settle {
+        core::hint::spin_loop();
+    }
+    let seen = crate::smp::IPI_SEEN.load(Ordering::Acquire);
+    if seen != want {
+        kernel::log!("selftest", "smp-ipi seen={} want={}", seen, want);
+        fail("smp-ipi: IPI handled more than once (missing SSIP ack?)");
+    }
     pass("smp-ipi")
 }
 

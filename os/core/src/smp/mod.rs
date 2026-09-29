@@ -42,7 +42,7 @@ pub use percpu::{PerCpu, PerCpuError};
 use crate::machine::{CpuId, MachineInfo};
 use arch::cpu::HardwareCpuId;
 use arch::smp::Smp;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use spin::Once;
 
 /// 当前编译目标的 SMP 后端（CPU 启动 + IPI 传输）。
@@ -79,6 +79,8 @@ pub(crate) struct CpuRecord {
     boot_state: AtomicU8,
     /// 待处理 IPI work 位集（Core 语义，不是 arch 的硬件寄存器）。
     pending_ipi: AtomicUsize,
+    /// 已消费 pending、等待在安全边界真正重调度的标志（由 `drain_pending` 置位）。
+    resched: AtomicBool,
     /// 已发布的本地存储地址；远端 CPU **不得**解引用，只作发布/查询。
     local: AtomicPtr<CpuLocal>,
 }
@@ -89,8 +91,19 @@ impl CpuRecord {
             hardware_id,
             boot_state: AtomicU8::new(CpuBootState::Offline.as_raw()),
             pending_ipi: AtomicUsize::new(0),
+            resched: AtomicBool::new(false),
             local: AtomicPtr::new(core::ptr::null_mut()),
         }
+    }
+
+    /// 置「需要重调度」标志（[`ipi::drain_pending`] 消费 pending 后调用）。
+    pub(crate) fn set_resched(&self) {
+        self.resched.store(true, Ordering::Release);
+    }
+
+    /// 消费「需要重调度」标志（调度安全的边界调用）。
+    pub(crate) fn take_resched(&self) -> bool {
+        self.resched.swap(false, Ordering::AcqRel)
     }
 
     /// 本记录的硬件身份。
@@ -311,6 +324,11 @@ pub(crate) fn hardware_id(cpu: CpuId) -> Option<HardwareCpuId> {
     RECORDS.get().and_then(|registry| registry.hardware_id(cpu))
 }
 
+/// 消费某逻辑 CPU 的「需要重调度」标志（调度安全边界调用；见 [`CpuRecord::take_resched`]）。
+pub(crate) fn take_resched(cpu: CpuId) -> bool {
+    record(cpu).is_some_and(CpuRecord::take_resched)
+}
+
 /// AP 入口：由 arch 启动 trampoline 进入，每个 AP 一次。
 ///
 /// `argument` = Core 校验过的逻辑 CPU 下标。
@@ -488,52 +506,100 @@ mod tests {
         assert_eq!(mask.count(), 2);
     }
 
+    /// 保证全局记录表已发布（`init` 幂等；测试间执行顺序不保证，故共享同一拓扑）。
+    fn ensure_global_records() {
+        if RECORDS.get().is_none() {
+            let _ = init(&machine(&[(true, 0), (false, 1)]));
+        }
+    }
+
     /// 全局 `init`：发布记录、注册 Core IPI 回调（host Fake 只记录）、BSP Online、
-    /// 其余 Offline。进程级 `Once`，只能有一个用例调用。
+    /// 其余 Offline。进程级 `Once`，测试共享同一份记录（同锁串行）。
     #[test]
     fn global_init_publishes_records_and_marks_bsp_online() {
         let _serial = SMP_TEST_LOCK.lock();
-        let info = machine(&[(true, 0), (false, 1)]);
-
-        assert!(RECORDS.get().is_none(), "init is tested once per process");
-        assert_eq!(init(&info), Ok(()));
+        ensure_global_records();
 
         assert_eq!(cpu_state(CpuId::from_raw(0)), Ok(CpuBootState::Online));
         assert_eq!(cpu_state(CpuId::from_raw(1)), Ok(CpuBootState::Offline));
         assert_eq!(online_cpus().count(), 1);
         assert!(online_cpus().contains(CpuId::from_raw(0)));
-        assert!(hardware_id(CpuId::from_raw(1)) == Some(HardwareCpuId::from_raw(1)));
-
-        // 重复 init 不再重建（Once），真相不变。
-        assert_eq!(init(&info), Ok(()));
-        assert_eq!(online_cpus().count(), 1);
+        assert_eq!(
+            hardware_id(CpuId::from_raw(1)),
+            Some(HardwareCpuId::from_raw(1))
+        );
 
         // Core IPI 回调已注册（host Fake 可观察）。
         assert!(
             arch::fake::registered_ipi_handler_for_test().is_some(),
             "smp::init must register the Core IPI handler for multi-CPU topologies"
         );
-
-        // pending work 位机制（ipi::ipi_interrupt / take_pending）。
-        let ap = CpuId::from_raw(1);
-        assert_eq!(ipi::take_pending(ap), 0);
-        ipi::ipi_interrupt(ap);
-        assert_eq!(ipi::take_pending(ap), ipi::RESCHEDULE_BIT);
-        assert_eq!(ipi::take_pending(ap), 0, "take drains exactly once");
     }
 
     /// pending work 位是每 CPU 独立的：操作一个 CPU 不影响另一个。
     #[test]
     fn pending_ipi_bits_are_per_cpu() {
         let _serial = SMP_TEST_LOCK.lock();
-        // 依赖上面的 global_init 已发布记录（同锁串行，顺序不保证）。
-        if RECORDS.get().is_none() {
-            let _ = init(&machine(&[(true, 0), (false, 1)]));
-        }
+        ensure_global_records();
         let a = CpuId::from_raw(0);
         let b = CpuId::from_raw(1);
+        let _ = ipi::take_pending(a);
+        let _ = ipi::take_pending(b);
         ipi::ipi_interrupt(a);
         assert_eq!(ipi::take_pending(b), 0);
         assert_eq!(ipi::take_pending(a), ipi::RESCHEDULE_BIT);
+    }
+
+    /// `notify` 先发布 pending 位、再响铃；host Fake 记录发出的硬件 id。
+    #[test]
+    fn notify_publishes_pending_then_rings_doorbell() {
+        let _serial = SMP_TEST_LOCK.lock();
+        ensure_global_records();
+        let ap = CpuId::from_raw(1);
+        let _ = ipi::take_pending(ap);
+        let _ = arch::fake::take_sent_ipis_for_test();
+
+        let mut targets = CpuMask::empty();
+        targets.insert(ap).unwrap();
+        assert_eq!(ipi::notify(&targets, IpiRequest::Reschedule), Ok(()));
+
+        assert_eq!(ipi::take_pending(ap), ipi::RESCHEDULE_BIT);
+        assert_eq!(arch::fake::take_sent_ipis_for_test(), alloc::vec![1]);
+    }
+
+    /// `notify` 对没有记录的逻辑 CPU 返回 `InvalidTarget`，且不响铃。
+    #[test]
+    fn notify_rejects_targets_without_records() {
+        let _serial = SMP_TEST_LOCK.lock();
+        ensure_global_records();
+        let _ = arch::fake::take_sent_ipis_for_test();
+
+        let mut targets = CpuMask::empty();
+        targets.insert(CpuId::from_raw(5)).unwrap(); // 容量内、但超过 cpu_count(2)
+        assert_eq!(
+            ipi::notify(&targets, IpiRequest::Reschedule),
+            Err(NotifyError::InvalidTarget)
+        );
+        assert!(arch::fake::take_sent_ipis_for_test().is_empty());
+    }
+
+    /// `drain_pending` 把 pending 的 Reschedule 转成「需要重调度」标志，且只置一次。
+    #[test]
+    fn drain_pending_turns_reschedule_into_flag() {
+        let _serial = SMP_TEST_LOCK.lock();
+        ensure_global_records();
+        let ap = CpuId::from_raw(1);
+        let _ = ipi::take_pending(ap);
+        let _ = take_resched(ap);
+
+        ipi::ipi_interrupt(ap);
+        ipi::drain_pending(ap);
+
+        assert_eq!(ipi::take_pending(ap), 0, "drain consumes the pending bits");
+        assert!(
+            take_resched(ap),
+            "Reschedule became a deferred-reschedule flag"
+        );
+        assert!(!take_resched(ap), "the flag is consumed once");
     }
 }

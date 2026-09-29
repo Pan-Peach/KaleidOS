@@ -69,6 +69,11 @@ pub fn dispatch_ipi() {
     handler(current_logical_cpu());
 }
 
+pub(crate) fn ack_ipi() {
+    unsafe {
+        core::arch::asm!("csrc sip, {}", in(reg) (1usize << 1), options(nostack, preserves_flags));
+    }
+}
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {
