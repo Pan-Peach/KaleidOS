@@ -3,11 +3,16 @@
 //! Two responsibilities, both boundary work (bootstrap owns discovery, Core
 //! owns truth):
 //!
-//! 1. **Stage the boot DTB** so the `fdt` parser can consume it.  QEMU's
-//!    `arm_load_dtb` sizes the blob from a fixed 1 MiB buffer, so the blob's
-//!    `totalsize` overshoots its real content; and on the `-kernel <elf>` path
-//!    QEMU 5.2 classifies the payload as "not Linux" and autoloads the blob at
-//!    **physical address 0**, which the parser rejects as a null pointer.
+//! 1. **Stage the boot DTB** so the `fdt` parser can consume it.  The staged
+//!    blob is a *validated, normalized* copy: the FDT header (magic / version /
+//!    totalsize / block offsets and sizes, including the reservation block) is
+//!    checked with bounded, checked arithmetic, and an inconsistent header is
+//!    rejected (with a log), never "repaired".  QEMU's `arm_load_dtb` sizes the
+//!    blob from a fixed 1 MiB buffer, so the blob's `totalsize` overshoots its
+//!    real content; and on the `-kernel <elf>` path QEMU 5.2 classifies the
+//!    payload as "not Linux" and autoloads the blob at **physical address 0**,
+//!    which the parser rejects as a null pointer.  The normalized copy
+//!    sidesteps both while keeping every read inside validated bounds.
 //! 2. **Normalize** the parsed tree into the owned, fixed-capacity
 //!    [`MachineInfo`]: memory regions, `/cpus` (BSP pinned to logical 0), and
 //!    root//soc device descriptors.
@@ -22,6 +27,33 @@ use kernel::machine::{
 /// FDT magic (`0xd00dfeed`, big-endian on the wire).
 const FDT_MAGIC: u32 = 0xd00d_feed;
 
+/// Fixed FDT header size (v16/v17): magic, totalsize, three block offsets,
+/// version, last_comp_version, boot_cpuid_phys, and two block sizes.
+const FDT_HEADER_SIZE: usize = 40;
+
+/// FDT versions this staging accepts (16 and 17 are the flattened-format
+/// versions in use; anything else is rejected rather than guessed).
+const FDT_VERSION_FIRST: u32 = 16;
+const FDT_VERSION_LAST: u32 = 17;
+
+/// Sanity cap for `totalsize`.  QEMU's `arm_load_dtb` writes the blob from a
+/// fixed 1 MiB buffer, so its `totalsize` overshoots the real content (observed
+/// 0x100000 on QEMU 5.2 `virt`); the normalized copy rewrites it down to the
+/// blocks actually copied.
+const FDT_MAX_TOTAL_SIZE: usize = 1 << 20;
+
+/// Size of one reservation-map entry (`base: u64, size: u64`).
+const FDT_RSV_ENTRY_SIZE: usize = 16;
+
+/// Upper bound for the reservation-block walk: the block ends at a 16-byte zero
+/// pair, and an FDT with this many reservations does not exist.
+const FDT_MAX_RSV_ENTRIES: usize = 1024;
+
+/// Bounded low-RAM probe window for QEMU's `-kernel <elf>` DTB autoload (the
+/// blob is normally at PA 0; this covers a QEMU that moves it into RAM).
+const DTB_PROBE_START: usize = 0x4000_0000;
+const DTB_PROBE_WINDOW: usize = 1 << 20;
+
 /// Capacity of the staging buffer.  QEMU virt's DTB is a few KiB; 64 KiB leaves
 /// generous headroom for a machine with many nodes.
 const DTB_COPY_CAPACITY: usize = 64 * 1024;
@@ -31,41 +63,141 @@ const DTB_COPY_CAPACITY: usize = 64 * 1024;
 struct DtbCopy([u8; DTB_COPY_CAPACITY]);
 static mut DTB_COPY: DtbCopy = DtbCopy([0; DTB_COPY_CAPACITY]);
 
-/// Big-endian `u32` read from a physical address (MMU off).
+/// Read a big-endian `u32` from physical address `pa`.
+///
+/// Boot runs with the MMU off and the identity mapping active, so `pa` is a
+/// physical address.  The read is volatile and byte-wise on purpose: the
+/// address may be firmware-owned (or, on QEMU's `-kernel <elf>` quirk, physical
+/// address 0), so no Rust reference is formed and no alignment is assumed.
+/// Callers must bound `pa` to a range the probed header itself vouches for.
 fn read_be_u32(pa: usize) -> u32 {
-    // SAFETY: caller passes addresses it knows are mapped (x0 / PA 0 / low RAM).
-    unsafe { u32::from_be(core::ptr::read_unaligned(pa as *const u32)) }
+    let mut bytes = [0u8; 4];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: physical identity-mapped read; see the doc comment.
+        *byte = unsafe { core::ptr::read_volatile((pa + offset) as *const u8) };
+    }
+    u32::from_be_bytes(bytes)
 }
 
-/// Copy a big-endian FDT at `pa` into the staging buffer and return its
-/// address; `None` if there is no FDT magic there or it does not fit.
+/// True when the 16-byte reservation entry at `pa` is the terminating zero pair.
+fn reservation_is_terminator(pa: usize) -> bool {
+    read_be_u32(pa) == 0
+        && read_be_u32(pa + 4) == 0
+        && read_be_u32(pa + 8) == 0
+        && read_be_u32(pa + 12) == 0
+}
+
+/// Walk the reservation block starting at `start` within a `total_size`-byte
+/// blob and return the offset just past its terminating zero pair.
+fn reservation_end(pa: usize, start: usize, total_size: usize) -> Result<usize, &'static str> {
+    let mut entry = start;
+    let mut walked = 0;
+    while walked < FDT_MAX_RSV_ENTRIES {
+        let Some(end) = entry.checked_add(FDT_RSV_ENTRY_SIZE) else {
+            return Err("reservation entry overflows");
+        };
+        if end > total_size {
+            return Err("reservation block runs past totalsize");
+        }
+        if reservation_is_terminator(pa + entry) {
+            return Ok(end);
+        }
+        entry = end;
+        walked += 1;
+    }
+    Err("reservation block unterminated")
+}
+
+/// Validate the FDT header at `pa` and return the exact prefix length to copy,
+/// or a static reason it is not self-consistent.
 ///
-/// `totalsize` is rewritten to the actually-used prefix
-/// (`max(off_dt_struct + size_dt_struct, off_dt_strings + size_dt_strings)`,
-/// 8-byte aligned), because QEMU's overshoot would otherwise fail the parser's
-/// `data.len() >= totalsize` check.
+/// Arithmetic is checked throughout: a corrupt header must neither overflow nor
+/// authorize a read outside `totalsize`.  The returned length covers the
+/// reservation block as well (walked to its terminator) so the copied blob
+/// stays self-consistent, and never exceeds `totalsize`.
+fn validated_fdt_len(pa: usize) -> Result<usize, &'static str> {
+    let version = read_be_u32(pa + 20);
+    let last_comp_version = read_be_u32(pa + 24);
+    if !(FDT_VERSION_FIRST..=FDT_VERSION_LAST).contains(&version) {
+        return Err("unsupported version");
+    }
+    if last_comp_version > version {
+        return Err("last_comp_version ahead of version");
+    }
+    let total_size = read_be_u32(pa + 4) as usize;
+    if !(FDT_HEADER_SIZE..=FDT_MAX_TOTAL_SIZE).contains(&total_size) {
+        return Err("implausible totalsize");
+    }
+    let structs_start = read_be_u32(pa + 8) as usize;
+    let strings_start = read_be_u32(pa + 12) as usize;
+    let rsvmap_start = read_be_u32(pa + 16) as usize;
+    let structs_size = read_be_u32(pa + 36) as usize;
+    let strings_size = read_be_u32(pa + 32) as usize;
+    let structs_end = structs_start
+        .checked_add(structs_size)
+        .ok_or("struct block size overflows")?;
+    let strings_end = strings_start
+        .checked_add(strings_size)
+        .ok_or("strings block size overflows")?;
+    if structs_end > total_size || strings_end > total_size {
+        return Err("block extends past totalsize");
+    }
+    let rsvmap_end = reservation_end(pa, rsvmap_start, total_size)?;
+    Ok(structs_end
+        .max(strings_end)
+        .max(rsvmap_end)
+        .next_multiple_of(8)
+        .min(total_size))
+}
+
+/// Copy the validated FDT at physical `pa` into the staging buffer and return
+/// its address; `None` if there is no FDT magic there or the header is not
+/// self-consistent (version / totalsize / block bounds).
+///
+/// The copy is *normalized*: `totalsize` is rewritten to the exact prefix that
+/// was copied (structs + strings + reservation block, 8-byte aligned), because
+/// QEMU's overshoot would otherwise fail the parser's `data.len() >= totalsize`
+/// check.  An inconsistent header is rejected and logged -- never repaired.
 fn stage_dtb(pa: usize) -> Option<usize> {
     if read_be_u32(pa) != FDT_MAGIC {
         return None;
     }
-    let structs_start = read_be_u32(pa + 8) as usize;
-    let strings_start = read_be_u32(pa + 12) as usize;
-    let strings_size = read_be_u32(pa + 32) as usize;
-    let structs_size = read_be_u32(pa + 36) as usize;
-    let used = (structs_start + structs_size)
-        .max(strings_start + strings_size)
-        .max(40)
-        .next_multiple_of(8);
+    let used = match validated_fdt_len(pa) {
+        Ok(used) => used,
+        Err(reason) => {
+            kernel::log!(
+                "discovery",
+                "DTB candidate at {:#x}: rejected ({})",
+                pa,
+                reason
+            );
+            return None;
+        }
+    };
     if used > DTB_COPY_CAPACITY {
+        kernel::log!(
+            "discovery",
+            "DTB at {:#x}: {:#x} bytes exceeds the {} byte staging buffer",
+            pa,
+            used,
+            DTB_COPY_CAPACITY
+        );
         return None;
     }
-    // SAFETY: `used` bytes are readable at `pa` (verified FDT magic + header
-    // fields) and `dst` is a static buffer; boot is single-threaded.
+    // SAFETY: `used` bytes were vouched for by the blob's own header (checked
+    // offsets/sizes within `totalsize`), and boot runs identity-mapped with the
+    // MMU off, so both addresses are physical; boot is single-threaded and the
+    // static outlives the parse.  Byte-wise volatile reads avoid assuming
+    // alignment or forming a reference to firmware memory.
     let dst = unsafe { core::ptr::addr_of_mut!(DTB_COPY.0) as *mut u8 };
-    unsafe {
-        core::ptr::copy_nonoverlapping(pa as *const u8, dst, used);
-        core::ptr::write_unaligned(dst.add(4) as *mut u32, (used as u32).to_be());
+    let mut index = 0;
+    while index < used {
+        let byte = unsafe { core::ptr::read_volatile((pa + index) as *const u8) };
+        unsafe { core::ptr::write_volatile(dst.add(index), byte) };
+        index += 1;
     }
+    // Rewrite `totalsize` so the copied prefix is self-consistent.
+    unsafe { core::ptr::write_unaligned(dst.add(4) as *mut u32, (used as u32).to_be()) };
     Some(dst as usize)
 }
 
@@ -74,9 +206,10 @@ fn stage_dtb(pa: usize) -> Option<usize> {
 /// The arm64 boot protocol passes the DTB in x0, and QEMU does that for raw
 /// Linux Images.  For an **ELF** kernel QEMU 5.2 jumps to the ELF entry without
 /// touching the argument registers; its DTB autoload still runs with
-/// `dtb_start == 0`, i.e. the blob lands at physical address 0.  Probe x0
-/// first, then PA 0, then a bounded low-RAM window so a QEMU that moves the
-/// blob is still covered.
+/// `dtb_start == 0`, so the blob lands at physical address 0 (observed).
+/// Probe x0 first, then PA 0, then a bounded low-RAM window so a QEMU that
+/// moves the blob is still covered.  Every candidate must present a fully
+/// self-consistent header; nothing is read past the bounds it vouches for.
 pub fn stage_boot_dtb(x0: usize) -> Option<usize> {
     if x0 != 0 {
         if let Some(staged) = stage_dtb(x0) {
@@ -86,13 +219,12 @@ pub fn stage_boot_dtb(x0: usize) -> Option<usize> {
     if let Some(staged) = stage_dtb(0) {
         return Some(staged);
     }
-    let start = 0x4000_0000usize;
-    let mut pa = start;
-    while pa < start + (1 << 20) {
-        if let Some(staged) = stage_dtb(pa) {
+    let mut offset = 0;
+    while offset < DTB_PROBE_WINDOW {
+        if let Some(staged) = stage_dtb(DTB_PROBE_START + offset) {
             return Some(staged);
         }
-        pa += 8;
+        offset += 8;
     }
     None
 }

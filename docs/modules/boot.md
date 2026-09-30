@@ -8,6 +8,9 @@
 - CPU 入口汇编与低地址 trampoline（`entry64.S` / `entry32.S` / `entry32-nommu.S`）：BSS 清零、临时 early root、`satp` 激活、栈设置。
 - **启动期临时页表**（分配器存在之前）：`vm/bootstrap.rs` 的静态池（`BOOT_ROOT` / `KERNEL_L1` / `KERNEL_L0S`），只活到 `kernel::init()` 完成之前。
 - **FDT discovery → `MachineInfo` 归一化**（内存 / CPU / 设备），以及 timer / PLIC 的机器侧接线。
+- **启动期外部输入校验**：bootloader / firmware 提供的数据一律当**不可信输入**——先校验，失败即拒绝 + log，绝不盲信指针 / 计数。
+  - **x86_64**：MB2 校验 `total_size` 上限（64 KiB）、每个 tag 必须完整落在信息块内、mmap tag 先证明 16 字节条目头存在再计算条目数（`8 <= tag_size < 16` 时直接 `tag_size - 16` 会下溢），条目读取全程 checked arithmetic；PVH 校验 `version >= 1`、`memmap_paddr != 0`、`memmap_entries <= 4096`、`memmap_paddr + entries*24` 不溢出且 < 4 GiB。校验失败返回空表，由调用方以 "no usable RAM region" fail-closed。
+  - **aarch64**：复制前校验 FDT header 的 magic / version(16·17) / `totalsize` 上限 / struct、strings 与 rsvmap 边界（rsvmap 走到 16 字节零对终结符；全部 checked arithmetic），`used` 覆盖 rsvmap 且 ≤ `DTB_COPY_CAPACITY`；header 不自洽即拒绝（`None` + log），**绝不"修复"坏 blob**，只重建 `totalsize` = 实际复制前缀的归一化副本。**QEMU `-kernel <elf>` 的 PA-0 DTB quirk** 用有界、经校验的探测处理：x0 → PA 0 → 1 MiB 低 RAM 窗口，每步只接受 header 完全自洽的候选；MMU 关闭 + identity mapping 下按物理地址做 raw volatile 读，不构造引用、不假设对齐。
 - **链接符号的唯一解释者**：`vm/layout.rs`（`KernelLayout`、`kernel_layout()`），固定 `KERNEL_VMA = 0xffff_ffc0_8020_0000` 与 `HIGH_HALF_OFFSET`。
 - **high-half 交接**（`bootstrap::enter_high_half`）与存活其上的 `BootContext`。
 - **长期内核地址空间**的构建 / 校验 / 激活：`vm/runtime.rs`（`RuntimeVm`、`build` / `verify` / `activate` / `init`）。

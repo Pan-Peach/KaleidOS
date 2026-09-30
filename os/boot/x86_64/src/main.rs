@@ -61,6 +61,17 @@ const HVM_START_MAGIC: u32 = 0x336e_c578;
 const MEMORY_AVAILABLE: u32 = 1;
 /// Boot-side staging capacity, matching `MachineInfo.memory_regions`.
 const MAX_REGIONS: usize = 16;
+/// Sanity cap for the Multiboot2 info block (a real block is a few KiB): a
+/// bogus `total_size` must not drive an unbounded tag scan.
+const MB2_MAX_TOTAL_SIZE: usize = 64 * 1024;
+/// Size of one `hvm_memmap_table_entry` (`base: u64, length: u64, type: u32,
+/// reserved: u32`), the PVH memory-map entry.
+const PVH_MEMMAP_ENTRY_SIZE: usize = 24;
+/// Sanity cap for a PVH memory map: more entries than this is firmware garbage.
+const PVH_MAX_MEMMAP_ENTRIES: usize = 4096;
+/// Plausibility bound for boot-info physical addresses.  The x86 boot protocol
+/// hands over low-RAM pointers, so anything at/above 4 GiB is bogus.
+const BOOT_INFO_MAX_PA: usize = 0x1_0000_0000;
 
 /// Raw (identity-mapped) boot-info reads.
 fn read_u32(address: usize) -> u32 {
@@ -118,9 +129,29 @@ impl RegionTable {
 /// meminfo (`mem_lower: u32, mem_upper: u32` in KiB) and is only a fallback.
 fn multiboot2_regions(info_pa: usize) -> RegionTable {
     let mut table = RegionTable::new();
+    // The info pointer comes from the boot protocol: validate it before any read.
+    if info_pa == 0 || !info_pa.is_multiple_of(8) || info_pa >= BOOT_INFO_MAX_PA {
+        kernel::log!(
+            "discovery",
+            "MB2: implausible info pointer {:#x}; no RAM regions",
+            info_pa
+        );
+        return table;
+    }
     let total_size = read_u32(info_pa) as usize;
-    let end = info_pa.saturating_add(total_size);
-    let mut cursor = info_pa.saturating_add(8);
+    if !(8..=MB2_MAX_TOTAL_SIZE).contains(&total_size) {
+        kernel::log!(
+            "discovery",
+            "MB2: implausible total_size {:#x}; no RAM regions",
+            total_size
+        );
+        return table;
+    }
+    let Some(end) = info_pa.checked_add(total_size) else {
+        kernel::log!("discovery", "MB2: info block address wraps; no RAM regions");
+        return table;
+    };
+    let mut cursor = info_pa + 8;
     let mut basic_mem_upper_kib = 0u32;
 
     while cursor + 8 <= end {
@@ -129,25 +160,51 @@ fn multiboot2_regions(info_pa: usize) -> RegionTable {
         if tag_type == 0 || tag_size < 8 {
             break;
         }
-        if tag_type == 6 {
-            if let Some(count) = (tag_size - 16).checked_div(read_u32(cursor + 8) as usize) {
-                let entry_size = read_u32(cursor + 8) as usize;
-                if entry_size >= 24 {
-                    for index in 0..count.min(MAX_REGIONS * 4) {
-                        let entry = cursor + 16 + index * entry_size;
-                        if entry + 24 > end {
-                            break;
-                        }
-                        if read_u32(entry + 16) == MEMORY_AVAILABLE {
-                            table.push(read_u64(entry), read_u64(entry + 8));
-                        }
+        // The tag must fit inside the info block before anything inside it is
+        // used; a truncated final tag is not trusted.
+        let tag_end = match cursor.checked_add(tag_size) {
+            Some(tail) if tail <= end => tail,
+            _ => {
+                kernel::log!(
+                    "discovery",
+                    "MB2: tag {:#x} (size {:#x}) overruns the info block; stop",
+                    tag_type,
+                    tag_size
+                );
+                break;
+            }
+        };
+        if tag_type == 6 && tag_size >= 16 {
+            // Memory map: the count is derived only after the 16-byte
+            // entry_size/entry_version header is known to fit.
+            let entry_size = read_u32(cursor + 8) as usize;
+            if entry_size >= PVH_MEMMAP_ENTRY_SIZE {
+                let count = (tag_size - 16) / entry_size;
+                let mut index = 0;
+                while index < count {
+                    let entry = cursor
+                        .checked_add(16)
+                        .and_then(|base| base.checked_add(index * entry_size));
+                    let Some(entry) = entry else { break };
+                    let Some(entry_end) = entry.checked_add(PVH_MEMMAP_ENTRY_SIZE) else {
+                        break;
+                    };
+                    if entry_end > tag_end {
+                        break;
                     }
+                    if read_u32(entry + 16) == MEMORY_AVAILABLE {
+                        table.push(read_u64(entry), read_u64(entry + 8));
+                    }
+                    index += 1;
                 }
             }
-        } else if tag_type == 4 {
+        } else if tag_type == 4 && tag_size >= 16 {
             basic_mem_upper_kib = read_u32(cursor + 12);
         }
-        cursor += (tag_size + 7) & !7;
+        cursor = match tag_end.checked_add(7) {
+            Some(next) => next & !7,
+            None => break,
+        };
     }
 
     // Fallback: no mmap tag (or no usable entry) -> basic meminfo 1 MiB..
@@ -166,14 +223,49 @@ fn multiboot2_regions(info_pa: usize) -> RegionTable {
 fn pvh_regions(info_pa: usize) -> RegionTable {
     let mut table = RegionTable::new();
     let version = read_u32(info_pa + 4);
-    if version >= 1 {
-        let memmap_pa = read_u64(info_pa + 40) as usize;
-        let entries = read_u32(info_pa + 48) as usize;
-        for index in 0..entries.min(MAX_REGIONS * 4) {
-            let entry = memmap_pa + index * 24;
-            if read_u32(entry + 16) == MEMORY_AVAILABLE {
-                table.push(read_u64(entry), read_u64(entry + 8));
-            }
+    if version < 1 {
+        kernel::log!(
+            "discovery",
+            "PVH: unsupported start_info version {}; no RAM regions",
+            version
+        );
+        return table;
+    }
+    // The map pointer and count come from firmware: validate both before any
+    // entry read, and keep the whole map below the 4 GiB plausibility bound.
+    let memmap_pa = read_u64(info_pa + 40) as usize;
+    let entries = read_u32(info_pa + 48) as usize;
+    if memmap_pa == 0 || entries == 0 || entries > PVH_MAX_MEMMAP_ENTRIES {
+        kernel::log!(
+            "discovery",
+            "PVH: implausible memmap (addr {:#x}, {} entries); no RAM regions",
+            memmap_pa,
+            entries
+        );
+        return table;
+    }
+    let Some(memmap_end) = entries
+        .checked_mul(PVH_MEMMAP_ENTRY_SIZE)
+        .and_then(|size| memmap_pa.checked_add(size))
+        .filter(|end| *end <= BOOT_INFO_MAX_PA)
+    else {
+        kernel::log!(
+            "discovery",
+            "PVH: memmap (addr {:#x}, {} entries) out of range; no RAM regions",
+            memmap_pa,
+            entries
+        );
+        return table;
+    };
+    for index in 0..entries {
+        // `index * 24` cannot overflow: `entries <= 4096` and `memmap_end`
+        // above already proved `memmap_pa + entries * 24` fits.
+        let entry = memmap_pa + index * PVH_MEMMAP_ENTRY_SIZE;
+        if entry + PVH_MEMMAP_ENTRY_SIZE > memmap_end {
+            break;
+        }
+        if read_u32(entry + 16) == MEMORY_AVAILABLE {
+            table.push(read_u64(entry), read_u64(entry + 8));
         }
     }
     table
@@ -182,6 +274,14 @@ fn pvh_regions(info_pa: usize) -> RegionTable {
 /// Boot protocol dispatch: EAX magic first (Multiboot2), then the info magic
 /// (`hvm_start_info` for the PVH fallback).
 fn discover_regions(magic: usize, info_pa: usize) -> RegionTable {
+    // The info pointer is firmware-provided: refuse an implausible one instead
+    // of dereferencing it (the protocol pointers are low RAM on x86).
+    if info_pa == 0 || info_pa >= BOOT_INFO_MAX_PA {
+        panic!(
+            "boot discovery: implausible boot info pointer {:#x}",
+            info_pa
+        );
+    }
     if magic == MB2_BOOT_MAGIC {
         kernel::log!(
             "discovery",
