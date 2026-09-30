@@ -1,6 +1,14 @@
 //! FDT 设备发现（RISC-V 共用，RV64/RV32 同一份）：设备描述 + 完整中断资源 +
 //! PLIC 逻辑线绑定。
 //!
+//! - **全部空间窗口**：节点的**所有** supported `reg` 条目按固件顺序收进
+//!   `spaces`（`spaces[0]` 是主窗口）；地址/长度按目标 `usize` 检查转换，
+//!   不可表示的条目诊断后跳过（绝不截断成假地址）。
+//! - **地址翻译**：只接受 identity 链——设备直接挂 root，或每一层 bus 祖先都
+//!   声明空 `ranges`（devicetree spec：空 = 父子地址空间相同）。缺 `ranges`
+//!   （子空间未映射到父空间）或非空 `ranges`（需要翻译）都**不**把子地址当 CPU
+//!   地址：诊断并丢弃该设备。
+//! - **全部 compatible**：不截断数量与长度。
 //! - **完整中断资源**：`interrupts-extended` 每条 tuple 用其引用控制器的
 //!   `#interrupt-cells` 切分（自带 phandle）；`interrupts` 用继承解析出的
 //!   interrupt parent 的 `#interrupt-cells` 切分。保留完整 cells（GIC 的
@@ -18,11 +26,10 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use fdt::nodes::{AsNode, Node};
+use fdt::properties::reg::Reg;
 use fdt::properties::values::StringList;
 use fdt::properties::PHandle;
-use kernel::machine::{
-    CompatStr, DeviceDescriptor, InterruptResource, InterruptSpecifier, IoSpace,
-};
+use kernel::machine::{DeviceDescriptor, InterruptResource, InterruptSpecifier, IoSpace};
 
 /// boot 的 FDT parser flavour（与 main64 / main32 共用同一类型）。
 pub type FdtParser<'a> = (
@@ -45,9 +52,19 @@ const MAX_PARENT_STEPS: usize = 16;
 
 /// 设备是否声明了某个 PLIC compatible（单源：绑定与 `configure` 共用）。
 pub fn is_plic_device(device: &DeviceDescriptor) -> bool {
-    device.compatibles[..device.compat_count as usize]
+    device
+        .compatibles
         .iter()
-        .any(|c| PLIC_COMPATIBLES.contains(&c.as_str()))
+        .any(|c| PLIC_COMPATIBLES.contains(&c.as_ref()))
+}
+
+/// 设备**主窗口**（`spaces[0]`，`kcore_device_claim` 返回的那一个）的 MMIO
+/// 基址/长度；主窗口不是 MMIO / 设备没有窗口 → `None`。
+pub fn primary_mmio(device: &DeviceDescriptor) -> Option<(usize, usize)> {
+    match device.spaces.first() {
+        Some(&IoSpace::Mmio { base, size }) => Some((base, size)),
+        _ => None,
+    }
 }
 
 /// 收集全部设备（root + /soc），并给属于已配置 PLIC 的中断资源绑定逻辑线。
@@ -149,48 +166,98 @@ fn collect<'a>(
 
 /// 提取一个 FDT 节点的设备描述。
 ///
-/// 过滤规则：必须有 reg 且 compatible 非空（memory 无 compatible、cpus/chosen/pmu
-/// 无 reg，天然跳过）。4d 只保留**单个** MMIO 窗口（多窗口是 4e）。
+/// 过滤规则：必须有 compatible 且至少一个可表示的 `reg` 窗口（memory 无
+/// compatible、cpus/chosen/pmu 无 reg，天然跳过）。`spaces` 收集**全部**
+/// supported `reg` 条目（固件顺序，`spaces[0]` 是主窗口）；`compatibles`
+/// 收集**全部**串（数量与长度都不截断）。
 fn device_descriptor<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     child: &Node<'a, FdtParser<'a>>,
 ) -> Result<Option<DeviceDescriptor>, &'static str> {
-    let mut descriptor = None;
-    if let Some(r) = child.reg() {
-        for entry in r.iter::<u64, u64>() {
-            if let Ok(reg) = entry {
-                descriptor = Some(DeviceDescriptor {
-                    space: IoSpace::Mmio {
-                        base: reg.address as usize,
-                        size: reg.len as usize,
-                    },
-                    interrupts: Box::new([]),
-                    compatibles: [CompatStr::empty(); 4],
-                    compat_count: 0,
-                });
-                break;
-            }
-        }
-    }
-    let Some(mut descriptor) = descriptor else {
-        return Ok(None);
-    };
+    let mut compatibles: Vec<Box<str>> = Vec::new();
     if let Some(compatible) = child.properties().find("compatible") {
         if let Ok(list) = compatible.as_value::<StringList>() {
             for value in list {
-                let index = descriptor.compat_count as usize;
-                if index < descriptor.compatibles.len() {
-                    descriptor.compatibles[index] = CompatStr::from_bytes(value.as_bytes());
-                    descriptor.compat_count += 1;
-                }
+                compatibles.push(Box::from(value));
             }
         }
     }
-    if descriptor.compat_count == 0 {
+    if compatibles.is_empty() {
         return Ok(None);
     }
-    descriptor.interrupts = interrupts_of(tree, child)?;
-    Ok(Some(descriptor))
+
+    let Some(reg) = child.reg() else {
+        return Ok(None);
+    };
+    if !identity_addressable(child) {
+        // 不能把需要翻译的子地址当 CPU 地址——诊断并丢弃这台设备。
+        kernel::log!(
+            "discovery",
+            "device requires address translation; omitted (no MMIO address invented)"
+        );
+        return Ok(None);
+    }
+    let spaces = collect_spaces(reg);
+    if spaces.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(DeviceDescriptor {
+        spaces: spaces.into_boxed_slice(),
+        interrupts: interrupts_of(tree, child)?,
+        compatibles: compatibles.into_boxed_slice(),
+    }))
+}
+
+/// 收集 `reg` 的**全部** supported 条目（固件顺序）：u64 → `usize` 检查转换，
+/// `base + size` 溢出检查；不可表示的条目诊断后跳过——绝不截断成假地址。
+fn collect_spaces(reg: Reg<'_>) -> Vec<IoSpace> {
+    let mut spaces = Vec::new();
+    for entry in reg.iter::<u64, u64>() {
+        let Ok(entry) = entry else {
+            kernel::log!("discovery", "malformed reg entry; skipped");
+            continue;
+        };
+        let (Ok(base), Ok(size)) = (usize::try_from(entry.address), usize::try_from(entry.len))
+        else {
+            kernel::log!(
+                "discovery",
+                "reg window {:#x}+{:#x} does not fit usize; skipped",
+                entry.address,
+                entry.len
+            );
+            continue;
+        };
+        if base.checked_add(size).is_none() {
+            kernel::log!(
+                "discovery",
+                "reg window {base:#x}+{size:#x} overflows; skipped"
+            );
+            continue;
+        }
+        spaces.push(IoSpace::Mmio { base, size });
+    }
+    spaces
+}
+
+/// 设备是否位于 identity 可直达的地址链上：
+/// - 直接挂在 root 下 → 固件的 CPU 地址空间，identity；
+/// - 否则每一层祖先 bus 必须声明**空** `ranges`（devicetree spec：空 ranges =
+///   父子地址空间相同）。缺 `ranges` = 子空间没有映射进父空间；非空 `ranges` =
+///   需要地址翻译——本阶段都不支持。
+fn identity_addressable<'a>(node: &Node<'a, FdtParser<'a>>) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.parent().is_none() {
+            return true; // 直接挂在 root 下：子地址就是 CPU 地址
+        }
+        match parent.properties().find("ranges") {
+            Some(property) if property.value.is_empty() => {}
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
 }
 
 /// 解析一个节点的完整中断资源列表（`interrupts-extended` 优先于 `interrupts`，

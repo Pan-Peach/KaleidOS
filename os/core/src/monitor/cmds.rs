@@ -44,25 +44,33 @@ pub fn machine(_line: &[u8]) {
     }
     printk!("devices: {}\n", info.devices.len());
     for d in info.devices.iter() {
-        let (space, base, size) = match d.space {
-            IoSpace::Mmio { base, size } => ("mmio", base, size),
-            IoSpace::Pio { base, size } => ("pio", base, size),
-        };
+        // 全部空间窗口按固件顺序打印（第一个是主窗口，claim 只返回它）。
+        printk!("  spaces=[");
+        for (index, space) in d.spaces.iter().enumerate() {
+            if index > 0 {
+                printk!(", ");
+            }
+            match space {
+                IoSpace::Mmio { base, size } => printk!("mmio {base:#x}+{size:#x}"),
+                IoSpace::Pio { base, size } => printk!("pio {base:#x}+{size:#x}"),
+            }
+        }
         // 中断资源逐条打印 Core 可投递的逻辑行号（`None` = 保留了固件资源但
         // 本阶段后端无法投递）。
-        printk!("  {space} {base:#x}+{size:#x} irq-lines=[");
+        printk!("] irq-lines=[");
         for (index, resource) in d.interrupts.iter().enumerate() {
             if index > 0 {
                 printk!(", ");
             }
             printk!("{:?}", resource.line);
         }
+        // 全部 compatible（数量与长度都不截断）。
         printk!("] compatible=[");
-        for j in 0..d.compat_count as usize {
-            if j > 0 {
+        for (index, compatible) in d.compatibles.iter().enumerate() {
+            if index > 0 {
                 printk!(", ");
             }
-            printk!("{:?}", d.compatibles[j].as_str());
+            printk!("{:?}", compatible);
         }
         printk!("]\n");
     }

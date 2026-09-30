@@ -980,7 +980,11 @@ extern "C" fn kcore_device_nth(
     })
 }
 
-/// 认领**一台确切设备**：Core 记 owner 并返回本执行域下的可访问 MMIO 窗口。
+/// 认领**一台确切设备**：Core 记 owner 并返回本执行域下的**主窗口** MMIO。
+///
+/// **认领是整台设备的所有权**：返回的窗口是 `DeviceDescriptor.spaces[0]`
+/// （`spaces` 按固件顺序，第一个是主窗口）。其余窗口由 boot/Core 保留与映射，
+/// 本阶段没有组件侧索引窗口的 API。
 ///
 /// **访问强制不在 Core 数据路径上**：KernelNative 与 Core 同特权，`*out_mmio`
 /// 直接是寄存器基址——driver 之后自己 volatile 读写，steady state 不再进 Core。
@@ -990,7 +994,8 @@ extern "C" fn kcore_device_nth(
 /// 成功 = 0，`*out_mmio`（指针宽）与 `*out_len` 写入（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller 或 caller 已
 /// `Failed` / `ENOTSUP` caller 不在 KernelNative 域（Isolated 无 MMIO 窗口）
-/// 或设备是 PIO / `ENODEV` 设备不存在 / `EBUSY` 设备已被认领或已 quarantine）。
+/// 或设备主窗口不是 MMIO（PIO / 无窗口）/ `ENODEV` 设备不存在 / `EBUSY`
+/// 设备已被认领或已 quarantine）。
 extern "C" fn kcore_device_claim(
     device_id: u32,
     out_mmio: *mut *mut u8,
@@ -1639,6 +1644,88 @@ mod tests {
                 kcore_device_claim(9999, &mut ptr, &mut len),
                 Errno::ENODEV.code(),
                 "KernelNative 不受域门禁限制，失败来自设备解析"
+            );
+        });
+    }
+
+    /// `kcore_device_claim` 的窗口契约（host 直调导出）：认领是整台设备的
+    /// ownership，返回**主窗口** `DeviceDescriptor.spaces[0]`；PIO 主窗口 / 无窗口
+    /// → `-ENOTSUP`（后续窗口即使存在也不改变结论）。
+    #[test]
+    fn kcore_device_claim_returns_primary_window_and_rejects_non_mmio_primary() {
+        use crate::component::{containment, registry};
+        use crate::machine::{CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MemoryRegion};
+
+        let _boundary = containment::test_boundary_lock();
+        let _machine = crate::machine::test_support::GUARD.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        registry::init();
+        crate::resource::init();
+
+        // [0] 多窗口 MMIO：[1] PIO 主窗口 + 第二 MMIO 窗口。
+        let mut devices = alloc::vec![DeviceDescriptor::empty(); 2];
+        devices[0].spaces = alloc::vec![
+            IoSpace::Mmio {
+                base: 0x1000_8000,
+                size: 0x1000,
+            },
+            IoSpace::Mmio {
+                base: 0x2000_0000,
+                size: 0x2000,
+            },
+        ]
+        .into_boxed_slice();
+        devices[1].spaces = alloc::vec![
+            IoSpace::Pio {
+                base: 0x3f8,
+                size: 8
+            },
+            IoSpace::Mmio {
+                base: 0x3000_0000,
+                size: 0x1000,
+            },
+        ]
+        .into_boxed_slice();
+        let info = crate::machine::test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            alloc::vec![CpuInfo {
+                boot_cpu: true,
+                hardware_id: HardwareCpuId::from_raw(0),
+            }],
+            alloc::vec![MemoryRegion {
+                base: 0x8000_0000,
+                size: 0x1000_0000,
+            }],
+            devices,
+        );
+        crate::machine::test_support::install(info);
+        crate::resource::test_support::reinstall();
+
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(
+                    b"export-test",
+                    crate::component::registry::test_support::test_loaded(0, None),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+
+        containment::with_test_init_boundary(Some(id), || {
+            let (mut ptr, mut len) = (core::ptr::null_mut(), 0usize);
+            assert_eq!(kcore_device_claim(0, &mut ptr, &mut len), 0);
+            assert_eq!(ptr as usize, 0x1000_8000, "claim 返回主窗口 spaces[0]");
+            assert_eq!(len, 0x1000);
+            assert_eq!(
+                kcore_device_claim(1, &mut ptr, &mut len),
+                Errno::ENOTSUP.code(),
+                "PIO 主窗口（后面还有 MMIO）必须拒绝"
             );
         });
     }

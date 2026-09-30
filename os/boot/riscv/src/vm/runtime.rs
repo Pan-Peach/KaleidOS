@@ -27,7 +27,7 @@
 //!               → PA = kernel_pa + (va - KERNEL_VMA)
 //! info RAM     → identity 映射（VA == PA，RWX：组件池在 buddy identity 页执行）
 //! info firmware→ 保留的 FDT 落在 identity RAM 之外时的显式只读 identity 映射
-//! info 设备    → MMIO 区间（VA == PA，RW-NX，页对齐向外取整）
+//! info 设备    → **全部** MMIO 窗口（VA == PA，RW-NX，页对齐向外取整）
 //! ```
 //!
 //! identity RAM 目前带 `EXECUTE`：loader 在组件池（buddy identity 页）里跑代码；
@@ -107,9 +107,10 @@ fn section_perm(flags: PteFlags) -> MappingPermission {
 /// 外部中断，因此它的 MMIO 窗口属于共享 Core 映射；其余设备窗口只留内核 root
 /// （Isolated 组件不因共享而获得设备访问权）。
 fn is_interrupt_controller(device: &kernel::machine::DeviceDescriptor) -> bool {
-    device.compatibles[..device.compat_count as usize]
+    device
+        .compatibles
         .iter()
-        .any(|compatible| matches!(compatible.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"))
+        .any(|compatible| matches!(&**compatible, "riscv,plic0" | "sifive,plic-1.0.0"))
 }
 
 /// 段的高半区 VMA → 段在物理镜像内的 PA。
@@ -300,11 +301,22 @@ impl RuntimeVm {
         }
 
         // 3) 设备 MMIO：VA == PA，RW-NX（设备寄存器永不执行）。
-        //    FDT 的 reg 区间未必页对齐，映射覆盖它的整页窗口（MMU 只能按页，
-        //    向外取整可接受；与 RAM 的内向取整不同——MMIO 页不会混着 RAM）。
+        //    **每个** MMIO 窗口都映射（不止主窗口）；FDT 的 reg 区间未必页对齐，
+        //    映射覆盖它的整页窗口（MMU 只能按页，向外取整可接受；与 RAM 的内向
+        //    取整不同——MMIO 页不会混着 RAM）。
         let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
         for d in info.devices.iter() {
-            if let IoSpace::Mmio { base, size } = d.space {
+            // 中断控制器窗口共享（trap 路径在每个 AS 都要 claim / complete）；
+            // 其余设备窗口只留内核 root。
+            let class = if is_interrupt_controller(d) {
+                MappingClass::SharedCore
+            } else {
+                MappingClass::CoreRootOnly
+            };
+            for window in d.spaces.iter() {
+                let IoSpace::Mmio { base, size } = *window else {
+                    continue;
+                };
                 if size == 0 {
                     continue;
                 }
@@ -325,13 +337,6 @@ impl RuntimeVm {
                 space
                     .map(range, pa, mmio_perm)
                     .map_err(|_| RuntimeVmError::MapFailed)?;
-                // 中断控制器窗口共享（trap 路径在每个 AS 都要 claim / complete）；
-                // 其余设备窗口只留内核 root。
-                let class = if is_interrupt_controller(d) {
-                    MappingClass::SharedCore
-                } else {
-                    MappingClass::CoreRootOnly
-                };
                 record!(
                     class,
                     Mapping {

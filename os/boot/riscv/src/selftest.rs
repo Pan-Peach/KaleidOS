@@ -1,7 +1,7 @@
 use arch::{CpuArch, InterruptController, ResetType, SystemReset, Timer};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::global_asm, mem::MaybeUninit};
-use kernel::machine::{CpuId, IoSpace, MachineInfo};
+use kernel::machine::{CpuId, MachineInfo};
 
 const STACK_BYTES: usize = 4096;
 const UNMAPPED_ADDRESS: usize = 0x4000_0000;
@@ -406,29 +406,20 @@ extern "C" fn task_normal_entry(_arg: *mut ()) -> ! {
     }
 }
 
-/// 按 compatible（任一命中）找已发现设备的 MMIO 窗口。
+/// 按 compatible（任一命中）找已发现设备的**主窗口** MMIO（`spaces[0]`）。
 fn find_mmio(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<(usize, usize)> {
     info.devices.iter().find_map(|device| {
-        let hit = device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| compatibles.contains(&c.as_str().as_bytes()));
-        if !hit {
+        if !compatibles.iter().any(|c| device.matches(c)) {
             return None;
         }
-        match device.space {
-            IoSpace::Mmio { base, size } => Some((base, size)),
-            IoSpace::Pio { .. } => None,
-        }
+        crate::discovery::primary_mmio(device)
     })
 }
 
 /// 按 compatible（任一命中）找设备的第一条**已绑定**逻辑中断线。
 fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
     info.devices.iter().find_map(|device| {
-        let hit = device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| compatibles.contains(&c.as_str().as_bytes()));
-        if !hit {
+        if !compatibles.iter().any(|c| device.matches(c)) {
             return None;
         }
         device.interrupts.iter().find_map(|resource| resource.line)

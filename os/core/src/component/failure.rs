@@ -64,7 +64,7 @@ mod tests {
     use crate::component::abi::{InterfaceAbi, InterfaceKind};
     use crate::component::endpoint::{ContractId, EndpointError, EndpointState, ExecutionDomain};
     use crate::component::registry;
-    use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
+    use crate::machine::{DeviceDescriptor, IoSpace};
     use crate::resource::{RequestContext, device, dma, irq};
 
     extern "C" fn demo_irq(_ctx: *mut ()) {}
@@ -79,28 +79,23 @@ mod tests {
             .unwrap()
     }
 
-    fn commit_device(device_index: usize, compatible: &[u8]) {
+    fn commit_device(device_index: usize, compatible: &str) {
         use crate::machine::{
             CpuInfo, HardwareCpuId, InterruptResource, InterruptSpecifier, MemoryRegion,
         };
         let mut devices = alloc::vec![DeviceDescriptor::empty(); device_index + 1];
         devices[device_index] = DeviceDescriptor {
-            space: IoSpace::Mmio {
+            spaces: alloc::vec![IoSpace::Mmio {
                 base: 0x1000_0000 + device_index * 0x1000,
                 size: 0x1000,
-            },
+            }]
+            .into_boxed_slice(),
             interrupts: alloc::vec![InterruptResource {
                 specifier: InterruptSpecifier::Isa { line: 8 },
                 line: Some(8),
             }]
             .into_boxed_slice(),
-            compatibles: [
-                CompatStr::from_bytes(compatible),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
+            compatibles: alloc::vec![alloc::boxed::Box::<str>::from(compatible)].into_boxed_slice(),
         };
         let info = crate::machine::test_support::snapshot(
             HardwareCpuId::from_raw(0),
@@ -129,7 +124,7 @@ mod tests {
         registry::init();
         endpoint::init();
         crate::resource::init();
-        commit_device(24, b"fail,mmio");
+        commit_device(24, "fail,mmio");
 
         let id = {
             let mut reg = registry::get_registry().lock();

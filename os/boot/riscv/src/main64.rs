@@ -3,10 +3,8 @@ use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-#[cfg(feature = "machine")]
-use kernel::machine::CompatStr;
 use kernel::machine::{
-    CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
+    CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, MachineInfo, MemoryRegion, MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -60,16 +58,16 @@ fn linker_addr(symbol: *const u8) -> usize {
 #[cfg(feature = "machine")]
 fn configure_machine_timer(info: &MachineInfo) {
     for device in info.devices.iter() {
-        let kind = device.compatibles[..device.compat_count as usize]
+        let kind = device
+            .compatibles
             .iter()
-            .map(CompatStr::as_str)
-            .find_map(|compatible| match compatible {
+            .find_map(|compatible| match &**compatible {
                 "riscv,clint0" => Some(0x4000),
                 "riscv,aclint-mtimer" => Some(0),
                 _ => None,
             });
         let Some(offset) = kind else { continue };
-        let IoSpace::Mmio { base, .. } = device.space else {
+        let Some((base, _)) = crate::discovery::primary_mmio(device) else {
             continue;
         };
         arch::riscv::firmware::configure_machine_timer(base + offset);
@@ -86,7 +84,7 @@ fn configure_interrupt_controller(info: &MachineInfo) {
         if !crate::discovery::is_plic_device(device) {
             continue;
         }
-        let IoSpace::Mmio { base, .. } = device.space else {
+        let Some((base, _)) = crate::discovery::primary_mmio(device) else {
             continue;
         };
         // 板级 PLIC context 计算留在 boot（QEMU virt：S-mode = hart*2+1，
@@ -315,7 +313,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 /// 完整 discovery（high-half、`early_init` 之后）：FDT → owned `MachineInfo`。
 ///
 /// 用 `Vec` 收集（**不**截断到旧定长容量），交接处 `.into_boxed_slice()`；
-/// 字符串用 `CompatStr` 内嵌复制。**FDT 源不再可丢**：`FirmwareInfo::Fdt`
+/// compatible 字符串 owned（`Box<str>`，无 32B / 4 槽截断）。**FDT 源不再可丢**：
+/// `FirmwareInfo::Fdt`
 /// 永久保留该物理区间（arena 选择已把它排除），供未来驱动读原始视图。
 /// CPU 承认规则：BSP 归一到逻辑
 /// CPU0；firmware 描述的 CPU 超过 `MAX_CPUS` 时 BSP 优先、其余按发现顺序取前

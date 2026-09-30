@@ -7,7 +7,7 @@
 //! linker32.ld 段 + layout  →  镜像段（VA==PA，段权限）
 //! info RAM                 →  identity RAM（VA==PA，RWX；**挖掉镜像段区间**）
 //! info firmware            →  保留 FDT 落在 identity RAM 之外时的显式只读 identity 映射
-//! info 设备                →  MMIO 窗口（VA==PA，RW-NX，页对齐向外取整）
+//! info 设备                →  **全部** MMIO 窗口（VA==PA，RW-NX，页对齐向外取整）
 //! ```
 //!
 //! 每次映射操作都带语义分类进 [`KernelMappingPlan`]，`init` 在激活后把计划交给
@@ -62,9 +62,10 @@ const fn align_down_page(addr: usize) -> usize {
 /// 中断控制器（PLIC）窗口：Core trap 路径在每个 AS 里都要 claim / complete，
 /// 因此共享；其余设备窗口只留内核 root。
 fn is_interrupt_controller(device: &kernel::machine::DeviceDescriptor) -> bool {
-    device.compatibles[..device.compat_count as usize]
+    device
+        .compatibles
         .iter()
-        .any(|compatible| matches!(compatible.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"))
+        .any(|compatible| matches!(&**compatible, "riscv,plic0" | "sifive,plic-1.0.0"))
 }
 
 /// `[start, end)` 里减去镜像区间后的最多两段：`(pieces, count)`，无分配。
@@ -209,10 +210,18 @@ impl RuntimeVm32 {
             map_section(&mut space, &mut plan, section)?;
         }
 
-        // 3) 设备 MMIO：VA == PA，RW-NX，页对齐向外取整。
+        // 3) 设备 MMIO：VA == PA，RW-NX，页对齐向外取整；**每个** MMIO 窗口都映射。
         let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
         for d in info.devices.iter() {
-            if let IoSpace::Mmio { base, size } = d.space {
+            let class = if is_interrupt_controller(d) {
+                MappingClass::SharedCore
+            } else {
+                MappingClass::CoreRootOnly
+            };
+            for window in d.spaces.iter() {
+                let IoSpace::Mmio { base, size } = *window else {
+                    continue;
+                };
                 if size == 0 {
                     continue;
                 }
@@ -222,11 +231,6 @@ impl RuntimeVm32 {
                     .map(align_up_page)
                     .ok_or(RuntimeVm32Error::InvalidLayout)?;
                 let map_size = map_end - map_base;
-                let class = if is_interrupt_controller(d) {
-                    MappingClass::SharedCore
-                } else {
-                    MappingClass::CoreRootOnly
-                };
                 map_and_record!(
                     class,
                     map_base,

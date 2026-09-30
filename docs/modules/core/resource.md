@@ -14,7 +14,7 @@
 
 - `init()`；重导出 `ResourceKind`（Device / Irq / Dma）与 `RequestContext`。
 - `RequestContext::ambient()` / `ambient_init()`。
-- `device`：`DeviceTable`、`DeviceMapping`、`DeviceClaimError`、`DeviceReleaseError`；`claim` / `release` / `quarantine_owner` / `owner_of`。
+- `device`：`DeviceTable`、`DeviceMapping`、`DeviceClaimError`、`DeviceReleaseError`；`claim` / `release` / `quarantine_owner` / `owner_of`。`claim` 是整台设备的所有权，返回**主窗口** `spaces[0]`（多窗口设备不暴露索引窗口 API；主窗口非 MMIO / 无窗口 → `NotMmio`）。
 - `irq`：`IrqTable`、`IrqError`、`IrqHandler`；`register` / `enable` / `disable` / `release` / `revoke_owner`，全部以 `(DeviceId, resource_index)` 为锚点。
 - `dma`：`DmaTable`、`DmaDirection`、`DmaError`、`DmaMapping`、`DmaBuffer`；`alloc` / `free` / `map` / `unmap` / `revoke_owner` + 私有 `QUARANTINE`。
 

@@ -13,7 +13,7 @@
 
 ## 暴露什么机制
 
-- 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`、`IoSpace`（Mmio / Pio）、`CompatStr`、`DeviceId`、`DeviceLookupError`、`InterruptResource` / `InterruptSpecifier`（设备的完整中断资源：固件 specifier + 可投递的逻辑 `line: Option<u32>`）。
+- 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`（`spaces: Box<[IoSpace]>` 全部窗口、固件顺序、`spaces[0]` = 主窗口；`interrupts: Box<[InterruptResource]>` 完整中断资源；`compatibles: Box<[Box<str>]>` 完整 compatible，数量与长度都不截断）、`IoSpace`（Mmio / Pio）、`DeviceId`、`DeviceLookupError`、`InterruptResource` / `InterruptSpecifier`（设备的完整中断资源：固件 specifier + 可投递的逻辑 `line: Option<u32>`）。
 - `commit(info)` / `committed()`。
 - `nth_compatible(compatible, ordinal)`：纯设备枚举（含已认领设备，顺序跨 claim/release 稳定；`ordinal` 越界 → `DeviceLookupError`）。
 

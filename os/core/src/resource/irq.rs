@@ -696,15 +696,16 @@ mod tests {
     /// 安装一台含两条中断资源的设备：资源 0 未绑定（line None），资源 1 绑定 42。
     fn install_fixture() -> DeviceId {
         use crate::machine::{
-            CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, InterruptResource,
-            InterruptSpecifier, IoSpace, MemoryRegion,
+            CpuInfo, DeviceDescriptor, HardwareCpuId, InterruptResource, InterruptSpecifier,
+            IoSpace, MemoryRegion,
         };
 
         let device = DeviceDescriptor {
-            space: IoSpace::Mmio {
+            spaces: vec![IoSpace::Mmio {
                 base: 0x1000_0000,
                 size: 0x1000,
-            },
+            }]
+            .into_boxed_slice(),
             interrupts: vec![
                 InterruptResource {
                     specifier: InterruptSpecifier::Fdt {
@@ -722,13 +723,7 @@ mod tests {
                 },
             ]
             .into_boxed_slice(),
-            compatibles: [
-                CompatStr::from_bytes(b"demo,device"),
-                CompatStr::empty(),
-                CompatStr::empty(),
-                CompatStr::empty(),
-            ],
-            compat_count: 1,
+            compatibles: vec![Box::<str>::from("demo,device")].into_boxed_slice(),
         };
         let info = test_support::snapshot(
             HardwareCpuId::from_raw(0),

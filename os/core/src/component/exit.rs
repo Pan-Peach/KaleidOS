@@ -214,10 +214,10 @@ mod tests {
 
     /// 安装一份含指定设备（MMIO + 一条绑定中断资源）的机器 fixture，并按尺寸
     /// 重建资源表。
-    fn commit_devices(devices: &[(usize, &[u8])]) {
+    fn commit_devices(devices: &[(usize, &str)]) {
         use crate::machine::{
-            CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, InterruptResource,
-            InterruptSpecifier, IoSpace, MemoryRegion,
+            CpuInfo, DeviceDescriptor, HardwareCpuId, InterruptResource, InterruptSpecifier,
+            IoSpace, MemoryRegion,
         };
         let count = devices
             .iter()
@@ -227,22 +227,18 @@ mod tests {
         let mut table = alloc::vec![DeviceDescriptor::empty(); count];
         for (index, compatible) in devices {
             table[*index] = DeviceDescriptor {
-                space: IoSpace::Mmio {
+                spaces: alloc::vec![IoSpace::Mmio {
                     base: 0x1000_0000 + *index * 0x1000,
                     size: 0x1000,
-                },
+                }]
+                .into_boxed_slice(),
                 interrupts: alloc::vec![InterruptResource {
                     specifier: InterruptSpecifier::Isa { line: 8 },
                     line: Some(8),
                 }]
                 .into_boxed_slice(),
-                compatibles: [
-                    CompatStr::from_bytes(compatible),
-                    CompatStr::empty(),
-                    CompatStr::empty(),
-                    CompatStr::empty(),
-                ],
-                compat_count: 1,
+                compatibles: alloc::vec![alloc::boxed::Box::<str>::from(*compatible)]
+                    .into_boxed_slice(),
             };
         }
         let info = crate::machine::test_support::snapshot(
@@ -418,7 +414,7 @@ mod tests {
         // Given：Ready 组件 + 一台它没来得及释放的设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
-        commit_devices(&[(23, b"exit,mmio")]);
+        commit_devices(&[(23, "exit,mmio")]);
         let id = ready_component(b"exit_leftover_mmio", destroy_hook_ok as *const () as usize);
         let ctx = RequestContext {
             component: id,
@@ -458,7 +454,7 @@ mod tests {
         // Given：同一 artifact 的两个 Ready 组件，各自认领一台设备。
         let _machine = crate::machine::test_support::GUARD.lock();
         let _heap = setup();
-        commit_devices(&[(10, b"exit,mmio0"), (11, b"exit,mmio1")]);
+        commit_devices(&[(10, "exit,mmio0"), (11, "exit,mmio1")]);
         let destroy = destroy_hook_ok as *const () as usize;
         let (first, second) = {
             let mut reg = registry::get_registry().lock();

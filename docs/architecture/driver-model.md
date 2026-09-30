@@ -85,7 +85,7 @@ Core：解析设备记录 → 独占检查 → 记 owner → 解析本执行域�
 ```
 
 - `DeviceId` 是**身份**：从 `MachineInfo.devices` 的兼容匹配顺序解析而来，可自由复制、比较、透传；**不是** Handle、不可撤销、不携带权限、无 generation/slot。零可以是合法值。
-- `kcore_device_claim(device_id)` 认领**那台确切设备**：Core 记 owner，返回本执行域下的可访问窗口（`(mmio, len)`）。独占锚在设备记录 index 上。
+- `kcore_device_claim(device_id)` 认领**那台确切设备**：Core 记 owner，返回本执行域下的可访问窗口（`(mmio, len)`）。独占锚在设备记录 index 上。**认领是整台设备的所有权**：返回的窗口是设备**主窗口** `spaces[0]`（`spaces` 按固件顺序，第一个是主窗口）；其余窗口由 boot/Core 保留与映射，本阶段没有组件侧索引窗口的 API。主窗口不是 MMIO（PIO / 无窗口）→ `NotMmio`（ABI 翻译为 `-ENOTSUP`）。
 - **上层 driver 的寄存器访问逻辑不因执行域改变而重写**：KernelNative 返回裸指针，Isolated 返回 mapped VA，两者对 driver 同形（`DeviceMapping { mmio, mmio_len }`）。
 - `kcore_device_release(device_id)` 主动释放；**拆机顺序**：仍有 live IRQ route / DMA mapping 时返回 `-EBUSY`——先静默设备、释放 IRQ/DMA，再释放 device。
 
@@ -150,10 +150,9 @@ enum IoSpace {
 }
 
 struct DeviceDescriptor {                 // owned 快照视图，不再 Copy
-    space: IoSpace,
+    spaces: Box<[IoSpace]>,               // 全部窗口，固件顺序；spaces[0] = 主窗口
     interrupts: Box<[InterruptResource]>, // 完整固件中断资源（长度即真相）
-    compatibles: [CompatStr; 4],
-    compat_count: u8,
+    compatibles: Box<[Box<str>]>,         // 完整 compatible（数量与长度都不截断）
 }
 
 enum InterruptSpecifier {

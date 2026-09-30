@@ -13,9 +13,9 @@
 //!    payload as "not Linux" and autoloads the blob at **physical address 0**,
 //!    which the parser rejects as a null pointer.  The normalized copy
 //!    sidesteps both while keeping every read inside validated bounds.
-//! 2. **Normalize** the parsed tree into the owned, fixed-capacity
+//! 2. **Normalize** the parsed tree into the owned (no fixed capacity)
 //!    [`MachineInfo`]: memory regions, `/cpus` (BSP pinned to logical 0), and
-//!    root//soc device descriptors.
+//!    root//soc device descriptors (all `reg` windows, all compatibles).
 //! 3. **Retain** the staged DTB as the raw firmware source: the normalized
 //!    [`MachineInfo`] carries [`FirmwareInfo::Fdt`] pointing at the **staged
 //!    copy** (with its rewritten validated length) -- never the original PA-0
@@ -25,11 +25,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use fdt::nodes::{AsNode, Node};
+use fdt::properties::reg::Reg;
 use fdt::properties::values::StringList;
 use fdt::properties::PHandle;
 use kernel::machine::{
-    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, InterruptResource,
-    InterruptSpecifier, IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
+    CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, InterruptResource, InterruptSpecifier,
+    IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
 };
 
 /// FDT magic (`0xd00dfeed`, big-endian on the wire).
@@ -417,46 +418,102 @@ fn collect<'a>(
 
 /// Extract one FDT node's device descriptor.
 ///
-/// Filter: must have `reg` and a non-empty `compatible` (memory/cpus/chosen/pmu
-/// fail one of those naturally).  This phase keeps a single MMIO window
-/// (multi-window is a later stage).
+/// Filter: must have a compatible and at least one representable `reg` window
+/// (memory/cpus/chosen/pmu fail one of those naturally).  Every supported
+/// `reg` entry is collected in firmware order (`spaces[0]` is the primary
+/// window); every compatible string is kept (no count/length truncation).
+/// Addresses must fit `usize` with a non-overflowing `base + size`.
 fn device_descriptor<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     child: &Node<'a, FdtParser<'a>>,
 ) -> Result<Option<DeviceDescriptor>, &'static str> {
-    let mut descriptor = None;
-    if let Some(r) = child.reg() {
-        if let Some(reg) = r.iter::<u64, u64>().flatten().next() {
-            descriptor = Some(DeviceDescriptor {
-                space: IoSpace::Mmio {
-                    base: reg.address as usize,
-                    size: reg.len as usize,
-                },
-                interrupts: Box::new([]),
-                compatibles: [CompatStr::empty(); 4],
-                compat_count: 0,
-            });
-        }
-    }
-    let Some(mut descriptor) = descriptor else {
-        return Ok(None);
-    };
+    let mut compatibles: Vec<Box<str>> = Vec::new();
     if let Some(comp) = child.properties().find("compatible") {
         if let Ok(list) = comp.as_value::<StringList>() {
-            for s in list {
-                let idx = descriptor.compat_count as usize;
-                if idx < descriptor.compatibles.len() {
-                    descriptor.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
-                    descriptor.compat_count += 1;
-                }
+            for value in list {
+                compatibles.push(Box::from(value));
             }
         }
     }
-    if descriptor.compat_count == 0 {
+    if compatibles.is_empty() {
         return Ok(None);
     }
-    descriptor.interrupts = interrupts_of(tree, child)?;
-    Ok(Some(descriptor))
+
+    let Some(reg) = child.reg() else {
+        return Ok(None);
+    };
+    if !identity_addressable(child) {
+        // Never treat a translated child address as a CPU address: diagnose
+        // and omit the device instead of inventing an MMIO window.
+        kernel::log!(
+            "discovery",
+            "device requires address translation; omitted (no MMIO address invented)"
+        );
+        return Ok(None);
+    }
+    let spaces = collect_spaces(reg);
+    if spaces.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(DeviceDescriptor {
+        spaces: spaces.into_boxed_slice(),
+        interrupts: interrupts_of(tree, child)?,
+        compatibles: compatibles.into_boxed_slice(),
+    }))
+}
+
+/// Collect every supported `reg` entry (firmware order): u64 → `usize` checked
+/// conversion plus `base + size` overflow check; unrepresentable entries are
+/// diagnosed and skipped, never truncated into a bogus address.
+fn collect_spaces(reg: Reg<'_>) -> Vec<IoSpace> {
+    let mut spaces = Vec::new();
+    for entry in reg.iter::<u64, u64>() {
+        let Ok(entry) = entry else {
+            kernel::log!("discovery", "malformed reg entry; skipped");
+            continue;
+        };
+        let (Ok(base), Ok(size)) = (usize::try_from(entry.address), usize::try_from(entry.len))
+        else {
+            kernel::log!(
+                "discovery",
+                "reg window {:#x}+{:#x} does not fit usize; skipped",
+                entry.address,
+                entry.len
+            );
+            continue;
+        };
+        if base.checked_add(size).is_none() {
+            kernel::log!(
+                "discovery",
+                "reg window {base:#x}+{size:#x} overflows; skipped"
+            );
+            continue;
+        }
+        spaces.push(IoSpace::Mmio { base, size });
+    }
+    spaces
+}
+
+/// Whether the device lives on an identity address chain:
+/// - a direct child of the root node is in the firmware CPU address space;
+/// - otherwise every ancestor bus must declare an **empty** `ranges` (the
+///   devicetree spec: empty ranges = child and parent address spaces are
+///   identical).  A missing `ranges` means no mapping exists; a non-empty
+///   `ranges` needs translation -- neither is supported in this phase.
+fn identity_addressable<'a>(node: &Node<'a, FdtParser<'a>>) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.parent().is_none() {
+            return true; // direct root child: child addresses are CPU addresses
+        }
+        match parent.properties().find("ranges") {
+            Some(property) if property.value.is_empty() => {}
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Parse the node's complete interrupt resources (`interrupts-extended` wins

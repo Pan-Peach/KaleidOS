@@ -19,41 +19,6 @@
 use alloc::boxed::Box;
 use core::fmt::Debug;
 
-/// 兼容性字符串块：内嵌定长（FDT compatible 一般 ≤ 32B），值类型可 Copy。
-#[derive(Clone, Copy)]
-pub struct CompatStr {
-    len: u8,
-    bytes: [u8; 32],
-}
-
-impl CompatStr {
-    pub const fn empty() -> Self {
-        Self {
-            len: 0,
-            bytes: [0; 32],
-        }
-    }
-
-    /// 从字节切片复制（截断至容量）。
-    pub fn from_bytes(src: &[u8]) -> Self {
-        let mut s = Self::empty();
-        let n = src.len().min(s.bytes.len());
-        s.bytes[..n].copy_from_slice(&src[..n]);
-        s.len = n as u8;
-        s
-    }
-
-    pub fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
-    }
-}
-
-impl core::fmt::Debug for CompatStr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", self.as_str())
-    }
-}
-
 // 逻辑 CPU 身份（`CpuId`）与硬件 CPU 身份（`HardwareCpuId`）定义在 `arch`：
 // arch 的 trait 签名需要逻辑 id，而 arch 不依赖 core。这里 re-export，
 // `core::machine::CpuId` 仍是 Core 侧唯一入口（契约不变）。
@@ -173,34 +138,35 @@ pub struct InterruptResource {
 
 /// 设备发现记录（owned；随 `MachineInfo` 一次性发布，**不再 `Copy`**）。
 ///
-/// `interrupts` 是**完整**的固件中断资源列表（长度即真相）：一台设备可以有多条
-/// 中断（多个资源 / 不同控制器），每条资源的 `line` 是 Core 后端支持的逻辑
-/// 外部 IRQ 号（未绑定 = `None`）。
+/// - `spaces` 是设备的**全部**空间窗口，按固件顺序；`spaces[0]` 是**主窗口**
+///   （当前 `kcore_device_claim` 只返回它——多窗口由 boot/Core 保留与映射，
+///   本阶段没有组件侧的索引窗口 API）。一条设备可以有多个 MMIO/PIO 窗口
+///   （如 PCI 双 BAR）。
+/// - `interrupts` 是**完整**的固件中断资源列表（长度即真相）：一台设备可以有多条
+///   中断（多个资源 / 不同控制器），每条资源的 `line` 是 Core 后端支持的逻辑
+///   外部 IRQ 号（未绑定 = `None`）。
+/// - `compatibles` 是**完整**的 compatible 列表（数量与长度都不截断）。
 #[derive(Clone)]
 pub struct DeviceDescriptor {
-    pub space: IoSpace,
+    pub spaces: Box<[IoSpace]>,
     pub interrupts: Box<[InterruptResource]>,
-    pub compatibles: [CompatStr; 4],
-    pub compat_count: u8,
+    pub compatibles: Box<[Box<str>]>,
 }
 
 impl DeviceDescriptor {
-    /// 空描述符（无空间 / 无中断 / 无 compatible）。`interrupts` 是空 boxed slice。
+    /// 空描述符（无空间 / 无中断 / 无 compatible；三个 boxed slice 都是空的）。
     pub fn empty() -> Self {
         Self {
-            space: IoSpace::Mmio { base: 0, size: 0 },
+            spaces: Box::new([]),
             interrupts: Box::new([]),
-            compatibles: [CompatStr::empty(); 4],
-            compat_count: 0,
+            compatibles: Box::new([]),
         }
     }
 
     /// 该描述符是否声明了 `compatible`（任一串命中即计一次）。
-    /// 纯谓词：不看可用性 / claim 状态，也不触碰设备。
+    /// 纯谓词：不看可用性 / claim 状态，也不触碰设备；遍历**全部** compatible。
     pub fn matches(&self, compatible: &[u8]) -> bool {
-        self.compatibles[..self.compat_count as usize]
-            .iter()
-            .any(|c| c.as_str().as_bytes() == compatible)
+        self.compatibles.iter().any(|c| c.as_bytes() == compatible)
     }
 }
 
@@ -277,24 +243,22 @@ fn nth_compatible_in(
 
 impl core::fmt::Debug for DeviceDescriptor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let (space, base, size) = match self.space {
-            IoSpace::Mmio { base, size } => ("mmio", base, size),
-            IoSpace::Pio { base, size } => ("pio", base, size),
-        };
-        write!(f, "DeviceDescriptor {{ {space}: {base:#x}, size: ")?;
-        write_size(f, size)?;
-        write!(f, ", interrupts: {:?}, compatibles: ", self.interrupts)?;
-        f.write_str("[")?;
-        for (i, c) in self.compatibles[..self.compat_count as usize]
-            .iter()
-            .enumerate()
-        {
-            if i > 0 {
+        // 全部窗口按固件顺序（`spaces[0]` 是主窗口）；长度即真相，无计数截断。
+        write!(f, "DeviceDescriptor {{ spaces: [")?;
+        for (index, space) in self.spaces.iter().enumerate() {
+            if index > 0 {
                 f.write_str(", ")?;
             }
-            write!(f, "{c:?}")?;
+            let (label, base, size) = match space {
+                IoSpace::Mmio { base, size } => ("mmio", base, size),
+                IoSpace::Pio { base, size } => ("pio", base, size),
+            };
+            write!(f, "{label} {base:#x}+")?;
+            write_size(f, *size)?;
         }
-        f.write_str("] }")
+        write!(f, "], interrupts: {:?}, compatibles: ", self.interrupts)?;
+        f.debug_list().entries(self.compatibles.iter()).finish()?;
+        f.write_str(" }")
     }
 }
 
@@ -461,12 +425,11 @@ mod tests {
         }
     }
 
-    fn device(compatibles: &[&[u8]], interrupts: Vec<InterruptResource>) -> DeviceDescriptor {
+    /// 构造一个只有 compatible + interrupts 的设备（无空间窗口；需要窗口的
+    /// 用例自行填 `spaces`）。
+    fn device(compatibles: &[&str], interrupts: Vec<InterruptResource>) -> DeviceDescriptor {
         let mut d = DeviceDescriptor::empty();
-        for (slot, c) in d.compatibles.iter_mut().zip(compatibles) {
-            *slot = CompatStr::from_bytes(c);
-        }
-        d.compat_count = compatibles.len() as u8;
+        d.compatibles = compatibles.iter().map(|c| Box::<str>::from(*c)).collect();
         d.interrupts = interrupts.into_boxed_slice();
         d
     }
@@ -502,12 +465,9 @@ mod tests {
     fn nth_compatible_counts_once_per_descriptor_and_terminates_with_no_such_ordinal() {
         // devices[0] 同时声明两个 compatible —— 匹配任一个都只算一台设备。
         let info = fixture(vec![
-            device(
-                &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-                vec![irq_resource(1)],
-            ),
-            device(&[b"ns16550a".as_slice()], vec![irq_resource(10)]),
-            device(&[b"virtio,mmio".as_slice()], vec![irq_resource(2)]),
+            device(&["virtio,mmio", "legacy,mmio"], vec![irq_resource(1)]),
+            device(&["ns16550a"], vec![irq_resource(10)]),
+            device(&["virtio,mmio"], vec![irq_resource(2)]),
         ]);
 
         assert_eq!(
@@ -556,7 +516,7 @@ mod tests {
     #[test]
     fn nth_compatible_reaches_devices_beyond_a_byte() {
         let mut devices = vec![DeviceDescriptor::empty(); 300];
-        devices[260] = device(&[b"far,device".as_slice()], vec![irq_resource(5)]);
+        devices[260] = device(&["far,device"], vec![irq_resource(5)]);
         let info = fixture(devices);
 
         assert_eq!(
@@ -581,7 +541,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let devices = (0..40)
-            .map(|_| device(&[b"many,device".as_slice()], vec![irq_resource(3)]))
+            .map(|_| device(&["many,device"], vec![irq_resource(3)]))
             .collect::<Vec<_>>();
         let info = test_support::snapshot(
             HardwareCpuId::from_raw(0),
@@ -608,7 +568,7 @@ mod tests {
         let first = commit(fixture(vec![])).expect("first commit must publish");
         assert_eq!(first.devices.len(), 0);
 
-        let second = commit(fixture(vec![device(&[b"late,device".as_slice()], vec![])]));
+        let second = commit(fixture(vec![device(&["late,device"], vec![])]));
         assert_eq!(second.err(), Some("machine info already committed"));
         assert_eq!(
             COMMITTED.get().expect("still committed").devices.len(),
@@ -670,109 +630,150 @@ mod tests {
         );
     }
 
-    /// CompatStr：从字节复制、截断到 32B 容量、`as_str` 往返、空串语义；
-    /// Debug 是带引号的字符串（不是 derive 的字段转储）。
+    /// 4e 形状：一条设备可以有多条 MMIO 窗口、多条中断资源、任意数量与长度的
+    /// compatible——全部按固件顺序保留（无 4 槽 / 32B 截断）。
     #[test]
-    fn compat_str_copies_truncates_and_reports_as_str() {
-        // 空串。
-        assert_eq!(CompatStr::empty().as_str(), "");
-        assert_eq!(alloc::format!("{:?}", CompatStr::empty()), "\"\"");
+    fn device_retains_all_windows_interrupts_and_compatibles() {
+        // 超过旧容量（4）的 compatible 数量；其中一个超过旧 32B 上限。
+        const LONG: &str = "vendor,extremely-long-compatible-string-beyond-the-old-32-byte-limit";
+        let mut d = device(
+            &[
+                "virtio,mmio",
+                "vendor,secondary",
+                "vendor,tertiary",
+                "vendor,quaternary",
+                "vendor,quinary",
+                LONG,
+            ],
+            vec![
+                fdt_resource(3, &[10, 1]),
+                irq_resource(7),
+                fdt_resource(4, &[0x2a]),
+            ],
+        );
+        d.spaces = vec![
+            IoSpace::Mmio {
+                base: 0x1000_0000,
+                size: 0x1000,
+            },
+            IoSpace::Mmio {
+                base: 0x1000_1000,
+                size: 0x2000,
+            },
+            IoSpace::Mmio {
+                base: 0x2000_0000,
+                size: 0x4000,
+            },
+        ]
+        .into_boxed_slice();
 
-        // 往返。
-        let s = CompatStr::from_bytes(b"virtio,mmio");
-        assert_eq!(s.as_str(), "virtio,mmio");
-        assert_eq!(alloc::format!("{s:?}"), "\"virtio,mmio\"");
+        // 长度即真相：全部保留、按固件顺序（spaces[0] 是主窗口）。
+        assert_eq!(d.spaces.len(), 3);
+        assert_eq!(
+            d.spaces[0],
+            IoSpace::Mmio {
+                base: 0x1000_0000,
+                size: 0x1000
+            }
+        );
+        assert_eq!(
+            d.spaces[2],
+            IoSpace::Mmio {
+                base: 0x2000_0000,
+                size: 0x4000
+            }
+        );
+        assert_eq!(d.interrupts.len(), 3, "多条中断资源全部保留");
+        assert_eq!(d.compatibles.len(), 6, "超过旧 4 槽的 compatible 全部保留");
+        assert_eq!(&*d.compatibles[5], LONG);
+        assert!(d.compatibles[5].len() > 32, "compatible 长度不截断");
 
-        // 边界：恰好 32B 完整保留；33B 及以上截断到 32B（不 panic）。
-        let exact = CompatStr::from_bytes(&[b'x'; 32]);
-        assert_eq!(exact.as_str().len(), 32);
-        let truncated = CompatStr::from_bytes(&[b'x'; 40]);
-        assert_eq!(truncated.as_str().len(), 32, "容量上限是 32B");
-        assert!(
-            truncated.as_str().bytes().all(|b| b == b'x'),
-            "截断保留的是前 32B"
+        // matches 遍历整张列表（含最后一个超长串）；前缀不算命中。
+        assert!(d.matches(b"virtio,mmio"));
+        assert!(d.matches(b"vendor,quinary"));
+        assert!(d.matches(LONG.as_bytes()));
+        assert!(!d.matches(b"vendor,missing"));
+        assert!(!d.matches(&LONG.as_bytes()[..31]), "前缀不是命中");
+
+        // 枚举同样能看到任意一个声明的 compatible。
+        let info = fixture(vec![d]);
+        assert_eq!(
+            nth_compatible_in(Some(&info), LONG.as_bytes(), 0),
+            Ok(DeviceId::from_raw(0))
         );
     }
 
-    /// `DeviceDescriptor::matches`：空描述符不匹配任何 compatible；声明的任一
-    /// 串命中即为真；只有 `compat_count` 之内的槽位参与匹配。
+    /// `DeviceDescriptor::matches`：空描述符不匹配任何 compatible；声明的**任一**
+    /// 串命中即为真（整张列表参与，无 count / 容量截断）。
     #[test]
-    fn device_matches_only_declared_compatibles_within_count() {
+    fn device_matches_any_declared_compatible() {
         // 零个 compatible：无论问什么都是 false。
         assert!(!DeviceDescriptor::empty().matches(b"virtio,mmio"));
         assert!(!DeviceDescriptor::empty().matches(b""));
 
         // 声明两个 compatible：命中任一为真，无关串为假（前缀也不算命中）。
-        let d = device(
-            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-            vec![irq_resource(1)],
-        );
+        let d = device(&["virtio,mmio", "legacy,mmio"], vec![irq_resource(1)]);
         assert!(d.matches(b"virtio,mmio"), "第一个声明的 compatible");
         assert!(d.matches(b"legacy,mmio"), "第二个声明的 compatible");
         assert!(!d.matches(b"ns16550a"), "未声明的 compatible");
         assert!(!d.matches(b"virtio,mmi"), "前缀不是命中");
         assert!(!d.matches(b""), "空查询不命中非空串");
 
-        // 槽位内容存在，但超出 compat_count 即被忽略。
-        let mut clipped = device(
-            &[b"virtio,mmio".as_slice(), b"hidden,mmio".as_slice()],
-            vec![],
-        );
-        assert!(clipped.matches(b"hidden,mmio"), "未截断前参与匹配");
-        clipped.compat_count = 1;
+        // 第 5 个兼容串同样参与匹配（旧的 4 槽截断已删除）。
+        let many = device(&["a", "b", "c", "d", "hidden,mmio"], vec![]);
         assert!(
-            !clipped.matches(b"hidden,mmio"),
-            "超出 compat_count 的槽位不得参与匹配"
+            many.matches(b"hidden,mmio"),
+            "超出旧 4 槽的声明必须参与匹配"
         );
-        assert!(clipped.matches(b"virtio,mmio"), "计数内的槽位仍然命");
     }
 
-    /// DeviceDescriptor Debug：MMIO/PIO 都带空间标签、`write_size` 单位、IRQ
-    /// Some/None 与 compatible 列表；不 panic 且含预期子串。
+    /// DeviceDescriptor Debug：全部窗口按固件顺序（MMIO/PIO 标签 + `write_size`
+    /// 单位）、IRQ Some/None 与完整 compatible 列表；不 panic 且含预期子串。
     #[test]
-    fn device_descriptor_debug_reports_space_irq_and_compatibles() {
-        // Given: 一个带 IRQ 与两个 compatible 的 MMIO 描述符。
-        let mut d = device(
-            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-            vec![irq_resource(7)],
-        );
-        d.space = IoSpace::Mmio {
-            base: 0x1000,
-            size: 0x1000,
-        };
+    fn device_descriptor_debug_reports_spaces_irq_and_compatibles() {
+        // Given: 三个窗口（两 MMIO + 一 PIO）、IRQ、两个 compatible。
+        let mut d = device(&["virtio,mmio", "legacy,mmio"], vec![irq_resource(7)]);
+        d.spaces = vec![
+            IoSpace::Mmio {
+                base: 0x1000,
+                size: 0x1000,
+            },
+            IoSpace::Pio {
+                base: 0x3f8,
+                size: 8,
+            },
+            IoSpace::Mmio {
+                base: 0x2000,
+                size: 0x2000,
+            },
+        ]
+        .into_boxed_slice();
 
         // When: 格式化。
         let text = alloc::format!("{d:?}");
 
-        // Then: 空间/大小/IRQ/compatible 都可读。
+        // Then: 全部窗口/大小/IRQ/compatible 都可读（列表完整，无计数截断）。
         assert!(text.contains("DeviceDescriptor"), "{text}");
-        assert!(text.contains("mmio: 0x1000"), "{text}");
-        assert!(text.contains("size: 4 KiB"), "{text}");
+        assert!(
+            text.contains("spaces: [mmio 0x1000+4 KiB, pio 0x3f8+8 B, mmio 0x2000+8 KiB]"),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "interrupts: [InterruptResource { specifier: Isa { line: 7 }, line: Some(7) }]"
             ),
             "{text}"
         );
-        assert!(text.contains("virtio,mmio"), "{text}");
-        assert!(text.contains("legacy,mmio"), "{text}");
+        assert!(
+            text.contains("[\"virtio,mmio\", \"legacy,mmio\"]"),
+            "{text}"
+        );
 
-        // 无 IRQ：显式 `None`（不是省略），零 compatible 打印空列表。
-        let mut no_irq = DeviceDescriptor::empty();
-        no_irq.space = IoSpace::Mmio { base: 0, size: 0 };
-        let text = alloc::format!("{no_irq:?}");
+        // 空描述符：三个列表都为空。
+        let text = alloc::format!("{:?}", DeviceDescriptor::empty());
+        assert!(text.contains("spaces: []"), "{text}");
         assert!(text.contains("interrupts: []"), "{text}");
         assert!(text.contains("compatibles: []"), "{text}");
-
-        // PIO 空间（x86 专用）同样被标注。
-        let mut pio = DeviceDescriptor::empty();
-        pio.space = IoSpace::Pio {
-            base: 0x3f8,
-            size: 8,
-        };
-        let text = alloc::format!("{pio:?}");
-        assert!(text.contains("pio: 0x3f8"), "{text}");
-        assert!(text.contains("size: 8 B"), "{text}");
     }
 
     /// 一条 FDT 中断资源：完整 cells 被保留，`line` 与 specifier 分开显示
@@ -802,9 +803,9 @@ mod tests {
     fn machine_info_debug_prints_full_tables_and_no_counts() {
         // Given: 1 CPU / 1 memory region / 3 devices。
         let info = fixture(vec![
-            device(&[b"virtio,mmio".as_slice()], vec![irq_resource(1)]),
-            device(&[b"ns16550a".as_slice()], vec![irq_resource(10)]),
-            device(&[b"riscv,clint0".as_slice()], vec![]),
+            device(&["virtio,mmio"], vec![irq_resource(1)]),
+            device(&["ns16550a"], vec![irq_resource(10)]),
+            device(&["riscv,clint0"], vec![]),
         ]);
 
         // When: 格式化（完整切片，不越界）。

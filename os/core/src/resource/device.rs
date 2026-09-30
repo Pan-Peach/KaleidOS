@@ -56,7 +56,7 @@ impl core::fmt::Debug for DeviceMapping {
 pub enum DeviceClaimError {
     /// `DeviceId` 越界，或机器信息尚未提交（正常组件运行期不可达）。
     DeviceNotFound,
-    /// 该设备不是 MMIO（PIO 空间；当前不支持）。
+    /// 该设备的**主窗口**（`spaces[0]`）不是 MMIO（PIO / 无窗口；当前不支持）。
     NotMmio,
     /// 该设备已被认领，或已被失败 quarantine 标记。
     DeviceBusy,
@@ -228,6 +228,11 @@ pub fn owner_of(device: DeviceId) -> Option<ComponentId> {
 ///
 /// `device` 由发现阶段 [`crate::machine::nth_compatible`] 给出；`DeviceId` 本身
 /// 不授予任何东西——authority 从 Core 记录 owner 开始。
+///
+/// **窗口契约**：认领是**整台设备**的所有权；返回的窗口是设备**主窗口**
+/// `DeviceDescriptor.spaces[0]`（`spaces` 按固件顺序，第一个是主窗口）。
+/// 其余窗口由 boot/Core 保留与映射，本阶段**没有**组件侧索引窗口的 API。
+/// 主窗口不是 MMIO（PIO / 设备没有窗口）→ [`DeviceClaimError::NotMmio`]。
 pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, DeviceClaimError> {
     let Some(machine) = machine::committed() else {
         return Err(DeviceClaimError::DeviceNotFound);
@@ -235,8 +240,8 @@ pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, De
     let Some(descriptor) = machine.devices.get(device.raw() as usize) else {
         return Err(DeviceClaimError::DeviceNotFound);
     };
-    // 只看 MMIO 空间（PIO 设备当前不认领）。
-    let IoSpace::Mmio { base, size } = descriptor.space else {
+    // 只看主窗口（PIO 主窗口 / 无窗口的设备当前不认领）。
+    let Some(&IoSpace::Mmio { base, size }) = descriptor.spaces.first() else {
         return Err(DeviceClaimError::NotMmio);
     };
 
@@ -324,11 +329,20 @@ pub fn quarantine_owner(owner: ComponentId) {
 mod tests {
     use super::{DeviceClaimError, DeviceReleaseError, DeviceTable};
     use crate::component::ComponentId;
-    use crate::machine::{CompatStr, DeviceDescriptor, DeviceId, IoSpace};
+    use crate::machine::{DeviceDescriptor, DeviceId, IoSpace};
+    use alloc::boxed::Box;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     fn owner(raw: u32) -> ComponentId {
         ComponentId::from_raw(raw)
+    }
+
+    fn with_spaces(spaces: Vec<IoSpace>, compatible: &str) -> DeviceDescriptor {
+        let mut d = DeviceDescriptor::empty();
+        d.spaces = spaces.into_boxed_slice();
+        d.compatibles = vec![Box::<str>::from(compatible)].into_boxed_slice();
+        d
     }
 
     #[test]
@@ -425,32 +439,66 @@ mod tests {
     }
 
     /// 全局认领路径：合成设备表 300 项（含 `DeviceId ≥ 256` 的设备），验证
-    /// resolve → 独占 → 本域窗口；越界 / PIO 的拒绝路径不变。
+    /// resolve → 独占 → 本域窗口。claim 返回**主窗口** `spaces[0]`：多窗口设备
+    /// 只取第一个（本阶段没有索引窗口 API）；PIO 主窗口 / 无窗口 → `NotMmio`，
+    /// 即使后面还有 MMIO 窗口也不行。
     #[test]
-    fn claim_resolves_mmio_and_rejects_out_of_range_and_pio() {
+    fn claim_returns_primary_window_and_rejects_non_mmio_primary() {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         let mut devices = vec![DeviceDescriptor::empty(); 300];
-        let mut mmio = DeviceDescriptor::empty();
-        mmio.space = IoSpace::Mmio {
-            base: 0x1000_8000,
-            size: 0x1000,
-        };
-        mmio.compatibles[0] = CompatStr::from_bytes(b"virtio,mmio");
-        mmio.compat_count = 1;
-        devices[0] = mmio;
-        let mut pio = DeviceDescriptor::empty();
-        pio.space = IoSpace::Pio {
-            base: 0x3f8,
-            size: 8,
-        };
-        devices[1] = pio;
-        let mut far = DeviceDescriptor::empty();
-        far.space = IoSpace::Mmio {
-            base: 0x2000_0000,
-            size: 0x2000,
-        };
-        devices[260] = far;
+        // [0] 多窗口 MMIO：第一窗口是主窗口（后续窗口不参与 claim）。
+        devices[0] = with_spaces(
+            vec![
+                IoSpace::Mmio {
+                    base: 0x1000_8000,
+                    size: 0x1000,
+                },
+                IoSpace::Mmio {
+                    base: 0x1000_9000,
+                    size: 0x2000,
+                },
+            ],
+            "virtio,mmio",
+        );
+        // [1] PIO-only。
+        devices[1] = with_spaces(
+            vec![IoSpace::Pio {
+                base: 0x3f8,
+                size: 8,
+            }],
+            "ns16550a",
+        );
+        // [2] PIO 主窗口 + 第二个 MMIO 窗口：没有 MMIO 主窗口 → 拒绝。
+        devices[2] = with_spaces(
+            vec![
+                IoSpace::Pio {
+                    base: 0x3f8,
+                    size: 8,
+                },
+                IoSpace::Mmio {
+                    base: 0x2000_0000,
+                    size: 0x1000,
+                },
+            ],
+            "mixed,device",
+        );
+        // [3] 无任何窗口。
+        devices[3] = with_spaces(vec![], "windowless,device");
+        // [260] 全宽 id 的多窗口设备。
+        devices[260] = with_spaces(
+            vec![
+                IoSpace::Mmio {
+                    base: 0x2000_0000,
+                    size: 0x2000,
+                },
+                IoSpace::Mmio {
+                    base: 0x3000_0000,
+                    size: 0x1000,
+                },
+            ],
+            "far,device",
+        );
         let info = crate::machine::test_support::snapshot(
             crate::machine::HardwareCpuId::from_raw(0),
             10_000_000,
@@ -477,16 +525,26 @@ mod tests {
             super::claim(&ctx, DeviceId::from_raw(300)),
             Err(DeviceClaimError::DeviceNotFound)
         );
-        // PIO → NotMmio。
+        // PIO-only → NotMmio。
         assert_eq!(
             super::claim(&ctx, DeviceId::from_raw(1)),
             Err(DeviceClaimError::NotMmio)
         );
-        // MMIO → 直接拿到寄存器基址（KernelNative identity）。
+        // PIO 主窗口（即使第二窗口是 MMIO）→ NotMmio：claim 只认 spaces[0]。
+        assert_eq!(
+            super::claim(&ctx, DeviceId::from_raw(2)),
+            Err(DeviceClaimError::NotMmio)
+        );
+        // 无窗口 → NotMmio。
+        assert_eq!(
+            super::claim(&ctx, DeviceId::from_raw(3)),
+            Err(DeviceClaimError::NotMmio)
+        );
+        // MMIO 多窗口 → 返回主窗口（spaces[0]，不是第二窗口；KernelNative identity）。
         let mapping = super::claim(&ctx, DeviceId::from_raw(0)).unwrap();
         assert_eq!(mapping.mmio as usize, 0x1000_8000);
         assert_eq!(mapping.mmio_len, 0x1000);
-        // 全宽：ID ≥ 256 的设备同样可认领。
+        // 全宽：ID ≥ 256 的设备同样可认领（仍取主窗口）。
         let far_mapping = super::claim(&ctx, DeviceId::from_raw(260)).expect("full-width id");
         assert_eq!(far_mapping.mmio as usize, 0x2000_0000);
         assert_eq!(far_mapping.mmio_len, 0x2000);

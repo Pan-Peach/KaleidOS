@@ -47,8 +47,8 @@ use arch::{Console, CpuArch};
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use kernel::machine::{
-    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, InterruptResource,
-    InterruptSpecifier, IoSpace, MachineInfo, MemoryRegion,
+    CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, InterruptResource, InterruptSpecifier,
+    IoSpace, MachineInfo, MemoryRegion,
 };
 
 #[cfg(feature = "selftest")]
@@ -563,24 +563,24 @@ fn boot_apic_id() -> u32 {
     }
 }
 
-/// The discovered 16550 UART as an `IoSpace::Pio` device descriptor.
+/// The discovered 16550 UART as a single-`Pio`-window device descriptor.
 ///
 /// Firmware resource: ISA IRQ 4 (`COM1`).  The logical line stays `None`: this
 /// phase has no PIC/IOAPIC routing backend, so the specifier is retained but
 /// Core has no deliverable external IRQ for it.
 fn uart_device() -> DeviceDescriptor {
     let mut device = DeviceDescriptor::empty();
-    device.space = IoSpace::Pio {
+    device.spaces = vec![IoSpace::Pio {
         base: arch::x86_64::console::COM1 as usize,
         size: 8,
-    };
+    }]
+    .into_boxed_slice();
     device.interrupts = vec![InterruptResource {
         specifier: InterruptSpecifier::Isa { line: 4 },
         line: None,
     }]
     .into_boxed_slice();
-    device.compatibles[0] = CompatStr::from_bytes(b"ns16550a");
-    device.compat_count = 1;
+    device.compatibles = vec![alloc::boxed::Box::<str>::from("ns16550a")].into_boxed_slice();
     device
 }
 
