@@ -1,40 +1,67 @@
-/* aarch64 boot skeleton linker script.
+/*
+ * aarch64 boot image layout (QEMU `virt`, `-kernel <elf>`).
  *
- * SKELETON: a minimal layout so the crate can cross-build.  Replace with the
- * real kernel image layout (load address, section alignment, BSS boundaries)
- * when bringing aarch64 up.  See os/boot/riscv/linker.ld for the production
- * shape. */
+ * Contract: QEMU loads the ELF PT_LOAD segments at their link addresses and
+ * enters at `_start` with x0 = DTB physical address.  The MMU is OFF, so
+ * VMA == LMA == PA; there is no high-half alias and no per-section AT() rule.
+ *
+ * RAM on QEMU `virt` starts at 0x40000000; the image is linked there so QEMU's
+ * ELF loader can place it directly.
+ */
 
+OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 
 SECTIONS
 {
     . = 0x40000000;
+    __kernel_start = .;
 
-    .text : {
-        __text_start = .;
+    /* Entry must be the first thing loaded: `_start` is the ELF entry point. */
+    .text : ALIGN(4096)
+    {
+        KEEP(*(.text.entry))
         *(.text .text.*)
-        __text_end = .;
     }
 
-    .rodata : ALIGN(4096) {
-        __rodata_start = .;
+    .rodata : ALIGN(4096)
+    {
         *(.rodata .rodata.*)
-        __rodata_end = .;
+        *(.srodata .srodata.*)
     }
 
-    .data : ALIGN(4096) {
-        __data_start = .;
+    .data : ALIGN(4096)
+    {
         *(.data .data.*)
-        __data_end = .;
+        *(.sdata .sdata.*)
+        /* Static (non-PIC) builds should not emit a GOT, but keep a home for
+         * it so an unexpected one lands inside the loaded image. */
+        *(.got .got.*)
     }
 
-    .bss : ALIGN(4096) {
+    /*
+     * Boot stack: its own NOLOAD region so the entry can zero `.bss` without
+     * touching the stack it is already running on.  `__boot_stack_top` is the
+     * initial SP (16-byte aligned per AAPCS64).
+     */
+    .bss.stack (NOLOAD) : ALIGN(16)
+    {
+        __boot_stack_bottom = .;
+        . += 16 * 1024;
+        __boot_stack_top = .;
+    }
+
+    .bss (NOLOAD) : ALIGN(16)
+    {
         __bss_start = .;
         *(.bss .bss.*)
+        *(.sbss .sbss.*)
         *(COMMON)
         __bss_end = .;
     }
 
+    /* The Core reserves [__kernel_start, __kernel_end) as permanent image. */
     __kernel_end = .;
+
+    /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) }
 }

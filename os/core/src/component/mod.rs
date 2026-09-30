@@ -20,8 +20,8 @@ pub mod failure;
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
-/// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口 +
-/// runtime slot，经跨 AS trampoline 执行 `kcomp_instance_create` /
+/// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口，
+/// 经跨 AS trampoline 执行 `kcomp_instance_create` /
 /// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
 /// 同一模块还承载跨域 service dispatch（KernelNative caller → Isolated
 /// provider，经 caller 帧直接交付 + 跨 AS trampoline）。
@@ -32,7 +32,6 @@ pub mod isolated_load;
 pub mod load;
 pub mod loader;
 pub mod registry;
-pub mod runtime_slot;
 pub mod store;
 
 pub use containment::panic_escape;

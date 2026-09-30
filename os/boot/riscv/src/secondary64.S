@@ -36,7 +36,7 @@ _secondary_start:
     
     #   4. 高半区栈：sp = [a1 + 8]
     ld  sp, 8(a1)
-    #   4b. 进入 Rust 前清 runtime slot：`tp = 0`（无实例上下文）。契约显式化，
+    #   4b. 进入 Rust 前清 tp：`tp = 0`（全新执行不带任何寄存器残留）。契约显式化，
     #       不依赖固件留下的寄存器值（Oracle 评审）。
     li  tp, 0
     #   5. 进入 Rust：

@@ -1,5 +1,8 @@
 # RISC-V 上下文切换参考（Context Switch Reference）
 
+> **HISTORICAL / 归档**：本页是 `os/arch` RV64 context 设计期的开源调研归档，**非权威、不代表当前实现**（见 `docs/README.md` §3）。
+> 当前的 `tp`（x4）是普通**架构 / 任务执行状态**（线程指针）：Core 只在任务切换（`RiscvContext.tp`、`switch32.S` / `switch64.S`）与 trap（`TrapFrame.x[4]`）时透明保存 / 恢复；全新执行上下文起点为 `tp == 0`。它**不是**组件运行时指针，也**没有**任何 per-instance runtime slot。TLS / 线程指针语义属未来 task/thread/libc runtime。
+>
 > 归档自开源调研（rCore / xv6 / RISC-V psABI / 特权规范），用于 `os/arch` 的
 > RV64 context 设计与 trap 入口汇编实现。所有出处为 git 固定 SHA，可直接溯源。
 

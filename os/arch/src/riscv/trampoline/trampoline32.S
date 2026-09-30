@@ -14,14 +14,13 @@
 .equ T_INSTANCE_SATP, 72
 .equ T_ENTRY, 76
 .equ T_STACK, 80
-.equ T_SLOT,  84
-.equ T_IRQ,   88
-.equ T_ARG0,  92
-.equ T_ARG1,  96
-.equ T_ARG2,  100
-.equ T_ARG3,  104
-.equ T_RESULT, 108
-.equ T_A0,    112
+.equ T_IRQ,   84
+.equ T_ARG0,  88
+.equ T_ARG1,  92
+.equ T_ARG2,  96
+.equ T_ARG3,  100
+.equ T_RESULT, 104
+.equ T_A0,    108
 .equ SIE_BIT, 2
 
 .section .text.trampoline,"ax"
@@ -62,7 +61,9 @@ trampoline_enter:
 1:
     mv s0, a0
     lw sp, T_STACK(s0)
-    lw tp, T_SLOT(s0)
+    # 新执行显式清零 tp：跨 AS 进入不继承挂起调用者的 tp（本镜像无 TLS；
+    # tp 只是被透明保存 / 恢复的架构执行状态）。调用者 tp 已在上面保存。
+    li tp, 0
     lw t0, T_IRQ(s0)
     beqz t0, 2f
     csrs sstatus, SIE_BIT

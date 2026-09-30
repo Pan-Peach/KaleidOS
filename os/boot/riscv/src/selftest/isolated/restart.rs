@@ -1,17 +1,15 @@
 //! Fault containment on an already-serving component and re-instantiation of the
 //! same artifact as a genuinely independent fresh component.
 
-/// （新 AS / 新窗口 / 新 slot / 新 endpoint）并再次服务。
+/// （新 AS / 新窗口 / 新 endpoint）并再次服务。
 pub(crate) fn isolated_ready_fault() -> ! {
     use kernel::component::abi::InterfaceAbi;
     use kernel::component::call::{self, CallError};
     use kernel::component::endpoint::{
         self, ContractId, EndpointError, ExecutionDomain, Mechanism,
     };
-    use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
 
     let core_satp = read_satp();
@@ -144,7 +142,7 @@ pub(crate) fn isolated_ready_fault() -> ! {
         fail_case("isolated-ready-fault", "stale call leaked inflight");
     }
 
-    // (4) 重新 instantiate：同一 artifact 的全新组件（fresh AS / backing / window / slot）。
+    // (4) 重新 instantiate：同一 artifact 的全新组件（fresh AS / backing / window）。
     let second = svc_provider();
     if second.id == first.id {
         fail_case("isolated-ready-fault", "restart reused the ComponentId");
@@ -157,17 +155,6 @@ pub(crate) fn isolated_ready_fault() -> ! {
     }
     if registry_state(first.id) != Some(ComponentState::Failed) {
         fail_case("isolated-ready-fault", "old instance tombstone was lost");
-    }
-    let expected_slot =
-        isolated_lifecycle::window_range().base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
-    if runtime_slot::get_slots().lock().get(second.id) as usize != expected_slot {
-        fail_case("isolated-ready-fault", "fresh instance has no runtime slot");
-    }
-    if !runtime_slot::get_slots().lock().get(first.id).is_null() {
-        fail_case(
-            "isolated-ready-fault",
-            "dead instance kept its runtime slot",
-        );
     }
     if second.endpoint == first.endpoint {
         fail_case("isolated-ready-fault", "restart reused the endpoint");
@@ -244,7 +231,6 @@ pub(crate) fn isolated_restart() -> ! {
     use kernel::component::isolated_lifecycle;
     use kernel::component::load::{self, ComponentLoadError};
     use kernel::component::registry;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
     use kernel::memory::address_space;
 
@@ -462,15 +448,6 @@ pub(crate) fn isolated_restart() -> ! {
             "isolated-restart",
             "restart reused the resident window backing",
         );
-    }
-    // fresh slot：旧实例的 slot 已清除，新实例的 slot 已安装。
-    let expected_slot =
-        isolated_lifecycle::window_range().base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
-    if runtime_slot::get_slots().lock().get(third) as usize != expected_slot {
-        fail_case("isolated-restart", "second restart has no runtime slot");
-    }
-    if !runtime_slot::get_slots().lock().get(second).is_null() {
-        fail_case("isolated-restart", "stopped instance kept its runtime slot");
     }
     // 两个 tombstone 都被保留，且都不阻止重启。
     if registry_state(failed_id) != Some(ComponentState::Failed) {

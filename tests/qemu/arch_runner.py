@@ -41,7 +41,7 @@ ARCH_CONF = {
     "x86_64": {"qemu": "qemu-system-x86_64", "mem": "512M",
                "extra": ["-machine", "q35", "-cpu", "qemu64"]},
     "aarch64": {"qemu": "qemu-system-aarch64", "mem": "1G",
-                "extra": ["-machine", "virt", "-cpu", "cortex-a57", "-bios", "default"]},
+                "extra": ["-machine", "virt", "-cpu", "cortex-a57"]},
     "loongarch64": {"qemu": "qemu-system-loongarch64", "mem": "1G",
                     "extra": ["-machine", "virt"]},
 }
@@ -106,7 +106,7 @@ CASES = (
     # production entry points.  `isolated-lifecycle` creates a real `.kcomp`
     # instance via `create_component(.., IsolatedNative)`, proves its
     # `kcomp_instance_create` ran inside the private AS with the ABI-transit
-    # window (args / config / out_state) and the per-instance runtime slot (tp),
+    # window (args / config / out_state) and the fresh entry's `tp == 0`,
     # proves the window is reachable only from that instance's AS, then stops it
     # through `stop_component` and proves `kcomp_instance_destroy` really ran
     # (window-side destroy marker) and the AS was retired.  The required
@@ -124,7 +124,7 @@ CASES = (
     # delivered DIRECTLY (shared Core mappings put the caller's descriptor and
     # buffers at the same VA->PA in the provider AS -- provider-side pointers are
     # the caller's, payloads read in place, output written in place), the provider
-    # runs on its own root/slot, and the Core root is restored after the
+    # runs on its own root, and the Core root is restored after the
     # transition.  `isolated-service-fault` proves a provider fault (load from an
     # unmapped VA) is contained: the caller gets a typed error, the instance is
     # Failed with a retired AS and released windows, and Core survives.
@@ -133,7 +133,7 @@ CASES = (
     # The failure/restart acceptance matrix.  Every row asserts the
     # AGENTS.md failure contract ("组件失败 = 逻辑死亡、物理驻留"): the instance
     # reaches its documented state, its AS is retired or released, the
-    # Core-prepared windows are returned, the runtime slot is cleared, the
+    # Core-prepared windows are returned, the
     # endpoint (if any) is dead, the caller gets a typed error, Core stays alive,
     # and the KernelNative path keeps working.
     #   isolated-load-reject    placement failure (17 MiB .bss beyond the image

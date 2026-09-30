@@ -544,7 +544,8 @@ mod tests {
     }
 
     /// 唯一支持面 = 诊断 / 只读查询 + `kcore_panic_escape`：面外（内存 / 调度 /
-    /// 设备）一律不冒充"支持的 import"；空名（ELF NULL 符号）不算 import。
+    /// 设备 / KernelNative 共享堆后端）一律不冒充"支持的 import"；空名（ELF NULL
+    /// 符号）不算 import。
     #[test]
     fn isolated_import_filter_is_the_single_supported_surface() {
         use crate::component::isolated_load::import_supported;
@@ -552,6 +553,8 @@ mod tests {
         assert!(import_supported(b"kcore_now"));
         assert!(import_supported(b"kcore_panic_escape"));
         assert!(!import_supported(b"kcore_memory_acquire"));
+        assert!(!import_supported(b"kcore_heap_alloc"));
+        assert!(!import_supported(b"kcore_heap_dealloc"));
         assert!(!import_supported(b"kcore_device_claim"));
         assert!(!import_supported(b"kcore_"));
         assert!(!import_supported(b"kcomp_instance_create"));

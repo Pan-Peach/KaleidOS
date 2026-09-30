@@ -1,10 +1,15 @@
-/* kcomp_kalloc.h —— per-instance runtime heap 的 C 接口（freestanding，无 libc）。
+/* kcomp_kalloc.h —— 私有执行域运行时堆的 C 接口（freestanding，无 libc）。
  *
- * 契约：docs/architecture/memory-and-heap.md §5 / §6。
+ * **保留为未来 Isolated / Sandboxed 的私有分配器后端**（当前没有生产调用方）：
+ * KernelNative 组件与 Core 同特权、同地址空间，普通 malloc/free 直接走
+ * `kcore_heap_alloc` / `kcore_heap_dealloc`（共享 Core 堆，契约 = Rust
+ * `GlobalAlloc`）；私有执行域才在实例自己的可写 `.data` / `.bss` 里放本分配器。
+ * 契约：docs/architecture/memory-and-heap.md §6。
+ *
  * 分配器实现是 **C**（`c/kalloc.c`），随每个 `.kcomp` 私有携带（"共享分配器
- * 实现代码，不是共享堆"）；Rust `GlobalAlloc`（`src/alloc.rs`）只是它的 adapter。
+ * 实现代码，不是共享堆"）；Rust 侧 facade 见 `src/heap.rs`。
  *
- * 用法（bootstrap，契约 §5）：
+ * 用法（未来私有域 bootstrap）：
  *   region = kcore_memory_acquire(...)            // 先有 backing，才发布堆
  *   heap   = kcomp_heap_place(region.base, region.len, backing_fn)
  *   ptr    = kcomp_heap_alloc(heap, size, align)  // 普通 malloc 不再进 Core

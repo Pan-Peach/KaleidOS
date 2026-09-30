@@ -224,7 +224,7 @@ BlockDevice（Interface）
 
 ## 5.5 内存：Core 管 Memory，不管 Heap
 
-**分层**：Core 只以 region / address-space 粒度提供 backing 与 mapping，**不**做内存记账——**不**记 region owner、**不**记 malloc/free 对象、**不**做 per-instance 字节计费或配额；每个 `ComponentInstance` 拥有独立 `HeapState`（共享的是分配器实现代码，不是堆；Core 对象堆仅供 Core 内部使用）。归属不由 Core 记：KernelNative 无隔离、无账本（没有可裁决的对象）；Isolated / Sandboxed 的归属与映射由该实例的地址空间 / 页表承载。KernelNative 的 region release / instance failure 只保证**逻辑失效**，已发布 backing 保留驻留、不承诺物理回收——没有归属记录，KernelNative 实例死亡也就没有可回收之物（这正是"逻辑死亡、物理驻留"的结果）。完整契约见 `docs/architecture/memory-and-heap.md`；访问窗口与 `kcore_device_claim` 同形（语义统一、表示不统一）。
+**分层**：Core 只以 region / address-space 粒度提供 backing 与 mapping，**不**做内存记账——**不**记 region owner、**不**记 malloc/free 对象、**不**做 per-instance 字节计费或配额；**堆是 runtime / deployment 策略，不是 Core 资源**（KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器；Core 对象堆仅供 Core 内部使用）。归属不由 Core 记：KernelNative 无隔离、无账本（没有可裁决的对象）；Isolated / Sandboxed 的归属与映射由该实例的地址空间 / 页表承载。KernelNative 的 region release / instance failure 只保证**逻辑失效**，已发布 backing 保留驻留、不承诺物理回收——没有归属记录，KernelNative 实例死亡也就没有可回收之物（这正是"逻辑死亡、物理驻留"的结果）。完整契约见 `docs/architecture/memory-and-heap.md`；访问窗口与 `kcore_device_claim` 同形（语义统一、表示不统一）。
 
 #### 5.5.1 内存三分法
 

@@ -156,7 +156,7 @@ lfs_t #1 / #2 / #3     →     FsInstance #1 / #2 / #3
 
 ### 6.1 动态内存：机制已在，只是 C 侧刻意不给
 
-- **Rust 组件现在就能动态分配**：`kcomp-sdk` 的 `alloc` feature 把 `#[global_allocator]` 接到 per-instance heap（`src/alloc.rs` → `crate::heap`；分配器是 freestanding C，backing 经 `kcore_memory_acquire` 取）；
+- **Rust 组件现在就能动态分配**：`kcomp-sdk` 的 `alloc` feature 把 `#[global_allocator]` 接到 KernelNative 共享 Core 堆（`src/alloc.rs` → `kcore_heap_alloc/dealloc`；部署形态决定的窄后端。Isolated / Sandboxed 的私有分配器后端 `src/heap.rs` + `c/kalloc.c` 当前未接线，backing 将经 `kcore_memory_acquire` 取）；
 - **C 组件现在不能**，不是缺机制，是两个刻意的选择：`kcomp_rt.c` 不朝 libc 扩张；C 没有 `#[global_allocator]`，要 malloc 得手写一层包在 `kcomp_heap_alloc` 上；
 - FatFs 今天不需要 malloc，纯因配置（`FF_FS_READONLY=1` / `FF_USE_LFN=0` / `FF_FS_EXFAT=0`）。一旦开写支持 / LFN / exFAT，它就会要 `ff_memalloc`。
 

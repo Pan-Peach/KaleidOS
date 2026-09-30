@@ -2,7 +2,7 @@
 //!
 //! # 参考（实现时）
 //!
-//! - **per-CPU 基址**：`TPIDR_EL1`（特权态）；runtime slot 走 `TPIDR_EL0`，二者分离。
+//! - **per-CPU 基址**：`TPIDR_EL1`（特权态），与其它架构状态分离。
 //! - **启动**：PSCI `CPU_ON`（SMC/HVC conduit）或平台释放机制；AP 从
 //!   `secondary_entry` 汇编进入。参考 Linux `arch/arm64/kernel/smp.c`。
 //! - **IPI**：GIC SGI（`ICC_SGI1R_EL1`）。

@@ -9,7 +9,7 @@
 //!   → 跨 AS 延续（`Outcome::Faulted`）→ 实例 `Failed` + 窗口归还。
 
 /// 直接 import 夹具的上报区偏移（与组件源码一致；窗口布局：args=0、out_state=32、
-/// runtime=64、report=512）。
+/// config=64、report=512）。
 const DIRECT_REPORT_OFF: usize = 512;
 
 /// `kcomp_isolated_direct` 上报槽号。
@@ -107,8 +107,8 @@ pub(crate) fn isolated_direct_imports() -> ! {
     if slot(R_SATP) != expected_satp || expected_satp == core_satp {
         fail("isolated-direct-imports: direct call did not run on the instance root");
     }
-    if slot(R_TP) != window.base + isolated_lifecycle::WINDOW_RUNTIME_OFF {
-        fail("isolated-direct-imports: runtime slot mismatch");
+    if slot(R_TP) != 0 {
+        fail("isolated-direct-imports: fresh entry did not observe tp == 0");
     }
 
     // 优雅停止：destroy 入口执行（写 R_LOG）后只退役 AS；窗口 backing 驻留。
@@ -149,6 +149,10 @@ pub(crate) fn isolated_panic_escape() -> ! {
         config: core::ptr::null(),
         config_len: 0,
     };
+    // panic 放弃路径（跨 AS trampoline 交回挂起调用者）必须恢复调用者的 `tp`：
+    // 非零哨兵值钉住它（本镜像无 TLS，tp 是普通执行状态）。
+    const CALLER_TP: usize = 0x707B;
+    set_tp(CALLER_TP);
     let error = match load::create_component(
         b"kcomp_isolated_direct",
         &args,
@@ -157,6 +161,10 @@ pub(crate) fn isolated_panic_escape() -> ! {
         Ok(_) => fail("isolated-panic-escape: panicking create was accepted"),
         Err(error) => error,
     };
+    if read_tp() != CALLER_TP {
+        fail("isolated-panic-escape: caller tp not restored");
+    }
+    set_tp(0);
     if error != ComponentLoadError::CreateFaulted {
         kernel::log!(
             "selftest",

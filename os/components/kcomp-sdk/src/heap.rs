@@ -1,16 +1,25 @@
-//! per-instance runtime heap（`docs/architecture/memory-and-heap.md` §5 / §6）。
+//! 私有执行域运行时堆后端（**未来 Isolated / Sandboxed**；当前未接线）。
 //!
 //! 分配器实现是 **freestanding C**（`c/kalloc.c` + `include/kcomp_kalloc.h`），
 //! 一份源码私有链进每个 `.kcomp`；这里只是 Rust 侧最小 facade：
 //!
 //! - [`Heap`]：**不透明句柄**（`[u8; 0]`，不镜像 C 布局——C 布局是私有实现）；
-//! - [`Backing`]：与 `kcore_memory_acquire` 同形的 backing 回调；
-//! - [`set_current_heap`] / [`current_heap`]：per-instance 解析器占位。
+//! - [`Backing`]：与 `kcore_memory_acquire` 同形的 backing 回调。
+//!
+//! # 这不是 KernelNative 的堆
+//!
+//! KernelNative 组件与 Core 同特权、同地址空间：它们的 `GlobalAlloc`
+//!（[`crate::alloc`]）直接走 Core 的共享堆后端 `kcore_heap_alloc/dealloc`，
+//! **没有** per-instance 堆，也**没有** ambient 堆指针。本模块的
+//! C 分配器保留为**未来私有执行域**（Isolated / Sandboxed）的运行时堆后端：
+//! 在实例自己的可写 `.data` / `.bss` 里 [`Heap::place`] 一段私有 backing（backing
+//! 由 `kcore_memory_acquire/release` 提供）。当前没有生产调用方；host 测试直接
+//! 驱动真实 C 实现（`src/tests/heap.rs`）。
 //!
 //! # 为什么是 C
 //!
-//! 契约 §6：分配器是"共享分配器**实现代码**，不是共享堆"。C 组件无法链接
-//! Rust，所以真相在 C；Rust `GlobalAlloc`（[`crate::alloc`]）只是 adapter。
+//! 契约 §6：私有域的分配器是"共享分配器**实现代码**，不是共享堆"。C 组件无法
+//! 链接 Rust，所以真相在 C；Rust facade 只是它的薄入口。
 //!
 //! # v1 边界（明确记录）
 //!
@@ -18,17 +27,12 @@
 //! - **整段 region release 不在范围内**：v1 不记 region 列表（Core 无账本，
 //!   契约 §4）。已接受的副作用：两段独立 `acquire` 的 region 若地址恰好相邻，
 //!   free list 上的空闲块可能跨 region 合并。
-//! - [`set_current_heap`] 是**占位**：真正的 per-instance runtime slot（`tp`，
-//!   契约 §5 / D2）落地前由调用方显式设置；null 堆 → 分配返回 null，
-//!   **绝不 panic**。
 //!
 //! # 句柄是"本执行域访问窗口"
 //!
 //! [`Heap::place`] 收到的 `base` 就是 Core 交付的本域 VA（与
 //! `kcore_device_claim` 的 MMIO 窗口同形）。Core 不记 heap 账；`HeapState`
 //! 的内部账完全归本模块 + C 分配器。
-
-use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// 不透明堆句柄：C 分配器的状态在 [`Heap::place`] 的 region 内，Rust 侧不解释。
 #[repr(C)]
@@ -101,22 +105,4 @@ impl Heap {
         // SAFETY: 句柄与 ptr 的契约由调用方保证（见 # Safety）。
         unsafe { kcomp_heap_realloc(self as *const Heap as *mut Heap, ptr, size, align) }
     }
-}
-
-/// 当前执行域的堆句柄（null = 未设置）。
-static CURRENT_HEAP: AtomicPtr<Heap> = AtomicPtr::new(core::ptr::null_mut());
-
-/// 设置当前执行域的堆句柄（null = 无堆；此时分配返回 null，绝不 panic）。
-///
-/// **占位**：真正的 per-instance runtime slot（`tp`，契约 §5 / D2）落地后由
-/// 运行时在组件入口 / 出口自动 save/restore；现在由 bootstrap / 调用方显式设置。
-/// 切换只影响本 adapter 的分配归属，**不构成访问强制**（协作式记账，不是鉴权
-/// 隔离），也不改变 panic 归属哪个 containment 边界。
-pub fn set_current_heap(heap: *mut Heap) {
-    CURRENT_HEAP.store(heap, Ordering::Release);
-}
-
-/// 当前执行域的堆句柄；未设置时为 null。
-pub fn current_heap() -> *mut Heap {
-    CURRENT_HEAP.load(Ordering::Acquire)
 }

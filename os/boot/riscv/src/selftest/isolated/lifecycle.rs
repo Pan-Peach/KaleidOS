@@ -59,12 +59,9 @@ pub(crate) unsafe fn life_slot(window_pa: usize, index: usize) -> usize {
 pub(crate) fn isolated_lifecycle() -> ! {
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
-    use kernel::component::isolated_lifecycle::{
-        self, ISOLATED_STACK_BASE, WINDOW_OUT_STATE_OFF, WINDOW_RUNTIME_OFF,
-    };
+    use kernel::component::isolated_lifecycle::{self, ISOLATED_STACK_BASE, WINDOW_OUT_STATE_OFF};
     use kernel::component::load;
     use kernel::component::registry;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
     use kernel::memory::address_space::{self, MapError};
 
@@ -166,12 +163,10 @@ pub(crate) fn isolated_lifecycle() -> ! {
     if slot(LIFE_R_VIEW_BASE) != window.base || slot(LIFE_R_VIEW_LEN) != window.size {
         fail("isolated-lifecycle: window view does not describe the instance window");
     }
-    // (c) runtime context：`tp` 就是 Core 为该实例安装的实例内 slot。
-    if slot(LIFE_R_TP) != window.base + WINDOW_RUNTIME_OFF {
-        fail("isolated-lifecycle: per-instance runtime slot (tp) not installed");
-    }
-    if runtime_slot::get_slots().lock().get(id) as usize != window.base + WINDOW_RUNTIME_OFF {
-        fail("isolated-lifecycle: runtime slot table disagrees with the window");
+    // (c) 新执行的 `tp` 显式清零：同步跨 AS 进入既不继承 Core 调用者的 `tp`，
+    //     也不携带任何实例上下文（tp 只是被透明保存 / 恢复的普通执行状态）。
+    if slot(LIFE_R_TP) != 0 {
+        fail("isolated-lifecycle: fresh entry did not observe tp == 0");
     }
 
     // (d) 窗口只属于本实例：另一个 AS 不映射这个 VA，窗口 VA 也不在 Core 的
@@ -262,11 +257,9 @@ pub(crate) fn failed_isolated_instance() -> Option<(ComponentId, AddressSpaceHan
 }
 
 /// 失败清理断言（**Core 中止实例**的路径：create / service 故障）：
-/// `Failed` + AS 退役 + Core 预置窗口（栈 / 实例窗口）归还 backing +
-/// runtime slot 清除。
+/// `Failed` + AS 退役 + Core 预置窗口（栈 / 实例窗口）归还 backing。
 pub(crate) fn assert_failure_released(case: &str, id: ComponentId, handle: AddressSpaceHandle) {
     use kernel::component::isolated_lifecycle;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
     use kernel::memory::address_space::{self, MapError};
 
@@ -285,21 +278,16 @@ pub(crate) fn assert_failure_released(case: &str, id: ComponentId, handle: Addre
             fail_case(case, "a Core-prepared window leaked");
         }
     }
-    if !runtime_slot::get_slots().lock().get(id).is_null() {
-        fail_case(case, "runtime slot was not cleared");
-    }
 }
 
 /// destroy 路径断言（成功或入口故障）：AS 退役 + Core 预置窗口**保持驻留**
-/// （AS 退役后不可再进入）+ runtime slot 清除。
+/// （AS 退役后不可再进入）。
 pub(crate) fn assert_destroy_path_retired(
     case: &str,
-    id: ComponentId,
     handle: AddressSpaceHandle,
     window: &VirtualRange,
 ) {
     use kernel::component::isolated_lifecycle;
-    use kernel::component::runtime_slot;
     use kernel::memory::address_space::{self, MapError};
 
     match address_space::prepare_activation(handle) {
@@ -314,9 +302,6 @@ pub(crate) fn assert_destroy_path_retired(
         Ok(Some(_))
     ) {
         fail_case(case, "destroy path must keep the prepared window resident");
-    }
-    if !runtime_slot::get_slots().lock().get(id).is_null() {
-        fail_case(case, "runtime slot was not cleared");
     }
 }
 
@@ -346,7 +331,7 @@ pub(crate) fn kernel_native_still_works() -> bool {
 }
 
 /// create 失败的公共终态断言：实例留 tombstone（`Failed`）、AS 退役、
-/// Core 预置窗口 / 栈归还、runtime slot 清空（半成品不留）。
+/// Core 预置窗口 / 栈归还（半成品不留）。
 pub(crate) fn assert_failed_isolated_cleanup() {
     match failed_isolated_instance() {
         Some((id, handle)) => assert_failure_released("isolated create failure", id, handle),

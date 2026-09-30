@@ -150,7 +150,7 @@ impl CpuRecord {
 /// 严格 CPU-local 的状态（contamination / IRQ 嵌套等）。
 ///
 /// 骨架先留空壳；其内部类型在对应模块暴露 per-CPU 结构后补入。
-/// **它不是组件 runtime slot**。
+/// **它不是 per-CPU 基址记录。**
 pub(crate) struct CpuLocal {
     _reserved: (),
 }
@@ -386,7 +386,7 @@ pub fn cpu_identity_ok(cpu: CpuId) -> bool {
 ///
 /// # Safety
 /// 只能由 arch 启动 trampoline 进入，且满足文档要求的执行环境（地址空间、栈、
-/// ABI、关中断、runtime slot = 0）。
+/// ABI、关中断、`tp = 0`）。
 pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
     let cpu = CpuId::from_raw(argument);
 

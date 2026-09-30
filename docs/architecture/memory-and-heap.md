@@ -1,25 +1,30 @@
 # memory 与 heap：Core Memory ↔ Runtime Heap
 
 > 本文件是**内存资源（Core）**与**堆（运行时）**的权威契约。
-> 一句话：**Core 管 Memory，不管 Heap，也不做内存记账。**
+> 一句话：**Core 管 Memory，不管 Heap；唯一例外是 KernelNative 共享 Core 堆的窄部署后端。**
 > 与 `AGENTS.md` 的不可违背原则一致；访问窗口与 `driver-model.md` 的 device claim **同形**——两者都返回「本执行域访问窗口」。
 
 ## 1. 分层
 
 | 层 | 负责 | 不负责 |
 |---|---|---|
-| **Core** | Memory：backing / mapping（按需给 backing；Isolated 时把 region 映射进该实例的 AS） | **owner 记账**、malloc/free 对象、堆内切分、字节计费 |
-| **Runtime**（`kcomp-sdk`，代码共享） | per-instance `HeapState` + 分配器实现（Rust `GlobalAlloc` / C `malloc`） | 拥有 backing、跨实例记账 |
+| **Core** | Memory：backing / mapping（按需给 backing；Isolated 时把 region 映射进该实例的 AS）；**KernelNative heap 后端**：`kcore_heap_alloc/dealloc` 薄接既有 `KernelAllocator` | **owner 记账**、malloc/free 对象账、堆内切分策略、字节计费 |
+| **Runtime**（`kcomp-sdk`，代码共享） | KernelNative：`GlobalAlloc` → Core 堆 ABI；私有执行域：per-instance `HeapState` + 分配器实现（Rust `GlobalAlloc` / C `malloc`），backing 经 `kcore_memory_acquire/release` | 拥有 backing、跨实例记账 |
 | **Component** | 只写 `Vec` / `Box` / `malloc` / `free` | 知道 allocator 存在 |
 
-判据（`AGENTS.md` 的 Core test）：`acquire` / `release` 进 Core，是因为**只有 Core 能**给全局 backing、只有 Core 能（Isolated 时）操作页表把 region 映射进实例 —— **不是因为要记账**。
+判据（`AGENTS.md` 的 Core test）：`acquire` / `release` 进 Core，是因为**只有 Core 能**给全局 backing、只有 Core 能（Isolated 时）操作页表把 region 映射进实例 —— **不是因为要记账**。`kcore_heap_alloc/dealloc` 进 Core 是**部署形态**的结果：KernelNative 与 Core 同特权、同地址空间，共享的就是 Core 自己的堆（受信代码，不新造边界）；它只是这个既有分配器的窄 C ABI，**不**成为通用 / 跨域内存 ABI。
+
+**两种堆后端（部署形态决定，不是组件的可选项）：**
+
+- **KernelNative**：`GlobalAlloc` → `kcore_heap_alloc/dealloc` → Core `KernelAllocator`（slab + buddy）。同特权、同 AS，没有可裁决的隔离对象，因此**不记 owner、不设配额、失败不撤销**。
+- **Isolated / Sandboxed**：私有分配器放在实例自己的可写 image（`.data` / `.bss`）里，backing 经 `kcore_memory_acquire/release` 以 region 粒度取得；**装载时显式拒绝** `kcore_heap_alloc/dealloc`（不静默回退）。
 
 **"谁拥有哪段内存"这件事，Core 不记：**
 
 - **KernelNative**：无隔离，记 owner 没有可裁决的对象，纯开销。
 - **Isolated / Sandboxed**：**归属与映射由该实例的地址空间 / 页表承载**——Core 已经拥有那个 AS，页表就是记录，不另立账本。
 
-普通 `malloc/free` **不进 Core**：在同一 instance 已有的 region 里完成；只有 backing 不够时才向 Core 请求一次 memory resource。反过来，**Core 也不为 heap 记任何账**——`HeapState` 的内部账完全归 runtime。
+普通 `malloc/free` 在 KernelNative 走共享 Core 堆 ABI（仍然不进任何 owner 账本）；私有执行域在同一 instance 已有的 region 里完成，只有 backing 不够时才向 Core 请求一次 memory resource。反过来，**Core 也不为 heap 记任何账**——`HeapState` 的内部账完全归 runtime。
 
 ## 2. Core ABI（域视图，无账本）
 
@@ -74,51 +79,49 @@ int32_t kcore_memory_release(const kcore_memory_view *view);
 - **instance 死亡**：
   - KernelNative → **无记录、不回收**。这正是"逻辑死亡、物理驻留"的结果；将来若要给 KernelNative 做物理回收，需要另立机制（那时才需要账本，不在本契约内）。
   - Isolated → **create / service 故障**（Core 中止实例）解映射并归还 Core 预置窗口 backing；**destroy 路径**（优雅停止或 destroy 入口故障）只退役 AS，窗口 backing 驻留（AS 退役后不可再进入）。页表页没有 teardown 接口，"不 leaked AS" = 退役后不再可达。
-- **重启 = 重新 instantiate**：全新组件、全新 `HeapState`，**绝不复用**失败堆。
+- **重启 = 重新 instantiate**：全新组件；KernelNative 共享 Core 堆（没有 per-instance 堆），私有执行域得到全新 `HeapState`，**绝不复用**失败堆。
 - 优雅销毁可把私有对象还进本地 free list；但**不得**释放仍通过 Direct binding / 任务参数暴露的存储。
 
 > **诚实边界**：KernelNative 的 release / failure 只保证**逻辑失效**，不承诺撤销裸指针或物理回收。真正的访问强制与安全复用依赖真实执行域（私有 AS + 页表）及 DMA 静默条件。
 
-## 5. 前置：per-instance runtime context（不可跳过）
+## 5. 私有执行域的 runtime context（不再有 runtime slot）
 
-> **这是本契约能成立的前提**，不是后续优化。
+> 早期的 per-instance runtime slot / `tp` ambient 指针机制**已删除**：它没有生产消费方——KernelNative 的堆绑定是**静态后端选择**（Core 共享堆），不是 per-instance 指针；保留只会制造假前提。`tp` 回归普通架构 / 任务执行状态（Core 在任务切换 / trap 时透明保存 / 恢复，全新上下文起点为 0），不再是组件运行时身份，也不承载堆句柄。
 
-每次 instantiate 都从 artifact **独立**放段 / 重定位，得到本组件自己的可写 image backing（`.data` / `.bss` 私有，含 `#[global_allocator]` 的内部 static）——**不存在**"同一份 image backing 被多个组件共享"的 image-global 状态，因此组件的可写 static 天然 per-component。per-instance runtime context 仍不可跳过：它把**运行时状态**（堆句柄 / opaque 状态）绑定到当前执行边界。
+- **KernelNative**：堆后端由部署形态静态选定（Core 共享堆），没有需要绑定的 per-instance 堆指针；`#[global_allocator]` 的 adapter static 天然 per-image（每次 instantiate 独立放段 / 重定位），但它只是适配器，不持有堆。
+- **Isolated / Sandboxed**（目标）：私有分配器状态放在实例自己的可写 image backing 内；每次 instantiate 都独立按域放置 / 重定位，因此天然 per-instance，不需要 Core 侧的 slot 表。私有分配器经 `kcore_memory_acquire/release` 取 backing（§6）；该组件可调用面尚未实现（§8）。
+- 组件的 create / task / Gate 入口与出口**不切换任何 ambient 堆指针**；执行边界只负责身份与 containment（见 `docs/architecture/component-lifecycle.md`）。
 
-- Core 为每个 instance 关联一个**稳定的 runtime slot**（内含 runtime 自有的 opaque 状态指针；Core **从不解释**它）。
-- 组件每个入口（create、task 切换、Gate 进入、**Direct provider 入口**、panic escape）都 **建立**正确的 runtime context；每个出口 / 非局部逃逸都 **恢复**。
-- Direct **不切 ambient 归属**（`deployment.md`），所以 Direct 的 SDK adapter 必须在调用 provider 前切到 provider 的**已注册 slot**。
-- 这是**协作式 KernelNative 记账，不是鉴权隔离**：slot 切换不得开启跨域访问，也不得改变"panic 归属哪个 containment 边界"。
+## 6. Runtime 分配器（部署后端）
 
-**不要**引入编译器 TLS 重定位，再把 `.kcomp` loader 变成 TLS linker。最小实现是**一个执行上下文寄存器**（RISC-V 上 `tp`；psABI 标记 `tp` 为 unallocatable/固定，编译器永不分配或写入它），由 trap/切换路径显式 save/restore。窄契约放 `abi/component.toml`，运行时访问与 bootstrap 放一个小 SDK runtime module。
-
-**bootstrap 不得递归分配**：首次进入 → 装好 slot（此时无堆指针）→ 直接 `kcore_memory_acquire` → 把 `HeapState` 与初始 region 元数据**放进这块 backing** → 发布 opaque 堆指针 → 才调用应用代码。
-
-## 6. Runtime 分配器（共享代码，非共享堆）
-
-- 用**侵入式、可合并的 free list，跨多段独立 acquire 的 region**。bump-only 不适合 malloc/free。
-- 元数据放在 region 内部，增长不需要额外分配。
-- 对齐 / 溢出检查（含元数据开销）；耗尽返回 null；分配器**自己不得 panic、不得分配**。
-- 普通 `free` 把块还给**本 HeapState**，不还给 Core（只有整个 region 不再需要才 `release`）。
-- 初版**不支持 IRQ 上下文分配**（明确记录，避免同 CPU 自旋锁死锁）。
-- **一份私有 freestanding C 实现**（`kcomp-sdk/c/`），Rust `GlobalAlloc` 只是它的 adapter。其函数**只链进各 `.kcomp`**，**绝不**进 Core 导出白名单。
-- "共享分配器代码" = **一份源码私有链进每个组件程序**，**不是**新建共享 Rust runtime，也不是把 allocator internals 变成 ABI。
+- **KernelNative**：不新造分配器——直接共享 Core 的 `KernelAllocator`（同一 `HEAP` + `SLABS`，见 `os/core/src/memory/mod.rs`）。SDK 的 `GlobalAlloc` adapter（`kcomp-sdk/src/alloc.rs`）只做 ABI 转发：`alloc` / `dealloc` 传**原始** `(size, align)`，`realloc` = alloc + copy + dealloc（旧 Layout 原样交回）。契约 = Rust `GlobalAlloc`：`dealloc` 的 layout 必须与那次成功 alloc 逐字一致（共享堆按 `Layout` 路由 slab / buddy，错配 = UB，与 C `malloc/free` 同类）。接口本身不取 registry / endpoint / task 锁、不打印、不做 ownership / 记账 / 撤销。
+- **Isolated / Sandboxed（目标，当前未接线）**：一份**私有 freestanding C 实现**（`kcomp-sdk/c/kalloc.c` + `include/kcomp_kalloc.h`，Rust facade 在 `kcomp-sdk/src/heap.rs`）：
+  - 用**侵入式、可合并的 free list**，跨多段独立 acquire 的 region；bump-only 不适合 malloc/free。
+  - 元数据放在 region 内部，增长不需要额外分配。
+  - 对齐 / 溢出检查（含元数据开销）；耗尽返回 null；分配器**自己不得 panic、不得分配**。
+  - 普通 `free` 把块还给**本 HeapState**，不还给 Core（只有整个 region 不再需要才 `release`）。
+  - 初版**不支持 IRQ 上下文分配**（明确记录，避免同 CPU 自旋锁死锁）。
+  - 该实现当前**保留但无生产调用方**（host 测试直接驱动真实 C 代码）；私有执行域落地时启用。它随 `.kcomp` 私有携带，**绝不**进 Core 导出白名单。
+- "共享分配器实现代码" = **一份源码私有链进每个组件程序**，**不是**新建共享 Rust runtime，也不是把 allocator internals 变成 ABI。
 - 增长可以几何式请求（128 → 256 → 512），但那是**请求容量**，不是物理占用承诺（今天最小一页）。
 
 ## 7. 明确不做
 
 - **不做 Core 侧内存账本**：无 owner 记录、无 region 注册表、无 region id、无 Retired 表。
 - **不做 per-instance 字节计费 / 配额**。
-- **不把帧 / 区域分配**（`alloc_region` / `vm_page_alloc`）暴露给组件——组件只经 `kcore_memory_acquire/release`。
+- **不把 `kcore_heap_alloc/dealloc` 当通用 / 跨域内存 ABI**：它只是 KernelNative 共享 Core 堆的部署后端；私有执行域装载时显式拒绝这两个符号（no silent fallback），未来的 Sandboxed / WASM 分配路径也不是它。
+- **不把帧 / 区域分配**（`alloc_region` / `vm_page_alloc`）暴露给组件——组件取 backing 只经 `kcore_memory_acquire/release`；KernelNative 的普通堆分配走 heap ABI，不直取 region。
 - **不为普通堆内存自动建立 DMA 依赖**：`resource/dma.rs` 记录的指针/范围**不构成**可安全释放的证明。启用物理复用前，先做 DMA 依赖/pinning 检查，或把 DMA 限定在专用 allocation 资源上。
 - **不把 `ResourceDomain` 变成第二张表或通用资源图**。
 - **不把每个 Core 内部 lease**（image 存储、Core 栈、页表页）翻成组件资源：它们保持既有内部资源。
 
 ## 8. 现状 / 目标
 
-- **现状**：`kcore_memory_acquire` / `kcore_memory_release`（`os/core/src/component/export.rs`）是 `memory::alloc_region` / `free_region_raw`（单一共享 buddy 堆 `MetadataHeap<32,12>`）上的薄 adapter，返回 / 接受 `kcore_memory_view` 域视图；旧的共享堆 `kcore_heap_alloc/dealloc` 已**原地删除**（无别名、无 legacy fallback）。组件面向的便利面是 SDK 的 `mem`（Rust）/ `kcomp_mem.h`（C）。`MemoryLease`（`os/core/src/memory/mod.rs`）是 Core 内部 region RAII，**无 owner 字段**；`alloc_region`/`free_region` 是 `pub(crate)`，刻意不在导出白名单。
-- **目标**（本契约）：SDK runtime 提供 per-instance `HeapState`（`kcomp-sdk` 的 `heap` / `alloc`）；Isolated 的归属由该实例的 AS / 页表承载，无隔离域不记归属。
-- **先行条件**：§5 的 per-instance runtime context（`tp`）。
+- **现状**：
+  - **Memory resource**：`kcore_memory_acquire` / `kcore_memory_release`（`os/core/src/component/export.rs`）是 `memory::alloc_region` / `free_region_raw`（单一共享 buddy 堆 `MetadataHeap<32,12>`）上的薄 adapter，返回 / 接受 `kcore_memory_view` 域视图。组件面向的便利面是 SDK 的 `mem`（Rust）/ `kcomp_mem.h`（C）。`MemoryLease`（`os/core/src/memory/mod.rs`）是 Core 内部 region RAII，**无 owner 字段**；`alloc_region`/`free_region` 是 `pub(crate)`，刻意不在导出白名单。
+  - **KernelNative heap**：`kcore_heap_alloc` / `kcore_heap_dealloc` 是既有 `memory::KernelAllocator`（slab + buddy）上的窄 C ABI，签名 / 语义由 `abi/core.toml` 单一来源生成；SDK feature `alloc` 的 `GlobalAlloc` adapter（`kcomp-sdk/src/alloc.rs`）直接走它。**不是**旧"通用共享堆 ABI"的复活：契约明确限定为 KernelNative 部署后端（Isolated / Sandboxed 装载显式拒绝）。
+  - **Isolated / Sandboxed heap**：私有 freestanding C 分配器（`kcomp-sdk/c/kalloc.c` + `src/heap.rs` facade）已实现且 host 测试，但**未接线**（无生产调用方）；Isolated 组件当前只拿 Core 预置的实例窗口（以 `kcore_memory_view`（`LOCAL_VA`）编码预交付），组件可调用的 `kcore_memory_acquire/release` 面**未做**（不在 import 白名单里，装载前显式拒绝）。
+- **目标**（本契约）：私有执行域在自己的可写 `.data` / `.bss` 里放置私有分配器，backing 经 `kcore_memory_acquire/release`；`kcore_memory_acquire/release` + `MemoryView` 保持**域感知 backing 机制**。Isolated 的归属由该实例的 AS / 页表承载，无隔离域不记归属；**没有** per-instance runtime slot / `tp` 堆指针（§5）。
 > **Isolated 回收的诚实边界**：私有 backing 的**别名排除**保证 A 不能经 identity 看见 B 的 backing（`kernel_mappings::publish_private_backing` 对**所有活着的** root 逐条摘除 + 后续 root 的计划排除）；但页表页没有 teardown 接口，"退役 AS"只保证**不可再进入**，不承诺物理回收。create / service 故障解映射并归还预置窗口 extent；destroy 路径窗口驻留。KernelNative 无隔离，失败只是逻辑失效。
 
-- 映射机制复用 `os/core/src/memory/address_space.rs`（`AddressSpaceManager` 已**有意重启**为 per-instance 表：`create_isolated_address_space_for`（共享 Core 映射 + 私有区）/ `map` / `unmap` / `mapping_exact` / `retire` / `prepare_activation` / `prepare_transition`，以及 `memory/kernel_mappings.rs` 的映射计划 + 私有 backing 别名排除事务，含 host 测试与 `Retired` 状态。私有 AS 切换机制在 `component/isolated.rs` + `arch/src/riscv/trampoline/`（最小 `satp` 切换汇编、普通 trap 路径往返、窄故障分派）；按域放段 / 逐段映射在 `component/isolated_load.rs`（页级权限分离 + 按域重定位 + 显式拒绝）；实例生命周期在 `component/isolated_lifecycle.rs`：私有 AS + 按域镜像 + **Core 预置的组件栈 / 实例内存窗口**（Core backing、零初始化、只映射在该实例的 AS 里）经 跨 AS trampoline 执行 `kcomp_instance_create` / `destroy` / `kcomp_service_dispatch`（service 的 caller 帧经共享 Core 映射直接交付——provider 原地读写 caller 缓冲，没有中间页；跨组件 transport 留给未来 I→I）。窗口生命周期两条路径：**create / service 故障 = Core 中止实例**（解映射并归还预置窗口 backing，半成品不留）；**destroy 路径**（入口成功或故障）只**退役 AS**，窗口 backing 保持驻留（phase 1 契约；AS 退役后不可再进入）。**重启 = 重新 instantiate**：每次全新按域放置到全新私有 backing / 全新 AS / 全新窗口 / 全新 slot（**没有** same-image backing 复用；同一 artifact 可并发多个组件）。**内存路径决定**：`kcore_memory_acquire/release` 的组件可调用面**未做**（不在 import 白名单里，装载前显式拒绝）——Isolated 组件只拿 Core 预置的实例窗口（以 `kcore_memory_view`（`LOCAL_VA`）编码预交付；表示仍是**实例内 VA**，与本节 §3 的域视图同形），归属由该实例的页表承载。上述行为由 ArchTest 在 RV64/RV32 证明（`isolated-*` 系列）。boot 的单一 `RUNTIME_VM` 仍是独立真相，`adopt` hook 尚未接线——不要把它当现成的 per-component AS 执行路径）。
+- 映射机制复用 `os/core/src/memory/address_space.rs`（`AddressSpaceManager` 已**有意重启**为 per-instance 表：`create_isolated_address_space_for`（共享 Core 映射 + 私有区）/ `map` / `unmap` / `mapping_exact` / `retire` / `prepare_activation` / `prepare_transition`，以及 `memory/kernel_mappings.rs` 的映射计划 + 私有 backing 别名排除事务，含 host 测试与 `Retired` 状态。私有 AS 切换机制在 `component/isolated.rs` + `arch/src/riscv/trampoline/`（最小 `satp` 切换汇编、普通 trap 路径往返、窄故障分派）；按域放段 / 逐段映射在 `component/isolated_load.rs`（页级权限分离 + 按域重定位 + 显式拒绝）；实例生命周期在 `component/isolated_lifecycle.rs`：私有 AS + 按域镜像 + **Core 预置的组件栈 / 实例内存窗口**（Core backing、零初始化、只映射在该实例的 AS 里）经 跨 AS trampoline 执行 `kcomp_instance_create` / `destroy` / `kcomp_service_dispatch`（service 的 caller 帧经共享 Core 映射直接交付——provider 原地读写 caller 缓冲，没有中间页；跨组件 transport 留给未来 I→I）。窗口生命周期两条路径：**create / service 故障 = Core 中止实例**（解映射并归还预置窗口 backing，半成品不留）；**destroy 路径**（入口成功或故障）只**退役 AS**，窗口 backing 保持驻留（phase 1 契约；AS 退役后不可再进入）。**重启 = 重新 instantiate**：每次全新按域放置到全新私有 backing / 全新 AS / 全新窗口（**没有** same-image backing 复用；同一 artifact 可并发多个组件；**没有** runtime slot 需要重建）。**内存路径决定**：`kcore_memory_acquire/release` 的组件可调用面**未做**（不在 import 白名单里，装载前显式拒绝）——Isolated 组件只拿 Core 预置的实例窗口（以 `kcore_memory_view`（`LOCAL_VA`）编码预交付；表示仍是**实例内 VA**，与本节 §3 的域视图同形），归属由该实例的页表承载。上述行为由 ArchTest 在 RV64/RV32 证明（`isolated-*` 系列）。boot 的单一 `RUNTIME_VM` 仍是独立真相，`adopt` hook 尚未接线——不要把它当现成的 per-component AS 执行路径）。

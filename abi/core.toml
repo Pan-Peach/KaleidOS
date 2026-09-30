@@ -385,6 +385,66 @@ name = "view"
 type = "*const MemoryView"
 
 [[function]]
+name = "kcore_heap_alloc"
+ret = "*mut u8"
+category = "KernelNative heap backend（部署后端；非通用内存 ABI）"
+c_category = "KernelNative heap backend（KernelNative 部署后端；Isolated import 拒绝）"
+category_group = "Memory resource（域视图，无账本）"
+doc = """
+**KernelNative 部署后端**：从 Core 共享堆（`memory::KernelAllocator`，slab + buddy）
+分配 `size` 字节、`align` 对齐的内存。契约 = Rust `GlobalAlloc::alloc`。
+
+**不是通用 / 跨域内存 ABI**：KernelNative 组件与 Core 同特权、同地址空间，所以共享
+同一个堆（受信部署形态）；Isolated / Sandboxed 的装载**显式拒绝**这两个符号
+（它们在自己的可写 image 里放私有分配器，backing 走
+`kcore_memory_acquire/release`）。Core 不做 per-component 记账：不记 owner、
+不设配额、失败不撤销（KernelNative 无隔离，记了也没有可裁决的对象）。
+
+`size == 0`、非法 layout（`align` 非 2 的幂 / 为 0 / 溢出）或堆耗尽 → 返回 null
+（**绝不 panic**）。成功返回的指针只能用 `kcore_heap_dealloc` 释放，且
+`(size, align)` 必须与本次调用逐字一致（与 C `malloc/free` 错配同类 = UB）。
+"""
+c_doc = """
+KernelNative 部署后端：从 Core 共享堆分配（size / align 同 Rust GlobalAlloc）。
+size == 0 / 非法 align / 耗尽 → NULL；释放必须用 kcore_heap_dealloc 且 (size, align)
+逐字一致。Isolated / Sandboxed 不解析该符号（私有分配器 + kcore_memory_acquire/release）。
+"""
+[[function.param]]
+name = "size"
+type = "usize"
+[[function.param]]
+name = "align"
+type = "usize"
+
+[[function]]
+name = "kcore_heap_dealloc"
+ret = "i32"
+category = "KernelNative heap backend（部署后端；非通用内存 ABI）"
+c_category = "KernelNative heap backend（KernelNative 部署后端；Isolated import 拒绝）"
+category_group = "Memory resource（域视图，无账本）"
+doc = """
+**KernelNative 部署后端**：归还一次 `kcore_heap_alloc` 的分配。契约 = Rust
+`GlobalAlloc::dealloc`——`(ptr, size, align)` 必须与那次成功 alloc **逐字一致**：
+共享堆按 `Layout` 路由 slab / buddy，**不得**从取整后的容量反推（违反 = UB）。
+
+成功 = `0`；失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` 非法或 `size == 0` 的
+layout——没有一次成功的 alloc 会产出这种形状）。释放只回到共享堆：不撤销、不记账。
+"""
+c_doc = """
+KernelNative 部署后端：归还一次 kcore_heap_alloc（ptr / size / align 必须逐字一致；
+Layout 驱动 slab / buddy 路由，不得从取整容量反推）。成功 = 0，失败 = -Errno。
+"""
+[[function.param]]
+name = "ptr"
+type = "*mut u8"
+[[function.param]]
+name = "size"
+type = "usize"
+[[function.param]]
+name = "align"
+type = "usize"
+
+[[function]]
 name = "kcore_console_write_byte"
 ret = "void"
 category = "Logging / diagnostics"

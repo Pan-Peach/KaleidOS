@@ -42,10 +42,17 @@ pub mod timer;
 pub mod trace;
 
 // 裸机目标才接管全局分配器；host test（std 环境）用 std 默认分配器。
+// KernelAllocator 是 ISA 中立的 Core 机制，所有裸机后端（RISC-V / x86_64 /
+// AArch64）共用；新增裸机 ISA 时必须在此登记，否则 `alloc` 无法链接。
 #[cfg(all(
     not(test),
     target_os = "none",
-    any(target_arch = "riscv32", target_arch = "riscv64")
+    any(
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "x86_64",
+        target_arch = "aarch64"
+    )
 ))]
 #[global_allocator]
 static ALLOCATOR: memory::KernelAllocator = memory::KernelAllocator;

@@ -68,6 +68,7 @@ use crate::resource::{RequestContext, device, dma, irq};
 use crate::sched;
 use crate::task::{self, TaskId, TaskState};
 use arch::{Console, ConsoleImpl};
+use core::alloc::GlobalAlloc;
 
 // ---------------------------------------------------------------------------
 // 导出表（v1 白名单；添加符号 = 破坏性 ABI 变更，必须同步 bump 文档）
@@ -174,6 +175,61 @@ extern "C" fn kcore_memory_release(view: *const MemoryView) -> i32 {
             Ok(()) => 0,
             Err(_) => Errno::EINVAL.code(),
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Category 1（续）：KernelNative heap backend（部署后端；非通用内存 ABI）
+// ---------------------------------------------------------------------------
+//
+// KernelNative 组件与 Core 同特权、同地址空间，所以共享同一个
+// `memory::KernelAllocator`——这是**部署形态决定的窄后端**，不是通用 / 跨域内存
+// ABI：Isolated / Sandboxed 的装载显式拒绝这两个符号（它们在自己的可写 image 里
+// 放私有分配器，backing 走 `kcore_memory_acquire/release`；见
+// `docs/architecture/memory-and-heap.md` §6）。两个实现体只碰共享堆：不取
+// registry / endpoint / task 锁，不打印（日志可能分配），不做 ownership / 记账 /
+// 撤销。
+
+/// KernelNative 部署后端：从 Core 共享堆分配（契约 = Rust `GlobalAlloc::alloc`）。
+///
+/// `size == 0`、非法 layout（`align` 非 2 的幂 / 为 0 / 溢出）或堆耗尽 → null
+/// （**绝不 panic**）。成功返回的指针只能用 [`kcore_heap_dealloc`] 释放，且
+/// `(size, align)` 必须与本次调用逐字一致（错配 = UB，与 C `malloc/free` 同类）。
+extern "C" fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    with_core_critical(|| {
+        if size == 0 {
+            return core::ptr::null_mut();
+        }
+        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: layout 已由 from_size_align 校验（size > 0、align 为合法 2 的幂）；
+        // KernelAllocator 是共享堆的 GlobalAlloc 实现，ptr/layout 匹配由调用方保证。
+        unsafe { memory::KernelAllocator.alloc(layout) }
+    })
+}
+
+/// 归还一次 [`kcore_heap_alloc`] 的分配（契约 = Rust `GlobalAlloc::dealloc`）。
+///
+/// `(ptr, size, align)` 必须与那次成功 alloc **逐字一致**：共享堆按 `Layout` 路由
+/// slab / buddy，**不得**从取整后的容量反推。成功 = `0`；失败 = `-Errno`
+/// （`EFAULT` 空指针 / `EINVAL` 非法或 `size == 0` 的 layout——没有一次成功 alloc
+/// 会产出这种形状）。释放只回到共享堆：不撤销、不记账。
+extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32 {
+    with_core_critical(|| {
+        if ptr.is_null() {
+            return Errno::EFAULT.code();
+        }
+        if size == 0 {
+            return Errno::EINVAL.code();
+        }
+        let Ok(layout) = core::alloc::Layout::from_size_align(size, align) else {
+            return Errno::EINVAL.code();
+        };
+        // SAFETY: 调用方保证 ptr 来自一次成功的 kcore_heap_alloc 且 layout 逐字一致
+        // （C ABI 契约，错配 = UB）。
+        unsafe { memory::KernelAllocator.dealloc(ptr, layout) };
+        0
     })
 }
 
@@ -1185,6 +1241,8 @@ mod tests {
             &b"kcore_trace_stats"[..],
             &b"kcore_memory_acquire"[..],
             &b"kcore_memory_release"[..],
+            &b"kcore_heap_alloc"[..],
+            &b"kcore_heap_dealloc"[..],
             &b"kcore_console_write_byte"[..],
             &b"kcore_log_line"[..],
             &b"kcore_machine_boot_hart"[..],
@@ -1697,6 +1755,55 @@ mod tests {
             }),
             Errno::EINVAL.code()
         );
+    }
+
+    /// `kcore_heap_alloc/dealloc`：KernelNative 共享堆后端往返（走**真实导出函数**，
+    /// 不是复刻逻辑）。
+    ///
+    /// 锁定契约语义：分配可写、返回指针对齐；`dealloc` 用**原始 layout** 归还后，
+    /// 同 layout 再分配必须复用同一块（slab / buddy 路由由 Layout 驱动）；
+    /// `size == 0` / 非法 align → null；null ptr / `size == 0` → `EINVAL`。
+    #[test]
+    fn heap_alloc_dealloc_roundtrip() {
+        let _g = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+
+        let alloc = resolve(b"kcore_heap_alloc").unwrap();
+        let alloc: extern "C" fn(usize, usize) -> *mut u8 = unsafe { core::mem::transmute(alloc) };
+        let dealloc = resolve(b"kcore_heap_dealloc").unwrap();
+        let dealloc: extern "C" fn(*mut u8, usize, usize) -> i32 =
+            unsafe { core::mem::transmute(dealloc) };
+
+        // 非法入口：size == 0 / align = 0 / 非 2 的幂 align → null（不 panic）。
+        assert!(alloc(0, 8).is_null());
+        assert!(alloc(16, 0).is_null());
+        assert!(alloc(16, 3).is_null());
+
+        // 小对象（slab 路径）：可写、按 align 对齐。
+        let ptr = alloc(24, 8);
+        assert!(!ptr.is_null(), "small alloc must succeed");
+        assert_eq!(ptr as usize % 8, 0);
+        // SAFETY: ptr 来自成功 alloc，覆盖 24 字节。
+        unsafe { ptr.write_bytes(0xA5, 24) };
+
+        // 原始 layout 归还后，同 layout 再分配复用同一块（Layout 驱动路由）。
+        assert_eq!(dealloc(ptr, 24, 8), 0);
+        let again = alloc(24, 8);
+        assert_eq!(again, ptr, "同 layout 的 slab 分配应复用释放的块");
+        assert_eq!(dealloc(again, 24, 8), 0);
+
+        // 大对象（buddy 路径，> 最大 slab class = 页/4）：同样按原始 layout 往返。
+        let big = alloc(8192, 16);
+        assert!(!big.is_null(), "large alloc must succeed");
+        assert_eq!(big as usize % 16, 0);
+        // SAFETY: big 来自成功 alloc，覆盖 8192 字节。
+        unsafe { big.write_bytes(0x5A, 8192) };
+        assert_eq!(dealloc(big, 8192, 16), 0);
+
+        // dealloc 入口校验：null ptr → EFAULT；size == 0 / 非法 layout → EINVAL。
+        assert_eq!(dealloc(core::ptr::null_mut(), 16, 8), Errno::EFAULT.code());
+        assert_eq!(dealloc(ptr, 0, 8), Errno::EINVAL.code());
+        assert_eq!(dealloc(ptr, 16, 3), Errno::EINVAL.code());
     }
 
     /// `kcore_trace_read`：一次只读一条、`out_next` 作续读游标、读空返回

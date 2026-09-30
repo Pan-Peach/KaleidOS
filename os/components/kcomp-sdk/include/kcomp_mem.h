@@ -4,8 +4,9 @@
  * `kcore_memory_acquire` / `kcore_memory_release`：取一段 backing，返回**本执行域
  * 访问窗口**（`struct kcore_memory_view`），释放凭同一个 view。
  *
- * **这不是 per-instance 堆**（那是 `kcomp_kalloc.h` 的职责）：这里是"向 Core 取
- * 一段 backing"的薄封装；普通 malloc/free 走 `kcomp_heap_*`，不该走它。
+ * **这不是堆**（KernelNative 的普通 malloc/free 走 `kcore_heap_alloc/dealloc`，
+ * 共享 Core 堆；私有执行域的后端是 `kcomp_kalloc.h`）：这里是"向 Core 取一段
+ * backing"的薄封装，也是 Isolated / Sandboxed 私有分配器的 backing 来源。
  *
  * 语义（与 Core 契约逐字一致，本层不添加策略）：
  *   - `kcomp_mem_alloc`：`min_len > 0`、`min_align` 为非零 2 的幂；成功 = 0 且写

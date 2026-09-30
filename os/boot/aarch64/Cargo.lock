@@ -21,6 +21,7 @@ name = "bootstrap"
 version = "0.1.0"
 dependencies = [
  "arch",
+ "fdt",
  "kernel",
  "spin",
 ]
@@ -31,6 +32,10 @@ version = "0.13.0"
 dependencies = [
  "spin",
 ]
+
+[[package]]
+name = "fdt"
+version = "0.2.0-alpha2"
 
 [[package]]
 name = "kernel"

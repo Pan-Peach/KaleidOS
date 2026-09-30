@@ -116,7 +116,7 @@ component wrapper
 
 ### 2.3 SDK adapter 层：Alloc / Log / Panic 的归属
 
-Core 管 Memory、不管 Heap：每个实例有自己的 `HeapState`（共享的是分配器实现代码），backing 以 region 粒度由 Core 提供（**不记 owner**）。adapter 层随 `.kcomp` 私有携带：
+Core 管 Memory、不管 Heap：堆是 **runtime / deployment 策略**，不是 Core 资源（KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器），backing 以 region 粒度由 Core 提供（**不记 owner**）。adapter 层随 `.kcomp` 私有携带：
 
 ```text
 GlobalAlloc   → component allocator adapter → kcore_memory_acquire / release → Core backing / mapping（无账本）
@@ -124,7 +124,7 @@ log crate     → component-local logger      → kcore_log_line
 panic handler → component panic adapter     → kcore_log_line（打印诊断）+ kcore_panic_escape（协作式逃逸）
 ```
 
-每次 instantiate 都从 artifact 独立放段 / 重定位，所以 `#[global_allocator]` 的 static 状态**天然 per-component**（各组件有自己的可写 image backing）；运行时仍经 per-instance runtime context（`tp`）绑定当前组件的堆句柄。C 组件没有这些 Rust adapter，只 `#include "kcomp.h"` 直调 `kcore_*`，外加 SDK 的 freestanding `mem*` / `strlen` / `strchr`；边界刻意收紧，**不朝 libc 扩张**，也不是 shared runtime。契约见 `docs/architecture/memory-and-heap.md`。
+每次 instantiate 都从 artifact 独立放段 / 重定位，所以 `#[global_allocator]` 的 static 状态**天然 per-component**（各组件有自己的可写 image backing）；堆绑定是 runtime / deployment 策略，**不再经 per-instance runtime slot 或 `tp`**（`tp` 只是架构 / 任务执行状态，见 `docs/modules/arch.md`）。C 组件没有这些 Rust adapter，只 `#include "kcomp.h"` 直调 `kcore_*`，外加 SDK 的 freestanding `mem*` / `strlen` / `strchr`；边界刻意收紧，**不朝 libc 扩张**，也不是 shared runtime。契约见 `docs/architecture/memory-and-heap.md`。
 
 ## 3. ResourceDomain —— 一个"视图"，不是一个对象
 
@@ -175,7 +175,7 @@ struct Mapping {               // DMA mapping（device-related）
 }
 ```
 
-> **ResourceDomain 不记受管内存**：Core 不做内存记账（无 region owner 记录），只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine；per-instance `HeapState` 属 runtime。契约见 `docs/architecture/memory-and-heap.md`。`ComponentId` 与 `DeviceId` 都是 identity（不是权限），所有权记录只存在于各资源表。
+> **ResourceDomain 不记受管内存**：Core 不做内存记账（无 region owner 记录），只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine；堆是 runtime / deployment 策略，不是 ResourceDomain 资源。契约见 `docs/architecture/memory-and-heap.md`。`ComponentId` 与 `DeviceId` 都是 identity（不是权限），所有权记录只存在于各资源表。
 
 > **DMA 归属模型（已决，刻意如此）**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报），并把 mapping 记在 device owner 名下。不建模"设备是不是 DMA master"（FDT 无可靠来源），按**协作式信任**处理。**未决**：组件可自行 claim PLIC 等设备，边界问题无人回答。规范契约见 `docs/architecture/driver-model.md`；记录见 `docs/development/testing.md` §6。
 

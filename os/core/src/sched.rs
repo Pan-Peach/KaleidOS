@@ -600,23 +600,6 @@ fn schedule_next_with_guard(
     // 在自己的调度帧里保存自己的深度（见 `containment::EscapeGuard::saved_depth`）。
     // 必须在 `enter_task` 归零**之前**捕获。
     let suspended_depth = containment::core_abi_depth();
-    // Runtime context（`docs/architecture/memory-and-heap.md` §5）：本调度帧自己的
-    // runtime slot 同样在切换期间挂起，切回来后重新装回 —— 与 `suspended_depth`
-    // 同一纪律（记录里也已保存 / 恢复；显式重装保证 stale 记录不会把 incoming
-    // 组件的 slot 漏进 Core 帧）。
-    let suspended_slot = CpuImpl::runtime_slot();
-    if let Some(owner) = next_owner {
-        // incoming 任务**每次**切换都重新建立 owner 当前的 runtime slot
-        // （0 = 无 slot）：切换从目标记录装载 `tp`，所以把 slot 预置进记录。
-        // 锁外执行 —— slot 表有自己的锁，不得与 cpu / task table 锁嵌套。
-        // SAFETY: [Category 2 — Data races] `to_ptr` 指向 incoming 任务的上下文
-        // Box（堆地址稳定）或锚点 Box（全局静态）；单 CPU、全部 Core 锁
-        // 已释放，切换前无其他执行触碰该记录。
-        CpuImpl::set_context_slot(
-            unsafe { &mut *to_ptr },
-            crate::component::runtime_slot::slot_of(owner),
-        );
-    }
 
     match next {
         Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
@@ -630,9 +613,8 @@ fn schedule_next_with_guard(
         CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
     }
     // 本帧被重新调度：恢复它离开 CPU 时的 Core ABI 深度（组件代码 = 0，
-    // 若它是在导出体内让出 CPU 则是导出体的深度）与 runtime slot。
+    // 若它是在导出体内让出 CPU 则是导出体的深度）。
     containment::resume_core_abi_depth(suspended_depth);
-    CpuImpl::install_runtime_slot(suspended_slot);
     Ok(())
 }
 

@@ -2,9 +2,9 @@
 //! 挂起的 Core 调用者（正常返回或被 Core trap 路径放弃）。
 //!
 //! 它**只**做机制：保存 / 恢复调用者的同步 ABI 现场（`ra/sp/gp/tp/s0-s11` +
-//! `sstatus` + `satp`）、按需切 `satp` + 全量 `sfence.vma`、装目标栈 / `tp`、
-//! 交付入口参数 `a0..a3`、收集返回值。它**不**知道 endpoint / service /
-//! lifecycle / registry，也没有 trap 帧、相位机、故障策略或 `stvec`
+//! `sstatus` + `satp`）、按需切 `satp` + 全量 `sfence.vma`、装目标栈并把
+//! `tp` 显式清零、交付入口参数 `a0..a3`、收集返回值。它**不**知道 endpoint /
+//! service / lifecycle / registry，也没有 trap 帧、相位机、故障策略或 `stvec`
 //! 切换：Core 代码 / 栈 / 全局状态在每个 Isolated AS 里 same VA → same PA
 //! （`memory/kernel_mappings.rs`），因此 `stvec` 保持 `trap::vector_address()`
 //! 不变、trap 走**普通** Core trap 路径。
@@ -14,14 +14,19 @@
 //! isolated::enter(ctx)
 //!    │  trampoline_enter(ctx)                    ← 保存调用者现场
 //!    │  satp = ctx.instance_satp（不同才切 + sfence）
-//!    │  sp = ctx.stack_top, tp = ctx.runtime_slot, sstatus.SIE = ctx.interrupts
+//!    │  sp = ctx.stack_top, tp = 0, sstatus.SIE = ctx.interrupts
 //!    └─ jalr ctx.entry ─────────────────────────► 组件运行（satp = 实例 root，
 //!                                                  stvec = 普通 Core 向量）
 //!    ┌─ 组件 ret ────────────────────────────────┘  result = Returned(a0)
 //!    ├─ Core trap 路径判定 Abandon ──► trampoline_return(ctx)   result = Faulted
 //!    ▼
-//! 恢复 ctx.caller_satp + sfence，恢复调用者 ABI 现场，ret 回 isolated::enter
+//! 恢复 ctx.caller_satp + sfence，恢复调用者 ABI 现场（含 `tp`），ret 回
+//! isolated::enter
 //! ```
+//!
+//! `tp` 只是被透明保存 / 恢复的架构执行状态（本镜像无 TLS）；**同步进入时不
+//! 继承挂起调用者的 `tp`**，而是显式清零——跨 AS 的新执行不带任何旧执行的
+//! 寄存器残留。
 //!
 //! **上下文记录是每次调用的**（由 `isolated::enter` 放在自己的栈帧里），不是
 //! 单例：嵌套调用（未来的 A→B）各自持有独立的 ctx，恢复顺序天然 LIFO。
@@ -49,8 +54,6 @@ pub struct Transition {
     pub entry: usize,
     /// 目标栈顶 VA（目标 AS 内可读写，16 字节对齐）。
     pub stack_top: usize,
-    /// 目标运行时的 runtime slot（写入 `tp`；0 = 无 slot）。
-    pub runtime_slot: usize,
     /// 目标初始是否开中断（`sstatus.SIE`）。
     pub interrupts_enabled: bool,
     /// 入口参数（Core 解释其含义，本模块只搬运）。
@@ -84,7 +87,6 @@ pub struct Context {
     instance_satp: usize,
     entry: usize,
     stack_top: usize,
-    runtime_slot: usize,
     interrupts: usize,
     arg0: usize,
     arg1: usize,
@@ -107,14 +109,14 @@ const _: () = {
     assert!(core::mem::offset_of!(Context, instance_satp) == 18 * core::mem::size_of::<usize>());
     assert!(core::mem::offset_of!(Context, entry) == 19 * core::mem::size_of::<usize>());
     assert!(core::mem::offset_of!(Context, stack_top) == 20 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, runtime_slot) == 21 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, interrupts) == 22 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, arg0) == 23 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, arg1) == 24 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, arg2) == 25 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, arg3) == 26 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, result) == 27 * core::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(Context, a0_result) == 28 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, interrupts) == 21 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, arg0) == 22 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, arg1) == 23 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, arg2) == 24 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, arg3) == 25 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, result) == 26 * core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(Context, a0_result) == 27 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<Context>() == 28 * core::mem::size_of::<usize>());
 };
 
 impl Context {
@@ -131,7 +133,6 @@ impl Context {
             instance_satp: transition.activation.satp(),
             entry: transition.entry,
             stack_top: transition.stack_top,
-            runtime_slot: transition.runtime_slot,
             interrupts: if transition.interrupts_enabled { 1 } else { 0 },
             arg0: transition.arg0,
             arg1: transition.arg1,

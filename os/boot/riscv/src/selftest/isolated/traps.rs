@@ -150,9 +150,17 @@ pub(crate) fn isolated_fault_abandon() -> ! {
         fail("isolated-fault-abandon: fault policy registration failed");
     }
 
+    // 放弃路径必须恢复挂起调用者的 `tp`（跨 AS trampoline 的共享恢复路径同时
+    // 服务正常返回与放弃）：用非零哨兵值钉住它。Core 无 TLS，tp 是普通执行状态。
+    const CALLER_TP: usize = 0x707A;
+    set_tp(CALLER_TP);
     let before = read_satp();
     let outcome = isolated::enter(transition);
     let after = read_satp();
+    if read_tp() != CALLER_TP {
+        fail("isolated-fault-abandon: caller tp not restored");
+    }
+    set_tp(0);
 
     if before != after {
         fail("isolated-fault-abandon: caller satp not restored");

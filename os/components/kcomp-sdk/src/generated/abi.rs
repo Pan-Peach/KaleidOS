@@ -273,6 +273,29 @@ unsafe extern "C" {
     /// 或 `(base, len)` 不是一次 acquire 产物的形状）。
     #[link_name = "kcore_memory_release"]
     pub fn kcore_memory_release(view: *const MemoryView) -> i32;
+    // -- KernelNative heap backend（KernelNative 部署后端；Isolated import 拒绝） --
+    /// **KernelNative 部署后端**：从 Core 共享堆（`memory::KernelAllocator`，slab + buddy）
+    /// 分配 `size` 字节、`align` 对齐的内存。契约 = Rust `GlobalAlloc::alloc`。
+    ///
+    /// **不是通用 / 跨域内存 ABI**：KernelNative 组件与 Core 同特权、同地址空间，所以共享
+    /// 同一个堆（受信部署形态）；Isolated / Sandboxed 的装载**显式拒绝**这两个符号
+    /// （它们在自己的可写 image 里放私有分配器，backing 走
+    /// `kcore_memory_acquire/release`）。Core 不做 per-component 记账：不记 owner、
+    /// 不设配额、失败不撤销（KernelNative 无隔离，记了也没有可裁决的对象）。
+    ///
+    /// `size == 0`、非法 layout（`align` 非 2 的幂 / 为 0 / 溢出）或堆耗尽 → 返回 null
+    /// （**绝不 panic**）。成功返回的指针只能用 `kcore_heap_dealloc` 释放，且
+    /// `(size, align)` 必须与本次调用逐字一致（与 C `malloc/free` 错配同类 = UB）。
+    #[link_name = "kcore_heap_alloc"]
+    pub fn kcore_heap_alloc(size: usize, align: usize) -> *mut u8;
+    /// **KernelNative 部署后端**：归还一次 `kcore_heap_alloc` 的分配。契约 = Rust
+    /// `GlobalAlloc::dealloc`——`(ptr, size, align)` 必须与那次成功 alloc **逐字一致**：
+    /// 共享堆按 `Layout` 路由 slab / buddy，**不得**从取整后的容量反推（违反 = UB）。
+    ///
+    /// 成功 = `0`；失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` 非法或 `size == 0` 的
+    /// layout——没有一次成功的 alloc 会产出这种形状）。释放只回到共享堆：不撤销、不记账。
+    #[link_name = "kcore_heap_dealloc"]
+    pub fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) -> i32;
     // -- Logging / diagnostics --
     #[link_name = "kcore_console_write_byte"]
     pub fn kcore_console_write_byte(byte: u8);

@@ -219,7 +219,6 @@ pub(crate) fn isolated_core_direct() -> ! {
         handle,
         isolated_core_direct_entry as *const () as usize,
         stack,
-        0,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {

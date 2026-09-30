@@ -55,8 +55,10 @@
 #include "kcomp_block.h"
 #include "kcomp_filesystem.h"
 
-/* raw backing 便利分配器（`kcore_memory_acquire/release` 的薄包装；与
- * `kcomp_kalloc.h` 的 per-instance 堆正交——普通 malloc/free 走后者）。 */
+/* raw backing 便利分配器（`kcore_memory_acquire/release` 的薄包装）。
+ * KernelNative 的普通 malloc/free 走 `kcore_heap_alloc/dealloc`（共享 Core 堆，
+ * 见 `generated/kcomp_abi.h`）；`kcomp_kalloc.h` 是未来私有执行域
+ *（Isolated / Sandboxed）的私有分配器后端，与这条 backing 路径正交。 */
 #include "kcomp_mem.h"
 
 #endif /* KCOMP_H */

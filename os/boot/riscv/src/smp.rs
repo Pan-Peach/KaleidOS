@@ -106,7 +106,7 @@ pub fn secondary_entry_address() -> usize {
 
 /// AP 的高半区 Rust 入口：由 `secondary64.S` 在长期地址空间生效后跳入。
 ///
-/// boot 只保证「站在高半区、关中断、runtime slot = 0、栈已就位」；其余
+/// boot 只保证「站在高半区、关中断、`tp = 0`、栈已就位」；其余
 /// （入口记录绑定、本地子系统、就绪 / 门控 / Online、空闲循环）全部交给 Core 的
 /// `smp::secondary_entry`。它**永不返回**。
 pub extern "C" fn secondary_main(argument: usize) -> ! {

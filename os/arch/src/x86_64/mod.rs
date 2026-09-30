@@ -2,8 +2,8 @@
 //!
 //! # 参考（实现时）
 //!
-//! - **per-CPU 基址**：kernel GS base（`IA32_GS_BASE` MSR）；runtime slot 走 FS base，
-//!   二者分离。`swapgs` 属于特权级入口机制，不是普通任务切换或每次中断都做。
+//! - **per-CPU 基址**：kernel GS base（`IA32_GS_BASE` MSR），与 FS base 等
+//!   架构状态分离。`swapgs` 属于特权级入口机制，不是普通任务切换或每次中断都做。
 //! - **启动**：INIT → INIT-deassert → SIPI(vector)，低内存 trampoline；
 //!   参考 Linux `arch/x86/kernel/smpboot.c` 与 DragonOS `arch/x86_64/smp`。
 //! - **IPI**：xAPIC ICR（或 x2APIC MSR）；门铃语义与 Core pending work 分离。

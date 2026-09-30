@@ -162,7 +162,7 @@ Hardware                                    目前只有 QEMU virt
 
 现状：一个 `ComponentId` 等于一个完整组件，`ComponentRecord` 直接持有 `loaded`；状态机是 `Declared→Resolved→Starting→Ready→Stopping→Stopped/Failed`。host 覆盖生命周期、停止与销毁、失败撤销、endpoint 永久失效；QEMU CoreTest `component-lifecycle`，ArchTest `isolated-lifecycle*` 与 `isolated-restart`。
 
-"一个 `.kcomp` 到多个独立实例"是真实支持，不只是 ID 类型上可表达：host 断言两次 instantiate 的 backing 独立且镜像区间不重叠，CoreTest `driver-multi-device`，ArchTest `isolated-restart` 接受同 artifact 的并发第二实例（各自 AS、backing、窗口、slot），`ram_blk_rw` 每实例独立 buffer。
+"一个 `.kcomp` 到多个独立实例"是真实支持，不只是 ID 类型上可表达：host 断言两次 instantiate 的 backing 独立且镜像区间不重叠，CoreTest `driver-multi-device`，ArchTest `isolated-restart` 接受同 artifact 的并发第二实例（各自 AS、backing、窗口），`ram_blk_rw` 每实例独立 buffer。
 
 缺口：unload 是 tombstone，不回收 backing；没有 drain 变体；没有意外退出的独立终态；endpoint、task、crosstalk、卸载后语义的完整矩阵没有逐个证明；组件自有任务入口 `kcomp_task` 不存在。
 

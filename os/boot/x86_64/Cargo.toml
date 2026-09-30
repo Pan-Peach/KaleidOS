@@ -2,6 +2,7 @@
 name = "bootstrap"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # Standalone workspace, like os/boot/riscv: managed kernel builds state their
 # profile explicitly and never rely on a default.

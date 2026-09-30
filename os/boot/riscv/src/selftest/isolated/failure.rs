@@ -5,9 +5,9 @@
 // 失败 / 重启矩阵。
 //
 // 逐条证明"组件失败 = 逻辑死亡、物理驻留"：每个阶段失败之后实例状态 / AS /
-// Core 预置窗口 / runtime slot / endpoint / caller 错误 / Core 存活 /
+// Core 预置窗口 / endpoint / caller 错误 / Core 存活 /
 // KernelNative 不受影响都有可观察断言；失败之后同一 artifact 可以**逻辑重启**
-// （全新实例、全新 AS / 窗口 / slot）。
+// （全新实例、全新 AS / 窗口）。
 // -----------------------------------------------------------------------
 
 /// 装载拒绝：放段失败 / import 白名单外符号在**声明实例之前**显式拒绝，不留
@@ -144,8 +144,8 @@ pub(crate) fn isolated_config_reject() -> ! {
     if read_satp() != core_satp {
         fail_case("isolated-config-reject", "Core satp not restored");
     }
-    // 实例在 create 入口执行之前就失败：tombstone + AS 退役 + 窗口归还 +
-    // slot 清除（与 create 失败同一套清理）。
+    // 实例在 create 入口执行之前就失败：tombstone + AS 退役 + 窗口归还
+    // （与 create 失败同一套清理）。
     assert_failed_isolated_cleanup();
     if !kernel_native_still_works() {
         fail_case(
@@ -158,7 +158,7 @@ pub(crate) fn isolated_config_reject() -> ! {
 
 /// prepare 失败：机制层的 `isolated::prepare` 在入口不可执行 / 栈不可写 /
 /// AS 已退役时**显式拒绝**，不改变实例真相（实例仍 Ready、AS 仍可激活、
-/// slot 原样、Core satp 不变）。
+/// Core satp 不变）。
 ///
 /// 生产 create 路径的 prepare 失败与其它 create 失败共用 `fail_with_as` 清理
 /// （已由 create-entry 故障用例证明）；本用例钉住拒绝判据本身 + "拒绝不动
@@ -170,7 +170,6 @@ pub(crate) fn isolated_prepare_reject() -> ! {
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
     use kernel::memory::address_space::{self, MapError, VirtualRange};
 
@@ -195,14 +194,12 @@ pub(crate) fn isolated_prepare_reject() -> ! {
     };
     let stack = isolated_lifecycle::stack_range();
     let window = isolated_lifecycle::window_range();
-    let slot = window.base + isolated_lifecycle::WINDOW_RUNTIME_OFF;
 
     // (a) 入口不在可执行映射：实例窗口是 R+W（不可执行）。
     match isolated::prepare(
         handle,
         window.base,
         stack,
-        slot,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {
@@ -221,7 +218,6 @@ pub(crate) fn isolated_prepare_reject() -> ! {
         handle,
         create_entry,
         unmapped_stack,
-        slot,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {
@@ -229,7 +225,7 @@ pub(crate) fn isolated_prepare_reject() -> ! {
         _ => fail_case("isolated-prepare-reject", "unmapped stack was not rejected"),
     }
 
-    // 实例真相不变：仍 Ready、AS 仍可激活、slot 原样、Core satp 不变。
+    // 实例真相不变：仍 Ready、AS 仍可激活、Core satp 不变。
     if registry_state(id) != Some(ComponentState::Ready) {
         fail_case(
             "isolated-prepare-reject",
@@ -238,9 +234,6 @@ pub(crate) fn isolated_prepare_reject() -> ! {
     }
     if address_space::prepare_activation(handle).is_err() {
         fail_case("isolated-prepare-reject", "address space became unusable");
-    }
-    if runtime_slot::get_slots().lock().get(id) as usize != slot {
-        fail_case("isolated-prepare-reject", "runtime slot changed");
     }
     if read_satp() != core_satp {
         fail_case("isolated-prepare-reject", "Core satp changed");
@@ -254,7 +247,6 @@ pub(crate) fn isolated_prepare_reject() -> ! {
         handle,
         create_entry,
         stack,
-        slot,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {
@@ -301,7 +293,7 @@ pub(crate) fn isolated_prepare_reject() -> ! {
 
 /// destroy 入口故障：`stop_component` → destroy 在私有 AS 里 trap →
 /// `DestroyPanicked`（EIO）、实例 `Failed`、AS 退役、Core 预置窗口保持驻留
-/// （与优雅停止同一纪律）、runtime slot 清除；**绝不自动重试析构**
+/// （与优雅停止同一纪律）；**绝不自动重试析构**
 /// （第二次 stop 被状态机拒绝，destroy 计数不变）。
 pub(crate) fn isolated_destroy_fault() -> ! {
     use kernel::component::containment::KcompCreateArgs;
@@ -375,13 +367,12 @@ pub(crate) fn isolated_destroy_fault() -> ! {
         );
     }
 
-    // Then：Failed + AS 退役 + 窗口驻留 + slot 清除。
+    // Then：Failed + AS 退役 + 窗口驻留。
     if registry_state(id) != Some(kernel::component::ComponentState::Failed) {
         fail_case("isolated-destroy-fault", "instance was not marked Failed");
     }
     assert_destroy_path_retired(
         "isolated-destroy-fault",
-        id,
         handle,
         &isolated_lifecycle::window_range(),
     );

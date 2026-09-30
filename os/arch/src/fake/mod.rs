@@ -28,6 +28,13 @@ std::thread_local! {
     static LAST_SWITCH_IRQ_ENABLED: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
+// Host-only observable `tp`: the fake switch saves / restores it exactly like a
+// real `__switch` (register #4 in `FakeContext`), so host tests can pin that `tp`
+// is plain task execution state, preserved across switches.
+std::thread_local! {
+    static CURRENT_TP: Cell<usize> = const { Cell::new(0) };
+}
+
 // SMP 骨架：host 用一个线程本地绑定模拟「本 CPU 的 CPU-local 状态」。
 // 真机语义（sscratch / GS / TPIDR_EL1 / KSAVE）见各 ISA 后端；host 只作为
 // 可观察的占位，让 Core 的 per-CPU 骨架在 host 上可编译、可测试。
@@ -87,7 +94,10 @@ impl CpuArch for Fake {
 
     fn context_switch(from: &mut Self::Context, to: &Self::Context) {
         LAST_SWITCH_IRQ_ENABLED.with(|last| last.set(Some(irq_enabled_for_test())));
-        // Placeholder for context switch logic
+        // Model the real `__switch`: save the running `tp` into the outgoing
+        // record and load the incoming record's `tp` (x4 = tp, the same shape
+        // as `RiscvContext`).  `tp` is plain execution state here.
+        CURRENT_TP.with(|tp| from.regs[4] = tp.replace(to.regs[4]));
         println!("Switching context from {:?} to {:?}", from, to);
     }
 
@@ -98,20 +108,6 @@ impl CpuArch for Fake {
         };
         ctx.regs[2] = stack_top; // sp
         ctx
-    }
-
-    fn runtime_slot() -> usize {
-        // host 无真实寄存器 / 无真实执行：没有「当前执行的 tp」，恒为 0（无 slot）。
-        0
-    }
-
-    fn install_runtime_slot(_slot: usize) {
-        // host 无真实寄存器：no-op 占位（真机语义见 Riscv 实现）。
-    }
-
-    fn set_context_slot(context: &mut Self::Context, slot: usize) {
-        // x4 = tp（与 Riscv 的上下文记录同形）；host 只作为测试可观察的占位。
-        context.regs[4] = slot;
     }
 
     fn init_cpu() {
@@ -263,5 +259,42 @@ impl Console for Fake {
 impl SystemReset for Fake {
     fn system_reset(_reset_type: ResetType) -> ! {
         panic!("fake system reset requested");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tp` 是**普通任务执行状态**：上下文切换精确保存 / 恢复它，example 哨兵值
+    /// A→B→A 之后逐字恢复；切换路径从不把它当作组件身份或上下文线索。
+    #[test]
+    fn context_switch_restores_tp_exactly() {
+        const SENTINEL_A: usize = 0x0A11_CE0A;
+        const SENTINEL_B: usize = 0x0B0B_0B0B;
+
+        let mut anchor = <Fake as CpuArch>::new_context(0, 0);
+        let mut a = <Fake as CpuArch>::new_context(0x1000, 0x8000_0000);
+        let mut b = <Fake as CpuArch>::new_context(0x2000, 0x9000_0000);
+        a.regs[4] = SENTINEL_A;
+        b.regs[4] = SENTINEL_B;
+
+        // Given：从锚点切入 A；CPU 的 tp = A 记录里的哨兵值。
+        Fake::context_switch(&mut anchor, &a);
+        assert_eq!(CURRENT_TP.with(Cell::get), SENTINEL_A);
+
+        // When：A → B。Then：tp = B；A 的记录保留自己的值。
+        Fake::context_switch(&mut a, &b);
+        assert_eq!(CURRENT_TP.with(Cell::get), SENTINEL_B);
+        assert_eq!(a.regs[4], SENTINEL_A, "outgoing record keeps its own tp");
+
+        // When：B → A。Then：tp 精确恢复为 A 的哨兵值；B 的记录保留自己的值。
+        Fake::context_switch(&mut b, &a);
+        assert_eq!(CURRENT_TP.with(Cell::get), SENTINEL_A);
+        assert_eq!(b.regs[4], SENTINEL_B, "outgoing record keeps its own tp");
+
+        // 再切回 B：两个哨兵都被逐字恢复，而不是碰巧等于初值 0。
+        Fake::context_switch(&mut a, &b);
+        assert_eq!(CURRENT_TP.with(Cell::get), SENTINEL_B);
     }
 }

@@ -1,13 +1,16 @@
-//! per-instance heap host 测试：直接走**真实 C 实现**（build.rs 编出的
-//! `libkalloc.a`），不是 Rust 复刻。覆盖：split / coalesce、对齐（含 > 16）、
-//! 溢出、OOM、realloc 语义（保留内容 / 失败保旧块）、backing 增长路径、
-//! 两个独立堆互不干扰、`GlobalAlloc` adapter 经 `set_current_heap` 路由。
+//! 私有域堆后端（C 实现）+ KernelNative `GlobalAlloc` adapter 的 host 测试。
+//!
+//! - [`Heap`] facade 直接走**真实 C 实现**（build.rs 编出的 `libkalloc.a`），不是
+//!   Rust 复刻。覆盖：split / coalesce、对齐（含 > 16）、溢出、OOM、realloc 语义
+//!   （保留内容 / 失败保旧块）、backing 增长路径、两个独立堆互不干扰。
+//! - adapter（[`KernelHeap`]）走 `test_support` 的 `kcore_heap_alloc/dealloc` 替身，
+//!   钉死 ABI 契约：原始 layout 逐字传递、realloc = alloc + copy + dealloc。
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::alloc::InstanceHeap;
+use crate::alloc::KernelHeap;
 use crate::heap::Heap;
 
 /// 4096 对齐的静态 arena（分配器会写它 → 必须 UnsafeCell）。
@@ -324,7 +327,85 @@ fn heap_growth_calls_backing_geometrically() {
 }
 
 // ---------------------------------------------------------------------------
-// 两个独立堆 / GlobalAlloc adapter
+// KernelNative GlobalAlloc adapter（Core 共享堆 ABI：kcore_heap_alloc/dealloc）
+// ---------------------------------------------------------------------------
+
+/// alloc/dealloc/realloc 都经 Core 堆 ABI；dealloc 必须拿**原始 layout**，
+/// realloc = alloc + copy + dealloc 旧块（不是把取整容量传回去）。
+#[test]
+fn global_alloc_adapter_roundtrips_through_core_heap_abi() {
+    let _guard = crate::test_support::lock();
+    crate::test_support::reset_script();
+    let adapter = KernelHeap;
+    let layout = Layout::from_size_align(32, 8).unwrap();
+
+    // alloc：size / align 原样进入 Core ABI。
+    let p = unsafe { adapter.alloc(layout) };
+    assert!(!p.is_null());
+    assert_eq!(
+        crate::test_support::last_heap_alloc(),
+        Some(crate::test_support::HeapAllocRecord { size: 32, align: 8 })
+    );
+    for i in 0..32 {
+        unsafe { p.add(i).write(i as u8) };
+    }
+
+    // realloc：新块走 Core alloc，旧块按**原始 layout** 归还，前缀内容保留。
+    let q = unsafe { adapter.realloc(p, layout, 128) };
+    assert!(!q.is_null());
+    for i in 0..32 {
+        assert_eq!(unsafe { q.add(i).read() }, i as u8);
+    }
+    assert_eq!(
+        crate::test_support::last_heap_dealloc(),
+        Some(crate::test_support::HeapDeallocRecord {
+            ptr: p as usize,
+            size: 32,
+            align: 8,
+        }),
+        "realloc 必须用旧 layout 归还旧块"
+    );
+
+    // dealloc：与前一次成功 alloc 逐字一致。
+    unsafe { adapter.dealloc(q, Layout::from_size_align(128, 8).unwrap()) };
+    assert_eq!(
+        crate::test_support::last_heap_dealloc(),
+        Some(crate::test_support::HeapDeallocRecord {
+            ptr: q as usize,
+            size: 128,
+            align: 8,
+        })
+    );
+}
+
+/// Core 堆耗尽 → alloc 返回 null、realloc 返回 null 且**旧块原样保留**
+/// （GlobalAlloc 契约；adapter 不 panic、不擅自释放）。
+#[test]
+fn global_alloc_adapter_surfaces_core_exhaustion_as_null() {
+    let _guard = crate::test_support::lock();
+    crate::test_support::reset_script();
+    let adapter = KernelHeap;
+    let layout = Layout::from_size_align(16, 8).unwrap();
+
+    crate::test_support::script_heap_exhaustion();
+    assert!(unsafe { adapter.alloc(layout) }.is_null());
+
+    crate::test_support::reset_script();
+    let p = unsafe { adapter.alloc(layout) };
+    assert!(!p.is_null());
+    unsafe { p.write(0x5A) };
+
+    crate::test_support::script_heap_exhaustion();
+    assert!(unsafe { adapter.realloc(p, layout, 64) }.is_null());
+    assert_eq!(unsafe { p.read() }, 0x5A, "realloc 失败必须保留旧块");
+
+    // 清理：耗尽脚本已消费（非 0 值在下次 alloc 仍会触发，先复位再释放）。
+    crate::test_support::reset_script();
+    unsafe { adapter.dealloc(p, layout) };
+}
+
+// ---------------------------------------------------------------------------
+// 两个独立堆互不干扰
 // ---------------------------------------------------------------------------
 
 arena!(ARENA_TWO_A, 4096);
@@ -364,38 +445,4 @@ fn independent_heaps_do_not_interfere() {
         (*heap_b).free(b2);
         (*heap_b).free(b);
     }
-}
-
-arena!(ARENA_ADAPTER, 4096);
-backing_fn!(backing_adapter, POOL_ADAPTER, 4096, false);
-
-#[test]
-fn global_alloc_adapter_routes_to_current_heap() {
-    let heap = unsafe { Heap::place(ARENA_ADAPTER.base(), 4096, backing_adapter) };
-    assert!(!heap.is_null());
-    let layout = Layout::from_size_align(32, 8).unwrap();
-    let adapter = InstanceHeap;
-
-    // 未设置堆 → 返回 null（绝不 panic）。
-    crate::heap::set_current_heap(core::ptr::null_mut());
-    assert!(unsafe { adapter.alloc(layout) }.is_null());
-
-    // 设置后 → 路由到该堆；realloc 保留内容。
-    crate::heap::set_current_heap(heap);
-    let p = unsafe { adapter.alloc(layout) };
-    assert!(!p.is_null());
-    for i in 0..32 {
-        unsafe { p.add(i).write(i as u8) };
-    }
-    let q = unsafe { adapter.realloc(p, layout, 128) };
-    assert!(!q.is_null());
-    for i in 0..32 {
-        assert_eq!(unsafe { q.add(i).read() }, i as u8);
-    }
-    unsafe { adapter.dealloc(q, Layout::from_size_align(128, 8).unwrap()) };
-
-    // 复位后 → 又返回 null。
-    crate::heap::set_current_heap(core::ptr::null_mut());
-    assert_eq!(crate::heap::current_heap(), core::ptr::null_mut());
-    assert!(unsafe { adapter.alloc(layout) }.is_null());
 }

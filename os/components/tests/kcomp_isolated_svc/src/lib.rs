@@ -20,7 +20,7 @@
 //! ```text
 //! args      → 实例窗口基址 + 0（KcompCreateArgs）
 //! out_state → 实例窗口基址 + 32（usize 槽；本组件写上报区地址，Core 读回）
-//! tp        = 实例窗口基址 + 64（Core 安装的 per-instance runtime slot）
+//! tp        = 0（同步跨 AS 进入的显式清零：tp 是普通执行状态，不承载实例上下文）
 //! ```
 //!
 //! 本组件把 `*out_state` 指向**上报区**（`args + REPORT_OFF`）；Core 把它记成

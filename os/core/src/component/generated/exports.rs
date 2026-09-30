@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 42] = [
+pub(super) static EXPORTS: [Export; 44] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -48,6 +48,22 @@ pub(super) static EXPORTS: [Export; 42] = [
         address: ExportAddress({
             let implementation: extern "C" fn(*const MemoryView) -> i32 =
                 super::kcore_memory_release;
+            implementation as *const ()
+        }),
+    },
+    // Category 1（续）：KernelNative heap backend（部署后端；非通用内存 ABI）
+    Export {
+        name: b"kcore_heap_alloc",
+        address: ExportAddress({
+            let implementation: extern "C" fn(usize, usize) -> *mut u8 = super::kcore_heap_alloc;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_heap_dealloc",
+        address: ExportAddress({
+            let implementation: extern "C" fn(*mut u8, usize, usize) -> i32 =
+                super::kcore_heap_dealloc;
             implementation as *const ()
         }),
     },

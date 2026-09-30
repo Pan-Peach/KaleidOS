@@ -1,7 +1,7 @@
 //! loongarch64 CPU backend（骨架；实现待手写）。
 //!
-//! per-CPU 基址放在显式保留的一个 `CSR.KSAVE` 槽；`$tp` 仍留给组件 runtime slot。
-//! 所有方法体 `todo!()`。参考 DragonOS `arch/loongarch64` 与 Linux `arch/loongarch`。
+//! per-CPU 基址放在显式保留的一个 `CSR.KSAVE` 槽。所有方法体 `todo!()`。
+//! 参考 DragonOS `arch/loongarch64` 与 Linux `arch/loongarch`。
 
 use crate::cpu::{CpuId, LocalInterruptHandler};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
@@ -38,18 +38,6 @@ impl CpuArch for Loongarch64 {
 
     fn enable_irq() {
         todo!("loongarch64: enable global interrupts on this CPU")
-    }
-
-    fn runtime_slot() -> usize {
-        todo!("loongarch64: read the runtime slot ($tp; separate from per-CPU KSAVE)")
-    }
-
-    fn install_runtime_slot(_slot: usize) {
-        todo!("loongarch64: install the runtime slot")
-    }
-
-    fn set_context_slot(_context: &mut Self::Context, _slot: usize) {
-        todo!("loongarch64: store the runtime slot in a context record")
     }
 
     fn disable_irq() -> Self::IrqFlags {

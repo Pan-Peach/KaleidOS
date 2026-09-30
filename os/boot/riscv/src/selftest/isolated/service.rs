@@ -285,7 +285,7 @@ pub(crate) fn isolated_service() -> ! {
     {
         fail("isolated-service: provider could not read the caller payload in place");
     }
-    // provider 在私有 AS 里运行：satp = 实例 root、tp = Core 安装的 runtime slot。
+    // provider 在私有 AS 里运行：satp = 实例 root、tp = 0（同步进入的显式清零）。
     let expected_satp = match address_space::prepare_activation(provider.handle) {
         Ok(activation) => activation.token().satp(),
         Err(_) => fail("isolated-service: prepare_activation failed"),
@@ -293,8 +293,8 @@ pub(crate) fn isolated_service() -> ! {
     if slot(SVC_R_SATP) != expected_satp || expected_satp == core_satp {
         fail("isolated-service: provider did not run on its private root");
     }
-    if slot(SVC_R_TP) != window.base + isolated_lifecycle::WINDOW_RUNTIME_OFF {
-        fail("isolated-service: provider runtime slot (tp) mismatch");
+    if slot(SVC_R_TP) != 0 {
+        fail("isolated-service: fresh entry did not observe tp == 0");
     }
 
     // Then 3：**共享 Core 映射**让 caller 的缓冲在 provider 的 AS 里直接有效
@@ -366,7 +366,6 @@ pub(crate) fn isolated_service_fault() -> ! {
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
-    use kernel::component::runtime_slot;
     use kernel::component::ComponentState;
     use kernel::errno::Errno;
 
@@ -453,7 +452,7 @@ pub(crate) fn isolated_service_fault() -> ! {
     }
 
     // Then 3：实例逻辑死亡 + AS 退役 + Core 预置窗口（栈 / 窗口）归还 +
-    // runtime slot 清空 + endpoint 永久失效 + inflight 归还。
+    // endpoint 永久失效 + inflight 归还。
     if registry::get_registry()
         .lock()
         .get(provider.id)
@@ -464,9 +463,6 @@ pub(crate) fn isolated_service_fault() -> ! {
     }
     if registry::get_registry().lock().active_calls(provider.id) != 0 {
         fail("isolated-service-fault: inflight was not returned");
-    }
-    if !runtime_slot::get_slots().lock().get(provider.id).is_null() {
-        fail("isolated-service-fault: runtime slot was not cleared");
     }
     match address_space::prepare_activation(provider.handle) {
         Err(kernel::memory::address_space::MapError::Retired) => {}

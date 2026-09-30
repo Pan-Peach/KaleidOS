@@ -12,7 +12,7 @@
 
 - `generated/abi.rs`：`InterfaceKind`（`#[repr(u32)]`：Device=0 / Service=1 / Policy=2）、`KcompCreateArgs`（`#[repr(C)]` + static 尺寸 / 偏移断言）、`KCOMP_ABI`（`b"KCOMPABI"`）、`TraceRecordAbi`（48B）、`TraceStatsAbi`（40B）、`IrqHandler`、`ABSENT`、`KIND_*`（1–11，连续编号）。
 - `generated/errno.rs`：完整 `Errno`（`#[repr(i32)]`，1–133；41 与 58 未用；`ENOTSUP`=95 与 `EOPNOTSUPP` 同值）。
-- `component/generated/exports.rs`：`EXPORTS: [Export; 40]`——`kcore_*` 名字到函数地址的绑定表。**注意它在 `component/generated/`，不在本目录。**
+- `component/generated/exports.rs`：`EXPORTS: [Export; 44]`——`kcore_*` 名字到函数地址的绑定表。**注意它在 `component/generated/`，不在本目录。**
 
 ## 明确不做
 
@@ -25,7 +25,7 @@
 | 文件 | 内容 |
 |---|---|
 | `os/core/src/generated/mod.rs` / `abi.rs` / `errno.rs` | 生成的 Rust ABI / errno |
-| `os/core/src/component/generated/exports.rs` | 生成的 40 项导出表 |
+| `os/core/src/component/generated/exports.rs` | 生成的 44 项导出表 |
 | `abi/core.toml` / `abi/component.toml` / `abi/errno.toml` | **源** schema（生成输入） |
 | `tools/kabi/kabi_gen.py` | 生成器（`generate` / `check` / `selftest`；`make abi-gen` / `make abi-check`） |
 

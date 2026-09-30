@@ -20,14 +20,13 @@
 .equ T_INSTANCE_SATP, 144
 .equ T_ENTRY, 152
 .equ T_STACK, 160
-.equ T_SLOT,  168
-.equ T_IRQ,   176
-.equ T_ARG0,  184
-.equ T_ARG1,  192
-.equ T_ARG2,  200
-.equ T_ARG3,  208
-.equ T_RESULT, 216
-.equ T_A0,    224
+.equ T_IRQ,   168
+.equ T_ARG0,  176
+.equ T_ARG1,  184
+.equ T_ARG2,  192
+.equ T_ARG3,  200
+.equ T_RESULT, 208
+.equ T_A0,    216
 .equ SIE_BIT, 2
 
 .section .text.trampoline,"ax"
@@ -69,7 +68,9 @@ trampoline_enter:
     # s0 = ctx（组件按 C ABI 必须保持 s0；返回点据此写入结果）。
     mv s0, a0
     ld sp, T_STACK(s0)
-    ld tp, T_SLOT(s0)
+    # 新执行显式清零 tp：跨 AS 进入不继承挂起调用者的 tp（本镜像无 TLS；
+    # tp 只是被透明保存 / 恢复的架构执行状态）。调用者 tp 已在上面保存。
+    li tp, 0
     ld t0, T_IRQ(s0)
     beqz t0, 2f
     csrs sstatus, SIE_BIT

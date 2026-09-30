@@ -127,7 +127,7 @@ int32_t kcomp_instance_destroy(void *state);
   组件侧不要手写 `const E*: i32`：Rust 用 `kcomp_sdk::Errno` / `Result<T>`，C 用 SDK 的
   `<errno.h>` shim（`return -ENODEV;`）。线格式仍是裸 `i32`（`0 / -errno`），类型只活在语言边界。
 - Core 把 `*out_state` 初始化为 `NULL`；成功时组件写入自己完成的 state 指针；**无状态组件可成功返回 NULL**。
-- 状态经该实例自己的 `HeapState` 分配；**共享的是分配器实现代码，不是堆**。Core 只存/传指针，不解释、不通用释放。（分层与**无账本**契约见 `docs/architecture/memory-and-heap.md`：Core 不记 region owner，无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载；per-instance runtime context 是目标；backing 已由 `kcore_memory_acquire/release`（域视图）提供。）
+- 状态由该实例自己的分配器分配（**堆是 runtime / deployment 策略，不是 Core 资源、不是组件一等资源**；KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器）。Core 只存/传指针，不解释、不通用释放；组件身份是 `ComponentId` + `ComponentRecord.instance_state`，不与分配器 / runtime 状态合并。（分层与**无账本**契约见 `docs/architecture/memory-and-heap.md`：Core 不记 region owner，无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载；**不再有 per-instance runtime slot / runtime context**；backing 已由 `kcore_memory_acquire/release`（域视图）提供。）
 - `kcomp_abi` 是手工维护的精确契约指纹；**不加版本后缀、不做兼容协商、不自动生成哈希**。
 - **协调替换**：原地删除 `kcomp_init` / `kcomp_exit`，**不留 legacy fallback**（`AGENTS.md`：不保证陈旧 `.kcomp` 可加载）。
 
@@ -232,7 +232,7 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 - **不实现 `instances == 0 → unload` / 物理回收。** 组件 backing 保持 pinned-until-reboot；`Stopped` / `Failed` 的记录留作 tombstone，其 backing 仍归**旧组件**所有。
 - **重启 = 从同一 artifact 重新 instantiate**：得到**全新 `ComponentId`**、**全新可写 image state**（`.data` / `.bss` 回到 artifact 初始值）、**全新资源归属 / endpoint**。旧组件的 `Stopped` / `Failed` 记录与 backing 驻留（phase 1 不回收）。
-  > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单 / runtime slot（`tp`）不变。见 `architecture/deployment.md` §10。
+  > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单不变（`tp` 是普通架构 / 任务执行状态，由 Core 在任务切换 / trap 时透明保存 / 恢复，全新上下文起点为 0，不再是组件运行时指针）。见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
 - **重启 ≠ 设备恢复**（隔离到重启，见 §8）。
 

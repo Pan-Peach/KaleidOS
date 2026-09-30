@@ -24,6 +24,7 @@ selftest = []
 
 [dependencies]
 arch = { path = "../../arch", default-features = false }
+fdt = { path = "../../../third_party/fdt" }
 kernel = { path = "../../core", default-features = false }
 spin = { version = "0.12.1", default-features = false, features = ["spin_mutex", "once"] }
 

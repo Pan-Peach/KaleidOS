@@ -196,23 +196,6 @@ pub trait CpuArch {
     /// 打开当前 CPU 的**全局**中断使能位（各本地中断源已初始化的最后一步）。
     fn enable_irq();
 
-    /// 读取当前执行的 **runtime slot**（RISC-V `tp`）；`0` = 无 slot。
-    ///
-    /// slot 是组件运行时自有的 opaque 状态指针（**执行状态，不是内存记账**，
-    /// 见 `docs/architecture/memory-and-heap.md` §5）：Core 只存 / 传，从不解释。
-    /// **Core 是唯一写者** —— RISC-V psABI 把 `tp` 标为 unallocatable/fixed，
-    /// 编译器永不分配或写入它；trap 帧另行保存 / 恢复它（`TrapFrame.x[4]`）。
-    fn runtime_slot() -> usize;
-
-    /// 把 `slot` 写入当前执行的 runtime slot 寄存器（RISC-V `tp`）；`0` = 无
-    /// slot。**Core 是唯一写者**（见 [`Self::runtime_slot`]）。
-    fn install_runtime_slot(slot: usize);
-
-    /// 把 `slot` 预置进一个**上下文记录**：切换路径从目标记录装载 runtime slot
-    /// 寄存器，因此下一次切入该上下文时，被恢复的执行带着自己的 runtime
-    /// context 运行。`0` = 无 slot（`new_context` 的初值）。
-    fn set_context_slot(context: &mut Self::Context, slot: usize);
-
     /// 关中断并返回先前状态（irq-save 临界区进入）。
     /// Riscv 保存状态寄存器；host fake 模拟嵌套状态供测试检查。
     fn disable_irq() -> Self::IrqFlags;
@@ -228,8 +211,9 @@ pub trait CpuArch {
     //
     // 契约要点：
     // - `current_cpu` 是**快照**，不是跨调度/迁移保留本地引用的许可；
-    // - per-CPU 基址是 **Core 拥有的不透明本地存储**，与组件 runtime slot（`tp`）
-    //   严格分离：`tp` 仍然只承载 per-instance runtime slot，Core 仍是唯一写者；
+    // - per-CPU 基址是 **Core 拥有的不透明本地存储**，与任务执行状态（RISC-V
+    //   `tp`）严格分离：`tp` 只是被透明保存 / 恢复的架构寄存器，不是第二份
+    //   per-CPU 基址；
     // - `install_per_cpu_base` 在**被绑定的 CPU 上、关中断**调用，且该 CPU 变
     //   online 后不得再绑定（CPU 不迁移）。
 
@@ -240,7 +224,7 @@ pub trait CpuArch {
 
     /// 当前执行 CPU 的 Core 本地存储基址（不透明；arch 不解释其内容）。
     ///
-    /// 这不是组件 runtime slot；实现载体随 ISA：RV S-mode = `sscratch`
+    /// 这不是任务执行状态（`tp`）；实现载体随 ISA：RV S-mode = `sscratch`
     /// 指向的 arch 私有入口记录，x86_64 = kernel GS base，AArch64 = `TPIDR_EL1`，
     /// LoongArch = 显式保留的 `CSR.KSAVE`。
     fn per_cpu_base() -> Option<core::ptr::NonNull<()>>;
@@ -254,8 +238,8 @@ pub trait CpuArch {
     /// - `cpu` 是本硬件 CPU 唯一的逻辑身份（由 Core 赋号，不是硬件 id）；
     /// - 该 CPU 变 online 后不得重绑定。
     ///
-    /// **注意**：`context_switch` 仍按任务上下文保存/恢复 runtime slot，但
-    /// **不得**从任务上下文恢复 per-CPU 基址。
+    /// **注意**：`context_switch` 按任务上下文保存 / 恢复 `tp`（普通架构执行
+    /// 状态），但 **不得**从任务上下文恢复 per-CPU 基址。
     unsafe fn install_per_cpu_base(cpu: cpu::CpuId, base: core::ptr::NonNull<()>);
 }
 

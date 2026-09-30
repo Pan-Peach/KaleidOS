@@ -8,7 +8,7 @@
 //!   HSM，则需 `-bios default` 的 SBI 版本或直接 mailbox。
 //! - **IPI**：SBI IPI 扩展（`sbi_send_ipi`，软件中断 `SIP.SSIP`）或 CLINT
 //!   `MSIP(hartid)`；本后端需把「先发布 pending、再响铃」的排序做对。
-//! - **per-CPU 基址**：**不要**用 `tp`（Core 的 runtime slot）；正确载体是
+//! - **per-CPU 基址**：**不要**用 `tp`（任务执行状态寄存器）；正确载体是
 //!   `sscratch` 升级成的 arch 私有入口记录（见 `context` / `trap` 的现有约定）。
 //!
 //! # 骨架约定

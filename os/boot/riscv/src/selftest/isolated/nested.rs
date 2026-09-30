@@ -130,7 +130,6 @@ fn nested_case(case: &str, b_entry: usize, expect_fault: bool) -> ! {
         b.handle,
         b_entry,
         stack_range(NESTED_B_STACK_BASE),
-        0,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {
@@ -145,7 +144,6 @@ fn nested_case(case: &str, b_entry: usize, expect_fault: bool) -> ! {
         a.handle,
         isolated_nested_a_entry as *const () as usize,
         stack_range(ISOLATED_STACK_BASE),
-        0,
         false,
         isolated::EntryArgs::pair(0, 0),
     ) {

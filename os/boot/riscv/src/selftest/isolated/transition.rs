@@ -1,4 +1,4 @@
-//! Synchronous Core → private AS → Core round trip: register / runtime-slot
+//! Synchronous Core → private AS → Core round trip: register / tp preservation
 //! discipline and the component-visible private root.
 
 /// 同步往返用例：寄存器纪律探针 → trampoline → 组件 → Core 恢复。
@@ -53,7 +53,7 @@ pub(crate) extern "C" fn selftest_isolated_roundtrip_resumed() -> ! {
     }
     // SAFETY: probe-written statics; single-threaded.
     if unsafe { core::ptr::addr_of!(ISOLATED_TP_AFTER).read() } != 0x707 {
-        fail("isolated-transition: tp (runtime slot) not restored");
+        fail("isolated-transition: tp not restored");
     }
     if unsafe { core::ptr::addr_of!(ISOLATED_GP_MATCH).read() } != 0 {
         fail("isolated-transition: gp not restored");

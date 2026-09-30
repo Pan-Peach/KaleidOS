@@ -15,9 +15,9 @@ __switch:
     sd s9, 88(a0)       
     sd s10, 96(a0)
     sd s11, 104(a0)
-    # tp = 本执行上下文的 runtime slot（0 = 无 slot）；与 RiscvContext 布局一致
-    # （ra@0 / sp@8 / s0-s11@16-104 / tp@112）。psABI 把 tp 标为 unallocatable，
-    # 编译器从不写它 —— Core 是唯一写者；trap 帧另行保存 tp（TrapFrame.x[4]）。
+    # tp = 被透明保存 / 恢复的架构执行状态（本镜像无 TLS）；与 RiscvContext 布局
+    # 一致（ra@0 / sp@8 / s0-s11@16-104 / tp@112）。psABI 把 tp 标为 unallocatable，
+    # 编译器从不写它；trap 帧另行保存 tp（TrapFrame.x[4]）。
     sd tp, 112(a0)
     # 恢复新的寄存器上下文 from
     ld ra, 0(a1)

@@ -15,13 +15,13 @@
 //! ```text
 //! args     → 实例窗口基址 + 0（KcompCreateArgs：config_abi / config / config_len）
 //! out_state→ 实例窗口基址 + 32（usize 槽；组件写，Core 从自己的视图读回）
-//! tp       = 实例窗口基址 + 64（Core 安装的 per-instance runtime slot）
+//! tp       = 0（同步跨 AS 进入的显式清零：tp 是普通执行状态，不承载实例上下文）
 //! ```
 //!
 //! 组件在窗口内 `args + REPORT_OFF` 写一份**上报**（magic / 观察到的 tp / satp /
 //! args / out_state / config 负载），并把 `*out_state` 指向它。ArchTest 从 Core
 //! 侧（窗口 backing 的 Core 视图）读回并断言：组件确实在私有 AS 里跑过、args 与
-//! config 真的送到了、`tp` 就是 Core 为该实例安装的 runtime slot。
+//! config 真的送到了、`tp` 观察值为 0。
 //!
 //! destroy 把 `DESTROY_MAGIC` 写进 `state + DESTROY_OFF`（`state` = create 写回的
 //! out_state），ArchTest 用它在销毁后证明 destroy 入口**真的执行过**。
@@ -50,7 +50,7 @@ pub struct CreateArgs {
 /// 上报区在实例窗口里的偏移（Core 不解释；ArchTest 按同一偏移读回）。
 const REPORT_OFF: usize = 512;
 /// Core 预交付的域视图（`kcore_memory_view`）在窗口里的偏移。
-const WINDOW_VIEW_OFF: usize = 384;
+const WINDOW_VIEW_OFF: usize = 320;
 /// destroy 标记相对 `state`（= 上报区基址）的偏移。
 const DESTROY_OFF: usize = 10 * core::mem::size_of::<usize>();
 

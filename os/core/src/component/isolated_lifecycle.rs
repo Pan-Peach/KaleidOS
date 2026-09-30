@@ -6,7 +6,7 @@
 //!   │     └─ Core 验证：段 / 权限 / 入口 / abi（`isolated_load`）
 //!   ├─ registry.declare(name, loaded, IsolatedNative) → create_isolated_address_space_for(id)
 //!   ├─ map_mappings(段) + map_instance_windows()（组件栈 + 实例窗口）
-//!   ├─ resolve → begin_start；写 create args / out_state / runtime slot 进窗口
+//!   ├─ resolve → begin_start；写 create args / out_state 进窗口
 //!   ├─ isolated::prepare(...)（Core 再验证入口 / 栈；共享 Core 映射已落）
 //!   └─ isolated::enter(...) → Returned(0) → 提交 pending → Ready
 //!
@@ -15,8 +15,8 @@
 //!      → `complete_stop` 提交 Stopped
 //!
 //! restart：前一个组件 Failed / Stopped（tombstone）后，同名 create 从 artifact
-//! **重新 instantiate**——全新 ComponentId / 全新私有 AS / 全新 backing / 新窗口 /
-//! 新 runtime slot，且 writable image state 回到 artifact 初始状态。同一 artifact
+//! **重新 instantiate**——全新 ComponentId / 全新私有 AS / 全新 backing / 新窗口，
+//! 且 writable image state 回到 artifact 初始状态。同一 artifact
 //! 可以并发存在多个组件（各自私有 AS + backing）。
 //!
 //! service dispatch（KernelNative caller → Isolated provider）
@@ -42,8 +42,8 @@
 //! （[`isolated_load::SUPPORTED_IMPORTS`]），其余具名 UNDEF 显式拒绝。
 //! 跨域 service 调用仍由 **Core 主动发起**，provider 不需要回调 Core。create 的
 //! 交付面是 Core 预置的**实例内存窗口**（[`ISOLATED_WINDOW_BASE`]：Core backing、
-//! 零初始化、只映射在该实例私有 AS），交付 create args / out_state / runtime
-//! context；窗口表示是**实例内 VA**（归属由该实例页表承载，Core 不另立账本），
+//! 零初始化、只映射在该实例私有 AS），交付 create args / out_state；
+//! 窗口表示是**实例内 VA**（归属由该实例页表承载，Core 不另立账本），
 //! 同一 VA 在别的实例 AS 里没有任何映射。
 //!
 //! service dispatch 的帧**没有中间页**：caller 是 KernelNative，运行在共享 Core
@@ -53,28 +53,27 @@
 //! **Isolated A → Isolated B** 的问题（A 的私有 VA 在 B 的 AS 里不可达），
 //! 本阶段不实现、也不预置机制。
 //!
-//! 窗口布局（**Core 内部**；组件只用 Core 经 `a0` .. `a3` / `tp` 交给它的实例内
+//! 窗口布局（**Core 内部**；组件只用 Core 经 `a0` .. `a3` 交给它的实例内
 //! VA，不需要知道偏移）：
 //!
 //! ```text
 //! +0    KcompCreateArgs（config_abi / config / config_len）
 //! +32   out_state 槽（usize；create 返回后由 Core 读回）
-//! +64   runtime context block（`tp` 指向这里；Core 从不解释其内容）
-//! +128  config 负载拷贝（≤ WINDOW_CONFIG_MAX 字节）
-//! +384  本窗口的**域视图编码**（`kcore_memory_view`：kind = LOCAL_VA、
+//! +64   config 负载拷贝（≤ WINDOW_CONFIG_MAX 字节）
+//! +320  本窗口的**域视图编码**（`kcore_memory_view`：kind = LOCAL_VA、
 //!       base = 本实例窗口 VA、len = 窗口长度）
 //! ```
 //!
 //! # 失败 / 重启矩阵
 //!
-//! | 阶段 | 终态 | AS | Core 预置窗口 | slot | caller 得到 |
-//! |---|---|---|---|---|---|
-//! | 放段 / 门禁失败（声明之前） | 无实例 | 未创建 | 未创建 | 未安装 | 类型化装载错误 |
-//! | create 入口返回非零 / config 拒绝 | `Failed` | 退役 | 归还 backing | 清除 | `CreateFailed` / `IsolatedConfigRejected` |
-//! | create 入口故障（trap） | `Failed` | 退役 | 归还 backing | 清除 | `CreateFaulted` |
-//! | service dispatch 故障 | `Failed` | 退役 | 归还 backing | 清除 | `CallError::ProviderFailed`（EIO） |
-//! | destroy 入口故障 | `Failed` | 退役 | **保持驻留** | 清除 | `DestroyPanicked`（EIO） |
-//! | 优雅 destroy 成功 | `Stopped` | 退役 | **保持驻留** | 清除 | `Ok` |
+//! | 阶段 | 终态 | AS | Core 预置窗口 | caller 得到 |
+//! |---|---|---|---|---|
+//! | 放段 / 门禁失败（声明之前） | 无实例 | 未创建 | 未创建 | 类型化装载错误 |
+//! | create 入口返回非零 / config 拒绝 | `Failed` | 退役 | 归还 backing | `CreateFailed` / `IsolatedConfigRejected` |
+//! | create 入口故障（trap） | `Failed` | 退役 | 归还 backing | `CreateFaulted` |
+//! | service dispatch 故障 | `Failed` | 退役 | 归还 backing | `CallError::ProviderFailed`（EIO） |
+//! | destroy 入口故障 | `Failed` | 退役 | **保持驻留** | `DestroyPanicked`（EIO） |
+//! | 优雅 destroy 成功 | `Stopped` | 退役 | **保持驻留** | `Ok` |
 //!
 //! 读法：**create / service 故障 = Core 中止实例**（预置机制一并归还，半成品不留）；
 //! **destroy 路径 = 实例已走到生命尽头**（无论入口成功或故障都只退役 AS，窗口
@@ -135,10 +134,8 @@ pub const ISOLATED_WINDOW_SIZE: usize = memory::ALLOC_GRANULE;
 pub const WINDOW_ARGS_OFF: usize = 0;
 /// `out_state` 槽在窗口里的偏移（Core 清零；组件写；Core 从自己的视图读回）。
 pub const WINDOW_OUT_STATE_OFF: usize = 32;
-/// 每实例 runtime context block 的偏移（`tp` = 窗口基址 + 本偏移；Core 不解释）。
-pub const WINDOW_RUNTIME_OFF: usize = 64;
 /// config 负载拷贝在窗口里的偏移（`args.config` 指向这里）。
-pub const WINDOW_CONFIG_OFF: usize = 128;
+pub const WINDOW_CONFIG_OFF: usize = 64;
 /// config 负载上限（窗口内固定区；超出显式拒绝，绝不截断）。
 pub const WINDOW_CONFIG_MAX: usize = 256;
 /// 本窗口的**域视图编码**（`kcore_memory_view`）在窗口里的偏移。
@@ -146,7 +143,21 @@ pub const WINDOW_CONFIG_MAX: usize = 256;
 /// Core 预交付该实例的域视图：`kind = KCORE_MEMORY_VIEW_LOCAL_VA`、
 /// `base = ISOLATED_WINDOW_BASE`、`len = ISOLATED_WINDOW_SIZE`。表示是**实例内
 /// VA**（与域视图契约同形）；不会出现物理地址或 Core 私有 VA。
-pub const WINDOW_VIEW_OFF: usize = 384;
+pub const WINDOW_VIEW_OFF: usize = 320;
+
+// 布局不变量（与上面的偏移常量放在一起，单一维护点）：
+// - 镜像窗口（开区间结束）== 栈基址；栈与窗口不重叠；
+// - 窗口内各固定区按序、不重叠、都落在窗口内（RV32 / RV64 同一份）。
+const _: () = {
+    let image_end =
+        isolated_load::ISOLATED_IMAGE_WINDOW.base + isolated_load::ISOLATED_IMAGE_WINDOW.size;
+    assert!(image_end == ISOLATED_STACK_BASE);
+    assert!(ISOLATED_STACK_BASE + ISOLATED_STACK_SIZE <= ISOLATED_WINDOW_BASE);
+    assert!(WINDOW_ARGS_OFF + core::mem::size_of::<KcompCreateArgs>() <= WINDOW_OUT_STATE_OFF);
+    assert!(WINDOW_OUT_STATE_OFF + core::mem::size_of::<usize>() <= WINDOW_CONFIG_OFF);
+    assert!(WINDOW_CONFIG_OFF + WINDOW_CONFIG_MAX <= WINDOW_VIEW_OFF);
+    assert!(WINDOW_VIEW_OFF + core::mem::size_of::<MemoryView>() <= ISOLATED_WINDOW_SIZE);
+};
 
 /// 本实例窗口的**域视图编码**：Core 预交付给实例的那份 `kcore_memory_view`。
 ///
@@ -178,17 +189,6 @@ pub fn window_range() -> VirtualRange {
     }
 }
 
-// 布局不变量：镜像窗口（开区间结束）== 栈基址；栈与窗口不重叠。
-const _: () = {
-    let image_end =
-        isolated_load::ISOLATED_IMAGE_WINDOW.base + isolated_load::ISOLATED_IMAGE_WINDOW.size;
-    assert!(image_end == ISOLATED_STACK_BASE);
-    assert!(ISOLATED_STACK_BASE + ISOLATED_STACK_SIZE <= ISOLATED_WINDOW_BASE);
-    assert!(WINDOW_OUT_STATE_OFF + core::mem::size_of::<usize>() <= WINDOW_RUNTIME_OFF);
-    assert!(WINDOW_CONFIG_OFF + WINDOW_CONFIG_MAX <= WINDOW_VIEW_OFF);
-    assert!(WINDOW_VIEW_OFF + core::mem::size_of::<MemoryView>() <= ISOLATED_WINDOW_SIZE);
-};
-
 #[cfg(all(
     feature = "vm-mmu",
     feature = "supervisor",
@@ -200,7 +200,7 @@ mod imp {
     use crate::component::isolated::{self, IsolatedPrepareError, Outcome};
     use crate::component::isolated_load::IsolatedLoadError;
     use crate::component::load;
-    use crate::component::{containment, failure, registry, runtime_slot};
+    use crate::component::{containment, failure, registry};
     use crate::memory::address_space::{
         self, AddressSpaceHandle, MapError, Mapping, MappingPermission, PhysicalRange,
     };
@@ -265,7 +265,7 @@ mod imp {
             return Err(fail_with_as(id, handle, ComponentLoadError::StartFailed));
         }
 
-        // (6) 窗口预置：args / out_state（组件只见实例内 VA）+ runtime slot。
+        // (6) 窗口预置：args / out_state（组件只见实例内 VA）。
         let window = window_range();
         let window_backing = match backing_of(handle, &window) {
             Some(backing) => backing,
@@ -274,10 +274,6 @@ mod imp {
         if let Err(error) = write_create_args(window_backing, args) {
             return Err(fail_with_as(id, handle, error));
         }
-        let slot = window.base + WINDOW_RUNTIME_OFF;
-        runtime_slot::get_slots()
-            .lock()
-            .install(id, slot as *mut ());
 
         // (7) Core 验证入口 / 栈（持锁阶段，返回后不持锁）。先把普通 trap 路径
         //     的异常钩子接到 Core：**没有显式策略就是 Abandon**（组件身份本身
@@ -288,7 +284,6 @@ mod imp {
             handle,
             create_entry,
             stack_range(),
-            slot,
             true,
             isolated::EntryArgs::pair(
                 window.base + WINDOW_ARGS_OFF,
@@ -366,14 +361,12 @@ mod imp {
                 return CallOutcome::Returned(Errno::EIO.code());
             }
         };
-        let slot = window_range().base + WINDOW_RUNTIME_OFF;
         // 与 create 同一纪律：组件故障交给 Core 的窄分派（无策略 = Abandon）。
         isolated::install();
         let transition = match isolated::prepare(
             handle,
             entry,
             stack_range(),
-            slot,
             true,
             isolated::EntryArgs::pair(state as usize, 0),
         ) {
@@ -471,7 +464,6 @@ mod imp {
             handle,
             dispatcher,
             stack_range(),
-            window_range().base + WINDOW_RUNTIME_OFF,
             // 与同域 service 边界同一纪律：调用期间不开中断（provider 不可抢占）。
             false,
             isolated::EntryArgs {
@@ -745,7 +737,6 @@ mod tests {
         let fields = [
             (WINDOW_ARGS_OFF, core::mem::size_of::<KcompCreateArgs>()),
             (WINDOW_OUT_STATE_OFF, core::mem::size_of::<usize>()),
-            (WINDOW_RUNTIME_OFF, 64),
             (WINDOW_CONFIG_OFF, WINDOW_CONFIG_MAX),
             (WINDOW_VIEW_OFF, core::mem::size_of::<MemoryView>()),
         ];
@@ -757,7 +748,7 @@ mod tests {
         }
         assert_eq!(fields[0].0, 0, "args 必须在窗口起点");
         let end = fields.last().map_or(0, |(offset, len)| offset + len);
-        assert!(end <= ISOLATED_WINDOW_SIZE, "config 区必须落在窗口内");
+        assert!(end <= ISOLATED_WINDOW_SIZE, "固定区必须落在窗口内");
     }
 
     /// Core 预交付的域视图编码：LOCAL_VA、base/len = 本实例窗口（表示是实例内 VA）。

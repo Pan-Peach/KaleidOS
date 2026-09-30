@@ -80,7 +80,6 @@ pub struct PreparedTransition {
     activation: PreparedActivation<address_space::ActiveActivation>,
     entry: usize,
     stack_top: usize,
-    runtime_slot: usize,
     interrupts_enabled: bool,
     entry_args: EntryArgs,
 }
@@ -100,7 +99,6 @@ impl PreparedTransition {
 /// 准备一次私有 AS 进入（**锁内完成，返回时锁已释放**）。
 ///
 /// - `stack`：组件栈的已映射区间；栈顶 = `base + size`，必须 16 字节对齐；
-/// - `runtime_slot`：组件运行的 `tp`（0 = 无；只搬运，不解释）；
 /// - `interrupts_enabled`：组件初始 `sstatus.SIE`（timer 往返需要它开闸；
 ///   service dispatch 传 `false`——与同域 service 边界同一纪律）；
 /// - `entry_args`：组件入口的 `a0` .. `a3`（入口 ABI 由 Core 解释）。
@@ -108,7 +106,6 @@ pub fn prepare(
     handle: AddressSpaceHandle,
     entry: usize,
     stack: VirtualRange,
-    runtime_slot: usize,
     interrupts_enabled: bool,
     entry_args: EntryArgs,
 ) -> Result<PreparedTransition, IsolatedPrepareError> {
@@ -120,7 +117,6 @@ pub fn prepare(
         activation,
         entry,
         stack_top,
-        runtime_slot,
         interrupts_enabled,
         entry_args,
     })
@@ -143,7 +139,6 @@ pub fn enter(transition: PreparedTransition) -> Outcome {
         activation: transition.activation.token(),
         entry: transition.entry,
         stack_top: transition.stack_top,
-        runtime_slot: transition.runtime_slot,
         interrupts_enabled: transition.interrupts_enabled,
         arg0: transition.entry_args.a0,
         arg1: transition.entry_args.a1,

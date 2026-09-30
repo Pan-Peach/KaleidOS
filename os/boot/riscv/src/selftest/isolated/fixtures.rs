@@ -78,6 +78,32 @@ pub(crate) fn read_sp() -> usize {
     sp
 }
 
+/// 读当前执行上下文的 `tp`（普通架构执行状态；本镜像无 TLS）。
+pub(crate) fn read_tp() -> usize {
+    let tp: usize;
+    // SAFETY: register move only.
+    unsafe {
+        core::arch::asm!(
+            "mv {tp}, tp",
+            tp = out(reg) tp,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    tp
+}
+
+/// 写当前执行上下文的 `tp`（用例哨兵；调用方负责恢复）。
+pub(crate) fn set_tp(value: usize) {
+    // SAFETY: register write only; 本镜像无 TLS，tp 不被编译器使用。
+    unsafe {
+        core::arch::asm!(
+            "mv tp, {value}",
+            value = in(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 pub(crate) fn ctl_pa() -> *mut usize {
     ISOLATED_CTL_PA.load(Ordering::Acquire) as *mut usize
 }
@@ -130,7 +156,6 @@ pub(crate) fn prepare_or_fail(
         handle,
         entry,
         stack,
-        0,
         interrupts_enabled,
         isolated::EntryArgs::pair(0, 0),
     ) {

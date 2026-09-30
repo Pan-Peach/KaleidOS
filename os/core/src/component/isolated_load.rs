@@ -304,8 +304,9 @@ pub fn map_mappings(
 ///
 /// 只放**诊断 / 只读查询**与 `kcore_panic_escape`：Isolated 组件保持 S-mode，
 /// 直接调用 Core 代码（共享 Core 映射，`satp` 不切换）。内存 acquire/release、
-/// 调度入口、组件创建、设备 / DMA / IRQ 获取等**仍然显式拒绝**——它们需要
-/// Core 侧的所有权 / 生命周期裁决，不在本阶段的支持面内。
+/// **KernelNative 共享堆后端 `kcore_heap_alloc/dealloc`**、调度入口、组件创建、
+/// 设备 / DMA / IRQ 获取等**仍然显式拒绝**——它们需要 Core 侧的所有权 / 生命周期
+/// 裁决，或只是 KernelNative 受信部署形态的窄后端，不在本阶段的支持面内。
 ///
 /// 任何不在白名单里的具名 UNDEF 符号都在装载前**显式拒绝**——绝不回退到裸
 /// Core 地址，也绝不静默忽略。
@@ -832,6 +833,8 @@ mod tests {
         for name in [
             b"kcore_memory_acquire".as_slice(),
             b"kcore_memory_release",
+            b"kcore_heap_alloc",
+            b"kcore_heap_dealloc",
             b"kcore_sched_run",
             b"kcore_component_create",
             b"kcore_device_claim",

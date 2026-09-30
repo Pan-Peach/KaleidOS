@@ -1,11 +1,15 @@
-/* kalloc.c —— per-instance runtime heap：freestanding C 实现（单一真相）。
+/* kalloc.c —— 私有执行域运行时堆：freestanding C 实现（单一真相）。
  *
- * 契约：docs/architecture/memory-and-heap.md §5 / §6。
+ * **保留为未来 Isolated / Sandboxed 的私有分配器后端**（当前没有生产调用方）：
+ * KernelNative 普通 malloc/free 走 Core 的 `kcore_heap_alloc` / `kcore_heap_dealloc`
+ * （同特权同 AS 共享 Core 堆）；私有执行域才在自己的可写 image 里用本分配器。
+ * 契约：docs/architecture/memory-and-heap.md §6。
+ *
  *   - 侵入式、按地址升序的 **coalescing free list**；堆头 / 块头全部在 region
  *     内部，增长（backing 回调）不产生任何辅助分配。
  *   - 分配器自己**绝不 panic、绝不分配**：失败一律返回 NULL。
- *   - Rust `GlobalAlloc`（kcomp-sdk/src/alloc.rs）只是本实现的 adapter；
- *     C 组件直接 `#include "kcomp_kalloc.h"`。
+ *   - Rust 侧 facade 在 kcomp-sdk/src/heap.rs；C 组件直接
+ *     `#include "kcomp_kalloc.h"`。
  *   - 只导出 `kcomp_heap_*`；**不**定义 malloc / free / calloc / realloc
  *     （避免与 kcomp_rt.c / picolibc 冲突）。
  *

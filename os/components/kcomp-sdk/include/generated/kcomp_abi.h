@@ -197,6 +197,14 @@ int32_t kcore_memory_acquire(uint64_t min_len, uint64_t min_align, struct kcore_
 /* 交回一个 kcore_memory_acquire 交付的 view，把 backing 归还分配器。
  * KernelNative 受信操作；(base, len) 必须与 acquire 一致。 */
 int32_t kcore_memory_release(const struct kcore_memory_view *view);
+/* -- KernelNative heap backend（KernelNative 部署后端；Isolated import 拒绝） -- */
+/* KernelNative 部署后端：从 Core 共享堆分配（size / align 同 Rust GlobalAlloc）。
+ * size == 0 / 非法 align / 耗尽 → NULL；释放必须用 kcore_heap_dealloc 且 (size, align)
+ * 逐字一致。Isolated / Sandboxed 不解析该符号（私有分配器 + kcore_memory_acquire/release）。 */
+uint8_t *kcore_heap_alloc(size_t size, size_t align);
+/* KernelNative 部署后端：归还一次 kcore_heap_alloc（ptr / size / align 必须逐字一致；
+ * Layout 驱动 slab / buddy 路由，不得从取整容量反推）。成功 = 0，失败 = -Errno。 */
+int32_t kcore_heap_dealloc(uint8_t *ptr, size_t size, size_t align);
 /* -- Logging / diagnostics -- */
 void kcore_console_write_byte(uint8_t byte);
 int32_t kcore_log_line(const uint8_t *ptr, size_t len);
