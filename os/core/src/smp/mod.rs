@@ -7,7 +7,7 @@
 //!   CPU / 响门铃”的机制（`arch::Smp`）。
 //! - **策略不在 Core**：不做运行队列、负载均衡、调度算法、跨 CPU RPC。
 //! - 逻辑 `CpuId` 与硬件 `arch::cpu::HardwareCpuId` 分离：真实 CPU 数一律来自
-//!   启动后发现的 `MachineInfo`（`cpu_count`），编译期容量只有一处
+//!   启动后发现的 `MachineInfo`（`cpu_info.len()`），编译期上限只有一处
 //!   [`crate::machine::MAX_CPUS`]。
 //!
 //! # 当前接通程度（M1）
@@ -39,7 +39,7 @@ pub use ipi::{IpiRequest, NotifyError};
 pub use mask::{CpuIndexError, CpuMask, CpuMaskIter};
 pub use percpu::{PerCpu, PerCpuError};
 
-use crate::machine::{CpuId, MachineInfo};
+use crate::machine::{CpuId, MAX_CPUS, MachineInfo};
 use arch::cpu::HardwareCpuId;
 use arch::smp::Smp;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
@@ -165,12 +165,15 @@ struct CpuRegistry {
 
 impl CpuRegistry {
     /// 从已发现的 `MachineInfo` 建立记录表并校验拓扑。不改任何状态。
+    ///
+    /// 长度即真相（`cpu_info.len()`）；`1..=MAX_CPUS` 是已承认逻辑 CPU 的硬上限。
+    /// BSP 必须**唯一**且位于逻辑 CPU0，硬件身份与 `boot_hardware_id` 一致
+    /// （boot 负责归一化；Core 不制造 BSP）。
     fn build(machine: &MachineInfo) -> Result<Self, SmpInitError> {
-        let count = machine.cpu_count;
-        if count == 0 || count > machine.cpu_info.len() {
+        let cpus = &machine.cpu_info[..];
+        if cpus.is_empty() || cpus.len() > MAX_CPUS {
             return Err(SmpInitError::InvalidTopology);
         }
-        let cpus = &machine.cpu_info[..count];
 
         // 硬件身份不得重复：重复会把两个逻辑 CPU 指向同一物理 hart（谓词式发现
         // 的一致性由 Core 守住）。
@@ -182,28 +185,23 @@ impl CpuRegistry {
             }
         }
 
-        // BSP：优先 `boot_cpu` 标记，其次按 `boot_hardware_id` 匹配。
-        // 归一化（boot hart = 逻辑 0）由 boot 完成；这里只忠实反映发现结果。
-        let bsp = cpus
-            .iter()
-            .position(|c| c.boot_cpu)
-            .or_else(|| {
-                cpus.iter()
-                    .position(|c| c.hardware_id == machine.boot_hardware_id)
-            })
-            .ok_or(SmpInitError::InvalidTopology)?;
-
-        // 不变式（boot 归一化保证）：BSP 必须是逻辑 CPU0。入口记录、`trap_stack_range()`、
-        // PLIC 外部固定路由都依赖它；Core 在这里守住，防止 boot 漂移后静默错绑。
-        if bsp != 0 {
+        // BSP：唯一、位于逻辑 CPU0、硬件身份与 `boot_hardware_id` 一致。
+        // 入口记录、`trap_stack_range()`、PLIC 外部固定路由都依赖它；Core 在这里
+        // 守住，防止 boot 漂移后静默错绑。
+        if cpus.iter().filter(|c| c.boot_cpu).count() != 1
+            || !cpus[0].boot_cpu
+            || cpus[0].hardware_id != machine.boot_hardware_id
+        {
             return Err(SmpInitError::InvalidTopology);
         }
 
-        let records = PerCpu::new(count, |cpu| CpuRecord::new(cpus[cpu.raw()].hardware_id))
-            .map_err(|_| SmpInitError::AllocationFailed)?;
+        let records = PerCpu::new(cpus.len(), |cpu| {
+            CpuRecord::new(cpus[cpu.raw()].hardware_id)
+        })
+        .map_err(|_| SmpInitError::AllocationFailed)?;
         Ok(Self {
             records,
-            bsp: CpuId::from_raw(bsp),
+            bsp: CpuId::from_raw(0),
         })
     }
 
@@ -314,7 +312,7 @@ pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
 
     // Core IPI 回调必须在**任何 CPU 打开 IPI 接收之前**注册（覆盖语义）。
     // 只在真有多 CPU 时触碰后端：UP 无 IPI，也让 host/单核 profile 免于后端差异。
-    if machine.cpu_count > 1 {
+    if machine.cpu_info.len() > 1 {
         <Backend as Smp>::register_ipi_handler(ipi::ipi_interrupt)
             .map_err(SmpInitError::BackendInit)?;
         <Backend as Smp>::init_ipi_cpu().map_err(SmpInitError::BackendInit)?;
@@ -551,37 +549,32 @@ fn boot_deadline() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::{CpuInfo, DeviceDescriptor, MAX_CPUS, MemoryRegion};
+    use crate::machine::{CpuInfo, MAX_CPUS};
 
     /// 测试串行化：全局 `RECORDS` 是进程级 `Once`，触碰它的用例必须串行。
     static SMP_TEST_LOCK: crate::test_support::TestLock =
         crate::test_support::TestLock::new(crate::test_support::Rank::Sched);
 
+    /// 从 `(boot_cpu, hardware_id)` 列表构造机器快照（长度即真相）。
     fn machine(cpus: &[(bool, u64)]) -> MachineInfo {
-        let mut cpu_info = [CpuInfo {
-            boot_cpu: false,
-            hardware_id: HardwareCpuId::from_raw(0),
-        }; MAX_CPUS];
         let mut boot_hardware_id = HardwareCpuId::from_raw(0);
-        for (slot, (boot, hardware)) in cpu_info.iter_mut().zip(cpus) {
-            *slot = CpuInfo {
-                boot_cpu: *boot,
-                hardware_id: HardwareCpuId::from_raw(*hardware),
-            };
+        let mut cpu_info = alloc::vec::Vec::new();
+        for (boot, hardware) in cpus {
             if *boot {
                 boot_hardware_id = HardwareCpuId::from_raw(*hardware);
             }
+            cpu_info.push(CpuInfo {
+                boot_cpu: *boot,
+                hardware_id: HardwareCpuId::from_raw(*hardware),
+            });
         }
-        MachineInfo {
+        crate::machine::test_support::snapshot(
             boot_hardware_id,
-            timebase_frequency: 0,
-            cpu_count: cpus.len(),
+            0,
             cpu_info,
-            mem_count: 0,
-            memory_regions: [MemoryRegion { base: 0, size: 0 }; 16],
-            dev_count: 0,
-            devices: [DeviceDescriptor::empty(); 26],
-        }
+            alloc::vec::Vec::new(),
+            alloc::vec::Vec::new(),
+        )
     }
 
     #[test]
@@ -611,6 +604,24 @@ mod tests {
             CpuRegistry::build(&info).err(),
             Some(SmpInitError::InvalidTopology)
         );
+    }
+
+    /// 已承认逻辑 CPU 数不得超过编译期上限 `MAX_CPUS`（长度即真相）。
+    #[test]
+    fn build_rejects_more_cpus_than_the_compile_time_limit() {
+        let mut cpus: alloc::vec::Vec<(bool, u64)> = (0..=MAX_CPUS)
+            .map(|hardware| (hardware == 0, hardware as u64))
+            .collect();
+        let info = machine(&cpus);
+        assert_eq!(
+            CpuRegistry::build(&info).err(),
+            Some(SmpInitError::InvalidTopology)
+        );
+
+        // 恰好 MAX_CPUS 台：接受。
+        cpus.pop();
+        let info = machine(&cpus);
+        assert!(CpuRegistry::build(&info).is_ok());
     }
 
     #[test]

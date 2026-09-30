@@ -28,6 +28,8 @@ use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine::{self, DeviceId, IoSpace};
 use crate::trace::{TraceEvent, emit};
+use alloc::boxed::Box;
+use alloc::vec;
 use spin::{Mutex, Once};
 
 /// 本执行域下的 device MMIO 窗口。
@@ -71,57 +73,94 @@ pub enum DeviceReleaseError {
     HasChildren,
 }
 
-/// Device ownership 真相表。
+/// 每个设备槽位的 ownership 真相。
+#[derive(Clone, Copy)]
+struct DeviceSlot {
+    owner: Option<ComponentId>,
+    quarantine: bool,
+}
+
+impl DeviceSlot {
+    const EMPTY: Self = Self {
+        owner: None,
+        quarantine: false,
+    };
+}
+
+/// Device ownership 真相表：**按已提交快照的设备数定容**的 boxed slice。
 ///
-/// `MachineInfo.devices` 定长 26，但这里用 256 项定长表避免任何越界换算；
-/// 只有已提交设备表内的 index 才会被写入（由 [`claim`] 保证）。
+/// 长度即容量（`MachineInfo.devices.len()`）：没有 256 项固定表，没有 u8 收窄。
+/// `DeviceId` 的完整 `u32` 空间由 `core::init` 校验可索引；`claim` / `release`
+/// 对越界 id 返回 `DeviceNotFound`（不 panic）。空设备表合法。
 pub struct DeviceTable {
-    owner: [Option<ComponentId>; 256],
-    quarantine: [bool; 256],
+    slots: Box<[DeviceSlot]>,
 }
 
 impl DeviceTable {
-    pub const fn new() -> Self {
+    /// 建立恰好 `devices` 个空槽位的表（快照设备数）。
+    pub fn new(devices: usize) -> Self {
         Self {
-            owner: [None; 256],
-            quarantine: [false; 256],
+            slots: vec![DeviceSlot::EMPTY; devices].into_boxed_slice(),
         }
     }
 
-    /// 该设备的 owner（`None` = 空闲）。
-    pub fn owner(&self, device_index: u8) -> Option<ComponentId> {
-        self.owner[device_index as usize]
+    /// 槽位数 = 已提交快照的设备数。
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn slot(&self, device: DeviceId) -> Option<&DeviceSlot> {
+        // raw() 是 u32；64 位目标上 as usize 是无损加宽，32 位目标上同宽。
+        self.slots.get(device.raw() as usize)
+    }
+
+    fn slot_mut(&mut self, device: DeviceId) -> Option<&mut DeviceSlot> {
+        self.slots.get_mut(device.raw() as usize)
+    }
+
+    /// 该设备的 owner（`None` = 空闲 / `DeviceId` 越界）。
+    pub fn owner(&self, device: DeviceId) -> Option<ComponentId> {
+        self.slot(device).and_then(|slot| slot.owner)
     }
 
     /// 该设备是否处于失败 quarantine（保持到 reboot）。
-    pub fn is_quarantined(&self, device_index: u8) -> bool {
-        self.quarantine[device_index as usize]
+    pub fn is_quarantined(&self, device: DeviceId) -> bool {
+        self.slot(device).is_some_and(|slot| slot.quarantine)
     }
 
-    /// 独占认领：已认领或已 quarantine → [`DeviceClaimError::DeviceBusy`]。
+    /// 独占认领：越界 → [`DeviceClaimError::DeviceNotFound`]；
+    /// 已认领或已 quarantine → [`DeviceClaimError::DeviceBusy`]。
     pub fn claim(
         &mut self,
         component: ComponentId,
-        device_index: u8,
+        device: DeviceId,
     ) -> Result<(), DeviceClaimError> {
-        let index = device_index as usize;
-        if self.quarantine[index] || self.owner[index].is_some() {
+        let Some(slot) = self.slot_mut(device) else {
+            return Err(DeviceClaimError::DeviceNotFound);
+        };
+        if slot.quarantine || slot.owner.is_some() {
             return Err(DeviceClaimError::DeviceBusy);
         }
-        self.owner[index] = Some(component);
+        slot.owner = Some(component);
         Ok(())
     }
 
-    /// 主动释放：仅 owner 本人可释放。
+    /// 主动释放：仅 owner 本人可释放；越界视为不存在。
     pub fn release(
         &mut self,
         component: ComponentId,
-        device_index: u8,
+        device: DeviceId,
     ) -> Result<(), DeviceReleaseError> {
-        let index = device_index as usize;
-        match self.owner[index] {
+        let Some(slot) = self.slot_mut(device) else {
+            return Err(DeviceReleaseError::DeviceNotFound);
+        };
+        match slot.owner {
             Some(owner) if owner == component => {
-                self.owner[index] = None;
+                slot.owner = None;
                 Ok(())
             }
             Some(_) => Err(DeviceReleaseError::NotOwner),
@@ -131,10 +170,10 @@ impl DeviceTable {
 
     /// 失败路径：撤销 component 的全部 device，并 quarantine（不立即复用）。
     pub fn quarantine_owner(&mut self, component: ComponentId) {
-        for index in 0..self.owner.len() {
-            if self.owner[index] == Some(component) {
-                self.owner[index] = None;
-                self.quarantine[index] = true;
+        for slot in self.slots.iter_mut() {
+            if slot.owner == Some(component) {
+                slot.owner = None;
+                slot.quarantine = true;
             }
         }
     }
@@ -142,13 +181,9 @@ impl DeviceTable {
     /// 清空失败 quarantine（**仅测试**：进程全局表不能在用例间回退）。
     #[cfg(test)]
     pub(crate) fn clear_quarantine(&mut self) {
-        self.quarantine = [false; 256];
-    }
-}
-
-impl Default for DeviceTable {
-    fn default() -> Self {
-        Self::new()
+        for slot in self.slots.iter_mut() {
+            slot.quarantine = false;
+        }
     }
 }
 
@@ -156,19 +191,37 @@ impl Default for DeviceTable {
 
 static TABLE: Once<Mutex<DeviceTable>> = Once::new();
 
-/// 初始化全局 device 表（`resource::init` 调用一次）。
+/// 测试专用的全局表覆盖（见 [`install_for_test`]）。
+#[cfg(test)]
+static TEST_TABLE: Mutex<Option<&'static Mutex<DeviceTable>>> = Mutex::new(None);
+
+/// 初始化全局 device 表（`resource::init` 调用一次）：按已提交快照的设备数定容。
 pub fn init() {
-    TABLE.call_once(|| Mutex::new(DeviceTable::new()));
+    let devices = crate::machine::committed().map_or(0, |info| info.devices.len());
+    TABLE.call_once(|| Mutex::new(DeviceTable::new(devices)));
+}
+
+/// **仅测试**：用恰好 `devices` 个槽位的全新表覆盖全局读路径（测试用例各自
+/// 带自己的机器 fixture；进程全局 `Once` 不能按用例重定容）。
+#[cfg(test)]
+pub(crate) fn install_for_test(devices: usize) {
+    let table: &'static Mutex<DeviceTable> =
+        Box::leak(Box::new(Mutex::new(DeviceTable::new(devices))));
+    *TEST_TABLE.lock() = Some(table);
 }
 
 /// 取全局 device 表（init 后可用）。
 pub fn get_table() -> &'static Mutex<DeviceTable> {
+    #[cfg(test)]
+    if let Some(table) = *TEST_TABLE.lock() {
+        return table;
+    }
     TABLE.get().expect("device table not initialized")
 }
 
 /// 该设备的 owner（跨模块查询：IRQ / DMA 的归属验证）。
-pub fn owner_of(device_index: u8) -> Option<ComponentId> {
-    get_table().lock().owner(device_index)
+pub fn owner_of(device: DeviceId) -> Option<ComponentId> {
+    get_table().lock().owner(device)
 }
 
 /// 认领**一台确切设备**：resolve → 独占检查 → 记 owner → 解析本域窗口。
@@ -179,21 +232,20 @@ pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, De
     let Some(machine) = machine::committed() else {
         return Err(DeviceClaimError::DeviceNotFound);
     };
-    let Some(descriptor) = machine.devices[..machine.dev_count].get(device.raw() as usize) else {
+    let Some(descriptor) = machine.devices.get(device.raw() as usize) else {
         return Err(DeviceClaimError::DeviceNotFound);
     };
     // 只看 MMIO 空间（PIO 设备当前不认领）。
     let IoSpace::Mmio { base, size } = descriptor.space else {
         return Err(DeviceClaimError::NotMmio);
     };
-    let device_index = u8::try_from(device.raw()).map_err(|_| DeviceClaimError::DeviceNotFound)?;
 
     let _guard = IrqSaveGuard::new();
-    get_table().lock().claim(ctx.component, device_index)?;
+    get_table().lock().claim(ctx.component, device)?;
     emit(TraceEvent::ResourceGrant {
         component: ctx.component,
         kind: ResourceKind::Device,
-        id: u64::from(device_index),
+        id: u64::from(device.raw()),
     });
     Ok(resolve_mapping(base, size))
 }
@@ -221,35 +273,28 @@ pub fn release(ctx: &RequestContext, device: DeviceId) -> Result<(), DeviceRelea
     let Some(machine) = machine::committed() else {
         return Err(DeviceReleaseError::DeviceNotFound);
     };
-    if machine.devices[..machine.dev_count]
-        .get(device.raw() as usize)
-        .is_none()
-    {
+    if machine.devices.get(device.raw() as usize).is_none() {
         return Err(DeviceReleaseError::DeviceNotFound);
     }
-    let device_index =
-        u8::try_from(device.raw()).map_err(|_| DeviceReleaseError::DeviceNotFound)?;
 
     let _guard = IrqSaveGuard::new();
     let mut table = get_table().lock();
-    if table.owner(device_index) != Some(ctx.component) {
+    if table.owner(device) != Some(ctx.component) {
         // 未认领 / 非 owner 都视为不可释放（不泄漏"谁拥有"给别人）。
-        return Err(match table.owner(device_index) {
+        return Err(match table.owner(device) {
             Some(_) => DeviceReleaseError::NotOwner,
             None => DeviceReleaseError::DeviceNotFound,
         });
     }
     // 子项检查与释放同锁完成：不允许"先检查无子项、随后子项才被 grant"的窗口。
-    if super::irq::has_route_for_device(device_index)
-        || super::dma::has_mapping_for_device(device_index)
-    {
+    if super::irq::has_route_for_device(device) || super::dma::has_mapping_for_device(device) {
         return Err(DeviceReleaseError::HasChildren);
     }
-    table.release(ctx.component, device_index)?;
+    table.release(ctx.component, device)?;
     emit(TraceEvent::ResourceRevoke {
         component: ctx.component,
         kind: ResourceKind::Device,
-        id: u64::from(device_index),
+        id: u64::from(device.raw()),
     });
     Ok(())
 }
@@ -258,12 +303,17 @@ pub fn release(ctx: &RequestContext, device: DeviceId) -> Result<(), DeviceRelea
 pub fn quarantine_owner(owner: ComponentId) {
     let _guard = IrqSaveGuard::new();
     let mut table = get_table().lock();
-    for index in 0..256u32 {
-        if table.owner(index as u8) == Some(owner) {
+    // 真实表长（= 快照设备数）迭代；不再扫描固定 0..256。
+    for index in 0..table.len() {
+        let Ok(raw) = u32::try_from(index) else {
+            break;
+        };
+        let device = DeviceId::from_raw(raw);
+        if table.owner(device) == Some(owner) {
             emit(TraceEvent::ResourceRevoke {
                 component: owner,
                 kind: ResourceKind::Device,
-                id: u64::from(index),
+                id: u64::from(device.raw()),
             });
         }
     }
@@ -274,7 +324,8 @@ pub fn quarantine_owner(owner: ComponentId) {
 mod tests {
     use super::{DeviceClaimError, DeviceReleaseError, DeviceTable};
     use crate::component::ComponentId;
-    use crate::machine::{CompatStr, DeviceDescriptor, IoSpace};
+    use crate::machine::{CompatStr, DeviceDescriptor, DeviceId, IoSpace};
+    use alloc::vec;
 
     fn owner(raw: u32) -> ComponentId {
         ComponentId::from_raw(raw)
@@ -284,54 +335,102 @@ mod tests {
     fn claim_is_exclusive_and_release_frees_for_reuse() {
         let a = owner(1);
         let b = owner(2);
-        let mut table = DeviceTable::new();
+        let mut table = DeviceTable::new(16);
 
-        assert_eq!(table.claim(a, 7), Ok(()));
-        assert_eq!(table.owner(7), Some(a));
+        assert_eq!(table.claim(a, DeviceId::from_raw(7)), Ok(()));
+        assert_eq!(table.owner(DeviceId::from_raw(7)), Some(a));
         // 同一 owner / 其他 owner 再认领都 Busy。
-        assert_eq!(table.claim(a, 7), Err(DeviceClaimError::DeviceBusy));
-        assert_eq!(table.claim(b, 7), Err(DeviceClaimError::DeviceBusy));
+        assert_eq!(
+            table.claim(a, DeviceId::from_raw(7)),
+            Err(DeviceClaimError::DeviceBusy)
+        );
+        assert_eq!(
+            table.claim(b, DeviceId::from_raw(7)),
+            Err(DeviceClaimError::DeviceBusy)
+        );
 
         // 非 owner 不能释放。
-        assert_eq!(table.release(b, 7), Err(DeviceReleaseError::NotOwner));
+        assert_eq!(
+            table.release(b, DeviceId::from_raw(7)),
+            Err(DeviceReleaseError::NotOwner)
+        );
         // owner 释放后可被他人复用。
-        assert_eq!(table.release(a, 7), Ok(()));
-        assert_eq!(table.owner(7), None);
-        assert_eq!(table.claim(b, 7), Ok(()));
+        assert_eq!(table.release(a, DeviceId::from_raw(7)), Ok(()));
+        assert_eq!(table.owner(DeviceId::from_raw(7)), None);
+        assert_eq!(table.claim(b, DeviceId::from_raw(7)), Ok(()));
+    }
+
+    /// 全宽设备身份：`DeviceId ≥ 256` 的合成设备可认领 / 释放；越界 id 返回
+    /// `DeviceNotFound`（不 panic）——旧的 u8 收窄已删除。
+    #[test]
+    fn claim_and_release_cover_device_ids_beyond_a_byte() {
+        let a = owner(1);
+        let mut table = DeviceTable::new(300);
+        let far = DeviceId::from_raw(260);
+
+        assert_eq!(table.claim(a, far), Ok(()));
+        assert_eq!(table.owner(far), Some(a));
+        assert!(!table.is_quarantined(far));
+        assert_eq!(table.release(a, far), Ok(()));
+        assert_eq!(table.owner(far), None);
+
+        // 表长之外：不存在（不 panic）。
+        assert_eq!(
+            table.claim(a, DeviceId::from_raw(300)),
+            Err(DeviceClaimError::DeviceNotFound)
+        );
+        assert_eq!(
+            table.release(a, DeviceId::from_raw(300)),
+            Err(DeviceReleaseError::DeviceNotFound)
+        );
     }
 
     #[test]
     fn quarantine_clears_owner_and_blocks_reclaim() {
         let a = owner(1);
         let b = owner(2);
-        let mut table = DeviceTable::new();
-        assert_eq!(table.claim(a, 9), Ok(()));
+        let mut table = DeviceTable::new(16);
+        assert_eq!(table.claim(a, DeviceId::from_raw(9)), Ok(()));
 
         table.quarantine_owner(a);
 
-        assert_eq!(table.owner(9), None, "失败后 owner 被清空");
-        assert!(table.is_quarantined(9), "失败设备被 quarantine");
+        assert_eq!(
+            table.owner(DeviceId::from_raw(9)),
+            None,
+            "失败后 owner 被清空"
+        );
+        assert!(
+            table.is_quarantined(DeviceId::from_raw(9)),
+            "失败设备被 quarantine"
+        );
         // 任何 owner 的认领都被挡住；别的设备不受影响。
-        assert_eq!(table.claim(a, 9), Err(DeviceClaimError::DeviceBusy));
-        assert_eq!(table.claim(b, 9), Err(DeviceClaimError::DeviceBusy));
-        assert_eq!(table.claim(b, 10), Ok(()));
+        assert_eq!(
+            table.claim(a, DeviceId::from_raw(9)),
+            Err(DeviceClaimError::DeviceBusy)
+        );
+        assert_eq!(
+            table.claim(b, DeviceId::from_raw(9)),
+            Err(DeviceClaimError::DeviceBusy)
+        );
+        assert_eq!(table.claim(b, DeviceId::from_raw(10)), Ok(()));
     }
 
     #[test]
     fn release_unknown_device_is_not_found() {
-        let mut table = DeviceTable::new();
+        let mut table = DeviceTable::new(16);
         assert_eq!(
-            table.release(owner(1), 3),
+            table.release(owner(1), DeviceId::from_raw(3)),
             Err(DeviceReleaseError::DeviceNotFound)
         );
     }
 
+    /// 全局认领路径：合成设备表 300 项（含 `DeviceId ≥ 256` 的设备），验证
+    /// resolve → 独占 → 本域窗口；越界 / PIO 的拒绝路径不变。
     #[test]
-    fn claim_rejects_out_of_range_and_pio() {
+    fn claim_resolves_mmio_and_rejects_out_of_range_and_pio() {
         let _guard = crate::machine::test_support::GUARD.lock();
-        super::init();
 
-        let mut devices = [DeviceDescriptor::empty(); 26];
+        let mut devices = vec![DeviceDescriptor::empty(); 300];
         let mut mmio = DeviceDescriptor::empty();
         mmio.space = IoSpace::Mmio {
             base: 0x1000_8000,
@@ -346,22 +445,28 @@ mod tests {
             size: 8,
         };
         devices[1] = pio;
-        crate::machine::commit(crate::machine::MachineInfo {
-            boot_hardware_id: crate::machine::HardwareCpuId::from_raw(0),
-            timebase_frequency: 10_000_000,
-            cpu_count: 1,
-            cpu_info: [crate::machine::CpuInfo {
+        let mut far = DeviceDescriptor::empty();
+        far.space = IoSpace::Mmio {
+            base: 0x2000_0000,
+            size: 0x2000,
+        };
+        devices[260] = far;
+        let info = crate::machine::test_support::snapshot(
+            crate::machine::HardwareCpuId::from_raw(0),
+            10_000_000,
+            vec![crate::machine::CpuInfo {
                 boot_cpu: true,
                 hardware_id: crate::machine::HardwareCpuId::from_raw(0),
-            }; crate::machine::MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [crate::machine::MemoryRegion {
+            }],
+            vec![crate::machine::MemoryRegion {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
-            }; 16],
-            dev_count: 2,
+            }],
             devices,
-        });
+        );
+        crate::machine::test_support::install(info);
+        // 测试表按 fixture 尺寸重建（全局 `Once` 表不能按用例重定容）。
+        super::install_for_test(300);
 
         let ctx = crate::resource::RequestContext {
             component: owner(60),
@@ -369,18 +474,23 @@ mod tests {
         };
         // 越界 → DeviceNotFound。
         assert_eq!(
-            super::claim(&ctx, crate::machine::DeviceId::from_raw(99)),
+            super::claim(&ctx, DeviceId::from_raw(300)),
             Err(DeviceClaimError::DeviceNotFound)
         );
         // PIO → NotMmio。
         assert_eq!(
-            super::claim(&ctx, crate::machine::DeviceId::from_raw(1)),
+            super::claim(&ctx, DeviceId::from_raw(1)),
             Err(DeviceClaimError::NotMmio)
         );
         // MMIO → 直接拿到寄存器基址（KernelNative identity）。
-        let mapping = super::claim(&ctx, crate::machine::DeviceId::from_raw(0)).unwrap();
+        let mapping = super::claim(&ctx, DeviceId::from_raw(0)).unwrap();
         assert_eq!(mapping.mmio as usize, 0x1000_8000);
         assert_eq!(mapping.mmio_len, 0x1000);
+        // 全宽：ID ≥ 256 的设备同样可认领。
+        let far_mapping = super::claim(&ctx, DeviceId::from_raw(260)).expect("full-width id");
+        assert_eq!(far_mapping.mmio as usize, 0x2000_0000);
+        assert_eq!(far_mapping.mmio_len, 0x2000);
+
         super::get_table().lock().quarantine_owner(owner(60));
         super::get_table().lock().clear_quarantine();
     }

@@ -80,8 +80,8 @@ mod tests {
     }
 
     fn commit_device(device_index: usize, compatible: &[u8]) {
-        use crate::machine::{self, CpuInfo, HardwareCpuId, MachineInfo, MemoryRegion};
-        let mut devices = [DeviceDescriptor::empty(); 26];
+        use crate::machine::{CpuInfo, HardwareCpuId, MemoryRegion};
+        let mut devices = alloc::vec![DeviceDescriptor::empty(); device_index + 1];
         devices[device_index] = DeviceDescriptor {
             space: IoSpace::Mmio {
                 base: 0x1000_0000 + device_index * 0x1000,
@@ -96,22 +96,22 @@ mod tests {
             ],
             compat_count: 1,
         };
-        machine::commit(MachineInfo {
-            boot_hardware_id: HardwareCpuId::from_raw(0),
-            timebase_frequency: 10_000_000,
-            cpu_count: 1,
-            cpu_info: [CpuInfo {
+        let info = crate::machine::test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            alloc::vec![CpuInfo {
                 boot_cpu: true,
                 hardware_id: HardwareCpuId::from_raw(0),
-            }; crate::machine::MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [MemoryRegion {
+            }],
+            alloc::vec![MemoryRegion {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
-            }; 16],
-            dev_count: device_index + 1,
+            }],
             devices,
-        });
+        );
+        crate::machine::test_support::install(info);
+        // device / irq 表按 fixture 尺寸重建（进程全局表不能按用例重定容）。
+        crate::resource::test_support::reinstall();
     }
 
     /// 失败编排：资源回收 + 提交 Failed + 设备 quarantine。
@@ -140,7 +140,8 @@ mod tests {
         device::claim(&ctx, device_id).expect("claim");
         irq::get_table()
             .lock()
-            .register(id, 24, 8, demo_irq, core::ptr::null_mut());
+            .register(id, device_id, 8, demo_irq, core::ptr::null_mut())
+            .unwrap();
         let buffer = dma::alloc(id, 4096).expect("dma alloc");
         let mapping = dma::map(
             &ctx,
@@ -163,8 +164,8 @@ mod tests {
             before_quarantine + 1,
             "DMA backing 必须进 quarantine"
         );
-        assert!(!device::get_table().lock().owner(24).is_some());
-        assert!(device::get_table().lock().is_quarantined(24));
+        assert!(!device::get_table().lock().owner(device_id).is_some());
+        assert!(device::get_table().lock().is_quarantined(device_id));
 
         // quarantine 后普通认领 -EBUSY。
         let claimant = RequestContext {

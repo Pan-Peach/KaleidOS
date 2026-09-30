@@ -138,7 +138,7 @@ impl RuntimeVm32 {
         let ram_perm =
             MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE;
         let image_va_end = align_up_page(image_end);
-        for r in &info.memory_regions[..info.mem_count] {
+        for r in info.memory_regions.iter() {
             if r.size == 0 {
                 continue;
             }
@@ -177,7 +177,7 @@ impl RuntimeVm32 {
 
         // 3) 设备 MMIO：VA == PA，RW-NX，页对齐向外取整。
         let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
-        for d in &info.devices[..info.dev_count] {
+        for d in info.devices.iter() {
             if let IoSpace::Mmio { base, size } = d.space {
                 if size == 0 {
                     continue;

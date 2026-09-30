@@ -1,4 +1,5 @@
 use crate::vm::{bootstrap, layout, runtime};
+use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -59,7 +60,7 @@ fn linker_addr(symbol: *const u8) -> usize {
 
 #[cfg(feature = "machine")]
 fn configure_machine_timer(info: &MachineInfo) {
-    for device in &info.devices[..info.dev_count] {
+    for device in info.devices.iter() {
         let kind = device.compatibles[..device.compat_count as usize]
             .iter()
             .map(CompatStr::as_str)
@@ -82,7 +83,7 @@ fn configure_machine_timer(info: &MachineInfo) {
 /// 匹配真实 QEMU 的 `riscv,plic0` 与 fixture/新版的 `sifive,plic-1.0.0`；
 /// 没有中断控制器的机器不阻塞 boot（外部中断不可用）。
 fn configure_interrupt_controller(info: &MachineInfo) {
-    for device in &info.devices[..info.dev_count] {
+    for device in info.devices.iter() {
         let is_plic = device.compatibles[..device.compat_count as usize]
             .iter()
             .any(|c| matches!(c.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"));
@@ -110,7 +111,10 @@ fn configure_interrupt_controller(info: &MachineInfo) {
             cpu: CpuId::from_raw(0),
             context: 0,
         }; arch::riscv::plic::MAX_PLIC_CONTEXTS];
-        let count = info.cpu_count.min(arch::riscv::plic::MAX_PLIC_CONTEXTS);
+        let count = info
+            .cpu_info
+            .len()
+            .min(arch::riscv::plic::MAX_PLIC_CONTEXTS);
         for (i, slot) in contexts.iter_mut().enumerate().take(count) {
             *slot = arch::riscv::plic::PlicCpuContext {
                 cpu: CpuId::from_raw(i),
@@ -313,44 +317,29 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     }
 }
 
-/// 完整 discovery（high-half、`early_init` 之后）：FDT → 定长 `MachineInfo`。
+/// 完整 discovery（high-half、`early_init` 之后）：FDT → owned `MachineInfo`。
 ///
-/// 不分配；`MachineInfo` 是定长数组 + count（无借用），字符串用 `CompatStr`
-/// 内嵌复制，DTB 之后可丢。
+/// 用 `Vec` 收集（**不**截断到旧定长容量），交接处 `.into_boxed_slice()`；
+/// 字符串用 `CompatStr` 内嵌复制，DTB 之后可丢。CPU 承认规则：BSP 归一到逻辑
+/// CPU0；firmware 描述的 CPU 超过 `MAX_CPUS` 时 BSP 优先、其余按发现顺序取前
+/// `MAX_CPUS` 并显式诊断。**BSP 缺失时不制造**——Core 校验会拒绝该提案。
 fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineInfo {
-    let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
-    let mut cpu_info = [CpuInfo {
-        boot_cpu: false,
-        hardware_id: HardwareCpuId::from_raw(0),
-    }; MAX_CPUS];
-    let mut devices = [DeviceDescriptor::empty(); 26];
-
-    let mut mem_count = 0usize;
+    let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(r) = region else { continue };
-        if mem_count >= memory_regions.len() {
-            kernel::log!("discovery", "too many RAM regions; dropping");
-            continue;
-        }
-        memory_regions[mem_count] = MemoryRegion {
+        memory_regions.push(MemoryRegion {
             base: r.address as usize,
             size: r.len as usize,
-        };
-        mem_count += 1;
+        });
     }
 
-    let mut cpu_count = 0usize;
+    let mut cpu_info: Vec<CpuInfo> = Vec::new();
     for cpu in tree.root().cpus().iter() {
-        if cpu_count >= cpu_info.len() {
-            kernel::log!("discovery", "too many CPUs; dropping");
-            continue;
-        }
         let hart = cpu.reg::<u64>().first().unwrap_or(0);
-        cpu_info[cpu_count] = CpuInfo {
+        cpu_info.push(CpuInfo {
             boot_cpu: hart == hart_id as u64,
             hardware_id: HardwareCpuId::from_raw(hart),
-        };
-        cpu_count += 1;
+        });
     }
 
     // 归一化：逻辑 CPU id = 数组下标（从 0 稠密），并强制 **boot hart = 逻辑
@@ -358,30 +347,32 @@ fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineIn
     // 化时 BSP 会绑到 CPU0 的入口记录/trap 栈，而某个 AP 之后又占用 CPU0 →
     // 逻辑身份互相别名（smp-percpu 因此 flaky）。保持「BSP = 逻辑 0」这一
     // 既有不变式，PLIC 外部固定路由、`trap_stack_*`、per-CPU 表全部继续正确。
-    if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
+    if let Some(boot_index) = cpu_info.iter().position(|c| c.boot_cpu) {
         cpu_info.swap(0, boot_index);
+    }
+    if cpu_info.len() > MAX_CPUS {
+        kernel::log!(
+            "discovery",
+            "too many CPUs ({}); admitting {} (BSP first)",
+            cpu_info.len(),
+            MAX_CPUS
+        );
+        cpu_info.truncate(MAX_CPUS);
     }
 
     // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
-    let mut dev_count = 0usize;
-    collect_devices(
-        tree.root().as_node().children(),
-        &mut devices,
-        &mut dev_count,
-    );
+    let mut devices: Vec<DeviceDescriptor> = Vec::new();
+    collect_devices(tree.root().as_node().children(), &mut devices);
     if let Some(soc) = tree.find_node("/soc") {
-        collect_devices(soc.children(), &mut devices, &mut dev_count);
+        collect_devices(soc.children(), &mut devices);
     }
 
     MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
-        cpu_count,
-        cpu_info,
-        mem_count,
-        memory_regions,
-        dev_count,
-        devices,
+        cpu_info: cpu_info.into_boxed_slice(),
+        memory_regions: memory_regions.into_boxed_slice(),
+        devices: devices.into_boxed_slice(),
     }
 }
 
@@ -419,79 +410,62 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
     kernel::printk!("{:#?}\n", info);
     kernel::log!("bootstrap", "BOOT DISCOVERY OK");
 
+    // Core 消费提案（owned）并返回唯一提交的 `&'static` 快照：此后 boot 侧
+    // 一律借用它（runtime VM / SMP / selftest / monitor）。
+    let info = match kernel::init(info, &context.reserved) {
+        Ok(info) => info,
+        Err(error) => panic!("core init failed: {}", error),
+    };
+
+    // 长期内核地址空间：buddy 已活（kernel::init 之后），建立/校验/激活/全局
+    // 安装 runtime root，替换 bootstrap 临时 root。
+    // kernel_pa = 镜像加载地址（context.reserved[0] 即镜像 PA 范围）。
+    let runtime_layout = layout::kernel_layout();
+    runtime::init(&runtime_layout, context.reserved[0].base, info)
+        .expect("Sv39 runtime VM init failed");
+    kernel::log!("mmu", "runtime VM active");
+
+    // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
+    let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
+    let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
+    let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
+    kernel::component::store::init(pkg);
+
+    // 显式开全局中断：各本地源已在 kernel::init 中解源。
+    arch::CpuImpl::enable_irq();
+
     #[cfg(feature = "selftest")]
     {
-        // selftest 在**完整初始化之后**运行：先起 Core + 长期内核地址空间
-        // （device MMIO 才被映射），才能测 PLIC/UART 这类真实设备契约。
-        if let Err(error) = kernel::init(&info, &context.reserved) {
-            panic!("core init failed: {}", error);
-        }
-        let runtime_layout = layout::kernel_layout();
-        runtime::init(&runtime_layout, context.reserved[0].base, &info)
-            .expect("Sv39 runtime VM init failed");
-        // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
-        let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
-        let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
-        let pkg =
-            unsafe { core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start) };
-        kernel::component::store::init(pkg);
-        // 显式开全局中断：各本地源已在 kernel::init 中解源。
-        arch::CpuImpl::enable_irq();
-        crate::selftest::run(&info);
+        // selftest 在**完整初始化之后**运行：Core + 长期内核地址空间
+        // （device MMIO 才被映射）都就绪，才能测 PLIC/UART 这类真实设备契约。
+        crate::selftest::run(info);
     }
 
     #[cfg(not(feature = "selftest"))]
     {
-        kernel::log!("core", "core init: ");
-
-        match kernel::init(&info, &context.reserved) {
-            Ok(()) => {
-                kernel::log!("core", "BOOT CORE OK");
-
-                // 长期内核地址空间：buddy 已活（kernel::init 之后），
-                // 建立/校验/激活/全局安装 runtime root，替换 bootstrap 临时 root。
-                // kernel_pa = 镜像加载地址（context.reserved[0] 即镜像 PA 范围）。
-                let runtime_layout = layout::kernel_layout();
-                let kernel_pa = context.reserved[0].base;
-                runtime::init(&runtime_layout, kernel_pa, &info)
-                    .expect("Sv39 runtime VM init failed");
-                kernel::log!("mmu", "runtime VM active");
-                // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
-                let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
-                let pkg_end = core::ptr::addr_of!(__initpkg_end) as usize;
-                let pkg = unsafe {
-                    core::slice::from_raw_parts(pkg_start as *const u8, pkg_end - pkg_start)
-                };
-                kernel::component::store::init(pkg);
-                if let Some(store) = kernel::component::store::get_component_store() {
-                    let list = store.list();
-                    match list {
-                        Ok(entries) => {
-                            // 只数组件：cpio 归档里还有 manifest 等元数据条目。
-                            let components = entries
-                                .iter()
-                                .filter(|entry| entry.name.ends_with(b".kcomp"))
-                                .count();
-                            kernel::log!("store", "embedded kpkg: {} components", components)
-                        }
-                        Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
-                    }
-                } else {
-                    kernel::log!("store", "store: not initialized");
+        kernel::log!("core", "BOOT CORE OK");
+        if let Some(store) = kernel::component::store::get_component_store() {
+            let list = store.list();
+            match list {
+                Ok(entries) => {
+                    // 只数组件：cpio 归档里还有 manifest 等元数据条目。
+                    let components = entries
+                        .iter()
+                        .filter(|entry| entry.name.ends_with(b".kcomp"))
+                        .count();
+                    kernel::log!("store", "embedded kpkg: {} components", components)
                 }
-
-                // 显式开全局中断：各本地源已在 kernel::init 中解源。
-                arch::CpuImpl::enable_irq();
-                // boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
-                // （见 src/smp.rs）。单 CPU 机器上自然空转。
-                crate::smp::start_secondaries(&info);
-                // 转交 Core Monitor（boot hart 同步主循环，永不返回）
-                kernel::monitor::run();
+                Err(e) => kernel::log!("store", "kpkg parse error: {:?}", e),
             }
-            Err(e) => {
-                panic!("core init failed: {}", e);
-            }
+        } else {
+            kernel::log!("store", "store: not initialized");
         }
+
+        // boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
+        // （见 src/smp.rs）。单 CPU 机器上自然空转。
+        crate::smp::start_secondaries(info);
+        // 转交 Core Monitor（boot hart 同步主循环，永不返回）
+        kernel::monitor::run();
     }
 }
 
@@ -541,18 +515,14 @@ fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<
     Some(d)
 }
 
-/// 把一批 FDT 子节点中符合规则的设备收集进 MachineInfo 的定长设备表。
+/// 把一批 FDT 子节点中符合规则的设备收集进 owned 设备表（无容量上限）。
 fn collect_devices<'a>(
     children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
-    devices: &mut [DeviceDescriptor; 26],
-    dev_count: &mut usize,
+    devices: &mut Vec<DeviceDescriptor>,
 ) {
     for child in children {
         if let Some(d) = device_descriptor(&child) {
-            if *dev_count < devices.len() {
-                devices[*dev_count] = d;
-                *dev_count += 1;
-            }
+            devices.push(d);
         }
     }
 }

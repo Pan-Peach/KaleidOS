@@ -7,17 +7,12 @@
 
 use crate::component::endpoint::ExecutionDomain;
 use crate::component::load::ComponentLoadError;
-use crate::machine::{IoSpace, MachineInfo};
+use crate::machine::IoSpace;
 use crate::memory;
 use crate::printk;
 use alloc::string::String;
 use alloc::vec::Vec;
 use arch::{ResetImpl, ResetType, SystemReset};
-
-/// 挂载 MachineInfo（core::init 完成时调用一次）：写入 machine 模块的唯一真相点。
-pub fn mount(info: &MachineInfo) {
-    crate::machine::commit(*info);
-}
 
 /// `help`：列出可用命令。
 pub fn help(_line: &[u8]) {
@@ -33,15 +28,13 @@ pub fn machine(_line: &[u8]) {
         return;
     };
     printk!("boot hart: hart{}\n", info.boot_hardware_id.raw());
-    printk!("cpus: {}\n", info.cpu_count);
-    for i in 0..info.cpu_count {
-        let c = &info.cpu_info[i];
+    printk!("cpus: {}\n", info.cpu_info.len());
+    for c in info.cpu_info.iter() {
         // raw()：HardwareCpuId 的 Display 是 "hwcpuN"；这里要裸 hart 号（hartN）。
         printk!("  hart{} boot={}\n", c.hardware_id.raw(), c.boot_cpu);
     }
-    printk!("memory regions: {}\n", info.mem_count);
-    for i in 0..info.mem_count {
-        let r = &info.memory_regions[i];
+    printk!("memory regions: {}\n", info.memory_regions.len());
+    for r in info.memory_regions.iter() {
         printk!(
             "  [{:#x}, {:#x}) size={:#x}\n",
             r.base,
@@ -49,9 +42,8 @@ pub fn machine(_line: &[u8]) {
             r.size
         );
     }
-    printk!("devices: {}\n", info.dev_count);
-    for i in 0..info.dev_count {
-        let d = &info.devices[i];
+    printk!("devices: {}\n", info.devices.len());
+    for d in info.devices.iter() {
         let (space, base, size) = match d.space {
             IoSpace::Mmio { base, size } => ("mmio", base, size),
             IoSpace::Pio { base, size } => ("pio", base, size),

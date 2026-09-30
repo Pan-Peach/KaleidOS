@@ -184,7 +184,7 @@ pub fn select_arena(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::{CpuInfo, DeviceDescriptor, HardwareCpuId, MAX_CPUS, MachineInfo};
+    use crate::machine::{CpuInfo, HardwareCpuId};
 
     fn region(base: usize, size: usize) -> MemoryRegion {
         MemoryRegion { base, size }
@@ -471,22 +471,19 @@ mod tests {
             !crate::memory::is_initialized(),
             "host fixtures must not trip the seam gate"
         );
-        let info = MachineInfo {
-            boot_hardware_id: HardwareCpuId::from_raw(0),
-            timebase_frequency: 0,
-            cpu_count: 1,
-            cpu_info: [CpuInfo {
+        let info = crate::machine::test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            0,
+            alloc::vec![CpuInfo {
                 boot_cpu: true,
                 hardware_id: HardwareCpuId::from_raw(0),
-            }; MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [region(0x8000_0000, 1 << 20); 16],
-            dev_count: 0,
-            devices: [DeviceDescriptor::empty(); 26],
-        };
+            }],
+            alloc::vec![region(0x8000_0000, 1 << 20)],
+            alloc::vec![],
+        );
         assert_eq!(
-            crate::init(&info, &[]),
-            Err("memory not early-initialized"),
+            crate::init(info, &[]).err(),
+            Some("memory not early-initialized"),
             "core::init must fail-closed before using the allocator"
         );
     }

@@ -128,11 +128,20 @@ pub fn route(number: u32) -> Option<(ComponentId, IrqHandler, *mut ())> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::DeviceId;
     use crate::resource::irq::{self, IrqError};
     use crate::test_support::{Rank, TestLock};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 装一张固定 8 槽的 IRQ 测试表（`get_table()` 的测试覆盖槽）。
+    ///
+    /// **调用方必须持 [`crate::machine::test_support::GUARD`]**：资源表测试可能
+    /// 用自己的 fixture 覆盖同一全局槽，MACHINE guard 把它们串行化。
+    fn install_test_irq_table() {
+        irq::install_for_test(8);
+    }
 
     /// Nested irq-save guards restore the state they observed, so only the outer
     /// guard that observed IRQs enabled may turn them back on.
@@ -168,14 +177,23 @@ mod tests {
     fn route_yields_delivery_only_for_registered_line() {
         let _serial = IRQ_TEST_LOCK.lock();
         let _boundary = crate::component::containment::test_boundary_lock();
+        let _machine = crate::machine::test_support::GUARD.lock();
         crate::component::containment::enter_anchor();
-        // 生产装配：route 表（resource）+ 投递回调注册（本模块 init → arch 后端）。
-        irq::init();
+        // 生产装配：route 表（resource，测试覆盖为固定 8 槽）+ 投递回调注册
+        // （本模块 init → arch 后端）。
+        install_test_irq_table();
         crate::irq::init();
         let owner = ComponentId::from_raw(0xfeed);
         irq::get_table()
             .lock()
-            .register(owner, 0, 42, bump, core::ptr::null_mut());
+            .register(
+                owner,
+                DeviceId::from_raw(0),
+                42,
+                bump,
+                core::ptr::null_mut(),
+            )
+            .unwrap();
 
         // 未注册 route 的线：无投递（中断到了也没人接）。
         arch::fake::deliver_external_for_test(CpuId::from_raw(0), 43);
@@ -196,16 +214,31 @@ mod tests {
     #[test]
     fn release_clears_the_route() {
         let _serial = IRQ_TEST_LOCK.lock();
-        irq::init();
+        let _machine = crate::machine::test_support::GUARD.lock();
+        install_test_irq_table();
         let owner = ComponentId::from_raw(0xbeef);
         irq::get_table()
             .lock()
-            .register(owner, 5, 43, bump, core::ptr::null_mut());
+            .register(
+                owner,
+                DeviceId::from_raw(5),
+                43,
+                bump,
+                core::ptr::null_mut(),
+            )
+            .unwrap();
         assert!(route(43).is_some());
-        assert_eq!(irq::get_table().lock().release(owner, 5), Ok(()));
+        assert_eq!(
+            irq::get_table()
+                .lock()
+                .release(owner, DeviceId::from_raw(5)),
+            Ok(())
+        );
         assert!(route(43).is_none());
         assert_eq!(
-            irq::get_table().lock().release(owner, 5),
+            irq::get_table()
+                .lock()
+                .release(owner, DeviceId::from_raw(5)),
             Err(IrqError::NoHandler)
         );
     }
@@ -238,14 +271,23 @@ mod tests {
     fn callback_dispatch_attributes_to_line_owner() {
         let _serial = IRQ_TEST_LOCK.lock();
         let _boundary = crate::component::containment::test_boundary_lock();
+        let _machine = crate::machine::test_support::GUARD.lock();
         crate::component::containment::enter_anchor();
-        // 生产装配：route 表（resource）+ 投递回调注册（本模块 init → arch 后端）。
-        irq::init();
+        // 生产装配：route 表（resource，测试覆盖为固定 8 槽）+ 投递回调注册
+        // （本模块 init → arch 后端）。
+        install_test_irq_table();
         crate::irq::init();
         let owner = ComponentId::from_raw(0xfeed);
         irq::get_table()
             .lock()
-            .register(owner, 0, 42, observe_ambient, core::ptr::null_mut());
+            .register(
+                owner,
+                DeviceId::from_raw(0),
+                42,
+                observe_ambient,
+                core::ptr::null_mut(),
+            )
+            .unwrap();
         OBSERVED_COMPONENT.store(usize::MAX, Ordering::Release);
         OBSERVED_TASK.store(usize::MAX, Ordering::Release);
 

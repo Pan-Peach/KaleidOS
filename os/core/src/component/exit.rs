@@ -212,14 +212,17 @@ mod tests {
         guard
     }
 
-    /// 提交一份含指定设备（MMIO + irq）的机器信息。
+    /// 安装一份含指定设备（MMIO + irq）的机器 fixture，并按尺寸重建资源表。
     fn commit_devices(devices: &[(usize, &[u8])]) {
         use crate::machine::{
-            self, CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo,
-            MemoryRegion,
+            CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MemoryRegion,
         };
-        let mut table = [DeviceDescriptor::empty(); 26];
-        let mut dev_count = 0;
+        let count = devices
+            .iter()
+            .map(|(index, _)| index + 1)
+            .max()
+            .unwrap_or(0);
+        let mut table = alloc::vec![DeviceDescriptor::empty(); count];
         for (index, compatible) in devices {
             table[*index] = DeviceDescriptor {
                 space: IoSpace::Mmio {
@@ -235,24 +238,22 @@ mod tests {
                 ],
                 compat_count: 1,
             };
-            dev_count = dev_count.max(*index + 1);
         }
-        machine::commit(MachineInfo {
-            boot_hardware_id: HardwareCpuId::from_raw(0),
-            timebase_frequency: 10_000_000,
-            cpu_count: 1,
-            cpu_info: [CpuInfo {
+        let info = crate::machine::test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            alloc::vec![CpuInfo {
                 boot_cpu: true,
                 hardware_id: HardwareCpuId::from_raw(0),
-            }; crate::machine::MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [MemoryRegion {
+            }],
+            alloc::vec![MemoryRegion {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
-            }; 16],
-            dev_count,
-            devices: table,
-        });
+            }],
+            table,
+        );
+        crate::machine::test_support::install(info);
+        crate::resource::test_support::reinstall();
     }
 
     extern "C" fn destroy_hook_ok(_state: *mut ()) -> i32 {
@@ -426,12 +427,12 @@ mod tests {
         assert!(
             crate::resource::device::get_table()
                 .lock()
-                .is_quarantined(23)
+                .is_quarantined(crate::machine::DeviceId::from_raw(23))
         );
         assert!(
             !crate::resource::device::get_table()
                 .lock()
-                .owner(23)
+                .owner(crate::machine::DeviceId::from_raw(23))
                 .is_some()
         );
 
@@ -499,10 +500,10 @@ mod tests {
         assert_eq!(reg.get(second).unwrap().state, ComponentState::Ready);
         drop(reg);
         let table = crate::resource::device::get_table().lock();
-        assert!(table.is_quarantined(10));
-        assert!(!table.is_quarantined(11));
+        assert!(table.is_quarantined(crate::machine::DeviceId::from_raw(10)));
+        assert!(!table.is_quarantined(crate::machine::DeviceId::from_raw(11)));
         assert_eq!(
-            table.owner(11),
+            table.owner(crate::machine::DeviceId::from_raw(11)),
             Some(second),
             "未选中实例的 ownership 必须原样"
         );

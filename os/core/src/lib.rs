@@ -57,60 +57,27 @@ pub mod trace;
 #[global_allocator]
 static ALLOCATOR: memory::KernelAllocator = memory::KernelAllocator;
 
-/// Core 初始化入口：消费 bootstrap 发现的 MachineInfo（提案），校验后提交资源真相。
+/// Core 初始化入口：**消费** bootstrap 发现的 `MachineInfo`（owned 提案），
+/// 校验后一次性提交（[`machine::commit`]），再从已提交快照初始化其余子系统，
+/// 返回该 `&'static` 真相供 boot 后续消费（runtime VM / SMP / 监视器）。
+///
 /// `reserved` 是需保留的区间（bootstrap 提供：ELF image range）。
 ///
 /// **不初始化 / 不重置内存**：分配器由 boot 的早期内存 seam
 /// （`memory::early_init(arena)`，无堆 pass 选出的单一 arena）在 `init` 之前
 /// 启动；seam 未跑即 fail-closed。镜像范围必须落在已发现的 RAM region 内
 /// （arena 选择与长期映射的前提，input sanity）。
+///
+/// **发布之后的任何失败都是终止启动**：没有 retry、没有替换 API。
 pub fn init(
-    info: &machine::MachineInfo,
+    info: machine::MachineInfo,
     reserved: &[machine::MemoryRegion],
-) -> Result<(), &'static str> {
+) -> Result<&'static machine::MachineInfo, &'static str> {
     if !memory::is_initialized() {
         return Err("memory not early-initialized");
     }
-    if info.mem_count == 0 {
-        return Err("no memory regions");
-    }
-    if info.mem_count > info.memory_regions.len()
-        || info.cpu_count > info.cpu_info.len()
-        || info.dev_count > info.devices.len()
-    {
-        return Err("machine info count exceeds capacity");
-    }
-    if info.cpu_count == 0 {
-        return Err("no cpu info");
-    }
-    if !info.cpu_info[..info.cpu_count]
-        .iter()
-        .any(|cpu| cpu.hardware_id == info.boot_hardware_id)
-    {
-        return Err("boot hart is not present in cpu info");
-    }
-
-    // 镜像（reserved）必须被某个已发现 RAM region 完整覆盖：boot 的 arena
-    // 选择与长期映射都以该不变式为前提，Core 不采信未验证的布局输入。
-    // 前提：BSS 已在 bootstrap 启动汇编里清零（见 entry.S）；
-    // core 不再负责 BSS 清零（那是启动路径职责）。
-    if let (Some(first), Some(last)) = (reserved.first(), reserved.last()) {
-        let image_start = first.base;
-        let image_end = last
-            .base
-            .checked_add(last.size)
-            .ok_or("reserved region overflows")?;
-        let covered = info.memory_regions[..info.mem_count].iter().any(|region| {
-            region.base <= image_start
-                && region
-                    .base
-                    .checked_add(region.size)
-                    .is_some_and(|end| image_end <= end)
-        });
-        if !covered {
-            return Err("reserved image is outside the discovered RAM regions");
-        }
-    }
+    validate_proposal(&info, reserved)?;
+    let info = machine::commit(info)?;
 
     task::init();
     sched::init();
@@ -131,6 +98,7 @@ pub fn init(
 
     component::registry::init();
     component::endpoint::init();
+    // resource 表按已提交快照的**设备数**定容（长度即真相，全宽 DeviceId）。
     resource::init();
     irq::init();
     // SMP：BSP 侧 Core 初始化（发布 CPU 记录、注册 Core IPI 回调、BSP Online）。
@@ -138,6 +106,200 @@ pub fn init(
     // 且接收端应答/drain 落地前不得开源（见 `os/core/src/smp/mod.rs` 模块文档）。
     smp::init(info).map_err(|_| "smp init failed")?;
     log!("core", "init OK");
-    monitor::mount(info);
+    Ok(info)
+}
+
+/// 校验机器提案的形状（`commit` 之前）：RAM / CPU / 设备表的存在性、CPU 上限
+/// 与 BSP 不变式、硬件身份唯一性、设备表可被 `DeviceId`（`u32`）索引、
+/// reserved 镜像落在已发现 RAM 内。
+///
+/// **长度即真相**：所有迭代走完整切片，没有 count 截断。BSP 必须由发现阶段
+/// 归一化到逻辑 CPU0（唯一且与 `boot_hardware_id` 一致）；Core **不制造** BSP，
+/// 缺失即拒绝。
+fn validate_proposal(
+    info: &machine::MachineInfo,
+    reserved: &[machine::MemoryRegion],
+) -> Result<(), &'static str> {
+    if info.memory_regions.is_empty() {
+        return Err("no memory regions");
+    }
+    if info.cpu_info.is_empty() {
+        return Err("no cpu info");
+    }
+    if info.cpu_info.len() > machine::MAX_CPUS {
+        return Err("cpu info exceeds MAX_CPUS");
+    }
+    // 设备身份是 u32（DeviceId）：表长必须能被 u32 索引（64 位目标上的防御；
+    // 32 位目标上 usize == u32，转换恒成功）。
+    if u32::try_from(info.devices.len()).is_err() {
+        return Err("device table exceeds DeviceId width");
+    }
+
+    // BSP：**唯一**、位于逻辑 CPU0、硬件身份与 `boot_hardware_id` 一致。
+    let boot_count = info.cpu_info.iter().filter(|cpu| cpu.boot_cpu).count();
+    if boot_count != 1
+        || !info.cpu_info[0].boot_cpu
+        || info.cpu_info[0].hardware_id != info.boot_hardware_id
+    {
+        return Err("boot CPU is not the unique logical CPU0");
+    }
+
+    // 硬件身份不得重复：重复会把两个逻辑 CPU 指向同一物理 hart。
+    for (index, cpu) in info.cpu_info.iter().enumerate() {
+        if info.cpu_info[index + 1..]
+            .iter()
+            .any(|other| other.hardware_id == cpu.hardware_id)
+        {
+            return Err("duplicate hardware cpu id");
+        }
+    }
+
+    // 镜像（reserved）必须被某个已发现 RAM region 完整覆盖：boot 的 arena
+    // 选择与长期映射都以该不变式为前提，Core 不采信未验证的布局输入。
+    // 前提：BSS 已在 bootstrap 启动汇编里清零（见 entry.S）；
+    // core 不再负责 BSS 清零（那是启动路径职责）。
+    if let (Some(first), Some(last)) = (reserved.first(), reserved.last()) {
+        let image_start = first.base;
+        let image_end = last
+            .base
+            .checked_add(last.size)
+            .ok_or("reserved region overflows")?;
+        let covered = info.memory_regions.iter().any(|region| {
+            region.base <= image_start
+                && region
+                    .base
+                    .checked_add(region.size)
+                    .is_some_and(|end| image_end <= end)
+        });
+        if !covered {
+            return Err("reserved image is outside the discovered RAM regions");
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use machine::{CpuInfo, DeviceDescriptor, HardwareCpuId, MachineInfo, MemoryRegion};
+
+    fn cpu(boot: bool, hardware: u64) -> CpuInfo {
+        CpuInfo {
+            boot_cpu: boot,
+            hardware_id: HardwareCpuId::from_raw(hardware),
+        }
+    }
+
+    fn ram(base: usize, size: usize) -> MemoryRegion {
+        MemoryRegion { base, size }
+    }
+
+    fn proposal(cpus: Vec<CpuInfo>, regions: Vec<MemoryRegion>) -> MachineInfo {
+        machine::test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            cpus,
+            regions,
+            vec![DeviceDescriptor::empty()],
+        )
+    }
+
+    #[test]
+    fn validate_rejects_empty_cpu_or_ram_inventory() {
+        // 空 CPU 表。
+        assert_eq!(
+            validate_proposal(&proposal(vec![], vec![ram(0x8000_0000, 0x1000)]), &[]),
+            Err("no cpu info")
+        );
+        // 空 RAM inventory（设备表可为空，但 RAM 不行）。
+        assert_eq!(
+            validate_proposal(&proposal(vec![cpu(true, 0)], vec![]), &[]),
+            Err("no memory regions")
+        );
+    }
+
+    #[test]
+    fn validate_enforces_max_cpus_as_an_admitted_cpu_limit() {
+        let mut cpus = Vec::new();
+        cpus.push(cpu(true, 0));
+        for hardware in 1..=machine::MAX_CPUS {
+            cpus.push(cpu(false, hardware as u64));
+        }
+        // MAX_CPUS + 1 台：拒绝（长度即限制）。
+        assert_eq!(
+            validate_proposal(&proposal(cpus, vec![ram(0x8000_0000, 0x1000)]), &[]),
+            Err("cpu info exceeds MAX_CPUS")
+        );
+    }
+
+    #[test]
+    fn validate_requires_a_unique_boot_cpu_at_logical_zero() {
+        // BSP 不在逻辑 0（发现阶段未归一化）。
+        assert_eq!(
+            validate_proposal(
+                &proposal(
+                    vec![cpu(false, 0), cpu(true, 1)],
+                    vec![ram(0x8000_0000, 0x1000)]
+                ),
+                &[]
+            ),
+            Err("boot CPU is not the unique logical CPU0")
+        );
+        // boot_cpu 标记在 0，但硬件身份与 boot_hardware_id 不一致（不能制造 BSP）。
+        let mut info = proposal(vec![cpu(true, 7)], vec![ram(0x8000_0000, 0x1000)]);
+        info.boot_hardware_id = HardwareCpuId::from_raw(99);
+        assert_eq!(
+            validate_proposal(&info, &[]),
+            Err("boot CPU is not the unique logical CPU0")
+        );
+        // 两个 boot_cpu 标记：不唯一。
+        assert_eq!(
+            validate_proposal(
+                &proposal(
+                    vec![cpu(true, 0), cpu(true, 1)],
+                    vec![ram(0x8000_0000, 0x1000)]
+                ),
+                &[]
+            ),
+            Err("boot CPU is not the unique logical CPU0")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_hardware_ids() {
+        assert_eq!(
+            validate_proposal(
+                &proposal(
+                    vec![cpu(true, 0), cpu(false, 0)],
+                    vec![ram(0x8000_0000, 0x1000)]
+                ),
+                &[]
+            ),
+            Err("duplicate hardware cpu id")
+        );
+    }
+
+    /// reserved 覆盖检查走**完整** RAM 切片（不只是前缀）：镜像落在第 17 个
+    /// region 里也必须通过——旧的 16 项 inventory 上限已删除。
+    #[test]
+    fn validate_checks_reserved_against_the_full_ram_inventory() {
+        let regions: Vec<MemoryRegion> = (0..20)
+            .map(|i| ram(0x8000_0000 + i * 0x10000, 0x10000))
+            .collect();
+        let image = ram(0x8000_0000 + 17 * 0x10000, 0x10000);
+        assert_eq!(
+            validate_proposal(&proposal(vec![cpu(true, 0)], regions.clone()), &[image]),
+            Ok(())
+        );
+        // 未覆盖的镜像仍然拒绝。
+        assert_eq!(
+            validate_proposal(
+                &proposal(vec![cpu(true, 0)], regions),
+                &[ram(0x4000_0000, 0x1000)]
+            ),
+            Err("reserved image is outside the discovered RAM regions")
+        );
+    }
 }

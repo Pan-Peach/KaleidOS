@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[cfg(all(target_arch = "riscv64", feature = "vm-nommu"))]
 compile_error!("the current RV64 boot layout requires `vm-mmu`; NoMMU boot is RV32-only");
 

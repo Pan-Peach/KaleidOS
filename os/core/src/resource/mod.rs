@@ -49,7 +49,7 @@ pub enum ResourceKind {
     Dma,
 }
 
-/// 初始化资源表（`core::init` 调用一次）。
+/// 初始化资源表（`core::init` 调用一次；device / IRQ 表按已提交快照定容）。
 pub fn init() {
     device::init();
     irq::init();
@@ -57,3 +57,15 @@ pub fn init() {
 }
 
 pub use context::RequestContext;
+
+/// host 测试专用：按当前测试机器 fixture 重建 device / irq 表（进程全局
+/// `Once` 表不能按用例重定容）。调用方必须持有 `machine::test_support::GUARD`
+/// （fixture 的安装与表的读取共享同一份全局状态）。
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn reinstall() {
+        let devices = crate::machine::committed().map_or(0, |info| info.devices.len());
+        super::device::install_for_test(devices);
+        super::irq::install_for_test(devices);
+    }
+}

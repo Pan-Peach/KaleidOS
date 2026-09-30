@@ -124,7 +124,7 @@ pub fn start_secondaries(info: &MachineInfo) {
     let entry = secondary_main as *const () as usize;
     let trampoline = secondary_entry_address();
 
-    for (i, cpu) in info.cpu_info[..info.cpu_count].iter().enumerate() {
+    for (i, cpu) in info.cpu_info.iter().enumerate() {
         if cpu.hardware_id == info.boot_hardware_id {
             continue;
         }

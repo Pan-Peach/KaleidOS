@@ -174,26 +174,24 @@ macro_rules! log {
 mod tests {
     use super::*;
 
-    /// 提交一份指定 timebase 频率的 `MachineInfo`（只关心 idle 换算字段）。
+    /// 安装一份指定 timebase 频率的机器 fixture（只关心 idle 换算字段）。
     ///
-    /// `COMMITTED` 是进程全局，调用方必须持有 `machine::test_support::GUARD`。
-    fn commit_timebase(timebase_frequency: u64) {
-        crate::machine::commit(crate::machine::MachineInfo {
-            boot_hardware_id: crate::machine::HardwareCpuId::from_raw(0),
+    /// 全局快照是进程级读路径，调用方必须持有 `machine::test_support::GUARD`。
+    fn install_timebase(timebase_frequency: u64) {
+        let info = crate::machine::test_support::snapshot(
+            crate::machine::HardwareCpuId::from_raw(0),
             timebase_frequency,
-            cpu_count: 1,
-            cpu_info: [crate::machine::CpuInfo {
+            alloc::vec![crate::machine::CpuInfo {
                 boot_cpu: true,
                 hardware_id: crate::machine::HardwareCpuId::from_raw(0),
-            }; crate::machine::MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [crate::machine::MemoryRegion {
+            }],
+            alloc::vec![crate::machine::MemoryRegion {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
-            }; 16],
-            dev_count: 0,
-            devices: [crate::machine::DeviceDescriptor::empty(); 26],
-        });
+            }],
+            alloc::vec![],
+        );
+        crate::machine::test_support::install(info);
     }
 
     /// `idle_period()` 用已提交 timebase 换算 ~10ms：10MHz → 100_000 ticks。
@@ -202,7 +200,7 @@ mod tests {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：已提交 10 MHz timebase（QEMU virt 典型值）。
-        commit_timebase(10_000_000);
+        install_timebase(10_000_000);
 
         // When：计算 idle 周期。
         let period = idle_period();
@@ -217,7 +215,7 @@ mod tests {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：50 Hz timebase → 50 / 100 == 0。
-        commit_timebase(50);
+        install_timebase(50);
 
         // When：计算 idle 周期。
         let period = idle_period();
@@ -232,7 +230,7 @@ mod tests {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：timebase 频率未知（0）。
-        commit_timebase(0);
+        install_timebase(0);
 
         // When：计算 idle 周期。
         let period = idle_period();

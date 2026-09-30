@@ -234,26 +234,24 @@ mod tests {
     /// rank = TIMER（模块本地、最外层；见 [`crate::test_support`]）。
     static TIMER_TEST_LOCK: TestLock = TestLock::new(Rank::Timer);
 
-    /// 提交一份 10 MHz timebase 的 `MachineInfo`（idle 周期换算用）。
+    /// 安装一份 10 MHz timebase 的机器 fixture（idle 周期换算用）。
     ///
     /// 调用方必须持有 [`crate::machine::test_support::GUARD`]。
-    fn commit_timebase(timebase_frequency: u64) {
-        crate::machine::commit(crate::machine::MachineInfo {
-            boot_hardware_id: crate::machine::HardwareCpuId::from_raw(0),
+    fn install_timebase(timebase_frequency: u64) {
+        let info = crate::machine::test_support::snapshot(
+            crate::machine::HardwareCpuId::from_raw(0),
             timebase_frequency,
-            cpu_count: 1,
-            cpu_info: [crate::machine::CpuInfo {
+            alloc::vec![crate::machine::CpuInfo {
                 boot_cpu: true,
                 hardware_id: crate::machine::HardwareCpuId::from_raw(0),
-            }; crate::machine::MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [crate::machine::MemoryRegion {
+            }],
+            alloc::vec![crate::machine::MemoryRegion {
                 base: 0x8000_0000,
                 size: 0x1000_0000,
-            }; 16],
-            dev_count: 0,
-            devices: [crate::machine::DeviceDescriptor::empty(); 26],
-        });
+            }],
+            alloc::vec![],
+        );
+        crate::machine::test_support::install(info);
     }
 
     fn cpu0() -> &'static Mutex<TimerState> {
@@ -271,7 +269,7 @@ mod tests {
         let _serial = TIMER_TEST_LOCK.lock();
         // MACHINE rank(1) > TIMER rank(-1)：顺序合法。
         let _machine = crate::machine::test_support::GUARD.lock();
-        commit_timebase(10_000_000);
+        install_timebase(10_000_000);
 
         // Given: 没有任何 timer 表；后端本地初始化被注入失败。
         assert!(

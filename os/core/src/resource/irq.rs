@@ -16,25 +16,29 @@
 //! 锚点是 **DeviceId**，不是 `IrqHandle`：`DeviceDescriptor` 本身带 `irq`，
 //! 单 IRQ 设备下再套一层"MMIO → IRQ authority 派生"没有真实用途。
 //!
-//! # 刻意不做（当前范围）
-//!
-//! - **Polled / event delivery**（`register_polled` / `poll` / `ack`）：那是隔离
-//!   域的 event/wake 机制，执行模型尚未定稿。KernelNative 当前只走
-//!   最简单路径：IRQ → Core route → native callback（trap 内同步调用）。
-//! - 多 MSI-X vector / shared line / 跨 owner delegation：真实需求出现再加
-//!   `irq_index` 或动态 IRQ 身份。
+//! route 表**按已提交快照的设备数定容**（boxed slice，按 `DeviceId` 索引；
+//! 无 u8 收窄、无 256 固定上限）。**一台设备一条 route**——多资源维度
+//! （`irq_index` / 多 MSI-X vector / shared line / 跨 owner delegation）留到
+//! 有真实需求时再加，本次不做。
 //!
 //! # 投递纪律
 //!
 //! route 在锁内只取一份 `(owner, handler, ctx)` 拷贝，实际回调在**锁外**执行
 //! （trap 可能重入，spin 锁不可重入）。回调在 Core 建立的 IRQ 归属作用域内运行
 //! （principal = 线 owner，task = None），见 `crate::irq::on_irq`。
+//!
+//! # 锁序
+//!
+//! device → irq：**route 的插入 / 移除都在 device 锁内完成**——owner 校验通过
+//! 与 route 生效之间不允许插入"设备被并发 release"的窗口。
 
 use super::{RequestContext, ResourceKind};
 use crate::component::ComponentId;
 use crate::irq::IrqSaveGuard;
 use crate::machine::{self, DeviceId};
 use crate::trace::{TraceEvent, emit};
+use alloc::boxed::Box;
+use alloc::vec;
 use arch::InterruptController;
 use spin::{Mutex, Once};
 
@@ -67,54 +71,77 @@ pub enum IrqError {
     NoHandler,
 }
 
-/// IRQ route 真相表（按 `device_index` 锚定：单 IRQ 设备最多一条 route）。
+/// IRQ route 真相表：按已提交快照的设备数定容（一个设备最多一条 route）。
 pub struct IrqTable {
-    routes: [Option<IrqRoute>; 256],
+    routes: Box<[Option<IrqRoute>]>,
 }
 
 impl IrqTable {
-    pub const fn new() -> Self {
+    /// 建立恰好 `devices` 个空 route 槽位的表（快照设备数；空表合法）。
+    pub fn new(devices: usize) -> Self {
         Self {
-            routes: [None; 256],
+            routes: vec![None; devices].into_boxed_slice(),
         }
     }
 
-    fn index(device_index: u8) -> usize {
-        device_index as usize
+    /// 槽位数 = 已提交快照的设备数。
+    pub fn len(&self) -> usize {
+        self.routes.len()
     }
 
-    /// 注册 / 替换该设备的投递目标。
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    fn slot(&self, device: DeviceId) -> Option<&Option<IrqRoute>> {
+        self.routes.get(device.raw() as usize)
+    }
+
+    fn slot_mut(&mut self, device: DeviceId) -> Option<&mut Option<IrqRoute>> {
+        self.routes.get_mut(device.raw() as usize)
+    }
+
+    /// 注册 / 替换该设备的投递目标；越界 id → `DeviceNotFound`（不 panic）。
     pub fn register(
         &mut self,
         owner: ComponentId,
-        device_index: u8,
+        device: DeviceId,
         number: u32,
         handler: IrqHandler,
         ctx: *mut (),
-    ) {
-        self.routes[Self::index(device_index)] = Some(IrqRoute {
+    ) -> Result<(), IrqError> {
+        let Some(slot) = self.slot_mut(device) else {
+            return Err(IrqError::DeviceNotFound);
+        };
+        *slot = Some(IrqRoute {
             owner,
             number,
             handler: handler as usize,
             ctx: ctx as usize,
         });
+        Ok(())
     }
 
     /// 该设备是否已注册 route（供 device 释放的子项检查）。
-    pub fn has_route_for_device(&self, device_index: u8) -> bool {
-        self.routes[Self::index(device_index)].is_some()
+    pub fn has_route_for_device(&self, device: DeviceId) -> bool {
+        self.slot(device).is_some_and(Option::is_some)
     }
 
     /// 该设备 route 的中断号（enable/disable 锁外用）。
-    pub fn number_for(&self, device_index: u8) -> Option<u32> {
-        self.routes[Self::index(device_index)].map(|route| route.number)
+    pub fn number_for(&self, device: DeviceId) -> Option<u32> {
+        self.slot(device)
+            .and_then(|route| route.as_ref())
+            .map(|route| route.number)
     }
 
     /// 撤销一条 route：非 owner / 不存在 → 错误。
-    pub fn release(&mut self, owner: ComponentId, device_index: u8) -> Result<(), IrqError> {
-        match self.routes[Self::index(device_index)] {
+    pub fn release(&mut self, owner: ComponentId, device: DeviceId) -> Result<(), IrqError> {
+        let Some(slot) = self.slot_mut(device) else {
+            return Err(IrqError::DeviceNotFound);
+        };
+        match slot {
             Some(route) if route.owner == owner => {
-                self.routes[Self::index(device_index)] = None;
+                *slot = None;
                 Ok(())
             }
             Some(_) => Err(IrqError::NotOwner),
@@ -145,70 +172,77 @@ impl IrqTable {
     }
 }
 
-impl Default for IrqTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // —— 全局（`resource::init` 初始化；测试用 `IrqTable::new()`）——
 
 static TABLE: Once<Mutex<IrqTable>> = Once::new();
 
-/// 初始化全局 IRQ route 表（`resource::init` 调用一次）。
+/// 测试专用的全局表覆盖（见 [`install_for_test`]）。
+#[cfg(test)]
+static TEST_TABLE: Mutex<Option<&'static Mutex<IrqTable>>> = Mutex::new(None);
+
+/// 初始化全局 IRQ route 表（`resource::init` 调用一次）：按已提交快照的设备数定容。
 pub fn init() {
-    TABLE.call_once(|| Mutex::new(IrqTable::new()));
+    let devices = crate::machine::committed().map_or(0, |info| info.devices.len());
+    TABLE.call_once(|| Mutex::new(IrqTable::new(devices)));
+}
+
+/// **仅测试**：用恰好 `devices` 个槽位的全新表覆盖全局读路径。
+#[cfg(test)]
+pub(crate) fn install_for_test(devices: usize) {
+    let table: &'static Mutex<IrqTable> = Box::leak(Box::new(Mutex::new(IrqTable::new(devices))));
+    *TEST_TABLE.lock() = Some(table);
 }
 
 /// 取全局 IRQ route 表（init 后可用）。
 pub fn get_table() -> &'static Mutex<IrqTable> {
+    #[cfg(test)]
+    if let Some(table) = *TEST_TABLE.lock() {
+        return table;
+    }
     TABLE.get().expect("irq table not initialized")
 }
 
 /// 该设备上是否还有 live IRQ route（供 `device::release` 的子项检查）。
-pub fn has_route_for_device(device_index: u8) -> bool {
-    get_table().lock().has_route_for_device(device_index)
+pub fn has_route_for_device(device: DeviceId) -> bool {
+    get_table().lock().has_route_for_device(device)
 }
 
-/// 解析 `DeviceId` → `(device_index, irq number)`。
-fn resolve(device: DeviceId) -> Result<(u8, u32), IrqError> {
+/// 解析 `DeviceId` → 中断号。
+fn resolve(device: DeviceId) -> Result<u32, IrqError> {
     let Some(machine) = machine::committed() else {
         return Err(IrqError::DeviceNotFound);
     };
-    let Some(descriptor) = machine.devices[..machine.dev_count].get(device.raw() as usize) else {
+    let Some(descriptor) = machine.devices.get(device.raw() as usize) else {
         return Err(IrqError::DeviceNotFound);
     };
-    let Some(number) = descriptor.irq else {
-        return Err(IrqError::NoIrq);
-    };
-    let device_index = u8::try_from(device.raw()).map_err(|_| IrqError::DeviceNotFound)?;
-    Ok((device_index, number))
+    descriptor.irq.ok_or(IrqError::NoIrq)
 }
 
 /// 注册该设备的中断投递目标。
 ///
 /// 只有设备 owner 能注册（Core 验证 device 表 owner，不信任组件自报身份）。
+/// **device 锁在 route 插入期间保持持有**（device → irq 锁序）：owner 校验通过
+/// 与 route 生效之间没有可插入的释放窗口。
 pub fn register(
     ctx: &RequestContext,
     device: DeviceId,
     handler: IrqHandler,
     handler_ctx: *mut (),
 ) -> Result<(), IrqError> {
-    let (device_index, number) = resolve(device)?;
+    let number = resolve(device)?;
     let _guard = IrqSaveGuard::new();
-    // 锁序 device → irq（device 表是最外层）。
     let device_table = super::device::get_table().lock();
-    if device_table.owner(device_index) != Some(ctx.component) {
+    if device_table.owner(device) != Some(ctx.component) {
         return Err(IrqError::NotOwner);
     }
-    drop(device_table);
     get_table()
         .lock()
-        .register(ctx.component, device_index, number, handler, handler_ctx);
+        .register(ctx.component, device, number, handler, handler_ctx)?;
+    drop(device_table);
     emit(TraceEvent::ResourceGrant {
         component: ctx.component,
         kind: ResourceKind::Irq,
-        id: u64::from(device_index),
+        id: u64::from(device.raw()),
     });
     Ok(())
 }
@@ -217,15 +251,14 @@ pub fn register(
 ///
 /// 表锁只覆盖验证；PLIC 寄存器与 CPU 使能位在**锁外**写（MMIO 慢，trap 可重入）。
 pub fn enable(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
-    let (device_index, _) = resolve(device)?;
+    resolve(device)?;
     let number = {
         let device_table = super::device::get_table().lock();
-        if device_table.owner(device_index) != Some(ctx.component) {
+        if device_table.owner(device) != Some(ctx.component) {
             return Err(IrqError::NotOwner);
         }
-        drop(device_table);
         let table = get_table().lock();
-        table.number_for(device_index).ok_or(IrqError::NoHandler)?
+        table.number_for(device).ok_or(IrqError::NoHandler)?
     };
     // 只开控制器上的**这条线**。本 CPU 的外部中断投递源与全局闸门在
     // `irq::init`（`InterruptController::init_cpu`）与 boot 的 `enable_irq` 里
@@ -236,15 +269,14 @@ pub fn enable(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
 
 /// 关断该设备的中断线（控制器层）。
 pub fn disable(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
-    let (device_index, _) = resolve(device)?;
+    resolve(device)?;
     let number = {
         let device_table = super::device::get_table().lock();
-        if device_table.owner(device_index) != Some(ctx.component) {
+        if device_table.owner(device) != Some(ctx.component) {
             return Err(IrqError::NotOwner);
         }
-        drop(device_table);
         let table = get_table().lock();
-        table.number_for(device_index).ok_or(IrqError::NoHandler)?
+        table.number_for(device).ok_or(IrqError::NoHandler)?
     };
     // 锁外关线：trap 可重入、控制器写慢。
     arch::InterruptImpl::disable(number);
@@ -252,25 +284,24 @@ pub fn disable(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
 }
 
 /// 释放该设备的 IRQ route：先撤销 route（此后不再投递给已死 owner），
-/// 再在锁外关断控制器上的线。
+/// 再在锁外关断控制器上的线。route 移除在 device 锁内完成（锁序 device → irq）。
 pub fn release(ctx: &RequestContext, device: DeviceId) -> Result<(), IrqError> {
-    let (device_index, _) = resolve(device)?;
+    resolve(device)?;
     let _guard = IrqSaveGuard::new();
     let number = {
         let device_table = super::device::get_table().lock();
-        if device_table.owner(device_index) != Some(ctx.component) {
+        if device_table.owner(device) != Some(ctx.component) {
             return Err(IrqError::NotOwner);
         }
-        drop(device_table);
         let mut table = get_table().lock();
-        let number = table.number_for(device_index).ok_or(IrqError::NoHandler)?;
-        table.release(ctx.component, device_index)?;
+        let number = table.number_for(device).ok_or(IrqError::NoHandler)?;
+        table.release(ctx.component, device)?;
         number
     };
     emit(TraceEvent::ResourceRevoke {
         component: ctx.component,
         kind: ResourceKind::Irq,
-        id: u64::from(device_index),
+        id: u64::from(device.raw()),
     });
     arch::InterruptImpl::disable(number);
     Ok(())
@@ -289,6 +320,7 @@ pub fn revoke_owner(owner: ComponentId) {
 mod tests {
     use super::{IrqError, IrqTable};
     use crate::component::ComponentId;
+    use crate::machine::DeviceId;
 
     extern "C" fn handler(_ctx: *mut ()) {}
 
@@ -299,12 +331,15 @@ mod tests {
     #[test]
     fn register_route_and_dispatch() {
         let a = owner(1);
-        let mut table = IrqTable::new();
+        let mut table = IrqTable::new(8);
 
-        assert!(!table.has_route_for_device(3));
-        table.register(a, 3, 42, handler, core::ptr::null_mut());
-        assert!(table.has_route_for_device(3));
-        assert_eq!(table.number_for(3), Some(42));
+        assert!(!table.has_route_for_device(DeviceId::from_raw(3)));
+        assert_eq!(
+            table.register(a, DeviceId::from_raw(3), 42, handler, core::ptr::null_mut()),
+            Ok(())
+        );
+        assert!(table.has_route_for_device(DeviceId::from_raw(3)));
+        assert_eq!(table.number_for(DeviceId::from_raw(3)), Some(42));
 
         let (routed_owner, routed_handler, _ctx) = table.route_of(42).expect("route");
         assert_eq!(routed_owner, a);
@@ -312,30 +347,70 @@ mod tests {
         assert!(table.route_of(43).is_none());
     }
 
+    /// 全宽设备身份：route 可锚在 `DeviceId ≥ 256` 上；越界注册返回
+    /// `DeviceNotFound`（旧的 256 固定表 / u8 收窄已删除）。
+    #[test]
+    fn register_covers_device_ids_beyond_a_byte_and_rejects_out_of_range() {
+        let a = owner(1);
+        let mut table = IrqTable::new(300);
+        let far = DeviceId::from_raw(260);
+
+        assert_eq!(
+            table.register(a, far, 77, handler, core::ptr::null_mut()),
+            Ok(())
+        );
+        assert_eq!(table.number_for(far), Some(77));
+        assert!(table.route_of(77).is_some());
+
+        assert_eq!(
+            table.register(
+                a,
+                DeviceId::from_raw(300),
+                1,
+                handler,
+                core::ptr::null_mut()
+            ),
+            Err(IrqError::DeviceNotFound)
+        );
+        assert_eq!(table.number_for(DeviceId::from_raw(300)), None);
+    }
+
     #[test]
     fn release_is_scoped_to_owner() {
         let a = owner(1);
         let b = owner(2);
-        let mut table = IrqTable::new();
-        table.register(a, 3, 42, handler, core::ptr::null_mut());
+        let mut table = IrqTable::new(8);
+        table
+            .register(a, DeviceId::from_raw(3), 42, handler, core::ptr::null_mut())
+            .unwrap();
 
-        assert_eq!(table.release(b, 3), Err(IrqError::NotOwner));
-        assert_eq!(table.release(a, 3), Ok(()));
-        assert!(!table.has_route_for_device(3));
-        assert_eq!(table.release(a, 3), Err(IrqError::NoHandler));
+        assert_eq!(
+            table.release(b, DeviceId::from_raw(3)),
+            Err(IrqError::NotOwner)
+        );
+        assert_eq!(table.release(a, DeviceId::from_raw(3)), Ok(()));
+        assert!(!table.has_route_for_device(DeviceId::from_raw(3)));
+        assert_eq!(
+            table.release(a, DeviceId::from_raw(3)),
+            Err(IrqError::NoHandler)
+        );
     }
 
     #[test]
     fn revoke_owner_clears_only_its_routes() {
         let a = owner(1);
         let b = owner(2);
-        let mut table = IrqTable::new();
-        table.register(a, 3, 42, handler, core::ptr::null_mut());
-        table.register(b, 4, 43, handler, core::ptr::null_mut());
+        let mut table = IrqTable::new(8);
+        table
+            .register(a, DeviceId::from_raw(3), 42, handler, core::ptr::null_mut())
+            .unwrap();
+        table
+            .register(b, DeviceId::from_raw(4), 43, handler, core::ptr::null_mut())
+            .unwrap();
 
         table.revoke_owner(a);
 
-        assert!(!table.has_route_for_device(3));
-        assert!(table.has_route_for_device(4));
+        assert!(!table.has_route_for_device(DeviceId::from_raw(3)));
+        assert!(table.has_route_for_device(DeviceId::from_raw(4)));
     }
 }

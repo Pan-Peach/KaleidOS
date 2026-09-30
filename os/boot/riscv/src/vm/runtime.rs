@@ -180,7 +180,7 @@ impl RuntimeVm {
         //    机器报告的 RAM 边界之外（边缘页可能混着 reserved/非 RAM）。
         let ram_perm =
             MappingPermission::READ | MappingPermission::WRITE | MappingPermission::EXECUTE;
-        for r in &info.memory_regions[..info.mem_count] {
+        for r in info.memory_regions.iter() {
             if r.size == 0 {
                 continue;
             }
@@ -257,7 +257,7 @@ impl RuntimeVm {
         //    FDT 的 reg 区间未必页对齐，映射覆盖它的整页窗口（MMU 只能按页，
         //    向外取整可接受；与 RAM 的内向取整不同——MMIO 页不会混着 RAM）。
         let mmio_perm = MappingPermission::READ | MappingPermission::WRITE;
-        for d in &info.devices[..info.dev_count] {
+        for d in info.devices.iter() {
             if let IoSpace::Mmio { base, size } = d.space {
                 if size == 0 {
                     continue;

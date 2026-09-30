@@ -179,11 +179,13 @@ CASES = (
     ("isolated-nested-fault", None, None),
 )
 
-# New-ISA ArchTest cases.  They FAIL until the ISA boot path is implemented
-# (os/boot/<arch> is all `todo!()`), which is the point: after hand-implementing
-# the boot path, run the opt-in `test-arch-<arch>` target and watch these pass.
-# Never run by the default `test-arch` aggregate.
+# New-ISA ArchTest cases.  The `boot` smoke case proves entry -> long mode /
+# EL boot -> discovery -> `MachineInfo` -> `kernel::init` -> console input; the
+# three hardware cases stay `todo!()`-backed and FAIL until their mechanisms
+# land (they must fail loudly, not fake a PASS).  Never run by the default
+# `test-arch` aggregate.
 NEW_ARCH_CASES = (
+    ("boot", None, None),
     ("smp-boot", None, None),
     ("timer", None, None),
     ("external-irq", None, None),

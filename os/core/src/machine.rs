@@ -1,9 +1,19 @@
 //! 归一化机器信息（MachineInfo）：bootstrap 发现 → core::init 消费。
 //! 单镜像内函数调用交接，用 Rust 类型即可（无需跨 binary POD/协议）。
-//! **owned 值类型**：不借用 DTB —— bootstrap 把需要的字符串/数值复制进
-//! 定长数组后，DTB 即可丢弃；core::init 消费的是 Core 自己的真相。
+//!
+//! **owned 不可变快照**：bootstrap 在完整 discovery 里用 `Vec` 复制出需要的
+//! 内容，交接处 `.into_boxed_slice()`；`core::init` 校验后**一次性提交**，
+//! 此后全系统只通过 [`committed`] 读同一份 `&'static MachineInfo`。快照
+//! 不实现 `Clone` / `Copy`：没有自动深拷贝，也没有发布后的替换 / 重置 API
+//! （发布后失败 = 终止启动，不 retry）。
+//!
+//! **长度即真相**：`cpu_info.len()` / `memory_regions.len()` / `devices.len()`；
+//! 没有 `*_count` 字段。`memory_regions` 是发现的 **RAM inventory**（不是空闲
+//! 内存，也不是分配器 arena），Core 不把它改成"当前可分配"的列表。
+//!
 //! 字段语义：Core Resource Truth 的"提案"，由 core::init 校验后提交。
 
+use alloc::boxed::Box;
 use core::fmt::Debug;
 
 /// 兼容性字符串块：内嵌定长（FDT compatible 一般 ≤ 32B），值类型可 Copy。
@@ -56,11 +66,11 @@ pub struct CpuInfo {
     pub hardware_id: HardwareCpuId,
 }
 
-/// Discovery 能承载的最大 CPU 数（`MachineInfo.cpu_info` 的容量）。
+/// **已承认（admitted）逻辑 CPU 数**的编译期上限：`1 <= cpu_info.len() <= MAX_CPUS`。
 ///
-/// 这是**编译期容量**（定长数组大小），不是运行时真值：真实 CPU 数一律由
-/// `MachineInfo.cpu_count`（bootstrap 从 FDT/ACPI 发现后填写）决定。SMP 的
-/// `CpuMask` / per-CPU 索引以本常量为上界；Core 只使用 `[..cpu_count]` 前缀。
+/// 这不是运行时真值（真值 = `MachineInfo.cpu_info.len()`）；SMP 的 `CpuMask` /
+/// per-CPU 索引以本常量为上界。发现阶段若 firmware 描述更多 CPU，boot 必须
+/// **BSP 优先、其余按发现顺序**取前 `MAX_CPUS` 台并显式诊断；Core 不制造 CPU。
 ///
 /// 定义在叶子 crate `arch`（由 Kconfig `MAX_CPUS` 经 `arch/build.rs` 生成），
 /// 这里只 re-export：`core` 依赖 `arch`，常量必须落在 `arch` 才能被两边共用。
@@ -139,6 +149,7 @@ impl DeviceDescriptor {
 /// - **不是** Handle、不可撤销、不携带权限；零可以是合法值。
 /// - 表示形式是实现细节：消费者**不得**把它解释成地址、IRQ 号、过滤后的序号，
 ///   或跨启动持久的身份。它只在一个已提交 `MachineInfo` 的生命周期内有意义。
+/// - 全宽 `u32`：设备表长度由 `core::init` 校验能被 `u32` 索引（无 u8 收窄）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DeviceId(u32);
 
@@ -165,6 +176,7 @@ pub enum DeviceLookupError {
 ///
 /// - **不分配、不预留、不触碰任何设备寄存器、不读取 claim 状态**；
 /// - 一条描述符匹配**任意** compatible 串即计一次；
+/// - **枚举整张设备表**（长度即真相，无 count 截断）；
 /// - 枚举**包含已认领设备**，且顺序只取决于已提交的 `MachineInfo`——因此跨
 ///   claim/release 稳定；
 /// - `ordinal >= 匹配数` → [`DeviceLookupError::NoSuchOrdinal`]。
@@ -172,11 +184,11 @@ pub enum DeviceLookupError {
 /// 身份不是权限：调用方只能拿这个 ID 去 [`crate::resource::device::claim`]
 /// 请求该**确切设备**的 authority；ID 本身不授予任何东西。
 pub fn nth_compatible(compatible: &[u8], ordinal: u32) -> Result<DeviceId, DeviceLookupError> {
-    nth_compatible_in(committed().as_ref(), compatible, ordinal)
+    nth_compatible_in(committed(), compatible, ordinal)
 }
 
 /// [`nth_compatible`] 的纯逻辑核心：把已提交快照显式传入，让 `NoMachineInfo`
-/// 路径可以确定性 host 测试（进程全局 `COMMITTED` 无法在测试间回退）。
+/// 路径可以确定性 host 测试（进程全局快照无法在测试间回退）。
 fn nth_compatible_in(
     info: Option<&MachineInfo>,
     compatible: &[u8],
@@ -186,15 +198,16 @@ fn nth_compatible_in(
         return Err(DeviceLookupError::NoMachineInfo);
     };
     let mut seen = 0u32;
-    for (index, device) in info.devices[..info.dev_count.min(info.devices.len())]
-        .iter()
-        .enumerate()
-    {
+    for (index, device) in info.devices.iter().enumerate() {
         if !device.matches(compatible) {
             continue;
         }
         if seen == ordinal {
-            return Ok(DeviceId(index as u32));
+            // 设备表长度已由 `commit` 校验可被 u32 索引；不可能失败的转换只做防御。
+            let Ok(raw) = u32::try_from(index) else {
+                break;
+            };
+            return Ok(DeviceId::from_raw(raw));
         }
         seen += 1;
     }
@@ -227,19 +240,22 @@ impl core::fmt::Debug for DeviceDescriptor {
     }
 }
 
-/// 定长机器信息（owned）：bootstrap 填满 → core::init 校验提交。
-/// 所有字段都是值，无借用 → DTB 可丢，MachineInfo 可自由传递/持久化。
-#[derive(Clone, Copy)]
+/// 机器真相快照（owned、不可变）：bootstrap 用 `Vec` 构造 →
+/// `core::init` 校验后 [`commit`] 一次 → 全系统经 [`committed`] 借用。
+///
+/// 长度即真相（没有 `cpu_count` / `mem_count` / `dev_count`）：
+/// - `cpu_info`：已承认的逻辑 CPU（BSP 恒为下标 0；`1..=MAX_CPUS`）；
+/// - `memory_regions`：发现的 RAM inventory（可空？不——`core::init` 拒绝空表）；
+/// - `devices`：发现的设备记录（可为空；`DeviceId` 全宽索引）。
 pub struct MachineInfo {
     /// BSP 的**硬件**身份（不是逻辑 `CpuId`；逻辑 id 由 Core 按下标赋）。
     pub boot_hardware_id: HardwareCpuId,
     pub timebase_frequency: u64,
-    pub cpu_count: usize,
-    pub cpu_info: [CpuInfo; MAX_CPUS],
-    pub mem_count: usize,
-    pub memory_regions: [MemoryRegion; 16],
-    pub dev_count: usize,
-    pub devices: [DeviceDescriptor; 26],
+    /// 已承认的逻辑 CPU：BSP 在下标 0，硬件身份唯一。
+    pub cpu_info: Box<[CpuInfo]>,
+    /// 发现的 RAM inventory（不是空闲内存、不是 arena）。
+    pub memory_regions: Box<[MemoryRegion]>,
+    pub devices: Box<[DeviceDescriptor]>,
 }
 
 impl core::fmt::Debug for MachineInfo {
@@ -247,43 +263,96 @@ impl core::fmt::Debug for MachineInfo {
         f.debug_struct("MachineInfo")
             .field("boot_hardware_id", &self.boot_hardware_id)
             .field("timebase_frequency", &self.timebase_frequency)
-            .field("cpu_count", &self.cpu_count)
-            .field("cpu_info", &&self.cpu_info[..self.cpu_count])
-            .field("mem_count", &self.mem_count)
-            .field("memory_regions", &&self.memory_regions[..self.mem_count])
-            .field("dev_count", &self.dev_count)
-            .field("devices", &&self.devices[..self.dev_count])
+            .field("cpu_info", &self.cpu_info)
+            .field("memory_regions", &self.memory_regions)
+            .field("devices", &self.devices)
             .finish()
     }
 }
 
-static COMMITTED: spin::Mutex<Option<MachineInfo>> = spin::Mutex::new(None);
+/// 已提交的机器真相：一次性发布，**不可替换**。
+static COMMITTED: spin::Once<MachineInfo> = spin::Once::new();
 
-/// 提交 MachineInfo（core::init 校验通过后调用一次）：唯一真相存放点。
-pub fn commit(info: MachineInfo) {
-    *COMMITTED.lock() = Some(info);
+/// `commit` 的互斥门：让"第二次发布"在并发下也确定性地被拒绝。
+static COMMIT_GATE: spin::Mutex<()> = spin::Mutex::new(());
+
+/// 一次性发布机器真相（`core::init` 校验通过后调用一次）：唯一真相存放点。
+///
+/// **拒绝第二次发布**：这是 BSP 启动期操作，不是运行时替换 / reset API。
+/// 发布后任何失败都是终止启动（没有 retry）。
+pub(crate) fn commit(info: MachineInfo) -> Result<&'static MachineInfo, &'static str> {
+    let _gate = COMMIT_GATE.lock();
+    if COMMITTED.get().is_some() {
+        return Err("machine info already committed");
+    }
+    COMMITTED.call_once(|| info);
+    COMMITTED.get().ok_or("machine info commit failed")
 }
 
-/// 读已提交的 MachineInfo（monitor / export table 共用同一份快照）。
-pub fn committed() -> Option<MachineInfo> {
-    *COMMITTED.lock()
+/// 读已提交的机器真相（monitor / export / resource 共用同一份不可变快照）。
+pub fn committed() -> Option<&'static MachineInfo> {
+    #[cfg(test)]
+    if let Some(info) = test_support::installed() {
+        return Some(info);
+    }
+    COMMITTED.get()
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::{CpuInfo, DeviceDescriptor, HardwareCpuId, MachineInfo, MemoryRegion};
     use crate::test_support::{Rank, TestLock};
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
 
-    /// 串行化「提交全局 MachineInfo」的测试：`COMMITTED` 是进程全局，并行测试
-    /// 各自 commit 一份会互相覆盖。测试很短，用自旋锁串起来即可。
+    /// 串行化「安装/替换全局机器快照」的测试：`committed()` 的读路径是进程全局，
+    /// 并行测试各自安装 fixture 会互相覆盖。测试很短，用自旋锁串起来即可。
     ///
     /// rank = MACHINE（规范顺序 `SCHED → LOAD → IRQ → TIMER → BOUNDARY → MACHINE → MEMORY → TRACE`；见
     /// [`crate::test_support`]）。
     pub(crate) static GUARD: TestLock = TestLock::new(Rank::Machine);
+
+    /// 测试专用覆盖槽：`COMMITTED: Once` 不能回退，host 用例把各自的
+    /// **泄漏的不可变 fixture** 装在这里，[`super::committed`] 优先返回它。
+    ///
+    /// **仅测试**：生产没有 reset / 替换 API——`commit` 依旧只发布一次。
+    static OVERRIDE: spin::Mutex<Option<&'static MachineInfo>> = spin::Mutex::new(None);
+
+    /// 构造 owned fixture（host 测试专用；production 由 boot 从 `Vec` 构造）。
+    pub(crate) fn snapshot(
+        boot_hardware_id: HardwareCpuId,
+        timebase_frequency: u64,
+        cpu_info: Vec<CpuInfo>,
+        memory_regions: Vec<MemoryRegion>,
+        devices: Vec<DeviceDescriptor>,
+    ) -> MachineInfo {
+        MachineInfo {
+            boot_hardware_id,
+            timebase_frequency,
+            cpu_info: cpu_info.into_boxed_slice(),
+            memory_regions: memory_regions.into_boxed_slice(),
+            devices: devices.into_boxed_slice(),
+        }
+    }
+
+    /// 安装 fixture（调用方必须持有 [`GUARD`]）：泄漏成 `&'static` 并覆盖全局读路径。
+    pub(crate) fn install(info: MachineInfo) -> &'static MachineInfo {
+        let leaked: &'static MachineInfo = Box::leak(Box::new(info));
+        *OVERRIDE.lock() = Some(leaked);
+        leaked
+    }
+
+    /// 当前已安装的 fixture（未安装 = `None`）。
+    pub(crate) fn installed() -> Option<&'static MachineInfo> {
+        *OVERRIDE.lock()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     fn device(compatibles: &[&[u8]], irq: Option<u32>) -> DeviceDescriptor {
         let mut d = DeviceDescriptor::empty();
@@ -295,46 +364,52 @@ mod tests {
         d
     }
 
-    fn info(devices: [DeviceDescriptor; 26], dev_count: usize) -> MachineInfo {
-        MachineInfo {
-            boot_hardware_id: HardwareCpuId::from_raw(0),
-            timebase_frequency: 10_000_000,
-            cpu_count: 1,
-            cpu_info: [CpuInfo {
-                boot_cpu: true,
-                hardware_id: HardwareCpuId::from_raw(0),
-            }; MAX_CPUS],
-            mem_count: 1,
-            memory_regions: [MemoryRegion {
-                base: 0x8000_0000,
-                size: 0x1000_0000,
-            }; 16],
-            dev_count,
-            devices,
+    fn cpu0() -> CpuInfo {
+        CpuInfo {
+            boot_cpu: true,
+            hardware_id: HardwareCpuId::from_raw(0),
         }
+    }
+
+    fn ram() -> MemoryRegion {
+        MemoryRegion {
+            base: 0x8000_0000,
+            size: 0x1000_0000,
+        }
+    }
+
+    /// 一份单 CPU / 单 RAM 区 / 指定设备的 fixture。
+    fn fixture(devices: Vec<DeviceDescriptor>) -> MachineInfo {
+        test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            vec![cpu0()],
+            vec![ram()],
+            devices,
+        )
     }
 
     /// 枚举纯逻辑：ordinal 是 zero-based 匹配序号，越界（含无匹配）→ NoSuchOrdinal；
     /// 一条描述符命中多个 compatible 只计一次；顺序就是设备表顺序（与 claim 无关）。
     #[test]
     fn nth_compatible_counts_once_per_descriptor_and_terminates_with_no_such_ordinal() {
-        let mut devices = [DeviceDescriptor::empty(); 26];
         // devices[0] 同时声明两个 compatible —— 匹配任一个都只算一台设备。
-        devices[0] = device(
-            &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-            Some(1),
-        );
-        devices[1] = device(&[b"ns16550a".as_slice()], Some(10));
-        devices[2] = device(&[b"virtio,mmio".as_slice()], Some(2));
-        let info = info(devices, 3);
+        let info = fixture(vec![
+            device(
+                &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
+                Some(1),
+            ),
+            device(&[b"ns16550a".as_slice()], Some(10)),
+            device(&[b"virtio,mmio".as_slice()], Some(2)),
+        ]);
 
         assert_eq!(
             nth_compatible_in(Some(&info), b"virtio,mmio", 0),
-            Ok(DeviceId(0))
+            Ok(DeviceId::from_raw(0))
         );
         assert_eq!(
             nth_compatible_in(Some(&info), b"virtio,mmio", 1),
-            Ok(DeviceId(2))
+            Ok(DeviceId::from_raw(2))
         );
         assert_eq!(
             nth_compatible_in(Some(&info), b"virtio,mmio", 2),
@@ -343,7 +418,7 @@ mod tests {
         // 另一个 compatible 命中同一描述符，仍只是 ordinal 0。
         assert_eq!(
             nth_compatible_in(Some(&info), b"legacy,mmio", 0),
-            Ok(DeviceId(0))
+            Ok(DeviceId::from_raw(0))
         );
         assert_eq!(
             nth_compatible_in(Some(&info), b"legacy,mmio", 1),
@@ -351,16 +426,11 @@ mod tests {
         );
         assert_eq!(
             nth_compatible_in(Some(&info), b"ns16550a", 0),
-            Ok(DeviceId(1))
+            Ok(DeviceId::from_raw(1))
         );
         // 完全无匹配 → 同样是 NoSuchOrdinal（枚举的唯一终止信号）。
         assert_eq!(
             nth_compatible_in(Some(&info), b"nope,device", 0),
-            Err(DeviceLookupError::NoSuchOrdinal)
-        );
-        // 只看 dev_count 个，尾部空描述符不参与。
-        assert_eq!(
-            nth_compatible_in(Some(&info), b"virtio,mmio", 2),
             Err(DeviceLookupError::NoSuchOrdinal)
         );
     }
@@ -371,6 +441,72 @@ mod tests {
         assert_eq!(
             nth_compatible_in(None, b"virtio,mmio", 0),
             Err(DeviceLookupError::NoMachineInfo)
+        );
+    }
+
+    /// 全宽设备身份：`DeviceId ≥ 256` 的设备**参与枚举**——旧的 u8 收窄 / 256
+    /// 上限已删除，长度即真相。
+    #[test]
+    fn nth_compatible_reaches_devices_beyond_a_byte() {
+        let mut devices = vec![DeviceDescriptor::empty(); 300];
+        devices[260] = device(&[b"far,device".as_slice()], Some(5));
+        let info = fixture(devices);
+
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"far,device", 0),
+            Ok(DeviceId::from_raw(260)),
+            "第 260 台设备必须可枚举"
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"far,device", 1),
+            Err(DeviceLookupError::NoSuchOrdinal)
+        );
+    }
+
+    /// 快照保留 > 26 台设备与 > 16 个 RAM 区（旧定长数组的 discover 上限已删除）：
+    /// 长度即真相，枚举走完整切片。
+    #[test]
+    fn snapshot_retains_more_than_sixteen_regions_and_twenty_six_devices() {
+        let regions = (0..20)
+            .map(|i| MemoryRegion {
+                base: 0x8000_0000 + i * 0x1000,
+                size: 0x1000,
+            })
+            .collect::<Vec<_>>();
+        let devices = (0..40)
+            .map(|_| device(&[b"many,device".as_slice()], Some(3)))
+            .collect::<Vec<_>>();
+        let info = test_support::snapshot(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            vec![cpu0()],
+            regions,
+            devices,
+        );
+
+        assert_eq!(info.memory_regions.len(), 20);
+        assert_eq!(info.devices.len(), 40);
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"many,device", 39),
+            Ok(DeviceId::from_raw(39)),
+            "第 39 台设备（>26）必须可枚举"
+        );
+    }
+
+    /// 发布一次性：第二次 `commit` 被拒绝，已提交快照不变；这是 BSP 启动期操作，
+    /// 没有运行时替换 / reset API。
+    #[test]
+    fn commit_publishes_once_and_rejects_a_second_call() {
+        let _guard = test_support::GUARD.lock();
+        let first = commit(fixture(vec![])).expect("first commit must publish");
+        assert_eq!(first.devices.len(), 0);
+
+        let second = commit(fixture(vec![device(&[b"late,device".as_slice()], None)]));
+        assert_eq!(second.err(), Some("machine info already committed"));
+        assert_eq!(
+            COMMITTED.get().expect("still committed").devices.len(),
+            0,
+            "第二次发布不得替换已提交快照"
         );
     }
 
@@ -527,38 +663,37 @@ mod tests {
         assert!(text.contains("size: 8 B"), "{text}");
     }
 
-    /// MachineInfo Debug：按 count 切片 CPU/内存/设备表，不 panic 且含身份、
-    /// 计数与已声明设备；`dev_count == 0` 时为空列表。
+    /// MachineInfo Debug：整张表可见（长度即真相，没有 count 字段），空设备表
+    /// 打印空列表。
     #[test]
-    fn machine_info_debug_contains_counts_and_sliced_tables() {
+    fn machine_info_debug_prints_full_tables_and_no_counts() {
         // Given: 1 CPU / 1 memory region / 3 devices。
-        let mut devices = [DeviceDescriptor::empty(); 26];
-        devices[0] = device(&[b"virtio,mmio".as_slice()], Some(1));
-        devices[1] = device(&[b"ns16550a".as_slice()], Some(10));
-        devices[2] = device(&[b"riscv,clint0".as_slice()], None);
-        let machine_info = info(devices, 3);
+        let info = fixture(vec![
+            device(&[b"virtio,mmio".as_slice()], Some(1)),
+            device(&[b"ns16550a".as_slice()], Some(10)),
+            device(&[b"riscv,clint0".as_slice()], None),
+        ]);
 
-        // When: 格式化（切片 cpu/mem/device 表不得越界）。
-        let text = alloc::format!("{machine_info:?}");
+        // When: 格式化（完整切片，不越界）。
+        let text = alloc::format!("{info:?}");
 
-        // Then: 身份 + 计数 + 声明设备可见，尾部空槽不可见。
+        // Then: 身份 + 表内容可见；计数字段已不存在。
         assert!(text.contains("MachineInfo"), "{text}");
         assert!(
             text.contains("boot_hardware_id: HardwareCpuId(0)"),
             "{text}"
         );
-        assert!(text.contains("cpu_count: 1"), "{text}");
-        assert!(text.contains("mem_count: 1"), "{text}");
         assert!(text.contains("memory_regions"), "{text}");
         assert!(text.contains("256 MiB"), "{text}");
-        assert!(text.contains("dev_count: 3"), "{text}");
         assert!(text.contains("virtio,mmio"), "{text}");
         assert!(text.contains("riscv,clint0"), "{text}");
+        assert!(!text.contains("cpu_count"), "{text}");
+        assert!(!text.contains("mem_count"), "{text}");
+        assert!(!text.contains("dev_count"), "{text}");
 
-        // dev_count == 0：空切片正常 Debug，仍然不 panic。
-        let empty = info([DeviceDescriptor::empty(); 26], 0);
+        // 空设备表：正常 Debug，仍然不 panic。
+        let empty = fixture(vec![]);
         let text = alloc::format!("{empty:?}");
-        assert!(text.contains("dev_count: 0"), "{text}");
         assert!(text.contains("devices: []"), "{text}");
     }
 }

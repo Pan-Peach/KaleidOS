@@ -29,9 +29,9 @@ pub fn run(info: &MachineInfo) -> ! {
             kernel::log!(
                 "selftest",
                 "boot: cpus={} mem_regions={} devices={}",
-                info.cpu_count,
-                info.mem_count,
-                info.dev_count
+                info.cpu_info.len(),
+                info.memory_regions.len(),
+                info.devices.len()
             );
             pass("boot")
         }

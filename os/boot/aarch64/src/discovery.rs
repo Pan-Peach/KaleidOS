@@ -17,6 +17,7 @@
 //!    [`MachineInfo`]: memory regions, `/cpus` (BSP pinned to logical 0), and
 //!    root//soc device descriptors.
 
+use alloc::vec::Vec;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{
@@ -400,19 +401,15 @@ fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<
     Some(d)
 }
 
-/// Collect matching device descriptors from a batch of FDT child nodes into
-/// the fixed-capacity `MachineInfo` table.
+/// Collect matching device descriptors from a batch of FDT child nodes (owned
+/// `Vec`; no capacity limit at discovery).
 fn collect_devices<'a>(
     children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
-    devices: &mut [DeviceDescriptor; 26],
-    dev_count: &mut usize,
+    devices: &mut Vec<DeviceDescriptor>,
 ) {
     for child in children {
         if let Some(d) = device_descriptor(&child) {
-            if *dev_count < devices.len() {
-                devices[*dev_count] = d;
-                *dev_count += 1;
-            }
+            devices.push(d);
         }
     }
 }
@@ -421,84 +418,62 @@ fn collect_devices<'a>(
 ///
 /// `boot_affinity` is the BSP's MPIDR affinity (the same shape FDT
 /// `/cpus/*/reg` uses); the boot CPU is pinned to `cpu_info[0]` because Core's
-/// `CpuRegistry::build` requires BSP == logical CPU0.
+/// `CpuRegistry::build` requires BSP == logical CPU0.  A BSP missing from
+/// `/cpus` is **not** fabricated here: Core rejects the proposal (boot must not
+/// manufacture a CPU).  More CPUs than `MAX_CPUS` are truncated with the BSP
+/// first and an explicit diagnostic.
 pub fn discover<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     boot_affinity: u64,
     timebase_frequency: u64,
 ) -> MachineInfo {
-    let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
-    let mut cpu_info = [CpuInfo {
-        boot_cpu: false,
-        hardware_id: HardwareCpuId::from_raw(0),
-    }; MAX_CPUS];
-    let mut devices = [DeviceDescriptor::empty(); 26];
-
-    let mut mem_count = 0usize;
+    let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(r) = region else { continue };
-        if mem_count >= memory_regions.len() {
-            kernel::log!("discovery", "too many RAM regions; dropping");
-            continue;
-        }
-        memory_regions[mem_count] = MemoryRegion {
+        memory_regions.push(MemoryRegion {
             base: r.address as usize,
             size: r.len as usize,
-        };
-        mem_count += 1;
+        });
     }
 
-    let mut cpu_count = 0usize;
+    let mut cpu_info: Vec<CpuInfo> = Vec::new();
     for cpu in tree.root().cpus().iter() {
-        if cpu_count >= cpu_info.len() {
-            kernel::log!("discovery", "too many CPUs; dropping");
-            continue;
-        }
         let affinity = cpu.reg::<u64>().first().unwrap_or(0);
-        cpu_info[cpu_count] = CpuInfo {
+        cpu_info.push(CpuInfo {
             boot_cpu: affinity == boot_affinity,
             hardware_id: HardwareCpuId::from_raw(affinity),
-        };
-        cpu_count += 1;
+        });
     }
 
     // Core invariant: BSP == logical CPU0.  FDT usually lists cpu@0 first; the
     // swap makes discovery order irrelevant.  If the BSP is missing entirely
-    // (affinity mismatch), pin index 0 to it so the topology stays bootable —
-    // the log records the disagreement.
-    if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
+    // (affinity mismatch), the proposal is left as discovered — Core rejects it
+    // rather than boot fabricating a CPU that firmware never described.
+    if let Some(boot_index) = cpu_info.iter().position(|c| c.boot_cpu) {
         cpu_info.swap(0, boot_index);
-    } else if cpu_count > 0 {
+    }
+    if cpu_info.len() > MAX_CPUS {
         kernel::log!(
             "discovery",
-            "boot affinity {:#x} not in /cpus; pinning cpu_info[0]",
-            boot_affinity
+            "too many CPUs ({}); admitting {} (BSP first)",
+            cpu_info.len(),
+            MAX_CPUS
         );
-        cpu_info[0] = CpuInfo {
-            boot_cpu: true,
-            hardware_id: HardwareCpuId::from_raw(boot_affinity),
-        };
+        cpu_info.truncate(MAX_CPUS);
     }
 
     // Two passes: root holds system-level devices, /soc holds bus devices.
-    let mut dev_count = 0usize;
-    collect_devices(
-        tree.root().as_node().children(),
-        &mut devices,
-        &mut dev_count,
-    );
+    let mut devices: Vec<DeviceDescriptor> = Vec::new();
+    collect_devices(tree.root().as_node().children(), &mut devices);
     if let Some(soc) = tree.find_node("/soc") {
-        collect_devices(soc.children(), &mut devices, &mut dev_count);
+        collect_devices(soc.children(), &mut devices);
     }
 
     MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(boot_affinity),
         timebase_frequency,
-        cpu_count,
-        cpu_info,
-        mem_count,
-        memory_regions,
-        dev_count,
-        devices,
+        cpu_info: cpu_info.into_boxed_slice(),
+        memory_regions: memory_regions.into_boxed_slice(),
+        devices: devices.into_boxed_slice(),
     }
 }

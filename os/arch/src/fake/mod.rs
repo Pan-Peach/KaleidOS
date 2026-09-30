@@ -287,8 +287,8 @@ impl Smp for Fake {
     }
 
     fn register_ipi_handler(handler: LocalInterruptHandler) -> Result<(), InitError> {
-        // Host 没有真实 IPI 传输，但 Core 的 `smp::init` 在 `cpu_count > 1` 时会
-        // 注册回调；这里**记住**它而不是 `todo!()`，让 Core 的 SMP 骨架在 host 上
+        // Host 没有真实 IPI 传输，但 Core 的 `smp::init` 在 `cpu_info.len() > 1`
+        // 时会注册回调；这里**记住**它而不是 `todo!()`，让 Core 的 SMP 骨架在 host 上
         // 可被单测。（真正投递见 `send_ipi*`：host 只做可观察记录。）
         IPI_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
         Ok(())

@@ -408,7 +408,7 @@ extern "C" fn task_normal_entry(_arg: *mut ()) -> ! {
 
 /// 按 compatible（任一命中）找已发现设备的 MMIO 窗口。
 fn find_mmio(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<(usize, usize)> {
-    info.devices[..info.dev_count].iter().find_map(|device| {
+    info.devices.iter().find_map(|device| {
         let hit = device.compatibles[..device.compat_count as usize]
             .iter()
             .any(|c| compatibles.contains(&c.as_str().as_bytes()));
@@ -424,7 +424,7 @@ fn find_mmio(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<(usize, usize)
 
 /// 按 compatible（任一命中）找设备的 PLIC 中断号。
 fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
-    info.devices[..info.dev_count].iter().find_map(|device| {
+    info.devices.iter().find_map(|device| {
         let hit = device.compatibles[..device.compat_count as usize]
             .iter()
             .any(|c| compatibles.contains(&c.as_str().as_bytes()));
@@ -677,11 +677,11 @@ fn external_irq_handler(_cpu: CpuId, line: u32) {
     EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
-/// `0..cpu_count` 的逻辑 CPU 集合（helper）。
+/// `0..cpu_info.len()` 的逻辑 CPU 集合（helper）。
 #[cfg(target_arch = "riscv64")]
 fn all_cpus(info: &MachineInfo) -> kernel::smp::CpuMask {
     let mut mask = kernel::smp::CpuMask::empty();
-    for i in 0..info.cpu_count {
+    for i in 0..info.cpu_info.len() {
         mask.insert(CpuId::from_raw(i))
             .expect("cpu within capacity");
     }
@@ -695,7 +695,7 @@ fn all_cpus(info: &MachineInfo) -> kernel::smp::CpuMask {
 /// online 集合覆盖全部 CPU。`-smp 2` 由 `arch_runner.py --smp` 提供。
 #[cfg(target_arch = "riscv64")]
 fn smp_boot(info: &MachineInfo) -> ! {
-    if info.cpu_count <= 1 {
+    if info.cpu_info.len() <= 1 {
         fail("smp-boot: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
@@ -706,12 +706,12 @@ fn smp_boot(info: &MachineInfo) -> ! {
             "selftest",
             "smp-boot online={} want={}",
             kernel::smp::online_cpus().count(),
-            info.cpu_count
+            info.cpu_info.len()
         );
         fail("smp-boot: CPU never reached Core Online");
     }
-    if kernel::smp::online_cpus().count() != info.cpu_count {
-        fail("smp-boot: online set != cpu_count");
+    if kernel::smp::online_cpus().count() != info.cpu_info.len() {
+        fail("smp-boot: online set != discovered cpu count");
     }
     pass("smp-boot")
 }
@@ -722,7 +722,7 @@ fn smp_boot(info: &MachineInfo) -> ! {
 fn smp_ipi(info: &MachineInfo) -> ! {
     use arch::smp::Smp;
 
-    if info.cpu_count <= 1 {
+    if info.cpu_info.len() <= 1 {
         fail("smp-ipi: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
@@ -737,14 +737,14 @@ fn smp_ipi(info: &MachineInfo) -> ! {
     }
 
     // 给每个非 boot CPU 发门铃（Core `notify` 走同一 arch 机制）。
-    for cpu in &info.cpu_info[..info.cpu_count] {
+    for cpu in info.cpu_info.iter() {
         if cpu.hardware_id == info.boot_hardware_id {
             continue;
         }
         <arch::SmpImpl as Smp>::send_ipi(cpu.hardware_id).expect("send_ipi failed");
     }
 
-    let want = info.cpu_count - 1;
+    let want = info.cpu_info.len() - 1;
     let deadline = arch::TimerImpl::now().saturating_add(10_000_000);
     while crate::smp::IPI_SEEN.load(Ordering::Acquire) < want && arch::TimerImpl::now() < deadline {
         core::hint::spin_loop();
@@ -781,7 +781,7 @@ fn bsp_ipi_handler(cpu: CpuId) {
 /// 因此 `cpu_identity_ok` 对每个 Online CPU 为真，且 BSP 的 `current_cpu()` 为 0。
 #[cfg(target_arch = "riscv64")]
 fn smp_percpu(info: &MachineInfo) -> ! {
-    if info.cpu_count <= 1 {
+    if info.cpu_info.len() <= 1 {
         fail("smp-percpu: only one CPU discovered (QEMU needs -smp 2)");
     }
     crate::smp::start_secondaries(info);
@@ -790,7 +790,7 @@ fn smp_percpu(info: &MachineInfo) -> ! {
     if kernel::smp::wait_until_online(&all_cpus(info), deadline).is_err() {
         fail("smp-percpu: AP did not reach Core Online");
     }
-    for i in 1..info.cpu_count {
+    for i in 1..info.cpu_info.len() {
         if !kernel::smp::cpu_identity_ok(CpuId::from_raw(i)) {
             fail("smp-percpu: AP did not verify its own logical id");
         }

@@ -19,8 +19,6 @@ use arch::Console;
 mod cmds;
 pub mod editor;
 
-pub use cmds::mount;
-
 /// 交互提示符（重绘时重新输出；`LINE_MAX` 与其匹配 80 列预算）。
 const PROMPT: &str = "core> ";
 

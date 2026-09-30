@@ -119,7 +119,7 @@ struct Allocation {
 struct Mapping {
     id: u64,
     owner: ComponentId,
-    device_index: u8,
+    device: DeviceId,
 }
 
 /// DMA allocation + mapping 真相表。
@@ -175,18 +175,14 @@ impl DmaTable {
     fn insert_mapping(
         &mut self,
         owner: ComponentId,
-        device_index: u8,
+        device: DeviceId,
         ptr: usize,
         _len: usize,
     ) -> DmaMapping {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let device_addr = ptr; // No-IOMMU identity；IOMMU 时改为 IOVA。
-        self.mappings.push(Mapping {
-            id,
-            owner,
-            device_index,
-        });
+        self.mappings.push(Mapping { id, owner, device });
         DmaMapping { device_addr, id }
     }
 
@@ -206,10 +202,8 @@ impl DmaTable {
     }
 
     /// 该设备上是否还有 live mapping（供 `device::release` 的子项检查）。
-    pub fn has_mapping_for_device(&self, device_index: u8) -> bool {
-        self.mappings
-            .iter()
-            .any(|mapping| mapping.device_index == device_index)
+    pub fn has_mapping_for_device(&self, device: DeviceId) -> bool {
+        self.mappings.iter().any(|mapping| mapping.device == device)
     }
 
     /// 撤销 owner 的全部映射，并把其全部 allocation backing quarantine。
@@ -263,8 +257,8 @@ pub fn get_table() -> &'static Mutex<DmaTable> {
 }
 
 /// 该设备上是否还有 live DMA mapping（供 `device::release` 的子项检查）。
-pub fn has_mapping_for_device(device_index: u8) -> bool {
-    get_table().lock().has_mapping_for_device(device_index)
+pub fn has_mapping_for_device(device: DeviceId) -> bool {
+    get_table().lock().has_mapping_for_device(device)
 }
 
 /// 分配一段物理连续的 DMA 缓冲（device-agnostic）。
@@ -306,25 +300,21 @@ pub fn map(
     let Some(machine) = machine::committed() else {
         return Err(DmaError::DeviceNotFound);
     };
-    if machine.devices[..machine.dev_count]
-        .get(device.raw() as usize)
-        .is_none()
-    {
+    if machine.devices.get(device.raw() as usize).is_none() {
         return Err(DmaError::DeviceNotFound);
     }
-    let device_index = u8::try_from(device.raw()).map_err(|_| DmaError::DeviceNotFound)?;
 
     let _guard = IrqSaveGuard::new();
     // 锁序 device → dma（device 表是最外层）。
     let device_table = super::device::get_table().lock();
-    let Some(owner) = device_table.owner(device_index) else {
+    let Some(owner) = device_table.owner(device) else {
         return Err(DmaError::NotOwner);
     };
     drop(device_table);
 
     let mapping = get_table()
         .lock()
-        .insert_mapping(owner, device_index, ptr as usize, len);
+        .insert_mapping(owner, device, ptr as usize, len);
     emit(TraceEvent::ResourceGrant {
         component: owner,
         kind: ResourceKind::Dma,
@@ -355,6 +345,7 @@ pub fn revoke_owner(owner: ComponentId) {
 mod tests {
     use super::{DmaDirection, DmaError, DmaTable};
     use crate::component::ComponentId;
+    use crate::machine::DeviceId;
     use crate::memory::test_support;
 
     fn cid(raw: u32) -> ComponentId {
@@ -376,25 +367,38 @@ mod tests {
     #[test]
     fn mapping_ids_are_monotonic_and_removed_mapping_is_not_found() {
         let owner = cid(1);
+        let device = DeviceId::from_raw(0);
         let mut table = DmaTable::new();
-        let first = table.insert_mapping(owner, 0, 0x1000, 16);
-        let second = table.insert_mapping(owner, 0, 0x2000, 16);
+        let first = table.insert_mapping(owner, device, 0x1000, 16);
+        let second = table.insert_mapping(owner, device, 0x2000, 16);
         assert_ne!(first.id, second.id, "mapping id 单调唯一");
         assert_eq!(first.device_addr, 0x1000, "No-IOMMU identity");
 
         assert_eq!(table.remove_mapping(first.id), Ok(cid(1)));
         // 已移除的 id 查不到（无 ABA：id 从不复用）。
         assert_eq!(table.remove_mapping(first.id), Err(DmaError::NotFound));
-        assert!(table.has_mapping_for_device(0));
+        assert!(table.has_mapping_for_device(device));
         assert_eq!(table.remove_mapping(second.id), Ok(cid(1)));
-        assert!(!table.has_mapping_for_device(0));
+        assert!(!table.has_mapping_for_device(device));
+    }
+
+    /// 设备身份全宽：mapping 记的是 `DeviceId`（≥ 256 也成立），无 u8 收窄。
+    #[test]
+    fn mapping_tracks_full_width_device_identity() {
+        let owner = cid(1);
+        let far = DeviceId::from_raw(260);
+        let mut table = DmaTable::new();
+        let mapping = table.insert_mapping(owner, far, 0x1000, 16);
+        assert!(table.has_mapping_for_device(far));
+        assert!(!table.has_mapping_for_device(DeviceId::from_raw(0)));
+        assert_eq!(table.remove_mapping(mapping.id), Ok(owner));
     }
 
     /// 未注册的 mapping id → NotFound（从不复用 → 无 ABA 误命中）。
     #[test]
     fn unmap_unknown_id_is_not_found() {
         let mut table = DmaTable::new();
-        let mapping = table.insert_mapping(cid(1), 0, 0x1000, 16);
+        let mapping = table.insert_mapping(cid(1), DeviceId::from_raw(0), 0x1000, 16);
         assert_eq!(
             table.remove_mapping(mapping.id + 1),
             Err(DmaError::NotFound)
@@ -445,9 +449,12 @@ mod tests {
 
         let owner = cid(52);
         let buffer = super::alloc(owner, 8192).expect("alloc");
-        super::get_table()
-            .lock()
-            .insert_mapping(owner, 3, buffer.ptr as usize, buffer.len);
+        super::get_table().lock().insert_mapping(
+            owner,
+            DeviceId::from_raw(3),
+            buffer.ptr as usize,
+            buffer.len,
+        );
 
         let before_quarantine = super::quarantine_len();
         let before_free = crate::memory::free_block_counts();
@@ -456,6 +463,10 @@ mod tests {
 
         assert_eq!(super::quarantine_len(), before_quarantine + 1);
         assert_eq!(crate::memory::free_block_counts(), before_free);
-        assert!(!super::get_table().lock().has_mapping_for_device(3));
+        assert!(
+            !super::get_table()
+                .lock()
+                .has_mapping_for_device(DeviceId::from_raw(3))
+        );
     }
 }

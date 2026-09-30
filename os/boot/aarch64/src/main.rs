@@ -16,6 +16,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use arch::{Console, CpuArch};
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -176,14 +178,16 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
         base: image_start,
         size: image.size,
     }];
-    if let Err(error) = kernel::init(&info, &reserved) {
-        panic!("core init failed: {}", error);
-    }
+    // Core 消费提案并返回唯一提交的 `&'static` 快照：此后 boot 只借用它。
+    let info = match kernel::init(info, &reserved) {
+        Ok(info) => info,
+        Err(error) => panic!("core init failed: {}", error),
+    };
     kernel::log!("bootstrap", "BOOT DISCOVERY OK");
 
     #[cfg(feature = "selftest")]
     {
-        crate::selftest::run(&info);
+        crate::selftest::run(info);
     }
 
     #[cfg(not(feature = "selftest"))]

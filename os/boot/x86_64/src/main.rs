@@ -32,12 +32,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
 use arch::{Console, CpuArch};
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use kernel::machine::{
     CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
-    MAX_CPUS,
 };
 
 #[cfg(feature = "selftest")]
@@ -59,8 +62,6 @@ const MB2_BOOT_MAGIC: usize = 0x36d7_6289;
 const HVM_START_MAGIC: u32 = 0x336e_c578;
 /// Guest memory map "usable RAM" entry type (MB2 mmap and hvm_memmap).
 const MEMORY_AVAILABLE: u32 = 1;
-/// Boot-side staging capacity, matching `MachineInfo.memory_regions`.
-const MAX_REGIONS: usize = 16;
 /// Sanity cap for the Multiboot2 info block (a real block is a few KiB): a
 /// bogus `total_size` must not drive an unbounded tag scan.
 const MB2_MAX_TOTAL_SIZE: usize = 64 * 1024;
@@ -89,68 +90,26 @@ fn read_u64(address: usize) -> u64 {
     unsafe { core::ptr::read_unaligned(address as *const u64) }
 }
 
-/// Staging buffer for the discovered usable RAM regions.
-struct RegionTable {
-    regions: [MemoryRegion; MAX_REGIONS],
+/// Capacity of the boot-payload exclusion set: PVH needs two (start_info +
+/// memmap), MB2 needs one (the whole information block).
+const BOOT_EXCLUSION_CAPACITY: usize = 2;
+
+/// Firmware-owned boot payload extents the early arena must never overlap
+/// (a MB2 information block, or PVH `hvm_start_info` + its separate map).
+///
+/// Fixed and tiny by construction: these are the *boot payload* records, not
+/// the machine RAM inventory (which is owned/`Vec`-built after the seam).
+#[derive(Clone, Copy)]
+struct ExclusionTable {
+    exclusions: [MemoryRegion; BOOT_EXCLUSION_CAPACITY],
     count: usize,
 }
 
-impl RegionTable {
-    fn new() -> Self {
-        Self {
-            regions: [MemoryRegion { base: 0, size: 0 }; MAX_REGIONS],
-            count: 0,
-        }
-    }
-
-    fn push(&mut self, base: u64, size: u64) {
-        if size == 0 || base > usize::MAX as u64 || size > usize::MAX as u64 {
-            return;
-        }
-        if self.count >= MAX_REGIONS {
-            return;
-        }
-        self.regions[self.count] = MemoryRegion {
-            base: base as usize,
-            size: size as usize,
-        };
-        self.count += 1;
-    }
-
-    /// The usable bank that fully contains `[start, end)`, if any.
-    fn containing(&self, start: usize, end: usize) -> Option<MemoryRegion> {
-        self.regions[..self.count]
-            .iter()
-            .find(|region| {
-                region.base <= start
-                    && region
-                        .base
-                        .checked_add(region.size)
-                        .is_some_and(|limit| end <= limit)
-            })
-            .copied()
-    }
-}
-
-/// Capacity of [`BootData::exclusions`]: PVH needs two (start_info + memmap),
-/// MB2 needs one (the whole information block).
-const BOOT_EXCLUSION_CAPACITY: usize = 2;
-
-/// Boot-info discovery result: usable RAM regions plus the firmware-owned
-/// boot payload extents the early arena must never overlap (a MB2 information
-/// block, or PVH `hvm_start_info` + its separate memory-map array).
-struct BootData {
-    regions: RegionTable,
-    exclusions: [MemoryRegion; BOOT_EXCLUSION_CAPACITY],
-    exclusion_count: usize,
-}
-
-impl BootData {
+impl ExclusionTable {
     fn empty() -> Self {
         Self {
-            regions: RegionTable::new(),
             exclusions: [MemoryRegion { base: 0, size: 0 }; BOOT_EXCLUSION_CAPACITY],
-            exclusion_count: 0,
+            count: 0,
         }
     }
 
@@ -159,11 +118,83 @@ impl BootData {
     /// exclusion the arena would then be free to overwrite.
     fn exclude(&mut self, base: usize, size: usize) {
         assert!(
-            self.exclusion_count < self.exclusions.len(),
+            self.count < self.exclusions.len(),
             "boot payload exclusion capacity exceeded"
         );
-        self.exclusions[self.exclusion_count] = MemoryRegion { base, size };
-        self.exclusion_count += 1;
+        self.exclusions[self.count] = MemoryRegion { base, size };
+        self.count += 1;
+    }
+}
+
+/// Boot protocol flavour decided once from the entry registers.
+#[derive(Clone, Copy)]
+enum BootProtocol {
+    Multiboot2,
+    Pvh,
+}
+
+/// Identify the boot protocol from the entry magic / info block.  Logs once
+/// and panics on an unknown protocol (boot cannot guess how to read RAM).
+fn detect_protocol(magic: usize, info_pa: usize) -> BootProtocol {
+    // The info pointer is firmware-provided: refuse an implausible one instead
+    // of dereferencing it (the protocol pointers are low RAM on x86).
+    if info_pa == 0 || info_pa >= BOOT_INFO_MAX_PA {
+        panic!(
+            "boot discovery: implausible boot info pointer {:#x}",
+            info_pa
+        );
+    }
+    if magic == MB2_BOOT_MAGIC {
+        kernel::log!(
+            "discovery",
+            "boot protocol: Multiboot2 (info @ {:#x})",
+            info_pa
+        );
+        return BootProtocol::Multiboot2;
+    }
+    let info_magic = read_u32(info_pa);
+    if info_magic == HVM_START_MAGIC {
+        kernel::log!(
+            "discovery",
+            "boot protocol: PVH (start_info @ {:#x})",
+            info_pa
+        );
+        return BootProtocol::Pvh;
+    }
+    panic!(
+        "unknown boot protocol: eax={:#x}, info_magic={:#x} @ {:#x}",
+        magic, info_magic, info_pa
+    );
+}
+
+/// Hand one firmware `(base, size)` pair to `sink` when it is representable;
+/// returns whether a region was emitted (zero size / overflow skipped).
+fn emit_region(sink: &mut dyn FnMut(MemoryRegion), base: u64, size: u64) -> bool {
+    if size == 0 || base > usize::MAX as u64 || size > usize::MAX as u64 {
+        return false;
+    }
+    sink(MemoryRegion {
+        base: base as usize,
+        size: size as usize,
+    });
+    true
+}
+
+/// Walk every usable RAM region the boot protocol describes, calling `sink`.
+///
+/// **Allocation-free and re-runnable**: the validated boot payload stays
+/// outside the early arena, so the pre-seam pass (find the image bank, pick
+/// the arena) and the post-seam pass (build the owned inventory with `Vec`)
+/// reuse the same parsing.  Returns the number of usable regions seen.
+fn walk_usable_regions(
+    protocol: BootProtocol,
+    info_pa: usize,
+    sink: &mut dyn FnMut(MemoryRegion),
+    excluded: &mut ExclusionTable,
+) -> usize {
+    match protocol {
+        BootProtocol::Multiboot2 => multiboot2_regions(info_pa, sink, excluded),
+        BootProtocol::Pvh => pvh_regions(info_pa, sink, excluded),
     }
 }
 
@@ -177,8 +208,12 @@ impl BootData {
 ///
 /// The whole validated information block (including embedded ACPI tags) is
 /// excluded from the early arena: boot keeps consuming it while discovering.
-fn multiboot2_regions(info_pa: usize) -> BootData {
-    let mut table = BootData::empty();
+fn multiboot2_regions(
+    info_pa: usize,
+    sink: &mut dyn FnMut(MemoryRegion),
+    excluded: &mut ExclusionTable,
+) -> usize {
+    let mut count = 0usize;
     // The info pointer comes from the boot protocol: validate it before any read.
     if info_pa == 0 || !info_pa.is_multiple_of(8) || info_pa >= BOOT_INFO_MAX_PA {
         kernel::log!(
@@ -186,7 +221,7 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
             "MB2: implausible info pointer {:#x}; no RAM regions",
             info_pa
         );
-        return table;
+        return 0;
     }
     let total_size = read_u32(info_pa) as usize;
     if !(8..=MB2_MAX_TOTAL_SIZE).contains(&total_size) {
@@ -195,13 +230,13 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
             "MB2: implausible total_size {:#x}; no RAM regions",
             total_size
         );
-        return table;
+        return 0;
     }
     let Some(end) = info_pa.checked_add(total_size) else {
         kernel::log!("discovery", "MB2: info block address wraps; no RAM regions");
-        return table;
+        return 0;
     };
-    table.exclude(info_pa, total_size);
+    excluded.exclude(info_pa, total_size);
     let mut cursor = info_pa + 8;
     let mut basic_mem_upper_kib = 0u32;
 
@@ -230,9 +265,9 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
             // entry_size/entry_version header is known to fit.
             let entry_size = read_u32(cursor + 8) as usize;
             if entry_size >= PVH_MEMMAP_ENTRY_SIZE {
-                let count = (tag_size - 16) / entry_size;
+                let entries = (tag_size - 16) / entry_size;
                 let mut index = 0;
-                while index < count {
+                while index < entries {
                     let entry = cursor
                         .checked_add(16)
                         .and_then(|base| base.checked_add(index * entry_size));
@@ -243,8 +278,10 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
                     if entry_end > tag_end {
                         break;
                     }
-                    if read_u32(entry + 16) == MEMORY_AVAILABLE {
-                        table.regions.push(read_u64(entry), read_u64(entry + 8));
+                    if read_u32(entry + 16) == MEMORY_AVAILABLE
+                        && emit_region(sink, read_u64(entry), read_u64(entry + 8))
+                    {
+                        count += 1;
                     }
                     index += 1;
                 }
@@ -259,12 +296,12 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
     }
 
     // Fallback: no mmap tag (or no usable entry) -> basic meminfo 1 MiB..
-    if table.regions.count == 0 && basic_mem_upper_kib > 0 {
-        table
-            .regions
-            .push(0x10_0000, basic_mem_upper_kib as u64 * 1024);
+    if count == 0 && basic_mem_upper_kib > 0 {
+        if emit_region(sink, 0x10_0000, basic_mem_upper_kib as u64 * 1024) {
+            count += 1;
+        }
     }
-    table
+    count
 }
 
 /// PVH `hvm_start_info` (version >= 1) -> usable RAM regions.
@@ -276,8 +313,12 @@ fn multiboot2_regions(info_pa: usize) -> BootData {
 ///
 /// Boot keeps consuming `hvm_start_info` and its separate memory-map array, so
 /// both fixed extents are excluded from the early arena.
-fn pvh_regions(info_pa: usize) -> BootData {
-    let mut table = BootData::empty();
+fn pvh_regions(
+    info_pa: usize,
+    sink: &mut dyn FnMut(MemoryRegion),
+    excluded: &mut ExclusionTable,
+) -> usize {
+    let mut count = 0usize;
     let version = read_u32(info_pa + 4);
     if version < 1 {
         kernel::log!(
@@ -285,7 +326,7 @@ fn pvh_regions(info_pa: usize) -> BootData {
             "PVH: unsupported start_info version {}; no RAM regions",
             version
         );
-        return table;
+        return 0;
     }
     // The map pointer and count come from firmware: validate both before any
     // entry read, and keep the whole map below the 4 GiB plausibility bound.
@@ -298,7 +339,7 @@ fn pvh_regions(info_pa: usize) -> BootData {
             memmap_pa,
             entries
         );
-        return table;
+        return 0;
     }
     let Some(memmap_end) = entries
         .checked_mul(PVH_MEMMAP_ENTRY_SIZE)
@@ -311,10 +352,10 @@ fn pvh_regions(info_pa: usize) -> BootData {
             memmap_pa,
             entries
         );
-        return table;
+        return 0;
     };
-    table.exclude(info_pa, HVM_START_INFO_SIZE);
-    table.exclude(memmap_pa, memmap_end - memmap_pa);
+    excluded.exclude(info_pa, HVM_START_INFO_SIZE);
+    excluded.exclude(memmap_pa, memmap_end - memmap_pa);
     for index in 0..entries {
         // `index * 24` cannot overflow: `entries <= 4096` and `memmap_end`
         // above already proved `memmap_pa + entries * 24` fits.
@@ -322,45 +363,13 @@ fn pvh_regions(info_pa: usize) -> BootData {
         if entry + PVH_MEMMAP_ENTRY_SIZE > memmap_end {
             break;
         }
-        if read_u32(entry + 16) == MEMORY_AVAILABLE {
-            table.regions.push(read_u64(entry), read_u64(entry + 8));
+        if read_u32(entry + 16) == MEMORY_AVAILABLE
+            && emit_region(sink, read_u64(entry), read_u64(entry + 8))
+        {
+            count += 1;
         }
     }
-    table
-}
-
-/// Boot protocol dispatch: EAX magic first (Multiboot2), then the info magic
-/// (`hvm_start_info` for the PVH fallback).
-fn discover_regions(magic: usize, info_pa: usize) -> BootData {
-    // The info pointer is firmware-provided: refuse an implausible one instead
-    // of dereferencing it (the protocol pointers are low RAM on x86).
-    if info_pa == 0 || info_pa >= BOOT_INFO_MAX_PA {
-        panic!(
-            "boot discovery: implausible boot info pointer {:#x}",
-            info_pa
-        );
-    }
-    if magic == MB2_BOOT_MAGIC {
-        kernel::log!(
-            "discovery",
-            "boot protocol: Multiboot2 (info @ {:#x})",
-            info_pa
-        );
-        return multiboot2_regions(info_pa);
-    }
-    let info_magic = read_u32(info_pa);
-    if info_magic == HVM_START_MAGIC {
-        kernel::log!(
-            "discovery",
-            "boot protocol: PVH (start_info @ {:#x})",
-            info_pa
-        );
-        return pvh_regions(info_pa);
-    }
-    panic!(
-        "unknown boot protocol: eax={:#x}, info_magic={:#x} @ {:#x}",
-        magic, info_magic, info_pa
-    );
+    count
 }
 
 /// The BSP's initial APIC id from CPUID leaf 1 EBX[31:24] (readable without
@@ -409,7 +418,6 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
     kernel::log!("bootstrap", "KaleidOS x86_64 bootstrap");
     kernel::log!("bootstrap", "========================================");
 
-    let boot = discover_regions(magic, info_pa);
     let image_start = core::ptr::addr_of!(__kernel_start) as usize;
     let image_end = core::ptr::addr_of!(__kernel_end) as usize;
     let image_size = image_end - image_start;
@@ -418,10 +426,34 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         size: image_size,
     };
 
-    if boot.regions.count == 0 {
+    let protocol = detect_protocol(magic, info_pa);
+
+    // 无堆 pass：在 `early_init` 之前**不分配**——只扫出"包含镜像的 bank"与
+    // boot payload 排除区间；完整 RAM inventory 在 seam 之后用 `Vec` 重建。
+    let mut exclusions = ExclusionTable::empty();
+    let mut bank = None;
+    let mut region_count = 0usize;
+    walk_usable_regions(
+        protocol,
+        info_pa,
+        &mut |region| {
+            region_count += 1;
+            if bank.is_none()
+                && region.base <= image_start
+                && region
+                    .base
+                    .checked_add(region.size)
+                    .is_some_and(|limit| image_end <= limit)
+            {
+                bank = Some(region);
+            }
+        },
+        &mut exclusions,
+    );
+    if region_count == 0 {
         panic!("boot discovery: no usable RAM region in boot info");
     }
-    let Some(bank) = boot.regions.containing(image_start, image_end) else {
+    let Some(bank) = bank else {
         panic!(
             "boot discovery: no RAM region covers the kernel image {:#x}-{:#x}",
             image_start, image_end
@@ -430,10 +462,10 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
 
     // Early-memory seam（无堆）：在包含镜像的那个 bank 里，排除镜像与 boot
     // payload（PVH start_info / memmap 或整个 MB2 信息块），选出最大的页对齐
-    // 连续间隙作为 arena。固定 RegionTable 仍是机器 inventory，**不是** arena。
+    // 连续间隙作为 arena。发现的 RAM inventory 是机器真相，**不是** arena。
     let arena = kernel::memory::select_arena(bank, image, |emit| {
         emit(image)?;
-        for excluded in &boot.exclusions[..boot.exclusion_count] {
+        for excluded in &exclusions.exclusions[..exclusions.count] {
             emit(*excluded)?;
         }
         Ok(())
@@ -447,7 +479,7 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         image_size / 1024,
         bank.base,
         bank.size / 1024,
-        boot.regions.count
+        region_count
     );
     kernel::log!(
         "bootstrap",
@@ -455,7 +487,7 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         arena.base,
         arena.base + arena.size,
         arena.size / 1024,
-        boot.exclusion_count
+        exclusions.count
     );
 
     // SAFETY: arena 是 boot 从可用 RAM 中选出的连续窗口——镜像（含 boot 栈 /
@@ -465,21 +497,21 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         panic!("early memory init failed: {}", error);
     }
 
-    let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; MAX_REGIONS];
-    memory_regions[..boot.regions.count]
-        .copy_from_slice(&boot.regions.regions[..boot.regions.count]);
+    // seam 之后：完整 inventory（`Vec`，无 boot 侧截断），交接处 boxed。
+    let mut memory_regions: Vec<MemoryRegion> = Vec::new();
+    walk_usable_regions(
+        protocol,
+        info_pa,
+        &mut |region| memory_regions.push(region),
+        &mut ExclusionTable::empty(),
+    );
 
-    let mut cpu_info = [CpuInfo {
-        boot_cpu: false,
-        hardware_id: HardwareCpuId::from_raw(0),
-    }; MAX_CPUS];
-    cpu_info[0] = CpuInfo {
+    let cpu_info = vec![CpuInfo {
         boot_cpu: true,
-        hardware_id: HardwareCpuId::from_raw(boot_apic_id() as u64),
-    };
+        hardware_id: HardwareCpuId::from_raw(u64::from(boot_apic_id())),
+    }];
 
-    let mut devices = [DeviceDescriptor::empty(); 26];
-    devices[0] = uart_device();
+    let devices = vec![uart_device()];
 
     let info = MachineInfo {
         boot_hardware_id: cpu_info[0].hardware_id,
@@ -491,12 +523,9 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         // AP discovery (ACPI MADT) is not part of this bring-up: the BSP is
         // the only CPU Core may see, and it must be logical CPU0 with
         // `boot_cpu = true`.
-        cpu_count: 1,
-        cpu_info,
-        mem_count: boot.regions.count,
-        memory_regions,
-        dev_count: 1,
-        devices,
+        cpu_info: cpu_info.into_boxed_slice(),
+        memory_regions: memory_regions.into_boxed_slice(),
+        devices: devices.into_boxed_slice(),
     };
 
     kernel::log!(
@@ -505,7 +534,7 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         image_start,
         image_end,
         image_size / 1024,
-        info.mem_count,
+        info.memory_regions.len(),
         info.boot_hardware_id.raw()
     );
     kernel::log!("bootstrap", "MachineInfo dump:");
@@ -515,9 +544,11 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         base: image_start,
         size: image_size,
     }];
-    if let Err(error) = kernel::init(&info, &reserved) {
-        panic!("core init failed: {}", error);
-    }
+    // Core 消费提案并返回唯一提交的 `&'static` 快照：此后 boot 只借用它。
+    let info = match kernel::init(info, &reserved) {
+        Ok(info) => info,
+        Err(error) => panic!("core init failed: {}", error),
+    };
     kernel::log!("bootstrap", "BOOT CORE OK");
 
     // Local sources are unmasked by `kernel::init`; open the global gate last.
@@ -525,7 +556,7 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
 
     #[cfg(feature = "selftest")]
     {
-        selftest::run(&info);
+        selftest::run(info);
     }
 
     #[cfg(not(feature = "selftest"))]
