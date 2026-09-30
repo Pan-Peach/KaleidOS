@@ -725,10 +725,26 @@ type = "u32"
 name = "kcore_irq_register"
 ret = "i32"
 category = "IRQ routes"
-c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+c_category = "IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback）"
 category_group = "Device ownership（mechanism-first）"
+doc = """
+注册该设备某条中断资源的投递目标。`resource_index` 是设备
+`DeviceDescriptor.interrupts` 中的下标——二维锚点 `(DeviceId, resource_index)`
+让一台设备的多条中断各自可路由。同一条逻辑 IRQ 线只允许挂在一个资源 key 下，
+换 key 重复注册 = `-EBUSY`（不做 shared-line fanout）。
+成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
+`ENOTSUP` caller 不在 KernelNative 域 / `ENODEV` 设备不存在、资源越界或
+无（未绑定）中断线 / `EACCES` 非 owner / `EBUSY` 逻辑线已被别的 key 占用）。
+"""
+c_doc = """
+注册该设备某条中断资源的投递目标（resource_index = interrupts 下标）；
+同一逻辑线换 key 重复注册 = -EBUSY。
+"""
 [[function.param]]
 name = "device_id"
+type = "u32"
+[[function.param]]
+name = "resource_index"
 type = "u32"
 [[function.param]]
 name = "handler"
@@ -741,30 +757,47 @@ type = "*mut void"
 name = "kcore_irq_enable"
 ret = "i32"
 category = "IRQ routes"
-c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+c_category = "IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback）"
 category_group = "Device ownership（mechanism-first）"
+doc = """
+使能该设备某条中断资源（先验证 route，再配置中断控制器）。
+成功 = 0；失败 = `-Errno`（`ENODEV` 设备/资源不存在或未绑定线 /
+`EACCES` 非 owner / `EINVAL` 尚未注册 handler）。
+"""
 [[function.param]]
 name = "device_id"
+type = "u32"
+[[function.param]]
+name = "resource_index"
 type = "u32"
 
 [[function]]
 name = "kcore_irq_disable"
 ret = "i32"
 category = "IRQ routes"
-c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+c_category = "IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback）"
 category_group = "Device ownership（mechanism-first）"
 [[function.param]]
 name = "device_id"
+type = "u32"
+[[function.param]]
+name = "resource_index"
 type = "u32"
 
 [[function]]
 name = "kcore_irq_release"
 ret = "i32"
 category = "IRQ routes"
-c_category = "IRQ routes（锚点是 DeviceId；只支持 native callback）"
+c_category = "IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback）"
 category_group = "Device ownership（mechanism-first）"
+doc = """
+撤销该设备某条中断资源的 route 并关断控制器线——此后不再投递给已死 owner。
+"""
 [[function.param]]
 name = "device_id"
+type = "u32"
+[[function.param]]
+name = "resource_index"
 type = "u32"
 
 [[function]]

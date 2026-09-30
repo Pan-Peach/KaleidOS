@@ -147,7 +147,7 @@ struct kcomp_driver_create_config {
 ```
 
 - Core 视其为**不透明字节**。
-- 驱动校验 payload 指纹/布局后，**在自己的 create 边界内**调用 `kcore_device_claim(device_id, ...)`；IRQ / DMA 都以该 `DeviceId` 为锚点（`kcore_irq_register` / `kcore_dma_map`）。
+- 驱动校验 payload 指纹/布局后，**在自己的 create 边界内**调用 `kcore_device_claim(device_id, ...)`；IRQ 以 `(DeviceId, resource_index)` 为锚点（`kcore_irq_register` / `kcore_irq_enable` ...），DMA 以 `DeviceId` 为锚点（`kcore_dma_map`）。
 - **`DeviceId` 是选择数据，不是权限。**
 - **禁止**把 prober 已认领的设备直接交给 driver——那需要跨组件所有权转移，已明确推迟。预授予若将来需要，Core 必须**先为目标实例建立所有权**再交付。
 

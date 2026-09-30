@@ -390,15 +390,31 @@ unsafe extern "C" {
     pub fn kcore_device_claim(device_id: u32, out_mmio: *mut *mut u8, out_len: *mut usize) -> i32;
     #[link_name = "kcore_device_release"]
     pub fn kcore_device_release(device_id: u32) -> i32;
-    // -- IRQ routes（锚点是 DeviceId；只支持 native callback） --
+    // -- IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback） --
+    /// 注册该设备某条中断资源的投递目标。`resource_index` 是设备
+    /// `DeviceDescriptor.interrupts` 中的下标——二维锚点 `(DeviceId, resource_index)`
+    /// 让一台设备的多条中断各自可路由。同一条逻辑 IRQ 线只允许挂在一个资源 key 下，
+    /// 换 key 重复注册 = `-EBUSY`（不做 shared-line fanout）。
+    /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
+    /// `ENOTSUP` caller 不在 KernelNative 域 / `ENODEV` 设备不存在、资源越界或
+    /// 无（未绑定）中断线 / `EACCES` 非 owner / `EBUSY` 逻辑线已被别的 key 占用）。
     #[link_name = "kcore_irq_register"]
-    pub fn kcore_irq_register(device_id: u32, handler: IrqHandler, ctx: *mut ()) -> i32;
+    pub fn kcore_irq_register(
+        device_id: u32,
+        resource_index: u32,
+        handler: IrqHandler,
+        ctx: *mut (),
+    ) -> i32;
+    /// 使能该设备某条中断资源（先验证 route，再配置中断控制器）。
+    /// 成功 = 0；失败 = `-Errno`（`ENODEV` 设备/资源不存在或未绑定线 /
+    /// `EACCES` 非 owner / `EINVAL` 尚未注册 handler）。
     #[link_name = "kcore_irq_enable"]
-    pub fn kcore_irq_enable(device_id: u32) -> i32;
+    pub fn kcore_irq_enable(device_id: u32, resource_index: u32) -> i32;
     #[link_name = "kcore_irq_disable"]
-    pub fn kcore_irq_disable(device_id: u32) -> i32;
+    pub fn kcore_irq_disable(device_id: u32, resource_index: u32) -> i32;
+    /// 撤销该设备某条中断资源的 route 并关断控制器线——此后不再投递给已死 owner。
     #[link_name = "kcore_irq_release"]
-    pub fn kcore_irq_release(device_id: u32) -> i32;
+    pub fn kcore_irq_release(device_id: u32, resource_index: u32) -> i32;
     // -- DMA（allocation 与 mapping 分离） --
     /// 分配 CPU-visible、物理连续的 DMA 缓冲（device-agnostic）。
     #[link_name = "kcore_dma_alloc"]

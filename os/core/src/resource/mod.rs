@@ -64,8 +64,16 @@ pub use context::RequestContext;
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) fn reinstall() {
-        let devices = crate::machine::committed().map_or(0, |info| info.devices.len());
-        super::device::install_for_test(devices);
-        super::irq::install_for_test(devices);
+        let counts: alloc::vec::Vec<usize> = crate::machine::committed()
+            .map(|info| {
+                info.devices
+                    .iter()
+                    .map(|device| device.interrupts.len())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // device 表按设备数、irq 表按逐设备中断资源数定容（同一份快照）。
+        super::device::install_for_test(counts.len());
+        super::irq::install_for_test(&counts);
     }
 }

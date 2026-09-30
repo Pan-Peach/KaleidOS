@@ -37,7 +37,9 @@ pub struct Outcome {
     /// 本组第一个 claim 之前取的 trace 游标。
     pub cursor: u64,
     /// 三者的资源 id（与 trace `ResourceGrant.c` 精确匹配）：
-    /// device = DeviceId（= device_index），irq = DeviceId，dma = mapping id。
+    /// device = DeviceId（= device_index），
+    /// irq = `(device << 32) | resource_index`（二维 IRQ 锚点的 trace 身份），
+    /// dma = mapping id。
     pub device: u64,
     pub irq: u64,
     pub dma: u64,
@@ -102,16 +104,17 @@ pub fn group(checks: &mut Checks) -> Outcome {
         && unsafe { kcore_device_claim(uart_device, &mut uart, &mut uart_len) } == 0;
 
     // 拒绝路径：使能前必须先注册 handler —— 未注册就 enable → -EINVAL。
+    // UART 只有一条中断资源（resource_index = 0）。
     checks.check(
         13,
         "irq-enable-order",
-        uart_claimed && unsafe { kcore_irq_enable(uart_device) } == Errno::EINVAL.code(),
+        uart_claimed && unsafe { kcore_irq_enable(uart_device, 0) } == Errno::EINVAL.code(),
     );
 
     let irq_registered = uart_claimed
-        && unsafe { kcore_irq_register(uart_device, irq_handler, core::ptr::null_mut()) } == 0;
-    let irq_enabled = irq_registered && unsafe { kcore_irq_enable(uart_device) } == 0;
-    let irq_disabled = irq_enabled && unsafe { kcore_irq_disable(uart_device) } == 0;
+        && unsafe { kcore_irq_register(uart_device, 0, irq_handler, core::ptr::null_mut()) } == 0;
+    let irq_enabled = irq_registered && unsafe { kcore_irq_enable(uart_device, 0) } == 0;
+    let irq_disabled = irq_enabled && unsafe { kcore_irq_disable(uart_device, 0) } == 0;
     checks.check(
         14,
         "irq-line-enable",
@@ -126,8 +129,8 @@ pub fn group(checks: &mut Checks) -> Outcome {
     );
 
     // --- IRQ release：撤销 route 后重复释放 → -EINVAL（该设备已无 route）。 ---
-    let irq_released = irq_registered && unsafe { kcore_irq_release(uart_device) } == 0;
-    let irq_double = unsafe { kcore_irq_release(uart_device) } == Errno::EINVAL.code();
+    let irq_released = irq_registered && unsafe { kcore_irq_release(uart_device, 0) } == 0;
+    let irq_double = unsafe { kcore_irq_release(uart_device, 0) } == Errno::EINVAL.code();
     checks.check(16, "irq-release", irq_released && irq_double);
 
     // --- Device release：释放后同一设备可被再次认领（无 quarantine）。 ---
@@ -216,7 +219,8 @@ pub fn group(checks: &mut Checks) -> Outcome {
     Outcome {
         cursor,
         device: u64::from(virtio_device),
-        irq: u64::from(uart_device),
+        // 二维 IRQ 锚点：设备全宽左移 32 位，低位是中断资源下标（UART 恒为 0）。
+        irq: (u64::from(uart_device) << 32),
         dma: dma_mapping,
         grants_ok: claimed && irq_registered && dma_mapped,
         revokes_ok: virtio_released && irq_released && dma_unmapped,

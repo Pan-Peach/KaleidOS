@@ -3,11 +3,10 @@ use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use fdt::nodes::AsNode;
-use fdt::properties::values::StringList;
+#[cfg(feature = "machine")]
+use kernel::machine::CompatStr;
 use kernel::machine::{
-    CompatStr, CpuId, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
-    MemoryRegion, MAX_CPUS,
+    CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -84,10 +83,7 @@ fn configure_machine_timer(info: &MachineInfo) {
 /// 没有中断控制器的机器不阻塞 boot（外部中断不可用）。
 fn configure_interrupt_controller(info: &MachineInfo) {
     for device in info.devices.iter() {
-        let is_plic = device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| matches!(c.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"));
-        if !is_plic {
+        if !crate::discovery::is_plic_device(device) {
             continue;
         }
         let IoSpace::Mmio { base, .. } = device.space else {
@@ -105,8 +101,7 @@ fn configure_interrupt_controller(info: &MachineInfo) {
                 hardware.raw() as usize * 2
             }
         };
-        // TODO(boot): parse `riscv,ndev` from the PLIC node instead of a constant.
-        const PLIC_SOURCE_COUNT: u32 = 1024;
+        const PLIC_SOURCE_COUNT: u32 = crate::discovery::PLIC_SOURCE_LIMIT;
         let mut contexts = [arch::riscv::plic::PlicCpuContext {
             cpu: CpuId::from_raw(0),
             context: 0,
@@ -326,10 +321,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 /// CPU0；firmware 描述的 CPU 超过 `MAX_CPUS` 时 BSP 优先、其余按发现顺序取前
 /// `MAX_CPUS` 并显式诊断。**BSP 缺失时不制造**——Core 校验会拒绝该提案。
 fn discover<'a>(
-    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    tree: &fdt::Fdt<'a, crate::discovery::FdtParser<'a>>,
     hart_id: usize,
     firmware: FirmwareInfo,
-) -> MachineInfo {
+) -> Result<MachineInfo, &'static str> {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(r) = region else { continue };
@@ -366,21 +361,18 @@ fn discover<'a>(
         cpu_info.truncate(MAX_CPUS);
     }
 
-    // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
-    let mut devices: Vec<DeviceDescriptor> = Vec::new();
-    collect_devices(tree.root().as_node().children(), &mut devices);
-    if let Some(soc) = tree.find_node("/soc") {
-        collect_devices(soc.children(), &mut devices);
-    }
+    // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备；
+    // 完整中断资源解析 + PLIC 逻辑线绑定都在 discovery 模块（RV64/RV32 共用）。
+    let devices = crate::discovery::collect_devices(tree)?;
 
-    MachineInfo {
+    Ok(MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
         firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),
-    }
+    })
 }
 
 /// First Rust entry reached through the high-half alias.
@@ -413,7 +405,8 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         phys: context.dtb_pa,
         size: tree.total_size(),
     };
-    let info = discover(&tree, context.hart_id, firmware);
+    let info = discover(&tree, context.hart_id, firmware)
+        .unwrap_or_else(|error| panic!("discovery failed: {}", error));
     kernel::log!("discovery", "firmware: {:?}", info.firmware);
 
     #[cfg(feature = "machine")]
@@ -499,64 +492,6 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         crate::smp::start_secondaries(info);
         // 转交 Core Monitor（boot hart 同步主循环，永不返回）
         kernel::monitor::run();
-    }
-}
-
-/// 提取一个 FDT 节点的设备描述。
-/// 过滤规则：必须有 reg 且 compatible 非空（memory 无 compatible、cpus/chosen/pmu 无 reg，天然跳过）。
-type FdtParser<'a> = (
-    fdt::parsing::unaligned::UnalignedParser<'a>,
-    fdt::parsing::Panic,
-);
-
-fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<DeviceDescriptor> {
-    let mut descriptor = None;
-    if let Some(r) = child.reg() {
-        for entry in r.iter::<u64, u64>() {
-            if let Ok(reg) = entry {
-                descriptor = Some(DeviceDescriptor {
-                    space: IoSpace::Mmio {
-                        base: reg.address as usize,
-                        size: reg.len as usize,
-                    },
-                    irq: None,
-                    compatibles: [CompatStr::empty(); 4],
-                    compat_count: 0,
-                });
-                break;
-            }
-        }
-    }
-    let mut d = descriptor?;
-    if let Some(comp) = child.properties().find("compatible") {
-        if let Ok(list) = comp.as_value::<StringList>() {
-            for s in list {
-                let idx = d.compat_count as usize;
-                if idx < d.compatibles.len() {
-                    d.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
-                    d.compat_count += 1;
-                }
-            }
-        }
-    }
-    if d.compat_count == 0 {
-        return None;
-    }
-    if let Some(irqs) = child.properties().find("interrupts") {
-        d.irq = irqs.as_value::<u32>().ok();
-    }
-    Some(d)
-}
-
-/// 把一批 FDT 子节点中符合规则的设备收集进 owned 设备表（无容量上限）。
-fn collect_devices<'a>(
-    children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
-    devices: &mut Vec<DeviceDescriptor>,
-) {
-    for child in children {
-        if let Some(d) = device_descriptor(&child) {
-            devices.push(d);
-        }
     }
 }
 

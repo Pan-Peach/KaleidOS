@@ -8,11 +8,10 @@ use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use fdt::nodes::AsNode;
-use fdt::properties::values::StringList;
+#[cfg(feature = "machine")]
+use kernel::machine::CompatStr;
 use kernel::machine::{
-    CompatStr, CpuId, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
-    MemoryRegion, MAX_CPUS,
+    CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -33,11 +32,6 @@ unsafe extern "C" {
 #[unsafe(link_section = ".initpkg")]
 static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
     *include_bytes!("../../../../tools/qemu/init.kpkg");
-
-type FdtParser<'a> = (
-    fdt::parsing::unaligned::UnalignedParser<'a>,
-    fdt::parsing::Panic,
-);
 
 fn linker_addr(symbol: *const u8) -> usize {
     symbol as usize
@@ -69,10 +63,7 @@ fn configure_machine_timer(info: &MachineInfo) {
 /// 没有中断控制器的机器不阻塞 boot（外部中断不可用）。
 fn configure_interrupt_controller(info: &MachineInfo) {
     for device in info.devices.iter() {
-        let is_plic = device.compatibles[..device.compat_count as usize]
-            .iter()
-            .any(|c| matches!(c.as_str(), "riscv,plic0" | "sifive,plic-1.0.0"));
-        if !is_plic {
+        if !crate::discovery::is_plic_device(device) {
             continue;
         }
         let IoSpace::Mmio { base, .. } = device.space else {
@@ -90,8 +81,7 @@ fn configure_interrupt_controller(info: &MachineInfo) {
                 hardware.raw() as usize * 2
             }
         };
-        // TODO(boot): parse `riscv,ndev` from the PLIC node instead of a constant.
-        const PLIC_SOURCE_COUNT: u32 = 1024;
+        const PLIC_SOURCE_COUNT: u32 = crate::discovery::PLIC_SOURCE_LIMIT;
         let mut contexts = [arch::riscv::plic::PlicCpuContext {
             cpu: CpuId::from_raw(0),
             context: 0,
@@ -149,10 +139,10 @@ fn install_runtime_root(_info: &MachineInfo, _kernel_pa: usize) {}
 /// RV32 只保留能由 32 位地址表达的内存区间。`firmware` 是**保留的原始 DTB
 /// 物理区间**（arena 选择已永久排除，boot 生命周期内不回收）。
 fn discover<'a>(
-    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    tree: &fdt::Fdt<'a, crate::discovery::FdtParser<'a>>,
     hart_id: usize,
     firmware: FirmwareInfo,
-) -> MachineInfo {
+) -> Result<MachineInfo, &'static str> {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(region) = region else { continue };
@@ -197,20 +187,18 @@ fn discover<'a>(
         cpu_info.truncate(MAX_CPUS);
     }
 
-    let mut devices: Vec<DeviceDescriptor> = Vec::new();
-    collect_devices(tree.root().as_node().children(), &mut devices);
-    if let Some(soc) = tree.find_node("/soc") {
-        collect_devices(soc.children(), &mut devices);
-    }
+    // 两层遍历 + 完整中断资源解析 + PLIC 逻辑线绑定都在 discovery 模块
+    // （RV64/RV32 共用）。
+    let devices = crate::discovery::collect_devices(tree)?;
 
-    MachineInfo {
+    Ok(MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
         firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),
-    }
+    })
 }
 
 /// OpenSBI 选定的 boot hart 进入 payload；RV32 profile 使用 identity Sv32。
@@ -271,7 +259,8 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         phys: dtb_pa,
         size: tree.total_size(),
     };
-    let info = discover(&tree, hart_id, firmware);
+    let info = discover(&tree, hart_id, firmware)
+        .unwrap_or_else(|error| panic!("discovery failed: {}", error));
     kernel::log!("discovery", "firmware: {:?}", info.firmware);
     #[cfg(feature = "machine")]
     configure_machine_timer(&info);
@@ -345,56 +334,6 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         // 显式开全局中断：各本地源已在 kernel::init 中解源。
         arch::CpuImpl::enable_irq();
         kernel::monitor::run();
-    }
-}
-
-fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<DeviceDescriptor> {
-    let mut descriptor = None;
-    if let Some(regs) = child.reg() {
-        for entry in regs.iter::<u64, u64>() {
-            if let Ok(reg) = entry {
-                descriptor = Some(DeviceDescriptor {
-                    space: IoSpace::Mmio {
-                        base: reg.address as usize,
-                        size: reg.len as usize,
-                    },
-                    irq: None,
-                    compatibles: [CompatStr::empty(); 4],
-                    compat_count: 0,
-                });
-                break;
-            }
-        }
-    }
-    let mut descriptor = descriptor?;
-    if let Some(property) = child.properties().find("compatible") {
-        if let Ok(list) = property.as_value::<StringList>() {
-            for value in list {
-                let index = descriptor.compat_count as usize;
-                if index < descriptor.compatibles.len() {
-                    descriptor.compatibles[index] = CompatStr::from_bytes(value.as_bytes());
-                    descriptor.compat_count += 1;
-                }
-            }
-        }
-    }
-    if descriptor.compat_count == 0 {
-        return None;
-    }
-    if let Some(irqs) = child.properties().find("interrupts") {
-        descriptor.irq = irqs.as_value::<u32>().ok();
-    }
-    Some(descriptor)
-}
-
-fn collect_devices<'a>(
-    children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
-    devices: &mut Vec<DeviceDescriptor>,
-) {
-    for child in children {
-        if let Some(device) = device_descriptor(&child) {
-            devices.push(device);
-        }
     }
 }
 

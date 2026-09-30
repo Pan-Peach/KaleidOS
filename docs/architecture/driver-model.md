@@ -140,8 +140,8 @@ struct RequestContext {
 // —— Core 内部真相（不跨 ABI 暴露布局）——
 
 struct DeviceTable {
-    owner: [Option<ComponentId>; 256],
-    quarantine: [bool; 256],          // 失败后保持到 reboot
+    slots: Box<[DeviceSlot]>,         // 按已提交快照的设备数定容（无 256 上限）
+    // DeviceSlot { owner: Option<ComponentId>, quarantine: bool }
 }
 
 enum IoSpace {
@@ -149,13 +149,26 @@ enum IoSpace {
     Pio  { base: usize, size: usize },   // x86 预留；本阶段不认领
 }
 
-struct DeviceDescriptor {
+struct DeviceDescriptor {                 // owned 快照视图，不再 Copy
     space: IoSpace,
-    irq: Option<u32>,                 // 单 IRQ 模型：一台设备一条线
+    interrupts: Box<[InterruptResource]>, // 完整固件中断资源（长度即真相）
     compatibles: [CompatStr; 4],
     compat_count: u8,
 }
 
+enum InterruptSpecifier {
+    // 已解析的控制器 phandle + 一条完整 specifier（host-endian，不含 phandle）
+    Fdt { controller: u32, cells: Box<[u32]> },
+    Isa { line: u8 },
+}
+
+struct InterruptResource {
+    specifier: InterruptSpecifier,
+    line: Option<u32>,                // 逻辑外部 IRQ 号；未绑定 = None
+}
+
+// IrqTable: Box<[Box<[Option<IrqRoute>]>]> —— 外层 DeviceId、内层中断资源下标
+// （槽位在 resource::init 一次性分配；注册 / trap 投递不分配）。
 struct IrqRoute {
     owner: ComponentId,
     number: u32,
@@ -172,7 +185,7 @@ struct Allocation {
 struct Mapping {
     id: u64,                          // 单调递增，从不复用
     owner: ComponentId,               // = device owner（不是 ambient caller）
-    device_index: u8,
+    device: DeviceId,                 // 全宽身份（无 u8 收窄）
 }
 
 enum DmaDirection { ToDevice, FromDevice, Bidirectional }  // ABI 0/1/2
@@ -209,11 +222,12 @@ int32_t kcore_device_nth(const uint8_t *compatible, size_t len,
 int32_t kcore_device_claim(uint32_t device_id, uint8_t **out_mmio, size_t *out_len);
 int32_t kcore_device_release(uint32_t device_id);
 
-/* IRQ routes（锚点是 DeviceId；native callback only） */
-int32_t kcore_irq_register(uint32_t device_id, void (*handler)(void *ctx), void *ctx);
-int32_t kcore_irq_enable(uint32_t device_id);
-int32_t kcore_irq_disable(uint32_t device_id);
-int32_t kcore_irq_release(uint32_t device_id);
+/* IRQ routes（锚点是 (DeviceId, resource_index)；native callback only） */
+int32_t kcore_irq_register(uint32_t device_id, uint32_t resource_index,
+                           void (*handler)(void *ctx), void *ctx);
+int32_t kcore_irq_enable(uint32_t device_id, uint32_t resource_index);
+int32_t kcore_irq_disable(uint32_t device_id, uint32_t resource_index);
+int32_t kcore_irq_release(uint32_t device_id, uint32_t resource_index);
 
 /* DMA（allocation 与 mapping 分离） */
 int32_t kcore_dma_alloc(size_t size, uint8_t **out_ptr, size_t *out_len);
@@ -232,21 +246,33 @@ int32_t kcore_dma_unmap(uint64_t mapping);
 - `kcore_device_nth`：`-ENOENT` ordinal 超出匹配数（唯一终止信号）；`-ENODEV` 机器信息未提交。
 - `kcore_device_claim`：`-EPERM` 无法解析 caller 或 caller 已 `Failed`；`-ENODEV` 设备不存在；`-ENOTSUP` 设备是 PIO；`-EBUSY` 已认领或已 quarantine。
 - `kcore_device_release`：`-EACCES` 非 owner；`-EBUSY` 仍有 live IRQ/DMA 子项；`-ENODEV` 不存在 / 未认领。
-- `kcore_irq_*`：`-ENODEV` 设备不存在或无中断线；`-EACCES` 非 owner；`-EINVAL` enable 前尚未 register handler。
+- `kcore_irq_*`：`-ENODEV` 设备不存在、`resource_index` 越界或无（未绑定）中断线；`-EACCES` 非 owner；`-EINVAL` enable 前尚未 register handler；`-EBUSY` 该逻辑线已挂在别的资源 key 下（不做 shared-line fanout）。
 - `kcore_dma_alloc`：`-EINVAL` 尺寸非法；`-ENOMEM` 物理内存耗尽。
 - `kcore_dma_map`：`-EINVAL` direction 非法或范围非法；`-ENODEV` 设备不存在；`-EACCES` 非 owner。
 - `kcore_dma_unmap`：`-ENOENT` mapping 不存在。
 
 ### 6.2 IRQ 模型
 
-- **锚点是已认领的 `DeviceId`**（`DeviceDescriptor` 自带 `irq: Option<u32>`），**不是** `IrqHandle`。单 IRQ 设备下再套一层"MMIO → IRQ 派生"没有真实用途，已删除。
+- **锚点是 `(DeviceId, resource_index)`**：已认领的设备 + 该设备 `DeviceDescriptor.interrupts`
+  里的中断资源下标，**不是** `IrqHandle`。一台设备可以有多条中断（多个资源 / 不同控制器），
+  每条资源各自可路由。
+- **固件 specifier 与逻辑线是两个事实**（`InterruptResource`）：
+  - `specifier`（`InterruptSpecifier::Fdt { controller, cells }` / `Isa { line }`）是固件怎么描述
+    这条中断——`interrupts` 经继承的 `interrupt-parent` 解析、`interrupts-extended` 每条 tuple
+    自带 phandle，cells 用该控制器的 `#interrupt-cells` 完整切分（GIC 的 type/number/flags 等）；
+  - `line: Option<u32>` 是 Core 后端能投递的**逻辑外部 IRQ 号**。绝不把解码后的 GIC INTID /
+    向量 / 固件 cell 直接当逻辑 IRQ。本阶段只有 RISC-V PLIC 源会被绑定（属于已配置 PLIC
+    且 source 在其声明范围内）；AArch64（无 GIC 路由）与 x86（无 PIC 路由）的资源保留
+    `line: None`——"有、但当前不可路由"。
 - Core 只维护 **IRQ line / owner / callback / context**：
   - `kcore_irq_register` 记录一条 route（handler + opaque ctx），只有设备 owner 能注册；
   - `kcore_irq_enable` / `kcore_irq_disable` 配置中断控制器（arch 层），表锁只覆盖验证，PLIC 寄存器在**锁外**写；
-  - `kcore_irq_release` 撤销 route 并关断控制器线——此后不再投递给已死 owner。
+  - `kcore_irq_release` 撤销 route 并关断控制器线——此后不再投递给已死 owner；
+  - route 表按已提交快照定容（外层设备 × 内层中断资源数），**注册与 trap 投递不分配**；
+  - 同一逻辑线只允许挂在一个资源 key 下（不做 shared-line fanout，first-match 不得静默挑 owner）。
 - **投递**：`trap → Core route → native callback`。Core 在锁内只取一份 `(owner, handler, ctx)` 拷贝，回调在**锁外**执行。回调运行在 Core 建立的 **IRQ 归属作用域**内（principal = 该线的 owner、`task = None`），被中断的边界在回调返回后恢复。作用域同步、不可 yield；作用域内调度类 Core 调用返回 `-EINVAL`；回调内 panic **致命**（没有 Core 拥有的可恢复上下文）。
 - **已删除（defer）**：`Polled` / 计数 / 掩蔽 / `ack` 的 event-delivery 模型。那属于真实 isolated / U-mode 执行模型出现后才需要的机制；当前 KernelNative 只走最简单的 native callback。
-- **暂不引入多 MSI-X vector / shared line / 跨 owner delegation**：真实需求出现再加 `irq_index` 或动态 IRQ 身份。
+- **已引入二维 `(DeviceId, resource_index)` 锚点**（多中断资源各自可路由）；**shared line 明确不实现**（换 key 重复注册 → `-EBUSY`，不做 fanout）。**暂不引入**多 MSI-X vector / 跨 owner delegation——真实需求出现再加动态 IRQ 身份。
 
 ### 6.3 DMA 模型：allocation 与 mapping 分离
 
@@ -315,9 +341,10 @@ device_nth → device_claim → 直接拿到寄存器基址 → 驱动 volatile 
 ### IRQ
 
 ```text
-claim 设备 → irq_register(device_id, handler, ctx) → irq_enable(device_id)
+claim 设备 → irq_register(device_id, resource_index, handler, ctx)
+  → irq_enable(device_id, resource_index)
   → trap → Core route(number) → 锁外 native callback（IRQ 归属作用域）
-  → irq_disable / irq_release
+  → irq_disable / irq_release(device_id, resource_index)
 ```
 
 ### DMA
@@ -425,7 +452,7 @@ runtime:
 
 - `kcore_device_nth(compatible, len, ordinal, out_device_id)` 纯发现（不分配、不触碰设备、包含已认领设备、order 稳定；`ordinal >= 匹配数` → `-ENOENT` 是唯一终止信号），产出 `DeviceId`（identity，非 handle）；
 - `kcore_device_claim(device_id, ...)` 认领**那台确切设备**，独占锚在 device index；
-- `kcore_irq_register(device_id, ...)` 与 `kcore_dma_map(device_id, ...)` 都以 `DeviceId` 为锚点（IRQ 通过 `DeviceDescriptor.irq` 解析线号），不存在"MMIO 给 A、IRQ 给 B"的跨设备错配；
+- `kcore_irq_register(device_id, resource_index, ...)` 与 `kcore_dma_map(device_id, ...)` 都以 `DeviceId` 为锚点（IRQ 通过 `DeviceDescriptor.interrupts[resource_index].line` 解析逻辑线号），不存在"MMIO 给 A、IRQ 给 B"的跨设备错配；
 - `kcore_device_release` 在仍有 live IRQ route / DMA mapping 时 `-EBUSY`；`kcore_irq_release` 撤销 route 并关断控制器线；
 - 失败 containment：`fail_component` 把失败组件占用的每台设备标进 Core 的 quarantine（phase 1 保持到 reboot；优雅 `release` 不标记）。
 
@@ -436,7 +463,7 @@ runtime:
 - **D1（已修订）**：Core 管 Memory、不管 Heap，也不做内存记账；**堆是 runtime / deployment 策略，不是 Core 资源**（KernelNative 可共享 Core 内核堆，私有执行域可自带私有分配器）；Core 只以 region 粒度提供 backing / mapping，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 归属由该实例的 AS / 页表承载），**不**做 per-instance 字节计费；region release / instance failure 只保证逻辑失效、backing 保留驻留（不承诺物理回收，无归属记录时实例死亡亦无可回收之物）；**不得以"地址空间隔离"为名把堆分离当成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
 - **D2 = A**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是可选的**教学实验**、**不是里程碑**；SandboxedNative（U + 私有 AS）是未来的**强制边界**。执行模型 / runtime（native vs Wasm）是**正交维度**，Wasm 只是 Component 的执行后端之一，不是第四个执行域。
 - **设备访问模型**：`DeviceId`（identity）+ `kcore_device_claim` 返回本执行域窗口；KernelNative 拿裸寄存器基址，driver 自己 `volatile` 读写；不做 per-access 鉴权。旧的 `Handle → validate → Core MMIO read/write`、typed `MmioLease` / `DmaLease` 已删除。
-- **IRQ 模型**：锚点是已认领的 `DeviceId`；只支持 native callback；polled / count / mask / ack 已删除并推迟到真实 isolated / U-mode 执行模型。
+- **IRQ 模型**：锚点是已认领的 `(DeviceId, resource_index)`（设备的中断资源下标）；固件 specifier 与逻辑 IRQ 号分离（`InterruptResource`）；只支持 native callback；polled / count / mask / ack 已删除并推迟到真实 isolated / U-mode 执行模型。
 - **DMA 模型**：allocation（device-agnostic）与 mapping（device-related）分离；mapping id 单调递增 `u64` 从不复用；No-IOMMU identity，IOMMU / bounce buffer 在同一 seam。
 - **DMA teardown = correctness**：组件失败 ≠ 设备静默；backing lease 不归还 buddy，move 进 Core 私有 `QUARANTINE`；没有"确认设备静默"的手段时不 free。
 - **`MemoryLease` 定位**：Core 内部 RAII ownership guard；物理帧是 Core 实现细节，组件永不跨 ABI manipulate "Frame #N"。

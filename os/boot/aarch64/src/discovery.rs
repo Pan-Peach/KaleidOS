@@ -22,12 +22,14 @@
 //!    address -- so a future driver can read vendor data beyond the normalized
 //!    view.  The staged bytes are never reclaimed.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use fdt::nodes::AsNode;
+use fdt::nodes::{AsNode, Node};
 use fdt::properties::values::StringList;
+use fdt::properties::PHandle;
 use kernel::machine::{
-    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
-    MemoryRegion, MAX_CPUS,
+    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, InterruptResource,
+    InterruptSpecifier, IoSpace, MachineInfo, MemoryRegion, MAX_CPUS,
 };
 
 /// FDT magic (`0xd00dfeed`, big-endian on the wire).
@@ -376,10 +378,52 @@ type FdtParser<'a> = (
     fdt::parsing::Panic,
 );
 
+/// Maximum cells in one interrupt specifier (defends against a malformed
+/// `#interrupt-cells`).
+const MAX_INTERRUPT_CELLS: usize = 16;
+
+/// Maximum interrupt-parent chain steps (defends against self-referencing or
+/// malformed trees).
+const MAX_PARENT_STEPS: usize = 16;
+
+/// Collect the device records (root children, then `/soc` children) with their
+/// complete interrupt resources.
+///
+/// AArch64 has no GIC routing in this phase: every retained specifier keeps
+/// `line: None` (the logical IRQ is deliberately *not* decoded from the INTID).
+pub fn collect_devices<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+) -> Result<Vec<DeviceDescriptor>, &'static str> {
+    let mut devices: Vec<DeviceDescriptor> = Vec::new();
+    collect(tree, tree.root().as_node().children(), &mut devices)?;
+    if let Some(soc) = tree.find_node("/soc") {
+        collect(tree, soc.children(), &mut devices)?;
+    }
+    Ok(devices)
+}
+
+fn collect<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    children: impl IntoIterator<Item = Node<'a, FdtParser<'a>>>,
+    devices: &mut Vec<DeviceDescriptor>,
+) -> Result<(), &'static str> {
+    for child in children {
+        if let Some(descriptor) = device_descriptor(tree, &child)? {
+            devices.push(descriptor);
+        }
+    }
+    Ok(())
+}
+
 /// Extract one FDT node's device descriptor.
+///
 /// Filter: must have `reg` and a non-empty `compatible` (memory/cpus/chosen/pmu
-/// fail one of those naturally).
-fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<DeviceDescriptor> {
+/// fail one of those naturally).  This phase keeps a single MMIO window
+/// (multi-window is a later stage).
+fn device_descriptor<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    child: &Node<'a, FdtParser<'a>>,
+) -> Result<Option<DeviceDescriptor>, &'static str> {
     let mut descriptor = None;
     if let Some(r) = child.reg() {
         if let Some(reg) = r.iter::<u64, u64>().flatten().next() {
@@ -388,44 +432,169 @@ fn device_descriptor<'a>(child: &fdt::nodes::Node<'a, FdtParser<'a>>) -> Option<
                     base: reg.address as usize,
                     size: reg.len as usize,
                 },
-                irq: None,
+                interrupts: Box::new([]),
                 compatibles: [CompatStr::empty(); 4],
                 compat_count: 0,
             });
         }
     }
-    let mut d = descriptor?;
+    let Some(mut descriptor) = descriptor else {
+        return Ok(None);
+    };
     if let Some(comp) = child.properties().find("compatible") {
         if let Ok(list) = comp.as_value::<StringList>() {
             for s in list {
-                let idx = d.compat_count as usize;
-                if idx < d.compatibles.len() {
-                    d.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
-                    d.compat_count += 1;
+                let idx = descriptor.compat_count as usize;
+                if idx < descriptor.compatibles.len() {
+                    descriptor.compatibles[idx] = CompatStr::from_bytes(s.as_bytes());
+                    descriptor.compat_count += 1;
                 }
             }
         }
     }
-    if d.compat_count == 0 {
-        return None;
+    if descriptor.compat_count == 0 {
+        return Ok(None);
     }
-    if let Some(irqs) = child.properties().find("interrupts") {
-        d.irq = irqs.as_value::<u32>().ok();
-    }
-    Some(d)
+    descriptor.interrupts = interrupts_of(tree, child)?;
+    Ok(Some(descriptor))
 }
 
-/// Collect matching device descriptors from a batch of FDT child nodes (owned
-/// `Vec`; no capacity limit at discovery).
-fn collect_devices<'a>(
-    children: impl IntoIterator<Item = fdt::nodes::Node<'a, FdtParser<'a>>>,
-    devices: &mut Vec<DeviceDescriptor>,
-) {
-    for child in children {
-        if let Some(d) = device_descriptor(&child) {
-            devices.push(d);
-        }
+/// Parse the node's complete interrupt resources (`interrupts-extended` wins
+/// over `interrupts`, matching the devicetree spec / the `fdt` crate); both
+/// missing is legal and yields an empty list.
+fn interrupts_of<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    node: &Node<'a, FdtParser<'a>>,
+) -> Result<Box<[InterruptResource]>, &'static str> {
+    if let Some(property) = node.properties().find("interrupts-extended") {
+        return parse_extended(tree, property.value);
     }
+    if let Some(property) = node.properties().find("interrupts") {
+        return parse_legacy(tree, node, property.value);
+    }
+    Ok(Box::new([]))
+}
+
+/// `interrupts-extended`: each tuple is `phandle + that controller's
+/// #interrupt-cells` cells.  Truncation / unresolved phandles are discovery
+/// errors.
+fn parse_extended<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    mut rest: &[u8],
+) -> Result<Box<[InterruptResource]>, &'static str> {
+    let mut resources = Vec::new();
+    while !rest.is_empty() {
+        let Some((phandle_bytes, tail)) = rest.split_at_checked(4) else {
+            return Err("interrupts-extended: truncated phandle");
+        };
+        let phandle = u32::from_be_bytes(phandle_bytes.try_into().expect("4 bytes"));
+        rest = tail;
+        let controller = resolve_controller(tree, phandle)?;
+        let cells_count = interrupt_cells(&controller)?;
+        let bytes = cells_count * 4;
+        let Some((cells_bytes, tail)) = rest.split_at_checked(bytes) else {
+            return Err("interrupts-extended: truncated specifier");
+        };
+        rest = tail;
+        resources.push(InterruptResource {
+            specifier: InterruptSpecifier::Fdt {
+                controller: phandle,
+                cells: collect_cells(cells_bytes),
+            },
+            line: None,
+        });
+    }
+    Ok(resources.into_boxed_slice())
+}
+
+/// `interrupts`: every tuple shares the (resolved, inherited) interrupt parent;
+/// the length must be a whole multiple of its `#interrupt-cells`.
+fn parse_legacy<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    node: &Node<'a, FdtParser<'a>>,
+    bytes: &[u8],
+) -> Result<Box<[InterruptResource]>, &'static str> {
+    if bytes.is_empty() {
+        return Ok(Box::new([]));
+    }
+    let controller = interrupt_parent(tree, node)?;
+    let cells_count = interrupt_cells(&controller)?;
+    let stride = cells_count * 4;
+    if !bytes.len().is_multiple_of(stride) {
+        return Err("interrupts: length is not a multiple of #interrupt-cells");
+    }
+    let phandle = controller
+        .property::<PHandle>()
+        .map(PHandle::as_u32)
+        .ok_or("interrupt controller node has no phandle")?;
+    let mut resources = Vec::new();
+    for cells_bytes in bytes.chunks_exact(stride) {
+        resources.push(InterruptResource {
+            specifier: InterruptSpecifier::Fdt {
+                controller: phandle,
+                cells: collect_cells(cells_bytes),
+            },
+            line: None,
+        });
+    }
+    Ok(resources.into_boxed_slice())
+}
+
+fn collect_cells(bytes: &[u8]) -> Box<[u32]> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().expect("chunk is 4 bytes")))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+/// Resolve the interrupt parent (Linux `of_irq_find_parent`): follow the node's
+/// own `interrupt-parent`; otherwise climb the devicetree parent; stop at the
+/// first node carrying `#interrupt-cells`.  Unresolved phandles / too-deep
+/// chains are discovery errors.
+fn interrupt_parent<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    node: &Node<'a, FdtParser<'a>>,
+) -> Result<Node<'a, FdtParser<'a>>, &'static str> {
+    let mut current = *node;
+    for _ in 0..MAX_PARENT_STEPS {
+        let next = if let Some(property) = current.properties().find("interrupt-parent") {
+            let phandle = property
+                .as_value::<u32>()
+                .map_err(|_| "invalid interrupt-parent")?;
+            resolve_controller(tree, phandle)?
+        } else {
+            current.parent().ok_or("device has no interrupt parent")?
+        };
+        if next.properties().find("#interrupt-cells").is_some() {
+            return Ok(next);
+        }
+        current = next;
+    }
+    Err("interrupt-parent chain is too deep")
+}
+
+fn resolve_controller<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    phandle: u32,
+) -> Result<Node<'a, FdtParser<'a>>, &'static str> {
+    tree.root()
+        .resolve_phandle(PHandle::new(phandle))
+        .ok_or("interrupt controller phandle does not resolve")
+}
+
+fn interrupt_cells<'a>(controller: &Node<'a, FdtParser<'a>>) -> Result<usize, &'static str> {
+    let property = controller
+        .properties()
+        .find("#interrupt-cells")
+        .ok_or("interrupt controller has no #interrupt-cells")?;
+    let count = property
+        .as_value::<u32>()
+        .map_err(|_| "invalid #interrupt-cells")? as usize;
+    if count == 0 || count > MAX_INTERRUPT_CELLS {
+        return Err("#interrupt-cells out of range");
+    }
+    Ok(count)
 }
 
 /// Normalize a parsed DTB into the owned [`MachineInfo`] Core consumes.
@@ -439,12 +608,15 @@ fn collect_devices<'a>(
 ///
 /// `firmware` is the retained raw source ([`FirmwareInfo::Fdt`] pointing at the
 /// staged copy); it is stored verbatim -- this function does not re-validate it.
+///
+/// Malformed / unresolved interrupt tuples are a hard discovery error (boot
+/// fails with the reason instead of silently dropping resources).
 pub fn discover<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     boot_affinity: u64,
     timebase_frequency: u64,
     firmware: FirmwareInfo,
-) -> MachineInfo {
+) -> Result<MachineInfo, &'static str> {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(r) = region else { continue };
@@ -481,18 +653,14 @@ pub fn discover<'a>(
     }
 
     // Two passes: root holds system-level devices, /soc holds bus devices.
-    let mut devices: Vec<DeviceDescriptor> = Vec::new();
-    collect_devices(tree.root().as_node().children(), &mut devices);
-    if let Some(soc) = tree.find_node("/soc") {
-        collect_devices(soc.children(), &mut devices);
-    }
+    let devices = collect_devices(tree)?;
 
-    MachineInfo {
+    Ok(MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(boot_affinity),
         timebase_frequency,
         firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),
-    }
+    })
 }

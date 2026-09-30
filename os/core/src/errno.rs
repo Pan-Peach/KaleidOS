@@ -251,6 +251,7 @@ impl From<irq::IrqError> for Errno {
             irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
             irq::IrqError::NotOwner => Errno::EACCES,
             irq::IrqError::NoHandler => Errno::EINVAL,
+            irq::IrqError::LineBusy => Errno::EBUSY,
         }
     }
 }
@@ -708,11 +709,13 @@ mod tests {
             irq::IrqError::NoIrq,
             irq::IrqError::NotOwner,
             irq::IrqError::NoHandler,
+            irq::IrqError::LineBusy,
         ] {
             let expected = match error {
                 irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
                 irq::IrqError::NotOwner => Errno::EACCES,
                 irq::IrqError::NoHandler => Errno::EINVAL,
+                irq::IrqError::LineBusy => Errno::EBUSY,
             };
             assert_eq!(Errno::from(error), expected, "IrqError {error:?}");
         }

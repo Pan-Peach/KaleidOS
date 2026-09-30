@@ -422,7 +422,7 @@ fn find_mmio(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<(usize, usize)
     })
 }
 
-/// 按 compatible（任一命中）找设备的 PLIC 中断号。
+/// 按 compatible（任一命中）找设备的第一条**已绑定**逻辑中断线。
 fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
     info.devices.iter().find_map(|device| {
         let hit = device.compatibles[..device.compat_count as usize]
@@ -431,7 +431,7 @@ fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
         if !hit {
             return None;
         }
-        device.irq
+        device.interrupts.iter().find_map(|resource| resource.line)
     })
 }
 

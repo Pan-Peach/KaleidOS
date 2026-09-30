@@ -13,7 +13,7 @@
 
 ## 暴露什么机制
 
-- 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`、`IoSpace`（Mmio / Pio）、`CompatStr`、`DeviceId`、`DeviceLookupError`。
+- 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`、`IoSpace`（Mmio / Pio）、`CompatStr`、`DeviceId`、`DeviceLookupError`、`InterruptResource` / `InterruptSpecifier`（设备的完整中断资源：固件 specifier + 可投递的逻辑 `line: Option<u32>`）。
 - `commit(info)` / `committed()`。
 - `nth_compatible(compatible, ordinal)`：纯设备枚举（含已认领设备，顺序跨 claim/release 稳定；`ordinal` 越界 → `DeviceLookupError`）。
 
@@ -22,6 +22,7 @@
 - **不解析 DTB / ACPI**：FDT / RSDP 解析与校验在 boot；Core 只收已归一化的值与已验证的保留位置。
 - **`FirmwareInfo` 不是 ABI**：不是 `repr(C)`、不进 `kcore_*` / 组件 SDK；`Static` = 没有保留的受支持固件描述（不是"校验失败但继续"）。
 - **发现是纯的**：不分配、不触碰设备寄存器、不读 claim 状态、不授权。
+- **不把固件解码值当逻辑 IRQ 号**：`specifier`（控制器 + 完整 cells）与 `line` 分开；`line` 的绑定是 boot 的 arch 特定工作（PLIC），Core 只消费。
 - `DeviceId` 是 **identity，不是权限**；零可以是合法值。
 
 ## 代码在哪

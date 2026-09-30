@@ -141,19 +141,55 @@ pub enum IoSpace {
     Pio { base: usize, size: usize },
 }
 
-#[derive(Clone, Copy)]
+/// 一条中断资源的**固件 specifier**：哪个中断控制器 + 一条完整 specifier。
+///
+/// `specifier` 与 [`InterruptResource::line`] 是**两个不同的事实**：
+/// specifier 是固件怎么描述这条中断（控制器身份 + 原始 cells），line 是 Core
+/// 的后端能不能把它变成一条可投递的**逻辑外部 IRQ 号**。绝不把解码后的
+/// GIC INTID / 向量 / 固件 cell 直接当逻辑 IRQ 号用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InterruptSpecifier {
+    /// FDT 的一条完整中断 tuple：
+    /// - `controller` 是**已解析**（resolved）的 interrupt controller phandle
+    ///   （host-endian；`interrupts` 经继承的 `interrupt-parent` 解析，
+    ///   `interrupts-extended` 每条 tuple 自带 phandle）；
+    /// - `cells` 是该控制器 `#interrupt-cells` 规定的**一条** specifier
+    ///   （host-endian，**不含** phandle）——完整保留 GIC 的 type/number/flags
+    ///   等全部 cell，不是属性包。
+    Fdt { controller: u32, cells: Box<[u32]> },
+    /// ISA IRQ 线（x86 8259 风格的固件编号）。
+    Isa { line: u8 },
+}
+
+/// 设备的一条中断资源：固件 specifier + Core 可投递的**逻辑 IRQ 号**（或未绑定）。
+///
+/// `line: None` = 资源被完整保留但本阶段后端无法投递（例如无 GIC/PIC 路由，
+/// 或 PLIC 源不在配置范围内）；这不是"没有中断"，是"有、但当前不可路由"。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterruptResource {
+    pub specifier: InterruptSpecifier,
+    pub line: Option<u32>,
+}
+
+/// 设备发现记录（owned；随 `MachineInfo` 一次性发布，**不再 `Copy`**）。
+///
+/// `interrupts` 是**完整**的固件中断资源列表（长度即真相）：一台设备可以有多条
+/// 中断（多个资源 / 不同控制器），每条资源的 `line` 是 Core 后端支持的逻辑
+/// 外部 IRQ 号（未绑定 = `None`）。
+#[derive(Clone)]
 pub struct DeviceDescriptor {
     pub space: IoSpace,
-    pub irq: Option<u32>,
+    pub interrupts: Box<[InterruptResource]>,
     pub compatibles: [CompatStr; 4],
     pub compat_count: u8,
 }
 
 impl DeviceDescriptor {
-    pub const fn empty() -> Self {
+    /// 空描述符（无空间 / 无中断 / 无 compatible）。`interrupts` 是空 boxed slice。
+    pub fn empty() -> Self {
         Self {
             space: IoSpace::Mmio { base: 0, size: 0 },
-            irq: None,
+            interrupts: Box::new([]),
             compatibles: [CompatStr::empty(); 4],
             compat_count: 0,
         }
@@ -247,10 +283,7 @@ impl core::fmt::Debug for DeviceDescriptor {
         };
         write!(f, "DeviceDescriptor {{ {space}: {base:#x}, size: ")?;
         write_size(f, size)?;
-        match self.irq {
-            Some(irq) => write!(f, ", irq: {irq}, compatibles: ")?,
-            None => write!(f, ", irq: None, compatibles: ")?,
-        }
+        write!(f, ", interrupts: {:?}, compatibles: ", self.interrupts)?;
         f.write_str("[")?;
         for (i, c) in self.compatibles[..self.compat_count as usize]
             .iter()
@@ -409,13 +442,32 @@ mod tests {
     /// FDT magic（测试哨兵：模拟保留的 FDT header 可重读）。
     const FDT_MAGIC: u32 = 0xd00d_feed;
 
-    fn device(compatibles: &[&[u8]], irq: Option<u32>) -> DeviceDescriptor {
+    /// 一条已绑定的 ISA 中断资源（测试便利构造）。
+    fn irq_resource(line: u32) -> InterruptResource {
+        InterruptResource {
+            specifier: InterruptSpecifier::Isa { line: line as u8 },
+            line: Some(line),
+        }
+    }
+
+    /// 一条未绑定的 FDT 中断资源（测试便利构造）。
+    fn fdt_resource(controller: u32, cells: &[u32]) -> InterruptResource {
+        InterruptResource {
+            specifier: InterruptSpecifier::Fdt {
+                controller,
+                cells: cells.to_vec().into_boxed_slice(),
+            },
+            line: None,
+        }
+    }
+
+    fn device(compatibles: &[&[u8]], interrupts: Vec<InterruptResource>) -> DeviceDescriptor {
         let mut d = DeviceDescriptor::empty();
         for (slot, c) in d.compatibles.iter_mut().zip(compatibles) {
             *slot = CompatStr::from_bytes(c);
         }
         d.compat_count = compatibles.len() as u8;
-        d.irq = irq;
+        d.interrupts = interrupts.into_boxed_slice();
         d
     }
 
@@ -452,10 +504,10 @@ mod tests {
         let info = fixture(vec![
             device(
                 &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-                Some(1),
+                vec![irq_resource(1)],
             ),
-            device(&[b"ns16550a".as_slice()], Some(10)),
-            device(&[b"virtio,mmio".as_slice()], Some(2)),
+            device(&[b"ns16550a".as_slice()], vec![irq_resource(10)]),
+            device(&[b"virtio,mmio".as_slice()], vec![irq_resource(2)]),
         ]);
 
         assert_eq!(
@@ -504,7 +556,7 @@ mod tests {
     #[test]
     fn nth_compatible_reaches_devices_beyond_a_byte() {
         let mut devices = vec![DeviceDescriptor::empty(); 300];
-        devices[260] = device(&[b"far,device".as_slice()], Some(5));
+        devices[260] = device(&[b"far,device".as_slice()], vec![irq_resource(5)]);
         let info = fixture(devices);
 
         assert_eq!(
@@ -529,7 +581,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let devices = (0..40)
-            .map(|_| device(&[b"many,device".as_slice()], Some(3)))
+            .map(|_| device(&[b"many,device".as_slice()], vec![irq_resource(3)]))
             .collect::<Vec<_>>();
         let info = test_support::snapshot(
             HardwareCpuId::from_raw(0),
@@ -556,7 +608,7 @@ mod tests {
         let first = commit(fixture(vec![])).expect("first commit must publish");
         assert_eq!(first.devices.len(), 0);
 
-        let second = commit(fixture(vec![device(&[b"late,device".as_slice()], None)]));
+        let second = commit(fixture(vec![device(&[b"late,device".as_slice()], vec![])]));
         assert_eq!(second.err(), Some("machine info already committed"));
         assert_eq!(
             COMMITTED.get().expect("still committed").devices.len(),
@@ -653,7 +705,7 @@ mod tests {
         // 声明两个 compatible：命中任一为真，无关串为假（前缀也不算命中）。
         let d = device(
             &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-            Some(1),
+            vec![irq_resource(1)],
         );
         assert!(d.matches(b"virtio,mmio"), "第一个声明的 compatible");
         assert!(d.matches(b"legacy,mmio"), "第二个声明的 compatible");
@@ -664,7 +716,7 @@ mod tests {
         // 槽位内容存在，但超出 compat_count 即被忽略。
         let mut clipped = device(
             &[b"virtio,mmio".as_slice(), b"hidden,mmio".as_slice()],
-            None,
+            vec![],
         );
         assert!(clipped.matches(b"hidden,mmio"), "未截断前参与匹配");
         clipped.compat_count = 1;
@@ -682,7 +734,7 @@ mod tests {
         // Given: 一个带 IRQ 与两个 compatible 的 MMIO 描述符。
         let mut d = device(
             &[b"virtio,mmio".as_slice(), b"legacy,mmio".as_slice()],
-            Some(7),
+            vec![irq_resource(7)],
         );
         d.space = IoSpace::Mmio {
             base: 0x1000,
@@ -696,7 +748,12 @@ mod tests {
         assert!(text.contains("DeviceDescriptor"), "{text}");
         assert!(text.contains("mmio: 0x1000"), "{text}");
         assert!(text.contains("size: 4 KiB"), "{text}");
-        assert!(text.contains("irq: 7"), "{text}");
+        assert!(
+            text.contains(
+                "interrupts: [InterruptResource { specifier: Isa { line: 7 }, line: Some(7) }]"
+            ),
+            "{text}"
+        );
         assert!(text.contains("virtio,mmio"), "{text}");
         assert!(text.contains("legacy,mmio"), "{text}");
 
@@ -704,7 +761,7 @@ mod tests {
         let mut no_irq = DeviceDescriptor::empty();
         no_irq.space = IoSpace::Mmio { base: 0, size: 0 };
         let text = alloc::format!("{no_irq:?}");
-        assert!(text.contains("irq: None"), "{text}");
+        assert!(text.contains("interrupts: []"), "{text}");
         assert!(text.contains("compatibles: []"), "{text}");
 
         // PIO 空间（x86 专用）同样被标注。
@@ -718,15 +775,36 @@ mod tests {
         assert!(text.contains("size: 8 B"), "{text}");
     }
 
+    /// 一条 FDT 中断资源：完整 cells 被保留，`line` 与 specifier 分开显示
+    /// （未绑定 = `None`，绝不把 cell 当逻辑 IRQ 号）。
+    #[test]
+    fn interrupt_resource_debug_distinguishes_specifier_from_line() {
+        let resource = fdt_resource(3, &[0x0a, 1]);
+        let text = alloc::format!("{resource:?}");
+        assert!(text.contains("controller: 3"), "{text}");
+        assert!(text.contains("cells: [10, 1]"), "{text}");
+        assert!(text.contains("line: None"), "{text}");
+
+        let bound = InterruptResource {
+            specifier: InterruptSpecifier::Fdt {
+                controller: 3,
+                cells: alloc::vec![10].into_boxed_slice(),
+            },
+            line: Some(10),
+        };
+        let text = alloc::format!("{bound:?}");
+        assert!(text.contains("line: Some(10)"), "{text}");
+    }
+
     /// MachineInfo Debug：整张表可见（长度即真相，没有 count 字段），空设备表
     /// 打印空列表。
     #[test]
     fn machine_info_debug_prints_full_tables_and_no_counts() {
         // Given: 1 CPU / 1 memory region / 3 devices。
         let info = fixture(vec![
-            device(&[b"virtio,mmio".as_slice()], Some(1)),
-            device(&[b"ns16550a".as_slice()], Some(10)),
-            device(&[b"riscv,clint0".as_slice()], None),
+            device(&[b"virtio,mmio".as_slice()], vec![irq_resource(1)]),
+            device(&[b"ns16550a".as_slice()], vec![irq_resource(10)]),
+            device(&[b"riscv,clint0".as_slice()], vec![]),
         ]);
 
         // When: 格式化（完整切片，不越界）。

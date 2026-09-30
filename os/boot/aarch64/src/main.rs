@@ -176,7 +176,8 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
         phys: dtb_pa,
         size: dtb_len,
     };
-    let info = discovery::discover(&tree, boot_affinity, timebase_frequency, firmware);
+    let info = discovery::discover(&tree, boot_affinity, timebase_frequency, firmware)
+        .unwrap_or_else(|error| panic!("discovery failed: {}", error));
     kernel::log!("discovery", "firmware: {:?}", info.firmware);
     kernel::log!("bootstrap", "MachineInfo dump:");
     kernel::printk!("{:#?}\n", info);

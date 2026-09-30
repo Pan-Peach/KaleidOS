@@ -135,12 +135,13 @@ mod tests {
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// 装一张固定 8 槽的 IRQ 测试表（`get_table()` 的测试覆盖槽）。
+    /// 装一张固定 8 设备 × 每设备 1 资源的 IRQ 测试表（`get_table()` 的测试
+    /// 覆盖槽）。
     ///
     /// **调用方必须持 [`crate::machine::test_support::GUARD`]**：资源表测试可能
     /// 用自己的 fixture 覆盖同一全局槽，MACHINE guard 把它们串行化。
     fn install_test_irq_table() {
-        irq::install_for_test(8);
+        irq::install_for_test(&[1; 8]);
     }
 
     /// Nested irq-save guards restore the state they observed, so only the outer
@@ -189,6 +190,7 @@ mod tests {
             .register(
                 owner,
                 DeviceId::from_raw(0),
+                0,
                 42,
                 bump,
                 core::ptr::null_mut(),
@@ -222,6 +224,7 @@ mod tests {
             .register(
                 owner,
                 DeviceId::from_raw(5),
+                0,
                 43,
                 bump,
                 core::ptr::null_mut(),
@@ -231,14 +234,14 @@ mod tests {
         assert_eq!(
             irq::get_table()
                 .lock()
-                .release(owner, DeviceId::from_raw(5)),
+                .release(owner, DeviceId::from_raw(5), 0),
             Ok(())
         );
         assert!(route(43).is_none());
         assert_eq!(
             irq::get_table()
                 .lock()
-                .release(owner, DeviceId::from_raw(5)),
+                .release(owner, DeviceId::from_raw(5), 0),
             Err(IrqError::NoHandler)
         );
     }
@@ -283,6 +286,7 @@ mod tests {
             .register(
                 owner,
                 DeviceId::from_raw(0),
+                0,
                 42,
                 observe_ambient,
                 core::ptr::null_mut(),

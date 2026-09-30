@@ -368,6 +368,38 @@ fn lifecycle_entry_surface_is_frozen() {
     }
 }
 
+/// IRQ 导出面冻结（Phase 4d 的协调 ABI 变更）：四个 `kcore_irq_*` 的 **C 声明**
+/// 必须带 `resource_index`（紧跟 `device_id`）——二维锚点
+/// `(DeviceId, resource_index)` 是 IRQ 契约的一部分，生成器 / schema 漂回单
+/// IRQ 形状时必须响亮失败。
+///
+/// 这是"签名形状"的指纹：`abi/core.toml` 是唯一来源，生成物与这里逐宽度对齐。
+#[test]
+fn irq_export_signatures_carry_the_resource_index() {
+    let header = strip_comments(&[HEADER_SRC, GENERATED_HEADER_SRC].concat());
+    let c = extract_c_decls(&header);
+
+    let register = c
+        .get("kcore_irq_register")
+        .expect("kcomp_abi.h 必须声明 kcore_irq_register");
+    assert_eq!(
+        register.params,
+        vec![Width::W32, Width::W32, Width::Ptr, Width::Ptr],
+        "kcore_irq_register(device_id, resource_index, handler, ctx) 形状漂移"
+    );
+    assert_eq!(register.ret, Width::W32);
+
+    for name in ["kcore_irq_enable", "kcore_irq_disable", "kcore_irq_release"] {
+        let decl = c.get(name).unwrap_or_else(|| panic!("缺少声明 `{name}`"));
+        assert_eq!(
+            decl.params,
+            vec![Width::W32, Width::W32],
+            "`{name}(device_id, resource_index)` 形状漂移"
+        );
+        assert_eq!(decl.ret, Width::W32);
+    }
+}
+
 // ===========================================================================
 // 组件间契约（block.device / filesystem）：编译器背书的绝对数值 pin
 // ---------------------------------------------------------------------------

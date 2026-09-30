@@ -212,10 +212,12 @@ mod tests {
         guard
     }
 
-    /// 安装一份含指定设备（MMIO + irq）的机器 fixture，并按尺寸重建资源表。
+    /// 安装一份含指定设备（MMIO + 一条绑定中断资源）的机器 fixture，并按尺寸
+    /// 重建资源表。
     fn commit_devices(devices: &[(usize, &[u8])]) {
         use crate::machine::{
-            CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MemoryRegion,
+            CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, InterruptResource,
+            InterruptSpecifier, IoSpace, MemoryRegion,
         };
         let count = devices
             .iter()
@@ -229,7 +231,11 @@ mod tests {
                     base: 0x1000_0000 + *index * 0x1000,
                     size: 0x1000,
                 },
-                irq: Some(8),
+                interrupts: alloc::vec![InterruptResource {
+                    specifier: InterruptSpecifier::Isa { line: 8 },
+                    line: Some(8),
+                }]
+                .into_boxed_slice(),
                 compatibles: [
                     CompatStr::from_bytes(compatible),
                     CompatStr::empty(),

@@ -249,7 +249,7 @@ pub(super) static EXPORTS: [Export; 44] = [
     Export {
         name: b"kcore_irq_register",
         address: ExportAddress({
-            let implementation: extern "C" fn(u32, IrqHandler, *mut ()) -> i32 =
+            let implementation: extern "C" fn(u32, u32, IrqHandler, *mut ()) -> i32 =
                 super::kcore_irq_register;
             implementation as *const ()
         }),
@@ -257,21 +257,21 @@ pub(super) static EXPORTS: [Export; 44] = [
     Export {
         name: b"kcore_irq_enable",
         address: ExportAddress({
-            let implementation: extern "C" fn(u32) -> i32 = super::kcore_irq_enable;
+            let implementation: extern "C" fn(u32, u32) -> i32 = super::kcore_irq_enable;
             implementation as *const ()
         }),
     },
     Export {
         name: b"kcore_irq_disable",
         address: ExportAddress({
-            let implementation: extern "C" fn(u32) -> i32 = super::kcore_irq_disable;
+            let implementation: extern "C" fn(u32, u32) -> i32 = super::kcore_irq_disable;
             implementation as *const ()
         }),
     },
     Export {
         name: b"kcore_irq_release",
         address: ExportAddress({
-            let implementation: extern "C" fn(u32) -> i32 = super::kcore_irq_release;
+            let implementation: extern "C" fn(u32, u32) -> i32 = super::kcore_irq_release;
             implementation as *const ()
         }),
     },

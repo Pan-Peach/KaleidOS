@@ -116,11 +116,11 @@ Hardware                                    目前只有 QEMU virt
 
 #### 3.9 IRQ `▰▰▰▱▱` EXPERIMENTAL
 
-现状：`IrqTable` 按 device 锚定 route，存 owner/handler/ctx；`register`/`enable`/`disable`/`release`/`revoke_owner`；投递走 trap→route→锁外 callback，回调带 IRQ 归属作用域。QEMU ArchTest `external-irq` 证明 PLIC 恰好投递一次 UART THRE 线；host 覆盖 route、owner 与 revoke。
+现状：`IrqTable` 按二维 `(DeviceId, resource_index)` 锚定 route（设备中断资源下标），存 owner/handler/ctx；`register`/`enable`/`disable`/`release`/`revoke_owner`；投递走 trap→route→锁外 callback，回调带 IRQ 归属作用域。固件 specifier（`InterruptSpecifier`：控制器 + 完整 cells）与逻辑 `line` 分离；RISC-V discovery 只把属于已配置 PLIC、source 在范围内的资源绑定成 `line`（AArch64/x86 `line: None`）。同一逻辑线换 key 重复注册 → `-EBUSY`（不做 shared-line fanout）。QEMU ArchTest `external-irq` 证明 PLIC 恰好投递一次 UART THRE 线；host 覆盖多资源独立路由、全宽 DeviceId、未绑定/越界/非 owner 拒绝与重复线拒绝。
 
-缺口：单线模型（一台设备一条 IRQ）；polled、计数、掩蔽、ack 已删并推迟；回调内 panic 会致命；只在 QEMU/PLIC 验证。
+缺口：polled、计数、掩蔽、ack 已删并推迟；回调内 panic 会致命；只在 QEMU/PLIC 验证；无 GIC/PIC/APIC 路由（对应资源保留 `line: None`）。
 
-下一步：共享线与 MSI-X 跟 PCIe 一起；ack/mask 等真机需求出现再补；回调 panic 并入 containment 的后续工作。
+下一步：共享线与 MSI-X 跟 PCIe 一起（shared-line fanout 已明确不做）；ack/mask 等真机需求出现再补；回调 panic 并入 containment 的后续工作。
 
 #### 3.10 DMA `▰▰▰▱▱` EXPERIMENTAL
 

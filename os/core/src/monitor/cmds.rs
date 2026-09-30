@@ -48,7 +48,16 @@ pub fn machine(_line: &[u8]) {
             IoSpace::Mmio { base, size } => ("mmio", base, size),
             IoSpace::Pio { base, size } => ("pio", base, size),
         };
-        printk!("  {space} {base:#x}+{size:#x} irq={:?} compatible=[", d.irq);
+        // 中断资源逐条打印 Core 可投递的逻辑行号（`None` = 保留了固件资源但
+        // 本阶段后端无法投递）。
+        printk!("  {space} {base:#x}+{size:#x} irq-lines=[");
+        for (index, resource) in d.interrupts.iter().enumerate() {
+            if index > 0 {
+                printk!(", ");
+            }
+            printk!("{:?}", resource.line);
+        }
+        printk!("] compatible=[");
         for j in 0..d.compat_count as usize {
             if j > 0 {
                 printk!(", ");

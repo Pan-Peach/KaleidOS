@@ -200,7 +200,7 @@ fn blocked_window(ptr: usize, len: usize) {
 fn release_authority(state: *mut State) {
     let device = unsafe { (*state).irq_device };
     if device != 0 {
-        let _ = unsafe { abi::kcore_irq_release(device) };
+        let _ = unsafe { abi::kcore_irq_release(device, 0) };
         let _ = unsafe { abi::kcore_device_release(device) };
         unsafe { (*state).irq_device = 0 };
     }
@@ -259,7 +259,7 @@ pub(crate) fn run(state: *mut State, context: &Context) {
             .irq_uart_lease
             .store(ptr as usize, Ordering::SeqCst)
     };
-    let registered = unsafe { abi::kcore_irq_register(device, handler, state as *mut ()) };
+    let registered = unsafe { abi::kcore_irq_register(device, 0, handler, state as *mut ()) };
     if registered != 0 {
         release_authority(state);
         blocked("register_failed", registered);
@@ -267,7 +267,7 @@ pub(crate) fn run(state: *mut State, context: &Context) {
     }
     // IER 是字节寄存器（偏移 1），开局先 mask。
     unsafe { core::ptr::write_volatile(ptr.add(REG_IER), 0) };
-    let enabled = unsafe { abi::kcore_irq_enable(device) };
+    let enabled = unsafe { abi::kcore_irq_enable(device, 0) };
     if enabled != 0 {
         release_authority(state);
         blocked("enable_failed", enabled);

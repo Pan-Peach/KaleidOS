@@ -80,14 +80,20 @@ mod tests {
     }
 
     fn commit_device(device_index: usize, compatible: &[u8]) {
-        use crate::machine::{CpuInfo, HardwareCpuId, MemoryRegion};
+        use crate::machine::{
+            CpuInfo, HardwareCpuId, InterruptResource, InterruptSpecifier, MemoryRegion,
+        };
         let mut devices = alloc::vec![DeviceDescriptor::empty(); device_index + 1];
         devices[device_index] = DeviceDescriptor {
             space: IoSpace::Mmio {
                 base: 0x1000_0000 + device_index * 0x1000,
                 size: 0x1000,
             },
-            irq: Some(8),
+            interrupts: alloc::vec![InterruptResource {
+                specifier: InterruptSpecifier::Isa { line: 8 },
+                line: Some(8),
+            }]
+            .into_boxed_slice(),
             compatibles: [
                 CompatStr::from_bytes(compatible),
                 CompatStr::empty(),
@@ -140,7 +146,7 @@ mod tests {
         device::claim(&ctx, device_id).expect("claim");
         irq::get_table()
             .lock()
-            .register(id, device_id, 8, demo_irq, core::ptr::null_mut())
+            .register(id, device_id, 0, 8, demo_irq, core::ptr::null_mut())
             .unwrap();
         let buffer = dma::alloc(id, 4096).expect("dma alloc");
         let mapping = dma::map(

@@ -254,11 +254,17 @@ int32_t kcore_device_nth(const uint8_t *compatible, size_t len, uint32_t ordinal
 /* 认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。 */
 int32_t kcore_device_claim(uint32_t device_id, uint8_t **out_mmio, size_t *out_len);
 int32_t kcore_device_release(uint32_t device_id);
-/* -- IRQ routes（锚点是 DeviceId；只支持 native callback） -- */
-int32_t kcore_irq_register(uint32_t device_id, IrqHandler handler, void *ctx);
-int32_t kcore_irq_enable(uint32_t device_id);
-int32_t kcore_irq_disable(uint32_t device_id);
-int32_t kcore_irq_release(uint32_t device_id);
+/* -- IRQ routes（锚点是 (DeviceId, resource_index)；只支持 native callback） -- */
+/* 注册该设备某条中断资源的投递目标（resource_index = interrupts 下标）；
+ * 同一逻辑线换 key 重复注册 = -EBUSY。 */
+int32_t kcore_irq_register(uint32_t device_id, uint32_t resource_index, IrqHandler handler, void *ctx);
+/* 使能该设备某条中断资源（先验证 route，再配置中断控制器）。
+ * 成功 = 0；失败 = `-Errno`（`ENODEV` 设备/资源不存在或未绑定线 /
+ * `EACCES` 非 owner / `EINVAL` 尚未注册 handler）。 */
+int32_t kcore_irq_enable(uint32_t device_id, uint32_t resource_index);
+int32_t kcore_irq_disable(uint32_t device_id, uint32_t resource_index);
+/* 撤销该设备某条中断资源的 route 并关断控制器线——此后不再投递给已死 owner。 */
+int32_t kcore_irq_release(uint32_t device_id, uint32_t resource_index);
 /* -- DMA（allocation 与 mapping 分离） -- */
 /* 分配 CPU-visible、物理连续的 DMA 缓冲（device-agnostic）。 */
 int32_t kcore_dma_alloc(size_t size, uint8_t **out_ptr, size_t *out_len);

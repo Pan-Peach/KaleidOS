@@ -1044,16 +1044,23 @@ extern "C" fn kcore_device_release(device_id: u32) -> i32 {
 // Category 8（续）：IRQ routes（device-anchored；native callback only）
 // ---------------------------------------------------------------------------
 
-/// 注册该设备的中断投递目标（组件处理函数 + opaque context）。
+/// 注册该设备某条中断资源的投递目标（组件处理函数 + opaque context）。
 ///
-/// `handler` 是组件提供的 `extern "C" fn(ctx: *mut ())`；`ctx` 原样回传，Core
-/// 不解引用。route 随 device release / 组件失败一起消失——之后不会再有回调进
-/// 它的代码。单 IRQ 模型：一台设备一条线，被 claim 的 DeviceId 就是锚点。
+/// `resource_index` 是该设备 `DeviceDescriptor.interrupts` 中的下标（二维锚点
+/// `(DeviceId, resource_index)`）；`handler` 是组件提供的
+/// `extern "C" fn(ctx: *mut ())`，`ctx` 原样回传，Core 不解引用。route 随
+/// device release / 组件失败一起消失——之后不会再有回调进它的代码。
 ///
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller 或已 Failed /
 /// `ENOTSUP` caller 不在 KernelNative 域（Isolated 无 IRQ 路径）/
-/// `ENODEV` 设备不存在或无中断线 / `EACCES` caller 不是设备 owner）。
-extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: *mut ()) -> i32 {
+/// `ENODEV` 设备不存在、资源越界或无（未绑定）中断线 /
+/// `EACCES` caller 不是设备 owner / `EBUSY` 该逻辑线已挂在别的资源 key 下）。
+extern "C" fn kcore_irq_register(
+    device_id: u32,
+    resource_index: u32,
+    handler: irq::IrqHandler,
+    ctx: *mut (),
+) -> i32 {
     with_core_critical(|| {
         let Some(caller) = RequestContext::ambient() else {
             return Errno::EPERM.code();
@@ -1067,26 +1074,31 @@ extern "C" fn kcore_irq_register(device_id: u32, handler: irq::IrqHandler, ctx: 
         status(irq::register(
             &caller,
             machine::DeviceId::from_raw(device_id),
+            resource_index,
             handler,
             ctx,
         ))
     })
 }
 
-/// 使能该设备的中断线：Core 验证 route 后配置中断控制器。
+/// 使能该设备某条中断资源：Core 验证 route 后配置中断控制器。
 /// 成功 = 0；失败 = `-Errno`（`EPERM` 无法解析 caller / `ENODEV` 无中断线 /
 /// `EACCES` 非 owner / `EINVAL` 尚未注册 handler）。
-extern "C" fn kcore_irq_enable(device_id: u32) -> i32 {
+extern "C" fn kcore_irq_enable(device_id: u32, resource_index: u32) -> i32 {
     with_core_critical(|| {
         let Some(caller) = RequestContext::ambient() else {
             return Errno::EPERM.code();
         };
-        status(irq::enable(&caller, machine::DeviceId::from_raw(device_id)))
+        status(irq::enable(
+            &caller,
+            machine::DeviceId::from_raw(device_id),
+            resource_index,
+        ))
     })
 }
 
-/// 关断该设备的中断线（控制器层）。返回 0 / `-Errno`。
-extern "C" fn kcore_irq_disable(device_id: u32) -> i32 {
+/// 关断该设备某条中断资源（控制器层）。返回 0 / `-Errno`。
+extern "C" fn kcore_irq_disable(device_id: u32, resource_index: u32) -> i32 {
     with_core_critical(|| {
         let Some(caller) = RequestContext::ambient() else {
             return Errno::EPERM.code();
@@ -1094,13 +1106,14 @@ extern "C" fn kcore_irq_disable(device_id: u32) -> i32 {
         status(irq::disable(
             &caller,
             machine::DeviceId::from_raw(device_id),
+            resource_index,
         ))
     })
 }
 
 /// 释放该设备的 IRQ route：撤销 route（此后不再投递给已死 owner）并关断控制器线。
 /// 返回 0 / `-Errno`。
-extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
+extern "C" fn kcore_irq_release(device_id: u32, resource_index: u32) -> i32 {
     with_core_critical(|| {
         let Some(caller) = RequestContext::ambient() else {
             return Errno::EPERM.code();
@@ -1108,6 +1121,7 @@ extern "C" fn kcore_irq_release(device_id: u32) -> i32 {
         status(irq::release(
             &caller,
             machine::DeviceId::from_raw(device_id),
+            resource_index,
         ))
     })
 }
@@ -1404,14 +1418,15 @@ mod tests {
         let _release: extern "C" fn(u32) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_device_release").unwrap()) };
 
-        // IRQ register/enable/disable/release：host 无 caller → EPERM（不是 panic）。
-        let _irq_register: extern "C" fn(u32, extern "C" fn(*mut ()), *mut ()) -> i32 =
+        // IRQ register/enable/disable/release（二维锚点：device + resource index）：
+        // host 无 caller → EPERM（不是 panic）。
+        let _irq_register: extern "C" fn(u32, u32, extern "C" fn(*mut ()), *mut ()) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_irq_register").unwrap()) };
-        let _irq_enable: extern "C" fn(u32) -> i32 =
+        let _irq_enable: extern "C" fn(u32, u32) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_irq_enable").unwrap()) };
-        let _irq_disable: extern "C" fn(u32) -> i32 =
+        let _irq_disable: extern "C" fn(u32, u32) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_irq_disable").unwrap()) };
-        let _irq_release: extern "C" fn(u32) -> i32 =
+        let _irq_release: extern "C" fn(u32, u32) -> i32 =
             unsafe { core::mem::transmute(resolve(b"kcore_irq_release").unwrap()) };
 
         // DMA alloc：out 为空 → EFAULT（早于 caller 解析）。
@@ -1500,7 +1515,7 @@ mod tests {
                 Errno::EPERM.code()
             );
             assert_eq!(
-                kcore_irq_register(0, irq_stub, core::ptr::null_mut()),
+                kcore_irq_register(0, 0, irq_stub, core::ptr::null_mut()),
                 Errno::EPERM.code()
             );
             assert_eq!(
@@ -1570,7 +1585,7 @@ mod tests {
                 Errno::ENOTSUP.code()
             );
             assert_eq!(
-                kcore_irq_register(0, irq_stub, core::ptr::null_mut()),
+                kcore_irq_register(0, 0, irq_stub, core::ptr::null_mut()),
                 Errno::ENOTSUP.code()
             );
             assert_eq!(
