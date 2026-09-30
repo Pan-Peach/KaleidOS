@@ -345,12 +345,25 @@ pub trait Timer {
 /// `InterruptImpl`，不感知 PLIC 寄存器布局。`docs/architecture/overview.md` §3 把中断
 /// 控制器的长期定位写成「驱动（由 discovery 发现）」——当前机制放在 arch（同
 /// CLINT/timer），Core 侧只依赖 trait，后端实现可替换。
+///
+/// # 职责边界：ack/EOI 与源映射归后端，路由归 Core
+///
+/// 后端拥有 **ack/EOI 与源映射**：claim / ack 令牌、设备树线号 → 控制器 source 号 /
+/// INTID / 向量的映射、spurious-interrupt 规则都是 backend-private，**不进本 trait**。
+/// 后端在自己的 trap 分发里循环，每一条中断走完整条链：
+///
+/// ```text
+/// PLIC:  claim        → map source → ExternalIrqHandler(cpu, irq) → complete
+/// GIC:   acknowledge  → classify timer/IPI/device → 同左            → EOI/deactivate
+/// x86:   entry vector → dispatch lookup            → 同左            → controller completion
+/// ```
+///
+/// Core 只拥有 **route 表与 owner**：它经 [`Self::register_external_handler`] 注册
+/// 回调，回调收到的是**逻辑 IRQ 号**（`u32`）——不是 claim 令牌、不是向量、不是
+/// INTID。Core 不 claim、不 complete，也看不到 ack token。
 pub trait InterruptController {
     /// 控制器全局配置类型（后端特有；由 boot 构造，含板级 context 映射）。
     type Config;
-    /// claim 令牌：携带 complete 所需的完整信息；**非 `Copy` / 非 `Send`**，
-    /// 约束在同一 CPU 上 claim/complete 配对。
-    type Claim;
 
     /// 全局配置（boot 一次）。
     ///
@@ -365,16 +378,12 @@ pub trait InterruptController {
     fn enable(line: u32);
     fn disable(line: u32);
 
-    /// 取一条 pending 外部中断；无 pending → `None`。
-    fn claim() -> Option<Self::Claim>;
-    /// 从 claim 令牌取线号（Core 路由用；令牌本身留作 complete）。
-    fn claim_line(claim: &Self::Claim) -> u32;
-    /// 通知控制器该中断已处理。
-    fn complete(claim: Self::Claim);
-
-    /// 注册外部中断回调（trap 分发调用；回执带**逻辑** `CpuId`）；
-    /// Core 在 `irq::init` 时接入。
-    fn register_external_handler(handler: cpu::LocalInterruptHandler);
+    /// 注册外部中断回调（回执带**逻辑** `CpuId` 与**逻辑** IRQ 号）。
+    ///
+    /// 后端负责把控制器的 source 分类 / 映射成逻辑 IRQ 号，并保证每次回调恰好
+    /// 对应一条已完成 ack 的中断；回调返回后由后端 complete/EOI。Core 在
+    /// `irq::init` 时接入。
+    fn register_external_handler(handler: cpu::ExternalIrqHandler);
 
     /// 只解除**当前执行 CPU** 的外部中断投递机制（不动全局中断使能位）。
     fn enable_external_interrupt();

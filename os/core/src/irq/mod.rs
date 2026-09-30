@@ -1,12 +1,13 @@
-//! IRQ 投递侧：外部中断入口 [`on_external`]、路由 [`route`]，以及 irq-save
+//! IRQ 投递侧：外部中断入口 [`on_irq`]、路由 [`route`]，以及 irq-save
 //! 临界区原语 [`IrqSaveGuard`]。
 //!
 //! # 结构约定
 //!
 //! - [`crate::resource::irq`]：IRQ route 真相（哪条线归哪个 owner、handler 是谁）
 //!   与 register/enable/disable/release。
-//! - 本模块：**投递**——Controller 寄存器机制在 arch
-//!   （`InterruptController` trait），Core 不碰 PLIC 寄存器。
+//! - 本模块：**投递**——后端拥有 ack/EOI 与源映射（claim 令牌、向量 / INTID →
+//!   逻辑 IRQ 号都在 arch `InterruptController` 之后），Core 只收到一个**逻辑
+//!   IRQ 号**并按 route 表投递；Core 不 claim、不 complete、不碰控制器寄存器。
 //!
 //! # C5 决策注记（irq-save 临界区）
 //!
@@ -54,13 +55,13 @@ impl Drop for IrqSaveGuard {
     }
 }
 
-/// 初始化外部中断投递：把 [`on_external`] 注册为 arch 的分发目标。
+/// 初始化外部中断投递：把 [`on_irq`] 注册为 arch 后端的分发目标。
 ///
 /// `core::init` 在 `resource::init()` 之后调用一次。这里只**注册**回调，
 /// 不打开 CPU 的全局中断使能位——开闸由第一条 IRQ 线的
 /// [`crate::resource::irq::enable`] 触发（避免 boot 期无谓开闸）。
 pub fn init() {
-    InterruptImpl::register_external_handler(on_external);
+    InterruptImpl::register_external_handler(on_irq);
     // 本 CPU 的外部中断投递源（本地）；全局使能由 boot 在 `kernel::init` 之后
     // 用 `CpuArch::enable_irq` 单独负责。设备线 enable 不再碰投递源。
     let _ = <InterruptImpl as InterruptController>::init_cpu();
@@ -78,43 +79,40 @@ pub(crate) fn init_cpu(cpu: crate::machine::CpuId) -> Result<(), arch::smp::Init
     Ok(())
 }
 
-/// 外部中断入口（trap 分发调用；中断上下文，已关中断）。
+/// 外部中断入口（后端分发调用；中断上下文，已关中断）。
 ///
-/// 循环从中断控制器取一条 pending 中断 → [`route`] 取投递目标 → 锁外调用
-/// 组件 handler → `complete`。一次 trap 可能对应多条 pending（PLIC 共享一个
-/// mip 位），必须循环到 claim 返回 `None`。
+/// **单发**：后端拥有 `ack/claim → 源映射 → 本回调 → complete/EOI` 的循环，
+/// 每一条已 ack 的中断调用本函数一次——Core 不循环、不 claim、不 complete。
+/// `irq` 是后端映射出的**逻辑 IRQ 号**（不是 claim 令牌 / 向量 / INTID）。
+///
+/// 本函数只做路由：取投递目标 → 锁外调用组件 handler。一次 trap 里可能有多条
+/// pending（PLIC 共享 mip 位）由后端循环处理。
 ///
 /// handler 在 Core 建立的 **IRQ 归属作用域**内执行（[`dispatch_callback`]）：
 /// principal = 该线 owner，`task = None`；作用域同步、不可 yield。
-pub fn on_external(_cpu: CpuId) {
-    while let Some(claim) = InterruptImpl::claim() {
-        let line = InterruptImpl::claim_line(&claim);
-        crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq: line });
-        let target = route(line);
-        let owner = target.map(|(owner, _, _)| owner);
-        crate::trace::emit(crate::trace::TraceEvent::IrqDispatch {
-            irq: line,
-            component: owner,
-        });
-        if let Some((owner, handler, ctx)) = target {
-            // 锁内只取一份拷贝，这里在锁外调用（trap 可重入，持锁调用组件代码
-            // 会自死锁）。Core 用该线的 owner 建立 IRQ 归属作用域：回调内
-            // `ambient()` 解析为 line owner、task = None。
-            dispatch_callback(handler, ctx, owner);
-        }
-        crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq: line });
-        InterruptImpl::complete(claim);
+pub fn on_irq(_cpu: CpuId, irq: u32) {
+    crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq });
+    let target = route(irq);
+    let owner = target.map(|(owner, _, _)| owner);
+    crate::trace::emit(crate::trace::TraceEvent::IrqDispatch {
+        irq,
+        component: owner,
+    });
+    if let Some((owner, handler, ctx)) = target {
+        // 锁内只取一份拷贝，这里在锁外调用（trap 可重入，持锁调用组件代码
+        // 会自死锁）。Core 用该线的 owner 建立 IRQ 归属作用域：回调内
+        // `ambient()` 解析为 line owner、task = None。
+        dispatch_callback(handler, ctx, owner);
     }
+    crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq });
 }
 
 /// 在 Core 建立的 IRQ 归属作用域内调用一个组件回调：principal = 该中断线的
 /// owner，`task = None`（IRQ 回调不是任务）。
 ///
-/// 从 [`on_external`] 单独提出来，让 host 测试能走**生产路径**（host 的
-/// `claim()` 恒为 `None`，永远进不了 `on_external` 的循环体）。作用域由
-/// [`crate::component::containment::with_irq_scope`] 安装/恢复，同步、不可
-/// yield；因此调度类 Core 操作在回调内返回 errno 而不是 panic。它是**可信
-/// KernelNative 组件下的记账，不是认证边界**。
+/// 作用域由 [`crate::component::containment::with_irq_scope`] 安装/恢复，同步、
+/// 不可 yield；因此调度类 Core 操作在回调内返回 errno 而不是 panic。它是
+/// **可信 KernelNative 组件下的记账，不是认证边界**。
 fn dispatch_callback(handler: IrqHandler, ctx: *mut (), owner: ComponentId) {
     containment::with_irq_scope(owner, || handler(ctx));
 }
@@ -163,34 +161,33 @@ mod tests {
     }
 
     /// 验收：只对「已注册 route」的线给出投递目标；撤销后立刻停止。
+    ///
+    /// 投递走**生产路径**：host fake 后端的 [`arch::fake::deliver_external_for_test`]
+    /// → `on_irq` → `route` → 锁外回调（不再是 claim 循环的 mock）。
     #[test]
     fn route_yields_delivery_only_for_registered_line() {
         let _serial = IRQ_TEST_LOCK.lock();
         let _boundary = crate::component::containment::test_boundary_lock();
         crate::component::containment::enter_anchor();
+        // 生产装配：route 表（resource）+ 投递回调注册（本模块 init → arch 后端）。
         irq::init();
+        crate::irq::init();
         let owner = ComponentId::from_raw(0xfeed);
         irq::get_table()
             .lock()
             .register(owner, 0, 42, bump, core::ptr::null_mut());
 
         // 未注册 route 的线：无投递（中断到了也没人接）。
-        assert!(route(43).is_none());
+        arch::fake::deliver_external_for_test(CpuId::from_raw(0), 43);
         assert_eq!(CALLS.load(Ordering::Acquire), 0);
 
-        // 注册的线得到投递目标；on_external 会在锁外调用它。
-        match route(42) {
-            Some((routed, handler, ctx)) => {
-                assert_eq!(routed, owner);
-                handler(ctx);
-            }
-            None => panic!("expected a delivery target"),
-        }
+        // 注册的线：fake 后端回调 → 生产 `on_irq` → route → 锁外调用它。
+        arch::fake::deliver_external_for_test(CpuId::from_raw(0), 42);
         assert_eq!(CALLS.load(Ordering::Acquire), 1);
 
         // 撤销后立刻停止投递。
         irq::get_table().lock().revoke_owner(owner);
-        assert!(route(42).is_none());
+        arch::fake::deliver_external_for_test(CpuId::from_raw(0), 42);
         assert_eq!(CALLS.load(Ordering::Acquire), 1);
         crate::component::containment::enter_anchor();
     }
@@ -234,14 +231,17 @@ mod tests {
         );
     }
 
-    /// 验收：`route` 给出的 owner 就是回调内的 principal —— `dispatch_callback`
-    /// 让 `ambient()` 解析为 line owner、`task = None`，而不是被中断的执行。
+    /// 验收：`route` 给出的 owner 就是回调内的 principal —— `on_irq` 的
+    /// `dispatch_callback` 让 `ambient()` 解析为 line owner、`task = None`，
+    /// 而不是被中断的执行。
     #[test]
     fn callback_dispatch_attributes_to_line_owner() {
         let _serial = IRQ_TEST_LOCK.lock();
         let _boundary = crate::component::containment::test_boundary_lock();
         crate::component::containment::enter_anchor();
+        // 生产装配：route 表（resource）+ 投递回调注册（本模块 init → arch 后端）。
         irq::init();
+        crate::irq::init();
         let owner = ComponentId::from_raw(0xfeed);
         irq::get_table()
             .lock()
@@ -249,9 +249,9 @@ mod tests {
         OBSERVED_COMPONENT.store(usize::MAX, Ordering::Release);
         OBSERVED_TASK.store(usize::MAX, Ordering::Release);
 
-        let (routed, handler, ctx) = route(42).expect("route");
-        assert_eq!(routed, owner, "route yields the Core-truth line owner");
-        dispatch_callback(handler, ctx, routed);
+        // 生产路径（不是直接调 `dispatch_callback`）：fake 后端回调 → `on_irq`
+        // → `route`（Core truth 的 owner）→ 作用域内回调。
+        arch::fake::deliver_external_for_test(CpuId::from_raw(0), 42);
 
         assert_eq!(
             OBSERVED_COMPONENT.load(Ordering::Acquire),

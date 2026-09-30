@@ -38,15 +38,19 @@ pub fn dispatch_timer() {
     handler(current_logical_cpu());
 }
 
-/// 外部中断回调（Core 在 `irq::init` 时注册 `crate::irq::on_external`）。
+/// 外部中断分发器槽：存的是**后端分发器** `fn(CpuId)`（PLIC 的
+/// `configure` 装入；见 `riscv/plic.rs::dispatch_external`）。
+///
+/// 后端分发器负责 ack/claim → 源映射 → Core 回调（逻辑 IRQ 号）→ complete/EOI；
+/// Core 只向后端注册 `ExternalIrqHandler`，不直接碰这个槽。
 static EXTERNAL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn register_external_handler(handler: LocalInterruptHandler) {
     EXTERNAL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
-/// 外部中断分发（`SupervisorExternal`/`MachineExternal` trap 分支调用）。
-/// 具体 claim/dispatch/complete 由注册进来的 Core handler 完成。
+/// 外部中断分发（`SupervisorExternal`/`MachineExternal` trap 分支调用）：
+/// 调已安装的后端分发器，由它完成 ack/claim、源映射、Core 回调与 complete。
 pub fn dispatch_external() {
     let address = EXTERNAL_HANDLER.load(Ordering::Acquire);
     assert!(address != 0, "external interrupt handler is not registered");

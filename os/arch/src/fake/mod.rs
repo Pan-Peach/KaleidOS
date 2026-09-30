@@ -1,4 +1,4 @@
-use crate::cpu::{CpuId, HardwareCpuId};
+use crate::cpu::{CpuId, ExternalIrqHandler, HardwareCpuId};
 use crate::smp::{CpuStartError, InitError, IpiError, LocalInterruptHandler, SecondaryBoot, Smp};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 
@@ -129,11 +129,29 @@ pub fn take_timer_events_for_test() -> Vec<TimerEvent> {
 /// 已注册的全局 IPI 回调（进程级：注册是全局的，不随测试线程变）。
 static IPI_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// 已注册的外部中断回调（进程级，同 `IPI_HANDLER`）。host 无中断硬件，Core 测试
+/// 经 [`deliver_external_for_test`] 驱动 `crate::irq::on_irq` 的生产路径。
+static EXTERNAL_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// 最近一次经 [`Fake`] 注册的 IPI 回调（host 无 IPI 传输，只作可观察占位）。
 #[doc(hidden)]
 pub fn registered_ipi_handler_for_test() -> Option<LocalInterruptHandler> {
     let address = IPI_HANDLER.load(core::sync::atomic::Ordering::Acquire);
     (address != 0).then(|| unsafe { core::mem::transmute::<usize, LocalInterruptHandler>(address) })
+}
+
+/// 投递一次外部中断（host 测试钩子）。
+///
+/// 调已注册的 Core 回调，模拟后端 `ack → map → callback → complete` 循环里的
+/// callback 一步，让 Core 的 `on_irq` 生产路径在 host 可被直接驱动。
+#[doc(hidden)]
+pub fn deliver_external_for_test(cpu: CpuId, irq: u32) {
+    let address = EXTERNAL_HANDLER.load(core::sync::atomic::Ordering::Acquire);
+    assert!(address != 0, "external interrupt handler is not registered");
+    // SAFETY: 只有 `Fake::register_external_handler` 写入本槽，始终是
+    // `ExternalIrqHandler`（同一镜像内的函数指针）。
+    let handler: ExternalIrqHandler = unsafe { core::mem::transmute(address) };
+    handler(cpu, irq);
 }
 
 /// 取走并清空 host 记录的「已发出 IPI」目标硬件 id 列表（`Core::smp::ipi::notify` 可测）。
@@ -342,10 +360,11 @@ impl Timer for Fake {
     }
 }
 
-// host 无中断硬件：控制器全是 no-op，claim 恒 None（永远不会投递外部中断）。
+// host 无中断硬件：控制器是 no-op（不 claim、不 EOI）。外部中断由
+// `deliver_external_for_test` 显式驱动：它调用这里注册的 Core 回调，让
+// `on_irq` 的生产路径在 host 可测（控制器本身不投递）。
 impl InterruptController for Fake {
     type Config = ();
-    type Claim = u32;
 
     unsafe fn configure(_config: ()) -> Result<(), InitError> {
         Ok(())
@@ -358,16 +377,10 @@ impl InterruptController for Fake {
     fn enable(_line: u32) {}
     fn disable(_line: u32) {}
 
-    fn claim() -> Option<u32> {
-        None
+    fn register_external_handler(handler: ExternalIrqHandler) {
+        EXTERNAL_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
     }
 
-    fn claim_line(claim: &u32) -> u32 {
-        *claim
-    }
-
-    fn complete(_claim: u32) {}
-    fn register_external_handler(_handler: LocalInterruptHandler) {}
     fn enable_external_interrupt() {}
 }
 

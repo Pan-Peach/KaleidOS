@@ -3,7 +3,7 @@
 //! per-CPU 基址放在显式保留的一个 `CSR.KSAVE` 槽。所有方法体 `todo!()`。
 //! 参考 DragonOS `arch/loongarch64` 与 Linux `arch/loongarch`。
 
-use crate::cpu::{CpuId, LocalInterruptHandler};
+use crate::cpu::{CpuId, ExternalIrqHandler, LocalInterruptHandler};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 
 /// loongarch64 后端类型。
@@ -101,7 +101,6 @@ impl Timer for Loongarch64 {
 
 impl InterruptController for Loongarch64 {
     type Config = ();
-    type Claim = ();
 
     unsafe fn configure(_config: ()) -> Result<(), crate::smp::InitError> {
         todo!("loongarch64: configure the interrupt controller / EIOINTC")
@@ -119,19 +118,7 @@ impl InterruptController for Loongarch64 {
         todo!("loongarch64: disable an external interrupt line")
     }
 
-    fn claim() -> Option<Self::Claim> {
-        todo!("loongarch64: acknowledge the pending interrupt (ESTAT/ECFG)")
-    }
-
-    fn claim_line(_claim: &Self::Claim) -> u32 {
-        todo!("loongarch64: map the acknowledged interrupt to a line")
-    }
-
-    fn complete(_claim: Self::Claim) {
-        todo!("loongarch64: complete an external interrupt")
-    }
-
-    fn register_external_handler(_handler: LocalInterruptHandler) {
+    fn register_external_handler(_handler: ExternalIrqHandler) {
         todo!("loongarch64: register the external interrupt handler")
     }
 

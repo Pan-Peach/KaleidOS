@@ -85,7 +85,7 @@ const TIMEOUT_MS: u64 = 20;
 /// 组件侧 handler（trap 上下文调用，锁外）。
 ///
 /// 第一件事读入口时间戳（这就是测量端点）；随后把 owned device 的 IER 清零
-/// （清 source，避免电平触发在 `on_external` 的 claim 循环里反复进入）。
+/// （清 source，避免电平触发在后端 claim 循环里反复进入）。
 /// 同一 trap 里若重复进入，只认第一次的时间戳（`SERVED` 先到先得）。
 extern "C" fn handler(ctx: *mut ()) {
     let state = ctx as *mut State;

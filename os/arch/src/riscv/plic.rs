@@ -7,15 +7,23 @@
 //! - `init_cpu` 选择**当前执行 CPU** 的 context，供 claim/complete 用。
 //! - `enable/disable` 作用于**固定路由**（`external_cpu`）的 context，不是调用者
 //!   CPU；且对 enable bank 的读改写全程持锁 + irq-save，避免两个 CPU 改同一字丢更新。
-//! - `claim/complete` 返回不透明 [`PlicClaim`]（携带 line + context，非 `Copy`/`Send`），
-//!   在同一 CPU 上配对完成。
+//! - `claim/complete` 是**后端私有**的（不是 trait 方法）：[`PlicClaim`]（携带
+//!   line + context，非 `Copy`/`Send`）与 CPU-context 逻辑都留在本模块。
+//!
+//! # 与 Core 的边界
+//!
+//! 后端拥有 ack/EOI 与源映射：`configure` 把私有分发器
+//! [`dispatch_external`] 装进 `trap::register_external_handler`；它在一次
+//! trap 里循环 `claim → Core 回调（逻辑 IRQ 号）→ complete`，直到无 pending。
+//! Core 只注册 [`crate::cpu::ExternalIrqHandler`] 并按逻辑 IRQ 号路由，
+//! 看不到 claim 令牌 / context / 寄存器（见 `trait InterruptController` 文档）。
 //!
 //! # 明确砍掉
 //!
 //! 优先级配置（写死 1）、触发方式、IRQ 均衡（固定路由到 BSP）、MSI。
 
 use crate::InterruptController;
-use crate::cpu::{CpuId, LocalInterruptHandler};
+use crate::cpu::{CpuId, ExternalIrqHandler};
 use crate::smp;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -52,28 +60,20 @@ pub struct PlicConfig {
 }
 
 /// PLIC claim 令牌：保留 complete 所需的完整信息；非 `Copy` / 非 `Send`。
-pub struct PlicClaim {
+///
+/// **后端私有**：Core 永远看不到它（Core 只收逻辑 IRQ 号）。
+struct PlicClaim {
     line: u32,
     context: usize,
     _cpu_local: PhantomData<*mut ()>,
-}
-
-impl PlicClaim {
-    /// 认领到的中断线号。
-    pub fn line(&self) -> u32 {
-        self.line
-    }
-
-    /// 认领所在的 PLIC context（诊断用）。
-    pub fn context(&self) -> usize {
-        self.context
-    }
 }
 
 static PLIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static PLIC_CONTEXT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PLIC_EXTERNAL_CPU: AtomicUsize = AtomicUsize::new(0);
 static PLIC_SOURCE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 已注册的 Core 外部中断回调（`0` = 未注册；Core `irq::init` 注册一次）。
+static PLIC_CORE_HANDLER: AtomicUsize = AtomicUsize::new(0);
 /// enable bank 读改写的锁（与 irq-save 配合）。
 static PLIC_ENABLE_LOCK: AtomicBool = AtomicBool::new(false);
 
@@ -145,9 +145,46 @@ fn with_enable_lock<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// 取一条 pending 外部中断（PLIC claim）；无 pending → `None`。
+///
+/// **后端私有**：令牌（line + context）只在 `dispatch_external` 与 [`complete`]
+/// 之间传递，Core 拿不到。
+fn claim() -> Option<PlicClaim> {
+    let context = cpu_context();
+    let addr = (base() + CONTEXT_BASE + context * CONTEXT_STRIDE + CONTEXT_CLAIM) as *mut u32;
+    let id = unsafe { core::ptr::read_volatile(addr) };
+    (id != 0).then_some(PlicClaim {
+        line: id,
+        context,
+        _cpu_local: PhantomData,
+    })
+}
+
+/// 通知控制器该中断已处理（PLIC complete 写回 claim id）。
+fn complete(claim: PlicClaim) {
+    let addr = (base() + CONTEXT_BASE + claim.context * CONTEXT_STRIDE + CONTEXT_CLAIM) as *mut u32;
+    unsafe { core::ptr::write_volatile(addr, claim.line) };
+}
+
+/// 后端外部中断分发器（`configure` 装进 `trap::register_external_handler`）。
+///
+/// 一次 trap 可能对应多条 pending（PLIC 共享一个 mip 位）：循环
+/// `claim → Core 回调（逻辑 IRQ 号）→ complete` 直到无 pending。与 Core 的
+/// 唯一接触面是 [`ExternalIrqHandler`]；令牌 / context / 寄存器都不外泄。
+fn dispatch_external(cpu: CpuId) {
+    let address = PLIC_CORE_HANDLER.load(Ordering::Acquire);
+    assert!(address != 0, "external interrupt handler is not registered");
+    // SAFETY: 注册方保证签名与 `ExternalIrqHandler` 一致（单一注册入口）。
+    let core: ExternalIrqHandler = unsafe { core::mem::transmute(address) };
+    while let Some(claim) = claim() {
+        let irq = claim.line;
+        core(cpu, irq);
+        complete(claim);
+    }
+}
+
 impl InterruptController for Riscv {
     type Config = PlicConfig;
-    type Claim = PlicClaim;
 
     unsafe fn configure(config: Self::Config) -> Result<(), smp::InitError> {
         if config.base == 0
@@ -177,6 +214,9 @@ impl InterruptController for Riscv {
         PLIC_EXTERNAL_CPU.store(config.external_cpu.raw(), Ordering::Release);
         PLIC_BASE.store(config.base, Ordering::Release);
         PLIC_CONTEXT_COUNT.store(config.context_count, Ordering::Release);
+        // 安装后端 trap 分发器（本函数在 boot 单线程跑一次）：`claim → Core
+        // 回调（逻辑号）→ complete` 的循环完全留在后端；Core 只注册回调。
+        super::trap::register_external_handler(dispatch_external);
         Ok(())
     }
 
@@ -220,29 +260,8 @@ impl InterruptController for Riscv {
         });
     }
 
-    fn claim() -> Option<Self::Claim> {
-        let context = cpu_context();
-        let addr = (base() + CONTEXT_BASE + context * CONTEXT_STRIDE + CONTEXT_CLAIM) as *mut u32;
-        let id = unsafe { core::ptr::read_volatile(addr) };
-        (id != 0).then_some(PlicClaim {
-            line: id,
-            context,
-            _cpu_local: PhantomData,
-        })
-    }
-
-    fn claim_line(claim: &Self::Claim) -> u32 {
-        claim.line
-    }
-
-    fn complete(claim: Self::Claim) {
-        let addr =
-            (base() + CONTEXT_BASE + claim.context * CONTEXT_STRIDE + CONTEXT_CLAIM) as *mut u32;
-        unsafe { core::ptr::write_volatile(addr, claim.line) };
-    }
-
-    fn register_external_handler(handler: LocalInterruptHandler) {
-        super::trap::register_external_handler(handler);
+    fn register_external_handler(handler: ExternalIrqHandler) {
+        PLIC_CORE_HANDLER.store(handler as usize, Ordering::Release);
     }
 
     fn enable_external_interrupt() {

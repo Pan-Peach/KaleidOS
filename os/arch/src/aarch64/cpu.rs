@@ -11,8 +11,12 @@
 //! # Deliberately `todo!()`
 //!
 //! - `context_switch` (needs a real AAPCS64 switch frame + assembly);
-//! - GICv3 external interrupt `claim`/`complete` and line enable/disable
-//!   (nothing routes an external line during boot).
+//! - GICv3 external interrupt ack/EOI and line enable/disable (nothing routes
+//!   an external line during boot).  The trap-side *dispatch* shape is honest:
+//!   the (future) GIC code acknowledges, classifies the INTID (timer PPI /
+//!   SGI / SPI), and calls the Core callback with a **logical IRQ number**;
+//!   deactivation (`ICC_EOIR1_EL1`) lives with that GIC code, not in the trap
+//!   dispatch.
 //!
 //! `new_context` **is** implemented as a pure record constructor: it builds an
 //! architecture-specific execution record (entry + stack) and never executes
@@ -29,7 +33,7 @@
 //! programs the GIC yet — the distributor/redistributor bases are discovered
 //! from the FDT, not hardcoded, and full claim/complete is the next step.
 
-use crate::cpu::{CpuId, LocalInterruptHandler};
+use crate::cpu::{CpuId, ExternalIrqHandler, LocalInterruptHandler};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 use core::arch::asm;
 use core::ptr::NonNull;
@@ -335,7 +339,6 @@ impl Timer for Aarch64 {
 
 impl InterruptController for Aarch64 {
     type Config = ();
-    type Claim = ();
 
     unsafe fn configure(_config: ()) -> Result<(), crate::smp::InitError> {
         todo!("aarch64: configure GICv3 distributor/redistributor from discovered MMIO windows")
@@ -356,19 +359,7 @@ impl InterruptController for Aarch64 {
         todo!("aarch64: disable an external interrupt line (GICv3 ICENABLER)")
     }
 
-    fn claim() -> Option<Self::Claim> {
-        todo!("aarch64: acknowledge an interrupt (ICC_IAR1_EL1)")
-    }
-
-    fn claim_line(_claim: &Self::Claim) -> u32 {
-        todo!("aarch64: map the acknowledged INTID to a line")
-    }
-
-    fn complete(_claim: Self::Claim) {
-        todo!("aarch64: deactivate the interrupt (ICC_EOIR1_EL1)")
-    }
-
-    fn register_external_handler(handler: LocalInterruptHandler) {
+    fn register_external_handler(handler: ExternalIrqHandler) {
         super::trap::register_external_handler(handler);
     }
 

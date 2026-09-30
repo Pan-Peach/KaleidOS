@@ -64,11 +64,22 @@ impl core::fmt::Display for HardwareCpuId {
     }
 }
 
-/// 本 CPU 局部中断（timer / external / IPI）回调的**唯一注册形状**。
+/// 本 CPU 局部中断（timer / IPI）回调的**唯一注册形状**。
 ///
 /// arch 在当前执行 CPU 上调用它，并传入**逻辑** `CpuId`（UP 阶段为 `CpuId(0)`；
 /// SMP 阶段从 CPU-local 入口记录读取已绑定的逻辑 id）。Core 据此知道是谁触发的。
 ///
 /// 这是内核内部（同一链接镜像）的回调，不是组件 C ABI；用 Rust `fn` 指针即可。
-/// `Timer` / `InterruptController` / `Smp` 的注册方法统一使用本类型。
+/// `Timer` / `Smp` 的注册方法统一使用本类型；外部中断用 [`ExternalIrqHandler`]。
 pub type LocalInterruptHandler = fn(CpuId);
+
+/// 外部中断回调形状：`(逻辑 CpuId, 逻辑 IRQ 号)`。
+///
+/// 外部中断控制器后端拥有 **ack/EOI 与源映射**：claim / ack 令牌、向量 / INTID /
+/// source 号 → 逻辑 IRQ 号的映射、spurious-interrupt 规则全部 backend-private。
+/// 后端在自己的分发里**每条中断调用一次**本回调，回调返回后才 complete/EOI；
+/// Core 只按逻辑 IRQ 号查 route 表，看不到令牌、向量或 INTID。
+///
+/// 与 [`LocalInterruptHandler`] 同一性质：内核内部（同一链接镜像）的回调，
+/// 不是组件 C ABI；用 Rust `fn` 指针即可。
+pub type ExternalIrqHandler = fn(CpuId, u32);

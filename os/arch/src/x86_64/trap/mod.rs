@@ -15,9 +15,13 @@
 //!   (a periodic tick would be a hidden wakeup pretending to be a deadline
 //!   source).  `Timer` reports `Unsupported`/`DeliveryUnavailable`, and Core
 //!   falls back to polling for the console.
-//! - The local APIC / IOAPIC (claim/complete, line routing) is **not** brought
-//!   up: no external line is enabled during boot, so the corresponding
-//!   `InterruptController` methods stay explicit `todo!()`.
+//! - The local APIC / IOAPIC **routing** (`InterruptController::enable` /
+//!   `disable`) is **not** brought up: no external line is enabled during boot,
+//!   so those methods stay explicit `todo!()`.  The external *dispatch* shape
+//!   is nevertheless honest: PIC vectors `0x20..=0x2F` are EOI'd at the PIC
+//!   and handed to the Core callback as the logical IRQ number
+//!   (`vector - 0x20`), with no fake `claim`.  PIC IRQ0 (vector 0x20) is the
+//!   legacy timer line and stays with the timer callback.
 //!
 //! # Frame layout
 //!
@@ -26,7 +30,7 @@
 //! ss`).  [`TrapFrame`] must match that order byte for byte; the offset
 //! assertions below fail the build if they drift.
 
-use crate::cpu::LocalInterruptHandler;
+use crate::cpu::{ExternalIrqHandler, LocalInterruptHandler};
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +44,11 @@ global_asm!(include_str!("entry.S"), options(att_syntax));
 /// Nothing raises it today (see the module docs); the dispatch below is kept so
 /// a real deadline source (LAPIC timer / TSC-deadline) has a landing pad.
 pub const TIMER_VECTOR: u8 = 0x20;
+
+/// Last PIC vector after the remap (`0x20..=0x2F` = PIC IRQ0..15).
+const PIC_VECTOR_LAST: usize = 0x2F;
+/// First slave-PIC vector (PIC IRQ8): those also need an EOI to the slave.
+const PIC_SLAVE_VECTOR: usize = 0x28;
 
 /// Number of architectural exception vectors (0..31).
 const EXCEPTION_VECTORS: usize = 32;
@@ -205,8 +214,8 @@ pub fn register_timer_handler(handler: LocalInterruptHandler) {
     TIMER_HANDLER.store(handler as usize, Ordering::Release);
 }
 
-/// Store the Core external-interrupt handler.
-pub fn register_external_handler(handler: LocalInterruptHandler) {
+/// Store the Core external-interrupt callback: `(logical CpuId, logical IRQ)`.
+pub fn register_external_handler(handler: ExternalIrqHandler) {
     EXTERNAL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
@@ -232,11 +241,19 @@ pub fn dispatch_timer() {
     }
 }
 
-/// Invoke the registered external-interrupt handler with the current CPU id.
-pub fn dispatch_external() {
-    if let Some(handler) = load_handler(&EXTERNAL_HANDLER) {
-        handler(super::cpu::current_logical_cpu());
+/// Invoke the registered external callback for one PIC line.
+///
+/// The backend owns ack/EOI: the trap entry already EOI'd the PIC, and `irq` is
+/// the **logical** IRQ number (`vector - 0x20`) — never a claim token.
+pub fn dispatch_external(irq: u32) {
+    let raw = EXTERNAL_HANDLER.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
     }
+    // SAFETY: only `register_external_handler` writes this slot, always with an
+    // `ExternalIrqHandler` (a function pointer into this same image).
+    let handler: ExternalIrqHandler = unsafe { core::mem::transmute(raw) };
+    handler(super::cpu::current_logical_cpu(), irq);
 }
 
 /// Invoke the registered IPI handler with the current logical `CpuId`.
@@ -254,14 +271,30 @@ pub fn dispatch_ipi() {
 extern "C" fn x86_trap_entry(frame: *const TrapFrame) {
     // SAFETY: `entry.S` always passes the frame pointer it just built.
     let frame = unsafe { &*frame };
-    if frame.vector == TIMER_VECTOR as usize {
-        // Nothing raises this vector today (the PIT is not started and no
-        // deadline source exists).  If a real timer lands here, complete it at
-        // the PIC before dispatching so a slow handler cannot lose the next
-        // event.
+    if (TIMER_VECTOR as usize..=PIC_VECTOR_LAST).contains(&frame.vector) {
+        // PIC-sourced line: the backend completes it at the PIC *before*
+        // dispatching (a slow handler must not lose the next edge, and the
+        // handler may re-enable the source).  Vectors >= 0x28 also need the
+        // slave EOI.
+        //
+        // Nothing raises these vectors today (every line is masked and the PIT
+        // is deliberately not started); the shape stays honest so a real
+        // source has a landing pad.
         // SAFETY: PIC was configured by `init` on this CPU.
-        unsafe { super::console::outb(PIC1_COMMAND, PIC_EOI) };
-        dispatch_timer();
+        unsafe {
+            if frame.vector >= PIC_SLAVE_VECTOR {
+                super::console::outb(PIC2_COMMAND, PIC_EOI);
+            }
+            super::console::outb(PIC1_COMMAND, PIC_EOI);
+        }
+        if frame.vector == TIMER_VECTOR as usize {
+            // PIC IRQ0 is the legacy timer line: the timer callback owns it.
+            dispatch_timer();
+        } else {
+            // External line: Core receives the **logical** IRQ number (not the
+            // vector); ack/EOI already happened above.
+            dispatch_external((frame.vector - TIMER_VECTOR as usize) as u32);
+        }
         return;
     }
     fault_halt(frame);

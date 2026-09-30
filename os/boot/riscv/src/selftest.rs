@@ -611,10 +611,10 @@ fn timer_handler(_cpu: CpuId) {
 ///
 /// 触发源用 **UART 的 THRE**（发送保持寄存器空）：打开 `IER.THRE` 后 UART 立刻
 /// 拉高中断线，不需要 runner 注入串口输入。handler 里先关掉 UART 中断源——THRE
-/// 是电平触发，不关的话 claim/complete 之后马上又 pending（中断风暴）。
+/// 是电平触发，不关的话后端 complete 之后马上又 pending（中断风暴）。
 ///
-/// 本用例直接驱动 PLIC（arch 白盒），不经过 Core 的 `irq::route`；Core 路由由
-/// host 测试与 CoreTest 覆盖。
+/// 本用例直接驱动 PLIC（arch 白盒，不经 Core 路由）；后端 `dispatch_external`
+/// 拥有 `claim → 逻辑 IRQ 号 → 回调 → complete` 循环，handler 只收逻辑号。
 fn external_irq(info: &MachineInfo) -> ! {
     // QEMU virt：PLIC + ns16550a（UART）；UART 的 IER 在 base+1（reg-shift 0）。
     const UART_IER_OFFSET: usize = 1;
@@ -630,8 +630,8 @@ fn external_irq(info: &MachineInfo) -> ! {
     let uart_line = find_irq(info, &[b"ns16550a".as_slice()]).expect("UART irq not found");
     let ier = uart_base + UART_IER_OFFSET;
 
-    // PLIC 已由 boot 全局配置（`configure` 在 UP 阶段只允许一次）；此用例只注册
-    // handler 并使能线，不再重复 configure。
+    // PLIC 已由 boot 全局配置（`configure` 在 UP 阶段只允许一次，它同时装入
+    // 后端分发器）；此用例只注册回调并使能线，不再重复 configure。
     arch::InterruptImpl::register_external_handler(external_irq_handler);
     arch::InterruptImpl::enable(uart_line);
 
@@ -664,19 +664,15 @@ fn external_irq(info: &MachineInfo) -> ! {
     pass("external-irq")
 }
 
-fn external_irq_handler(_cpu: CpuId) {
-    // 顺序要紧：**先 claim 再关源**。claim 读走 pending 并置 in-service、才拿得到 id；
-    // 若先关设备（UART 电平触发），pending 随电平撤销，claim 会返回 0。
-    if let Some(claim) = arch::InterruptImpl::claim() {
-        let line = arch::InterruptImpl::claim_line(&claim);
-        EXTERNAL_IRQ_LINE.store(line as usize, Ordering::Release);
-        // 关中断源（THRE 电平触发：不关的话 complete 后立刻又 pending = 风暴）
-        let ier = UART_IER_ADDR.load(Ordering::Acquire);
-        if ier != 0 {
-            // SAFETY: 已发现 UART 的 IER 寄存器（字节宽）。
-            unsafe { core::ptr::write_volatile(ier as *mut u8, 0) };
-        }
-        arch::InterruptImpl::complete(claim);
+fn external_irq_handler(_cpu: CpuId, line: u32) {
+    // 顺序已由后端保证：`dispatch_external` 先 claim（置 in-service）再调本回调，
+    // 返回后才 complete。回调只需关设备源——THRE 电平触发，不关的话 complete
+    // 后立刻又 pending（中断风暴）。
+    EXTERNAL_IRQ_LINE.store(line as usize, Ordering::Release);
+    let ier = UART_IER_ADDR.load(Ordering::Acquire);
+    if ier != 0 {
+        // SAFETY: 已发现 UART 的 IER 寄存器（字节宽）。
+        unsafe { core::ptr::write_volatile(ier as *mut u8, 0) };
     }
     EXTERNAL_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
 }

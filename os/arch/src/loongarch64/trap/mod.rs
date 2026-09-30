@@ -27,8 +27,8 @@ pub fn register_timer_handler(_handler: crate::cpu::LocalInterruptHandler) {
     todo!("loongarch64: store the timer handler")
 }
 
-/// Store the Core external-interrupt handler.
-pub fn register_external_handler(_handler: crate::cpu::LocalInterruptHandler) {
+/// Store the Core external-interrupt callback `(logical CpuId, logical IRQ)`.
+pub fn register_external_handler(_handler: crate::cpu::ExternalIrqHandler) {
     todo!("loongarch64: store the external-interrupt handler")
 }
 

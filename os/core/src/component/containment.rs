@@ -171,7 +171,7 @@ pub enum EscapeKind {
     /// A component task running on its own kernel stack.
     Task { task: TaskId, owner: ComponentId },
     /// A component IRQ callback running synchronously on the trap path
-    /// ([`crate::irq::on_external`]).
+    /// ([`crate::irq::on_irq`]).
     ///
     /// The owner is the **IRQ line's owner** (Core truth from the routing
     /// table), never the interrupted execution; there is no task because an
@@ -975,7 +975,7 @@ fn run_isolated_on(stack_top: usize, call: IsolatedCall, kind: EscapeKind) -> Ca
 /// Runs `f` inside an **IRQ attribution scope** ([`EscapeKind::Irq`]): Core
 /// calls made by `f` resolve to `owner` with `task = None`.
 ///
-/// Installed by [`crate::irq::on_external`] around exactly one component
+/// Installed by [`crate::irq::on_irq`] around exactly one component
 /// callback, using the same save/replace/restore discipline as the create and
 /// destroy boundaries: the interrupted guard (task / init / exit / anchor) is
 /// captured in the scope record and restored **explicitly** after `f` returns,

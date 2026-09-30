@@ -14,13 +14,13 @@
 //! record (Core's containment/sched init constructs placeholder contexts
 //! during `kernel::init`).
 //! Deliberately absent: any deadline timer (the PIT is not started) and the
-//! APIC/IOAPIC line path — `Timer` reports `Unsupported`/`DeliveryUnavailable`
-//! instead of faking delivery.
+//! APIC/IOAPIC **routing** path — `Timer` reports `Unsupported`/
+//! `DeliveryUnavailable` instead of faking delivery.
 //! Explicit `todo!()`: the register-level task context **switch** assembly and
-//! the APIC/IOAPIC line path.
+//! the APIC/IOAPIC line routing.
 
 use super::encoding as enc;
-use crate::cpu::{CpuId, LocalInterruptHandler};
+use crate::cpu::{CpuId, ExternalIrqHandler, LocalInterruptHandler};
 use crate::{Console, CpuArch, InterruptController, ResetType, SystemReset, Timer};
 
 /// x86_64 backend type.
@@ -286,7 +286,6 @@ impl Timer for X86_64 {
 
 impl InterruptController for X86_64 {
     type Config = ();
-    type Claim = ();
 
     unsafe fn configure(_config: ()) -> Result<(), crate::smp::InitError> {
         // Legacy PIC/PIT are configured by `trap::init`; there is no external
@@ -310,21 +309,7 @@ impl InterruptController for X86_64 {
         )
     }
 
-    fn claim() -> Option<Self::Claim> {
-        todo!("x86_64: APIC/IOAPIC claim not implemented (no external line is enabled during boot)")
-    }
-
-    fn claim_line(_claim: &Self::Claim) -> u32 {
-        todo!(
-            "x86_64: APIC/IOAPIC claim-line not implemented (no external line is enabled during boot)"
-        )
-    }
-
-    fn complete(_claim: Self::Claim) {
-        todo!("x86_64: APIC/IOAPIC EOI not implemented (no external line is enabled during boot)")
-    }
-
-    fn register_external_handler(handler: LocalInterruptHandler) {
+    fn register_external_handler(handler: ExternalIrqHandler) {
         super::trap::register_external_handler(handler);
     }
 

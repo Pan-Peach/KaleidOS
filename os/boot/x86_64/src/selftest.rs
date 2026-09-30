@@ -42,7 +42,7 @@ pub fn run(info: &MachineInfo) -> ! {
             todo!("x86_64 archtest: one-shot deadline timer not implemented (no deadline source; the PIT is deliberately not started)")
         }
         b"external-irq" => {
-            todo!("x86_64 archtest: APIC/IOAPIC claim/complete not implemented")
+            todo!("x86_64 archtest: APIC/IOAPIC line routing + EOI not implemented")
         }
         _ => fail("unknown command"),
     }

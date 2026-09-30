@@ -10,7 +10,7 @@
 //!   - `boot`         — discovery → `kernel::init` → ready → PASS → shutdown;
 //!   - `smp-boot`     — `todo!()`: PSCI AP bring-up (`Smp::prepare/start_cpu`);
 //!   - `timer`        — `todo!()`: timer IRQ needs the GICv3 PPI route;
-//!   - `external-irq` — `todo!()`: needs GICv3 claim/complete.
+//!   - `external-irq` — `todo!()`: needs GICv3 ack/EOI + INTID → IRQ mapping.
 //!
 //! Fault cases do not print PASS: they execute a faulting instruction and the
 //! vector table's default handler reports ESR/FAR/ELR before panicking.
@@ -29,7 +29,7 @@ pub fn run(_info: &MachineInfo) -> ! {
         b"smp-boot" => todo!("aarch64 archtest: PSCI CPU_ON AP bring-up (Smp::prepare/start_cpu)"),
         b"timer" => todo!("aarch64 archtest: timer IRQ needs GICv3 PPI 27 routing"),
         b"external-irq" => {
-            todo!("aarch64 archtest: external IRQ needs GICv3 claim/complete")
+            todo!("aarch64 archtest: external IRQ needs GICv3 ack/EOI + INTID mapping")
         }
         _ => fail("unknown case"),
     }

@@ -8,7 +8,7 @@
 //!   │    Core: 验证 owner → 查 MachineInfo.devices[id].irq → 记 route
 //!   ▼
 //! kcore_irq_enable(device_id)   → 配置中断控制器（arch）
-//! trap → on_external → route(number) → 锁外调用组件 handler
+//! trap → on_irq（后端 ack/映射后）→ route(number) → 锁外调用组件 handler
 //!   ▼
 //! kcore_irq_disable/release(device_id)
 //! ```
@@ -28,7 +28,7 @@
 //!
 //! route 在锁内只取一份 `(owner, handler, ctx)` 拷贝，实际回调在**锁外**执行
 //! （trap 可能重入，spin 锁不可重入）。回调在 Core 建立的 IRQ 归属作用域内运行
-//! （principal = 线 owner，task = None），见 `crate::irq::on_external`。
+//! （principal = 线 owner，task = None），见 `crate::irq::on_irq`。
 
 use super::{RequestContext, ResourceKind};
 use crate::component::ComponentId;

@@ -9,13 +9,18 @@
 //! Every vector entry branches to [`aarch64_default_exception_handler`], which
 //! prints `ESR`/`FAR`/`ELR` and panics — enough to diagnose ANY unexpected
 //! exception instead of hanging silently.  The registered timer/external/IPI
-//! handlers are stored by [`register_timer_handler`] / [`register_external_handler`]
+//! callbacks are stored by [`register_timer_handler`] / [`register_external_handler`]
 //! / [`register_ipi_handler`] and are dispatched by [`dispatch_timer`] /
 //! [`dispatch_external`] / [`dispatch_ipi`]; no vector currently reaches those
 //! dispatch points (IRQs stay masked, and GICv3 delivery is `todo!()`), so an
 //! interrupt that arrives during bring-up is reported as an exception.
+//!
+//! [`dispatch_external`] takes the already-acknowledged **INTID** plus the
+//! logical `CpuId`: the future GICv3 path owns ack/classification (timer PPI /
+//! SGI / device) and deactivation (`ICC_EOIR1_EL1`), converts the INTID to a
+//! logical IRQ number, and only then calls the Core callback.
 
-use crate::cpu::{CpuId, LocalInterruptHandler};
+use crate::cpu::{CpuId, ExternalIrqHandler, LocalInterruptHandler};
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -134,21 +139,27 @@ pub fn dispatch_timer() {
     handler(current_logical_cpu());
 }
 
-/// 外部中断回调（Core 在 `irq::init` 时注册 `irq::on_external`）。
+/// 外部中断回调（Core 在 `irq::init` 时注册 `crate::irq::on_irq`）。
 static EXTERNAL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-/// Store the Core external-interrupt handler.
-pub fn register_external_handler(handler: LocalInterruptHandler) {
+/// Store the Core external-interrupt callback: `(logical CpuId, logical IRQ)`.
+pub fn register_external_handler(handler: ExternalIrqHandler) {
     EXTERNAL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
-/// Invoke the registered external handler with the current logical `CpuId`.
-pub fn dispatch_external() {
+/// Invoke the registered external callback for one acknowledged interrupt.
+///
+/// This is only the dispatch seam: the (future) GICv3 delivery path owns
+/// ack/classification (timer PPI / SGI / device), EOI/deactivate, and the
+/// INTID → logical IRQ mapping before handing the identity to Core.  No vector
+/// reaches this seam during bring-up (IRQs stay masked; GICv3 delivery is
+/// `todo!()`), so `intid` is forwarded as the interrupt identity as-is.
+pub fn dispatch_external(cpu: CpuId, intid: u32) {
     let address = EXTERNAL_HANDLER.load(Ordering::Acquire);
     assert!(address != 0, "external interrupt handler is not registered");
-    // SAFETY: 注册方保证签名与 `LocalInterruptHandler` 一致（单一注册入口）。
-    let handler: LocalInterruptHandler = unsafe { core::mem::transmute(address) };
-    handler(current_logical_cpu());
+    // SAFETY: 注册方保证签名与 `ExternalIrqHandler` 一致（单一注册入口）。
+    let handler: ExternalIrqHandler = unsafe { core::mem::transmute(address) };
+    handler(cpu, intid);
 }
 
 /// IPI（GIC SGI）回调（Core 在 `smp::init` 时注册 `ipi::ipi_interrupt`）。
