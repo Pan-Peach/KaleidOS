@@ -83,6 +83,18 @@ SBI 调用集中在 `riscv/firmware.rs`，CPU 原语在 `riscv/cpu.rs`，陷阱�
 `.text`、`.initpkg` 或 bootstrap hand-off。
 选择对应的 Console/SystemReset backend。
 
+### 责任边界：Arch / Platform（职责，不是新层）/ Boot
+
+`Arch`、`Platform`、`Boot` 是**职责划分**，不是三个 crate，更不是一个新的分层：
+
+| 责任 | 内容 | 代码位置 |
+|---|---|---|
+| **Arch** | CPU / ISA 原语：trap 与分发、上下文切换、MMU/TLB、中断开关、原子原语、CPU-local idle（`wait_for_interrupt` / `atomic_idle`）、CPU architected 定时器与 CPU-local firmware boundary（SBI 等） | `os/arch/` |
+| **Platform（职责，不是 crate / 层）** | 机器发现与接线：把 FDT / ACPI / probing 归一化为 `MachineInfo`，处理板级拓扑、发现到的控制器 / 设备接线 | 由 boot crate 内的 discovery 承担；**不**新立 Platform crate |
+| **Boot** | loader / firmware / boot protocol handoff：入口汇编、启动期页表、把 `MachineInfo` 与 reserved 交给 `core::init` | `os/boot/<arch>/` |
+
+不变式：Arch 不认识板卡名（不能有 `if board == ...` 的机制分叉）；Machine Discovery 不定义 ISA 契约；Core 不知道事实来自 FDT 还是 ACPI。三者只通过稳定 backend trait 与 `MachineInfo` 相接。
+
 ### Machine Discovery —— 机器发现（不设 platform 层）
 
 不设 platform 层：机器差异由 **Machine Discovery** 消化 —— 从各种来源发现

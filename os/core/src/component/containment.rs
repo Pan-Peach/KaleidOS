@@ -403,6 +403,12 @@ static mut TASK_GUARD: MaybeUninit<EscapeGuard> = MaybeUninit::uninit();
 
 /// Prepare the Core-owned task-abort context.  Called once from `core::init`
 /// before any task can run.
+///
+/// The record's entry is [`task_abort_trampoline`] — a **real, executable**
+/// panic-recovery destination that [`switch_to_core`] enters after a task
+/// panic — not inert metadata.  Constructing it here only builds the record;
+/// whether it is actually reachable is proven by the target-side task-panic
+/// cases, not by boot construction.
 pub fn init() {
     let context = CpuImpl::new_context(
         task_abort_trampoline as *const () as usize,

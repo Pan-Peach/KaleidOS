@@ -44,6 +44,88 @@ std::thread_local! {
     static SENT_IPIS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
+// Fake timer 模拟（host 测试）：故障注入（init / delivery / arm）、单调 host
+// tick、以及一条**有序事件日志**，让 Core 的「检查-睡眠」协议可被断言。
+std::thread_local! {
+    static TIMER_INIT_FAILS: Cell<bool> = const { Cell::new(false) };
+    static TIMER_DELIVERY_FAILS: Cell<bool> = const { Cell::new(false) };
+    static TIMER_ARM_FAILS: Cell<bool> = const { Cell::new(false) };
+    static TIMER_DEADLINE: Cell<Option<u64>> = const { Cell::new(None) };
+    static TIMER_EVENTS: RefCell<Vec<TimerEvent>> = const { RefCell::new(Vec::new()) };
+    static HOST_TICKS: Cell<u64> = const { Cell::new(0) };
+    static PENDING_WAKEUP: Cell<bool> = const { Cell::new(false) };
+    static IDLE_SLEEPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Fake 时钟 / idle 事件（host 测试可观察轨迹）。
+///
+/// 事件按发生顺序记录，让 Core 的「关中断 → arm → atomic_idle」协议可被
+/// 精确断言（而不是只看最终状态）。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerEvent {
+    /// `set_deadline` 接受了 deadline；`irq_enabled` = 编程时模拟的中断使能
+    /// 状态（idle 路径必须在**关中断**状态下 arm）。
+    Armed { deadline: u64, irq_enabled: bool },
+    /// `cancel_deadline`。
+    Cancelled,
+    /// `atomic_idle` 被进入；`saved_irq_enabled` = 调用者进入 idle 前的状态，
+    /// `wakeup_pending` = 边界上是否已有 pending 唤醒。
+    Idled {
+        saved_irq_enabled: bool,
+        wakeup_pending: bool,
+    },
+}
+
+#[doc(hidden)]
+pub fn timer_init_fails_for_test(fails: bool) {
+    TIMER_INIT_FAILS.with(|flag| flag.set(fails));
+}
+
+#[doc(hidden)]
+pub fn timer_delivery_fails_for_test(fails: bool) {
+    TIMER_DELIVERY_FAILS.with(|flag| flag.set(fails));
+}
+
+#[doc(hidden)]
+pub fn timer_arm_fails_for_test(fails: bool) {
+    TIMER_ARM_FAILS.with(|flag| flag.set(fails));
+}
+
+/// 重置单调 host tick（测试可精确预期 deadline）。
+#[doc(hidden)]
+pub fn reset_host_clock_for_test() {
+    HOST_TICKS.with(|ticks| ticks.set(0));
+}
+
+/// 模拟「唤醒在检查-睡眠边界上已经 pending」（例如 timer 恰好先到）。
+/// `atomic_idle` 必须观察到它并返回，且**不消费**它。
+#[doc(hidden)]
+pub fn set_pending_wakeup_for_test(pending: bool) {
+    PENDING_WAKEUP.with(|flag| flag.set(pending));
+}
+
+#[doc(hidden)]
+pub fn pending_wakeup_for_test() -> bool {
+    PENDING_WAKEUP.with(Cell::get)
+}
+
+/// `atomic_idle` 真正选择睡眠（无 pending 唤醒）的次数。
+#[doc(hidden)]
+pub fn idle_sleeps_for_test() -> u64 {
+    IDLE_SLEEPS.with(Cell::get)
+}
+
+#[doc(hidden)]
+pub fn timer_deadline_for_test() -> Option<u64> {
+    TIMER_DEADLINE.with(Cell::get)
+}
+
+#[doc(hidden)]
+pub fn take_timer_events_for_test() -> Vec<TimerEvent> {
+    TIMER_EVENTS.with(|events| core::mem::take(&mut *events.borrow_mut()))
+}
+
 /// 已注册的全局 IPI 回调（进程级：注册是全局的，不随测试线程变）。
 static IPI_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -132,6 +214,23 @@ impl CpuArch for Fake {
         // host 无中断/时钟硬件：no-op（真机语义见 Riscv 实现）。
     }
 
+    unsafe fn atomic_idle(flags: Self::IrqFlags) {
+        // 可观察模拟：host 不真正睡眠，但记录边界状态，让 Core 测试断言
+        // 「关中断 arm → idle」的协议与「pending 唤醒不丢」。
+        let wakeup_pending = PENDING_WAKEUP.with(Cell::get);
+        if !wakeup_pending {
+            IDLE_SLEEPS.with(|sleeps| sleeps.set(sleeps.get() + 1));
+        }
+        TIMER_EVENTS.with(|events| {
+            events.borrow_mut().push(TimerEvent::Idled {
+                saved_irq_enabled: flags != 0,
+                wakeup_pending,
+            });
+        });
+        // 模拟「返回前恢复调用者保存的中断状态」。
+        Self::restore_irq(flags);
+    }
+
     fn current_cpu() -> Option<CpuId> {
         // host 恒为 CPU0（UP = 只有第 0 项的 SMP）；`install_per_cpu_base` 可覆盖。
         Some(CpuId::from_raw(CPU_ID.with(|id| id.get()).unwrap_or(0)))
@@ -165,7 +264,7 @@ impl Smp for Fake {
         todo!("SMP: host fake has no secondary CPU startup")
     }
 
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_ipi_cpu() -> Result<(), InitError> {
         Ok(())
     }
 
@@ -195,24 +294,52 @@ impl Smp for Fake {
 }
 
 impl Timer for Fake {
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_cpu() -> Result<(), crate::TimerError> {
+        // 故障注入：测试可让"本地初始化失败"，验证 Core 不发布 readiness。
+        if TIMER_INIT_FAILS.with(Cell::get) {
+            return Err(crate::TimerError::Unsupported);
+        }
         Ok(())
     }
 
     fn now() -> u64 {
-        // host 占位时间源（C5 骨架）：非单调 0，仅供编译/接线占位。
-        0
+        // 单调 host tick：每次读取前进 1（重置见 `reset_host_clock_for_test`）。
+        HOST_TICKS.with(|ticks| {
+            let value = ticks.get();
+            ticks.set(value.wrapping_add(1));
+            value
+        })
     }
 
-    fn set_deadline(_deadline: u64) {
-        // host 无定时器硬件：no-op 占位。
+    fn set_deadline(deadline: u64) -> Result<(), crate::TimerError> {
+        // 故障注入：测试可让 arm 失败，验证失败不发布 deadline 且不进入 idle。
+        if TIMER_ARM_FAILS.with(Cell::get) {
+            return Err(crate::TimerError::HardwareFailure);
+        }
+        TIMER_DEADLINE.with(|slot| slot.set(Some(deadline)));
+        TIMER_EVENTS.with(|events| {
+            events.borrow_mut().push(TimerEvent::Armed {
+                deadline,
+                irq_enabled: IRQ_ENABLED.with(Cell::get),
+            });
+        });
+        Ok(())
     }
 
-    fn cancel_deadline() {}
+    fn cancel_deadline() {
+        TIMER_DEADLINE.with(|slot| slot.set(None));
+        TIMER_EVENTS.with(|events| events.borrow_mut().push(TimerEvent::Cancelled));
+    }
 
     fn register_timer_handler(_handler: LocalInterruptHandler) {}
 
-    fn enable_timer_interrupt() {}
+    fn enable_timer_interrupt() -> Result<(), crate::TimerError> {
+        // 故障注入：模拟"投递不可用"（能力在、路由 / CPU interface 不在）。
+        if TIMER_DELIVERY_FAILS.with(Cell::get) {
+            return Err(crate::TimerError::DeliveryUnavailable);
+        }
+        Ok(())
+    }
 }
 
 // host 无中断硬件：控制器全是 no-op，claim 恒 None（永远不会投递外部中断）。

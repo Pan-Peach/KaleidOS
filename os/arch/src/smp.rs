@@ -25,9 +25,10 @@
 //! 三者的**回调注册签名已经统一**为 [`LocalInterruptHandler`]（`fn(CpuId)`）：
 //! trap 分发在 Rust 侧把逻辑 CPU 身份传给回调，**不需要改 trap 汇编**。
 //!
-//! 仍待各自补齐的是 `init_cpu()`（只初始化**当前执行 CPU** 的本地源，且保持
-//! masked），以及 `Timer`/`InterruptController` 的原地接口收敛（per-CPU 初始化、
-//! claim/complete 配对）。这些属于 SMP 实现工作；本骨架只固化签名与边界。
+//! 仍待各自补齐的是 `init_ipi_cpu()`（只初始化**当前执行 CPU** 的本地 IPI
+//! 接收，且保持 masked），以及 `Timer`/`InterruptController` 的原地接口收敛
+//! （per-CPU 初始化、claim/complete 配对）。这些属于 SMP 实现工作；本骨架只
+//! 固化签名与边界。
 //!
 //! 逻辑身份、启动状态、pending work、调度归属、启动屏障全部在 **Core**（`os/core/src/smp/`）。
 
@@ -127,7 +128,11 @@ pub trait Smp {
     ) -> Result<(), CpuStartError>;
 
     /// 初始化**当前执行 CPU** 的 IPI 接收机制（仍保持 masked）。
-    fn init_cpu() -> Result<(), InitError>;
+    ///
+    /// 这是 IPI 接收的本地初始化，**不是** [`crate::CpuArch::init_cpu`]（trap
+    /// 状态）或 [`crate::Timer::init_cpu`]（本地 timer）；BSP 与每个 AP 都要在
+    /// 本地调用一次。
+    fn init_ipi_cpu() -> Result<(), InitError>;
 
     /// 全局注册一次 IPI 回调，必须在任何 CPU 打开 IPI 接收之前完成。
     fn register_ipi_handler(handler: LocalInterruptHandler) -> Result<(), InitError>;

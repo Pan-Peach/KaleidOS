@@ -14,7 +14,7 @@
 //! 由 bootstrap 的静态紧急 console 直连输出（见 bootstrap console.rs）。
 
 use crate::monitor::editor::{LineEditor, Outcome, Screen};
-use arch::{Console, ConsoleImpl, CpuArch, Timer, TimerImpl};
+use arch::{Console, ConsoleImpl, Timer, TimerImpl};
 use core::fmt::{self, Write};
 
 /// 无前缀输出（core 内部各模块的自描述日志用）。
@@ -80,32 +80,55 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     }
 }
 
-/// 空闲等待：短 one-shot timer + WFI（唤醒后回到 getc 轮询）。
+/// 空闲等待：「检查-睡眠原子化」的短 one-shot timer + CPU idle（唤醒后回到
+/// getc 轮询）。
 ///
-/// `Console::getc()` 是轮询式 SBI 调用（未使能 UART RX 中断），单独 `wfi`
-/// 没有任何东西能唤醒——所以先 arm 一个 ~10ms 的 one-shot deadline，让
-/// timer IRQ 把 WFI 叫醒。arm 失败（timer 未初始化，如 selftest 早于
-/// `core::init`）退回自旋，**绝不挂死**。
+/// `Console::getc()` 是轮询式调用（未使能 UART RX 中断），单独 idle 没有东西
+/// 能唤醒——所以先关本 CPU 中断，在**关中断状态下** arm 一个 ~10ms 的
+/// one-shot deadline，再用 `atomic_idle(saved_flags)` 进入 idle：
+/// - 唤醒源与谓词检查在同一临界区内建立，不存在"检查完就睡、事件被吞"的窗口；
+/// - `atomic_idle` 返回前恢复中断状态。
+///
+/// **永不挂死**：频率未知 / 投递未就绪 / arm 失败时不睡眠，回退到轮询自旋。
+/// `delivery_ready()` 与 `arm_deadline()` 在机制初始化前都不分配。
 pub(crate) fn idle_wait() {
-    let now = TimerImpl::now();
-    let deadline = now.saturating_add(idle_period());
+    // 频率未知（如 x86 的 0 = unknown 约定）或换算失败：回退轮询。
+    let Some(period) = idle_period() else {
+        core::hint::spin_loop();
+        return;
+    };
+    // readiness 只从 false 单调变 true；这里提前判掉"没有投递"的情形，
+    // 避免无意义地翻转中断状态（arm_deadline 仍会二次校验）。
+    if !crate::timer::delivery_ready() {
+        core::hint::spin_loop();
+        return;
+    }
+    let flags = <arch::CpuImpl as arch::CpuArch>::disable_irq();
+    let deadline = TimerImpl::now().saturating_add(period);
     if crate::timer::arm_deadline(deadline).is_ok() {
-        arch::CpuImpl::wait_for_interrupt();
+        // SAFETY: local IRQs are disabled (above); the one-shot deadline was
+        // armed while they were disabled, so the wakeup cannot be lost between
+        // the check and the sleep; no interrupt-path lock is held.
+        unsafe { <arch::CpuImpl as arch::CpuArch>::atomic_idle(flags) };
     } else {
+        // 编程失败：恢复中断，轮询。
+        <arch::CpuImpl as arch::CpuArch>::restore_irq(flags);
         core::hint::spin_loop();
     }
 }
 
-/// ~10ms 的 idle 周期：优先用已提交 MachineInfo 的 timebase 频率换算，
-/// 缺省用安全常量（10ms @ 10MHz，QEMU virt 的 timebase）。
-fn idle_period() -> u64 {
+/// idle 周期（tick）：只从已提交 `MachineInfo` 的**已知非零** timebase 频率
+/// 换算 ~10ms。频率未知（如 x86 的 0 = unknown 约定）或换算截断为 0 → `None`
+/// （调用者回退轮询）——**不伪造**任何架构专属常量。
+fn idle_period() -> Option<u64> {
     const TARGET_MS: u64 = 10;
-    const FALLBACK_TICKS: u64 = 100_000;
-    let Some(info) = crate::machine::committed() else {
-        return FALLBACK_TICKS;
-    };
-    let period = info.timebase_frequency / (1000 / TARGET_MS);
-    if period == 0 { FALLBACK_TICKS } else { period }
+    let info = crate::machine::committed()?;
+    let hz = info.timebase_frequency;
+    if hz == 0 {
+        return None;
+    }
+    let period = hz / (1000 / TARGET_MS);
+    (period != 0).then_some(period)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,12 +208,12 @@ mod tests {
         let period = idle_period();
 
         // Then：10ms @ 10MHz = 100_000 ticks。
-        assert_eq!(period, 100_000, "10ms @ 10MHz 应换算为 100_000 ticks");
+        assert_eq!(period, Some(100_000), "10ms @ 10MHz 应换算为 100_000 ticks");
     }
 
-    /// timebase 太小导致整除截断为 0 时必须回退到安全常量，绝不返回 0。
+    /// timebase 太小导致整除截断为 0 时不得伪造常量：返回 `None`（调用者轮询）。
     #[test]
-    fn idle_period_falls_back_when_timebase_truncates_to_zero() {
+    fn idle_period_is_unknown_when_timebase_truncates_to_zero() {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：50 Hz timebase → 50 / 100 == 0。
@@ -199,8 +222,22 @@ mod tests {
         // When：计算 idle 周期。
         let period = idle_period();
 
-        // Then：回退到安全常量（100_000），不得为 0。
-        assert_eq!(period, 100_000, "截断为 0 时必须回退到 100_000");
-        assert_ne!(period, 0, "idle 周期绝不能为 0");
+        // Then：未知（绝不回退到架构专属常量）。
+        assert_eq!(period, None, "截断为 0 时必须报未知而不是伪造周期");
+    }
+
+    /// timebase 频率为 0（如 x86 的 zero-as-unknown 约定）→ 未知，回退轮询。
+    #[test]
+    fn idle_period_is_unknown_when_timebase_frequency_is_zero() {
+        let _guard = crate::machine::test_support::GUARD.lock();
+
+        // Given：timebase 频率未知（0）。
+        commit_timebase(0);
+
+        // When：计算 idle 周期。
+        let period = idle_period();
+
+        // Then：未知（回退轮询，绝不伪造）。
+        assert_eq!(period, None, "timebase=0 是未知约定，必须返回 None");
     }
 }

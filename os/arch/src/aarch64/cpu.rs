@@ -14,10 +14,13 @@
 //! - GICv3 external interrupt `claim`/`complete` and line enable/disable
 //!   (nothing routes an external line during boot).
 //!
-//! `new_context` **is** implemented as a pure record constructor: `core::init`
-//! reaches it through `component::containment::init`, which stores an inert
-//! abort context before the scheduler can run.  It builds data only — any
-//! actual switch still goes through the `todo!()` `context_switch`.
+//! `new_context` **is** implemented as a pure record constructor: it builds an
+//! architecture-specific execution record (entry + stack) and never executes
+//! it.  `core::init` reaches it through `component::containment::init`, which
+//! prepares the **executable** abort destination (`task_abort_trampoline`); any
+//! actual switch still goes through the `todo!()` `context_switch`.  A
+//! boot-construction test therefore proves the record is built, not that task
+//! execution works.
 //!
 //! # GIC naming
 //!
@@ -98,6 +101,17 @@ fn read_daif() -> usize {
     value
 }
 
+/// `ISR_EL1`: bit 7 = an IRQ is pending (bit 6 = FIQ, bit 8 = SError).
+#[inline]
+fn read_isr_el1() -> usize {
+    let value: usize;
+    // SAFETY: 只读系统寄存器；无内存 / 栈 / 标志位副作用。
+    unsafe {
+        asm!("mrs {}, isr_el1", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 impl CpuArch for Aarch64 {
     type Context = Aarch64Context;
     type IrqFlags = usize;
@@ -107,9 +121,16 @@ impl CpuArch for Aarch64 {
     }
 
     fn new_context(entry: usize, stack_top: usize) -> Self::Context {
-        // Pure record construction: no architectural state is touched.  An
-        // actual switch still requires the `todo!()` `context_switch`; this
-        // exists because `core::init` prepares an inert abort context.
+        // Builds an execution record; it does not execute anything.  Two
+        // distinct caller obligations:
+        //  - fresh execution (real entry + stack): must be entered through the
+        //    (still `todo!()`) `context_switch`;
+        //  - save-only placeholder `(0, 0)` used by Core as the outgoing anchor
+        //    for "no current task": never entered as a destination.
+        // `core::init` prepares the containment abort context through the first
+        // kind: its entry is the real abort trampoline, a panic-recovery
+        // destination — not inert metadata.  Building it here does not prove
+        // task execution works.
         Aarch64Context {
             pc: entry,
             sp: stack_top,
@@ -166,20 +187,44 @@ impl CpuArch for Aarch64 {
     }
 
     fn wait_for_interrupt() {
-        // WFI sleeps until an interrupt is pending.  The bring-up path keeps
-        // `DAIF.I` masked and GICv3 delivery is `todo!()` — nothing can ever
-        // become pending, so a literal WFI would wedge the polling console
-        // (`kernel::print::read_line` arms a one-shot and waits).  While IRQs
-        // are masked, spin and keep polling; WFI is used once interrupts can
-        // actually arrive.
-        if read_daif() & PSTATE_I != 0 {
-            core::hint::spin_loop();
-            return;
-        }
+        // Raw idle hint: plain WFI.  It may return spuriously (or never, with
+        // no pending wake event) and does not touch DAIF — the documented raw
+        // primitive contract.  The atomic check→idle protocol is `atomic_idle`.
         // SAFETY: hint instruction; no memory / stack side effects.
         unsafe {
             asm!("wfi", options(nomem, nostack, preserves_flags));
         }
+    }
+
+    unsafe fn atomic_idle(flags: Self::IrqFlags) {
+        if flags & PSTATE_I != 0 {
+            // Caller entered with IRQs masked: per the contract there is no
+            // enabled wake source, so sleeping could be forever.  Restore and
+            // return without idling.
+            Self::restore_irq(flags);
+            return;
+        }
+        // An IRQ already pending at the boundary must be delivered by the
+        // caller's trap path, not chosen-away by idle.
+        if read_isr_el1() & PSTATE_I != 0 {
+            Self::restore_irq(flags);
+            return;
+        }
+        // Keep IRQs **masked** across WFI.  AArch64 WFI wakes on a *pending*
+        // IRQ even while `PSTATE.I` masks it, so a wakeup arriving now stays
+        // pending and is taken only after `restore_irq` unmasks below — no
+        // enable→sleep gap.  (Never WFE: there is no event protocol.)
+        // SAFETY: hint instruction; IRQs remain masked here and the caller
+        // holds no interrupt-path lock.
+        unsafe {
+            asm!(
+                "dsb sy",
+                "wfi",
+                "isb",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        Self::restore_irq(flags);
     }
 
     fn current_cpu() -> Option<CpuId> {
@@ -228,7 +273,7 @@ impl CpuArch for Aarch64 {
 }
 
 impl Timer for Aarch64 {
-    fn init_cpu() -> Result<(), crate::smp::InitError> {
+    fn init_cpu() -> Result<(), crate::TimerError> {
         // Disarm: push the comparator out of reach and mask the output.
         // `CNTV_CTL_EL0 = 0` (disabled), `CNTV_CVAL_EL0 = u64::MAX`.
         unsafe {
@@ -248,11 +293,19 @@ impl Timer for Aarch64 {
         value
     }
 
-    fn set_deadline(deadline: u64) {
-        // SAFETY: register write only; the comparator is a 64-bit counter value.
+    fn set_deadline(deadline: u64) -> Result<(), crate::TimerError> {
+        // Program the comparator **and** re-enable the timer output.  Writing
+        // only `CNTV_CVAL_EL0` is not enough after `cancel_deadline` (which
+        // clears `CNTV_CTL_EL0.ENABLE`): a second one-shot would never fire.
+        // `ENABLE=1, IMASK=0` makes the condition real.
+        // SAFETY: register writes only; the comparator is a 64-bit counter
+        // value and CTL is the architectural enable/mask pair.
         unsafe {
             asm!("msr cntv_cval_el0, {}", in(reg) deadline, options(nostack, preserves_flags));
+            asm!("isb", options(nomem, nostack, preserves_flags));
+            asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nostack, preserves_flags));
         }
+        Ok(())
     }
 
     fn cancel_deadline() {
@@ -267,15 +320,16 @@ impl Timer for Aarch64 {
         super::trap::register_timer_handler(handler);
     }
 
-    fn enable_timer_interrupt() {
-        // Unmask the *local* virtual timer condition (`ENABLE=1, IMASK=0`).
-        // Delivery to the CPU additionally needs the GICv3 PPI 27 route
-        // (`todo!()`: redistributor + group enable), so with no deadline past
-        // `CNTV_CVAL_EL0` nothing can fire yet.  The Core only requires this
-        // not to panic; a real deadline is programmed later by `set_deadline`.
+    fn enable_timer_interrupt() -> Result<(), crate::TimerError> {
+        // Unmask the *local* virtual timer condition (`ENABLE=1, IMASK=0`),
+        // then report the truth: delivery to the CPU additionally needs the
+        // GICv3 PPI 27 route (redistributor + group enable), which is not
+        // brought up.  Returning `Ok` here would make Core publish timer
+        // readiness for a callback that can never run.
         unsafe {
             asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nostack, preserves_flags));
         }
+        Err(crate::TimerError::DeliveryUnavailable)
     }
 }
 

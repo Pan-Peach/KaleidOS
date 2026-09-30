@@ -8,10 +8,14 @@
 //!
 //! # Bring-up scope
 //!
-//! Implemented: CPU init (IDT + legacy PIC/PIT), global interrupt enable,
-//! IRQ-save/restore, `hlt`, TSC time source, per-CPU identity, reset, and the
-//! structural `new_context` record (Core's containment/sched init constructs
-//! placeholder contexts during `kernel::init`).
+//! Implemented: CPU init (IDT + legacy PIC remap with all lines masked),
+//! global interrupt enable, IRQ-save/restore, raw `hlt` + atomic idle, TSC
+//! time source, per-CPU identity, reset, and the structural `new_context`
+//! record (Core's containment/sched init constructs placeholder contexts
+//! during `kernel::init`).
+//! Deliberately absent: any deadline timer (the PIT is not started) and the
+//! APIC/IOAPIC line path — `Timer` reports `Unsupported`/`DeliveryUnavailable`
+//! instead of faking delivery.
 //! Explicit `todo!()`: the register-level task context **switch** assembly and
 //! the APIC/IOAPIC line path.
 
@@ -112,10 +116,16 @@ impl CpuArch for X86_64 {
     }
 
     fn new_context(entry: usize, stack_top: usize) -> Self::Context {
-        // Structural record only; Core builds placeholder anchors during
-        // `kernel::init` (containment / sched), and real task contexts go
-        // through the same constructor.  The register-level save/restore is
-        // `context_switch`, still a `todo!()`.
+        // Builds an execution record; it does not execute anything.  Two
+        // distinct caller obligations:
+        //  - fresh execution (real task entry + stack): must be entered through
+        //    the (still `todo!()`) `context_switch`;
+        //  - save-only placeholder `(0, 0)` used by Core as the outgoing anchor
+        //    for "no current task": never entered as a destination.
+        // Containment's abort context is the fresh-execution kind: a real
+        // panic-recovery destination (Core switches to it), not inert data.
+        // A boot-construction test only proves the record is built; it does not
+        // prove task execution works.
         X86_64Context {
             rip: entry,
             rsp: stack_top,
@@ -163,9 +173,34 @@ impl CpuArch for X86_64 {
     }
 
     fn wait_for_interrupt() {
-        // The PIT periodic tick (see `trap::init`) guarantees a wakeup.
-        // SAFETY: `hlt` is a hint; it resumes at the next interrupt.
+        // Raw idle hint: `hlt` resumes only on an interrupt that can wake the
+        // CPU (or reset/SMI).  Nothing here arms a timer or changes IF, and no
+        // interrupt source is currently unmasked on this bring-up, so this can
+        // return spuriously or never return — exactly the documented raw
+        // primitive contract.  The atomic check→idle protocol is `atomic_idle`.
+        // SAFETY: `hlt` is a hint; it resumes at the next wake event.
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    }
+
+    unsafe fn atomic_idle(flags: Self::IrqFlags) {
+        const RFLAGS_IF: usize = 1 << 9;
+        if flags & RFLAGS_IF == 0 {
+            // Caller had interrupts disabled: there is no enabled wakeup
+            // source, so never halt (it would be forever).  Restore the exact
+            // flags anyway (IF is already 0; this keeps the contract uniform).
+            Self::restore_irq(flags);
+            return;
+        }
+        // Contiguous enable/halt sequence: the STI interrupt shadow defers an
+        // already-pending interrupt until after the following instruction
+        // (the HLT), so the halt cannot miss a wakeup in the enable→sleep
+        // gap.  `cli` re-masks before restoring the caller's exact flags.
+        // SAFETY: `sti`/`hlt`/`cli` only touch RFLAGS and CPU state; the
+        // caller's contract guarantees no interrupt-path lock is held.
+        unsafe {
+            core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack),);
+        }
+        Self::restore_irq(flags);
     }
 
     fn current_cpu() -> Option<CpuId> {
@@ -209,10 +244,14 @@ impl CpuArch for X86_64 {
 }
 
 impl Timer for X86_64 {
-    fn init_cpu() -> Result<(), crate::smp::InitError> {
-        // The local time source is the TSC (read directly in `now`); the
-        // periodic PIT tick is armed by `trap::init` on this CPU.
-        Ok(())
+    fn init_cpu() -> Result<(), crate::TimerError> {
+        // The TSC is readable (see `now`), but there is **no deadline timer
+        // bring-up** on this port: LAPIC/TSC-deadline programming is not
+        // implemented and the legacy PIT is deliberately not started (starting
+        // it would be a hidden periodic wakeup pretending to be a deadline
+        // source).  `Unsupported` is the honest answer — Core then falls back
+        // to polling for the console instead of arming a deadline.
+        Err(crate::TimerError::Unsupported)
     }
 
     fn now() -> u64 {
@@ -221,24 +260,27 @@ impl Timer for X86_64 {
         unsafe { core::arch::x86_64::_rdtsc() }
     }
 
-    fn set_deadline(_deadline: u64) {
+    fn set_deadline(_deadline: u64) -> Result<(), crate::TimerError> {
         // One-shot deadline programming is a `todo!()` boundary (LAPIC timer /
-        // TSC-deadline bring-up).  The periodic PIT tick already provides the
-        // wakeups the polled console idle loop needs, so this stays a no-op —
-        // and it must not panic: Core calls it from `read_line`.
+        // TSC-deadline bring-up).  Report the failure instead of pretending:
+        // Core only calls this after `init_cpu`/`enable_timer_interrupt`
+        // succeeded, which they never do on this port.
+        Err(crate::TimerError::Unsupported)
     }
 
     fn cancel_deadline() {
-        // No programmed deadline exists yet; see `set_deadline`.
+        // No programmed deadline exists; see `set_deadline`.
     }
 
     fn register_timer_handler(handler: LocalInterruptHandler) {
         super::trap::register_timer_handler(handler);
     }
 
-    fn enable_timer_interrupt() {
-        // The PIT tick is already running and unmasked at the PIC from
-        // `trap::init`; there is no separate per-deadline source to unmask.
+    fn enable_timer_interrupt() -> Result<(), crate::TimerError> {
+        // Delivery needs a real deadline source plus its route/CPU interface.
+        // Neither exists (see `init_cpu`); the PIT tick was the only timer IRQ
+        // and it is no longer started.
+        Err(crate::TimerError::DeliveryUnavailable)
     }
 }
 

@@ -571,10 +571,14 @@ fn timer() -> ! {
 
     TIMER_HANDLER_COUNT.store(0, Ordering::Release);
     arch::TimerImpl::register_timer_handler(timer_handler);
-    arch::TimerImpl::enable_timer_interrupt();
+    if arch::TimerImpl::enable_timer_interrupt().is_err() {
+        fail("timer: timer delivery is unavailable");
+    }
 
     let first_deadline = arch::TimerImpl::now().saturating_add(WINDOW);
-    arch::TimerImpl::set_deadline(first_deadline);
+    if arch::TimerImpl::set_deadline(first_deadline).is_err() {
+        fail("timer: one-shot deadline programming failed");
+    }
 
     while TIMER_HANDLER_COUNT.load(Ordering::Acquire) == 0 {
         core::hint::spin_loop();

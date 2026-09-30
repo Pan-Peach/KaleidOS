@@ -547,6 +547,9 @@ fn schedule_next_with_guard(
             }
             None => {
                 if cpu_guard.anchor.is_none() {
+                    // Save-only placeholder: this anchor is only the outgoing
+                    // record for "no current task"; it is never entered as a
+                    // `to` context.
                     cpu_guard.anchor = Some(Box::new(CpuImpl::new_context(0, 0)));
                 }
                 cpu_guard

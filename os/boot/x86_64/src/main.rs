@@ -61,11 +61,6 @@ const HVM_START_MAGIC: u32 = 0x336e_c578;
 const MEMORY_AVAILABLE: u32 = 1;
 /// Boot-side staging capacity, matching `MachineInfo.memory_regions`.
 const MAX_REGIONS: usize = 16;
-/// TSC frequency reported as the timer timebase.  The TSC frequency of
-/// `qemu64` is not discoverable via CPUID 0x15/0x16, so this is the documented
-/// nominal value; only the `preempt` profile derives periods from it, and this
-/// bring-up uses the periodic PIT tick instead.
-const TSC_NOMINAL_HZ: u64 = 1_000_000_000;
 
 /// Raw (identity-mapped) boot-info reads.
 fn read_u32(address: usize) -> u32 {
@@ -288,7 +283,11 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
 
     let info = MachineInfo {
         boot_hardware_id: cpu_info[0].hardware_id,
-        timebase_frequency: TSC_NOMINAL_HZ,
+        // TSC frequency is not discoverable via CPUID 0x15/0x16 on `qemu64`,
+        // so the timebase is **unknown** (`0` convention, not fabricated).
+        // No timer-derived period is used on this port: `Timer` reports
+        // `Unsupported`/`DeliveryUnavailable` and Core polls.
+        timebase_frequency: 0,
         // AP discovery (ACPI MADT) is not part of this bring-up: the BSP is
         // the only CPU Core may see, and it must be logical CPU0 with
         // `boot_cpu = true`.

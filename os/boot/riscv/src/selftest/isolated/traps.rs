@@ -23,7 +23,9 @@ pub(crate) fn isolated_timer() -> ! {
     // SAFETY: fixture ensured.
     unsafe { ctl_set(CTL_FLAG, 0) };
     let deadline = arch::TimerImpl::now().saturating_add(1_000_000);
-    arch::TimerImpl::set_deadline(deadline);
+    if arch::TimerImpl::set_deadline(deadline).is_err() {
+        fail("isolated-timer: one-shot deadline programming failed");
+    }
 
     let before = read_satp();
     let outcome = isolated::enter(transition);

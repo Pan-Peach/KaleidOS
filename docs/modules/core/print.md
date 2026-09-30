@@ -10,7 +10,7 @@
 
 - `print()`、`log(tag, args)`、`print_bytes()`。
 - `read_line()`：monitor 行编辑读取。
-- `idle_wait()`（含内部 `idle_period`、`ConsoleScreen`）：空闲不忙等，arm 一次性 timer 后 `wfi`。
+- `idle_wait()`（含内部 `idle_period`、`ConsoleScreen`）：空闲不忙等——关中断后 arm 一次性 timer（~10ms，仅用**已知非零** timebase 换算），再经 `CpuArch::atomic_idle(saved_flags)` 进入 idle；频率未知 / 投递未就绪 / arm 失败时恢复中断并回退轮询自旋，**永不挂死**。
 - 宏：`printk!`、`log!`（`#[macro_export]`）。
 
 ## 明确不做

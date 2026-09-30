@@ -8,10 +8,13 @@
 //!
 //! - A full 256-entry IDT with a diagnosable default fault path (prints vector /
 //!   error code / RIP and halts) so a fault is never a silent triple fault.
-//! - The legacy 8259 PIC is remapped to vectors 0x20..0x2F and the 8254 PIT
-//!   channel 0 is started at ~100 Hz on vector [`TIMER_VECTOR`].  This periodic
-//!   tick is the wake source for the polled console loop (`hlt` in
-//!   [`crate::CpuArch::wait_for_interrupt`]) and feeds Core's timer trap entry.
+//! - The legacy 8259 PIC is remapped to vectors 0x20..0x2F with **every line
+//!   masked**.  The remap only keeps the PIC's default vectors away from the
+//!   architectural exception range; no interrupt source is enabled.
+//! - There is **no timer interrupt**: the 8254 PIT is deliberately not started
+//!   (a periodic tick would be a hidden wakeup pretending to be a deadline
+//!   source).  `Timer` reports `Unsupported`/`DeliveryUnavailable`, and Core
+//!   falls back to polling for the console.
 //! - The local APIC / IOAPIC (claim/complete, line routing) is **not** brought
 //!   up: no external line is enabled during boot, so the corresponding
 //!   `InterruptController` methods stay explicit `todo!()`.
@@ -32,7 +35,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // Intel syntax; the entry assembly is written in AT&T (GAS) syntax.
 global_asm!(include_str!("entry.S"), options(att_syntax));
 
-/// IDT vector of the PIT (IRQ0) after the PIC remap done by [`init`].
+/// IDT vector of the (future) PIT / deadline timer after the PIC remap.
+///
+/// Nothing raises it today (see the module docs); the dispatch below is kept so
+/// a real deadline source (LAPIC timer / TSC-deadline) has a landing pad.
 pub const TIMER_VECTOR: u8 = 0x20;
 
 /// Number of architectural exception vectors (0..31).
@@ -43,13 +49,6 @@ const PIC1_DATA: u16 = 0x21;
 const PIC2_COMMAND: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
 const PIC_EOI: u8 = 0x20;
-
-const PIT_CHANNEL0: u16 = 0x40;
-const PIT_COMMAND: u16 = 0x43;
-/// Input clock of the 8254 (Hz).
-const PIT_BASE_HZ: u32 = 1_193_182;
-/// Periodic tick rate programmed into PIT channel 0.
-const PIT_TICK_HZ: u32 = 100;
 
 /// Trap frame as built by `entry.S` (see module docs for the layout contract).
 #[repr(C)]
@@ -150,7 +149,7 @@ unsafe extern "C" {
     static x86_isr_stub_table: [usize; 256];
 }
 
-/// Install the IDT and bring up the legacy PIC + PIT on the current CPU.
+/// Install the IDT and remap the legacy PIC (all lines masked) on this CPU.
 pub fn init() {
     // SAFETY: BSP early boot, single-threaded, interrupts still disabled by
     // the boot path; IDT and stub table live in this image.
@@ -170,14 +169,18 @@ pub fn init() {
             options(nostack),
         );
     }
-    init_legacy_pic_and_pit();
+    init_legacy_pic();
 }
 
-/// Remap the 8259 pair to vectors 0x20..0x2F, unmask only IRQ0, and start the
-/// 8254 PIT channel 0 as a ~100 Hz periodic tick.
-fn init_legacy_pic_and_pit() {
+/// Remap the 8259 pair to vectors 0x20..0x2F and mask every line.
+///
+/// The remap is required because the PIC's reset vectors overlap the
+/// architectural exception range; masking all lines is required because this
+/// port brings up **no** interrupt source (the PIT is deliberately not
+/// started).
+fn init_legacy_pic() {
     // SAFETY: fixed legacy PC I/O ports; runs once during early boot with
-    // interrupts disabled and no other user of the PIC/PIT.
+    // interrupts disabled and no other user of the PIC.
     unsafe {
         // ICW1: begin initialization, edge triggered, cascade.
         super::console::outb(PIC1_COMMAND, 0x11);
@@ -191,14 +194,9 @@ fn init_legacy_pic_and_pit() {
         // ICW4: 8086/88 mode.
         super::console::outb(PIC1_DATA, 0x01);
         super::console::outb(PIC2_DATA, 0x01);
-        // OCW1: unmask only IRQ0 (PIT) on the master; slave fully masked.
-        super::console::outb(PIC1_DATA, 0xFE);
+        // OCW1: mask every line (no interrupt source is enabled).
+        super::console::outb(PIC1_DATA, 0xFF);
         super::console::outb(PIC2_DATA, 0xFF);
-        // 8254: channel 0, lo/hi byte, mode 3 (square wave), binary.
-        let divisor = (PIT_BASE_HZ / PIT_TICK_HZ) as u16;
-        super::console::outb(PIT_COMMAND, 0x36);
-        super::console::outb(PIT_CHANNEL0, divisor as u8);
-        super::console::outb(PIT_CHANNEL0, (divisor >> 8) as u8);
     }
 }
 
@@ -257,9 +255,11 @@ extern "C" fn x86_trap_entry(frame: *const TrapFrame) {
     // SAFETY: `entry.S` always passes the frame pointer it just built.
     let frame = unsafe { &*frame };
     if frame.vector == TIMER_VECTOR as usize {
-        // Complete the interrupt at the PIC before dispatching so a slow
-        // handler cannot lose the next tick; the PIT keeps its period.
-        // SAFETY: PIC/PIT were configured by `init` on this CPU.
+        // Nothing raises this vector today (the PIT is not started and no
+        // deadline source exists).  If a real timer lands here, complete it at
+        // the PIC before dispatching so a slow handler cannot lose the next
+        // event.
+        // SAFETY: PIC was configured by `init` on this CPU.
         unsafe { super::console::outb(PIC1_COMMAND, PIC_EOI) };
         dispatch_timer();
         return;

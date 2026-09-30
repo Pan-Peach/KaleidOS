@@ -187,6 +187,19 @@ pub trait CpuArch {
     /// C5 骨架：irq-save 临界区的状态载体。
     type IrqFlags;
     fn context_switch(from: &mut Self::Context, to: &Self::Context);
+    /// 构造一个**架构相关的执行记录**（entry + 栈顶）；**不执行它**。
+    ///
+    /// 调用点有两种不同义务，不要混淆：
+    /// - **全新执行**：`entry` 是真实入口、`stack_top` 是可用内核栈——之后必须
+    ///   经 [`Self::context_switch`] 进入。构造成功**不证明**能执行：trap 状态、
+    ///   栈与地址空间由调用点各自保证。
+    /// - **仅作保存位**（save-only placeholder）：`(0, 0)` 之类占位只让切换路径
+    ///   有地方保存"当前无任务/锚点"的寄存器状态，**永不**作为 `to` 进入。
+    ///
+    /// containment 的 panic-recovery 目标属于第一种：它是**真实可执行**的恢复
+    /// 目的地（由 `switch_to_core` 进入），不是惰性元数据。宿主侧构造测试
+    /// （boot 构建路径）只证明记录被建出来，**不证明**任务真的能执行——那需要
+    /// 目标上的真实 trap / context switch。
     fn new_context(entry: usize, stack_top: usize) -> Self::Context;
     /// 初始化**当前执行 CPU** 的架构执行/trap 状态。
     ///
@@ -201,11 +214,43 @@ pub trait CpuArch {
     fn disable_irq() -> Self::IrqFlags;
     /// 恢复 `disable_irq` 返回的状态（irq-restore 退出）；嵌套 guard 必须恢复进入时状态。
     fn restore_irq(flags: Self::IrqFlags);
-    /// 等待下一次中断（RISC-V `wfi`；host fake = no-op）。
+
+    /// 等待下一次中断的**原始 CPU idle 提示**（RISC-V `wfi`、x86 `hlt`、
+    /// AArch64 `wfi`；host fake = no-op）。
+    ///
+    /// 这是裸指令语义，只做"CPU 可以睡了"这一个提示，**不保证**：
+    /// - 不强加有界等待：可能立刻虚假返回（spurious），也可能**永不返回**；
+    /// - 不 arm timer、不改中断使能状态；
+    /// - 不同 ISA 的指令序列无需相同。
     ///
     /// **调用者负责保证有中断会到来**（例如先 arm 一个 one-shot timer）——
-    /// 没有使能的中断源时 `wfi` 可能永久睡眠。
+    /// 没有使能的中断源时可能永久睡眠。需要"检查-睡眠原子化、不丢唤醒"的
+    /// 协议请用 [`Self::atomic_idle`]。
     fn wait_for_interrupt();
+
+    /// **检查-睡眠原子化**的 CPU idle；在本地中断已由 [`Self::disable_irq`]
+    /// 关闭的前提下进入 idle，返回前恢复 `flags`。
+    ///
+    /// # 调用者契约
+    ///
+    /// - 在**同一 CPU** 上调用，且该 CPU 的本地中断投递已由 `disable_irq()`
+    ///   关闭（进入时中断必须是关的）；
+    /// - 调用前（关中断状态下）已检查谓词 / arm 了**可用的唤醒源**；
+    /// - 不得持有任何会从中断路径再次获取的锁；
+    /// - `flags` 为"中断已启用"：从已 armed 状态进入 idle 时，**不得**在
+    ///   "重新使能 → 睡眠"的窗口里丢掉一个 pending 中断；
+    /// - `flags` 为"中断已关闭"：恢复 `flags` 并立即返回，**不睡眠**；
+    /// - 返回前恢复 `flags`（嵌套 guard 看到的状态不变）。
+    ///
+    /// 实现必须使用各 ISA 的原子 idle 序列（x86 `sti; hlt; cli` 的连续序列、
+    /// RISC-V 保持全局中断关闭的 masked-WFI 行为、AArch64 的 pending-IRQ 检查
+    /// + WFI）；**不得**简单实现成 `restore_irq(flags); wait_for_interrupt()`。
+    ///
+    /// # Safety
+    ///
+    /// 必须满足上述执行环境与协议：中断必须在调用前关闭、谓词 / 唤醒源必须在
+    /// 关中断状态下建立；在中断未关闭时调用会失去检查-睡眠的原子性。
+    unsafe fn atomic_idle(flags: Self::IrqFlags);
 
     // ——— SMP：CPU-local 身份与基址（SMP 骨架，见 docs/modules/arch.md）———
     //
@@ -243,26 +288,55 @@ pub trait CpuArch {
     unsafe fn install_per_cpu_base(cpu: cpu::CpuId, base: core::ptr::NonNull<()>);
 }
 
+/// Timer 后端的失败原因。
+///
+/// 只在后端**真的没有可用机制**时返回：成功必须意味着这条能力可用
+/// （见 [`Timer`] 各方法契约），不是"结构上存在所以返回 `Ok`"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerError {
+    /// 该 ISA / 平台没有这条能力（例如没有 deadline 编程硬件）。
+    Unsupported,
+    /// 能力存在，但到 CPU 的投递路径（路由 / CPU interface / trap 分发）不可用。
+    DeliveryUnavailable,
+    /// 后端硬件 / 固件调用失败。
+    HardwareFailure,
+}
+
 /// 时钟 / 单次定时器服务（firmware/platform 能力，不是 ISA 原语）。
 ///
 /// 与 `Console`/`SystemReset` 同一模式：Core 只依赖本 trait 与 `TimerImpl`，
-/// 不感知 SBI/CLINT 细节。时间单位 = 平台的 timebase tick。
-/// C5 骨架：签名即契约，实现待手写。
+/// 不感知 SBI/CLINT/PIT/CNTV 细节。时间单位 = 平台的 timebase tick。
+///
+/// # 成功语义（诚实性要求）
+///
+/// - [`Self::init_cpu`] / [`Self::enable_timer_interrupt`] 返回 `Ok(())` 表示
+///   **投递路径端到端可用**：本地机制已配置、源已解开、trap 分发会到达
+///   [`Self::register_timer_handler`] 注册的回调；
+/// - [`Self::set_deadline`] 返回 `Ok(())` 表示一个**真实 deadline 已被编程**，
+///   不是"某个无关的周期 tick 正在跑"；
+/// - 能力存在但投递不可用时必须返回 [`TimerError::DeliveryUnavailable`]，绝不
+///   假装成功（Core 据此决定是否回退到轮询）。
 pub trait Timer {
-    /// 初始化**当前执行 CPU** 的 timer（disarmed、source-masked）。
+    /// 初始化**当前执行 CPU** 的 timer 机制（disarmed、source-masked）。
     ///
     /// 不得打开全局中断使能；由 [`CpuArch::enable_irq`] 在最后统一开闸。
-    fn init_cpu() -> Result<(), smp::InitError>;
+    fn init_cpu() -> Result<(), TimerError>;
     /// 当前时间（单调递增）。
     fn now() -> u64;
     /// 编程下一次时钟中断的**绝对** deadline（与 `now` 同一基准）。
-    fn set_deadline(deadline: u64);
-    /// 取消当前 deadline，直到下一次 `set_deadline` 不再产生 timer IRQ。
+    ///
+    /// `Ok(())` = deadline 真的被写进硬件（并保证稍后产生一次 timer IRQ）。
+    fn set_deadline(deadline: u64) -> Result<(), TimerError>;
+    /// 取消当前 deadline；直到下一次 `set_deadline` 不再产生 timer IRQ。
     fn cancel_deadline();
     /// 注册时钟中断回调（回执带**逻辑** `CpuId`）；是否使能由
     /// [`Self::enable_timer_interrupt`] 单独负责。
     fn register_timer_handler(handler: cpu::LocalInterruptHandler);
-    fn enable_timer_interrupt();
+    /// 建立 / 解开**当前 CPU** 的 timer 投递路径（不动全局中断使能位）。
+    ///
+    /// `Ok(())` 必须意味着回调真的会被调用；路由、CPU interface 或 trap 分发
+    /// 任一缺失时返回 [`TimerError::DeliveryUnavailable`]。
+    fn enable_timer_interrupt() -> Result<(), TimerError>;
 }
 
 /// 外部中断控制器（PLIC）机制（C6 骨架）。

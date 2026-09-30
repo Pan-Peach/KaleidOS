@@ -15,12 +15,25 @@
 
 | trait | 契约方法 | Riscv 实现 | Fake 实现 |
 |---|---|---|---|
-| `CpuArch` | `Context`、`IrqFlags`、`context_switch`、`new_context`、`init_cpu`、`enable_irq`、`disable_irq`/`restore_irq`、`wait_for_interrupt`、`current_cpu`/`per_cpu_base`/`install_per_cpu_base` | `riscv/cpu.rs` | `fake/mod.rs` |
-| `Timer` | `init_cpu`（本地、disarmed、masked）、`now`、`set_deadline`、`cancel_deadline`、`register_timer_handler(LocalInterruptHandler)`、`enable_timer_interrupt`（只解源） | `riscv/cpu.rs` | `fake/mod.rs` |
+| `CpuArch` | `Context`、`IrqFlags`、`context_switch`、`new_context`、`init_cpu`、`enable_irq`、`disable_irq`/`restore_irq`、`wait_for_interrupt`（裸 idle 提示）、`unsafe atomic_idle`（检查-睡眠原子化）、`current_cpu`/`per_cpu_base`/`install_per_cpu_base` | `riscv/cpu.rs` | `fake/mod.rs` |
+| `Timer` | `init_cpu`（本地、disarmed、masked，`Result<(), TimerError>`）、`now`、`set_deadline`（`Result`；`Ok` = 真实 deadline 已编程）、`cancel_deadline`、`register_timer_handler(LocalInterruptHandler)`、`enable_timer_interrupt`（只解投递路径、`Result`；`Ok` = 回调真的会被调用） | `riscv/cpu.rs` | `fake/mod.rs` |
 | `InterruptController` | `Config`、`Claim`、`unsafe configure`、`init_cpu`、`enable`/`disable`、`claim`/`claim_line`/`complete`、`register_external_handler(LocalInterruptHandler)`、`enable_external_interrupt` | `riscv/plic.rs`（`PlicConfig` / `PlicClaim`） | `fake/mod.rs` |
-| `Smp` | `BootConfig`、`unsafe prepare`、`unsafe start_cpu`、`init_cpu`、`register_ipi_handler`、`enable_ipi_interrupt`、`send_ipi`、`send_ipi_mask` | `riscv/smp.rs`（骨架） | `fake/mod.rs` |
+| `Smp` | `BootConfig`、`unsafe prepare`、`unsafe start_cpu`、`init_ipi_cpu`（本地 IPI 接收，保持 masked）、`register_ipi_handler`、`enable_ipi_interrupt`、`send_ipi`、`send_ipi_mask` | `riscv/smp.rs`（骨架） | `fake/mod.rs` |
 | `Console` | `write_byte`、`getc` | `riscv/console.rs` | `fake/mod.rs` |
 | `SystemReset` | `system_reset(ResetType) -> !` | `riscv/cpu.rs` | `fake/mod.rs` |
+
+> **timer 的诚实性契约**：`TimerError { Unsupported, DeliveryUnavailable, HardwareFailure }`。
+> `init_cpu` / `enable_timer_interrupt` 返回 `Ok` 必须意味着投递链路端到端可用；
+> `set_deadline` 返回 `Ok` 必须意味着一个**真实 deadline** 被编程（不是"某个无关的周期 tick 正好在跑"）。
+> 能力存在但路由 / CPU interface / trap 分发缺失时必须返回 `DeliveryUnavailable`，绝不假装成功。
+> 当前映射：RISC-V（SBI TIME）可用；x86_64 只有可读 TSC、无 deadline 投递 → `Unsupported` / `DeliveryUnavailable`；
+> AArch64 架构 timer 可编程但 GICv3 PPI 路由未接通 → `DeliveryUnavailable`；LoongArch64 骨架 → `Unsupported`。
+>
+> **`atomic_idle` 契约**（替代旧 Core 里的 "masked WFI" 汇编）：调用前必须已由 `disable_irq()` 关中断，
+> 并在关中断状态下 arm 好唤醒源；`flags` 为"中断已启用"时不得在 enable→sleep 窗口丢 pending 中断；
+> `flags` 为"已关闭"时恢复并立即返回、不睡眠；实现用各 ISA 的原子序列（x86 `sti; hlt; cli`、
+> RISC-V 全局中断关闭的 masked-WFI、AArch64 pending-IRQ 检查 + WFI），**不是** `restore_irq + wait_for_interrupt`。
+> `wait_for_interrupt` 退回为**裸 idle 提示**：可能 spurious / 永不返回、不 arm timer、不改中断状态。
 
 > **`tp`（x4）只是架构 / 任务执行状态（线程指针）**，不是组件运行时指针，也没有 per-instance runtime slot：`RiscvContext.tp` 与 `switch32.S` / `switch64.S` 在任务切换、`TrapFrame.x[4]` 在 trap 时由 Core 透明保存 / 恢复；全新执行上下文起点为 `tp == 0`；跨 AS trampoline 对全新同步 Isolated 入口**显式清零 `tp`**（不继承 caller 的 `tp`）。TLS / 线程指针语义属未来 task/thread/libc runtime，**不属于 Component 模型**；Core 的 principal / authority 来自 `RequestContext::ambient()`（containment escape-guard 链），与 `tp` 无关。
 
@@ -40,7 +53,7 @@
 
 **不变式：逻辑 CPU0 = boot hart。** OpenSBI 用**抽签**选 boot hart，它不一定是 DTB 里第一个 CPU；boot 在 discovery 后**归一化**（`main64.rs` / `main32.rs`），使 BSP 恒为逻辑 0。PLIC 外部固定路由、`trap_stack_range()`、per-CPU 表都依赖这条不变式（不归一化时 `smp-percpu` / `external-irq` 实测 flaky）。
 
-- **已实现（RISC-V / Fake）**：`CpuId`/`HardwareCpuId` 分离；回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 的 `Config`/`Claim` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；`CpuArch::init_cpu`/`enable_irq`/`current_cpu`/`per_cpu_base`/`install_per_cpu_base`；`Timer::init_cpu`；`Smp::init_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；中断使能生命周期显式化（本地 `init_cpu`/解源 与全局 `enable_irq` 分离）。
+- **已实现（RISC-V / Fake）**：`CpuId`/`HardwareCpuId` 分离；回调统一为 `LocalInterruptHandler = fn(CpuId)`；`InterruptController` 的 `Config`/`Claim` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；`CpuArch::init_cpu`/`enable_irq`/`current_cpu`/`per_cpu_base`/`install_per_cpu_base`/`atomic_idle`（RISC-V：全局中断关闭下的 masked-WFI）；`Timer::init_cpu` + 诚实 readiness（`Ok` = 投递可用）；`Smp::init_ipi_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；中断使能生命周期显式化（本地 `init_cpu`/解源 与全局 `enable_irq` 分离）。Fake 后端提供确定性故障注入（init / delivery / arm 失败）与有序 `TimerEvent` 日志，供 Core 测试断言检查-睡眠协议。
 - **Core 侧（`os/core/src/smp/`，已落地并接线）**：`CpuMask`/`PerCpu`/`CpuBootState`/`BootGate` + 记录表 `CpuRegistry`；`init`（BSP 侧：校验拓扑、注册 Core IPI 回调、BSP Online）；`cpu_state`/`online_cpus`/`request_start`/`mark_ready`/`cpu_identity_ok`；`ipi::notify`/`ipi_interrupt`/`drain_pending`（pending 位 → 延迟重调度标志）；`secondary_entry`（AP 入场：绑入口记录 → per-CPU sched/timer/irq → 身份验证 → Ready → BootGate → Online → Core 空闲循环）；`release_secondaries`/`wait_until_online`；`timer::STATE` 已 per-CPU。`core::init` 调 `smp::init`；boot 的 `secondary_main` 现为指向 Core 的**薄 trampoline**，`start_secondaries` 驱动 `request_start` + `release_secondaries`。**AP 已进入 Core 并 Online**（`smp-boot`/`smp-ipi`/`smp-percpu` 经 Core 状态断言）。
 - **仍是 `todo!()`（人类，关键并发路径）**：arch `Smp::prepare`/`start_cpu`（启动 seam，可 still boot 驱动）；`containment` 的进程级 `static mut` → per-CPU（AP 跑组件任务的前提）；跨 CPU **任务放置 / 迁移**的离场上下文交接（Oracle 最高风险：`sched.rs` 先发布离场状态、后保存上下文）；抢占（C5）。
 - **协调项**：外部 IRQ 仍固定路由 BSP；AP 目前只做 Core 空闲循环（不跑组件任务），因此 `containment::init_cpu` 仍滞留 `todo!()`（AP 不触发它）。详见 `.omo/plans/smp-production-integration.md`。
@@ -53,6 +66,7 @@
 - `encoding.rs`：APIC/ICR（x86_64）、MPIDR/PSCI/SGI（aarch64）、CSR/IOCSR mailbox/IPI（loongarch64）等纯格式。
 - `elf.rs`：各 ISA 的 `RelocationBackend`，`ELF_MACHINE` = 62 / 183 / 258；未实现时 `apply` 返回 `RelocationError::Unsupported`，**绝不误用 RISC-V 语义**。
 - `AddressSpaceImpl`：新 ISA 未实现前用显式占位 `stub_vm::StubAddressSpace`（`PRIVATE_ADDRESS_SPACE = false`），不假装成 Sv39。
+- **timer 诚实性（新 ISA）**：x86_64 只有可读 TSC（`now` 可用），没有 deadline 投递，且**不再**在 IDT 安装时启动周期 PIT —— `init_cpu`/`set_deadline` 返回 `Unsupported`、`enable_timer_interrupt` 返回 `DeliveryUnavailable`，控制台靠 Core 轮询继续工作；AArch64 的 `init_cpu` / `set_deadline` 真实可用（`cancel_deadline` 后再次 `set_deadline` 会显式重开 `CNTV_CTL.ENABLE`），但 GICv3 PPI 路由未接通 → `enable_timer_interrupt` 返回 `DeliveryUnavailable`；LoongArch64 骨架一律 `Unsupported` / `DeliveryUnavailable`。
 - boot：`os/boot/{x86_64,aarch64,loongarch64}` 骨架（`_start` `todo!()`）；`.kcomp` 组件目前仍是 RISC-V 重定位专用，所以新 ISA ArchTest 用 **Core-only** 镜像。
 
 ## 明确不做

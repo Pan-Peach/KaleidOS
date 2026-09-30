@@ -31,7 +31,7 @@ impl Smp for Loongarch64 {
         todo!("loongarch64 SMP: write the AP entry address into the mailbox and IPI it")
     }
 
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_ipi_cpu() -> Result<(), InitError> {
         todo!("loongarch64 SMP: enable this CPU's IOCSR IPI reception, still masked")
     }
 

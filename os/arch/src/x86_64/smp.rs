@@ -39,7 +39,7 @@ impl Smp for X86_64 {
         todo!("x86_64 SMP: INIT -> INIT-deassert -> SIPI -> SIPI to the target APIC id")
     }
 
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_ipi_cpu() -> Result<(), InitError> {
         // Local APIC bring-up (SVR enable, spurious vector) is part of the AP
         // path; with no APIC yet, the IPI vector is trivially masked.
         Ok(())

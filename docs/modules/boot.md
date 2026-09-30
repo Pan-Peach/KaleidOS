@@ -19,6 +19,8 @@
 - RV64：`bootstrap_main(hart_id, dtb_pa, kernel_pa)`（`main64.rs`）→ `bootstrap_high(context_ptr)`（高半区别名进入）→ `kernel::init(&context.info, &context.reserved)` → `runtime::init(...)` → `kernel::component::store::init(pkg)` → `CpuImpl::enable_irq()` → `smp::start_secondaries(&info)` → `kernel::monitor::run()`。
 - **SMP（RV64）**：boot 在 `kernel::init` + 长期地址空间 + 全局中断之后调 `crate::smp::start_secondaries`（SBI HSM `hart_start` 启动 AP）。**归一化不变式**：discovery 后把 cpu 顺序调整为 **boot hart = 逻辑 CPU0**（OpenSBI 抽签使 boot hart 不一定是 DTB 首个 CPU；不归一化会让 PLIC 外部路由 / per-CPU 表指向错误的 hart）。AP 入口 `secondary_main`（`src/smp.rs`）+ 物理 trampoline `_secondary_start`（`secondary64.S`）；AP 目前完成本地初始化后 `wfi`（尚未进入 Core 调度，见 `docs/modules/arch.md` SMP 章节）。
 - RV32：`bootstrap_main`（`main32.rs`）→ `discover(dtb_pa, hart_id)` 返回 `MachineInfo` → `kernel::init` → store init → `monitor::run()`。
+- **新 ISA（x86_64 / aarch64）现状**：x86_64 经 Multiboot2 / PVH 发现可用 RAM，CPU 只报告 BSP（无 ACPI MADT），`timebase_frequency = 0`（zero-as-unknown：TSC 频率不可发现，**不伪造** 1 GHz）；aarch64 读 `CNTFRQ_EL0` 得到非零 timebase。两者都只跑 `selftest` 镜像（`boot` 用例），timer 投递分别诚实报告 `Unsupported` / `DeliveryUnavailable`（控制台靠 Core 轮询）；aarch64 非 selftest 的 Core Monitor 入口仍是 `todo!()`（`os/boot/aarch64/src/main.rs`）。
+- **aarch64 boot 栈 = 64 KiB**（`linker.ld` `.bss.stack`）：`resource::init` 会在 ~10 KiB 调用深度上构造 8 KiB 的 `IrqTable` 栈临时量；16 KiB 栈会溢出到 `__boot_stack_bottom` 之下（`.data` 末尾的全局堆 / 已提交 `MachineInfo`）并静默破坏 live statics。
 - `selftest` feature：走 `crate::selftest::run(&info)`（ArchTest，白盒 selftest，返回 `!`）。
 - 关键内部符号：`layout::kernel_layout()`、`bootstrap::init` / `install_identity_alias` / `install_kernel_alias` / `root_pa` / `enter_high_half`、`runtime::RuntimeVm`、`print_linker_layout()`、`configure_machine_timer` / `configure_interrupt_controller`。
 

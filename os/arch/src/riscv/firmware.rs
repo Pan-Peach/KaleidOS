@@ -108,9 +108,12 @@ pub fn time() -> u64 {
 /// 到点后硬件置 `mip.STIP` → OpenSBI 委托为 `sip.STIP` → 在 `sie.STIE`
 /// 打开时向 S-mode 投递时钟中断。`deadline` 与 [`time`] 同一基准。
 ///
+/// `Ok(())` 只在 SBI 调用真的成功后返回；失败绝不假装已编程。
 #[cfg(feature = "supervisor")]
-pub fn set_timer(deadline: u64) {
-    sbi_rt::set_timer(deadline);
+pub fn set_timer(deadline: u64) -> Result<(), crate::TimerError> {
+    if sbi_rt::set_timer(deadline).is_err() {
+        return Err(crate::TimerError::HardwareFailure);
+    }
     unsafe {
         core::arch::asm!(
             "csrs sie, {mask}",
@@ -118,6 +121,7 @@ pub fn set_timer(deadline: u64) {
             options(nostack, preserves_flags),
         );
     }
+    Ok(())
 }
 
 #[cfg(feature = "supervisor")]
@@ -164,7 +168,7 @@ pub fn configure_machine_timer(mtimecmp_base: usize) {
 }
 
 #[cfg(feature = "machine")]
-pub fn set_timer(deadline: u64) {
+pub fn set_timer(deadline: u64) -> Result<(), crate::TimerError> {
     let hart_id: usize;
     unsafe {
         core::arch::asm!(
@@ -175,7 +179,10 @@ pub fn set_timer(deadline: u64) {
     }
 
     let mtimecmp_base = MACHINE_MTIMECMP_BASE.load(Ordering::Acquire);
-    assert!(mtimecmp_base != 0, "machine timer was not configured");
+    if mtimecmp_base == 0 {
+        // boot 尚未配置 mtimecmp：没有可编程的 deadline 机制，诚实报错。
+        return Err(crate::TimerError::HardwareFailure);
+    }
     let address = mtimecmp_base + hart_id * 8;
 
     #[cfg(target_arch = "riscv64")]
@@ -202,11 +209,12 @@ pub fn set_timer(deadline: u64) {
             options(nostack, preserves_flags),
         );
     }
+    Ok(())
 }
 
 #[cfg(feature = "machine")]
 pub fn cancel_timer() {
-    set_timer(u64::MAX);
+    let _ = set_timer(u64::MAX);
     unsafe {
         core::arch::asm!(
             "csrc mie, {mask}",

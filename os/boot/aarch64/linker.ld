@@ -43,11 +43,17 @@ SECTIONS
      * Boot stack: its own NOLOAD region so the entry can zero `.bss` without
      * touching the stack it is already running on.  `__boot_stack_top` is the
      * initial SP (16-byte aligned per AAPCS64).
+     *
+     * 64 KiB, not 16 KiB: `resource::init` constructs the 8 KiB `IrqTable`
+     * (`[Option<IrqRoute>; 256]`) as a stack temporary while the call chain is
+     * already ~10 KiB deep.  On a 16 KiB stack that overflowed *below*
+     * `__boot_stack_bottom` into `.data` (the global heap / committed machine
+     * info are the last objects there), silently corrupting live statics.
      */
     .bss.stack (NOLOAD) : ALIGN(16)
     {
         __boot_stack_bottom = .;
-        . += 16 * 1024;
+        . += 64 * 1024;
         __boot_stack_top = .;
     }
 

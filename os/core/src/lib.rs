@@ -113,7 +113,16 @@ pub fn init(
     #[cfg(feature = "preempt")]
     timer::init_preempt(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
     #[cfg(not(feature = "preempt"))]
-    timer::init().map_err(|_| "timer init failed")?;
+    if let Err(error) = timer::init() {
+        // 协作式 profile 可以在**没有 timer 投递**的情况下继续：`print::
+        // idle_wait` 会在 arm 失败时回退轮询，绝不挂死。需要 timer 驱动的
+        // profile（`preempt`，上面那行）仍然 fail-closed。
+        log!(
+            "timer",
+            "delivery unavailable ({:?}); idle falls back to polling",
+            error
+        );
+    }
 
     component::registry::init();
     component::endpoint::init();

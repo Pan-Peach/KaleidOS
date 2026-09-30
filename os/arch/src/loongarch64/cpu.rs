@@ -52,6 +52,10 @@ impl CpuArch for Loongarch64 {
         todo!("loongarch64: idle (idle instruction)")
     }
 
+    unsafe fn atomic_idle(_flags: Self::IrqFlags) {
+        todo!("loongarch64: atomic check→idle (idle instruction, CRMD.IE restore)")
+    }
+
     fn current_cpu() -> Option<CpuId> {
         todo!(
             "loongarch64: return the Core-assigned *logical* CpuId from the arch entry record (NOT CSR.CPUID)"
@@ -68,16 +72,17 @@ impl CpuArch for Loongarch64 {
 }
 
 impl Timer for Loongarch64 {
-    fn init_cpu() -> Result<(), crate::smp::InitError> {
-        todo!("new ISA: initialize this CPU's timer, disarmed and source-masked")
+    fn init_cpu() -> Result<(), crate::TimerError> {
+        // No timer machinery exists on this skeleton; never claim readiness.
+        Err(crate::TimerError::Unsupported)
     }
 
     fn now() -> u64 {
         todo!("loongarch64: monotonic time source (stable counter via RDTIME*, not CNTC)")
     }
 
-    fn set_deadline(_deadline: u64) {
-        todo!("loongarch64: program TCFG/TVAL for this CPU")
+    fn set_deadline(_deadline: u64) -> Result<(), crate::TimerError> {
+        Err(crate::TimerError::Unsupported)
     }
 
     fn cancel_deadline() {
@@ -88,8 +93,9 @@ impl Timer for Loongarch64 {
         todo!("loongarch64: register the timer interrupt handler")
     }
 
-    fn enable_timer_interrupt() {
-        todo!("loongarch64: unmask this CPU's timer interrupt (ECFG)")
+    fn enable_timer_interrupt() -> Result<(), crate::TimerError> {
+        // No route / CPU interface exists yet; report delivery honestly.
+        Err(crate::TimerError::DeliveryUnavailable)
     }
 }
 

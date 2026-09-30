@@ -317,7 +317,7 @@ pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
     if machine.cpu_count > 1 {
         <Backend as Smp>::register_ipi_handler(ipi::ipi_interrupt)
             .map_err(SmpInitError::BackendInit)?;
-        <Backend as Smp>::init_cpu().map_err(SmpInitError::BackendInit)?;
+        <Backend as Smp>::init_ipi_cpu().map_err(SmpInitError::BackendInit)?;
     }
 
     registry.publish_bsp_online(bsp)?;
@@ -404,7 +404,7 @@ pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
     let init_ok = crate::sched::init_cpu(cpu).is_ok()
         && crate::timer::init_cpu(cpu).is_ok()
         && crate::irq::init_cpu(cpu).is_ok()
-        && <Backend as Smp>::init_cpu().is_ok();
+        && <Backend as Smp>::init_ipi_cpu().is_ok();
 
     // 3) 身份 + 初始化门禁：任一失败即标记 Failed 并 park，绝不进入调度。
     if !init_ok || current_cpu() != cpu {
@@ -441,8 +441,9 @@ fn ap_failed(cpu: CpuId) -> ! {
 fn idle_loop(cpu: CpuId) -> ! {
     loop {
         // 「检查-睡眠」原子化（Oracle 评审：防丢唤醒）：先关本 CPU 中断再 drain；
-        // 此后到达的门铃让 `sip.SSIP` 保持 pending，而 SIE 关闭下的 `wfi` 会立即
-        // 返回（pending 即唤醒），不会出现“drain 完就睡、门铃被吞”的永久睡眠。
+        // 此后到达的门铃让 `sip.SSIP` / GIC SGI / xAPIC IRR 保持 pending，
+        // `atomic_idle` 在中断关闭下执行休眠——已 armed 的本地源（IPI 接收 /
+        // timer）使 pending 即唤醒，不会出现"drain 完就睡、门铃被吞"的永久睡眠。
         let flags = <arch::CpuImpl as arch::CpuArch>::disable_irq();
         ipi::drain_pending(cpu);
         let _ = take_resched(cpu);
@@ -450,8 +451,10 @@ fn idle_loop(cpu: CpuId) -> ! {
         //   if crate::sched::has_claimable_for(cpu) {
         //       let _ = crate::sched::run();
         //   }
-        <arch::CpuImpl as arch::CpuArch>::wait_for_interrupt();
-        <arch::CpuImpl as arch::CpuArch>::restore_irq(flags);
+        // SAFETY: IRQs are disabled on this CPU (above); `drain_pending` is the
+        // checked predicate and local IPI reception stays enabled, so a doorbell
+        // arriving now keeps the wakeup pending; no interrupt-path lock is held.
+        unsafe { <arch::CpuImpl as arch::CpuArch>::atomic_idle(flags) };
     }
 }
 

@@ -45,7 +45,7 @@ impl Smp for Riscv {
         todo!("SMP(riscv): hand the AP its entry/stack via SBI HSM or mailbox, then IPI it")
     }
 
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_ipi_cpu() -> Result<(), InitError> {
         unsafe { asm!("csrc sip, {}", in(reg) (1usize << 1), options(nostack)) };
         Ok(())
     }

@@ -207,9 +207,26 @@ impl CpuArch for Riscv {
     }
 
     fn wait_for_interrupt() {
+        // 原始 idle 提示：不 arm timer、不改中断使能状态，可能立刻返回或
+        // 永不返回（调用者契约见 `CpuArch::wait_for_interrupt`）。
         unsafe {
             asm!("wfi", options(nomem, nostack, preserves_flags));
         }
+    }
+
+    unsafe fn atomic_idle(flags: Self::IrqFlags) {
+        // 进入时本 CPU 中断投递已关闭（trait 契约），唤醒源已在关中断状态下
+        // armed。这里**保持**全局中断关闭执行 WFI：RISC-V WFI 对"本地使能
+        // （如 `sie.STIE`）且 pending"的中断即使在 SIE=0 时也必须返回，因此
+        // 唤醒不会在"使能 → 睡眠"窗口里丢失——pending 的 trap 留到
+        // `restore_irq` 之后按正常路径处理。
+        if flags & IRQ_ENABLE_BIT != 0 {
+            unsafe {
+                asm!("wfi", options(nomem, nostack, preserves_flags));
+            }
+        }
+        // `flags` 为关中断时不做任何事：没有可用唤醒源，绝不睡眠。
+        Self::restore_irq(flags);
     }
 
     // ——— CPU-local 身份与基址 ———
@@ -292,7 +309,7 @@ impl CpuArch for Riscv {
 }
 
 impl Timer for Riscv {
-    fn init_cpu() -> Result<(), crate::smp::InitError> {
+    fn init_cpu() -> Result<(), crate::TimerError> {
         // UP：无 per-CPU timer 状态；deadline 编程见 `firmware::set_timer`。
         // SMP：实现时在此初始化本 CPU 的 `mtimecmp` 路径。
         Ok(())
@@ -302,8 +319,8 @@ impl Timer for Riscv {
         firmware::time()
     }
 
-    fn set_deadline(_deadline: u64) {
-        firmware::set_timer(_deadline);
+    fn set_deadline(deadline: u64) -> Result<(), crate::TimerError> {
+        firmware::set_timer(deadline)
     }
 
     fn cancel_deadline() {
@@ -314,8 +331,9 @@ impl Timer for Riscv {
         trap::register_timer_handler(handler);
     }
 
-    fn enable_timer_interrupt() {
+    fn enable_timer_interrupt() -> Result<(), crate::TimerError> {
         firmware::enable_timer_interrupt();
+        Ok(())
     }
 }
 

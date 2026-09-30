@@ -35,7 +35,7 @@ impl Smp for Aarch64 {
         todo!("aarch64 SMP: issue PSCI CPU_ON for the target MPIDR affinity")
     }
 
-    fn init_cpu() -> Result<(), InitError> {
+    fn init_ipi_cpu() -> Result<(), InitError> {
         // GICv3 SGI reception (`ICC_IGRPEN1_EL1` + redistributor PPI 27 wake)
         // belongs to the GIC bring-up and stays `todo!()`; no SGI is sent yet,
         // so there is no local source to unmask.  Core only needs `Ok`.
