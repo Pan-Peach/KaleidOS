@@ -25,6 +25,10 @@ pub(crate) mod vm;
 #[path = "vm32/mod.rs"]
 pub(crate) mod vm32;
 
+// 无堆早期内存 pass（RV64/RV32 共用）：包含镜像的 bank + FDT 排除区间扫描。
+#[path = "bootmem.rs"]
+pub(crate) mod bootmem;
+
 // SMP 的 boot 侧骨架（AP trampoline + 栈 + 描述符 + 调用点）。仅 RV64 MMU。
 // 恒编译：单 CPU 机器上 `start_secondaries` 自然空转；哪些用例跑由 runner 决定。
 #[cfg(all(target_arch = "riscv64", feature = "vm-mmu"))]

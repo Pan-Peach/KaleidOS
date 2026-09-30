@@ -7,11 +7,13 @@
 //! 规则（Core 与组件共享）：
 //! - 一个 `MetadataHeap<32, 12>` 实例：`alloc_pages` 提供连续的物理区域；
 //!   `alloc(layout)` 提供小对象堆。
-//! - 区域 = `[align_up(__bootstrap_end), RAM 末尾)` —— ELF/BSS/DTB 在区域外，
-//!   天然保留，无需 reserve API。
+//! - arena 由 boot 的**无堆内存 pass** 选出（Phase 4a：在包含镜像的 bank 内，
+//!   排除镜像 / FDT / boot payload 等 live 区间后的单一连续间隙），经
+//!   [`early_init`] 一次性移交 —— `core::init` 不再初始化 / 重置内存。
 //! - 无 per-component 记账：组件与 Core 共享同一 heap；ResourceDomain 只记 handle。
 //!
 use crate::log;
+use crate::machine::MemoryRegion;
 use crate::memory::address_space::PhysicalRange;
 use buddy_system_allocator::{MetadataHeap, PageOrder, PageRun};
 use core::alloc::{GlobalAlloc, Layout};
@@ -20,8 +22,11 @@ use slab::SlabAllocator;
 use spin::Mutex;
 
 pub mod address_space;
+mod early;
 pub mod kernel_mappings;
 mod slab;
+
+pub use early::{MIN_ARENA_SIZE, select_arena};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -112,25 +117,27 @@ static SLABS: Mutex<SlabAllocator> = Mutex::new(SlabAllocator::new());
 // Init
 // ---------------------------------------------------------------------------
 
-/// Core 物理内存初始化：
-/// - `region_start`：物理区域起点（bootstrap 传页对齐后的 image 末尾）；
-///   该点之前（ELF/BSS/DTB）天然保留。
-/// - `frame_end`：RAM 区域末尾。
+/// 把 `[region_start, region_end)` 交给给定 `MetadataHeap` 的公共实现
+/// （`early::bring_up` 与 host 测试共用；不写第二套分配器逻辑）。
 ///
 /// MetadataHeap 的 metadata 从区域前端 carve，自我描述（无鸡生蛋）。
-pub fn init(region_start: usize, region_end: usize) -> Result<(), &'static str> {
+/// 锁后日志：不持分配器锁打印（打印可能分配/被 panic 中途打断）。
+fn init_heap(
+    heap: &Mutex<MetadataHeap<HEAP_ORDER, HEAP_MIN_ORDER>>,
+    region_start: usize,
+    region_end: usize,
+) -> Result<(), &'static str> {
     if region_start >= region_end {
         return Err("invalid frame region");
     }
 
     // try_init 不安全：调用方保证区间有效、未被他方管理。
     let init_result = {
-        let mut heap = HEAP.lock();
+        let mut heap = heap.lock();
         unsafe { heap.try_init(region_start, region_end - region_start) }
             .map_err(|_| "frame region init failed")
     };
 
-    // 锁后日志：不持分配器锁打印（打印可能分配/被 panic 中途打断）。
     match &init_result {
         Ok(()) => {
             let span_pages = (region_end - region_start) / ALLOC_GRANULE;
@@ -148,6 +155,38 @@ pub fn init(region_start: usize, region_end: usize) -> Result<(), &'static str> 
         }
     }
     init_result
+}
+
+/// host 测试用的裸入口；boot **只**走 [`early_init`]（一次性 seam）。
+#[cfg(test)]
+fn init(region_start: usize, region_end: usize) -> Result<(), &'static str> {
+    init_heap(&HEAP, region_start, region_end)
+}
+
+/// **早期内存 seam**：boot 完成无堆内存 pass、选出唯一 arena 后调用一次。
+///
+/// 校验（全部 fail-closed）：非零尺寸、端点 `base + size` 不溢出、页对齐、
+/// 不小于分配器可用的最小容量（[`MIN_ARENA_SIZE`]）、且**只允许调用一次**。
+/// 通过后启动 Core 唯一的分配器并跑一次 alloc/free 探针（探针帧必须落在
+/// arena 内——arena 选择/元数据出错时立即失败，绝不静默越界）。
+///
+/// # Safety
+///
+/// SAFETY: `arena` is writable RAM under the current mapping; it contains no
+/// image, stack, page tables, live firmware/boot data, firmware reservation, or
+/// other live allocation; boot transfers exclusive management of it to Core;
+/// called once by the BSP before any secondary CPU or interrupt can allocate.
+pub unsafe fn early_init(arena: MemoryRegion) -> Result<(), &'static str> {
+    // SAFETY: 调用方契约由本函数的 SAFETY 文档承载；校验在 early::bring_up 内完成。
+    unsafe { early::bring_up(&HEAP, &early::INITIALIZED, arena) }
+}
+
+/// Whether the allocator has been brought up (for `core::init` to check).
+///
+/// 只有 [`early_init`] 成功会置位：host 测试 fixture 直接 `try_init` 全局堆
+/// **不**算 seam 跑过——这正是 `core::init` 要 fail-closed 的情形。
+pub fn is_initialized() -> bool {
+    early::is_initialized()
 }
 
 // ---------------------------------------------------------------------------

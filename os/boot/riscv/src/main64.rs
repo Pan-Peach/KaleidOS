@@ -37,9 +37,19 @@ unsafe extern "C" {
 ///
 /// The object remains on the original discovery stack while
 /// `enter_high_half` switches to a separate high-half stack.
+///
+/// 低地址阶段**不**做完整 discovery、不构造 `MachineInfo`（更不分配）：它只做
+/// 无堆内存 pass。这里是 hand-off 所需的纯输入；完整 discovery 在 high-half
+/// entry 里、`memory::early_init` 之后进行。
 #[repr(C)]
 struct BootContext {
-    info: MachineInfo,
+    /// OpenSBI 传下来的 DTB 物理地址（high-half 仍有 identity alias，可继续解析）。
+    dtb_pa: usize,
+    /// OpenSBI 选定的 boot hart（discovery 用它标 boot CPU）。
+    hart_id: usize,
+    /// 无堆 pass 选出的早期内存 arena（`memory::early_init` 的输入）。
+    arena: MemoryRegion,
+    /// 本文档镜像范围（Core 自己，永久 reserved）。
     reserved: [MemoryRegion; 1],
 }
 
@@ -214,157 +224,164 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     kernel::log!("bootstrap", "========================================");
 
     // FDT 发现：直接吃 OpenSBI 给的 dtb 物理地址（unsafe：该地址有效性 Rust 无从验证）
-    match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
+    let tree = match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
         Ok(tree) => {
             kernel::log!("bootstrap", "FDT magic: OK");
-
-            // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
-            // MachineInfo 是定长数组 + count（无借用），字符串用 CompatStr 内嵌复制。
-            let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
-            let mut cpu_info = [CpuInfo {
-                boot_cpu: false,
-                hardware_id: HardwareCpuId::from_raw(0),
-            }; MAX_CPUS];
-            let mut devices = [DeviceDescriptor::empty(); 26];
-
-            let mut mem_count = 0usize;
-            for region in tree.root().memory().reg().iter::<u64, u64>() {
-                let Ok(r) = region else { continue };
-                if mem_count >= memory_regions.len() {
-                    kernel::log!("discovery", "too many RAM regions; dropping");
-                    continue;
-                }
-                memory_regions[mem_count] = MemoryRegion {
-                    base: r.address as usize,
-                    size: r.len as usize,
-                };
-                mem_count += 1;
-            }
-
-            let mut cpu_count = 0usize;
-            for cpu in tree.root().cpus().iter() {
-                if cpu_count >= cpu_info.len() {
-                    kernel::log!("discovery", "too many CPUs; dropping");
-                    continue;
-                }
-                let hart = cpu.reg::<u64>().first().unwrap_or(0);
-                cpu_info[cpu_count] = CpuInfo {
-                    boot_cpu: hart == hart_id as u64,
-                    hardware_id: HardwareCpuId::from_raw(hart),
-                };
-                cpu_count += 1;
-            }
-
-            // 归一化：逻辑 CPU id = 数组下标（从 0 稠密），并强制 **boot hart = 逻辑
-            // CPU0**。OpenSBI 用抽签选 boot hart，它不一定是 discovery 下标 0；不归一
-            // 化时 BSP 会绑到 CPU0 的入口记录/trap 栈，而某个 AP 之后又占用 CPU0 →
-            // 逻辑身份互相别名（smp-percpu 因此 flaky）。保持「BSP = 逻辑 0」这一
-            // 既有不变式，PLIC 外部固定路由、`trap_stack_*`、per-CPU 表全部继续正确。
-            if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
-                cpu_info.swap(0, boot_index);
-            }
-
-            // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
-            let mut dev_count = 0usize;
-            collect_devices(
-                tree.root().as_node().children(),
-                &mut devices,
-                &mut dev_count,
-            );
-            if let Some(soc) = tree.find_node("/soc") {
-                collect_devices(soc.children(), &mut devices, &mut dev_count);
-            }
-
-            let info = MachineInfo {
-                boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
-                timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
-                cpu_count,
-                cpu_info,
-                mem_count,
-                memory_regions,
-                dev_count,
-                devices,
-            };
-
-            #[cfg(feature = "machine")]
-            configure_machine_timer(&info);
-
-            configure_interrupt_controller(&info);
-
-            if mem_count == 0 {
-                panic!("Sv39 early map failed: no RAM region");
-            }
-
-            let linked_image_start =
-                bootstrap::physical_address_of(linker_addr(core::ptr::addr_of!(__bootstrap_start)));
-            let linked_image_end =
-                bootstrap::physical_address_of(linker_addr(core::ptr::addr_of!(__bootstrap_end)));
-            let image_size = linked_image_end
-                .checked_sub(linked_image_start)
-                .expect("invalid linked kernel image range");
-
-            // Pick the RAM region that actually contains the loaded kernel
-            // image instead of assuming it is the first one.  This keeps the
-            // boot mapping correct on platforms with multiple RAM regions.
-            let ram = memory_regions[..mem_count]
-                .iter()
-                .find(|r| {
-                    r.base <= kernel_pa
-                        && kernel_pa
-                            .checked_add(image_size)
-                            .is_some_and(|end| end <= r.base + r.size)
-                })
-                .copied()
-                .unwrap_or(memory_regions[0]);
-
-            // Section-aware high-half alias: map each linker section with the
-            // permission it actually needs.  Sv39 enforces W^X / no-write on
-            // the formal image once the high-half alias is active.
-            // 段范围与权限的唯一来源：vm::layout（boot/runtime 共同输入）。
-            let layout = layout::kernel_layout();
-
-            match unsafe {
-                bootstrap::init(
-                    kernel_pa,
-                    linked_image_start,
-                    image_size,
-                    ram.base,
-                    ram.size,
-                    &layout.sections(),
-                )
-            } {
-                Ok(()) => {}
-                Err(error) => panic!("Sv39 early map failed: {:?}", error),
-            }
-
-            // 本文档镜像范围 → reserved（Core 自己，永久保留）
-            let image_start = kernel_pa;
-            let context = BootContext {
-                info,
-                reserved: [MemoryRegion {
-                    base: image_start,
-                    size: image_size,
-                }],
-            };
-
-            // Keep the context pointer in the original stack while the
-            // hand-off switches to a separate high-half stack.  FDT discovery
-            // and the early root remain low-address work; Core starts only
-            // after the high-half hand-off.
-            let context_ptr = &context as *const BootContext as usize;
-            kernel::log!("bootstrap", "Sv39 dual map OK; entering high-half");
-            unsafe {
-                arch::riscv::mmu::activate(bootstrap::root_pa() >> 12, 0);
-                bootstrap::enter_high_half(
-                    bootstrap_high as *const () as usize,
-                    context_ptr,
-                    core::ptr::addr_of!(high_boot_stack_top) as usize,
-                );
-            }
+            tree
         }
-        Err(_) => {
-            panic!("FDT magic: BAD");
+        Err(_) => panic!("FDT magic: BAD"),
+    };
+
+    // 无堆早期内存 pass（低地址阶段**不**分配、不构造 MachineInfo）：
+    // 镜像范围 → 包含镜像的 bank（找不到即失败，不落回无关 bank）→ 排除镜像与
+    // 所有 FDT live/reserved 区间后的 arena。
+    let linked_image_start =
+        bootstrap::physical_address_of(linker_addr(core::ptr::addr_of!(__bootstrap_start)));
+    let linked_image_end =
+        bootstrap::physical_address_of(linker_addr(core::ptr::addr_of!(__bootstrap_end)));
+    let image_size = linked_image_end
+        .checked_sub(linked_image_start)
+        .expect("invalid linked kernel image range");
+    let image = MemoryRegion {
+        base: kernel_pa,
+        size: image_size,
+    };
+    let bank = crate::bootmem::image_bank(&tree, kernel_pa, image_size)
+        .unwrap_or_else(|error| panic!("Sv39 early memory: {}", error));
+    // KernelNative 组件从 Core 堆取镜像并做 ±2 GiB PC-relative 重定位：arena
+    // 收在镜像可达窗口内（见 `bootmem::arena_search_window`）。
+    let window = crate::bootmem::arena_search_window(bank, image);
+    let arena = kernel::memory::select_arena(window, image, |emit| {
+        emit(image)?;
+        crate::bootmem::scan_fdt_exclusions(&tree, dtb_pa, emit)
+    })
+    .unwrap_or_else(|error| panic!("Sv39 early memory: {}", error));
+    kernel::log!(
+        "bootstrap",
+        "early arena {:#x}-{:#x} ({} KiB), bank {:#x}+{} MiB",
+        arena.base,
+        arena.base + arena.size,
+        arena.size / 1024,
+        bank.base,
+        bank.size / (1024 * 1024)
+    );
+
+    // Section-aware high-half alias: map each linker section with the
+    // permission it actually needs.  Sv39 enforces W^X / no-write on
+    // the formal image once the high-half alias is active.
+    // 段范围与权限的唯一来源：vm::layout（boot/runtime 共同输入）。
+    let layout = layout::kernel_layout();
+
+    match unsafe {
+        bootstrap::init(
+            kernel_pa,
+            linked_image_start,
+            image_size,
+            bank.base,
+            bank.size,
+            &layout.sections(),
+        )
+    } {
+        Ok(()) => {}
+        Err(error) => panic!("Sv39 early map failed: {:?}", error),
+    }
+
+    // 本文档镜像范围 → reserved（Core 自己，永久保留）
+    let context = BootContext {
+        dtb_pa,
+        hart_id,
+        arena,
+        reserved: [MemoryRegion {
+            base: kernel_pa,
+            size: image_size,
+        }],
+    };
+
+    // Keep the context pointer in the original stack while the
+    // hand-off switches to a separate high-half stack.  FDT discovery
+    // and the early root remain low-address work; Core starts only
+    // after the high-half hand-off.
+    let context_ptr = &context as *const BootContext as usize;
+    kernel::log!("bootstrap", "Sv39 dual map OK; entering high-half");
+    unsafe {
+        arch::riscv::mmu::activate(bootstrap::root_pa() >> 12, 0);
+        bootstrap::enter_high_half(
+            bootstrap_high as *const () as usize,
+            context_ptr,
+            core::ptr::addr_of!(high_boot_stack_top) as usize,
+        );
+    }
+}
+
+/// 完整 discovery（high-half、`early_init` 之后）：FDT → 定长 `MachineInfo`。
+///
+/// 不分配；`MachineInfo` 是定长数组 + count（无借用），字符串用 `CompatStr`
+/// 内嵌复制，DTB 之后可丢。
+fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineInfo {
+    let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
+    let mut cpu_info = [CpuInfo {
+        boot_cpu: false,
+        hardware_id: HardwareCpuId::from_raw(0),
+    }; MAX_CPUS];
+    let mut devices = [DeviceDescriptor::empty(); 26];
+
+    let mut mem_count = 0usize;
+    for region in tree.root().memory().reg().iter::<u64, u64>() {
+        let Ok(r) = region else { continue };
+        if mem_count >= memory_regions.len() {
+            kernel::log!("discovery", "too many RAM regions; dropping");
+            continue;
         }
+        memory_regions[mem_count] = MemoryRegion {
+            base: r.address as usize,
+            size: r.len as usize,
+        };
+        mem_count += 1;
+    }
+
+    let mut cpu_count = 0usize;
+    for cpu in tree.root().cpus().iter() {
+        if cpu_count >= cpu_info.len() {
+            kernel::log!("discovery", "too many CPUs; dropping");
+            continue;
+        }
+        let hart = cpu.reg::<u64>().first().unwrap_or(0);
+        cpu_info[cpu_count] = CpuInfo {
+            boot_cpu: hart == hart_id as u64,
+            hardware_id: HardwareCpuId::from_raw(hart),
+        };
+        cpu_count += 1;
+    }
+
+    // 归一化：逻辑 CPU id = 数组下标（从 0 稠密），并强制 **boot hart = 逻辑
+    // CPU0**。OpenSBI 用抽签选 boot hart，它不一定是 discovery 下标 0；不归一
+    // 化时 BSP 会绑到 CPU0 的入口记录/trap 栈，而某个 AP 之后又占用 CPU0 →
+    // 逻辑身份互相别名（smp-percpu 因此 flaky）。保持「BSP = 逻辑 0」这一
+    // 既有不变式，PLIC 外部固定路由、`trap_stack_*`、per-CPU 表全部继续正确。
+    if let Some(boot_index) = cpu_info[..cpu_count].iter().position(|c| c.boot_cpu) {
+        cpu_info.swap(0, boot_index);
+    }
+
+    // 两层遍历：root 挂系统级设备（QEMU 把 fw-cfg/flash 放在 /），/soc 挂总线设备
+    let mut dev_count = 0usize;
+    collect_devices(
+        tree.root().as_node().children(),
+        &mut devices,
+        &mut dev_count,
+    );
+    if let Some(soc) = tree.find_node("/soc") {
+        collect_devices(soc.children(), &mut devices, &mut dev_count);
+    }
+
+    MachineInfo {
+        boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
+        timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
+        cpu_count,
+        cpu_info,
+        mem_count,
+        memory_regions,
+        dev_count,
+        devices,
     }
 }
 
@@ -380,19 +397,37 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
     let context = unsafe { &*(context_ptr as *const BootContext) };
     kernel::log!("bootstrap", "entered high-half kernel");
     print_linker_layout();
+
+    // Early-memory seam：无堆 pass 已选定 arena；在完整 discovery / 任何分配
+    // 之前把它交给 Core（一次性，重复调用被拒绝）。
+    if let Err(error) = unsafe { kernel::memory::early_init(context.arena) } {
+        panic!("early memory init failed: {}", error);
+    }
+
+    // 完整 discovery：high-half 仍有 identity alias，FDT 物理地址可直接解析。
+    let tree = match unsafe { fdt::Fdt::from_ptr_unaligned(context.dtb_pa as *const u8) } {
+        Ok(tree) => tree,
+        Err(error) => panic!("FDT parse failed in high half: {:?}", error),
+    };
+    let info = discover(&tree, context.hart_id);
+
+    #[cfg(feature = "machine")]
+    configure_machine_timer(&info);
+    configure_interrupt_controller(&info);
+
     kernel::log!("bootstrap", "MachineInfo dump:");
-    kernel::printk!("{:#?}\n", context.info);
+    kernel::printk!("{:#?}\n", info);
     kernel::log!("bootstrap", "BOOT DISCOVERY OK");
 
     #[cfg(feature = "selftest")]
     {
         // selftest 在**完整初始化之后**运行：先起 Core + 长期内核地址空间
         // （device MMIO 才被映射），才能测 PLIC/UART 这类真实设备契约。
-        if let Err(error) = kernel::init(&context.info, &context.reserved) {
+        if let Err(error) = kernel::init(&info, &context.reserved) {
             panic!("core init failed: {}", error);
         }
         let runtime_layout = layout::kernel_layout();
-        runtime::init(&runtime_layout, context.reserved[0].base, &context.info)
+        runtime::init(&runtime_layout, context.reserved[0].base, &info)
             .expect("Sv39 runtime VM init failed");
         // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
         let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;
@@ -402,14 +437,14 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         kernel::component::store::init(pkg);
         // 显式开全局中断：各本地源已在 kernel::init 中解源。
         arch::CpuImpl::enable_irq();
-        crate::selftest::run(&context.info);
+        crate::selftest::run(&info);
     }
 
     #[cfg(not(feature = "selftest"))]
     {
         kernel::log!("core", "core init: ");
 
-        match kernel::init(&context.info, &context.reserved) {
+        match kernel::init(&info, &context.reserved) {
             Ok(()) => {
                 kernel::log!("core", "BOOT CORE OK");
 
@@ -418,7 +453,7 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
                 // kernel_pa = 镜像加载地址（context.reserved[0] 即镜像 PA 范围）。
                 let runtime_layout = layout::kernel_layout();
                 let kernel_pa = context.reserved[0].base;
-                runtime::init(&runtime_layout, kernel_pa, &context.info)
+                runtime::init(&runtime_layout, kernel_pa, &info)
                     .expect("Sv39 runtime VM init failed");
                 kernel::log!("mmu", "runtime VM active");
                 // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
@@ -449,7 +484,7 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
                 arch::CpuImpl::enable_irq();
                 // boot hart 在全局中断已开、长期地址空间已生效之后，才启动次 CPU
                 // （见 src/smp.rs）。单 CPU 机器上自然空转。
-                crate::smp::start_secondaries(&context.info);
+                crate::smp::start_secondaries(&info);
                 // 转交 Core Monitor（boot hart 同步主循环，永不返回）
                 kernel::monitor::run();
             }

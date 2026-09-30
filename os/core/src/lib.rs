@@ -59,11 +59,18 @@ static ALLOCATOR: memory::KernelAllocator = memory::KernelAllocator;
 
 /// Core 初始化入口：消费 bootstrap 发现的 MachineInfo（提案），校验后提交资源真相。
 /// `reserved` 是需保留的区间（bootstrap 提供：ELF image range）。
-/// 流程：sanity 校验 → 帧区域初始化（frame_start 由 bootstrap 传对齐后的镜像末尾）。
+///
+/// **不初始化 / 不重置内存**：分配器由 boot 的早期内存 seam
+/// （`memory::early_init(arena)`，无堆 pass 选出的单一 arena）在 `init` 之前
+/// 启动；seam 未跑即 fail-closed。镜像范围必须落在已发现的 RAM region 内
+/// （arena 选择与长期映射的前提，input sanity）。
 pub fn init(
     info: &machine::MachineInfo,
     reserved: &[machine::MemoryRegion],
 ) -> Result<(), &'static str> {
+    if !memory::is_initialized() {
+        return Err("memory not early-initialized");
+    }
     if info.mem_count == 0 {
         return Err("no memory regions");
     }
@@ -83,29 +90,27 @@ pub fn init(
         return Err("boot hart is not present in cpu info");
     }
 
-    // 帧区域：reserved[0] 的末尾（对齐帧）→ 包含内核镜像的那个 RAM region
-    // 的末尾。多 region 平台内核可能不在 memory_regions[0]，不能硬编码 [0]。
+    // 镜像（reserved）必须被某个已发现 RAM region 完整覆盖：boot 的 arena
+    // 选择与长期映射都以该不变式为前提，Core 不采信未验证的布局输入。
     // 前提：BSS 已在 bootstrap 启动汇编里清零（见 entry.S）；
     // core 不再负责 BSS 清零（那是启动路径职责）。
-    let reserved_start = reserved.first().map_or(0, |r| r.base);
-    let reserved_end = reserved
-        .last()
-        .map_or(info.memory_regions[0].base, |r| r.base + r.size);
-    let region_start = memory::align_up_page(reserved_end);
-
-    let region_end = info.memory_regions[..info.mem_count]
-        .iter()
-        .find(|r| r.base <= reserved_start && reserved_end <= r.base + r.size)
-        .map_or(
-            info.memory_regions[0].base + info.memory_regions[0].size,
-            |r| r.base + r.size,
-        );
-
-    memory::init(region_start, region_end)?;
-
-    // 帧真相验证：可分配一帧并释放（自证 allocator 可用）。
-    let probe = memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| "alloc probe failed")?;
-    memory::free_region(probe).map_err(|_| "free probe failed")?;
+    if let (Some(first), Some(last)) = (reserved.first(), reserved.last()) {
+        let image_start = first.base;
+        let image_end = last
+            .base
+            .checked_add(last.size)
+            .ok_or("reserved region overflows")?;
+        let covered = info.memory_regions[..info.mem_count].iter().any(|region| {
+            region.base <= image_start
+                && region
+                    .base
+                    .checked_add(region.size)
+                    .is_some_and(|end| image_end <= end)
+        });
+        if !covered {
+            return Err("reserved image is outside the discovered RAM regions");
+        }
+    }
 
     task::init();
     sched::init();

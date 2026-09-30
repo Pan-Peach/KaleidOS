@@ -1,13 +1,14 @@
 # boot（os/boot/riscv/）
 
-> 成品镜像层（crate 名 `bootstrap`）：`_start` → FDT discovery → `MachineInfo` → `core::init` → Core Monitor。
+> 成品镜像层（crate 名 `bootstrap`）：`_start` → 无堆早期内存 pass（arena + `early_init`）→ FDT discovery → `MachineInfo` → `core::init` → Core Monitor。
 > 拥有**启动期 / 物理布局那一半**；`core::init` 之后资源真相全归 Core。职责分离、装载合一（链接成 `kaleidos.elf`）。
 
 ## owns 什么真相
 
 - CPU 入口汇编与低地址 trampoline（`entry64.S` / `entry32.S` / `entry32-nommu.S`）：BSS 清零、临时 early root、`satp` 激活、栈设置。
+- **无堆早期内存 pass（Phase 4a）**：在分配器存在之前，从已校验的 firmware/boot 记录里选出唯一一段连续、页对齐、已排除镜像（含 boot 栈 / 静态页表 / 内嵌包 / staging buffer）与 live/reserved 区间（RV/AArch64：保留的 FDT 整体、header reservation map、`/reserved-memory`；x86_64：PVH `hvm_start_info` + memmap 或整个 MB2 信息块）的 RAM **arena**，然后 `kernel::memory::early_init(arena)`（一次性）。RV64/RV32 的搜索窗口收在镜像的 ±2 GiB PC-relative 重定位可达范围内（KernelNative 组件镜像由 Core 堆分配）。
 - **启动期临时页表**（分配器存在之前）：`vm/bootstrap.rs` 的静态池（`BOOT_ROOT` / `KERNEL_L1` / `KERNEL_L0S`），只活到 `kernel::init()` 完成之前。
-- **FDT discovery → `MachineInfo` 归一化**（内存 / CPU / 设备），以及 timer / PLIC 的机器侧接线。
+- **FDT discovery → `MachineInfo` 归一化**（内存 / CPU / 设备），以及 timer / PLIC 的机器侧接线。RV64 在 high-half entry 里、`early_init` 之后才做完整 discovery；低地址阶段只做内存 pass（不构造 `MachineInfo`、不分配）。
 - **启动期外部输入校验**：bootloader / firmware 提供的数据一律当**不可信输入**——先校验，失败即拒绝 + log，绝不盲信指针 / 计数。
   - **x86_64**：MB2 校验 `total_size` 上限（64 KiB）、每个 tag 必须完整落在信息块内、mmap tag 先证明 16 字节条目头存在再计算条目数（`8 <= tag_size < 16` 时直接 `tag_size - 16` 会下溢），条目读取全程 checked arithmetic；PVH 校验 `version >= 1`、`memmap_paddr != 0`、`memmap_entries <= 4096`、`memmap_paddr + entries*24` 不溢出且 < 4 GiB。校验失败返回空表，由调用方以 "no usable RAM region" fail-closed。
   - **aarch64**：复制前校验 FDT header 的 magic / version(16·17) / `totalsize` 上限 / struct、strings 与 rsvmap 边界（rsvmap 走到 16 字节零对终结符；全部 checked arithmetic），`used` 覆盖 rsvmap 且 ≤ `DTB_COPY_CAPACITY`；header 不自洽即拒绝（`None` + log），**绝不"修复"坏 blob**，只重建 `totalsize` = 实际复制前缀的归一化副本。**QEMU `-kernel <elf>` 的 PA-0 DTB quirk** 用有界、经校验的探测处理：x0 → PA 0 → 1 MiB 低 RAM 窗口，每步只接受 header 完全自洽的候选；MMU 关闭 + identity mapping 下按物理地址做 raw volatile 读，不构造引用、不假设对齐。
@@ -19,9 +20,9 @@
 
 ## 暴露什么机制
 
-- RV64：`bootstrap_main(hart_id, dtb_pa, kernel_pa)`（`main64.rs`）→ `bootstrap_high(context_ptr)`（高半区别名进入）→ `kernel::init(&context.info, &context.reserved)` → `runtime::init(...)` → `kernel::component::store::init(pkg)` → `CpuImpl::enable_irq()` → `smp::start_secondaries(&info)` → `kernel::monitor::run()`。
+- RV64：`bootstrap_main(hart_id, dtb_pa, kernel_pa)`（`main64.rs`；低地址阶段 = FDT 解析 + 无堆内存 pass + 静态 bootstrap 页表 → `BootContext`）→ `bootstrap_high(context_ptr)`（高半区别名进入）→ `memory::early_init(arena)` → `discover(&tree, hart_id)` → `kernel::init(&info, &context.reserved)` → `runtime::init(...)` → `kernel::component::store::init(pkg)` → `CpuImpl::enable_irq()` → `smp::start_secondaries(&info)` → `kernel::monitor::run()`。
 - **SMP（RV64）**：boot 在 `kernel::init` + 长期地址空间 + 全局中断之后调 `crate::smp::start_secondaries`（SBI HSM `hart_start` 启动 AP）。**归一化不变式**：discovery 后把 cpu 顺序调整为 **boot hart = 逻辑 CPU0**（OpenSBI 抽签使 boot hart 不一定是 DTB 首个 CPU；不归一化会让 PLIC 外部路由 / per-CPU 表指向错误的 hart）。AP 入口 `secondary_main`（`src/smp.rs`）+ 物理 trampoline `_secondary_start`（`secondary64.S`）；AP 目前完成本地初始化后 `wfi`（尚未进入 Core 调度，见 `docs/modules/arch.md` SMP 章节）。
-- RV32：`bootstrap_main`（`main32.rs`）→ `discover(dtb_pa, hart_id)` 返回 `MachineInfo` → `kernel::init` → store init → `monitor::run()`。
+- RV32：`bootstrap_main`（`main32.rs`）→ FDT 解析 + 无堆内存 pass → `memory::early_init(arena)` → `discover(&tree, hart_id)` 返回 `MachineInfo` → timer/PLIC 接线 → `kernel::init`（两条 profile 共用）→ 长期 root + store init → `selftest::run` / `monitor::run()`。
 - **新 ISA（x86_64 / aarch64）现状**：x86_64 经 Multiboot2 / PVH 发现可用 RAM，CPU 只报告 BSP（无 ACPI MADT），`timebase_frequency = 0`（zero-as-unknown：TSC 频率不可发现，**不伪造** 1 GHz）；aarch64 读 `CNTFRQ_EL0` 得到非零 timebase。两者都只跑 `selftest` 镜像（`boot` 用例），timer 投递分别诚实报告 `Unsupported` / `DeliveryUnavailable`（控制台靠 Core 轮询）；aarch64 非 selftest 的 Core Monitor 入口仍是 `todo!()`（`os/boot/aarch64/src/main.rs`）。
 - **aarch64 boot 栈 = 64 KiB**（`linker.ld` `.bss.stack`）：`resource::init` 会在 ~10 KiB 调用深度上构造 8 KiB 的 `IrqTable` 栈临时量；16 KiB 栈会溢出到 `__boot_stack_bottom` 之下（`.data` 末尾的全局堆 / 已提交 `MachineInfo`）并静默破坏 live statics。
 - `selftest` feature：走 `crate::selftest::run(&info)`（ArchTest，白盒 selftest，返回 `!`）。
@@ -30,7 +31,7 @@
 ## 明确不做
 
 - **不持有资源真相**：`core::init` 消费并校验 boot 提议的 `MachineInfo` + `reserved`（ELF 镜像范围）后才提交。
-- **不管帧分配器**：长期页表通过 `kernel::memory::vm_page_alloc`（buddy）取页；分配器归 Core。
+- **不管帧分配器**：boot 只做一次无堆的 arena **选择**并 `early_init` 一次性移交；分配器本体、区域记账与长期页表取页（`kernel::memory::vm_page_alloc`）都归 Core，`core::init` 不重置内存。
 - **不做 BSS 清零以外的 Core 初始化**：BSS 清零是启动路径职责，core 不再负责。
 - 不做 `#[cfg]` 之外的平台判断、不把板卡名渗透进资源语义（platform quirks 只是 escape hatch）。
 
@@ -39,8 +40,9 @@
 | 路径 | 内容 |
 |---|---|
 | `os/boot/riscv/src/main.rs` | profile 选择、`compile_error!` 守卫、模块接线 |
-| `os/boot/riscv/src/main64.rs` | RV64 启动：`bootstrap_main` / `bootstrap_high` / `core::init` / monitor |
+| `os/boot/riscv/src/main64.rs` | RV64 启动：`bootstrap_main` / `bootstrap_high` / `discover` / `core::init` / monitor |
 | `os/boot/riscv/src/main32.rs` | RV32 启动：`bootstrap_main` / `discover` / `core::init` / monitor |
+| `os/boot/riscv/src/bootmem.rs` | RV64/RV32 共用的无堆内存 pass：`image_bank` / `arena_search_window` / `scan_fdt_exclusions` |
 | `os/boot/riscv/src/entry64.S` / `entry32.S` / `entry32-nommu.S` | `_start` trampoline、early root、high-half 交接 |
 | `os/boot/riscv/src/vm/{mod,bootstrap,layout,runtime}.rs` | 启动页表 / 布局解释 / 长期地址空间 |
 | `os/boot/riscv/src/console.rs` | boot console shim |

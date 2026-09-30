@@ -67,7 +67,7 @@ pub struct CpuInfo {
 /// 要支持更多 CPU，改 Kconfig `MAX_CPUS` 一处即可。
 pub use arch::MAX_CPUS;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
     pub base: usize,
     pub size: usize,

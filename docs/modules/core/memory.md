@@ -5,14 +5,16 @@
 
 ## owns 什么真相
 
-- 物理帧真相与 canonical 分配器：`buddy_system_allocator::MetadataHeap`（O(1) buddy，metadata 自托管），区域 `[align_up(__bootstrap_end), RAM 末尾)`。
+- 物理帧真相与 canonical 分配器：`buddy_system_allocator::MetadataHeap`（O(1) buddy，metadata 自托管）。
+- **早期内存 seam（Phase 4a）**：boot 做**无堆**内存 pass挑选唯一一段连续、页对齐、已排除镜像 / FDT / boot payload 等 live/reserved 区间的 RAM **arena**，经 `early_init(arena)` 一次性交给 Core；`core::init` **不再初始化 / 重置内存**，seam 未跑即 fail-closed。
 - 受 Core 管理的区域归属（`MemoryLease` 是 Core 内部 RAII 独占 guard）。
 - Core 对象堆仅供 Core 内部使用；组件侧堆是 runtime / deployment 策略（KernelNative 可共享 Core 内核堆，私有执行域可自带私有分配器）、**不由本模块拥有**。受管内存以 **region / address-space 粒度**提供 backing 与 mapping，**Core 不记 owner**（KernelNative 无账本；Isolated / Sandboxed 的归属由该实例的 AS / 页表承载），**不**记 malloc/free 对象、**不**做 per-instance 字节计费（见 `docs/architecture/memory-and-heap.md`）。
 - 地址空间的语义真相：`KernelAddressSpace` 保存 mapping ledger；PTE 只是 backend 的硬件投影。
 
 ## 暴露什么机制
 
-- `init(region_start, region_end)`；`alloc_region(size) -> MemoryLease`；`free_region(lease)`；`vm_page_alloc() -> Result<usize, ()>`；`align_up_page`；`free_block_counts()`。
+- `unsafe early_init(arena)`（一次性；形状 / 溢出 / 页对齐 / 最小容量校验 + alloc/free 探针 canary）与 `is_initialized()`；`select_arena(bank, image, scan)`（无堆：在包含镜像的 bank 内选最大页对齐间隙，排除集由 boot 逐条 emit，重复扫描、不缓存）与 `MIN_ARENA_SIZE`。
+- `alloc_region(size) -> MemoryLease`；`free_region(lease)`；`vm_page_alloc() -> Result<usize, ()>`；`align_up_page`；`free_block_counts()`。（`init(region_start, region_end)` 仅存于 host 测试。）
 - `KernelAllocator`（Core 内部 `GlobalAlloc`，接 Core 内部对象堆，仅 Core 使用；面向组件的内存面是 `kcore_memory_acquire/release`（域视图），**不引入 Core 侧账本**，见 `docs/architecture/memory-and-heap.md`）。
 - 常量：`ALLOC_GRANULE = 4096`（物理分配粒度）、`HEAP_ORDER = 32`、`HEAP_MIN_ORDER = 12`。
 - `MemoryLease`、`MemoryError`。
@@ -30,7 +32,8 @@
 
 | 文件 | 内容 |
 |---|---|
-| `os/core/src/memory/mod.rs` | buddy heap、区域 API、`KernelAllocator` |
+| `os/core/src/memory/mod.rs` | buddy heap、区域 API、`KernelAllocator`、`early_init` / `is_initialized` |
+| `os/core/src/memory/early.rs` | 早期内存 seam：arena 形状校验、一次性启动、无堆 `select_arena` |
 | `os/core/src/memory/address_space.rs` | 地址空间词汇 + 所有权骨架（`KernelAddressSpace` / manager） |
 | `os/core/src/memory/slab.rs` | 小对象 slab 分配器 |
 | `os/core/src/memory/test_support.rs` | host 测试初始化 / guard |

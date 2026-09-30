@@ -123,27 +123,59 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
         }
         Err(error) => panic!("FDT parse failed: {:?}", error),
     };
+    let dtb_len = discovery::staged_len(dtb_pa);
 
-    // 归一化：fdt 类型 → core::machine 类型（owned，DTB 用完可丢）。
-    let info = discovery::discover(&tree, boot_affinity, timebase_frequency);
-    kernel::log!("bootstrap", "MachineInfo dump:");
-    kernel::printk!("{:#?}\n", info);
-
-    // 本文档镜像范围 → reserved（Core 自己，永久保留）。
+    // 本文档镜像范围（MMU 关 + identity：链接地址即物理地址）→ reserved
+    //（Core 自己，永久保留）。**先**算镜像，再选 arena、再 discovery。
     let image_start = core::ptr::addr_of!(__kernel_start) as usize;
     let image_end = core::ptr::addr_of!(__kernel_end) as usize;
-    let reserved = [MemoryRegion {
+    let image = MemoryRegion {
         base: image_start,
         size: image_end - image_start,
-    }];
+    };
     kernel::log!(
         "bootstrap",
         "image {:#x}-{:#x} ({} KiB)",
         image_start,
         image_end,
-        (image_end - image_start) / 1024
+        image.size / 1024
     );
 
+    // 无堆早期内存 pass + seam：包含镜像的 bank → 排除镜像与全部 FDT
+    // live/reserved 区间后的 arena → `early_init`；此后才允许分配 / 完整
+    // discovery（旧流程在镜像边界可知之前就 discovery，这里纠正顺序）。
+    let bank = discovery::image_bank(&tree, image_start, image_end)
+        .unwrap_or_else(|error| panic!("aarch64 early memory: {}", error));
+    let arena = kernel::memory::select_arena(bank, image, |emit| {
+        emit(image)?;
+        discovery::scan_fdt_exclusions(&tree, dtb_pa, dtb_len, emit)
+    })
+    .unwrap_or_else(|error| panic!("aarch64 early memory: {}", error));
+    kernel::log!(
+        "bootstrap",
+        "early arena {:#x}-{:#x} ({} KiB), bank {:#x}+{} MiB",
+        arena.base,
+        arena.base + arena.size,
+        arena.size / 1024,
+        bank.base,
+        bank.size / (1024 * 1024)
+    );
+    // SAFETY: arena 是 boot 从可用 RAM 中选出的连续窗口——镜像（含 boot 栈 /
+    // 内嵌包 / staging buffer）与全部 FDT live/reserved 区间都已被排除；单 CPU、
+    // 中断未开、尚无其它分配者。
+    if let Err(error) = unsafe { kernel::memory::early_init(arena) } {
+        panic!("early memory init failed: {}", error);
+    }
+
+    // 完整 discovery（seam 之后）：FDT → core::machine 归一化（owned）。
+    let info = discovery::discover(&tree, boot_affinity, timebase_frequency);
+    kernel::log!("bootstrap", "MachineInfo dump:");
+    kernel::printk!("{:#?}\n", info);
+
+    let reserved = [MemoryRegion {
+        base: image_start,
+        size: image.size,
+    }];
     if let Err(error) = kernel::init(&info, &reserved) {
         panic!("core init failed: {}", error);
     }

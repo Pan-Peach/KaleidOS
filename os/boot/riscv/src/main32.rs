@@ -138,8 +138,7 @@ fn install_runtime_root(info: &MachineInfo, kernel_pa: usize) {
 #[cfg(feature = "vm-nommu")]
 fn install_runtime_root(_info: &MachineInfo, _kernel_pa: usize) {}
 
-fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
-    let tree = unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) }.map_err(|_| ())?;
+fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineInfo {
     let mut memory_regions = [MemoryRegion { base: 0, size: 0 }; 16];
     let mut cpu_info = [CpuInfo {
         boot_cpu: false,
@@ -198,7 +197,7 @@ fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
         collect_devices(soc.children(), &mut devices, &mut dev_count);
     }
 
-    Ok(MachineInfo {
+    MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
         cpu_count,
@@ -207,7 +206,7 @@ fn discover(dtb_pa: usize, hart_id: usize) -> Result<MachineInfo, ()> {
         memory_regions,
         dev_count,
         devices,
-    })
+    }
 }
 
 /// OpenSBI 选定的 boot hart 进入 payload；RV32 profile 使用 identity Sv32。
@@ -216,42 +215,79 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     arch::CpuImpl::init_cpu();
     kernel::log!("bootstrap", "KaleidOS RV32 bootstrap");
 
-    let info = match discover(dtb_pa, hart_id) {
-        Ok(info) if info.mem_count != 0 => info,
-        Ok(_) => panic!("RV32 boot failed: no RAM region"),
+    // FDT 解析 + 无堆早期内存 pass：镜像范围 → 包含镜像的 bank → arena →
+    // seam（`early_init`）。此前不分配、不构造 MachineInfo。
+    let tree = match unsafe { fdt::Fdt::from_ptr_unaligned(dtb_pa as *const u8) } {
+        Ok(tree) => {
+            kernel::log!("bootstrap", "FDT magic: OK");
+            tree
+        }
         Err(_) => panic!("FDT magic: BAD"),
     };
-
-    #[cfg(feature = "machine")]
-    configure_machine_timer(&info);
-
-    configure_interrupt_controller(&info);
-
     let linked_start =
         arch::physical_address_of(linker_addr(core::ptr::addr_of!(__image_load_start)));
     let linked_end = arch::physical_address_of(linker_addr(core::ptr::addr_of!(__image_end)));
     let image_size = linked_end
         .checked_sub(linked_start)
         .expect("invalid RV32 image range");
+    let image = MemoryRegion {
+        base: kernel_pa,
+        size: image_size,
+    };
+    let bank = crate::bootmem::image_bank(&tree, kernel_pa, image_size)
+        .unwrap_or_else(|error| panic!("RV32 early memory: {}", error));
+    // KernelNative 组件从 Core 堆取镜像并做 ±2 GiB PC-relative 重定位：arena
+    // 收在镜像可达窗口内（见 `bootmem::arena_search_window`）。
+    let window = crate::bootmem::arena_search_window(bank, image);
+    let arena = kernel::memory::select_arena(window, image, |emit| {
+        emit(image)?;
+        crate::bootmem::scan_fdt_exclusions(&tree, dtb_pa, emit)
+    })
+    .unwrap_or_else(|error| panic!("RV32 early memory: {}", error));
+    kernel::log!(
+        "bootstrap",
+        "early arena {:#x}-{:#x} ({} KiB), bank {:#x}+{} MiB",
+        arena.base,
+        arena.base + arena.size,
+        arena.size / 1024,
+        bank.base,
+        bank.size / (1024 * 1024)
+    );
+    // SAFETY: arena 是 boot 从可用 RAM 中选出的连续窗口——镜像（含 boot 栈 /
+    // 静态页表 / 内嵌包）与全部 FDT live/reserved 区间都已被排除；boot 单 CPU、
+    // 中断未开、尚无其它分配者。
+    if let Err(error) = unsafe { kernel::memory::early_init(arena) } {
+        panic!("early memory init failed: {}", error);
+    }
+
+    // 完整 discovery（seam 之后才允许分配）+ 机器侧 timer / PLIC 接线。
+    let info = discover(&tree, hart_id);
+    #[cfg(feature = "machine")]
+    configure_machine_timer(&info);
+    configure_interrupt_controller(&info);
+
     let reserved = [MemoryRegion {
         base: kernel_pa,
         size: image_size,
     }];
 
+    // 两条 profile 共用的初始化（此前在 selftest / 非 selftest 分支里各写一遍）：
+    // Core + 长期 root + 内嵌组件仓库；之后才分岔到 ArchTest / Monitor。
+    if let Err(error) = kernel::init(&info, &reserved) {
+        panic!("core init failed: {}", error);
+    }
+    // 长期 root：buddy 可用后替换 bootstrap 的全量 executable identity root，
+    // 并把映射计划交给 Core（Isolated AS 只从计划取共享 Core 映射）。
+    install_runtime_root(&info, kernel_pa);
+    // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
+    let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
+    let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
+    kernel::component::store::init(pkg);
+
     #[cfg(feature = "selftest")]
     {
         // selftest 在**完整初始化之后**运行（RV32 identity 映射下 device MMIO
         // 本就可达；后挪让两个 profile 语义一致）。
-        if let Err(error) = kernel::init(&info, &reserved) {
-            panic!("core init failed: {}", error);
-        }
-        // 长期 root：buddy 可用后替换 bootstrap 的全量 executable identity root，
-        // 并把映射计划交给 Core（Isolated AS 只从计划取共享 Core 映射）。
-        install_runtime_root(&info, kernel_pa);
-        // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
-        let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
-        let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
-        kernel::component::store::init(pkg);
         // 显式开全局中断：各本地源已在 kernel::init 中解源。
         arch::CpuImpl::enable_irq();
         crate::selftest::run(&info);
@@ -259,33 +295,25 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 
     #[cfg(not(feature = "selftest"))]
     {
-        match kernel::init(&info, &reserved) {
-            Ok(()) => {
-                install_runtime_root(&info, kernel_pa);
-                kernel::log!("bootstrap", "RV32 CORE OK");
-                let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
-                let pkg =
-                    unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };
-                kernel::component::store::init(pkg);
-                if let Some(store) = kernel::component::store::get_component_store() {
-                    match store.list() {
-                        Ok(entries) => {
-                            // 只数组件：cpio 归档里还有 manifest 等元数据条目。
-                            let components = entries
-                                .iter()
-                                .filter(|entry| entry.name.ends_with(b".kcomp"))
-                                .count();
-                            kernel::log!("store", "embedded kpkg: {} components", components)
-                        }
-                        Err(error) => kernel::log!("store", "kpkg parse error: {:?}", error),
-                    }
-                } else {
-                    kernel::log!("store", "store: not initialized");
+        kernel::log!("bootstrap", "RV32 CORE OK");
+        if let Some(store) = kernel::component::store::get_component_store() {
+            match store.list() {
+                Ok(entries) => {
+                    // 只数组件：cpio 归档里还有 manifest 等元数据条目。
+                    let components = entries
+                        .iter()
+                        .filter(|entry| entry.name.ends_with(b".kcomp"))
+                        .count();
+                    kernel::log!("store", "embedded kpkg: {} components", components)
                 }
-                kernel::monitor::run();
+                Err(error) => kernel::log!("store", "kpkg parse error: {:?}", error),
             }
-            Err(error) => panic!("core init failed: {}", error),
+        } else {
+            kernel::log!("store", "store: not initialized");
         }
+        // 显式开全局中断：各本地源已在 kernel::init 中解源。
+        arch::CpuImpl::enable_irq();
+        kernel::monitor::run();
     }
 }
 

@@ -79,6 +79,132 @@ fn read_be_u32(pa: usize) -> u32 {
     u32::from_be_bytes(bytes)
 }
 
+/// Read a big-endian `u64` (same raw, bounded convention as [`read_be_u32`]).
+fn read_be_u64(pa: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: see [`read_be_u32`].
+        *byte = unsafe { core::ptr::read_volatile((pa + offset) as *const u8) };
+    }
+    u64::from_be_bytes(bytes)
+}
+
+/// Exact staged extent of the normalized DTB at `pa`.
+///
+/// `stage_dtb` rewrites the copy's `totalsize` to the exact prefix it copied,
+/// so the staged blob is self-consistent by construction.
+pub fn staged_len(pa: usize) -> usize {
+    read_be_u32(pa + 4) as usize
+}
+
+/// Locate the FDT `/memory` bank that fully covers `[image_start, image_end)`.
+///
+/// Fails (instead of falling back to an unrelated bank) when no bank contains
+/// the loaded image; 64-bit cells that do not fit the target address space are
+/// skipped (they cannot contain the image).
+pub fn image_bank<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    image_start: usize,
+    image_end: usize,
+) -> Result<MemoryRegion, &'static str> {
+    let Some(memory) = tree.find_node("/memory") else {
+        return Err("FDT has no /memory node");
+    };
+    let Some(regions) = memory.reg() else {
+        return Err("FDT /memory has no reg");
+    };
+    for entry in regions.iter::<u64, u64>() {
+        let Ok(entry) = entry else { continue };
+        let (Ok(base), Ok(size)) = (usize::try_from(entry.address), usize::try_from(entry.len))
+        else {
+            continue;
+        };
+        let Some(end) = base.checked_add(size) else {
+            continue;
+        };
+        if base <= image_start && image_end <= end {
+            return Ok(MemoryRegion { base, size });
+        }
+    }
+    Err("no RAM bank contains the loaded image")
+}
+
+/// Emit every **FDT-derived** live/reserved interval except the image itself:
+/// the retained (staged) FDT extent, its header memory reservation map, and
+/// `/reserved-memory` children that carry a fixed `reg`.
+///
+/// The scan is allocation-free and may be re-run (Core's arena sweep re-reads
+/// the firmware records instead of caching them).  An uninterpretable
+/// reservation fails closed: it is never silently ignored.
+pub fn scan_fdt_exclusions<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    dtb_pa: usize,
+    dtb_len: usize,
+    emit: &mut dyn FnMut(MemoryRegion) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    if dtb_len == 0 {
+        return Err("staged FDT extent is zero");
+    }
+    emit(MemoryRegion {
+        base: dtb_pa,
+        size: dtb_len,
+    })?;
+
+    // Header memory reservation map: 16-byte zero-pair terminated, bounded by
+    // the staged extent.
+    let mut cursor = tree.header().memory_reserve_map_offset as usize;
+    loop {
+        let end = cursor
+            .checked_add(FDT_RSV_ENTRY_SIZE)
+            .ok_or("FDT reservation entry overflows")?;
+        if end > dtb_len {
+            return Err("FDT reservation block runs past totalsize");
+        }
+        let base = read_be_u64(dtb_pa + cursor);
+        let size = read_be_u64(dtb_pa + cursor + 8);
+        if base == 0 && size == 0 {
+            break;
+        }
+        emit_reservation(base, size, emit)?;
+        cursor = end;
+    }
+
+    // /reserved-memory: only fixed-address (`reg`) children are supported;
+    // any other shape could overlap the arena unverified -> fail closed.
+    if let Some(node) = tree.find_node("/reserved-memory") {
+        for child in node.children() {
+            let Some(reg) = child.reg() else {
+                return Err("uninterpretable /reserved-memory child (no reg)");
+            };
+            for entry in reg.iter::<u64, u64>() {
+                let entry = entry.map_err(|_| "uninterpretable /reserved-memory reg entry")?;
+                emit_reservation(entry.address, entry.len, emit)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convert one FDT `(address, size)` reservation to the target address width.
+///
+/// Zero-size reservations are skipped; an `address` beyond the target width is
+/// entirely outside the address space (cannot overlap any arena); a `size` that
+/// does not fit fails closed.
+fn emit_reservation(
+    base: u64,
+    size: u64,
+    emit: &mut dyn FnMut(MemoryRegion) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    if size == 0 {
+        return Ok(());
+    }
+    let Ok(base) = usize::try_from(base) else {
+        return Ok(());
+    };
+    let size = usize::try_from(size).map_err(|_| "FDT reservation does not fit the target")?;
+    emit(MemoryRegion { base, size })
+}
+
 /// True when the 16-byte reservation entry at `pa` is the terminating zero pair.
 fn reservation_is_terminator(pa: usize) -> bool {
     read_be_u32(pa) == 0
