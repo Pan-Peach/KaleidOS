@@ -16,13 +16,18 @@
 //! 2. **Normalize** the parsed tree into the owned, fixed-capacity
 //!    [`MachineInfo`]: memory regions, `/cpus` (BSP pinned to logical 0), and
 //!    root//soc device descriptors.
+//! 3. **Retain** the staged DTB as the raw firmware source: the normalized
+//!    [`MachineInfo`] carries [`FirmwareInfo::Fdt`] pointing at the **staged
+//!    copy** (with its rewritten validated length) -- never the original PA-0
+//!    address -- so a future driver can read vendor data beyond the normalized
+//!    view.  The staged bytes are never reclaimed.
 
 use alloc::vec::Vec;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{
-    CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
-    MAX_CPUS,
+    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
+    MemoryRegion, MAX_CPUS,
 };
 
 /// FDT magic (`0xd00dfeed`, big-endian on the wire).
@@ -96,6 +101,15 @@ fn read_be_u64(pa: usize) -> u64 {
 /// so the staged blob is self-consistent by construction.
 pub fn staged_len(pa: usize) -> usize {
     read_be_u32(pa + 4) as usize
+}
+
+/// Re-read a retained staged copy: magic and rewritten `totalsize` must be
+/// unchanged.  `size` is the retained length boot recorded in
+/// [`FirmwareInfo::Fdt`]; this proves the bytes survived the early allocations
+/// (the staging buffer lives in the image, which Core marks permanently
+/// reserved) and is what a future consumer would read.
+pub fn staged_dtb_intact(pa: usize, size: usize) -> bool {
+    read_be_u32(pa) == FDT_MAGIC && read_be_u32(pa + 4) as usize == size
 }
 
 /// Locate the FDT `/memory` bank that fully covers `[image_start, image_end)`.
@@ -422,10 +436,14 @@ fn collect_devices<'a>(
 /// `/cpus` is **not** fabricated here: Core rejects the proposal (boot must not
 /// manufacture a CPU).  More CPUs than `MAX_CPUS` are truncated with the BSP
 /// first and an explicit diagnostic.
+///
+/// `firmware` is the retained raw source ([`FirmwareInfo::Fdt`] pointing at the
+/// staged copy); it is stored verbatim -- this function does not re-validate it.
 pub fn discover<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     boot_affinity: u64,
     timebase_frequency: u64,
+    firmware: FirmwareInfo,
 ) -> MachineInfo {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
@@ -472,6 +490,7 @@ pub fn discover<'a>(
     MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(boot_affinity),
         timebase_frequency,
+        firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),

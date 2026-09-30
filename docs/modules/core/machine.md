@@ -1,22 +1,26 @@
 # machine（os/core/src/machine.rs）
 
 > **已提交的机器事实**（`MachineInfo`）+ **纯设备发现**。
-> Core 不知道这些事实来自 FDT 还是 ACPI——boot 把 backend 归一化成 `MachineInfo` 后交给它。
+> Core 不知道这些事实来自 FDT 还是 ACPI——boot 把 backend 归一化成 `MachineInfo` 后交给它；
+> 原始固件描述本身不再被丢弃：`firmware` 字段保留**已校验的来源位置**（见下）。
 
 ## owns 什么真相
 
 - 已提交的归一化机器信息：`static COMMITTED`（RAM、CPU 清单、设备描述符）。monitor 与导出表共用这一份快照。
-- `commit(info)` 由 `monitor::mount` 在 `core::init` 末尾调用（`machine::commit` 不在 `lib.rs` 里直接调）。
+- **保留的原始固件描述源**（`MachineInfo.firmware` / `FirmwareInfo`）：`Fdt { phys, size }` / `Acpi { rsdp }` / `Static`。只记"字节在哪、有多大"，**不认证内容**；下游表（RSDT/XSDT/…）由未来消费者读取时各自校验。保留字节不回收（所在区间由 boot 的 arena 选择永久排除）。
+- `core::init` 在 `commit` 前拒绝形状非法的固件源（零地址 / 零长度）——绝不以 `Static` 之外的形式发布悬空固件根。
+- `commit(info)` 由 `core::init`（`lib.rs`）校验通过后调用一次；第二次发布被拒绝。
 
 ## 暴露什么机制
 
-- 类型：`MachineInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`、`IoSpace`（Mmio / Pio）、`CompatStr`、`DeviceId`、`DeviceLookupError`。
+- 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`、`IoSpace`（Mmio / Pio）、`CompatStr`、`DeviceId`、`DeviceLookupError`。
 - `commit(info)` / `committed()`。
 - `nth_compatible(compatible, ordinal)`：纯设备枚举（含已认领设备，顺序跨 claim/release 稳定；`ordinal` 越界 → `DeviceLookupError`）。
 
 ## 明确不做
 
-- **不解析 DTB**：FDT 解析在 boot；Core 只收已归一化的值。
+- **不解析 DTB / ACPI**：FDT / RSDP 解析与校验在 boot；Core 只收已归一化的值与已验证的保留位置。
+- **`FirmwareInfo` 不是 ABI**：不是 `repr(C)`、不进 `kcore_*` / 组件 SDK；`Static` = 没有保留的受支持固件描述（不是"校验失败但继续"）。
 - **发现是纯的**：不分配、不触碰设备寄存器、不读 claim 状态、不授权。
 - `DeviceId` 是 **identity，不是权限**；零可以是合法值。
 

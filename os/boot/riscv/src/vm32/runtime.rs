@@ -6,6 +6,7 @@
 //! ```text
 //! linker32.ld 段 + layout  →  镜像段（VA==PA，段权限）
 //! info RAM                 →  identity RAM（VA==PA，RWX；**挖掉镜像段区间**）
+//! info firmware            →  保留 FDT 落在 identity RAM 之外时的显式只读 identity 映射
 //! info 设备                →  MMIO 窗口（VA==PA，RW-NX，页对齐向外取整）
 //! ```
 //!
@@ -16,7 +17,7 @@
 
 use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
 use arch::AddressSpaceImpl;
-use kernel::machine::{IoSpace, MachineInfo};
+use kernel::machine::{FirmwareInfo, IoSpace, MachineInfo};
 use kernel::memory::address_space::Mapping;
 use kernel::memory::kernel_mappings::{KernelMappingPlan, MappingClass};
 use spin::Mutex;
@@ -163,6 +164,39 @@ impl RuntimeVm32 {
                         size: piece_end - piece_start,
                     },
                     ram_perm
+                );
+            }
+        }
+
+        // 1b) 保留的固件源（`info.firmware`）：identity RAM 映射只覆盖
+        //     `memory_regions`（且挖掉镜像 / 向内取整）。保留的 FDT 若落在这些
+        //     映射之外，**物理驻留 ≠ 可访问**——显式建立 Core 可访问的只读
+        //     identity 映射。只进内核 root：不给实例任何 PA 查询 / 共享别名。
+        if let FirmwareInfo::Fdt { phys, size } = info.firmware {
+            if size == 0 {
+                return Err(RuntimeVm32Error::InvalidLayout);
+            }
+            let end = phys
+                .checked_add(size)
+                .ok_or(RuntimeVm32Error::InvalidLayout)?;
+            let start_page = align_down_page(phys);
+            let end_page = align_up_page(end);
+            let covered = info.memory_regions.iter().any(|region| {
+                let Some(region_end) = region.base.checked_add(region.size) else {
+                    return false;
+                };
+                // 与上面的 identity 映射同一取整：`[align_up(base), align_down(end))`。
+                align_up_page(region.base) <= start_page && end_page <= align_down_page(region_end)
+            });
+            if !covered {
+                map_and_record!(
+                    MappingClass::CoreRootOnly,
+                    start_page,
+                    PhysicalRange {
+                        base: start_page,
+                        size: end_page - start_page,
+                    },
+                    MappingPermission::READ
                 );
             }
         }

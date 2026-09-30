@@ -21,7 +21,7 @@ extern crate alloc;
 use arch::{Console, CpuArch};
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
-use kernel::machine::{CpuId, MemoryRegion};
+use kernel::machine::{CpuId, FirmwareInfo, MemoryRegion};
 
 #[cfg(feature = "vm-nommu")]
 compile_error!("aarch64 boot requires `vm-mmu`");
@@ -170,7 +170,14 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
     }
 
     // 完整 discovery（seam 之后）：FDT → core::machine 归一化（owned）。
-    let info = discovery::discover(&tree, boot_affinity, timebase_frequency);
+    // 保留的原始固件源 = **staged 副本**（不会指向原 PA-0 地址）；staging 已把
+    // totalsize 重写为实际复制前缀，`size` 即该已验证长度。
+    let firmware = FirmwareInfo::Fdt {
+        phys: dtb_pa,
+        size: dtb_len,
+    };
+    let info = discovery::discover(&tree, boot_affinity, timebase_frequency, firmware);
+    kernel::log!("discovery", "firmware: {:?}", info.firmware);
     kernel::log!("bootstrap", "MachineInfo dump:");
     kernel::printk!("{:#?}\n", info);
 
@@ -184,6 +191,18 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
         Err(error) => panic!("core init failed: {}", error),
     };
     kernel::log!("bootstrap", "BOOT DISCOVERY OK");
+
+    // 保留源必须扛过早期分配（staged 副本在镜像内，Core 已把镜像永久 Reserved）：
+    // 重读 magic 与重写后的 totalsize，证明未来消费者仍能读到这份原始视图。
+    if let FirmwareInfo::Fdt { phys, size } = info.firmware {
+        if !discovery::staged_dtb_intact(phys, size) {
+            panic!(
+                "retained staged FDT is unreadable after early allocations (phys {:#x})",
+                phys
+            );
+        }
+        kernel::log!("discovery", "retained staged FDT intact at {:#x}", phys);
+    }
 
     #[cfg(feature = "selftest")]
     {

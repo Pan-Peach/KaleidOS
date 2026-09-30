@@ -25,7 +25,14 @@
 //!   with MB2 basic-meminfo as the fallback when no mmap tag is present;
 //! - CPU: exactly one CPU (the BSP), hardware id = CPUID leaf 1 initial APIC
 //!   id; AP discovery (ACPI MADT) is not part of this bring-up;
-//! - devices: the 16550 UART (PIO) is registered so the machine dump is real.
+//! - devices: the 16550 UART (PIO) is registered so the machine dump is real;
+//! - firmware: the retained raw source.  PVH publishes `Acpi { rsdp }` from
+//!   `hvm_start_info.rsdp_paddr` (offset 32), MB2 from the ACPI RSDP tag payload
+//!   (tag 15 = v2+ preferred, tag 14 = v1 fallback) -- each validated
+//!   (signature / checksum / revision-appropriate length) before it is retained.
+//!   No valid RSDP is `FirmwareInfo::Static` (this static BSP/UART platform has
+//!   no retained firmware description).  The retained RSDP extent is excluded
+//!   from the early arena before any memory is admitted.
 //!
 //! `reserved` is the linked image range (`__kernel_start`..`__kernel_end`).
 
@@ -40,7 +47,8 @@ use arch::{Console, CpuArch};
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use kernel::machine::{
-    CompatStr, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
+    CompatStr, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
+    MemoryRegion,
 };
 
 #[cfg(feature = "selftest")]
@@ -77,8 +85,24 @@ const BOOT_INFO_MAX_PA: usize = 0x1_0000_0000;
 /// (`magic, version, flags, nr_modules, modlist_paddr, cmdline_paddr,
 /// rsdp_paddr, memmap_paddr, memmap_entries, reserved` = 56 bytes).
 const HVM_START_INFO_SIZE: usize = 56;
+/// ACPI RSDP signature (8 bytes, trailing space included).
+const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
+/// Canonical RSDP length for revision 0 (RSDT, first-20-byte checksum).
+const RSDP_V1_SIZE: usize = 20;
+/// Canonical RSDP length for revision >= 2 (XSDT + extended checksum).
+const RSDP_V2_SIZE: usize = 36;
+/// Multiboot2 tag type: ACPI old RSDP (a v1 RSDP copy embedded in the payload).
+const MB2_TAG_ACPI_OLD_RSDP: u32 = 14;
+/// Multiboot2 tag type: ACPI new RSDP (a v2+ RSDP copy embedded in the payload).
+const MB2_TAG_ACPI_NEW_RSDP: u32 = 15;
 
 /// Raw (identity-mapped) boot-info reads.
+fn read_u8(address: usize) -> u8 {
+    // SAFETY: callers pass addresses from the boot protocol (RAM, identity
+    // mapped by `entry.S`).
+    unsafe { core::ptr::read_volatile(address as *const u8) }
+}
+
 fn read_u32(address: usize) -> u32 {
     // SAFETY: callers pass addresses from the boot protocol (RAM, identity
     // mapped by `entry.S`).
@@ -90,9 +114,10 @@ fn read_u64(address: usize) -> u64 {
     unsafe { core::ptr::read_unaligned(address as *const u64) }
 }
 
-/// Capacity of the boot-payload exclusion set: PVH needs two (start_info +
-/// memmap), MB2 needs one (the whole information block).
-const BOOT_EXCLUSION_CAPACITY: usize = 2;
+/// Capacity of the boot-payload exclusion set: PVH needs three (start_info +
+/// its separate memmap + the retained RSDP), MB2 needs two (the whole
+/// information block + the RSDP tag copy, already inside that block).
+const BOOT_EXCLUSION_CAPACITY: usize = 3;
 
 /// Firmware-owned boot payload extents the early arena must never overlap
 /// (a MB2 information block, or PVH `hvm_start_info` + its separate map).
@@ -372,6 +397,157 @@ fn pvh_regions(
     count
 }
 
+/// Validate one RSDP and return its retained length (20 / 36): signature,
+/// revision-appropriate length and checksums, plus the retained-extent address
+/// arithmetic.  `readable` is the number of bytes the caller vouches are
+/// readable (already bounded by the source's own extent).
+///
+/// - revision 0: 20-byte structure, first-20-byte checksum must be zero;
+/// - revision >= 2: the `length` field must be exactly 36, and **both** the
+///   first-20-byte and the extended (all 36 bytes) checksums must be zero;
+/// - any other revision / shape: not retained (the caller publishes `Static` --
+///   not "corrupt but continue").
+///
+/// **Only the RSDP itself is certified**: RSDT / XSDT and their downstream
+/// tables are validated by future consumers when they read them.
+fn validate_rsdp(pa: usize, readable: usize) -> Option<usize> {
+    if pa == 0 || readable < RSDP_V1_SIZE {
+        return None;
+    }
+    // Address arithmetic: the retained extent must be expressible.
+    pa.checked_add(readable)?;
+    for (offset, byte) in RSDP_SIGNATURE.iter().enumerate() {
+        if read_u8(pa + offset) != *byte {
+            return None;
+        }
+    }
+    let checksum_zero = |len: usize| {
+        let mut sum = 0u8;
+        for offset in 0..len {
+            sum = sum.wrapping_add(read_u8(pa + offset));
+        }
+        sum == 0
+    };
+    // Revision sits after the first checksum (offset 8) and a 6-byte OEM id.
+    let revision = read_u8(pa + 15);
+    if revision == 0 {
+        return checksum_zero(RSDP_V1_SIZE).then_some(RSDP_V1_SIZE);
+    }
+    // Revision >= 2: the only defined shape is the 36-byte v2 structure, which
+    // self-describes its length (a corrupt length must not authorize a larger
+    // checksum read).
+    if readable < RSDP_V2_SIZE || read_u32(pa + 20) as usize != RSDP_V2_SIZE {
+        return None;
+    }
+    if !checksum_zero(RSDP_V1_SIZE) || !checksum_zero(RSDP_V2_SIZE) {
+        return None;
+    }
+    Some(RSDP_V2_SIZE)
+}
+
+/// Find the ACPI RSDP tag in a Multiboot2 information block (tag 15 = new /
+/// v2+ preferred, tag 14 = old / v1 fallback), validate the embedded copy, and
+/// return `(copy address, retained length)`.
+///
+/// Allocation-free, bounded by the info block's own `total_size`; the tag scan
+/// mirrors [`multiboot2_regions`] (a truncated tag is not trusted).
+fn multiboot2_rsdp(info_pa: usize) -> Option<(usize, usize)> {
+    if info_pa == 0 || !info_pa.is_multiple_of(8) || info_pa >= BOOT_INFO_MAX_PA {
+        return None;
+    }
+    let total_size = read_u32(info_pa) as usize;
+    if !(8..=MB2_MAX_TOTAL_SIZE).contains(&total_size) {
+        return None;
+    }
+    let end = info_pa.checked_add(total_size)?;
+    let mut cursor = info_pa + 8;
+    let mut old = None;
+    let mut new = None;
+    while cursor + 8 <= end {
+        let tag_type = read_u32(cursor);
+        let tag_size = read_u32(cursor + 4) as usize;
+        if tag_type == 0 || tag_size < 8 {
+            break;
+        }
+        let tag_end = match cursor.checked_add(tag_size) {
+            Some(tail) if tail <= end => tail,
+            _ => break,
+        };
+        if tag_type == MB2_TAG_ACPI_OLD_RSDP || tag_type == MB2_TAG_ACPI_NEW_RSDP {
+            let payload = cursor + 8;
+            if let Some(length) = validate_rsdp(payload, tag_end - payload) {
+                let found = (payload, length);
+                if tag_type == MB2_TAG_ACPI_NEW_RSDP {
+                    new = new.or(Some(found));
+                } else {
+                    old = old.or(Some(found));
+                }
+            }
+        }
+        cursor = match tag_end.checked_add(7) {
+            Some(next) => next & !7,
+            None => break,
+        };
+    }
+    new.or(old)
+}
+
+/// Discover the retained firmware source (allocation-free raw reads):
+/// PVH's `rsdp_paddr`, or the MB2 ACPI RSDP tag copy, each validated before it
+/// is published.  The second tuple item is the retained extent that the early
+/// arena must exclude **before** any memory is admitted.
+///
+/// No candidate / a rejected candidate -> [`FirmwareInfo::Static`].  The MB2
+/// copy already lives inside the excluded information block; its extent is
+/// still reported (redundant exclusions are harmless).
+fn discover_firmware(
+    protocol: BootProtocol,
+    info_pa: usize,
+) -> (FirmwareInfo, Option<(usize, usize)>) {
+    match protocol {
+        BootProtocol::Pvh => {
+            if read_u32(info_pa + 4) < 1 {
+                return (FirmwareInfo::Static, None);
+            }
+            let rsdp = read_u64(info_pa + 32) as usize;
+            if rsdp == 0 || rsdp >= BOOT_INFO_MAX_PA {
+                return (FirmwareInfo::Static, None);
+            }
+            match validate_rsdp(rsdp, BOOT_INFO_MAX_PA - rsdp) {
+                Some(len) => {
+                    kernel::log!(
+                        "discovery",
+                        "PVH: RSDP at {:#x} validated ({} bytes)",
+                        rsdp,
+                        len
+                    );
+                    (FirmwareInfo::Acpi { rsdp }, Some((rsdp, len)))
+                }
+                None => {
+                    kernel::log!(
+                        "discovery",
+                        "PVH: rsdp_paddr {:#x} rejected; firmware: static",
+                        rsdp
+                    );
+                    (FirmwareInfo::Static, None)
+                }
+            }
+        }
+        BootProtocol::Multiboot2 => match multiboot2_rsdp(info_pa) {
+            Some((rsdp, len)) => {
+                kernel::log!(
+                    "discovery",
+                    "MB2: ACPI RSDP tag at {:#x} validated ({} bytes)",
+                    rsdp,
+                    len
+                );
+                (FirmwareInfo::Acpi { rsdp }, Some((rsdp, len)))
+            }
+            None => (FirmwareInfo::Static, None),
+        },
+    }
+}
+
 /// The BSP's initial APIC id from CPUID leaf 1 EBX[31:24] (readable without
 /// enabling the APIC).
 fn boot_apic_id() -> u32 {
@@ -431,6 +607,13 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
     // 无堆 pass：在 `early_init` 之前**不分配**——只扫出"包含镜像的 bank"与
     // boot payload 排除区间；完整 RAM inventory 在 seam 之后用 `Vec` 重建。
     let mut exclusions = ExclusionTable::empty();
+    // 保留的固件源必须在**归还内存之前**确定：RSDP 本体的保留区间先记进排除
+    // 表（`select_arena` / `early_init` 之前），arena 永远不会覆盖它。
+    // 无候选 / 校验失败 → `Static`（本机没有保留的受支持固件描述）。
+    let (firmware, retained_firmware) = discover_firmware(protocol, info_pa);
+    if let Some((base, size)) = retained_firmware {
+        exclusions.exclude(base, size);
+    }
     let mut bank = None;
     let mut region_count = 0usize;
     walk_usable_regions(
@@ -461,8 +644,9 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
     };
 
     // Early-memory seam（无堆）：在包含镜像的那个 bank 里，排除镜像与 boot
-    // payload（PVH start_info / memmap 或整个 MB2 信息块），选出最大的页对齐
-    // 连续间隙作为 arena。发现的 RAM inventory 是机器真相，**不是** arena。
+    // payload（PVH start_info / memmap 或整个 MB2 信息块，加保留的 RSDP），
+    // 选出最大的页对齐连续间隙作为 arena。发现的 RAM inventory 是机器真相，
+    // **不是** arena；ACPI reclaim / NVS 区间不在 type-1 表内，天然不进 arena。
     let arena = kernel::memory::select_arena(bank, image, |emit| {
         emit(image)?;
         for excluded in &exclusions.exclusions[..exclusions.count] {
@@ -520,6 +704,8 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         // No timer-derived period is used on this port: `Timer` reports
         // `Unsupported`/`DeliveryUnavailable` and Core polls.
         timebase_frequency: 0,
+        // 保留的原始固件源（PVH `rsdp_paddr` / MB2 ACPI tag，均先经校验）。
+        firmware,
         // AP discovery (ACPI MADT) is not part of this bring-up: the BSP is
         // the only CPU Core may see, and it must be logical CPU0 with
         // `boot_cpu = true`.
@@ -537,6 +723,7 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         info.memory_regions.len(),
         info.boot_hardware_id.raw()
     );
+    kernel::log!("discovery", "firmware: {:?}", info.firmware);
     kernel::log!("bootstrap", "MachineInfo dump:");
     kernel::printk!("{:#?}\n", info);
 
@@ -549,6 +736,18 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
         Ok(info) => info,
         Err(error) => panic!("core init failed: {}", error),
     };
+
+    // 保留的 RSDP 必须在早期分配之后仍可按原样重读：重跑完整校验（签名 /
+    // 校验和 / 长度）。下游 ACPI 表不在此认证——未来消费者读表时各自校验。
+    if let FirmwareInfo::Acpi { rsdp } = info.firmware {
+        if validate_rsdp(rsdp, BOOT_INFO_MAX_PA.saturating_sub(rsdp)).is_none() {
+            panic!(
+                "retained RSDP is unreadable after early allocations (rsdp {:#x})",
+                rsdp
+            );
+        }
+        kernel::log!("discovery", "retained RSDP intact at {:#x}", rsdp);
+    }
     kernel::log!("bootstrap", "BOOT CORE OK");
 
     // Local sources are unmasked by `kernel::init`; open the global gate last.

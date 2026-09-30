@@ -11,8 +11,8 @@ use core::panic::PanicInfo;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{
-    CompatStr, CpuId, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
-    MAX_CPUS,
+    CompatStr, CpuId, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
+    MemoryRegion, MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -146,8 +146,13 @@ fn install_runtime_root(_info: &MachineInfo, _kernel_pa: usize) {}
 ///
 /// BSP 归一到逻辑 CPU0；firmware 描述超过 `MAX_CPUS` 时 BSP 优先、其余按发现
 /// 顺序取前 `MAX_CPUS` 并诊断；BSP 缺失不制造（Core 校验拒绝）。
-/// RV32 只保留能由 32 位地址表达的内存区间。
-fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineInfo {
+/// RV32 只保留能由 32 位地址表达的内存区间。`firmware` 是**保留的原始 DTB
+/// 物理区间**（arena 选择已永久排除，boot 生命周期内不回收）。
+fn discover<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    hart_id: usize,
+    firmware: FirmwareInfo,
+) -> MachineInfo {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(region) = region else { continue };
@@ -201,6 +206,7 @@ fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineIn
     MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
+        firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),
@@ -259,7 +265,14 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     }
 
     // 完整 discovery（seam 之后才允许分配）+ 机器侧 timer / PLIC 接线。
-    let info = discover(&tree, hart_id);
+    // 保留的原始固件源 = 入口给出的**原始** DTB 物理区间（fdt parser 已验证的
+    // totalsize）；arena 选择已把该区间永久排除，boot 生命周期内不回收。
+    let firmware = FirmwareInfo::Fdt {
+        phys: dtb_pa,
+        size: tree.total_size(),
+    };
+    let info = discover(&tree, hart_id, firmware);
+    kernel::log!("discovery", "firmware: {:?}", info.firmware);
     #[cfg(feature = "machine")]
     configure_machine_timer(&info);
     configure_interrupt_controller(&info);
@@ -278,6 +291,25 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
     // 长期 root：buddy 可用后替换 bootstrap 的全量 executable identity root，
     // 并把映射计划交给 Core（Isolated AS 只从计划取共享 Core 映射）。
     install_runtime_root(info, kernel_pa);
+
+    // 保留的 FDT 源必须在早期分配（discovery Vec / 长期页表）之后仍可读：
+    // 重读 header 的 magic 与 totalsize（NoMMU profile 是 flat identity，
+    // MMU profile 的 identity RAM 映射覆盖该区间；落在 `memory_regions` 之外
+    // 的情形由 `vm32::runtime::build` 的显式固件映射兜底）。
+    if let FirmwareInfo::Fdt { phys, size } = info.firmware {
+        if !crate::bootmem::retained_fdt_intact(phys, size) {
+            panic!(
+                "retained FDT is unreadable after early allocations (phys {:#x}, size {})",
+                phys, size
+            );
+        }
+        kernel::log!(
+            "discovery",
+            "retained FDT intact at {:#x} ({} bytes)",
+            phys,
+            size
+        );
+    }
     // 内嵌组件仓库：selftest 用例可加载真实组件（如 task-panic 的调度器）。
     let pkg_start = core::ptr::addr_of!(INITPKG) as usize;
     let pkg = unsafe { core::slice::from_raw_parts(pkg_start as *const u8, INITPKG.len()) };

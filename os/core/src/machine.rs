@@ -11,6 +11,9 @@
 //! 没有 `*_count` 字段。`memory_regions` 是发现的 **RAM inventory**（不是空闲
 //! 内存，也不是分配器 arena），Core 不把它改成"当前可分配"的列表。
 //!
+//! `firmware` 是**保留的原始固件描述源**（[`FirmwareInfo`]）：归一化视图不是
+//! 硬件描述的终点，未来驱动可据此读取 vendor 特定数据；保留字节不回收。
+//!
 //! 字段语义：Core Resource Truth 的"提案"，由 core::init 校验后提交。
 
 use alloc::boxed::Box;
@@ -105,6 +108,28 @@ impl core::fmt::Debug for MemoryRegion {
         write_size(f, self.size)?;
         write!(f, " }}")
     }
+}
+
+/// **保留的原始固件描述源**：boot 校验后保留的字节在哪里、有多少。
+///
+/// 归一化的 [`MachineInfo`] 不是硬件描述的终点：未来驱动可能需要 vendor
+/// 特定数据（FDT 节点 / ACPI 表）。本类型只给出**已验证的来源位置**：
+/// - 只说明"字节在哪、有多大"，**不认证内容**；下游表（RSDT/XSDT/…）由
+///   未来消费者在读取时各自校验；
+/// - 保留字节不回收（本阶段没有 reclaim 机制）：其所在区间由 boot 的 arena
+///   选择永久排除；
+/// - **不是** `repr(C)`、不进 `kcore_*` / 组件 SDK —— boot + Core 内部真相。
+///
+/// `Static` = 本机**没有保留的受支持固件描述**（不是"校验失败但继续"）。
+#[derive(Clone, Copy, Debug)]
+pub enum FirmwareInfo {
+    /// 保留的 FDT：`phys` 是本执行域可直接读的地址（RISC-V = DTB 物理区间；
+    /// AArch64 = staging 副本地址），`size` 是已验证的 `totalsize`。
+    Fdt { phys: usize, size: usize },
+    /// 保留的 ACPI RSDP 地址（签名 / 校验和 / 长度已验证）。
+    Acpi { rsdp: usize },
+    /// 没有保留的受支持固件描述。
+    Static,
 }
 
 /// 设备的一个空间条目：MMIO 窗口或 PIO 窗口，互斥由类型保证。
@@ -251,6 +276,8 @@ pub struct MachineInfo {
     /// BSP 的**硬件**身份（不是逻辑 `CpuId`；逻辑 id 由 Core 按下标赋）。
     pub boot_hardware_id: HardwareCpuId,
     pub timebase_frequency: u64,
+    /// 保留的原始固件描述源（归一化视图之外；见 [`FirmwareInfo`]）。
+    pub firmware: FirmwareInfo,
     /// 已承认的逻辑 CPU：BSP 在下标 0，硬件身份唯一。
     pub cpu_info: Box<[CpuInfo]>,
     /// 发现的 RAM inventory（不是空闲内存、不是 arena）。
@@ -263,6 +290,7 @@ impl core::fmt::Debug for MachineInfo {
         f.debug_struct("MachineInfo")
             .field("boot_hardware_id", &self.boot_hardware_id)
             .field("timebase_frequency", &self.timebase_frequency)
+            .field("firmware", &self.firmware)
             .field("cpu_info", &self.cpu_info)
             .field("memory_regions", &self.memory_regions)
             .field("devices", &self.devices)
@@ -300,7 +328,9 @@ pub fn committed() -> Option<&'static MachineInfo> {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{CpuInfo, DeviceDescriptor, HardwareCpuId, MachineInfo, MemoryRegion};
+    use super::{
+        CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, MachineInfo, MemoryRegion,
+    };
     use crate::test_support::{Rank, TestLock};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
@@ -319,6 +349,8 @@ pub(crate) mod test_support {
     static OVERRIDE: spin::Mutex<Option<&'static MachineInfo>> = spin::Mutex::new(None);
 
     /// 构造 owned fixture（host 测试专用；production 由 boot 从 `Vec` 构造）。
+    /// 无保留固件源（[`FirmwareInfo::Static`]）；需要固件真相的用例走
+    /// [`snapshot_with_firmware`]。
     pub(crate) fn snapshot(
         boot_hardware_id: HardwareCpuId,
         timebase_frequency: u64,
@@ -326,9 +358,29 @@ pub(crate) mod test_support {
         memory_regions: Vec<MemoryRegion>,
         devices: Vec<DeviceDescriptor>,
     ) -> MachineInfo {
+        snapshot_with_firmware(
+            boot_hardware_id,
+            timebase_frequency,
+            FirmwareInfo::Static,
+            cpu_info,
+            memory_regions,
+            devices,
+        )
+    }
+
+    /// 带保留固件源的 fixture（其余与 [`snapshot`] 相同）。
+    pub(crate) fn snapshot_with_firmware(
+        boot_hardware_id: HardwareCpuId,
+        timebase_frequency: u64,
+        firmware: FirmwareInfo,
+        cpu_info: Vec<CpuInfo>,
+        memory_regions: Vec<MemoryRegion>,
+        devices: Vec<DeviceDescriptor>,
+    ) -> MachineInfo {
         MachineInfo {
             boot_hardware_id,
             timebase_frequency,
+            firmware,
             cpu_info: cpu_info.into_boxed_slice(),
             memory_regions: memory_regions.into_boxed_slice(),
             devices: devices.into_boxed_slice(),
@@ -353,6 +405,9 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    /// FDT magic（测试哨兵：模拟保留的 FDT header 可重读）。
+    const FDT_MAGIC: u32 = 0xd00d_feed;
 
     fn device(compatibles: &[&[u8]], irq: Option<u32>) -> DeviceDescriptor {
         let mut d = DeviceDescriptor::empty();
@@ -687,6 +742,7 @@ mod tests {
         assert!(text.contains("256 MiB"), "{text}");
         assert!(text.contains("virtio,mmio"), "{text}");
         assert!(text.contains("riscv,clint0"), "{text}");
+        assert!(text.contains("firmware: Static"), "{text}");
         assert!(!text.contains("cpu_count"), "{text}");
         assert!(!text.contains("mem_count"), "{text}");
         assert!(!text.contains("dev_count"), "{text}");
@@ -695,5 +751,81 @@ mod tests {
         let empty = fixture(vec![]);
         let text = alloc::format!("{empty:?}");
         assert!(text.contains("devices: []"), "{text}");
+    }
+
+    /// 一份带指定保留固件源的单 CPU / 单 RAM 区 fixture。
+    fn fixture_with_firmware(firmware: FirmwareInfo) -> MachineInfo {
+        test_support::snapshot_with_firmware(
+            HardwareCpuId::from_raw(0),
+            10_000_000,
+            firmware,
+            vec![cpu0()],
+            vec![ram()],
+            vec![],
+        )
+    }
+
+    /// 保留的固件源是**位置真相**：快照发布后大量分配，`committed()` 仍报告同
+    /// 一变体/取值，且来源地址上的字节仍可按原样重读（模拟未来消费者）。
+    #[test]
+    fn firmware_info_survives_heavy_allocation_and_source_stays_readable() {
+        let _guard = test_support::GUARD.lock();
+
+        // Given: boot 保留的 FDT 字节（泄漏缓冲模拟固件源）与带 FirmwareInfo 的已安装快照。
+        let mut source = vec![0xa5u8; 512];
+        source[..4].copy_from_slice(&FDT_MAGIC.to_be_bytes());
+        let source: &'static mut [u8] = Box::leak(source.into_boxed_slice());
+        let phys = source.as_ptr() as usize;
+        let size = source.len();
+        let _installed =
+            test_support::install(fixture_with_firmware(FirmwareInfo::Fdt { phys, size }));
+
+        // When: 大量分配 / 释放（搬动堆内其它对象，不得动到保留源）。
+        let mut pressure: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..64 {
+            pressure.push(vec![0xAAu8; 256 * 1024]);
+        }
+        pressure.shrink_to_fit();
+        drop(pressure);
+
+        // Then: 已提交快照仍报告同一来源，重读的字节未变。
+        let committed = committed().expect("fixture must be installed");
+        assert!(
+            matches!(
+                committed.firmware,
+                FirmwareInfo::Fdt { phys: p, size: s } if p == phys && s == size
+            ),
+            "firmware 来源不得在分配后漂移: {:?}",
+            committed.firmware
+        );
+        // SAFETY: `source` 是本测试泄漏的缓冲区，`phys` 就是它的地址。
+        let reread = unsafe { core::slice::from_raw_parts(phys as *const u8, size) };
+        assert_eq!(reread, &source[..], "保留源必须仍可读且内容未变");
+        assert_eq!(
+            u32::from_be_bytes(reread[..4].try_into().unwrap()),
+            FDT_MAGIC
+        );
+    }
+
+    /// `Static` / `Acpi` 变体经快照往返保持不变，Debug 输出可读。
+    #[test]
+    fn firmware_info_variants_round_trip_and_are_visible_in_debug() {
+        // Static：默认 fixture（无保留固件源）。
+        let static_info = fixture(vec![]);
+        assert!(matches!(static_info.firmware, FirmwareInfo::Static));
+        let text = alloc::format!("{:?}", static_info.firmware);
+        assert_eq!(text, "Static");
+
+        // Acpi：安装后 `committed()` 报告同一 rsdp；Debug 保留字段名与值。
+        let _guard = test_support::GUARD.lock();
+        let _installed =
+            test_support::install(fixture_with_firmware(FirmwareInfo::Acpi { rsdp: 0xf_0000 }));
+        let committed = committed().expect("fixture must be installed");
+        assert!(matches!(
+            committed.firmware,
+            FirmwareInfo::Acpi { rsdp: 0xf_0000 }
+        ));
+        let text = alloc::format!("{:?}", committed.firmware);
+        assert_eq!(text, "Acpi { rsdp: 983040 }", "{text}");
     }
 }

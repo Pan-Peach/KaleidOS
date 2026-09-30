@@ -6,8 +6,8 @@ use core::panic::PanicInfo;
 use fdt::nodes::AsNode;
 use fdt::properties::values::StringList;
 use kernel::machine::{
-    CompatStr, CpuId, CpuInfo, DeviceDescriptor, HardwareCpuId, IoSpace, MachineInfo, MemoryRegion,
-    MAX_CPUS,
+    CompatStr, CpuId, CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, IoSpace, MachineInfo,
+    MemoryRegion, MAX_CPUS,
 };
 
 #[path = "console.rs"]
@@ -320,10 +320,16 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
 /// 完整 discovery（high-half、`early_init` 之后）：FDT → owned `MachineInfo`。
 ///
 /// 用 `Vec` 收集（**不**截断到旧定长容量），交接处 `.into_boxed_slice()`；
-/// 字符串用 `CompatStr` 内嵌复制，DTB 之后可丢。CPU 承认规则：BSP 归一到逻辑
+/// 字符串用 `CompatStr` 内嵌复制。**FDT 源不再可丢**：`FirmwareInfo::Fdt`
+/// 永久保留该物理区间（arena 选择已把它排除），供未来驱动读原始视图。
+/// CPU 承认规则：BSP 归一到逻辑
 /// CPU0；firmware 描述的 CPU 超过 `MAX_CPUS` 时 BSP 优先、其余按发现顺序取前
 /// `MAX_CPUS` 并显式诊断。**BSP 缺失时不制造**——Core 校验会拒绝该提案。
-fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineInfo {
+fn discover<'a>(
+    tree: &fdt::Fdt<'a, FdtParser<'a>>,
+    hart_id: usize,
+    firmware: FirmwareInfo,
+) -> MachineInfo {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();
     for region in tree.root().memory().reg().iter::<u64, u64>() {
         let Ok(r) = region else { continue };
@@ -370,6 +376,7 @@ fn discover<'a>(tree: &fdt::Fdt<'a, FdtParser<'a>>, hart_id: usize) -> MachineIn
     MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
         timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
+        firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
         devices: devices.into_boxed_slice(),
@@ -400,7 +407,14 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
         Ok(tree) => tree,
         Err(error) => panic!("FDT parse failed in high half: {:?}", error),
     };
-    let info = discover(&tree, context.hart_id);
+    // 保留的原始固件源 = 入口给出的 **原始** DTB 物理区间（fdt parser 已验证的
+    // totalsize）；arena 选择已把该区间永久排除，boot 生命周期内不回收。
+    let firmware = FirmwareInfo::Fdt {
+        phys: context.dtb_pa,
+        size: tree.total_size(),
+    };
+    let info = discover(&tree, context.hart_id, firmware);
+    kernel::log!("discovery", "firmware: {:?}", info.firmware);
 
     #[cfg(feature = "machine")]
     configure_machine_timer(&info);
@@ -424,6 +438,25 @@ extern "C" fn bootstrap_high(context_ptr: usize) -> ! {
     runtime::init(&runtime_layout, context.reserved[0].base, info)
         .expect("Sv39 runtime VM init failed");
     kernel::log!("mmu", "runtime VM active");
+
+    // 保留的 FDT 源必须在早期分配（buddy 页表 / discovery Vec）之后仍可读：
+    // 重读 header 的 magic 与 totalsize。runtime root 对 RAM 的 identity 映射
+    // 覆盖该区间；若 FDT 在 `memory_regions` 之外，`vm::runtime::build` 已额外
+    // 建立 Core 可访问映射——物理驻留与可读性一起保留。
+    if let FirmwareInfo::Fdt { phys, size } = info.firmware {
+        if !crate::bootmem::retained_fdt_intact(phys, size) {
+            panic!(
+                "retained FDT is unreadable after early allocations (phys {:#x}, size {})",
+                phys, size
+            );
+        }
+        kernel::log!(
+            "discovery",
+            "retained FDT intact at {:#x} ({} bytes)",
+            phys,
+            size
+        );
+    }
 
     // 内嵌组件仓库：.initpkg section = init.kpkg（cpio 归档）
     let pkg_start = core::ptr::addr_of!(__initpkg_start) as usize;

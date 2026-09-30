@@ -7,11 +7,18 @@
 //!    （`scan_fdt_exclusions`：保留的 FDT 整体、FDT header 的 memory
 //!    reservation map、`/reserved-memory` 的定址子节点）。
 //!
+//! 保留的 FDT 整体是**永久保留**（Phase 4c）：`MachineInfo.firmware` 永久指向
+//! 该物理区间，供未来驱动读原始视图；arena 必须永远排除这些页（本阶段没有
+//! reclaim 机制）。`retained_fdt_intact` 在早期分配之后重读 header 自检。
+//!
 //! 本模块不做分配、不缓存排除集；`scan_fdt_exclusions` 会被
 //! `kernel::memory::select_arena` 反复调用（每次重读 FDT 记录）。无法解释的
 //! reservation 一律返回 `Err` → fail-closed。
 
 use kernel::machine::MemoryRegion;
+
+/// FDT magic（大端在线上）。
+const FDT_MAGIC: u32 = 0xd00d_feed;
 
 type FdtParser<'a> = (
     fdt::parsing::unaligned::UnalignedParser<'a>,
@@ -70,7 +77,7 @@ pub fn arena_search_window(bank: MemoryRegion, image: MemoryRegion) -> MemoryReg
 
 /// 逐条 emit 所有 **FDT 派生**的 live/reserved 区间（不含镜像本身）。
 ///
-/// 覆盖：保留的 FDT 整体 `[dtb_pa, dtb_pa + totalsize)`、header memory
+/// 覆盖：**永久保留**的 FDT 整体 `[dtb_pa, dtb_pa + totalsize)`、header memory
 /// reservation map 的每个条目、`/reserved-memory` 每个子节点的 `reg`。
 /// 任何无法解释的形状（无终结符、越界、无 `reg` 的子节点）→ `Err`。
 pub fn scan_fdt_exclusions<'a>(
@@ -78,7 +85,8 @@ pub fn scan_fdt_exclusions<'a>(
     dtb_pa: usize,
     emit: &mut dyn FnMut(MemoryRegion) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
-    // 保留的 FDT 整体：boot 在完整 discovery 结束前持续读它。
+    // 保留的 FDT 整体：**永久保留**（`MachineInfo.firmware` 指向它），arena
+    // 必须永远排除这些页——不再只是"discovery 结束前读它"。
     let total_size = tree.total_size();
     if total_size == 0 {
         return Err("FDT totalsize is zero");
@@ -143,6 +151,12 @@ fn emit_reservation(
     emit(MemoryRegion { base, size })
 }
 
+/// 保留 FDT 源（`MachineInfo.firmware` 的 `FirmwareInfo::Fdt`）的自检：
+/// 重读 header 的 magic 与 totalsize，证明早期分配之后原始字节仍可按原样读回。
+pub fn retained_fdt_intact(dtb_pa: usize, size: usize) -> bool {
+    read_be_u32(dtb_pa) == FDT_MAGIC && read_be_u32(dtb_pa + 4) as usize == size
+}
+
 /// Big-endian u64 的逐字节 volatile 读（DTB 可能未对齐，不假设对齐 / 不构造引用）。
 fn read_be_u64(pa: usize) -> u64 {
     let mut bytes = [0u8; 8];
@@ -151,4 +165,14 @@ fn read_be_u64(pa: usize) -> u64 {
         *byte = unsafe { core::ptr::read_volatile((pa + offset) as *const u8) };
     }
     u64::from_be_bytes(bytes)
+}
+
+/// Big-endian u32 的逐字节 volatile 读（与 [`read_be_u64`] 同一约定）。
+fn read_be_u32(pa: usize) -> u32 {
+    let mut bytes = [0u8; 4];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: 见 [`read_be_u64`]。
+        *byte = unsafe { core::ptr::read_volatile((pa + offset) as *const u8) };
+    }
+    u32::from_be_bytes(bytes)
 }

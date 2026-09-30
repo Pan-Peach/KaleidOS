@@ -26,6 +26,7 @@
 //! layout       → 高半区正式段（.text RX / .rodata+.initpkg R / .data+.bss RW）
 //!               → PA = kernel_pa + (va - KERNEL_VMA)
 //! info RAM     → identity 映射（VA == PA，RWX：组件池在 buddy identity 页执行）
+//! info firmware→ 保留的 FDT 落在 identity RAM 之外时的显式只读 identity 映射
 //! info 设备    → MMIO 区间（VA == PA，RW-NX，页对齐向外取整）
 //! ```
 //!
@@ -39,7 +40,7 @@
 use arch::riscv::mmu::address_space::Sv39AddressSpace;
 use arch::riscv::mmu::sv39::{PteFlags, VM_PAGE_SIZE};
 use arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange};
-use kernel::machine::{IoSpace, MachineInfo};
+use kernel::machine::{FirmwareInfo, IoSpace, MachineInfo};
 use kernel::memory::address_space::Mapping;
 use kernel::memory::kernel_mappings::{KernelMappingPlan, MappingClass};
 use spin::{Mutex, Once};
@@ -122,10 +123,11 @@ fn section_pa(va_start: usize, kernel_pa: usize) -> Result<usize, RuntimeVmError
 }
 
 impl RuntimeVm {
-    /// 建立长期 root。四个映射来源覆盖全部 PA 来源（见模块文档）：
+    /// 建立长期 root。映射来源覆盖全部 PA 来源（见模块文档）：
     /// 0. 低引导区的高半区影子（`[KERNEL_VMA, text.va_start)`，RW-NX——含
     ///    `.bss.stack` 高栈与 `.bss.early_root`，bootstrap_high 正跑在上面）；
     /// 1. identity RAM（`info.memory_regions`，VA == PA，RWX——阶段一组件池）；
+    ///    1b. 保留固件源（`info.firmware` 的 FDT 不在 identity RAM 内时的只读兜底）；
     /// 2. 内核镜像正式段（`layout.sections()`，PA 由 `kernel_pa` 推导，段权限）；
     /// 3. 设备 MMIO（`info.devices`，VA == PA，RW-NX）。
     pub fn build(
@@ -214,6 +216,50 @@ impl RuntimeVm {
                     permission: ram_perm,
                 }
             );
+        }
+
+        // 1b) 保留的固件源（`info.firmware`）：identity RAM 映射只覆盖
+        //     `memory_regions`（且向内取整到页）。保留的 FDT 若落在这些映射
+        //     之外，**物理驻留 ≠ 可访问**——显式建立 Core 可访问的只读
+        //     identity 映射。只进内核 root：不给实例任何 PA 查询 / 共享别名。
+        if let FirmwareInfo::Fdt { phys, size } = info.firmware {
+            if size == 0 {
+                return Err(RuntimeVmError::InvalidLayout);
+            }
+            let end = phys
+                .checked_add(size)
+                .ok_or(RuntimeVmError::InvalidLayout)?;
+            let start_page = align_down_page(phys);
+            let end_page = align_up_page(end);
+            let covered = info.memory_regions.iter().any(|region| {
+                let Some(region_end) = region.base.checked_add(region.size) else {
+                    return false;
+                };
+                // 与上面的 identity 映射同一取整：`[align_up(base), align_down(end))`。
+                align_up_page(region.base) <= start_page && end_page <= align_down_page(region_end)
+            });
+            if !covered {
+                let range = VirtualRange {
+                    base: start_page,
+                    size: end_page - start_page,
+                };
+                let pa = PhysicalRange {
+                    base: start_page,
+                    size: end_page - start_page,
+                };
+                let permission = MappingPermission::READ;
+                space
+                    .map(range, pa, permission)
+                    .map_err(|_| RuntimeVmError::MapFailed)?;
+                record!(
+                    MappingClass::CoreRootOnly,
+                    Mapping {
+                        virtual_range: range,
+                        physical_range: pa,
+                        permission,
+                    }
+                );
+            }
         }
 
         // 2) 内核镜像：段 VA 高半区，PA = kernel_pa + (va_start - KERNEL_VMA)。

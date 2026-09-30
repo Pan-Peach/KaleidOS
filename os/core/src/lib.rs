@@ -135,6 +135,23 @@ fn validate_proposal(
         return Err("device table exceeds DeviceId width");
     }
 
+    // 保留的固件源是**位置真相**：非 `Static` 必须是形状合法的保留区间。
+    // 内容校验（FDT header / RSDP 签名·校验和·长度）在 boot 边界完成；Core
+    // 拒绝零地址 / 零长度这类不可能合法的提案——绝不发布指向无效字节的固件根。
+    match info.firmware {
+        machine::FirmwareInfo::Fdt { phys, size } => {
+            if phys == 0 || size == 0 {
+                return Err("invalid retained FDT source");
+            }
+        }
+        machine::FirmwareInfo::Acpi { rsdp } => {
+            if rsdp == 0 {
+                return Err("invalid retained ACPI RSDP source");
+            }
+        }
+        machine::FirmwareInfo::Static => {}
+    }
+
     // BSP：**唯一**、位于逻辑 CPU0、硬件身份与 `boot_hardware_id` 一致。
     let boot_count = info.cpu_info.iter().filter(|cpu| cpu.boot_cpu).count();
     if boot_count != 1
@@ -301,5 +318,40 @@ mod tests {
             ),
             Err("reserved image is outside the discovered RAM regions")
         );
+    }
+
+    /// 保留的固件源必须是形状合法的位置：零地址 / 零长度 → 拒绝提案（绝不以
+    /// `Static` 之外的形式发布悬空固件根）；`Static` 不携带来源，合法。
+    #[test]
+    fn validate_rejects_dangling_firmware_sources() {
+        let mut info = proposal(vec![cpu(true, 0)], vec![ram(0x8000_0000, 0x1000)]);
+        assert_eq!(validate_proposal(&info, &[]), Ok(()), "Static 合法");
+
+        info.firmware = machine::FirmwareInfo::Fdt {
+            phys: 0,
+            size: 0x1000,
+        };
+        assert_eq!(
+            validate_proposal(&info, &[]),
+            Err("invalid retained FDT source")
+        );
+
+        info.firmware = machine::FirmwareInfo::Fdt {
+            phys: 0x8000_0000,
+            size: 0,
+        };
+        assert_eq!(
+            validate_proposal(&info, &[]),
+            Err("invalid retained FDT source")
+        );
+
+        info.firmware = machine::FirmwareInfo::Acpi { rsdp: 0 };
+        assert_eq!(
+            validate_proposal(&info, &[]),
+            Err("invalid retained ACPI RSDP source")
+        );
+
+        info.firmware = machine::FirmwareInfo::Acpi { rsdp: 0xf_0000 };
+        assert_eq!(validate_proposal(&info, &[]), Ok(()));
     }
 }
