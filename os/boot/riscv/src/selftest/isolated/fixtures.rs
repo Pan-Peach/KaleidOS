@@ -224,7 +224,7 @@ pub(crate) fn isolated_fixture() -> Result<IsolatedFixture, &'static str> {
     };
     map_page(
         ISOLATED_FIXTURE_VA,
-        arch::physical_address_of(fixture_va),
+        crate::addr::linked_to_physical(fixture_va),
         MappingPermission::READ | MappingPermission::EXECUTE,
     )?;
     map_page(

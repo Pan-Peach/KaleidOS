@@ -180,12 +180,12 @@ pub(crate) fn isolated_image() -> ! {
     // 共享 Core 映射：Core 镜像静态 / 安全 trap 栈在实例 AS 里 same VA → same PA。
     let core_static_va = core::ptr::addr_of!(super::super::MAPPING_VALUE) as usize;
     match address_space::translate(fixture.handle, core_static_va) {
-        Ok(Some(pa)) if pa == arch::physical_address_of(core_static_va) => {}
+        Ok(Some(pa)) if pa == crate::addr::linked_to_physical(core_static_va) => {}
         _ => fail("isolated-image: a Core image static is not shared into the instance AS"),
     }
     let trap_stack_base = arch::riscv::trap::trap_stack_range().0;
     match address_space::translate(fixture.handle, trap_stack_base) {
-        Ok(Some(pa)) if pa == arch::physical_address_of(trap_stack_base) => {}
+        Ok(Some(pa)) if pa == crate::addr::linked_to_physical(trap_stack_base) => {}
         _ => fail("isolated-image: the safe trap stack is not shared into the instance AS"),
     }
     // 镜像窗口之外仍是组件私有布局：不可达。

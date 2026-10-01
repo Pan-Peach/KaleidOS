@@ -28,6 +28,11 @@ pub fn machine(_line: &[u8]) {
         return;
     };
     printk!("boot hart: hart{}\n", info.boot_hardware_id.raw());
+    // timebase 频率是显式 optional：未知时打印 unknown，绝不伪造 0 Hz。
+    match info.timebase_frequency {
+        Some(hz) => printk!("timebase: {} Hz\n", hz),
+        None => printk!("timebase: unknown\n"),
+    }
     printk!("cpus: {}\n", info.cpu_info.len());
     for c in info.cpu_info.iter() {
         // raw()：HardwareCpuId 的 Display 是 "hwcpuN"；这里要裸 hart 号（hartN）。

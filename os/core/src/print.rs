@@ -92,7 +92,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 /// **永不挂死**：频率未知 / 投递未就绪 / arm 失败时不睡眠，回退到轮询自旋。
 /// `delivery_ready()` 与 `arm_deadline()` 在机制初始化前都不分配。
 pub(crate) fn idle_wait() {
-    // 频率未知（如 x86 的 0 = unknown 约定）或换算失败：回退轮询。
+    // 频率未知（`None`）或换算失败：回退轮询。
     let Some(period) = idle_period() else {
         core::hint::spin_loop();
         return;
@@ -117,16 +117,13 @@ pub(crate) fn idle_wait() {
     }
 }
 
-/// idle 周期（tick）：只从已提交 `MachineInfo` 的**已知非零** timebase 频率
-/// 换算 ~10ms。频率未知（如 x86 的 0 = unknown 约定）或换算截断为 0 → `None`
-/// （调用者回退轮询）——**不伪造**任何架构专属常量。
+/// idle 周期（tick）：只从已提交 `MachineInfo` 的**已知** timebase 频率换算
+/// ~10ms。频率未知（`None`）或换算截断为 0 → `None`（调用者回退轮询）——
+/// **不伪造**任何架构专属常量。
 fn idle_period() -> Option<u64> {
     const TARGET_MS: u64 = 10;
     let info = crate::machine::committed()?;
-    let hz = info.timebase_frequency;
-    if hz == 0 {
-        return None;
-    }
+    let hz = info.timebase_frequency?.get();
     let period = hz / (1000 / TARGET_MS);
     (period != 0).then_some(period)
 }
@@ -173,11 +170,13 @@ macro_rules! log {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::num::NonZeroU64;
 
-    /// 安装一份指定 timebase 频率的机器 fixture（只关心 idle 换算字段）。
+    /// 安装一份指定 timebase 频率（`None` = 未知）的机器 fixture（只关心 idle
+    /// 换算字段）。
     ///
     /// 全局快照是进程级读路径，调用方必须持有 `machine::test_support::GUARD`。
-    fn install_timebase(timebase_frequency: u64) {
+    fn install_timebase(timebase_frequency: Option<NonZeroU64>) {
         let info = crate::machine::test_support::snapshot(
             crate::machine::HardwareCpuId::from_raw(0),
             timebase_frequency,
@@ -200,7 +199,7 @@ mod tests {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：已提交 10 MHz timebase（QEMU virt 典型值）。
-        install_timebase(10_000_000);
+        install_timebase(NonZeroU64::new(10_000_000));
 
         // When：计算 idle 周期。
         let period = idle_period();
@@ -215,7 +214,7 @@ mod tests {
         let _guard = crate::machine::test_support::GUARD.lock();
 
         // Given：50 Hz timebase → 50 / 100 == 0。
-        install_timebase(50);
+        install_timebase(NonZeroU64::new(50));
 
         // When：计算 idle 周期。
         let period = idle_period();
@@ -224,18 +223,18 @@ mod tests {
         assert_eq!(period, None, "截断为 0 时必须报未知而不是伪造周期");
     }
 
-    /// timebase 频率为 0（如 x86 的 zero-as-unknown 约定）→ 未知，回退轮询。
+    /// timebase 频率显式未知（`None`，如未发现 TSC 频率的 x86）→ 回退轮询。
     #[test]
-    fn idle_period_is_unknown_when_timebase_frequency_is_zero() {
+    fn idle_period_is_unknown_when_timebase_frequency_is_unknown() {
         let _guard = crate::machine::test_support::GUARD.lock();
 
-        // Given：timebase 频率未知（0）。
-        install_timebase(0);
+        // Given：timebase 频率未知（显式 `None`）。
+        install_timebase(None);
 
         // When：计算 idle 周期。
         let period = idle_period();
 
         // Then：未知（回退轮询，绝不伪造）。
-        assert_eq!(period, None, "timebase=0 是未知约定，必须返回 None");
+        assert_eq!(period, None, "None 是显式未知，必须返回 None");
     }
 }

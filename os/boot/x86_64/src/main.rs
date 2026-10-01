@@ -708,10 +708,11 @@ extern "C" fn bootstrap_main(magic: usize, info_pa: usize) -> ! {
     let info = MachineInfo {
         boot_hardware_id: cpu_info[0].hardware_id,
         // TSC frequency is not discoverable via CPUID 0x15/0x16 on `qemu64`,
-        // so the timebase is **unknown** (`0` convention, not fabricated).
+        // so the timebase is **explicitly unknown** (`None`, not fabricated).
         // No timer-derived period is used on this port: `Timer` reports
-        // `Unsupported`/`DeliveryUnavailable` and Core polls.
-        timebase_frequency: 0,
+        // `Unsupported`/`DeliveryUnavailable` and Core polls; a future
+        // preempt profile would fail closed on this `None`.
+        timebase_frequency: None,
         // 保留的原始固件源（PVH `rsdp_paddr` / MB2 ACPI tag，均先经校验）。
         firmware,
         // AP discovery (ACPI MADT) is not part of this bring-up: the BSP is

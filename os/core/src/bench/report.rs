@@ -137,7 +137,9 @@ pub fn report_environment() {
     } else {
         "host"
     };
-    let timebase_hz = crate::machine::committed().map_or(0, |info| info.timebase_frequency);
+    let timebase_hz = crate::machine::committed()
+        .and_then(|info| info.timebase_frequency)
+        .map_or(0, |hz| hz.get());
     crate::printk!(
         "BENCH-ENV arch={} xlen={} platform=undetected timebase_hz={} privilege={} vm={} trace={} preempt={} clock={} mode={} commit={}\n",
         ARCH,

@@ -24,6 +24,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use fdt::nodes::{AsNode, Node};
 use fdt::properties::reg::Reg;
 use fdt::properties::values::StringList;
@@ -671,7 +672,7 @@ fn interrupt_cells<'a>(controller: &Node<'a, FdtParser<'a>>) -> Result<usize, &'
 pub fn discover<'a>(
     tree: &fdt::Fdt<'a, FdtParser<'a>>,
     boot_affinity: u64,
-    timebase_frequency: u64,
+    timebase_frequency: Option<NonZeroU64>,
     firmware: FirmwareInfo,
 ) -> Result<MachineInfo, &'static str> {
     let mut memory_regions: Vec<MemoryRegion> = Vec::new();

@@ -38,7 +38,7 @@
 
 > **`tp`（x4）只是架构 / 任务执行状态（线程指针）**，不是组件运行时指针，也没有 per-instance runtime slot：`RiscvContext.tp` 与 `switch32.S` / `switch64.S` 在任务切换、`TrapFrame.x[4]` 在 trap 时由 Core 透明保存 / 恢复；全新执行上下文起点为 `tp == 0`；跨 AS trampoline 对全新同步 Isolated 入口**显式清零 `tp`**（不继承 caller 的 `tp`）。TLS / 线程指针语义属未来 task/thread/libc runtime，**不属于 Component 模型**；Core 的 principal / authority 来自 `RequestContext::ambient()`（containment escape-guard 链），与 `tp` 无关。
 
-- 通用地址方案原语：`HIGH_HALF_OFFSET`、`physical_address_of`（RV64 高半区 → 物理；否则恒等）。
+- **不做通用地址方案原语**：公共 HAL 不承诺任何固定 VA↔PA 偏移（无 `HIGH_HALF_OFFSET` / 无 `physical_address_of`）。运行期 VA→PA 一律走 `AddressSpaceBackend::translate`（由映射所有者裁决）；RISC-V 高半区换算只出现在 boot 本地（`vm/bootstrap.rs`）与该 ISA 的**组件导入 / callable 绑定**（`riscv/elf.rs`，不是 VA→PA 查询）内部。
 - 架构中立 VM contract（`os/arch/src/vm.rs`）：`AddressSpaceBackend`（`GRANULE` / `PRIVATE_ADDRESS_SPACE` / `map` / `unmap` / `translate` / `activate` / `prepare_activation`）。
 - 组件传输 / 对象 ABI 机制：`ComponentStore` / `StoreEntry`（`store.rs`）、`RelocationBackend` / `Relocation` / `WordSize`（`component.rs`）。
 - 具体 ISA 机制：RISC-V trap / context switch / Sv39·Sv32 页表 / SBI / PLIC / `RiscvRelocator` / 跨 AS trampoline；新 ISA 为同形骨架（见下）。
@@ -95,7 +95,7 @@
 
 | 路径 | 内容 |
 |---|---|
-| `os/arch/src/lib.rs` | 后端 trait、`ResetType`、cfg 别名、`physical_address_of` |
+| `os/arch/src/lib.rs` | 后端 trait、`ResetType`、cfg 别名 |
 | `os/arch/src/cpu.rs` | `CpuId` / `HardwareCpuId` / `LocalInterruptHandler` / `ExternalIrqHandler` |
 | `os/arch/src/smp.rs` | `Smp` trait、`SecondaryBoot`、`InitError`/`CpuStartError`/`IpiError` |
 | `os/arch/src/vm.rs` | `AddressSpaceBackend` 与范围 / 权限类型 |

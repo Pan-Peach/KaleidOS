@@ -27,6 +27,11 @@ pub(crate) mod vm;
 #[path = "vm32/mod.rs"]
 pub(crate) mod vm32;
 
+// boot 本地链接地址归一化（RV32 boot + 两个 XLEN 的 selftest）。
+#[cfg(any(target_arch = "riscv32", feature = "selftest"))]
+#[path = "addr.rs"]
+pub(crate) mod addr;
+
 // 无堆早期内存 pass（RV64/RV32 共用）：包含镜像的 bank + FDT 排除区间扫描。
 #[path = "bootmem.rs"]
 pub(crate) mod bootmem;

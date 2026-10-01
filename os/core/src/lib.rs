@@ -82,8 +82,10 @@ pub fn init(
     task::init();
     sched::init();
     component::containment::init();
+    // 抢占必须知道 timebase 速率：未知（`None`）时 `init_preempt` fail-closed，
+    // 这里把失败升级为启动失败（没有可用的调度 tick，不假装成功）。
     #[cfg(feature = "preempt")]
-    timer::init_preempt(info.timebase_frequency as usize).map_err(|_| "timer init failed")?;
+    timer::init_preempt(info.timebase_frequency).map_err(|_| "timer init failed")?;
     #[cfg(not(feature = "preempt"))]
     if let Err(error) = timer::init() {
         // 协作式 profile 可以在**没有 timer 投递**的情况下继续：`print::
@@ -216,7 +218,7 @@ mod tests {
     fn proposal(cpus: Vec<CpuInfo>, regions: Vec<MemoryRegion>) -> MachineInfo {
         machine::test_support::snapshot(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            core::num::NonZeroU64::new(10_000_000),
             cpus,
             regions,
             vec![DeviceDescriptor::empty()],

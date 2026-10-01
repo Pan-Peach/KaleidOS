@@ -28,6 +28,8 @@
 //! 5. 可选抢占：仅 `preempt` profile 由 `init_preempt` 使用周期 deadline。
 use crate::machine::CpuId;
 use arch::Timer;
+#[cfg(feature = "preempt")]
+use core::num::NonZeroU64;
 use spin::{Mutex, Once};
 
 struct TimerState {
@@ -69,8 +71,11 @@ const PREEMPT_HZ: u64 = 100;
 /// 时钟机制错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerError {
-    /// 频率非法（0 或换算溢出）。
+    /// 频率非法（非零但低于抢占频率，或换算溢出）。
     InvalidFrequency,
+    /// 抢占需要 timebase 速率，但机器**未报告已知速率**（`None`）：fail-closed，
+    /// 绝不猜测换算周期。
+    UnknownFrequency,
     /// 已经初始化（Core 单例机制，只 init 一次）。
     AlreadyInitialized,
     /// 本 CPU 的 timer 投递未就绪（`on_trap` / `arm_deadline` / `ticks` 先于
@@ -147,8 +152,12 @@ pub fn arm_deadline(deadline: u64) -> Result<(), TimerError> {
 
 #[cfg(feature = "preempt")]
 /// 为抢占 profile 在**当前 CPU** 上初始化周期性调度 tick。
-pub fn init_preempt(timebase_hz: usize) -> Result<(), TimerError> {
-    let timebase_hz = u64::try_from(timebase_hz).map_err(|_| TimerError::InvalidFrequency)?;
+///
+/// 抢占必须把 `PREEMPT_HZ` 换算成 timebase tick：机器未报告已知速率
+/// （`None`）时 **fail-closed**（[`TimerError::UnknownFrequency`]），
+/// **绝不**用缺省常量猜周期。
+pub fn init_preempt(timebase_hz: Option<NonZeroU64>) -> Result<(), TimerError> {
+    let timebase_hz = timebase_hz.ok_or(TimerError::UnknownFrequency)?.get();
     if timebase_hz < PREEMPT_HZ {
         return Err(TimerError::InvalidFrequency);
     }
@@ -200,7 +209,6 @@ pub fn on_trap(cpu: CpuId) {
         } else {
             state.next_deadline = None;
         }
-        return;
     }
     #[cfg(not(feature = "preempt"))]
     {
@@ -224,6 +232,7 @@ pub fn ticks() -> u64 {
 mod tests {
     use super::*;
     use crate::test_support::{Rank, TestLock};
+    use core::num::NonZeroU64;
 
     /// 序列化触碰进程级 timer 全局的测试。
     ///
@@ -234,10 +243,10 @@ mod tests {
     /// rank = TIMER（模块本地、最外层；见 [`crate::test_support`]）。
     static TIMER_TEST_LOCK: TestLock = TestLock::new(Rank::Timer);
 
-    /// 安装一份 10 MHz timebase 的机器 fixture（idle 周期换算用）。
+    /// 安装一份已知 10 MHz timebase 的机器 fixture（idle 周期换算用）。
     ///
     /// 调用方必须持有 [`crate::machine::test_support::GUARD`]。
-    fn install_timebase(timebase_frequency: u64) {
+    fn install_timebase(timebase_frequency: Option<NonZeroU64>) {
         let info = crate::machine::test_support::snapshot(
             crate::machine::HardwareCpuId::from_raw(0),
             timebase_frequency,
@@ -269,7 +278,7 @@ mod tests {
         let _serial = TIMER_TEST_LOCK.lock();
         // MACHINE rank(1) > TIMER rank(-1)：顺序合法。
         let _machine = crate::machine::test_support::GUARD.lock();
-        install_timebase(10_000_000);
+        install_timebase(NonZeroU64::new(10_000_000));
 
         // Given: 没有任何 timer 表；后端本地初始化被注入失败。
         assert!(
@@ -431,5 +440,19 @@ mod tests {
                 .lock()
                 .delivery_ready
         );
+    }
+
+    /// 抢占在 timebase **未知**时必须 fail-closed（`UnknownFrequency`），
+    /// **绝不**猜测换算周期（x86 未发现 TSC 频率即走此路径）。
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn preempt_init_fails_closed_when_timebase_is_unknown() {
+        let _serial = TIMER_TEST_LOCK.lock();
+
+        // When: 用显式未知速率初始化抢占。
+        let result = init_preempt(None);
+
+        // Then: fail-closed；返回类型化原因，调用方（`core::init`）据此终止启动。
+        assert_eq!(result, Err(TimerError::UnknownFrequency));
     }
 }

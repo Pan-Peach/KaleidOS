@@ -99,7 +99,7 @@ mod tests {
         };
         let info = crate::machine::test_support::snapshot(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            core::num::NonZeroU64::new(10_000_000),
             alloc::vec![CpuInfo {
                 boot_cpu: true,
                 hardware_id: HardwareCpuId::from_raw(0),

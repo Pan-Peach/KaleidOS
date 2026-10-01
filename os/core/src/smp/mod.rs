@@ -308,7 +308,11 @@ pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
     let registry = CpuRegistry::build(machine)?;
     let bsp = registry.bsp();
 
-    TIMEBASE_HZ.store(machine.timebase_frequency as usize, Ordering::Release);
+    // 本模块内部沿用 0 = 未知的窄表示；机器侧真相是显式 `Option<NonZeroU64>`。
+    TIMEBASE_HZ.store(
+        machine.timebase_frequency.map_or(0, |hz| hz.get() as usize),
+        Ordering::Release,
+    );
 
     // Core IPI 回调必须在**任何 CPU 打开 IPI 接收之前**注册（覆盖语义）。
     // 只在真有多 CPU 时触碰后端：UP 无 IPI，也让 host/单核 profile 免于后端差异。
@@ -570,7 +574,7 @@ mod tests {
         }
         crate::machine::test_support::snapshot(
             boot_hardware_id,
-            0,
+            None,
             cpu_info,
             alloc::vec::Vec::new(),
             alloc::vec::Vec::new(),

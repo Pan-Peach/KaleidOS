@@ -18,6 +18,7 @@
 
 use alloc::boxed::Box;
 use core::fmt::Debug;
+use core::num::NonZeroU64;
 
 // 逻辑 CPU 身份（`CpuId`）与硬件 CPU 身份（`HardwareCpuId`）定义在 `arch`：
 // arch 的 trait 签名需要逻辑 id，而 arch 不依赖 core。这里 re-export，
@@ -272,7 +273,11 @@ impl core::fmt::Debug for DeviceDescriptor {
 pub struct MachineInfo {
     /// BSP 的**硬件**身份（不是逻辑 `CpuId`；逻辑 id 由 Core 按下标赋）。
     pub boot_hardware_id: HardwareCpuId,
-    pub timebase_frequency: u64,
+    /// 平台 timebase 频率（Hz）：`Some(non-zero)` = 已发现的真实速率，
+    /// `None` = **未知**（不是 0 约定，也不伪造常量）。需要速率换算的消费者
+    /// （`timer::init_preempt` / idle 换算 / 组件导出）各自显式处理未知：
+    /// 抢占 fail-closed，idle 回退轮询。
+    pub timebase_frequency: Option<NonZeroU64>,
     /// 保留的原始固件描述源（归一化视图之外；见 [`FirmwareInfo`]）。
     pub firmware: FirmwareInfo,
     /// 已承认的逻辑 CPU：BSP 在下标 0，硬件身份唯一。
@@ -327,6 +332,7 @@ pub fn committed() -> Option<&'static MachineInfo> {
 pub(crate) mod test_support {
     use super::{
         CpuInfo, DeviceDescriptor, FirmwareInfo, HardwareCpuId, MachineInfo, MemoryRegion,
+        NonZeroU64,
     };
     use crate::test_support::{Rank, TestLock};
     use alloc::boxed::Box;
@@ -350,7 +356,7 @@ pub(crate) mod test_support {
     /// [`snapshot_with_firmware`]。
     pub(crate) fn snapshot(
         boot_hardware_id: HardwareCpuId,
-        timebase_frequency: u64,
+        timebase_frequency: Option<NonZeroU64>,
         cpu_info: Vec<CpuInfo>,
         memory_regions: Vec<MemoryRegion>,
         devices: Vec<DeviceDescriptor>,
@@ -368,7 +374,7 @@ pub(crate) mod test_support {
     /// 带保留固件源的 fixture（其余与 [`snapshot`] 相同）。
     pub(crate) fn snapshot_with_firmware(
         boot_hardware_id: HardwareCpuId,
-        timebase_frequency: u64,
+        timebase_frequency: Option<NonZeroU64>,
         firmware: FirmwareInfo,
         cpu_info: Vec<CpuInfo>,
         memory_regions: Vec<MemoryRegion>,
@@ -402,6 +408,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::num::NonZeroU64;
 
     /// FDT magic（测试哨兵：模拟保留的 FDT header 可重读）。
     const FDT_MAGIC: u32 = 0xd00d_feed;
@@ -452,7 +459,7 @@ mod tests {
     fn fixture(devices: Vec<DeviceDescriptor>) -> MachineInfo {
         test_support::snapshot(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            NonZeroU64::new(10_000_000),
             vec![cpu0()],
             vec![ram()],
             devices,
@@ -545,7 +552,7 @@ mod tests {
             .collect::<Vec<_>>();
         let info = test_support::snapshot(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            NonZeroU64::new(10_000_000),
             vec![cpu0()],
             regions,
             devices,
@@ -836,7 +843,7 @@ mod tests {
     fn fixture_with_firmware(firmware: FirmwareInfo) -> MachineInfo {
         test_support::snapshot_with_firmware(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            NonZeroU64::new(10_000_000),
             firmware,
             vec![cpu0()],
             vec![ram()],

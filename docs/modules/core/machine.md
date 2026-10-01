@@ -8,6 +8,7 @@
 
 - 已提交的归一化机器信息：`static COMMITTED`（RAM、CPU 清单、设备描述符）。monitor 与导出表共用这一份快照。
 - **保留的原始固件描述源**（`MachineInfo.firmware` / `FirmwareInfo`）：`Fdt { phys, size }` / `Acpi { rsdp }` / `Static`。只记"字节在哪、有多大"，**不认证内容**；下游表（RSDT/XSDT/…）由未来消费者读取时各自校验。保留字节不回收（所在区间由 boot 的 arena 选择永久排除）。
+- **timebase 速率是显式 optional**（`timebase_frequency: Option<NonZeroU64>`）：`Some(non-zero)` = 已发现速率，`None` = **未知**（不是 0 约定，也不伪造常量）。消费者各自处理未知：`timer::init_preempt` fail-closed、`print::idle_wait` 回退轮询、组件导出 `kcore_timebase_hz` 映射为 0。
 - `core::init` 在 `commit` 前拒绝形状非法的固件源（零地址 / 零长度）——绝不以 `Static` 之外的形式发布悬空固件根。
 - `commit(info)` 由 `core::init`（`lib.rs`）校验通过后调用一次；第二次发布被拒绝。
 

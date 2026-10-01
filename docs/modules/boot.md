@@ -15,7 +15,7 @@
 - **启动期外部输入校验**：bootloader / firmware 提供的数据一律当**不可信输入**——先校验，失败即拒绝 + log，绝不盲信指针 / 计数。
   - **x86_64**：MB2 校验 `total_size` 上限（64 KiB）、每个 tag 必须完整落在信息块内、mmap tag 先证明 16 字节条目头存在再计算条目数（`8 <= tag_size < 16` 时直接 `tag_size - 16` 会下溢），条目读取全程 checked arithmetic；PVH 校验 `version >= 1`、`memmap_paddr != 0`、`memmap_entries <= 4096`、`memmap_paddr + entries*24` 不溢出且 < 4 GiB。校验失败返回空表，由调用方以 "no usable RAM region" fail-closed。**RSDP**：PVH 的 `rsdp_paddr`（offset 32）与 MB2 的 ACPI RSDP tag（15 new 优先、14 old 兜底）都先校验签名 `"RSD PTR "`、revision 对应长度（v1 20B / v2+ 36B 且 `length == 36`）、第一 + extended 校验和、保留区间地址算术；**只认证 RSDP 本身**，RSDT/XSDT 下游表由未来消费者读取时各自校验。无有效 RSDP → `FirmwareInfo::Static`（当前静态 BSP/UART 平台合法地是 `Static`）。
   - **aarch64**：复制前校验 FDT header 的 magic / version(16·17) / `totalsize` 上限 / struct、strings 与 rsvmap 边界（rsvmap 走到 16 字节零对终结符；全部 checked arithmetic），`used` 覆盖 rsvmap 且 ≤ `DTB_COPY_CAPACITY`；header 不自洽即拒绝（`None` + log），**绝不"修复"坏 blob**，只重建 `totalsize` = 实际复制前缀的归一化副本。**QEMU `-kernel <elf>` 的 PA-0 DTB quirk** 用有界、经校验的探测处理：x0 → PA 0 → 1 MiB 低 RAM 窗口，每步只接受 header 完全自洽的候选；MMU 关闭 + identity mapping 下按物理地址做 raw volatile 读，不构造引用、不假设对齐。
-- **链接符号的唯一解释者**：`vm/layout.rs`（`KernelLayout`、`kernel_layout()`），固定 `KERNEL_VMA = 0xffff_ffc0_8020_0000` 与 `HIGH_HALF_OFFSET`。
+- **链接符号的唯一解释者**：`vm/layout.rs`（`KernelLayout`、`kernel_layout()`），固定 `KERNEL_VMA = 0xffff_ffc0_8020_0000` 与 `HIGH_HALF_OFFSET`（**boot 本地布局常量**，不是对 arch 公共 HAL 的固定偏移承诺）。
 - **high-half 交接**（`bootstrap::enter_high_half`）与存活其上的 `BootContext`。
 - **长期内核地址空间**的构建 / 校验 / 激活：`vm/runtime.rs`（`RuntimeVm`、`build` / `verify` / `activate` / `init`）。
 - 内嵌组件归档 `.initpkg`（`INITPKG` static + 链接段符号）。
@@ -26,7 +26,7 @@
 - RV64：`bootstrap_main(hart_id, dtb_pa, kernel_pa)`（`main64.rs`；低地址阶段 = FDT 解析 + 无堆内存 pass + 静态 bootstrap 页表 → `BootContext`）→ `bootstrap_high(context_ptr)`（高半区别名进入）→ `memory::early_init(arena)` → `discover(&tree, hart_id)` → `kernel::init(&info, &context.reserved)` → `runtime::init(...)` → `kernel::component::store::init(pkg)` → `CpuImpl::enable_irq()` → `smp::start_secondaries(&info)` → `kernel::monitor::run()`。
 - **SMP（RV64）**：boot 在 `kernel::init` + 长期地址空间 + 全局中断之后调 `crate::smp::start_secondaries`（SBI HSM `hart_start` 启动 AP）。**归一化不变式**：discovery 后把 cpu 顺序调整为 **boot hart = 逻辑 CPU0**（OpenSBI 抽签使 boot hart 不一定是 DTB 首个 CPU；不归一化会让 PLIC 外部路由 / per-CPU 表指向错误的 hart）。AP 入口 `secondary_main`（`src/smp.rs`）+ 物理 trampoline `_secondary_start`（`secondary64.S`）；AP 目前完成本地初始化后 `wfi`（尚未进入 Core 调度，见 `docs/modules/arch.md` SMP 章节）。
 - RV32：`bootstrap_main`（`main32.rs`）→ FDT 解析 + 无堆内存 pass → `memory::early_init(arena)` → `discover(&tree, hart_id)` 返回 `MachineInfo` → timer/PLIC 接线 → `kernel::init`（两条 profile 共用）→ 长期 root + store init → `selftest::run` / `monitor::run()`。
-- **新 ISA（x86_64 / aarch64）现状**：x86_64 经 Multiboot2 / PVH 发现可用 RAM，CPU 只报告 BSP（无 ACPI MADT），`timebase_frequency = 0`（zero-as-unknown：TSC 频率不可发现，**不伪造** 1 GHz）；aarch64 读 `CNTFRQ_EL0` 得到非零 timebase。两者都只跑 `selftest` 镜像（`boot` 用例），timer 投递分别诚实报告 `Unsupported` / `DeliveryUnavailable`（控制台靠 Core 轮询）；aarch64 非 selftest 的 Core Monitor 入口仍是 `todo!()`（`os/boot/aarch64/src/main.rs`）。
+- **新 ISA（x86_64 / aarch64）现状**：x86_64 经 Multiboot2 / PVH 发现可用 RAM，CPU 只报告 BSP（无 ACPI MADT），`timebase_frequency = None`（**显式未知**：TSC 频率不可发现，**不伪造** 1 GHz）；aarch64 读 `CNTFRQ_EL0`，非零时发布 `Some(Hz)`、为零时同样诚实报 `None`。两者都只跑 `selftest` 镜像（`boot` 用例），timer 投递分别诚实报告 `Unsupported` / `DeliveryUnavailable`（控制台靠 Core 轮询）；aarch64 非 selftest 的 Core Monitor 入口仍是 `todo!()`（`os/boot/aarch64/src/main.rs`）。
 - **aarch64 boot 栈 = 64 KiB**（`linker.ld` `.bss.stack`）：`resource::init` 会在 ~10 KiB 调用深度上构造 8 KiB 的 `IrqTable` 栈临时量；16 KiB 栈会溢出到 `__boot_stack_bottom` 之下（`.data` 末尾的全局堆 / 已提交 `MachineInfo`）并静默破坏 live statics。
 - `selftest` feature：走 `crate::selftest::run(&info)`（ArchTest，白盒 selftest，返回 `!`）。
 - 关键内部符号：`layout::kernel_layout()`、`bootstrap::init` / `install_identity_alias` / `install_kernel_alias` / `root_pa` / `enter_high_half`、`runtime::RuntimeVm`、`print_linker_layout()`、`configure_machine_timer` / `configure_interrupt_controller`；保留源自检：`bootmem::retained_fdt_intact`（RISC-V）/ `discovery::staged_dtb_intact`（aarch64）/ `main::validate_rsdp`（x86_64）。
@@ -45,6 +45,7 @@
 | `os/boot/riscv/src/main.rs` | profile 选择、`compile_error!` 守卫、模块接线 |
 | `os/boot/riscv/src/main64.rs` | RV64 启动：`bootstrap_main` / `bootstrap_high` / `discover` / `core::init` / monitor |
 | `os/boot/riscv/src/main32.rs` | RV32 启动：`bootstrap_main` / `discover` / `core::init` / monitor |
+| `os/boot/riscv/src/addr.rs` | RV32 boot + 两个 XLEN 的 selftest 共用的 boot 本地链接地址归一化（`linked_to_physical`；RV64 委托 `vm::bootstrap`，RV32 identity） |
 | `os/boot/riscv/src/bootmem.rs` | RV64/RV32 共用的无堆内存 pass：`image_bank` / `arena_search_window` / `scan_fdt_exclusions` |
 | `os/boot/riscv/src/discovery.rs` | RV64/RV32 共用的 FDT 设备发现：完整中断资源解析 + PLIC 逻辑线绑定 |
 | `os/boot/riscv/src/entry64.S` / `entry32.S` / `entry32-nommu.S` | `_start` trampoline、early root、high-half 交接 |
@@ -57,4 +58,4 @@
 | `os/boot/riscv/.cargo/config.toml` | 按 target 指定链接脚本；**无默认 target**（由 Makefile 传 `KCFG_TARGET`） |
 | `os/boot/riscv/Cargo.toml` | crate `bootstrap`，独立 workspace，`panic = "abort"` |
 
-> `linker.ld` 的 `HIGH_OFFSET` / `KERNEL_VMA` 必须与 `vm/layout.rs` 及 `arch/src/lib.rs` 的 `HIGH_HALF_OFFSET` 保持一致。
+> `linker.ld` 的 `HIGH_OFFSET` / `KERNEL_VMA` 必须与 `vm/layout.rs` 的 `HIGH_HALF_OFFSET` / `KERNEL_VMA` 保持一致。这是 **boot 本地布局契约**，不上行到 arch 公共 HAL（见 `docs/modules/arch.md`）。

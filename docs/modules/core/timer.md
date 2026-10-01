@@ -6,11 +6,11 @@
 ## owns 什么真相
 
 - timer 机制状态：**`delivery_ready`**（投递链路端到端就绪的单一 readiness 标志）、tick 计数、next deadline。
-- 抢占模式的初始化开关（`init_preempt(timebase_hz)`）。
+- 抢占模式的初始化开关（`init_preempt(Option<NonZeroU64>)`）：速率未知时 fail-closed（`UnknownFrequency`），绝不猜周期。
 
 ## 暴露什么机制
 
-- `init()`、`init_preempt(timebase_hz)`。
+- `init()`、`init_preempt(Option<NonZeroU64>)`。
 - `arm_deadline(deadline)`：**关中断**下编程一次性 deadline；只有硬件接受才发布新的 `next_deadline`。
 - `delivery_ready()`：本 CPU 是否已有可用投递（不分配，早期 boot / 轮询回退可安全查询）。
 - `on_trap()`：trap 侧驱动 tick / 过期。

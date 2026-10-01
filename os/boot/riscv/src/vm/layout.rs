@@ -28,6 +28,10 @@ use arch::riscv::mmu::sv39::PteFlags;
 /// 内核链接虚拟基址（高半区）。layout 与 bootstrap 共用同一锚点。
 pub const KERNEL_VMA: usize = 0xffff_ffc0_8020_0000;
 /// 高半区偏移（identity ↔ 高别名 换算）。
+///
+/// **boot 本地布局常量**（由 `linker.ld` 决定），不是对 arch 公共契约的固定
+/// 偏移承诺；运行期 VA→PA 一律走映射所有者
+/// （`AddressSpaceBackend::translate`），不从本常量推导。
 pub const HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
 
 /// Permission set for the executable text segment: read + execute.

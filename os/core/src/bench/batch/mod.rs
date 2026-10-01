@@ -23,9 +23,12 @@ pub fn batch_cap() -> u64 {
     match clock_unit() {
         ClockUnit::Nanoseconds => 1_000_000,
         ClockUnit::TimebaseTicks => {
-            // 10 MHz timebase → 1 ms = 10_000 tick；未知时用同一缺省。
-            let hz = crate::machine::committed().map_or(10_000_000, |info| info.timebase_frequency);
-            if hz == 0 { 10_000 } else { (hz / 1_000).max(1) }
+            // 10 MHz timebase → 1 ms = 10_000 tick；速率未知时用同一缺省
+            // （bench-only 采样参数，不是对机器真相的替代）。
+            let hz = crate::machine::committed()
+                .and_then(|info| info.timebase_frequency)
+                .map_or(10_000_000, |hz| hz.get());
+            (hz / 1_000).max(1)
         }
     }
 }

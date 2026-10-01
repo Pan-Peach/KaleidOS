@@ -350,8 +350,13 @@ extern "C" fn kcore_now() -> u64 {
 }
 
 /// 时钟频率（Hz）：把 [`kcore_now`] 的 tick 换算成时间需要它。
+///
+/// ABI 约定：`0` = 未知 / 不可换算（机器真相里是显式 `None`）——组件必须
+/// 处理该情形，不得把 0 当真实频率做除法。
 extern "C" fn kcore_timebase_hz() -> u64 {
-    with_core_critical(|| machine::committed().map_or(0, |m| m.timebase_frequency))
+    with_core_critical(|| {
+        machine::committed().map_or(0, |m| m.timebase_frequency.map_or(0, |hz| hz.get()))
+    })
 }
 
 extern "C" fn kcore_machine_cpu_count() -> u32 {
@@ -1689,7 +1694,7 @@ mod tests {
         .into_boxed_slice();
         let info = crate::machine::test_support::snapshot(
             HardwareCpuId::from_raw(0),
-            10_000_000,
+            core::num::NonZeroU64::new(10_000_000),
             alloc::vec![CpuInfo {
                 boot_cpu: true,
                 hardware_id: HardwareCpuId::from_raw(0),

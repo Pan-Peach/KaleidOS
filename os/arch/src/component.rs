@@ -44,7 +44,13 @@ pub trait RelocationBackend: Sized {
         false
     }
 
-    /// Convert a linked kernel symbol into the address visible to a component.
+    /// Bind a linked kernel symbol into the address a component can call.
+    ///
+    /// This is a **component-import / callable binding**, not a VA→PA query:
+    /// it normalizes the linker's kernel view (e.g. the RISC-V high-half VMA)
+    /// into the address the component's execution view can branch to.  Runtime
+    /// virtual→physical translation belongs to the mapping owner
+    /// (`AddressSpaceBackend::translate`), never to this hook.
     fn normalize_symbol_address(address: usize) -> usize;
 
     fn apply(

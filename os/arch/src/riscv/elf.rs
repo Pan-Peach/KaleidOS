@@ -100,6 +100,37 @@ impl RiscvRelocator {
     }
 }
 
+/// RV64 内核镜像的高半区链接偏移（boot 的 `linker.ld` 布局；RV32/host 恒等）。
+///
+/// **这是本 ISA 的组件导入绑定常量，不是通用 VA→PA 转换原语。** 只有
+/// [`RiscvRelocator::normalize_symbol_address`] 用它：把链接期高半区 `kcore_*`
+/// 符号绑定到组件执行环境里**可调用的地址**。组件池在 identity 窗口中执行，
+/// `auipc+jalr` 只覆盖 ±2 GiB，因此导入必须走低别名；boot 的 identity 窗口
+/// 与 runtime root 的 identity RAM 映射都保留该别名。
+///
+/// 运行期 VA→PA 查询一律走映射所有者
+/// （[`crate::vm::AddressSpaceBackend::translate`]）——本常量不承诺任何固定
+/// 偏移的地址空间布局。
+#[cfg(target_arch = "riscv64")]
+const KERNEL_HIGH_HALF_OFFSET: usize = 0xffff_ffc0_0000_0000;
+
+/// 把链接期内核符号地址规范化为**组件可调用的地址**（组件导入 / callable
+/// binding，不是页表翻译）：RV64 高半区符号 → 低别名；其余地址原样保留。
+fn component_callable_address(address: usize) -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        if address >= KERNEL_HIGH_HALF_OFFSET {
+            address.wrapping_sub(KERNEL_HIGH_HALF_OFFSET)
+        } else {
+            address
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        address
+    }
+}
+
 impl RelocationBackend for RiscvRelocator {
     const ELF_MACHINE: u16 = 0xF3;
 
@@ -114,7 +145,7 @@ impl RelocationBackend for RiscvRelocator {
     }
 
     fn normalize_symbol_address(address: usize) -> usize {
-        crate::physical_address_of(address)
+        component_callable_address(address)
     }
 
     fn apply(

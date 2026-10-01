@@ -428,7 +428,7 @@ fn find_irq(info: &MachineInfo, compatibles: &[&[u8]]) -> Option<u32> {
 
 fn mapping() -> ! {
     let high = core::ptr::addr_of!(MAPPING_VALUE) as usize;
-    let low = arch::physical_address_of(high);
+    let low = crate::addr::linked_to_physical(high);
     // SAFETY: the boot identity alias of this linked static is mapped.
     let value = unsafe { core::ptr::read_volatile(low as *const usize) };
     if value != MAPPING_VALUE {
@@ -938,7 +938,7 @@ unsafe fn rv32_root() -> *mut u32 {
 /// `page` 必须指向一个活的测试页。
 unsafe fn test_page_pa(page: *mut TestPage) -> usize {
     // SAFETY: 调用者保证指针有效；只取首字节地址，不解引用内容。
-    arch::physical_address_of(unsafe { (*page).0.as_mut_ptr() } as usize)
+    crate::addr::linked_to_physical(unsafe { (*page).0.as_mut_ptr() } as usize)
 }
 
 /// 在**活动** satp 页表里重写 `va` 的 4 KiB 叶子（测试侧 poke）。
@@ -970,10 +970,10 @@ unsafe fn selftest_map_page(va: usize, pa: usize, flags: usize) {
         let root = ((satp & ((1 << 44) - 1)) << 12) as *mut u64;
         // SAFETY: 两个测试表页对齐、只被本用例使用；PA 由恒等/低别名约定给出。
         let l2_entries = unsafe { &mut (*core::ptr::addr_of_mut!(TLB_L2)).0 };
-        let l2_pa = arch::physical_address_of(l2_entries.as_mut_ptr() as usize);
+        let l2_pa = crate::addr::linked_to_physical(l2_entries.as_mut_ptr() as usize);
         let l2 = unsafe { sv39_child_table(root, (va >> 30) & 0x1ff, l2_pa) };
         let l1_entries = unsafe { &mut (*core::ptr::addr_of_mut!(TLB_L1)).0 };
-        let l1_pa = arch::physical_address_of(l1_entries.as_mut_ptr() as usize);
+        let l1_pa = crate::addr::linked_to_physical(l1_entries.as_mut_ptr() as usize);
         let l1 = unsafe { sv39_child_table(l2, (va >> 21) & 0x1ff, l1_pa) };
         let leaf = ((pa >> 12) as u64) << 10 | flags as u64;
         unsafe { l1.add((va >> 12) & 0x1ff).write_volatile(leaf) };

@@ -7,6 +7,7 @@
 use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
+use core::num::NonZeroU64;
 use core::panic::PanicInfo;
 use kernel::machine::{
     CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, MachineInfo, MemoryRegion, MAX_CPUS,
@@ -191,7 +192,12 @@ fn discover<'a>(
 
     Ok(MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
-        timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
+        // FDT 报告的 timebase 速率：非零才算已知（`None` = 未报告 / 报 0）。
+        timebase_frequency: tree
+            .root()
+            .cpus()
+            .common_timebase_frequency()
+            .and_then(NonZeroU64::new),
         firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
@@ -214,9 +220,10 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         }
         Err(_) => panic!("FDT magic: BAD"),
     };
+    // boot 本地镜像地址换算（RV32 identity，VA == PA）：见 `crate::addr`。
     let linked_start =
-        arch::physical_address_of(linker_addr(core::ptr::addr_of!(__image_load_start)));
-    let linked_end = arch::physical_address_of(linker_addr(core::ptr::addr_of!(__image_end)));
+        crate::addr::linked_to_physical(linker_addr(core::ptr::addr_of!(__image_load_start)));
+    let linked_end = crate::addr::linked_to_physical(linker_addr(core::ptr::addr_of!(__image_end)));
     let image_size = linked_end
         .checked_sub(linked_start)
         .expect("invalid RV32 image range");

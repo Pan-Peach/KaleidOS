@@ -20,6 +20,7 @@ extern crate alloc;
 
 use arch::{Console, CpuArch};
 use core::arch::{asm, global_asm};
+use core::num::NonZeroU64;
 use core::panic::PanicInfo;
 use kernel::machine::{CpuId, FirmwareInfo, MemoryRegion};
 
@@ -99,14 +100,16 @@ pub extern "C" fn bootstrap_main(x0: usize) -> ! {
 
     kernel::log!("bootstrap", "KaleidOS aarch64 bootstrap");
     let boot_affinity = affinity_of(read_mpidr());
-    let timebase_frequency = read_cntfrq();
+    // CNTFRQ 为零 = 固件未编程速率：诚实报**未知**（`None`），不伪造。
+    let cntfrq = read_cntfrq();
+    let timebase_frequency = NonZeroU64::new(cntfrq);
     kernel::log!(
         "bootstrap",
         "EL{} MPIDR={:#x} (affinity {:#x}) CNTFRQ={}Hz",
         current_el(),
         read_mpidr(),
         boot_affinity,
-        timebase_frequency
+        cntfrq
     );
 
     // SAFETY: the staged buffer holds a verified FDT blob in a static that

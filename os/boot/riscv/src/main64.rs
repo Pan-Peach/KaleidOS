@@ -2,6 +2,7 @@ use crate::vm::{bootstrap, layout, runtime};
 use alloc::vec::Vec;
 use arch::CpuArch;
 use core::arch::global_asm;
+use core::num::NonZeroU64;
 use core::panic::PanicInfo;
 use kernel::machine::{
     CpuId, CpuInfo, FirmwareInfo, HardwareCpuId, MachineInfo, MemoryRegion, MAX_CPUS,
@@ -366,7 +367,12 @@ fn discover<'a>(
 
     Ok(MachineInfo {
         boot_hardware_id: HardwareCpuId::from_raw(hart_id as u64),
-        timebase_frequency: tree.root().cpus().common_timebase_frequency().unwrap_or(0),
+        // FDT 报告的 timebase 速率：非零才算已知（`None` = 未报告 / 报 0）。
+        timebase_frequency: tree
+            .root()
+            .cpus()
+            .common_timebase_frequency()
+            .and_then(NonZeroU64::new),
         firmware,
         cpu_info: cpu_info.into_boxed_slice(),
         memory_regions: memory_regions.into_boxed_slice(),
