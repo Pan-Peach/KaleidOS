@@ -335,6 +335,16 @@ unsafe extern "C" {
     pub fn kcore_task_create(entry: KcompTaskEntry, arg: *mut (), out_task: *mut u32) -> i32;
     #[link_name = "kcore_task_start"]
     pub fn kcore_task_start(id: u32) -> i32;
+    /// 提议将 caller 拥有的 Created 任务启动在逻辑 cpu 上。Core 校验 owner、生命周期与
+    /// 目标 CPU Online，提交 Runnable 与固定 CPU 归属，再通知目标 CPU。无任务迁移。
+    /// 普通 kcore_task_start 等价于请求当前 CPU。成功表示任务已提交，不保证已经执行。
+    #[link_name = "kcore_task_start_on"]
+    pub fn kcore_task_start_on(id: u32, cpu: u32) -> i32;
+    // -- Machine query --
+    /// 当前执行 CPU 的逻辑身份快照；不授予权限。
+    #[link_name = "kcore_cpu_current"]
+    pub fn kcore_cpu_current() -> u32;
+    // -- Task control --
     #[link_name = "kcore_task_yield"]
     pub fn kcore_task_yield() -> i32;
     /// 阻塞当前任务，直到它被 `kcore_task_unpark` 唤醒后再次获得 CPU 才返回。

@@ -25,6 +25,8 @@ mod report;
 mod resource;
 mod sched;
 mod sched_park;
+#[cfg(target_arch = "riscv64")]
+mod smp;
 mod trace;
 
 use kcomp_sdk::abi::{MemoryView, kcore_sched_run};
@@ -37,12 +39,15 @@ use report::Checks;
 /// 旧实现用 `static mut`（image-global）；按
 /// `docs/architecture/component-lifecycle.md` §9，共享地址空间下 per-instance
 /// 状态必须来自显式分配。指针经 `*out_state` 交 Core 保管，任务经
-/// `kcore_task_create` 的 `arg` 拿回同一份。KernelNative 单 CPU，无并发。
+/// `kcore_task_create` 的 `arg` 拿回同一份。既有场景固定在调用 CPU；SMP 场景
+/// 使用独立的原子状态，任务全部退出之后才能重置或释放。
 #[repr(C)]
 pub struct State {
     sched: sched::State,
     filesystem: filesystem::State,
     driver: driver::State,
+    #[cfg(target_arch = "riscv64")]
+    smp: smp::State,
     region: MemoryView,
 }
 
@@ -114,6 +119,12 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     driver::report(&mut checks, driver_state);
 
     c_frontend::run(&mut checks);
+    #[cfg(target_arch = "riscv64")]
+    smp::group(
+        &mut checks,
+        unsafe { core::ptr::addr_of_mut!((*state).smp) },
+        sched.rr_id,
+    );
     checks.finish()
 });
 

@@ -10,27 +10,28 @@
 //!   启动后发现的 `MachineInfo`（`cpu_info.len()`），编译期上限只有一处
 //!   [`crate::machine::MAX_CPUS`]。
 //!
-//! # 当前接通程度（M1）
+//! # 当前接通程度
 //!
-//! - **已机械实现**：[`CpuRegistry`]（每 CPU 记录表 + 拓扑校验 + 启动状态机 +
+//! - [`CpuRegistry`]（每 CPU 记录表 + 拓扑校验 + 启动状态机 +
 //!   online 集合）、[`init`]（BSP 侧 Core 初始化）、[`cpu_state`]、
 //!   [`online_cpus`]、[`request_start`]、`mark_ready`、[`record`]。
-//! - **仍是 `todo!()`（人类实现，见 `.omo/plans/smp-production-integration.md`）**：
-//!   [`secondary_entry`]（AP 入口编排）、`wait_for_release` / `release_secondaries`
-//!   / `wait_until_online`（BootGate + 超时）、`ipi::notify` / `ipi::drain_pending`。
+//! - [`secondary_entry`]（AP 入场）、`release_secondaries` / `wait_until_online`
+//!   （BootGate + 超时）、`ipi::notify` / `ipi::drain_pending` 已接线。
+//! - AP Online 后调度本 CPU 的组件任务；固定归属，不做迁移或 work stealing。
 //!
 //! # `init` 为什么**不**启动 AP
 //!
 //! Core `init`（`crate::init`）发生在 boot 建立**长期内核地址空间**
 //! （`runtime::init`）之前；而 boot 的 AP 启动描述符要携带当时的 `satp`。因此
 //! AP 的物理启动仍由 boot 在地址空间就绪后触发（`os/boot/riscv/src/smp.rs`），
-//! Core 只拥有**身份 / 状态 / 就绪 / online** 这些真相。把物理启动搬进 arch
-//! `Smp::start_cpu` 属后续里程碑（需人类定稿 seam）。
+//! Core 拥有**身份 / 状态 / 就绪 / online** 真相；boot 提供栈和页表参数，
+//! 当前 RISC-V 路径经 arch 的 firmware HSM mechanism 请求物理启动。
+//! 通用 `Smp::prepare/start_cpu` 的描述符契约仍待接线。
 
-#![allow(dead_code)] // M1：接口与类型先立住，部分尚未被默认构建路径调用
+#![allow(dead_code)] // 部分诊断入口与 CpuLocal 预留字段尚未被默认路径调用
 
 mod boot;
-mod ipi;
+pub(crate) mod ipi;
 mod mask;
 mod percpu;
 
@@ -70,8 +71,8 @@ pub enum SmpInitError {
 
 /// 每个逻辑 CPU 的真相记录（Core 拥有）。
 ///
-/// **不**包含调度/中断的完整本地状态字段——那些在 per-CPU 重塑落地后补入；
-/// 这里先立住身份、启动状态与 pending IPI 三样 Core 独占的真相。
+/// 调度、时钟和 containment 的本地执行状态各自在对应模块；本记录只持有
+/// 身份、启动状态与 pending IPI，不另立任务状态账本。
 pub(crate) struct CpuRecord {
     /// 硬件身份，由 discovery 建立映射。
     hardware_id: HardwareCpuId,
@@ -298,12 +299,12 @@ static TIMEBASE_HZ: AtomicUsize = AtomicUsize::new(0);
 /// AP bring-up 超时的兜底 tick 上限（timebase 未知时使用）。
 const AP_BOOT_TIMEOUT_FALLBACK: u64 = 20_000_000;
 
-/// BSP 启动流程（M1，机械）：校验拓扑 → 发布记录 → 注册 Core IPI 回调 →
+/// BSP 启动流程：校验拓扑 → 注册 Core IPI 回调 → 发布记录并
 /// 置 BSP Online。
 ///
 /// **不启动 AP**（见模块头）：AP 的物理启动仍由 boot 在长期地址空间就绪后触发。
-/// **不** `enable_ipi_interrupt`：接收端 SSIP ack 与 `drain_pending` 尚未落地，
-/// 此刻开源会造成中断风暴。失败即 fail-closed（不发布半成品记录）。
+/// IPI 接收源在 `release_secondaries` 完成启动门控后打开；本阶段只初始化并
+/// 保持 masked。失败即 fail-closed（不发布半成品记录）。
 pub fn init(machine: &MachineInfo) -> Result<(), SmpInitError> {
     let registry = CpuRegistry::build(machine)?;
     let bsp = registry.bsp();
@@ -383,7 +384,7 @@ pub fn cpu_identity_ok(cpu: CpuId) -> bool {
 /// AP 入口：由 arch 启动 trampoline 进入，每个 AP 一次。
 ///
 /// `argument` = Core 校验过的逻辑 CPU 下标。顺序：绑定本地入口记录 → 本 CPU 子系统
-/// （sched/timer/irq/ipi）→ 验证身份 → Ready → 等 BSP 放行（BootGate）→ Online →
+/// （containment/sched/timer/irq/ipi）→ 验证身份 → Ready → 等 BSP 放行（BootGate）→ Online →
 /// 打开 IPI 源与全局中断 → Core 空闲循环。
 ///
 /// # Safety
@@ -400,10 +401,10 @@ pub unsafe extern "C" fn secondary_entry(argument: usize) -> ! {
     }
     <arch::CpuImpl as arch::CpuArch>::init_cpu(); // stvec / trap 入口
 
-    // 2) 本 CPU 的 Core 子系统。containment 尚未 per-CPU 化（plan）——本里程碑
-    //    AP 不运行组件任务，故不调用 `containment::init_cpu`（保持其 `todo!()` 不被触发）。
-    //    **任一本地子系统初始化失败即 fail-closed**：不得宣称 Online（Oracle 评审）。
-    let init_ok = crate::sched::init_cpu(cpu).is_ok()
+    // 2) 本 CPU 的执行边界与本地机制必须先就绪，再允许 Online 和组件任务。
+    //    任一本地子系统初始化失败即 fail-closed：不得宣称 Online。
+    let init_ok = crate::component::containment::init_cpu(cpu).is_ok()
+        && crate::sched::init_cpu(cpu).is_ok()
         && crate::timer::init_cpu(cpu).is_ok()
         && crate::irq::init_cpu(cpu).is_ok()
         && <Backend as Smp>::init_ipi_cpu().is_ok();
@@ -435,11 +436,14 @@ fn ap_failed(cpu: CpuId) -> ! {
     if let Some(record) = record(cpu) {
         record.set_boot_state(CpuBootState::Failed);
     }
-    idle_loop(cpu)
+    // Failed initialization never admits this CPU to task execution.
+    <arch::CpuImpl as arch::CpuArch>::disable_irq();
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
-/// CPU 的 Core 空闲循环：自旋 + `wfi`；IPI 只在硬件回调里标记 pending，在这里
-/// （安全边界）drain。本里程碑 AP 无跨 CPU 任务，故不进入 `sched::run`。
+/// CPU 的 Core 空闲循环：在安全边界处理 IPI、调度本 CPU 的任务；无工作时休眠。
 fn idle_loop(cpu: CpuId) -> ! {
     loop {
         // 「检查-睡眠」原子化（Oracle 评审：防丢唤醒）：先关本 CPU 中断再 drain；
@@ -449,10 +453,16 @@ fn idle_loop(cpu: CpuId) -> ! {
         let flags = <arch::CpuImpl as arch::CpuArch>::disable_irq();
         ipi::drain_pending(cpu);
         let _ = take_resched(cpu);
-        // TODO(手写)：containment per-CPU 落地后，在此进入本 CPU 的调度——
-        //   if crate::sched::has_claimable_for(cpu) {
-        //       let _ = crate::sched::run();
-        //   }
+        if crate::sched::has_claimable_for(cpu) {
+            match crate::sched::run() {
+                Ok(()) => {
+                    <arch::CpuImpl as arch::CpuArch>::restore_irq(flags);
+                    continue;
+                }
+                Err(crate::sched::SchedError::NoPolicy) => {}
+                Err(error) => panic!("AP scheduler invariant: {:?}", error),
+            }
+        }
         // SAFETY: IRQs are disabled on this CPU (above); `drain_pending` is the
         // checked predicate and local IPI reception stays enabled, so a doorbell
         // arriving now keeps the wakeup pending; no interrupt-path lock is held.

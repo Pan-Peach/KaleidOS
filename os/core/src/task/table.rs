@@ -27,6 +27,13 @@ pub(crate) enum UnparkOutcome {
     Deferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchCommit {
+    Committed,
+    ParkPermit,
+    StaleProposal,
+}
+
 impl Default for TaskTable {
     fn default() -> Self {
         Self::new()
@@ -115,11 +122,67 @@ impl TaskTable {
 
     /// Core 语义入口：只有任务 owner 才能启动该任务。
     pub fn start(&mut self, requester: ComponentId, id: TaskId) -> Result<(), TaskError> {
+        self.start_on(requester, id, crate::smp::current_cpu())
+    }
+
+    /// Placement is a caller proposal, validated by Core. Once started the
+    /// task stays on this CPU; the scheduler cannot move it.
+    pub(crate) fn start_on(
+        &mut self,
+        requester: ComponentId,
+        id: TaskId,
+        cpu: arch::cpu::CpuId,
+    ) -> Result<(), TaskError> {
         let record = self.get(id).ok_or(TaskError::NotFound)?;
         if record.owner() != requester {
             return Err(TaskError::WrongOwner);
         }
-        self.transition(id, TaskState::Runnable)
+        self.transition(id, TaskState::Runnable)?;
+        self.get_mut(id).unwrap().set_home_cpu(cpu);
+        Ok(())
+    }
+
+    /// One locked transaction: validate both sides before changing either.
+    /// A stale snapshot is normal contention, not a policy violation. The
+    /// caller holds registry admission stable over this transaction.
+    pub(crate) fn commit_switch(
+        &mut self,
+        cpu: arch::cpu::CpuId,
+        from: Option<TaskId>,
+        after: Option<TaskState>,
+        next: Option<TaskId>,
+    ) -> Result<SwitchCommit, TaskError> {
+        if let Some(id) = from {
+            let record = self.get(id).ok_or(TaskError::NotFound)?;
+            if record.state() != TaskState::Running(cpu)
+                || !matches!(
+                    after,
+                    Some(TaskState::Runnable | TaskState::Blocked | TaskState::Exited)
+                )
+            {
+                return Err(TaskError::InvalidTransition);
+            }
+            if after == Some(TaskState::Blocked) && self.consume_park_pending(id)? {
+                return Ok(SwitchCommit::ParkPermit);
+            }
+        } else if after.is_some() {
+            return Err(TaskError::InvalidTransition);
+        }
+        if let Some(id) = next {
+            let Some(record) = self.get(id) else {
+                return Ok(SwitchCommit::StaleProposal);
+            };
+            if record.state() != TaskState::Runnable || !record.claimable_by(cpu) {
+                return Ok(SwitchCommit::StaleProposal);
+            }
+        }
+        if let Some(id) = from {
+            self.transition(id, after.expect("outgoing state validated"))?;
+        }
+        if let Some(id) = next {
+            self.transition(id, TaskState::Running(cpu))?;
+        }
+        Ok(SwitchCommit::Committed)
     }
 
     /// 取走当前任务的一次 pending unpark permit。
@@ -177,8 +240,8 @@ impl TaskTable {
     /// 其余一律 `InvalidTransition`（Exited 终态、Created 直接 Running 等）。
     ///
     /// **跨 CPU 认领门禁（SMP）**：`Runnable → Running(cpu)` 还要满足
-    /// [`TaskRecord::claimable_by`]——从未运行过的任务任何 CPU 可认领，运行过的
-    /// 只认它上次所在的 CPU。不满足即 `InvalidTransition`（fail-closed）。这是
+    /// [`TaskRecord::claimable_by`]——start_on 已固定归属的任务只允许该 CPU；
+    /// Core 内部尚无归属的任务在首次认领时固定。不满足即 `InvalidTransition`。这是
     /// 「离场任务上下文尚未保存完成就被另一 CPU 取走」竞态的 Core 侧守门。
     pub fn transition(&mut self, id: TaskId, to: TaskState) -> Result<(), TaskError> {
         let record = self.get_mut(id).ok_or(TaskError::NotFound)?;
@@ -241,6 +304,100 @@ mod tests {
 
         let d = TaskTable::default();
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn switch_rejects_stale_candidate_without_releasing_outgoing_task() {
+        let _g = setup();
+        let mut table = TaskTable::new();
+        let outgoing = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        let candidate = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        // A snapshot precedes another CPU claiming a fresh candidate.
+        for id in [outgoing, candidate] {
+            table.transition(id, TaskState::Runnable).unwrap();
+        }
+        table
+            .transition(outgoing, TaskState::Running(CpuId(0)))
+            .unwrap();
+        assert_eq!(
+            table.commit_switch(CpuId(1), None, None, Some(candidate)),
+            Ok(SwitchCommit::Committed)
+        );
+        assert_eq!(
+            table.commit_switch(
+                CpuId(0),
+                Some(outgoing),
+                Some(TaskState::Runnable),
+                Some(candidate)
+            ),
+            Ok(SwitchCommit::StaleProposal)
+        );
+        assert_eq!(
+            table.get(outgoing).unwrap().state(),
+            TaskState::Running(CpuId(0))
+        );
+        assert_eq!(
+            table.get(candidate).unwrap().state(),
+            TaskState::Running(CpuId(1))
+        );
+    }
+
+    #[test]
+    fn remote_unpark_between_fast_check_and_commit_prevents_blocking() {
+        let _g = setup();
+        let mut table = TaskTable::new();
+        let id = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        table.start_on(OWNER, id, CpuId(1)).unwrap();
+        table.transition(id, TaskState::Running(CpuId(1))).unwrap();
+        assert!(!table.consume_park_pending(id).unwrap());
+        // Remote CPU publishes after park's early check, while policy runs.
+        table.unpark(OWNER, id).unwrap();
+        assert_eq!(
+            table.commit_switch(CpuId(1), Some(id), Some(TaskState::Blocked), None),
+            Ok(SwitchCommit::ParkPermit)
+        );
+        assert_eq!(table.get(id).unwrap().state(), TaskState::Running(CpuId(1)));
+        assert!(!table.consume_park_pending(id).unwrap());
+        // A subsequent park without another notification really blocks.
+        assert_eq!(
+            table.commit_switch(CpuId(1), Some(id), Some(TaskState::Blocked), None),
+            Ok(SwitchCommit::Committed)
+        );
+        assert_eq!(table.get(id).unwrap().state(), TaskState::Blocked);
+    }
+
+    #[test]
+    fn initial_placement_is_enforced_before_first_dispatch_and_after_wake() {
+        let _g = setup();
+        let mut table = TaskTable::new();
+        let id = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        assert_eq!(
+            table.start_on(OTHER_OWNER, id, CpuId(1)),
+            Err(TaskError::WrongOwner)
+        );
+        assert_eq!(table.get(id).unwrap().home_cpu(), None);
+        table.start_on(OWNER, id, CpuId(1)).unwrap();
+        assert_eq!(
+            table.commit_switch(CpuId(0), None, None, Some(id)),
+            Ok(SwitchCommit::StaleProposal)
+        );
+        assert_eq!(
+            table.commit_switch(CpuId(1), None, None, Some(id)),
+            Ok(SwitchCommit::Committed)
+        );
+        assert_eq!(
+            table.commit_switch(CpuId(0), Some(id), Some(TaskState::Blocked), None),
+            Err(TaskError::InvalidTransition)
+        );
+        table
+            .commit_switch(CpuId(1), Some(id), Some(TaskState::Blocked), None)
+            .unwrap();
+        table.unpark(OWNER, id).unwrap();
+        assert_eq!(
+            table.commit_switch(CpuId(0), None, None, Some(id)),
+            Ok(SwitchCommit::StaleProposal)
+        );
+        assert_eq!(table.get(id).unwrap().home_cpu(), Some(CpuId(1)));
     }
 
     #[test]

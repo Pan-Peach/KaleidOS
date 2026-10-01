@@ -92,18 +92,21 @@ pub enum ComponentStopError {
 /// `kcomp_instance_destroy` 是**必需导出**（loader 保证每个 image 都有）。
 pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     // 步骤 1：拒绝门。必须在任何提交之前——拒绝不得改变 Core 真相。
-    // 1a. 仍拥有未退出任务？只读扫现有任务表（不建第二账本）。
-    //     与 1b 之间没有可运行窗口：单核协作式，当前执行不在任何组件
-    //     任务里；且 `begin_stop` 提交后 `kcore_task_create` 也不再放行该实例。
-    if crate::task::get_task_table().lock().has_live_tasks(id) {
-        return Err(ComponentStopError::OwnsLiveTasks);
-    }
-    // 1b. `Ready → Stopping` 是唯一合法起点；非 Ready / 不存在由规则表拒绝。
-    if let Err(error) = registry::get_registry().lock().begin_stop(id) {
-        return Err(match error {
-            RegistryError::NotFound => ComponentStopError::NotFound,
-            _ => ComponentStopError::NotReady,
-        });
+    // Creation and stop admission share registry → task lock order. No remote
+    // create can slip between checking live work and committing Stopping.
+    {
+        let _irq = crate::irq::IrqSaveGuard::new();
+        let mut registry = registry::get_registry().lock();
+        let table = crate::task::get_task_table().lock();
+        if table.has_live_tasks(id) {
+            return Err(ComponentStopError::OwnsLiveTasks);
+        }
+        if let Err(error) = registry.begin_stop(id) {
+            return Err(match error {
+                RegistryError::NotFound => ComponentStopError::NotFound,
+                _ => ComponentStopError::NotReady,
+            });
+        }
     }
 
     // 步骤 2：必需销毁入口。参数 = 实例在 create 时记录的 opaque state

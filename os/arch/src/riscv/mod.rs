@@ -21,7 +21,7 @@ pub mod cpu;
 pub mod firmware;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod plic;
-/// RISC-V SMP backend（CPU 启动 + IPI 传输；骨架，实现待手写）。
+/// RISC-V IPI backend；通用 CPU 启动描述符仍待接线。
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 pub mod smp;
 

@@ -124,5 +124,10 @@ SECTIONS
     __bootstrap_load_start = PHYS_BASE;
     __bootstrap_load_end = LOADADDR(.bss) + SIZEOF(.bss);
 
+    /* entry64.S has four L0 pages for this 2 MiB-aligned high window. */
+    ASSERT((KERNEL_VMA & 0x1fffff) == 0, "bootstrap kernel window must be 2 MiB aligned")
+    ASSERT((KERNEL_VMA & 0x3fffffff) <= 0x3f800000, "bootstrap kernel window crosses an L1 table")
+    ASSERT(__bootstrap_end - __bootstrap_start <= 8M, "bootstrap kernel window exceeds 8 MiB")
+
     /DISCARD/ : { *(.eh_frame) }
 }

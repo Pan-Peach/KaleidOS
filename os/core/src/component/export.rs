@@ -837,6 +837,24 @@ extern "C" fn kcore_task_start(id: u32) -> i32 {
     })
 }
 
+/// Owner 提议初始 CPU；Core 校验、固定归属并通知 Online 目标。
+extern "C" fn kcore_task_start_on(id: u32, cpu: u32) -> i32 {
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        status(task::start_task_on(
+            ctx.component,
+            TaskId::from_raw(id),
+            crate::machine::CpuId::from_raw(cpu as usize),
+        ))
+    })
+}
+
+extern "C" fn kcore_cpu_current() -> u32 {
+    with_core_critical(|| crate::smp::current_cpu().raw() as u32)
+}
+
 /// 让出 CPU：Running → Runnable + 调度切换。任务再次被选中时返回 0。
 /// 返回 0 / `-Errno`。
 ///

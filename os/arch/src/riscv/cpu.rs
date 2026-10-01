@@ -140,6 +140,10 @@ impl CpuArch for Riscv {
             fn __switch(from: *mut RiscvContext, to: *const RiscvContext);
         }
         unsafe {
+            // The receiving hart acquired the published task/image metadata.
+            // Its own instruction stream must observe the relocated bytes;
+            // a loader-side fence.i on a different hart is insufficient.
+            asm!("fence.i", options(nostack));
             __switch(from as *mut RiscvContext, to as *const RiscvContext);
         }
     }

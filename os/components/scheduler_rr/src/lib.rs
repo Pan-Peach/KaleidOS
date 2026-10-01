@@ -1,6 +1,6 @@
 //! RR（轮转）调度器组件 —— `scheduler.policy` 的参考实现。
 //!
-//! 策略只保存一个 RR cursor（runqueue 真相由 Core 每次调用时传入，本组件
+//! 策略为每个 CPU 保存一个 RR cursor（runqueue 真相由 Core 每次调用时传入，本组件
 //! 不持有）。`CHOOSE_NEXT` 只做一件事：在 Core 给的 runnable 列表里轮流
 //! 提议下一个 TaskId。**提议**是否被采纳由 Core 验证后决定——本组件永远
 //! 拿不到任务表、状态或任何 Core truth 的写权限。
@@ -37,13 +37,14 @@ use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME};
 /// 选中 `scheduler.policy` 契约。单端口组件用 0。
 pub const SCHEDULER_POLICY_PORT: u32 = 0;
 
-/// RR 调度器**实例状态**：cursor 指向 runnable 列表中的下一个槽位。
+/// RR 调度器**实例状态**：每 CPU cursor 指向本地 runnable 列表中的下一个槽位。
 ///
 /// 经 Core backing 分配（地址稳定）、作为实例 state 交给 Core；不同实例各自独立
 /// 轮转（不再是 image-global 的共享 cursor）。
 #[repr(C)]
 struct SchedulerState {
-    cursor: AtomicU32,
+    cursors: *mut AtomicU32,
+    cpu_count: usize,
 }
 
 /// RR 提议：在 Core 传入的 runnable（id 升序）里轮流选择。
@@ -51,11 +52,12 @@ struct SchedulerState {
 /// **算法**：cursor 每次 +1，对 `count` 取模；runnable 列表每次
 /// 由 Core 重新收集（yield 者不在自己看到的列表里），count 收缩时取模也保持
 /// 有效选择。
-fn rr_slot(state: &SchedulerState, count: usize) -> usize {
+fn rr_slot(state: &SchedulerState, cpu: usize, count: usize) -> usize {
     if count == 0 {
         return 0; // 不可达：Core 的 frame 契约保证 input 非空；防御性返回。
     }
-    state.cursor.fetch_add(1, Ordering::SeqCst) as usize % count
+    // SAFETY: create initialized cpu_count cursors; caller validated cpu.
+    unsafe { &*state.cursors.add(cpu) }.fetch_add(1, Ordering::Relaxed) as usize % count
 }
 
 /// `CHOOSE_NEXT` 的处理：解码 frame → RR 选择 → 把提议写进 output。
@@ -69,7 +71,11 @@ fn choose_next(state: &SchedulerState, method: u32, call: frame::Call<'_>) -> i3
     let Some(request) = scheduler::ChooseNextRequest::decode(call.args, call.input) else {
         return Errno::EINVAL.code();
     };
-    let slot = rr_slot(state, request.runnable_count());
+    let cpu = request.cpu() as usize;
+    if cpu >= state.cpu_count {
+        return Errno::EINVAL.code();
+    }
+    let slot = rr_slot(state, cpu, request.runnable_count());
     let Some(proposed) = request.runnable_at(slot) else {
         return Errno::EINVAL.code(); // 不可达：slot < runnable_count。
     };
@@ -93,23 +99,27 @@ kcomp_sdk::kcomp_services! {
 // **不会**调用 destroy（构造期清理由本入口负责）。config 不进状态：RR 无配置，
 // 默认配置 = cursor 0。
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
-    let size = core::mem::size_of::<SchedulerState>();
+    let cpu_count = unsafe { kcomp_sdk::abi::kcore_machine_cpu_count() } as usize;
+    let header = core::mem::size_of::<SchedulerState>();
+    let size = header + cpu_count * core::mem::size_of::<AtomicU32>();
     let align = core::mem::align_of::<SchedulerState>();
     let state_view = match mem::mem_alloc(size as u64, align as u64) {
         Ok(view) => view,
         Err(_) => return Errno::ENOMEM.code(),
     };
     let state = state_view.base as *mut SchedulerState;
-    // 新实例从 cursor 0 开始：替换实例拿到全新 cursor。
+    let cursors = unsafe { state.cast::<u8>().add(header).cast::<AtomicU32>() };
+    for cpu in 0..cpu_count {
+        // SAFETY: backing includes the header and every aligned cursor.
+        unsafe {
+            cursors.add(cpu).write(AtomicU32::new(0));
+        }
+    }
+    // 每 CPU 独立轮转；Core 仅传 CPU 身份和候选，不保存算法状态。
     // SAFETY: state 是 acquire 交付、对齐满足的 SchedulerState 存储；ptr::write
     // 直接放置初始值（不读旧值）。
     unsafe {
-        core::ptr::write(
-            state,
-            SchedulerState {
-                cursor: AtomicU32::new(0),
-            },
-        );
+        core::ptr::write(state, SchedulerState { cursors, cpu_count });
     }
 
     // 发布策略 endpoint（Gate-only：api / ctx 为空；staged，create 返回 0 后
@@ -149,7 +159,12 @@ mod tests {
 
     fn instance_state(cursor: u32) -> SchedulerState {
         SchedulerState {
-            cursor: AtomicU32::new(cursor),
+            cursors: std::boxed::Box::into_raw(std::boxed::Box::new([
+                AtomicU32::new(cursor),
+                AtomicU32::new(cursor),
+            ]))
+            .cast(),
+            cpu_count: 2,
         }
     }
 
@@ -157,9 +172,9 @@ mod tests {
     #[test]
     fn rr_alternates_over_runnable_list() {
         let state = instance_state(0);
-        assert_eq!(rr_slot(&state, 2), 0, "从 cursor 0 起严格交替");
-        assert_eq!(rr_slot(&state, 2), 1);
-        assert_eq!(rr_slot(&state, 2), 0, "第三次回到首项（模 2 轮转）");
+        assert_eq!(rr_slot(&state, 0, 2), 0, "从 cursor 0 起严格交替");
+        assert_eq!(rr_slot(&state, 0, 2), 1);
+        assert_eq!(rr_slot(&state, 0, 2), 0, "第三次回到首项（模 2 轮转）");
     }
 
     /// 收缩列表仍然给出有效槽位（cursor 对 count 取模）。
@@ -167,7 +182,7 @@ mod tests {
     fn rr_stays_valid_when_list_shrinks() {
         let state = instance_state(0);
         for _ in 0..4 {
-            assert_eq!(rr_slot(&state, 1), 0);
+            assert_eq!(rr_slot(&state, 0, 1), 0);
         }
     }
 
@@ -176,16 +191,31 @@ mod tests {
     fn rr_cursors_are_per_instance() {
         let first = instance_state(0);
         let second = instance_state(0);
-        assert_eq!(rr_slot(&first, 2), 0);
-        assert_eq!(rr_slot(&first, 2), 1);
-        assert_eq!(rr_slot(&second, 2), 0, "另一个实例从自己的 cursor 0 开始");
+        assert_eq!(rr_slot(&first, 0, 2), 0);
+        assert_eq!(rr_slot(&first, 0, 2), 1);
+        assert_eq!(
+            rr_slot(&second, 0, 2),
+            0,
+            "另一个实例从自己的 cursor 0 开始"
+        );
+    }
+
+    #[test]
+    fn rr_progress_on_another_cpu_does_not_advance_the_local_cursor() {
+        let state = instance_state(0);
+        assert_eq!(rr_slot(&state, 0, 3), 0);
+        for _ in 0..5 {
+            rr_slot(&state, 1, 2);
+        }
+        assert_eq!(rr_slot(&state, 0, 3), 1);
+        assert_eq!(rr_slot(&state, 1, 2), 1);
     }
 
     /// 端到端 wire：CHOOSE_NEXT 解码 → RR 槽位 → 写 output。
     #[test]
     fn choose_next_writes_the_cursor_slot_proposal() {
         let state = instance_state(0);
-        let args = SCHEDULER_NONE.to_le_bytes();
+        let args = [SCHEDULER_NONE.to_le_bytes(), 0u32.to_le_bytes()].concat();
         let input = [3u32.to_le_bytes(), 5u32.to_le_bytes()].concat();
         let mut output = [0u8; SCHEDULER_TASK_ID_LEN];
         let frame = KcompCallFrame {
@@ -220,7 +250,7 @@ mod tests {
     #[test]
     fn choose_next_rejects_unknown_method_and_malformed_frames() {
         let state = instance_state(0);
-        let args = SCHEDULER_NONE.to_le_bytes();
+        let args = [SCHEDULER_NONE.to_le_bytes(), 0u32.to_le_bytes()].concat();
         let input = 3u32.to_le_bytes();
         let mut output = [0u8; SCHEDULER_TASK_ID_LEN];
         let frame = KcompCallFrame {

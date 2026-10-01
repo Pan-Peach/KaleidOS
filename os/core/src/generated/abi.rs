@@ -210,9 +210,9 @@ pub const KCORE_MEMORY_VIEW_LINEAR_OFFSET: u32 = 2;
 /// 解析"当前调度器"。
 pub const KCOMP_SCHEDULER_POLICY_NAME: &[u8] = b"scheduler.policy";
 
-/// exact ABI fingerprint（8 字节 ASCII "SCHEDULR" 的大端读数）。`kcore_sched_set_policy`
+/// exact ABI fingerprint（8 字节 ASCII "SCHEDCPU" 的大端读数）。`kcore_sched_set_policy`
 /// 要求 endpoint 记录的 abi 与它逐位相等，否则拒绝选择。
-pub const KCOMP_SCHEDULER_POLICY_ABI: u64 = 0x5343_4845_4455_4C52;
+pub const KCOMP_SCHEDULER_POLICY_ABI: u64 = 0x5343_4845_4443_5055;
 
 /// `scheduler.policy` 的 endpoint 契约身份（`kcore_endpoint_*` 的 `contract` 参数）。
 /// 数值 = 8 字节 ASCII tag `b"SCHEDPOL"` 的大端读数（与 `BLKCONTR` / `PRBCONTR` 同一约定）。
@@ -221,10 +221,13 @@ pub const KCOMP_SCHEDULER_POLICY_CONTRACT: u64 = 0x5343_4845_4450_4F4C;
 /// `CHOOSE_NEXT` 的方法号：见本文件顶部的 wire 格式。
 pub const KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT: u32 = 0;
 
-/// 一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`args` 与 `output` 恰好这么长；
+/// 一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`output` 恰好这么长；
 /// `input` 是它的整数倍。
 pub const KCOMP_SCHEDULER_TASK_ID_LEN: usize = 4;
 
 /// `args` 里的"当前无任务"哨兵（`UINT32_MAX`）：从锚点（monitor / 组件 init）进入
 /// 调度时没有 current task。它是**编码值**，不是 TaskId。
 pub const KCOMP_SCHEDULER_NONE: u32 = 0xFFFF_FFFF;
+
+/// CHOOSE_NEXT 的 args 长度：current TaskId + CpuId，各 u32 LE。
+pub const KCOMP_SCHEDULER_ARGS_LEN: usize = 8;

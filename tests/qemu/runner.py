@@ -114,6 +114,15 @@ CORE_TEST_CASES = (
     "park-unpark-64-rounds",
     "park-unpark-task-completion",
 )
+CORE_TEST_SMP_CASES = (
+    "smp-parallel",
+    "smp-remote-park-wake",
+    "smp-local-rr",
+    "smp-task-completion",
+    "smp-panic-ap",
+    "smp-panic-bsp",
+    "smp-scheduler-live",
+)
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
@@ -280,7 +289,8 @@ def main() -> int:
 
         # -- 3) CoreTest: 唯一的组件/系统集成判定 --------------------------
         expected = [CORE_TEST_OK, CORE_TEST_ALL_PASS]
-        expected += [f"[core-test]   {case}: PASS" for case in CORE_TEST_CASES]
+        cases = CORE_TEST_CASES + (CORE_TEST_SMP_CASES if arch == "rv64" else ())
+        expected += [f"[core-test]   {case}: PASS" for case in cases]
         send(proc, CORE_TEST_CMD)
         output2, ok = collect(proc, CORE_TEST_TIMEOUT_S, expected, FATAL_MARKERS)
         output += "\n" + output2
@@ -298,7 +308,7 @@ def main() -> int:
         ]
         summary.append(
             f"core_test: PASS ({len(core_test_lines)} report lines, "
-            f"{len(CORE_TEST_CASES)} absorbed cases + all: PASS)"
+            f"{len(cases)} absorbed cases + all: PASS)"
         )
 
         # -- 4) shutdown ---------------------------------------------------

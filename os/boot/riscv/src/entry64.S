@@ -84,17 +84,26 @@ _start:
     ori t4, t4, 1
     sd t4, 0(t2)
 
-    # early_kernel_l1[vpn(KERNEL_VMA, 1)] = early_kernel_l0
+    # Four L0 tables cover an 8 MiB image window. The linker checks the bound;
+    # a single L0 silently overwrote .text when per-CPU stacks grew past 2 MiB.
+    # early_kernel_l1[vpn(KERNEL_VMA, 1) + j] = early_kernel_l0[j]
     srli t2, t0, 21
     andi t2, t2, 0x1ff
     slli t2, t2, 3
     la t3, early_kernel_l1
     add t2, t3, t2
-    la t4, early_kernel_l0
-    srli t4, t4, 12
+    la t3, early_kernel_l0
+    li t6, 4
+6:
+    srli t4, t3, 12
     slli t4, t4, 10
     ori t4, t4, 1
     sd t4, 0(t2)
+    addi t2, t2, 8
+    li t4, 4096
+    add t3, t3, t4
+    addi t6, t6, -1
+    bnez t6, 6b
 
     # early_kernel_l0[i] = kernel_pa + i * PAGE_SIZE
     la t2, early_kernel_l0
@@ -163,7 +172,7 @@ early_kernel_l1:
 
 .align 12
 early_kernel_l0:
-    .space 4096
+    .space 4096*4
 
 early_tables_end:
 

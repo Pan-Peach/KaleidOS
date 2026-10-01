@@ -305,15 +305,54 @@ impl Default for Registry {
 
 // —— 全局（boot/core::init 初始化；monitor 等使用全局，测试用 Registry::new()）——
 
-static REGISTRY: Once<Mutex<Registry>> = Once::new();
+/// IRQ callbacks consult lifecycle admission too. Mask IRQs before acquiring
+/// the mutex, and release the mutex before restoring them.
+pub struct RegistryLock(Mutex<Registry>);
+
+pub struct RegistryGuard<'a> {
+    inner: Option<spin::MutexGuard<'a, Registry>>,
+    irq: Option<crate::irq::IrqSaveGuard>,
+}
+
+impl RegistryLock {
+    pub fn lock(&self) -> RegistryGuard<'_> {
+        let irq = crate::irq::IrqSaveGuard::new();
+        RegistryGuard {
+            inner: Some(self.0.lock()),
+            irq: Some(irq),
+        }
+    }
+}
+
+impl core::ops::Deref for RegistryGuard<'_> {
+    type Target = Registry;
+    fn deref(&self) -> &Registry {
+        self.inner.as_deref().expect("active registry guard")
+    }
+}
+
+impl core::ops::DerefMut for RegistryGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Registry {
+        self.inner.as_deref_mut().expect("active registry guard")
+    }
+}
+
+impl Drop for RegistryGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        drop(self.irq.take());
+    }
+}
+
+static REGISTRY: Once<RegistryLock> = Once::new();
 
 /// 初始化全局注册表（core::init 调用一次）。
 pub fn init() {
-    REGISTRY.call_once(|| Mutex::new(Registry::new()));
+    REGISTRY.call_once(|| RegistryLock(Mutex::new(Registry::new())));
 }
 
 /// 取全局注册表（init 后可用）。
-pub fn get_registry() -> &'static Mutex<Registry> {
+pub fn get_registry() -> &'static RegistryLock {
     REGISTRY.get().expect("registry not initialized")
 }
 

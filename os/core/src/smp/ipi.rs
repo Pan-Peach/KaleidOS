@@ -12,12 +12,9 @@
 //!
 //! # 接通程度
 //!
-//! - **已机械实现**：[`ipi_interrupt`]（接收回调只标记）、[`take_pending`]
-//!   （安全边界的原子 take）。
-//! - **仍 `todo!()`（人类）**：[`notify`]（“先发布再响铃”的并发排序）与
-//!   [`drain_pending`]（安全边界的重调度）。在 arch 补齐 **SSIP 应答**之前
-//!   **不得**打开 IPI 源，否则会中断风暴（见 `.omo/plans/smp-production-integration.md`
-//!   与 Oracle 评审）。
+//! - [`notify`] 先发布 pending 再响铃；[`ipi_interrupt`] 只标记；
+//!   [`take_pending`] / [`drain_pending`] 在安全边界消费并请求重调度。
+//! - RISC-V trap 在回调前应答 SSIP；接收源只在本 CPU 初始化完成后打开。
 //!
 //! 先只做实际需要的 `Reschedule`。**不**预先塞一个“无载荷 TLB shootdown 标志”
 //! 就宣称完成：正确的 shootdown 需要受影响的地址空间/范围、确认与生存期规则。

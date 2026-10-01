@@ -21,7 +21,7 @@
 //!   state is saved/restored explicitly around the switch (the RISC-V context
 //!   record does not carry `sstatus.SIE`; `tp` **is** part of it, as plain
 //!   architectural execution state).
-//! - **Policy call** (`crate::sched::pick_next` → `call_component_policy`):
+//! - **Policy call** (`crate::sched` → `call_component_policy`):
 //!   Core is the caller (no principal, no caller task); a panic returns to the
 //!   suspended scheduler frame, which still owns its `IrqSaveGuard`.
 //! - **Cross-AS service** (`with_isolated_service_boundary`; KernelNative
@@ -45,9 +45,9 @@
 //!
 //! # Execution guard (lock-free)
 //!
-//! [`ACTIVE_GUARD`] is a plain static pointer, never a lock: the boot panic
+//! The CPU-local active guard is a plain static pointer, never a lock: the boot panic
 //! handler performs no allocation, logging, or locking.  It is only touched at
-//! synchronous entry/switch boundaries on the single active CPU.  [`with_irq_scope`]
+//! synchronous entry/switch boundaries on the current CPU.  [`with_irq_scope`]
 //! layers one more boundary around a component IRQ callback: principal is the
 //! IRQ line's owner, `task = None`, scheduling is forbidden beneath it, and it
 //! is **not escapable** (an IRQ callback has no Core-owned context to resume).
@@ -61,7 +61,7 @@
 //! only authority is revoked via `fail_component`.  Tasks of a failed component
 //! are excluded by `may_run` but keep non-`Exited` records (no task-stop API),
 //! so graceful stop refuses components that still own live tasks.  No Core lock
-//! may span the switch.  The task-abort context is single-CPU, entered once per
+//! may span the switch.  The task-abort context is per-CPU, entered once per
 //! panic, never resumed.
 //!
 //! Contract: `docs/modules/core/component.md`; `docs/philosophy/core-philosophy.md`
@@ -306,55 +306,88 @@ struct EscapeGuard {
     saved_depth: u32,
 }
 
-// Phase 1 is single-active-CPU and component entry is synchronous, so the
-// active record is accessed only by the current component execution or its
-// panic handler.  It intentionally uses no lock: the panic handler cannot
-// acquire one.
-static mut ACTIVE_GUARD: *mut EscapeGuard = core::ptr::null_mut();
-/// Ambient guard saved when the scheduler first leaves the anchor for a task.
-static mut ANCHOR_GUARD: *mut EscapeGuard = core::ptr::null_mut();
-/// True while the CPU is inside the task-scheduling region.
-static mut TASK_REGION: bool = false;
+/// Execution state belongs to the current CPU; it is never restored from a task.
+/// Raw field accesses are short and no reference spans an IRQ or context switch.
+struct CpuContainment {
+    active: *mut EscapeGuard,
+    anchor: *mut EscapeGuard,
+    task_region: bool,
+    #[cfg(not(test))]
+    depth: u32,
+    creating: Option<ComponentId>,
+    abort_stack: TaskAbortStack,
+    scratch: MaybeUninit<ContextImpl>,
+    abort: MaybeUninit<ContextImpl>,
+    task_guard: MaybeUninit<EscapeGuard>,
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
+    cross_as: *mut cross_as::CrossAsContext,
+}
 
-/// Core ABI execution depth on the current CPU: `0` = the execution is
-/// **component** code (a panic may escape); `> 0` = Core code reached through an
-/// export is on the stack ([`with_core_critical`]) — a panic there is a **Core**
-/// panic and must stay fatal ([`panic_escape`] refuses).
-///
-/// Production: one process-global counter with the same single-active-CPU,
-/// lock-free discipline as [`ACTIVE_GUARD`].  Host tests run many test threads in
-/// one process, and every export call touches this counter, so under `cfg(test)`
-/// it is thread-local instead: each test thread is its own simulated single CPU
-/// (same accommodation as the trace enabled-mask).
-#[cfg(not(test))]
-static mut CORE_ABI_DEPTH: u32 = 0;
+impl CpuContainment {
+    const fn new() -> Self {
+        Self {
+            active: core::ptr::null_mut(),
+            anchor: core::ptr::null_mut(),
+            task_region: false,
+            #[cfg(not(test))]
+            depth: 0,
+            creating: None,
+            abort_stack: TaskAbortStack([0; TASK_ABORT_STACK_BYTES]),
+            scratch: MaybeUninit::uninit(),
+            abort: MaybeUninit::uninit(),
+            task_guard: MaybeUninit::uninit(),
+            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
+            cross_as: core::ptr::null_mut(),
+        }
+    }
+}
 
+struct CpuSlot(core::cell::UnsafeCell<CpuContainment>);
+// SAFETY: each slot is accessed only on its CPU, without migration. Panic/IRQ
+// paths use raw accesses and never keep a mutable reference to the slot alive.
+unsafe impl Sync for CpuSlot {}
+static LOCAL: [CpuSlot; crate::machine::MAX_CPUS] =
+    [const { CpuSlot(core::cell::UnsafeCell::new(CpuContainment::new())) };
+        crate::machine::MAX_CPUS];
+
+fn local() -> *mut CpuContainment {
+    let cpu = CpuImpl::current_cpu().unwrap_or(crate::machine::CpuId::from_raw(0));
+    LOCAL[cpu.raw()].0.get()
+}
+
+// Host test threads each simulate an execution; their ABI depth is independent.
 #[cfg(test)]
 std::thread_local! {
     static CORE_ABI_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
-/// Current Core ABI depth (see [`CORE_ABI_DEPTH`]).
 pub(crate) fn core_abi_depth() -> u32 {
     #[cfg(not(test))]
-    // SAFETY: [Category 2 — Data races] single-active-CPU; the counter is
-    // pushed/popped only synchronously on that CPU.
-    return unsafe { core::ptr::addr_of!(CORE_ABI_DEPTH).read() };
+    // SAFETY: a short read of the current CPU's field.
+    return unsafe { core::ptr::addr_of!((*local()).depth).read() };
     #[cfg(test)]
     return CORE_ABI_DEPTH.with(core::cell::Cell::get);
 }
 
-/// Overwrites the Core ABI depth (boundary suspend / restore; see
-/// [`CORE_ABI_DEPTH`]).
 fn set_core_abi_depth(next: u32) {
     #[cfg(not(test))]
-    // SAFETY: [Category 2 — Data races] same single-active-CPU contract as
-    // `core_abi_depth`.
+    // SAFETY: a short write of the current CPU's field.
     unsafe {
-        core::ptr::addr_of_mut!(CORE_ABI_DEPTH).write(next);
-    }
+        core::ptr::addr_of_mut!((*local()).depth).write(next)
+    };
     #[cfg(test)]
     CORE_ABI_DEPTH.with(|depth| depth.set(next));
+}
+
+/// CPU-local lifecycle attribution, saved/restored by nested create calls.
+pub(crate) fn creating() -> Option<ComponentId> {
+    // SAFETY: only this CPU reads/writes its current create identity.
+    unsafe { core::ptr::addr_of!((*local()).creating).read() }
+}
+
+pub(crate) fn replace_creating(next: Option<ComponentId>) -> Option<ComponentId> {
+    // SAFETY: synchronous CPU-local push/pop; never held across a reference.
+    unsafe { core::ptr::replace(core::ptr::addr_of_mut!((*local()).creating), next) }
 }
 
 /// Runs `f` as **Core-critical**: the Core ABI depth is incremented for the whole
@@ -393,81 +426,46 @@ pub(crate) fn resume_core_abi_depth(saved: u32) {
 /// stack is abandoned, so it must have its own.
 #[repr(align(16))]
 struct TaskAbortStack([u8; TASK_ABORT_STACK_BYTES]);
-static mut TASK_ABORT_STACK: TaskAbortStack = TaskAbortStack([0; TASK_ABORT_STACK_BYTES]);
-/// Core-owned context that receives a panicking task's registers.
-static mut TASK_SCRATCH_CONTEXT: MaybeUninit<ContextImpl> = MaybeUninit::uninit();
-/// Core-owned context whose entry is [`task_abort_trampoline`].
-static mut TASK_ABORT_CONTEXT: MaybeUninit<ContextImpl> = MaybeUninit::uninit();
-/// Persistent task escape record (single CPU, overwritten per task switch).
-static mut TASK_GUARD: MaybeUninit<EscapeGuard> = MaybeUninit::uninit();
-
-/// Prepare the Core-owned task-abort context.  Called once from `core::init`
-/// before any task can run.
-///
-/// The record's entry is [`task_abort_trampoline`] — a **real, executable**
-/// panic-recovery destination that [`switch_to_core`] enters after a task
-/// panic — not inert metadata.  Constructing it here only builds the record;
-/// whether it is actually reachable is proven by the target-side task-panic
-/// cases, not by boot construction.
+/// Initialize this CPU's executable panic destination before it goes Online.
 pub fn init() {
-    let context = CpuImpl::new_context(
-        task_abort_trampoline as *const () as usize,
-        abort_stack_top(),
-    );
-    // SAFETY: [Category 1 — Initialization] this runs once during `core::init`,
-    // before the scheduler is reachable; no other CPU exists.
-    unsafe {
-        core::ptr::addr_of_mut!(TASK_ABORT_CONTEXT).write(MaybeUninit::new(context));
+    let cpu = CpuImpl::current_cpu().unwrap_or(crate::machine::CpuId::from_raw(0));
+    init_cpu(cpu).expect("containment CPU initialization failed");
+}
+
+pub(crate) fn init_cpu(cpu: crate::machine::CpuId) -> Result<(), ContainmentInitError> {
+    if CpuImpl::current_cpu().unwrap_or(crate::machine::CpuId::from_raw(0)) != cpu {
+        return Err(ContainmentInitError::WrongCpu);
     }
+    let slot = local();
+    // SAFETY: this CPU is not yet Online; static backing is already mapped in
+    // the kernel image and remains resident. No other CPU touches this slot.
+    unsafe {
+        let top = (core::ptr::addr_of_mut!((*slot).abort_stack.0) as usize
+            + TASK_ABORT_STACK_BYTES)
+            & !(STACK_ALIGNMENT - 1);
+        let context = CpuImpl::new_context(task_abort_trampoline as *const () as usize, top);
+        core::ptr::addr_of_mut!((*slot).abort).write(MaybeUninit::new(context));
+    }
+    Ok(())
 }
 
-/// Per-CPU containment state（SMP 骨架接缝）。
-///
-/// 今天这一整块是**单活动 CPU**的进程级 `static mut`（`ACTIVE_GUARD` /
-/// `ANCHOR_GUARD` / `TASK_REGION` / `CORE_ABI_DEPTH` / abort 与 scratch 上下文 /
-/// `TASK_GUARD` / `ACTIVE_CROSS_AS`）。SMP 下它们必须变成**每 CPU 一份**保存在
-/// 本结构里（Oracle：只搬 CPU-local 的当前执行/escape 状态，不按 CPU 复制身份表），
-/// 且 panic 路径的访问仍必须无锁、不得跨组件调用 / IRQ 嵌套 / 上下文切换持有
-/// Rust 可变引用。
-///
-/// 骨架先留空壳：字段在把上述 `static mut` 迁进来时补。**它不是 per-CPU 基址记录。**
-#[allow(dead_code)]
-pub(crate) struct CpuContainment {
-    _reserved: (),
-}
-
-/// 初始化**当前执行 CPU** 的 containment 本地状态（AP 在本地启动时调用；UP 不调用）。
-#[allow(dead_code)]
-pub(crate) fn init_cpu(_cpu: crate::machine::CpuId) -> Result<(), ContainmentInitError> {
-    todo!("SMP: move the containment static-mut set into a per-CPU CpuContainment")
-}
-
-/// [`init_cpu`] 的失败原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainmentInitError {
-    /// 本地栈 / 上下文准备失败。
-    NoStack,
-}
-
-fn abort_stack_top() -> usize {
-    // SAFETY: [Category 1 — Initialization] only forms the one-past-end address
-    // of the static abort stack; no reference is created.
-    let base = unsafe { core::ptr::addr_of_mut!(TASK_ABORT_STACK.0) as usize };
-    (base + TASK_ABORT_STACK_BYTES) & !(STACK_ALIGNMENT - 1)
+    WrongCpu,
 }
 
 fn replace_active(next: *mut EscapeGuard) -> Option<*mut EscapeGuard> {
-    // SAFETY: [Category 2 — Data races] one active CPU; this pointer is
+    // SAFETY: [Category 2 — Data races] one writer on this CPU; this pointer is
     // changed only at synchronous entry/return boundaries; the
     // panic handler runs on that same CPU and performs no nested mutation.
-    let previous = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(ACTIVE_GUARD), next) };
+    let previous = unsafe { core::ptr::replace(core::ptr::addr_of_mut!((*local()).active), next) };
     (!previous.is_null()).then_some(previous)
 }
 
 fn active_guard() -> Option<*mut EscapeGuard> {
-    // SAFETY: [Category 2 — Data races] the single-active-CPU contract used by
+    // SAFETY: [Category 2 — Data races] the CPU-local contract used by
     // `replace_active` also serializes this raw read with guard installation.
-    let guard = unsafe { core::ptr::addr_of!(ACTIVE_GUARD).read() };
+    let guard = unsafe { core::ptr::addr_of!((*local()).active).read() };
     (!guard.is_null()).then_some(guard)
 }
 
@@ -498,25 +496,23 @@ pub(crate) mod cross_as {
         pub space: Option<crate::memory::address_space::AddressSpaceHandle>,
     }
 
-    static mut ACTIVE_CROSS_AS: *mut CrossAsContext = core::ptr::null_mut();
-
     /// 安装本次 Isolated 执行的可恢复现场，返回被替换的上一个（LIFO / 嵌套安全）。
     pub(crate) fn swap_cross_as(next: *mut CrossAsContext) -> *mut CrossAsContext {
-        // SAFETY: [Category 2 — Data races] single-active-CPU; only touched at
+        // SAFETY: [Category 2 — Data races] CPU-local; only touched at
         // synchronous Isolated entry/return boundaries.
-        unsafe { core::ptr::replace(core::ptr::addr_of_mut!(ACTIVE_CROSS_AS), next) }
+        unsafe { core::ptr::replace(core::ptr::addr_of_mut!((*super::local()).cross_as), next) }
     }
 
     /// 恢复 [`swap_cross_as`] 返回的上一个现场。
     pub(crate) fn restore_cross_as(previous: *mut CrossAsContext) {
-        // SAFETY: same single-active-CPU contract as `swap_cross_as`.
-        unsafe { core::ptr::addr_of_mut!(ACTIVE_CROSS_AS).write(previous) };
+        // SAFETY: same CPU-local contract as `swap_cross_as`.
+        unsafe { core::ptr::addr_of_mut!((*super::local()).cross_as).write(previous) };
     }
 
     /// 当前 Isolated 执行的可恢复现场；`None` = 当前不在 Isolated AS 里执行。
     pub(crate) fn active_cross_as() -> Option<*mut CrossAsContext> {
-        // SAFETY: [Category 2 — Data races] same single-active-CPU contract.
-        let ctx = unsafe { core::ptr::addr_of!(ACTIVE_CROSS_AS).read() };
+        // SAFETY: [Category 2 — Data races] same CPU-local contract.
+        let ctx = unsafe { core::ptr::addr_of!((*super::local()).cross_as).read() };
         (!ctx.is_null()).then_some(ctx)
     }
 }
@@ -560,7 +556,7 @@ pub(crate) fn in_irq_context() -> bool {
 fn chain_any(predicate: impl Fn(&EscapeGuard) -> bool) -> bool {
     let mut next = active_guard();
     while let Some(guard_ptr) = next {
-        // SAFETY: [Category 2 — Data races] single-active-CPU; the chain is
+        // SAFETY: [Category 2 — Data races] CPU-local; the chain is
         // stable while this synchronous walk runs (no guard is popped
         // concurrently), and every `previous` points at a live suspended frame.
         let guard = unsafe { &*guard_ptr };
@@ -1029,36 +1025,36 @@ pub(crate) fn with_irq_scope<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R 
 /// switch (`sched::schedule_next`) saves its own depth and restores it when that
 /// frame is resumed.
 pub fn enter_task(task: TaskId, owner: ComponentId) {
-    // SAFETY: [Category 2 — Data races] single active CPU; called on the
+    // SAFETY: [Category 2 — Data races] current CPU; called on the
     // synchronous scheduling path with all locks released.
     unsafe {
-        if !TASK_REGION {
-            ANCHOR_GUARD = ACTIVE_GUARD;
-            TASK_REGION = true;
+        if !(*local()).task_region {
+            (*local()).anchor = (*local()).active;
+            (*local()).task_region = true;
         }
         let guard = EscapeGuard {
             kind: EscapeKind::Task { task, owner },
-            from_context: core::ptr::addr_of_mut!(TASK_SCRATCH_CONTEXT).cast::<ContextImpl>(),
-            to_context: core::ptr::addr_of_mut!(TASK_ABORT_CONTEXT).cast::<ContextImpl>(),
+            from_context: core::ptr::addr_of_mut!((*local()).scratch).cast::<ContextImpl>(),
+            to_context: core::ptr::addr_of_mut!((*local()).abort).cast::<ContextImpl>(),
             call: IsolatedCall::None,
             returned: 0,
             state: GuardState::new(None),
             // Unused at the task boundary: see `EscapeGuard::saved_depth`.
             saved_depth: 0,
         };
-        core::ptr::addr_of_mut!(TASK_GUARD).write(MaybeUninit::new(guard));
-        ACTIVE_GUARD = core::ptr::addr_of_mut!(TASK_GUARD).cast::<EscapeGuard>();
+        core::ptr::addr_of_mut!((*local()).task_guard).write(MaybeUninit::new(guard));
+        (*local()).active = core::ptr::addr_of_mut!((*local()).task_guard).cast::<EscapeGuard>();
     }
     set_core_abi_depth(0);
 }
 
 /// Scheduler hook: restore the ambient guard before switching **into the anchor**.
 pub fn enter_anchor() {
-    // SAFETY: [Category 2 — Data races] single active CPU; synchronous path.
+    // SAFETY: [Category 2 — Data races] current CPU; synchronous path.
     unsafe {
-        TASK_REGION = false;
-        ACTIVE_GUARD = ANCHOR_GUARD;
-        ANCHOR_GUARD = core::ptr::null_mut();
+        (*local()).task_region = false;
+        (*local()).active = (*local()).anchor;
+        (*local()).anchor = core::ptr::null_mut();
     }
 }
 
@@ -1253,7 +1249,7 @@ pub fn panic_escape() -> bool {
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
 fn mark_active_panicked() {
     if let Some(guard_ptr) = active_guard() {
-        // SAFETY: [Category 2 — Data races] single-active-CPU; the record is live
+        // SAFETY: [Category 2 — Data races] CPU-local; the record is live
         // and this is the only execution touching it.
         unsafe { (*guard_ptr).state.mark_panicked() };
     }
@@ -1518,7 +1514,7 @@ pub(crate) fn test_mark_active_panicked() {
 #[cfg(test)]
 pub(crate) fn test_active_panicked() -> bool {
     active_guard().is_some_and(|guard_ptr| {
-        // SAFETY: [Category 2 — Data races] single active CPU / test boundary
+        // SAFETY: [Category 2 — Data races] current CPU / test boundary
         // lock; the record is live and only this test reads it.
         unsafe { (*guard_ptr).state.panicked() }
     })
@@ -1528,6 +1524,33 @@ pub(crate) fn test_active_panicked() -> bool {
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    #[test]
+    fn execution_identity_is_cpu_local() {
+        let _boundary = test_boundary_lock();
+        let original = CpuImpl::current_cpu().unwrap();
+        let base = CpuImpl::per_cpu_base().unwrap_or(core::ptr::NonNull::dangling());
+        // A second CPU must not inherit CPU0's task or create attribution.
+        unsafe { CpuImpl::install_per_cpu_base(crate::machine::CpuId(0), base) };
+        let previous = replace_creating(Some(ComponentId::from_raw(70)));
+        enter_task(TaskId::from_raw(80), ComponentId::from_raw(70));
+        unsafe { CpuImpl::install_per_cpu_base(crate::machine::CpuId(1), base) };
+        assert_eq!(creating(), None);
+        assert_eq!(active_escape(), None);
+        enter_task(TaskId::from_raw(81), ComponentId::from_raw(71));
+        replace_creating(Some(ComponentId::from_raw(71)));
+        enter_anchor();
+        replace_creating(None);
+        unsafe { CpuImpl::install_per_cpu_base(crate::machine::CpuId(0), base) };
+        assert_eq!(creating(), Some(ComponentId::from_raw(70)));
+        assert_eq!(
+            active_escape().unwrap().owner(),
+            Some(ComponentId::from_raw(70))
+        );
+        enter_anchor();
+        replace_creating(previous);
+        unsafe { CpuImpl::install_per_cpu_base(original, base) };
+    }
 
     #[test]
     fn empty_create_args_have_no_config_payload() {

@@ -19,7 +19,7 @@
 | `CpuArch` | `Context`、`IrqFlags`、`context_switch`、`new_context`、`init_cpu`、`enable_irq`、`disable_irq`/`restore_irq`、`wait_for_interrupt`（裸 idle 提示）、`unsafe atomic_idle`（检查-睡眠原子化）、`current_cpu`/`per_cpu_base`/`install_per_cpu_base` | `riscv/cpu.rs` | `fake/mod.rs` |
 | `Timer` | `init_cpu`（本地、disarmed、masked，`Result<(), TimerError>`）、`now`、`set_deadline`（`Result`；`Ok` = 真实 deadline 已编程）、`cancel_deadline`、`register_timer_handler(LocalInterruptHandler)`、`enable_timer_interrupt`（只解投递路径、`Result`；`Ok` = 回调真的会被调用） | `riscv/cpu.rs` | `fake/mod.rs` |
 | `InterruptController` | `Config`、`unsafe configure`、`init_cpu`、`enable`/`disable`、`register_external_handler(ExternalIrqHandler)`、`enable_external_interrupt`；**ack/EOI 与源映射是后端私有**（PLIC claim/complete、claim 令牌不进 trait），Core 只按逻辑 IRQ 号路由 | `riscv/plic.rs`（`PlicConfig`） | `fake/mod.rs` |
-| `Smp` | `BootConfig`、`unsafe prepare`、`unsafe start_cpu`、`init_ipi_cpu`（本地 IPI 接收，保持 masked）、`register_ipi_handler`、`enable_ipi_interrupt`、`send_ipi`、`send_ipi_mask` | `riscv/smp.rs`（骨架） | `fake/mod.rs` |
+| `Smp` | `BootConfig`、`unsafe prepare`、`unsafe start_cpu`、`init_ipi_cpu`（本地 IPI 接收，保持 masked）、`register_ipi_handler`、`enable_ipi_interrupt`、`send_ipi`、`send_ipi_mask` | `riscv/smp.rs`（IPI 已实现；prepare/start_cpu 占位） | `fake/mod.rs` |
 | `Console` | `write_byte`、`getc` | `riscv/console.rs` | `fake/mod.rs` |
 | `SystemReset` | `system_reset(ResetType) -> !` | `riscv/cpu.rs` | `fake/mod.rs` |
 
@@ -56,9 +56,10 @@
 
 - **已实现（RISC-V / Fake）**：`CpuId`/`HardwareCpuId` 分离；回调分两类——`LocalInterruptHandler = fn(CpuId)`（timer / IPI）与 `ExternalIrqHandler = fn(CpuId, u32)`（外部中断，逻辑 IRQ 号）；`InterruptController` 的 `Config` + `init_cpu`（`PlicConfig` 携带**逻辑 CPU → PLIC context 映射表** + 固定路由 CPU + source 上界；enable bank 读改写持锁 + irq-save）；**后端拥有 ack/EOI 与源映射**（PLIC claim/complete、claim 令牌 backend-private；`configure` 装入后端分发器，循环 `claim → 逻辑号 → Core 回调 → complete`），Core 只收逻辑 IRQ 号并按 route 表投递；`CpuArch::init_cpu`/`enable_irq`/`current_cpu`/`per_cpu_base`/`install_per_cpu_base`/`atomic_idle`（RISC-V：全局中断关闭下的 masked-WFI）；`Timer::init_cpu` + 诚实 readiness（`Ok` = 投递可用）；`Smp::init_ipi_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；中断使能生命周期显式化（本地 `init_cpu`/解源 与全局 `enable_irq` 分离）。Fake 后端提供确定性故障注入（init / delivery / arm 失败）与有序 `TimerEvent` 日志，供 Core 测试断言检查-睡眠协议；`deliver_external_for_test` 直接驱动 Core `on_irq` 生产路径。
 - **Core 侧（`os/core/src/smp/`，已落地并接线）**：`CpuMask`/`PerCpu`/`CpuBootState`/`BootGate` + 记录表 `CpuRegistry`；`init`（BSP 侧：校验拓扑、注册 Core IPI 回调、BSP Online）；`cpu_state`/`online_cpus`/`request_start`/`mark_ready`/`cpu_identity_ok`；`ipi::notify`/`ipi_interrupt`/`drain_pending`（pending 位 → 延迟重调度标志）；`secondary_entry`（AP 入场：绑入口记录 → per-CPU sched/timer/irq → 身份验证 → Ready → BootGate → Online → Core 空闲循环）；`release_secondaries`/`wait_until_online`；`timer::STATE` 已 per-CPU。`core::init` 调 `smp::init`；boot 的 `secondary_main` 现为指向 Core 的**薄 trampoline**，`start_secondaries` 驱动 `request_start` + `release_secondaries`。**AP 已进入 Core 并 Online**（`smp-boot`/`smp-ipi`/`smp-percpu` 经 Core 状态断言）。
-- **仍是 `todo!()`（人类，关键并发路径）**：arch `Smp::prepare`/`start_cpu`（启动 seam，可 still boot 驱动）；`containment` 的进程级 `static mut` → per-CPU（AP 跑组件任务的前提）；跨 CPU **任务放置 / 迁移**的离场上下文交接（Oracle 最高风险：`sched.rs` 先发布离场状态、后保存上下文）；抢占（C5）。
-- **协调项**：外部 IRQ 仍固定路由 BSP；AP 目前只做 Core 空闲循环（不跑组件任务），因此 `containment::init_cpu` 仍滞留 `todo!()`（AP 不触发它）。详见 `.omo/plans/smp-production-integration.md`。
-- **测试入口**：`make test-arch`（rv64+rv32，默认）；`make test-arch-smp-rv64`（`smp-boot`/`smp-ipi`/`smp-percpu`，已确定性通过）；`make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（opt-in 新 ISA，boot 未实现前会失败）。
+- **当前范围**：RV64 KernelNative 协作式 SMP 已接入真实组件任务。固定 CPU、per-CPU containment、远端 wake 与 Core commit 已实现；抢占、迁移、work stealing 与私有 AS 任务调度未实现。
+- **启动传输现状**：boot 的 `ApBoot` / 物理 trampoline 经 `arch::riscv::firmware::hart_start` 启动 AP；通用 `Smp::prepare/start_cpu` 尚未接线。Core / scheduler 边界不依赖此描述符的 ISA 布局。
+- **协调项**：外部 IRQ 仍固定路由 BSP；AP 在 Online 前初始化 containment，空闲安全点运行固定到本 CPU 的组件任务。调度分工见 `docs/architecture/scheduling.md`。
+- **测试入口**：`make test-arch`（rv64+rv32，默认）；`make test-arch-smp-rv64`（启动 / IPI / per-CPU）；组件并行 / park-wake / 双向 panic 由 `make test-qemu` 的 CoreTest 验证；`make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（opt-in 新 ISA，boot 未实现前会失败）。
 
 ## 新 ISA 骨架（x86_64 / aarch64 / loongarch64）
 
@@ -89,7 +90,7 @@
    - `all(target_arch = "x86_64", target_os = "none")` → `X86_64`，aarch64 / loongarch64 同理；
    - **host（`not(target_os = "none")`）→ `Fake`**（host 上的 `x86_64` 必须落到 `Fake`，不能按 `target_arch` 单独判）；
    - 未支持的裸机目标 → 显式 `compile_error!`。
-2. **Kconfig → Cargo features**：`supervisor`/`machine` 二选一、`vm-mmu`/`vm-nommu` 二选一、`smp`（CONFIG_SMP）；映射集中在 `scripts/kconfig/genmk.py`（`ARCH_MAP` / `PRIV_MAP` / `VM_MAP`），`.config` 是唯一真相。`KCFG_BOOT_DIR` 也由 `ARCH_MAP` 给出（Makefile 不再写死 `os/boot/riscv`）。
+2. **Kconfig → Cargo features**：`supervisor`/`machine` 二选一、`vm-mmu`/`vm-nommu` 二选一（SMP 无 Cargo feature）；映射集中在 `scripts/kconfig/genmk.py`（`ARCH_MAP` / `PRIV_MAP` / `VM_MAP`），`.config` 是唯一真相。`KCFG_BOOT_DIR` 也由 `ARCH_MAP` 给出（Makefile 不再写死 `os/boot/riscv`）。
 
 ## 代码在哪
 

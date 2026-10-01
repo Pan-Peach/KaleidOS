@@ -1,41 +1,37 @@
-# task（os/core/src/task/）
+# sched（os/core/src/sched.rs）
 
-> 任务**身份与生命周期真相**：谁存在、属于谁、处于什么状态、跑在哪个 CPU、用哪个内核栈、上下文在哪。
-> 这里的"上下文"是执行状态；**调度策略**（下一个跑谁）不在这里。
+> Core 的调度提交与上下文切换机制。职责契约见 `docs/architecture/scheduling.md`。
 
 ## owns 什么真相
 
-- Task 身份（`TaskId`）与 owner（`ComponentId`）。
-- 任务状态机（`TaskState`：Created / Runnable / Running(CpuId) / Blocked / Exited）。
-- 内核栈（`Kernelstack`）与任务执行上下文。
-- 每个任务最多一份 pending unpark permit（提前通知会被下一次 park 消费；重复通知合并）。
-- 任务归属：`TaskRecord.owner`（组件停止 / 失败时按 owner 回收）。
+- 每 CPU 的 current task、锚点上下文及 incoming / anchor IRQ 状态。
+- 当前 policy EndpointId、调用栈、占用与退役状态。
+- 任务状态与固定 CPU 归属保存在 task table，由 commit 复验并推进。
 
 ## 暴露什么机制
 
-- `create_task(requester, entry, arg)` / `start_task(requester, task)`：语义入口，只接受 Core 导出的白名单；入口必须落在调用者已加载的镜像内。
-- 静态 `TASK_TABLE`（`TaskTable`）；`TaskTable::create/start/transition/remove/get/has_live_tasks`。
-- `consume_park_pending` / `unpark` 实现每任务一位 permit、owner 校验与 `Blocked→Runnable`；调度层还需把 permit 快速路径与 block commit 正确衔接。
-- Core 拥有的 `task_entry_trampoline`（组件任务从 Core 边界进入）。
-- 类型：`TaskId`、`TaskState`、`TaskRecord`、`TaskTable`、`Kernelstack`、`TaskError`。
+- `set_policy` / `select_provider`：验证并显式选择 scheduler.policy。
+- `run` / `yield_current` / `park_current` / `exit_current`：候选快照 → 组件提议 → Core 原子提交 → 切换。
+- `unpark_task`：owner 验证、permit / wake 提交，通知目标 CPU。
+- `request_reschedule`：本地 pending 或远端 IPI；AP 空闲循环和 BSP 空闲安全点服务工作。
+- policy 回调串行占用同一张 Core 栈；候选失效重试，错误提议或 panic 退役 provider。
+- IRQ 关闭至 incoming 栈与边界安装完成，恢复 incoming 保存值；没有锁或 IRQ RAII guard 跨切换持有。
 
 ## 明确不做
 
-- **不做调度**：runqueue / vruntime / cursor 属于 `sched` + Scheduler 组件；task 只提供状态与执行原语。
-- 不拥有 event、waitqueue 或 condition 语义；组件按自己的条件维护等待者 `TaskId`，再调用 park/unpark。
-- `unpark` 允许从 IRQ 回调调用；任务表锁必须在 irq-save 保护下获取，并在释放表锁后才恢复 IRQ。
-- 拒绝在 IRQ 上下文创建 / 启动任务（`TaskError::InvalidTransition` → `-EINVAL`）。
-- 非 owner 操作任务被拒（`WrongOwner`）；入口越出 owner 镜像被拒（`EntryOutOfImage`）。
-- 不跨组件共享任务真相：`TaskId` 只在 Core 内唯一，组件拿不到自报告 identity。
+- RR 游标、优先级、公平性、私有 runqueue 属于 scheduler 组件。
+- 当前不迁移任务、不 work steal、不抢占；`on_timer_tick` 仍未实现。
+- 不定义等待条件、事件对象或组件等待队列。
+- 私有 AS 任务调度未实现。
 
 ## 代码在哪
 
 | 文件 | 内容 |
 |---|---|
-| `os/core/src/task/mod.rs` | 语义入口 `create_task` / `start_task` + 边界测试 |
-| `os/core/src/task/id.rs` | `TaskId` |
-| `os/core/src/task/state.rs` | `TaskState`（含 `Running(CpuId)`） |
-| `os/core/src/task/record.rs` | `TaskRecord`（owner / state / pending permit / stack / context） |
-| `os/core/src/task/table.rs` | `TaskTable`（`BTreeMap<TaskId, TaskRecord>`）、状态转换 |
-| `os/core/src/task/kstack.rs` | `Kernelstack` |
-| `os/core/src/task/error.rs` | `TaskError` |
+| `os/core/src/sched.rs` | 配置、快照、策略调用、提交与切换 |
+| `os/core/src/task/table.rs` | commit 事务、permit、任务状态真相 |
+| `os/core/src/component/containment.rs` | 每 CPU 身份与 panic / policy 边界 |
+| `os/core/src/smp/mod.rs`、`ipi.rs` | AP 调度循环、Online、Reschedule 门铃 |
+| `os/components/scheduler_rr/src/lib.rs` | 每 CPU 的 RR 算法状态 |
+| `os/components/tests/core_test/src/runtime/smp.rs` | 公开 ABI 上的 SMP 组件调度集成编排 |
+| `os/components/tests/kcomp_smp/` | 独立的任务 panic 被测对象 |

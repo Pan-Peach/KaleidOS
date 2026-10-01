@@ -1,4 +1,4 @@
-//! RISC-V SMP 的 **boot 侧**骨架：AP 入口 trampoline、AP 初始栈、启动描述符与调用点。
+//! RISC-V SMP 的 **boot 侧**：AP 入口 trampoline、AP 初始栈、启动描述符与调用点。
 //!
 //! # 边界（对齐 `AGENTS.md` 与 `docs/modules/arch.md`）
 //!
@@ -13,14 +13,13 @@
 //!   为每个非 boot CPU 发布描述符并请求 arch 启动 AP。
 //!
 //! **不在 boot**：逻辑 CPU 身份 / 启动状态 / pending work / 调度归属（Core，
-//! `kernel::smp`），以及 SBI HSM / IPI 的传输（arch，`arch::riscv::smp`）。
+//! `kernel::smp`），以及 SBI HSM / IPI 的传输（arch 的 firmware / smp 模块）。
 //!
-//! # 骨架状态
+//! # 当前接线
 //!
-//! 类型与入口签名已定；[`start_secondaries`] / [`secondary_main`] 与
-//! `secondary64.S` 的步骤体为 `todo!()`，由人类手写。本模块只在
-//! `riscv64 + vm-mmu + smp` 下编译，默认（单 CPU）构建路径不包含它，因此现有
-//! host / rv64 / rv32 测试保持全绿。
+//! `riscv64 + vm-mmu` 下编译，UP 不启动 AP。boot 发布 [`ApBoot`] 并调用
+//! arch 的 firmware HSM mechanism；`secondary64.S` 建立地址空间与栈后，
+//! [`secondary_main`] 把 CPU 交给 Core。通用 `Smp::prepare/start_cpu` 尚未接线。
 
 use crate::vm::bootstrap;
 use core::arch::global_asm;

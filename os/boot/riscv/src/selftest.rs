@@ -275,8 +275,8 @@ extern "C" fn panic_containment_entry(
 
 /// Task-boundary containment ArchTest.
 ///
-/// Loads a real scheduler policy provider plus a separate victim component from
-/// the embedded archive, then creates two component-owned tasks directly in the
+/// Loads a real scheduler policy provider plus separate victim and healthy
+/// instances, then creates two component-owned tasks directly in the
 /// Core table (white-box: task entries live in the boot image, so the
 /// image-range check in `task::create_task` is intentionally bypassed).  One
 /// task panics; the scheduler's ambient escape guard must redirect it to the
@@ -304,6 +304,15 @@ fn task_panic() -> ! {
         Ok(id) => id,
         Err(_) => fail("task-panic: kcomp_smoke load failed"),
     };
+    // The surviving task must have a different owner: Failed instances cannot
+    // resume sibling tasks, even if a policy snapshot previously included them.
+    let healthy = match kernel::component::load::load_and_start(
+        b"kcomp_smoke",
+        kernel::component::endpoint::ExecutionDomain::KernelNative,
+    ) {
+        Ok(id) => id,
+        Err(_) => fail("task-panic: healthy instance load failed"),
+    };
 
     let (panicking, normal) = {
         let mut table = kernel::task::get_task_table().lock();
@@ -315,7 +324,7 @@ fn task_panic() -> ! {
             fail("task-panic: panic task create failed");
         };
         let Ok(normal) = table.create(
-            victim,
+            healthy,
             task_normal_entry as *const () as usize,
             core::ptr::null_mut(),
         ) else {
@@ -351,10 +360,16 @@ fn task_panic() -> ! {
         .get(victim)
         .map(|record| record.state)
         == Some(kernel::component::ComponentState::Failed);
+    let healthy_ready = kernel::component::registry::get_registry()
+        .lock()
+        .get(healthy)
+        .map(|record| record.state)
+        == Some(kernel::component::ComponentState::Ready);
 
     let contained = panicking_state == Some(kernel::task::TaskState::Exited)
         && normal_state == Some(kernel::task::TaskState::Exited)
-        && victim_failed;
+        && victim_failed
+        && healthy_ready;
     if contained {
         pass("task-panic")
     } else {

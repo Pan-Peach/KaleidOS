@@ -39,6 +39,12 @@ impl IrqSaveGuard {
             _cpu_local: core::marker::PhantomData,
         }
     }
+
+    /// Move restoration to the incoming execution, after its current/guard
+    /// metadata and stack are installed. No RAII guard spans a context switch.
+    pub(crate) fn into_flags(mut self) -> <CpuImpl as CpuArch>::IrqFlags {
+        self.flags.take().expect("active IRQ guard")
+    }
 }
 
 impl Default for IrqSaveGuard {

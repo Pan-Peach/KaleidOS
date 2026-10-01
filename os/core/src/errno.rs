@@ -75,6 +75,7 @@ impl From<SchedError> for Errno {
             SchedError::NoPolicyStack => Errno::ENOMEM,
             // 策略 provider 不在 KernelNative 域：没有已实现的执行路径（ENOTSUP）。
             SchedError::PolicyUnsupportedDomain => Errno::ENOTSUP,
+            SchedError::PolicyBusy => Errno::EBUSY,
         }
     }
 }
@@ -403,6 +404,7 @@ mod tests {
             SchedError::NoDispatcher,
             SchedError::NoPolicyStack,
             SchedError::PolicyUnsupportedDomain,
+            SchedError::PolicyBusy,
         ] {
             let expected = match error {
                 SchedError::NoPolicy => Errno::ENOTSUP,
@@ -413,6 +415,7 @@ mod tests {
                 SchedError::NoPolicyStack => Errno::ENOMEM,
                 // 策略 provider 不在 KernelNative 域：没有已实现的执行路径。
                 SchedError::PolicyUnsupportedDomain => Errno::ENOTSUP,
+                SchedError::PolicyBusy => Errno::EBUSY,
                 // endpoint 臂已在上面的循环里逐变体覆盖。
                 SchedError::PolicyEndpoint(_) => unreachable!("covered above"),
             };

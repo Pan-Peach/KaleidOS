@@ -17,6 +17,7 @@ docs/
 │   ├── component-lifecycle.md   （已冻结的组件生命周期契约）
 │   ├── driver-model.md
 │   ├── deployment.md            （部署决定调用机制：五个概念、模式矩阵、迁移与缺口）
+│   ├── scheduling.md           （调度真相 / 策略、固定 CPU、SMP 提交与失败边界）
 │   ├── kconfig.md
 │   ├── porting.md               （第三方库移植 / 调包能力：设计契约 + 候选地图）
 │   └── memory-and-heap.md       （内存资源 vs 堆：Core Memory ↔ Runtime Heap 契约）
@@ -60,6 +61,7 @@ docs/
 | 内存资源 vs 堆、region 归属（无账本）、执行域访问窗口、回收 | `architecture/memory-and-heap.md` | 内存/堆分层最终契约；访问窗口与 driver-model 的 device claim 同形 |
 | 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **补充** `component-lifecycle.md` §9"代码页去重不是 ABI / 生命周期承诺"的目标方向；KernelNative → Isolated 的 Gate 已落地，其余跨域机制未实现，见其 §10 |
 | 分层总览、ResourceDomain / ExecutionDomain 概念 | `architecture/overview.md` | 与 driver-model 细节冲突时以 driver-model 为准 |
+| 调度、Core / scheduler 分工、SMP 提交与 CPU 归属 | `architecture/scheduling.md` | 固定 CPU 的协作式组件任务调度契约 |
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
 | 第三方库移植 / 调包能力（候选库 + 许可、组件内 adapter、SDK host-glue） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
 | 组件对外契约（设备/FS/服务） | `interfaces/` | 接口语义契约；文件系统抽象见 `interfaces/filesystem.md` |
@@ -77,6 +79,7 @@ docs/
 |---|---|
 | 理解项目为什么长这样 | `philosophy/core-philosophy.md` + `architecture/overview.md` |
 | 知道某个 Core 模块在干嘛、代码在哪 | `modules/README.md` → `modules/core/<module>.md` |
+| 理解 SMP 调度与 scheduler / Core 分工 | `architecture/scheduling.md` + `modules/core/sched.md` |
 | 写一个驱动 / 认领设备 | `architecture/driver-model.md` + `modules/components.md` |
 | 理解内存与堆的边界（组件怎么拿内存） | `architecture/memory-and-heap.md` |
 | 理解部署如何决定调用机制、跨域调用现状（K→I 已落地，其余未实现） | `architecture/deployment.md` |

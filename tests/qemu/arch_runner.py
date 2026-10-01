@@ -192,8 +192,7 @@ NEW_ARCH_CASES = (
 )
 
 # RISC-V SMP cases.  Run only with `--smp` (multi-CPU QEMU); the default
-# `test-arch` never sends these names, so the `todo!()`-backed cases (smp-ipi /
-# smp-percpu) never affect the RISC-V baseline.
+# `test-arch` never sends these names. Component scheduling is tested by CoreTest.
 SMP_CASES = (
     ("smp-boot", None, None),
     ("smp-ipi", None, None),

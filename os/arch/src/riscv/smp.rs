@@ -1,4 +1,4 @@
-//! RISC-V SMP backend（骨架；实现待手写）。
+//! RISC-V SMP backend：本地 IPI 接收与门铃传输。
 //!
 //! # 参考（人类实现时）
 //!
@@ -11,9 +11,10 @@
 //! - **per-CPU 基址**：**不要**用 `tp`（任务执行状态寄存器）；正确载体是
 //!   `sscratch` 升级成的 arch 私有入口记录（见 `context` / `trap` 的现有约定）。
 //!
-//! # 骨架约定
+//! # 启动描述符现状
 //!
-//! 所有方法体为 `todo!()`；接口/错误类型/配置形状已定，留给人类实现。
+//! IPI 已接线。通用 `prepare/start_cpu` 仍占位；当前 RV64 物理启动由 boot
+//! 的描述符与 trampoline 经 `firmware::hart_start` 完成。
 
 use super::Riscv;
 use super::trap;

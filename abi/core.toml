@@ -580,6 +580,30 @@ name = "id"
 type = "u32"
 
 [[function]]
+name = "kcore_task_start_on"
+ret = "i32"
+category = "Task control（v2）"
+c_category = "Task control"
+doc = """
+提议将 caller 拥有的 Created 任务启动在逻辑 cpu 上。Core 校验 owner、生命周期与
+目标 CPU Online，提交 Runnable 与固定 CPU 归属，再通知目标 CPU。无任务迁移。
+普通 kcore_task_start 等价于请求当前 CPU。成功表示任务已提交，不保证已经执行。
+"""
+[[function.param]]
+name = "id"
+type = "u32"
+[[function.param]]
+name = "cpu"
+type = "u32"
+
+[[function]]
+name = "kcore_cpu_current"
+ret = "u32"
+category = "Machine query"
+c_category = "Machine query"
+doc = "当前执行 CPU 的逻辑身份快照；不授予权限。"
+
+[[function]]
 name = "kcore_task_yield"
 ret = "i32"
 category = "Task control（v2）"

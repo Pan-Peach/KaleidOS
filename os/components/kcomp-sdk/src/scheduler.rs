@@ -18,7 +18,7 @@
 //! wire 格式（`abi/scheduler.toml` 的 CHOOSE_NEXT）：
 //!
 //! ```text
-//! args   : current TaskId（u32 LE；KCOMP_SCHEDULER_NONE = 无）
+//! args   : current TaskId（u32 LE；KCOMP_SCHEDULER_NONE = 无）+ CpuId（u32 LE）
 //! input  : runnable TaskId 列表（逐个 u32 LE 连接，非空）
 //! output : 提议的 TaskId（u32 LE，恰好 4 字节）
 //! 返回   : 0 / -errno
@@ -43,7 +43,7 @@ pub const SCHEDULER_POLICY_NAME: &[u8] = KCOMP_SCHEDULER_POLICY_NAME;
 
 /// `scheduler.policy` 的 exact ABI fingerprint。
 ///
-/// 数值 = 8 字节 ASCII tag `b"SCHEDULR"` 的大端读数；raw `u64` 本体在生成物
+/// 数值 = 8 字节 ASCII tag `b"SCHEDCPU"` 的大端读数；raw `u64` 本体在生成物
 /// （schema 单一来源），这里包成 [`InterfaceAbi`] newtype。
 pub const SCHEDULER_POLICY_ABI: InterfaceAbi = InterfaceAbi::from_raw(KCOMP_SCHEDULER_POLICY_ABI);
 
@@ -130,14 +130,15 @@ pub fn publish_endpoint(port_name: &[u8], port: u32) -> Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChooseNextRequest<'a> {
     current: u32,
+    cpu: u32,
     runnable: &'a [u8],
 }
 
 impl<'a> ChooseNextRequest<'a> {
-    /// 解码 `(args, input)`：结构不符（args 不是 4 字节 / input 空或不是 4 的
+    /// 解码 `(args, input)`：结构不符（args 不是 8 字节 / input 空或不是 4 的
     /// 整数倍）→ `None`（provider 应返回 `-EINVAL`）。
     pub fn decode(args: &'a [u8], input: &'a [u8]) -> Option<Self> {
-        if args.len() != KCOMP_SCHEDULER_TASK_ID_LEN {
+        if args.len() != crate::generated::scheduler::KCOMP_SCHEDULER_ARGS_LEN {
             return None;
         }
         if input.is_empty() || !input.len().is_multiple_of(KCOMP_SCHEDULER_TASK_ID_LEN) {
@@ -146,6 +147,7 @@ impl<'a> ChooseNextRequest<'a> {
         let current = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
         Some(Self {
             current,
+            cpu: u32::from_le_bytes([args[4], args[5], args[6], args[7]]),
             runnable: input,
         })
     }
@@ -157,6 +159,11 @@ impl<'a> ChooseNextRequest<'a> {
         } else {
             Some(self.current)
         }
+    }
+
+    /// 请求调度的逻辑 CPU；候选列表已由 Core 按此 CPU 的归属裁剪。
+    pub const fn cpu(self) -> u32 {
+        self.cpu
     }
 
     /// runnable 列表长度（非空）。
@@ -190,10 +197,11 @@ mod tests {
     /// 合法请求：current / runnable 正确解码。
     #[test]
     fn choose_next_request_decodes_current_and_runnable() {
-        let args = 7u32.to_le_bytes();
+        let args = [7u32.to_le_bytes(), 3u32.to_le_bytes()].concat();
         let input = [3u32.to_le_bytes(), 5u32.to_le_bytes()].concat();
         let request = ChooseNextRequest::decode(&args, &input).expect("well-formed request");
         assert_eq!(request.current(), Some(7));
+        assert_eq!(request.cpu(), 3);
         assert_eq!(request.runnable_count(), 2);
         assert_eq!(request.runnable_at(0), Some(3));
         assert_eq!(request.runnable_at(1), Some(5));
@@ -203,7 +211,7 @@ mod tests {
     /// `NONE` 哨兵 = 无 current（从锚点进入调度）。
     #[test]
     fn choose_next_request_maps_none_sentinel_to_no_current() {
-        let args = SCHEDULER_NONE.to_le_bytes();
+        let args = [SCHEDULER_NONE.to_le_bytes(), 0u32.to_le_bytes()].concat();
         let input = 1u32.to_le_bytes();
         let request = ChooseNextRequest::decode(&args, &input).expect("well-formed request");
         assert_eq!(request.current(), None);
@@ -215,11 +223,11 @@ mod tests {
         let args = 1u32.to_le_bytes();
         assert!(
             ChooseNextRequest::decode(&[], &args).is_none(),
-            "args 必须 4 字节"
+            "args 必须 8 字节"
         );
         assert!(
             ChooseNextRequest::decode(&[0u8; 3], &args).is_none(),
-            "args 必须 4 字节"
+            "args 必须 8 字节"
         );
         assert!(
             ChooseNextRequest::decode(&args, &[]).is_none(),
@@ -246,9 +254,9 @@ mod tests {
     #[test]
     fn scheduler_policy_identity_is_anchored() {
         assert_eq!(SCHEDULER_POLICY_NAME, b"scheduler.policy");
-        assert_eq!(SCHEDULER_POLICY_ABI.raw(), 0x5343_4845_4455_4C52);
+        assert_eq!(SCHEDULER_POLICY_ABI.raw(), 0x5343_4845_4443_5055);
         assert_eq!(SchedulerPolicy::ID, 0x5343_4845_4450_4F4C);
-        assert_eq!(SchedulerPolicy::ABI, 0x5343_4845_4455_4C52);
+        assert_eq!(SchedulerPolicy::ABI, 0x5343_4845_4443_5055);
         assert_eq!(SchedulerPolicy::KIND, InterfaceKind::Policy);
         assert_eq!(SCHEDULER_METHOD_CHOOSE_NEXT, 0);
         assert_eq!(SCHEDULER_TASK_ID_LEN, 4);

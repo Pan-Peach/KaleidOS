@@ -24,7 +24,6 @@ use crate::component::{ComponentId, failure, registry};
 use crate::errno::Errno;
 use crate::memory::address_space;
 use crate::task::TaskId;
-use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentLoadError {
@@ -111,29 +110,27 @@ impl ComponentLoadError {
     }
 }
 
-/// 当前正在创建的实例（create 调用期间由 Core 记录）。
+/// 当前 CPU 正在创建的实例（create 调用期间由 Core 记录）。
 ///
 /// `kcore_endpoint_publish` 的 provider 以及锚点上
 /// create 阶段的 task requester 从这里解析——组件不需要知道自己/别人的
 /// ComponentId，Core 不信任组件自报的身份。普通任务的 requester 从
 /// `TaskRecord.owner` 解析。嵌套创建（组件 create 里再创建别的组件）时保存/恢复。
-static CURRENT: Mutex<Option<ComponentId>> = Mutex::new(None);
-
 /// 取当前正在创建的实例；不在 create 调用内返回 None。
 pub fn current_component() -> Option<ComponentId> {
-    *CURRENT.lock()
+    containment::creating()
 }
 
-/// 在 `CURRENT = Some(component)` 的上下文里执行 `f`（返回后恢复嵌套前的值）。
+/// 在本 CPU 的 creating = Some(component) 上下文里执行 `f`（返回后恢复嵌套前的值）。
 ///
 /// 与 KernelNative create 同一身份纪律：组件在 Core 拥有的边界内看到自己是
 /// "正在被创建的实例"；嵌套调用（组件 create 里再创建组件）保存 / 恢复。
 /// Core 内部 API（不在组件导出白名单里）。
 pub fn with_current<R>(component: ComponentId, f: impl FnOnce() -> R) -> R {
-    let previous = *CURRENT.lock();
-    *CURRENT.lock() = Some(component);
+    let previous = containment::creating();
+    containment::replace_creating(Some(component));
     let result = f();
-    *CURRENT.lock() = previous;
+    containment::replace_creating(previous);
     result
 }
 
@@ -213,13 +210,13 @@ fn create_kernel_native(
         id
     };
 
-    // 入口调用：期间 CURRENT = 本实例（publish / task_create 的身份来源）。
+    // 入口调用：期间本 CPU 的 creating = 本实例（publish / task_create 的身份来源）。
     // Core 先把 out_state 置 NULL（无状态组件可成功写回 NULL）。
     let mut instance_state: *mut () = core::ptr::null_mut();
-    let previous = *CURRENT.lock();
-    *CURRENT.lock() = Some(id);
+    let previous = containment::creating();
+    containment::replace_creating(Some(id));
     let outcome = containment::call_component_create(create_entry, args, &mut instance_state);
-    *CURRENT.lock() = previous;
+    containment::replace_creating(previous);
 
     match outcome {
         CallOutcome::Returned(0) => {

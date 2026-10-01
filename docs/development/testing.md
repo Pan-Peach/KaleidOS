@@ -52,6 +52,7 @@ Host Test（宿主单测 —— 主体，日常主力）
 make check        质量快车道：fmt + clippy -D warnings + host 单测 + RV64 构建 + RV32 check
 make test-host    宿主单测
 make test-qemu    boot smoke + 加载 core_test 并判定 [core-test] all: PASS
+make test-arch-smp-rv64  RV64：CPU 启动 / IPI / per-CPU（组件调度由 test-qemu 中的 CoreTest 验证）
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```
 
@@ -83,3 +84,11 @@ host 调度集成用例失败时会 fail-fast，并用 RAII 清理全局任务/�
 - **身份模型限制**：`ComponentId` 只在单个 `Registry` 实例内唯一，trace ring 是进程 / 整机全局；断言锚在"本组件刚加载的 `ComponentId` + 该次 load 前的游标"，这是当前身份模型允许的最强形式（全局唯一 ComponentId / boot epoch 未做）。
 - **DMA 归属**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是该设备 owner。**未决**：组件可 claim PLIC 等设备（"认领一台设备 = 拿到它的全部语义，含控制其他设备的中断线"），该边界问题无人回答，记录而非"修"。
 - 未来工具链：CHESS / Test Scheduler / Hunt Mode（确定性并发）、Kani / Loom / Miri / Verus（模型检查 / UB / 演绎验证）、FSCQ（FS 崩溃一致性）。见 `references.md`。
+
+## SMP 组件执行验证
+
+`make test-qemu` 的 RV64 场景运行双 CPU CoreTest。`core_test/runtime/smp.rs` 编排并创建普通任务，只通过公开 `kcore_*` ABI 验证：两 CPU 不 yield 的 rendezvous 证明物理并行；每 CPU 两任务验证本地 RR 进展；128 轮跨 CPU park/unpark 验证唤醒与固定归属；所有任务最终 Exited。CPU1 与 CPU0 的 panic 用例各加载一个独立 `kcomp_smp`，该 fixture 只负责故意 panic；CoreTest 在另一个 CPU 上继续工作，通过任务状态与指定 ComponentId 的 Failed trace 验证结果。共享控制窗口来自 CoreTest 实例分配，跨镜像仅传 C 布局标量与 u32 窗口，并全部使用原子访问。
+
+`make test-arch-smp-rv64` 只负责启动 / IPI / per-CPU 三个硬件契约用例；CI 的 ArchTest job 也运行此门禁。组件调度集成的唯一编排者仍是 CoreTest，ArchTest 不读取私有表来替代公开 ABI 的集成验证。
+
+host 对提交竞争、park 快速检查后的远端通知、固定 CPU、并发 policy 栈占用与每 CPU 身份分别做确定性测试。QEMU 不替代这些状态机验证，也不证明真实硬件长期稳定性。

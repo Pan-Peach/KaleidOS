@@ -1,8 +1,8 @@
 # KaleidOS 状态与计划
 
-快照：2026-09-28（UTC）。分支 `develop`，`git rev-parse HEAD` = `0d189e1029d6bf62eb48a76ff32decbb73f7d388`。
+更新：2026-10-01。此次同步 SMP / task / scheduler 的实现与验证状态；其余章节仍保留此前审计快照。
 
-工作树干净。本次快照纳入 **SMP 骨架 + 多 ISA 骨架 + HAL 接口收敛**（`feat(smp)`，见 `docs/modules/arch.md`）：接口已立，`Smp` / 新 ISA 的实现体仍是 `todo!()`；RISC-V 单核行为不变，全部测试保持绿。上一快照提到的并发卫生改动（inspector 移除、dma 测试 flake 等）已提交（`bb215b5`），不再有"工作树与 HEAD 冲突"的情况。
+RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
 本文是审计快照加计划，不是设计文档。事实以代码、测试、构建配置为准。README 和设计文档里写了但代码没有的，按未实现记。
 
@@ -10,9 +10,9 @@
 
 ## 0. 一句话
 
-KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 单核内核。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。最大的洞是 block/wake 语义和 task 与地址空间的关系；它们决定未来 POSIX personality、驱动、服务会不会继续向 Core 要新的对象类型。
+KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；当前主要缺口是 task 与私有地址空间的关系；它们决定未来 POSIX personality、驱动、服务会不会继续向 Core 要新的对象类型。
 
-底座侧有新进展：`arch` 的 CPU 身份（逻辑 `CpuId` / 硬件 `HardwareCpuId`）、中断回调（`LocalInterruptHandler = fn(CpuId)`）与中断控制器（关联 `Config` / `Claim`）契约已收敛成可多核、可多 ISA 的稳定面，并落下 SMP 与 x86_64 / aarch64 / loongarch64 的**骨架**——接口已定，实现体待手写。详见 3.12、3.24 与 `docs/modules/arch.md`。
+底座侧 RISC-V 的 CPU 身份、启动、IPI 与 per-CPU 执行现场已接通组件调度。第二 ISA 的现状见模块文档，本轮不扩展它的实现或测试范围。
 
 ## 1. 图例：状态与进度条
 
@@ -72,23 +72,23 @@ Hardware                                    目前只有 QEMU virt
 
 缺口：`TaskRecord` 与 `AddressSpaceId` 没有绑定，`Running(CpuId)` 没有 AS 概念。
 
-下一步：完成通用 park/unpark（见 3.4），再做 task 与 AS 的绑定语义。
+下一步：task 与 AS 的绑定语义（当前调度只承诺 KernelNative 固定 CPU）。
 
-#### 3.4 park/unpark 原语 `▱▱▱▱▱` IMPLEMENTATION IN PROGRESS
+#### 3.4 park/unpark 原语 `▰▰▰▰▱` IMPLEMENTED
 
-现状：ABI、每任务 pending permit、owner 校验与 `Blocked→Runnable` 已实现；host `proptest!` 验证 permit 状态模型，CoreTest 新增组件侧提前 unpark 与 64 轮 park/unpark 调度；host 集成测试当前在“schedule_next 前任务表锁已释放”的断言失败。每任务最多一个 pending permit；Core 不定义 EventId / waitqueue，等待队列和条件由组件持有。
+现状：每任务一份 pending permit、owner 校验、Blocked → Runnable 已接入真实任务调度。最终 permit 检查与 block commit 共用一个 task table 事务，覆盖跨 CPU 在策略执行期间 unpark 的竞争。wake 提交后通知目标 CPU。host 确定性测试与 property 测试覆盖状态模型；RV64 SMP 真实组件跑 128 轮远端 park/unpark。
 
-缺口：当前 host 调度集成测试发现 `park_current` 持有 TaskTable 锁调用 `schedule_next`，触发 fail-fast 不变量；外层 irq-save guard 也不能跨 context switch。RV64 CoreTest 已构建并启动，报告到 `park-early-unpark-accepted` 后没有完成后续阻塞/唤醒场景，runner 判失败。`TaskBlock`/`TaskWake` trace 事件尚未定义（`os/core/src/trace/event.rs`）。
+缺口：没有 task join、task-stop、Core event / waitqueue，也没有独立 TaskBlock / TaskWake trace。等待条件与等待者集合属于组件。
 
-下一步：把 permit 检查和 Blocked 提交纳入调度临界区、释放 TaskTable 锁后再调度，并确保 context switch 前 IRQ 恢复；随后运行 `cargo test -p kernel --lib park -- --test-threads=1` 与 `make test-qemu`。
+#### 3.5 调度机制 `▰▰▰▰▱` IMPLEMENTED（协作式 SMP）
 
-#### 3.5 调度机制 `▰▰▰▰▱` IMPLEMENTED（协作式）
+现状：每 CPU current / anchor / IRQ 状态和 containment；AP Online 后进入本 CPU 调度，BSP 在 monitor 空闲安全点服务工作。普通 start 固定到当前 CPU；start_on 接受 owner 的初始 CPU 请求，由 Core 验证 Online 并固定归属。调度事务复验 owner、状态、CPU 与 outgoing Running，快照失效重试。PolicyAccepted 只记录成功提交。scheduler_rr 保存每 CPU 游标，Core 不保存算法状态。
 
-现状：每 CPU `CpuState`，`PolicySlot` 存选中的 `EndpointId` 与 Core 栈，`run`/`yield_current`/`exit_current` 走 `propose → validate → commit`。host 22 项测试覆盖非法提议拒绝、策略失败回退、IRQ 与 service-call 门禁、trace；QEMU 有 `scheduler-load`/`scheduler-select`/`scheduler-rr`；`kbench` 量 `sched.yield_roundtrip`。
+策略回调串行占用 Core policy 栈，忙时替换返回 EBUSY；错误提议 / panic 退役并使用已有确定性回退。host 并发测试覆盖同栈占用和每 CPU 身份；RV64 ArchTest 覆盖启动 / IPI / per-CPU；CoreTest 新增七项检查，覆盖真实组件并行、远端 wake、本地 RR、任务退出与 CPU0 / CPU1 双向 panic containment。职责契约见 `docs/architecture/scheduling.md`。
 
-缺口：没有抢占（`on_timer_tick` 是 `todo!()`）；SMP 的 **Core 编排 M1 已接线**（`core::init` 调 `smp::init`；per-CPU 记录/状态/online、`sched::init_cpu`、per-CPU `timer::STATE`、IPI mark/take 已落地并有 host 单测），但 **AP 尚未进入 Core 调度**：`secondary_entry`/门控/`ipi::notify`/`drain_pending`/arch SSIP 应答仍 `todo!()`；没有 priority/CFS，这属于策略组件。
+缺口：无抢占、迁移、work stealing、hotplug、私有 AS 任务调度；没有真机证明。其它 ISA 的调度不在本轮范围。
 
-下一步：接抢占，见 3.6；SMP 按 `.omo/plans/smp-production-integration.md` 推进（M2 并发安全 → M3 AP 进入 Core → M4 统一启动 seam；先 RISC-V）。priority/CFS 留在组件。
+下一步：用真实驱动 / 服务的组件等待队列检验协作式 SMP；私有 AS 任务绑定与抢占单独定契约。
 
 #### 3.6 时钟 / 抢占 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -146,7 +146,7 @@ Hardware                                    目前只有 QEMU virt
 
 缺口：跨架构抽象**已有骨架但未被第二个 ISA 验证**——`os/arch/src/{x86_64,aarch64,loongarch64}` 与 `os/boot/<isa>` 已建（同形，实现体 `todo!()`），能编译、未启动、未验证；没有真机；机器差异欠验证。SMP 接口已收敛（`Smp` trait / `LocalInterruptHandler` / `InterruptController` 的 `Config`+`Claim` / `CpuArch::init_cpu`+`enable_irq`），但实现与 CPU-local 存储（`sscratch` 入口记录、per-CPU trap 栈）都是 `todo!()`，属协调 trap bring-up 的工作。RISC-V bring-up 进展可观，但层本身还在动。
 
-下一步：实现 SMP（per-CPU 状态 + AP 启动 + IPI，先 RISC-V）；按 x86_64 → aarch64 → loongarch64 顺序做第二 ISA 的真实 bring-up。新 ISA 的 ArchTest 入口已就绪但 opt-in（`make test-arch-{x86_64,aarch64,loongarch64}`，boot 未实现前会失败）；`.kcomp` 组件目前仍是 RISC-V 重定位专用，新 ISA 先用 Core-only 镜像。M-mode 补 boot harness 之后才有意义。
+下一步：RISC-V 协作式 SMP 已接线；第二 ISA 暂不扩展。新 ISA 的 ArchTest 入口已就绪但 opt-in（`make test-arch-{x86_64,aarch64,loongarch64}`，boot 未实现前会失败）；`.kcomp` 组件目前仍是 RISC-V 重定位专用，新 ISA 先用 Core-only 镜像。M-mode 补 boot harness 之后才有意义。
 
 ### 组件与执行域
 
@@ -222,7 +222,7 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.21 测试体系 `▰▰▰▰▱` IMPLEMENTED
 
-现状：host 单测含 proptest；CoreTest 是板内集成，49 项检查（bit 0 到 49，bit 23 未用）；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP / 新 ISA 未实现前会失败，刻意不进默认聚合与 CI）；CI 三个 job（check/qemu/archtest）。
+现状：host 单测含 proptest；CoreTest 是板内集成，RV64 双 CPU 为 56 项检查（bit 0 到 56，bit 23 未用），RV32 为原 49 项；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
 
 缺口：NoMMU 不在任何测试入口或 CI 里构建与启动，只有 Kconfig 解析用例；M-mode 无验证；runner 只显式断言 12 条，其余靠 `all: PASS`；host ring 是线程本地替身，不覆盖并发语义。
 
@@ -272,7 +272,7 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
-1. block/wake 尚未通过集成验证，最高优先。TaskTable permit / owner 路径已实现；调度测试当前发现 park 持表锁进入 schedule_next，且 irq-save guard 跨 context switch。组件持有条件和等待者列表，Core 只提供按任务 park/unpark 机制。
+1. block/wake 已接通固定 CPU 的协作式 SMP；组件持有条件与等待者集合，Core 只提供 permit / park / unpark。继续检验真实驱动与服务负载。
 2. task 与地址空间没有绑定。`TaskRecord` 和 `AddressSpaceId` 之间没有关系，`Running(CpuId)` 没有 AS 概念。将来一个 POSIX 进程等于一个 AS 加 N 个 task，这个语义必须由 Core 先提供，否则进程语义会漏进 Core。
 3. 抢占没接线。`timer::on_trap` 不调用 `sched::on_timer_tick`，后者是 `todo!()`。纯协作模型下，不协作或死循环的执行域拿不回控制权。
 4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。unload 是 tombstone，backing 驻留到 reboot，没有 drain。consumer 缓存的裸 function table 在 provider `Stopped`/`Failed` 后仍能调用成功，这是物理驻留的直接后果，不是 bug，但 teardown 正确性不能建立在它上面。
@@ -290,18 +290,20 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 | ArchTest / QEMU RV64 / MMU（41 case） | 是 | `make test-arch` → `tests/qemu/arch_runner.py` |
 | ArchTest / QEMU RV32 / MMU（41 case） | 是 | 同上 |
 | ArchTest / 新 ISA 骨架（opt-in） | 否 | `make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`：镜像可构建（Core-only），boot 为 `todo!()`，用例现在会失败 |
-| ArchTest / SMP（opt-in） | 否 | `make test-arch-smp-rv64`：`smp-*` 用例为 `todo!()`，现在会失败 |
+| ArchTest / SMP | 是 | `make test-arch-smp-rv64`：启动 / IPI / per-CPU；组件调度、远端 wake、双向 panic 在 CoreTest 的 `make test-qemu` 中验证 |
 | KernelNative（执行域） | 是 | CoreTest 全链加 ArchTest `panic-*` |
 | IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（27 case，RV64+RV32） |
 | SandboxedNative（U-mode） | 否 | `todo!()`（`load.rs:183`、`exit.rs:129`），全部组合显式拒绝 |
 | RV32 / NoMMU | 仅配置解析 | `configs/qemu_rv32_nommu_defconfig` 只被 `tests/kconfig/test_glue.py` 解析；`make check` 的 `_test-build` 与所有 runner/CI 都不构建、不启动它 |
 | RV32 / M-mode（`PRIVILEGE_MACHINE`） | 否 | 仅可编译；无 defconfig；无 boot harness |
 | 真机（任何板卡） | 否 | 仓库没有任何真机代码或配置；`os/`、`configs/` 无 VisionFive/JH7110/ESP32 之类 |
-| CI | 是 | `.github/workflows/ci.yml` 三个 job：`check` / `qemu` / `archtest`；只覆盖 RV64+RV32 MMU。SMP / 新 ISA 的 opt-in 目标不在 CI（未实现前会红） |
+| CI | 是 | `.github/workflows/ci.yml` 三个 job：`check` / `qemu` / `archtest`；只覆盖 RV64+RV32 MMU。SMP 已进入 archtest job，新 ISA 的 opt-in 目标仍不在 CI |
 
 提醒：`make test` = `test-host + test-qemu + test-arch`；`make check` = fmt + clippy + `_test-kconfig` + `abi-check` + `test-host` + 交叉构建。两者都不含 NoMMU 启动，不含真机。
 
-本次复核抽样：在 `0d189e1` 上复跑 `make check`、`make test-qemu`、`make test-arch`，均通过；`tests/qemu/logs/` 留有 2026-09-28 的 RV64/RV32 `default`+`no-block` 与 ArchTest（RV64/RV32 各 41/41）日志。`python3 tests/kconfig/test_glue.py` 复跑为 11/11 PASS。
+此前复核抽样：在 `0d189e1` 上复跑 `make check`、`make test-qemu`、`make test-arch`，均通过；`tests/qemu/logs/` 留有 2026-09-28 的 RV64/RV32 `default`+`no-block` 与 ArchTest（RV64/RV32 各 41/41）日志。`python3 tests/kconfig/test_glue.py` 复跑为 11/11 PASS。
+
+2026-10-01 SMP 工作树验证：`make check` 通过（Core host 531 PASS、6 ignored；scheduler_rr 6 PASS；SDK 82 PASS；Kconfig 11/11；13 个 ABI 生成物一致；RV64 构建 / RV32 检查）。`make test-qemu` 的 default / no-block 均通过：RV64 CoreTest 56/56、RV32 49/49；RV64 两场景另各复跑一次通过。`make test-arch` 的 RV64 / RV32 各 41/41；`make test-arch-smp-rv64` 的基线与三个 SMP 硬件契约用例全通过。串口证据在 `tests/qemu/logs/*20261001-20*.log`。测试编排在 CoreTest，独立 `kcomp_smp` 只充当 panic 被测对象。
 
 ## 6. 近期依赖链
 
@@ -318,12 +320,12 @@ P4 执行域/隔离（C10）                                        —— 部�
 当前未完成项按依赖顺序排，前一项不成立，后一项无从谈起。
 
 1. Timer 与抢占接线：让 `timer::on_trap` 真正到达调度。先决定用延迟重调度标志还是 trap 内直接切换，并正面回答 `sstatus.SIE` 的保存恢复。
-2. Task block/wake：修复当前失败的调度集成测试，验证 permit 快速路径、阻塞后唤醒及 IRQ 恢复，再决定 trace 事件。等待条件与等待者列表留在组件。
+2. Task block/wake：permit 快速路径、阻塞后唤醒及 IRQ 恢复已接线并测试；下一步决定独立 trace 事件。等待条件与等待者列表留在组件。
 3. Task 与 AddressSpace：定义绑定语义，为将来的 POSIX "Process = AS + N Task" 铺路。
 4. 组件生命周期收敛：drain 协调协议，`kcomp_task`，卸载与重载的语义矩阵。
 5. IsolatedNative 收敛或冻结：补 ASID、U-mode、出站调用、更宽 import 面，或者明确冻结成教学实验。
 6. 消费路径 ABI 的文档收敛：代码侧没有缺口，`validate` 与 `bind` 都做 exact contract 加 abi 加存活，SDK 已接。要做的是把 `deployment.md` §7.4/§11 的"consumer exact ABI 未做"改到和代码一致，或明确声明 lookup 永远 contract-only。
-7. SMP 与第二 ISA：`arch` 接口已收敛（`Smp` trait；逻辑 `CpuId` / 硬件 `HardwareCpuId`；回调 `fn(CpuId)`；`InterruptController` 的 `Config`/`Claim`；per-ISA 重定位；per-CPU seams）。**SMP 不是构建开关**（无 `smp` feature）。Core 编排 M1 已接线（`core::init`→`smp::init`、记录/状态/online、`sched::init_cpu`、per-CPU `timer::STATE`、IPI mark/take），boot 归一化 **boot hart = 逻辑 CPU0**；剩余为并发关键实现（`secondary_entry`/门控、arch `start_cpu`/SSIP 应答、`ipi::notify`/`drain_pending`、containment per-CPU、离场上下文交接），见 `.omo/plans/smp-production-integration.md`。第二 ISA 仍待 bring-up。见 3.12 / 3.24 与 `docs/modules/arch.md`。
+7. RISC-V SMP 已接入真实组件任务调度，验证与职责见 §3.5 和 `docs/architecture/scheduling.md`。第二 ISA 暂不扩展；迁移 / work stealing / 抢占后置。
 
 三条贯穿约束（合并自原路线图 §3，仍在生效）：
 
@@ -778,8 +780,8 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 - SandboxedNative（U-mode 加私有 AS 加 `ecall`）：`todo!()`（`load.rs:183`、`exit.rs:129`），没有 syscall wire ABI。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
-- block/wake 任务原语：ABI 与 TaskTable permit/owner 已实现；host property test 已启用，调度集成测试当前失败于 TaskTable 锁跨 `schedule_next`，IRQ 恢复路径仍待修正。trace 事件未定义。IN PROGRESS。
-- SMP：**不是构建开关**（无 `smp` feature；`.config` 的 `CONFIG_SMP` 是悬空符号，Kconfig 未定义）。已落地：`os/core/src/smp/`（`CpuMask`/`PerCpu`/`BootGate`/`CpuBootState` + 记录表 `CpuRegistry`；`init` BSP 侧、`cpu_state`/`online_cpus`/`request_start`/`mark_ready`、`ipi_interrupt`/`take_pending`，含 host 单测）、`timer::STATE` per-CPU、`sched::init_cpu`、`core::init` 调 `smp::init`、arch `Smp` 的 `init_cpu`/`register_ipi_handler`/`enable_ipi_interrupt`/`send_ipi*`；boot 归一化 **boot hart = 逻辑 CPU0** 与 AP 打印顺序，修掉 OpenSBI 抽签导致的 `smp-percpu`/`external-irq` flaky。仍 `todo!()`（人类，并发关键）：`Smp::prepare`/`start_cpu`、Core `secondary_entry`/门控/`wait_until_online`、`ipi::notify`/`drain_pending`、arch SSIP 应答（**未补齐前不得开 IPI 源**）、containment per-CPU、跨 CPU `Running(CpuId)` 与离场上下文交接。IN PROGRESS。详见 `.omo/plans/smp-production-integration.md`。
+- block/wake：任务 permit、owner、最终检查与 commit 已落地；CoreTest 覆盖本地与跨 CPU 唤醒。独立 TaskBlock / TaskWake trace、event / waitqueue、join / stop 未做。
+- SMP 基础已落地（RV64）：AP 启动、BootGate、Online、IPI、per-CPU scheduler / timer / containment、固定 CPU 的真实组件调度、跨 CPU wake 与 panic containment。复杂 SMP 调度（迁移 / work stealing / 抢占 / hotplug）与私有 AS 任务调度未做。SMP 不是构建开关，无 `smp` Cargo feature。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
 - 内存物理回收与 instance 退役回收：不承诺，逻辑死亡、物理驻留。NOT IMPLEMENTED。
@@ -797,4 +799,4 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 - `docs/modules/components.md` 漏登记两个已在 `KCOMP_SRCS` 里的 fixture：`tests/kcomp_isolated_direct`、`tests/kcomp_isolated_unsupported`，全 `docs/` 没有引用。
 - `README.md` 目录说明列了 `components/drivers/ uart/ virtio_blk/ …`，但 `uart/` 不存在，`driver-model.md` §4 明说 uart 未实现；README 的 monitor 命令列表漏了 `unload` 和 `trace`，`docs/modules/core/monitor.md` 有。
 - 源码注释陈旧，不改 Core 代码：`os/core/src/component/endpoint.rs:234` 仍写 IsolatedNative"未实现：无私有 AS / `satp` 切换"，与已落地的私有 AS、trampoline、生命周期代码矛盾；`os/core/src/memory/address_space.rs:2030` 的"对应 roadmap 的 NoMMU 验收点"失去所指（路线图文档已删除，NoMMU 现状见 3.23 与第 7 节）。
-- 计数校验：CoreTest 当前有 49 项 distinct 检查（bit 0 到 49，bit 23 未用；2026-09-27 的 `41/41` 日志是旧快照）；ArchTest 有 41 个 case。本快照在 `0d189e1` 复跑，数字未变。
+- 计数校验：CoreTest 在 RV64 双 CPU 上有 56 项 distinct 检查（bit 0 到 56，bit 23 未用）；RV32 保留 49 项。ArchTest 基线为 41 case，RV64 SMP 额外三个硬件契约 case。2026-09-27 的 `41/41` CoreTest 日志是旧快照。

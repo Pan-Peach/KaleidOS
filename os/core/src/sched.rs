@@ -1,40 +1,13 @@
-//! 调度 commit 路径（Core 侧）：收集 Runnable 真相 → 请求 SchedulerPolicy
-//! 提议 → Core 验证 → commit 状态 → context switch。
+//! Core 调度机制：本 CPU 候选快照 → SchedulerPolicy 提议 → 原子复验 / 提交 → 切换。
+//! 职责契约见 `docs/architecture/scheduling.md`；RR / 公平性 / 私有队列属于组件。
 //!
-//! **Policy proposes, Core validates and commits**：调度器组件（如 scheduler_rr）
-//! 只看到 runnable id 列表（Core 提供的、经过裁剪的输入），只能"提议"下一个
-//! TaskId；存在性、状态、切换由 Core 验证后生效。
+//! 每 CPU 拥有 current、锚点和 incoming IRQ 状态；全局 task table 是任务真相。
+//! 决定阶段锁序为 registry → CPU state → task table；组件回调与 context switch
+//! 期间不持 Core 锁。IRQ 关闭至 incoming 栈和身份安装完成，再恢复 incoming 的值。
 //!
-//! # 策略选择与专用执行路径
-//!
-//! - **选择**（`kcore_sched_set_policy` / [`set_policy`]）：组合方在 provider 的
-//!   create 返回 0 之后**显式**发现 `scheduler.policy` endpoint 并提交它；Core
-//!   只记 `EndpointId`（+ 为策略执行准备的 Core 栈）。没有全局名字发现，
-//!   `NoPolicy` 只表示"从未选择过"。
-//! - **执行**（[`pick_next`]）：每次调度经 `call::prepare_policy` 在锁内解析存活
-//!   endpoint，再经专用 [`containment::call_component_policy`] 边界
-//!   （[`EscapeKind::PolicyCall`]）调用 provider 的 `kcomp_service_dispatch`。
-//!   **Core 是 caller**（无 principal / 无 caller task）；`IrqSaveGuard` 横跨
-//!   策略执行，但 CPU / task 表锁在之后才取。
-//! - **失败**：非法提议 / 非 0 返回 → provider endpoint-aware 失败（逻辑死亡 +
-//!   全部 endpoint 永久失效）+ 配置退役；panic → 逃逸回**本调度帧**（栈保留、
-//!   退役，绝不复用）。退役后 Core 用确定性回退（id 序首项，提交前验证 owner）
-//!   继续调度，绝不退化成 `NoPolicy`。
-//!
-//! # 执行流（单 CPU）
-//!
-//! 组件 init（或 monitor）在**锚点栈**上运行；`run()` 首次进入调度时，锚点上下文
-//! 被捕获保存。任务在自己的内核栈上运行；yield/exit 触发 `schedule_next`，选下
-//! 一个任务或（没有 Runnable 时）切回锚点——`run()` 在锚点上下文"返回"，调用者
-//! 继续。
-//!
-//! # 锁纪律（关键）
-//!
-//! `cpu` / `task_table` / `registry`+`endpoints`+`images` 只在**决定阶段**短暂
-//! 持有；`context_switch`（以及任何组件代码，包括策略回调）必须在全部锁释放后
-//! 执行——否则切过去的任务第一次调 yield 就会自死锁（spin::Mutex 不可重入）。
-//! 决定阶段与切换之间无 yield 点（单 CPU 协作式），raw 指针安全。跨 CPU 状态机 /
-//! Running(cpu) 互斥不存在（SMP 未实现）。
+//! 同一 policy 的调用栈串行认领 / 归还；替换 busy policy 返回 EBUSY。过期候选重新
+//! 取快照，非法提议 / 非零返回 / panic 才退役 provider。策略失败使用确定性回退；
+//! 从未选择策略仍返回 NoPolicy。固定 CPU 防止寄存器保存完成前跨 CPU 重入。
 
 use crate::component::abi::InterfaceAbi;
 use crate::component::call;
@@ -85,6 +58,8 @@ pub enum SchedError {
     /// 绝不静默按 KernelNative 语义执行（跨域 Gate 只覆盖通用
     /// service 调用，不覆盖调度 commit 路径）。
     PolicyUnsupportedDomain,
+    /// The selected provider is currently executing; replacement must retry.
+    PolicyBusy,
 }
 
 /// 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
@@ -111,6 +86,8 @@ fn deny_scheduling_forbidden() -> Result<(), SchedError> {
 struct CpuState {
     anchor: Option<Box<ContextImpl>>,
     current: Option<TaskId>,
+    anchor_irq: Option<<CpuImpl as CpuArch>::IrqFlags>,
+    incoming_irq: Option<<CpuImpl as CpuArch>::IrqFlags>,
 }
 
 /// 每逻辑 CPU 一份调度真相，索引 = 逻辑 `CpuId`。**UP = 只有第 0 项的 SMP**，
@@ -125,11 +102,12 @@ static CPU_TABLE: Once<crate::smp::PerCpu<Mutex<CpuState>>> = Once::new();
 /// - `retired == true` = 已安装策略失败 / 失效：确定性回退（id 序首项）生效，
 ///   直到显式重新选择——不会在下次调度时退化成 `NoPolicy`；
 /// - `stack` 只在 Armed 状态下非空。panic 的栈被保留（`mem::forget`，退役、
-///   绝不复用）；正常返回的栈留在槽里复用；退役时立即释放。重新选择 = 准备新栈。
+///   绝不复用）；正常返回的栈留在槽里复用；退役时立即释放。调用中 stack 被认领且 busy=true；重新选择 = 准备新栈。
 struct PolicySlot {
     endpoint: Option<EndpointId>,
     stack: Option<MemoryLease>,
     retired: bool,
+    busy: bool,
 }
 
 static POLICY: Once<Mutex<PolicySlot>> = Once::new();
@@ -140,6 +118,8 @@ pub fn init() {
             Mutex::new(CpuState {
                 anchor: None,
                 current: None,
+                anchor_irq: None,
+                incoming_irq: None,
             })
         })
         .expect("sched per-cpu table allocation failed")
@@ -149,6 +129,7 @@ pub fn init() {
             endpoint: None,
             stack: None,
             retired: false,
+            busy: false,
         })
     });
 }
@@ -186,13 +167,30 @@ pub(crate) fn init_cpu(cpu: CpuId) -> Result<(), SchedError> {
     let mut state = slot.lock();
     state.anchor = None;
     state.current = None;
+    state.anchor_irq = None;
+    state.incoming_irq = None;
     Ok(())
 }
 
 /// 请求目标 CPU 在**安全边界**重新调度（不在 IPI 回调里切上下文；UP 不调用）。
 #[allow(dead_code)]
-pub(crate) fn request_reschedule(_cpu: CpuId) -> Result<(), SchedError> {
-    todo!("SMP: mark a reschedule request for the target CPU")
+pub(crate) fn request_reschedule(target: CpuId) -> Result<(), SchedError> {
+    let Some(record) = crate::smp::record(target) else {
+        // Host/early UP has no published SMP topology yet.
+        return if target == current_cpu_id() {
+            Ok(())
+        } else {
+            Err(SchedError::NotFound)
+        };
+    };
+    record.set_resched();
+    if target != current_cpu_id() {
+        let mut targets = crate::smp::CpuMask::empty();
+        targets.insert(target).map_err(|_| SchedError::NotFound)?;
+        crate::smp::ipi::notify(&targets, crate::smp::ipi::IpiRequest::Reschedule)
+            .map_err(|_| SchedError::NotFound)?;
+    }
+    Ok(())
 }
 
 fn policy() -> &'static Mutex<PolicySlot> {
@@ -203,15 +201,15 @@ fn policy() -> &'static Mutex<PolicySlot> {
 ///
 /// 这是 Core 读取执行身份的入口；组件不能通过它修改调度状态。
 pub fn current_task() -> Option<TaskId> {
+    let _irq = IrqSaveGuard::new();
     cpu().lock().current
 }
 
 /// 收集**本 CPU 可认领**的 Runnable 且 **owner 仍是活实例**的任务（BTreeMap 迭代序
 /// = id 升序；列表内容由 Core 决定，调度器只读这份裁剪过的输入）。
 ///
-/// 「可认领」见 [`TaskRecord::claimable_by`]：未运行过的任务任何 CPU 可认领，
-/// 运行过的只认其上次所在 CPU——这样同一任务不会被两个 CPU 同时取走，且规避了
-/// 离场上下文尚未保存完成就跨 CPU 迁移的竞态。
+/// 任务在 start 时固定到目标 CPU，Core 提供的候选不会交给其它 CPU。
+/// Core 内部尚未设置归属的 fresh context 也必须在首次 dispatch 时固定归属。
 ///
 /// 组件失败 = 逻辑死亡：`Failed` 组件的任务必须从候选中剔除，否则调度器会把 CPU
 /// 交给一个已经死掉的实例。两把锁**先后分开**取（先 task 表快照 owner、再 registry
@@ -222,6 +220,7 @@ fn collect_runnable() -> Vec<TaskId> {
 
 /// 收集逻辑 CPU `cpu` 可认领的 Runnable 任务（owner 存活）。
 fn collect_claimable_for(cpu: CpuId) -> Vec<TaskId> {
+    let _irq = IrqSaveGuard::new();
     let candidates: Vec<(TaskId, ComponentId)> = {
         let table = task::get_task_table().lock();
         table
@@ -240,16 +239,13 @@ fn collect_claimable_for(cpu: CpuId) -> Vec<TaskId> {
 
 /// 逻辑 CPU `cpu` 是否有可认领的 Runnable 任务——AP 空闲循环「要不要进调度」的门。
 ///
-/// 只看可认领性（不判 owner 存活，避免与 registry 的锁嵌套）；真正的调度
-/// （`run`）仍会做 owner 门禁，所以这里宽松一点不会让死实例的任务被执行。
-///
-/// 骨架接缝：`smp::idle_loop` 在 containment per-CPU 落地后调用它（见那里的 TODO）。
-#[allow(dead_code)]
+/// 按 registry → task 顺序验证 owner，失败任务不能使 idle 永久自旋。
 pub(crate) fn has_claimable_for(cpu: CpuId) -> bool {
-    task::get_task_table()
-        .lock()
-        .iter()
-        .any(|(_, r)| r.state() == TaskState::Runnable && r.claimable_by(cpu))
+    let _irq = IrqSaveGuard::new();
+    let reg = registry::get_registry().lock();
+    task::get_task_table().lock().iter().any(|(_, r)| {
+        r.state() == TaskState::Runnable && r.claimable_by(cpu) && reg.may_run(r.owner())
+    })
 }
 
 /// Commit-time 门禁：任务 owner 此刻是否仍允许运行。
@@ -308,9 +304,17 @@ pub fn set_policy(endpoint: EndpointId) -> Result<(), SchedError> {
     // (4) 提交配置：只记 EndpointId + 准备好的栈。旧栈（若有）随替换释放——
     //     策略调用是同步的，且 policy 执行内拒绝替换，故旧栈不在使用中。
     let mut slot = policy().lock();
+    if slot.busy {
+        return Err(SchedError::PolicyBusy);
+    }
     slot.endpoint = Some(endpoint);
     slot.stack = Some(stack);
     slot.retired = false;
+    drop(slot);
+    // Tasks may have been published before a policy was selected.
+    for cpu in crate::smp::online_cpus().iter() {
+        let _ = request_reschedule(cpu);
+    }
     Ok(())
 }
 
@@ -354,6 +358,7 @@ fn retire_policy(stack: Option<MemoryLease>) {
     drop(stack);
     let mut slot = policy().lock();
     slot.retired = true;
+    slot.busy = false;
     slot.stack = None;
 }
 
@@ -361,6 +366,26 @@ fn retire_policy(stack: Option<MemoryLease>) {
 fn restore_policy_stack(stack: Option<MemoryLease>) {
     let mut slot = policy().lock();
     slot.stack = stack;
+    slot.busy = false;
+}
+
+struct Choice {
+    task: Option<TaskId>,
+    provider: Option<ComponentId>,
+}
+
+impl Choice {
+    fn fallback(task: Option<TaskId>) -> Self {
+        Self {
+            task,
+            provider: None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
+    choose_next(runnable).map(|choice| choice.task)
 }
 
 /// 请求策略提议下一个任务。返回 `None` = 没有可运行任务（回锚点）。
@@ -374,26 +399,34 @@ fn restore_policy_stack(stack: Option<MemoryLease>) {
 /// - **provider panic** → panic 收尾已在 `call::call_policy` 内完成（含 inflight
 ///   归还）；这里只退役配置 + 回退。panic 逃逸回**本调度帧**（它仍持有
 ///   `IrqSaveGuard`），绝不穿越它，也不继承让出 CPU 的任务的边界。
-fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
+fn choose_next(runnable: &[TaskId]) -> Result<Choice, SchedError> {
     if runnable.is_empty() {
-        return Ok(None);
+        return Ok(Choice::fallback(None));
     }
 
     // (1) 配置快照：endpoint + 选择时准备好的栈（锁只在这一小段持有）。
-    let (endpoint, stack) = {
+    let (endpoint, stack) = loop {
         let mut slot = policy().lock();
+        if slot.busy {
+            drop(slot);
+            core::hint::spin_loop();
+            continue;
+        }
         let Some(endpoint) = slot.endpoint else {
             return Err(SchedError::NoPolicy);
         };
         if slot.retired {
-            return Ok(fallback_task(runnable));
+            return Ok(Choice::fallback(fallback_task(runnable)));
         }
         match slot.stack.take() {
-            Some(stack) => (endpoint, stack),
+            Some(stack) => {
+                slot.busy = true;
+                break (endpoint, stack);
+            }
             None => {
                 // 配置损坏（Armed 却没有栈）：退役 + 回退，绝不 panic。
                 slot.retired = true;
-                return Ok(fallback_task(runnable));
+                return Ok(Choice::fallback(fallback_task(runnable)));
             }
         }
     };
@@ -404,7 +437,7 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
         Err(_) => {
             // 已安装策略的 endpoint 失效 / provider 离开 Ready：退役 + 回退。
             retire_policy(Some(stack));
-            return Ok(fallback_task(runnable));
+            return Ok(Choice::fallback(fallback_task(runnable)));
         }
     };
 
@@ -414,7 +447,9 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
         .lock()
         .current
         .map_or(KCOMP_SCHEDULER_NONE, |id| id.raw());
-    let args = current.to_le_bytes();
+    let mut args = [0u8; crate::generated::abi::KCOMP_SCHEDULER_ARGS_LEN];
+    args[..4].copy_from_slice(&current.to_le_bytes());
+    args[4..].copy_from_slice(&(current_cpu_id().raw() as u32).to_le_bytes());
     let mut input = Vec::with_capacity(runnable.len() * KCOMP_SCHEDULER_TASK_ID_LEN);
     for id in runnable {
         input.extend_from_slice(&id.raw().to_le_bytes());
@@ -440,12 +475,11 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
                 task: proposed,
             });
             if runnable.contains(&proposed) {
-                crate::trace::emit(crate::trace::TraceEvent::PolicyAccepted {
-                    component: target.owner,
-                    task: proposed,
-                });
                 restore_policy_stack(stack);
-                return Ok(Some(proposed));
+                return Ok(Choice {
+                    task: Some(proposed),
+                    provider: Some(target.owner),
+                });
             }
             // 组件提出非法提议：endpoint-aware 隔离 + 退役 + 回退。
             crate::trace::emit(crate::trace::TraceEvent::PolicyRejected {
@@ -454,7 +488,7 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
             });
             crate::component::fail_component(target.owner, ComponentLoadError::PolicyRejected);
             retire_policy(stack);
-            Ok(fallback_task(runnable))
+            Ok(Choice::fallback(fallback_task(runnable)))
         }
         // provider 返回非 0（契约违约 / 内部错误）：提议不可用 → 同一档失败。
         // 不发 trace 事件：`RejectReason` 的词表只描述"提议被 Core 拒绝"，
@@ -463,18 +497,18 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
         CallOutcome::Returned(_) => {
             crate::component::fail_component(target.owner, ComponentLoadError::PolicyRejected);
             retire_policy(stack);
-            Ok(fallback_task(runnable))
+            Ok(Choice::fallback(fallback_task(runnable)))
         }
         // panic 收尾（Failed + endpoint 失效 + inflight 归还）已在 `call_policy`
         // 内完成；`stack == None`（保留、退役）。这里只退役配置 + 回退。
         CallOutcome::Panicked => {
             retire_policy(stack);
-            Ok(fallback_task(runnable))
+            Ok(Choice::fallback(fallback_task(runnable)))
         }
         // 不可能：栈是选择时准备好的。防御性退役 + 回退，绝不 panic。
         CallOutcome::NoStack => {
             retire_policy(stack);
-            Ok(fallback_task(runnable))
+            Ok(Choice::fallback(fallback_task(runnable)))
         }
     }
 }
@@ -485,14 +519,8 @@ fn pick_next(runnable: &[TaskId]) -> Result<Option<TaskId>, SchedError> {
 /// 并保存它的上下文；`from = None`：捕获锚点上下文（首次 run）。
 /// `next = None`：没有可运行任务，切回锚点。
 ///
-/// `abort` 非空时走**任务 panic 收尾路径**：任务已 commit 为 `Exited`
-/// 后、切换前调用 `fail_component`。顺序刻意如此——`pick_next` 先于
-/// `fail_component`，这样即使 panic 的任务属于当前 scheduler provider，
-/// 后继任务也已在 provider 被解绑前选定，Core 不会被失败组件挂起。
-///
-/// Failed 门禁发生在**候选收集**与 **commit 之前**（Phase 0）：已经 `Failed` 的
-/// owner 的任务既不进候选、也过不了 commit-time 复验。abort 交接是唯一例外——
-/// 后继任务在 owner 死亡前就已完成 commit，Core 靠它保持存活。
+/// `abort` 非空时，先撤销失败 owner 的 admission，再收集候选；同 owner 的
+/// 其它任务不会作为后继提交。失败的 scheduler provider 也经退役 / 回退维持进展。
 ///
 /// 锁纪律：`context_switch` 前全部锁释放；锁外先 revoke、再按**目标上下文**
 /// 安装逃逸 guard，最后切换。
@@ -511,114 +539,117 @@ fn schedule_next_with_guard(
     abort: Option<(TaskId, ComponentId)>,
     guard: IrqSaveGuard,
 ) -> Result<(), SchedError> {
+    // Revoke admission before taking any successor snapshot. This also
+    // excludes siblings on other CPUs at their next scheduling boundary.
+    if let Some((dead, owner)) = abort {
+        crate::component::fail_component(owner, ComponentLoadError::TaskPanicked(dead));
+    }
     #[cfg(test)]
     assert!(
         task::get_task_table().try_lock().is_some(),
         "schedule_next must not be entered while holding the TaskTable lock"
     );
-    // Phase 0：收集 + 提议（策略调用的准备锁在 `call::prepare_policy` 内，短暂；
-    // 组件调用本身在 PolicyCall 边界内、无锁）。
-    let runnable = collect_runnable();
-    let mut next = pick_next(&runnable)?;
-
-    // Commit-time 门禁：候选过滤只发生一次；真正 commit 前再核对一次 owner 真相
-    //（`pick_next` 可能隔离了一个失败的调度器 provider，而它恰好是候选的 owner）。
-    // owner 已死 → 回锚点，绝不把 CPU 交给已死实例的任务。
-    if let Some(id) = next
-        && !owner_still_runnable(id)
-    {
-        next = None;
-    }
-
-    // 锁内 commit 状态 + 取上下文指针。`guard` 此时仍关闭本地 IRQ，防止 trap
-    // 重入并再次获取 cpu/task-table 锁；具体锁仍只在这个短作用域内持有。
-    let (from_ptr, to_ptr, next_owner): (*mut ContextImpl, *mut ContextImpl, Option<ComponentId>) = {
+    // Policy sees a snapshot. Registry -> CPU slot -> task table protects
+    // admission and the two-sided commit; no lock spans provider execution.
+    let (from_ptr, to_ptr, next, next_owner) = loop {
+        let runnable = collect_runnable();
+        let choice = choose_next(&runnable)?;
+        let mut next = choice.task;
+        let reg = registry::get_registry().lock();
         let mut cpu_guard = cpu().lock();
         let mut table = task::get_task_table().lock();
-
-        let from_ptr: *mut ContextImpl = match from {
-            Some(id) => {
-                let after = after.ok_or(SchedError::InvalidTransition)?;
-                table
-                    .transition(id, after)
-                    .map_err(|_| SchedError::InvalidTransition)?;
-                let rec = table.get_mut(id).ok_or(SchedError::NotFound)?;
-                rec.context.as_mut() as *mut ContextImpl
+        if cpu_guard.current != from {
+            return Err(SchedError::InvalidTransition);
+        }
+        if let Some(id) = next
+            && table.get(id).is_none_or(|r| !reg.may_run(r.owner()))
+        {
+            next = None;
+        }
+        let mut after = after.clone();
+        if let Some(id) = from
+            && table.get(id).is_some_and(|r| !reg.may_run(r.owner()))
+        {
+            after = Some(TaskState::Exited);
+        }
+        match table
+            .commit_switch(current_cpu_id(), from, after, next)
+            .map_err(|_| SchedError::InvalidTransition)?
+        {
+            task::table::SwitchCommit::StaleProposal => continue,
+            task::table::SwitchCommit::ParkPermit => return Ok(()),
+            task::table::SwitchCommit::Committed => {}
+        }
+        if let (Some(component), Some(task)) = (choice.provider, next) {
+            // Acceptance records committed truth, never a stale snapshot.
+            crate::trace::emit(crate::trace::TraceEvent::PolicyAccepted { component, task });
+        }
+        if from.is_none() && next.is_none() {
+            return Ok(());
+        }
+        let outgoing_irq = guard.into_flags();
+        let from_ptr = if let Some(id) = from {
+            let record = table.get_mut(id).expect("validated outgoing task");
+            record.irq_flags = Some(outgoing_irq);
+            record.context.as_mut() as *mut ContextImpl
+        } else {
+            cpu_guard.anchor_irq = Some(outgoing_irq);
+            if cpu_guard.anchor.is_none() {
+                cpu_guard.anchor = Some(Box::new(CpuImpl::new_context(0, 0)));
             }
-            None => {
-                if cpu_guard.anchor.is_none() {
-                    // Save-only placeholder: this anchor is only the outgoing
-                    // record for "no current task"; it is never entered as a
-                    // `to` context.
-                    cpu_guard.anchor = Some(Box::new(CpuImpl::new_context(0, 0)));
-                }
-                cpu_guard
-                    .anchor
-                    .as_mut()
-                    .expect("anchor just ensured")
-                    .as_mut() as *mut ContextImpl
-            }
+            cpu_guard.anchor.as_mut().unwrap().as_mut() as *mut ContextImpl
         };
-
-        let (to_ptr, next_owner): (*mut ContextImpl, Option<ComponentId>) = match next {
-            Some(id) => {
-                // owner 先取（Copy），再可变借 table 推进状态。
-                let owner = table.get(id).ok_or(SchedError::NotFound)?.owner();
-                table
-                    .transition(id, TaskState::Running(current_cpu_id()))
-                    .map_err(|_| SchedError::InvalidTransition)?;
-                cpu_guard.current = Some(id);
-                let rec = table.get_mut(id).ok_or(SchedError::NotFound)?;
-                (rec.context.as_mut() as *mut ContextImpl, Some(owner))
-            }
-            None => {
-                cpu_guard.current = None;
-                (
-                    cpu_guard
-                        .anchor
-                        .as_mut()
-                        .expect("anchor exists after first run")
-                        .as_mut() as *mut ContextImpl,
-                    None,
-                )
-            }
+        let (to_ptr, owner) = if let Some(id) = next {
+            let record = table.get_mut(id).expect("validated incoming task");
+            cpu_guard.incoming_irq = record.irq_flags.take();
+            (
+                record.context.as_mut() as *mut ContextImpl,
+                Some(record.owner()),
+            )
+        } else {
+            cpu_guard.incoming_irq = cpu_guard.anchor_irq.take();
+            (
+                cpu_guard.anchor.as_mut().expect("saved anchor").as_mut() as *mut ContextImpl,
+                None,
+            )
         };
-        (from_ptr, to_ptr, next_owner)
-    }; // 全部锁在此释放
+        cpu_guard.current = next;
+        break (from_ptr, to_ptr, next, owner);
+    };
 
-    drop(guard);
-
-    // Phase 2：锁外 revoke（仅 abort 路径）+ 按 incoming 安装逃逸 guard + 切换。
-    if let Some((dead, owner)) = abort {
-        crate::component::fail_component(owner, ComponentLoadError::TaskPanicked(dead));
-    }
-    // Trace：状态 commit 已完成，这里记录"要切给谁"。放在真正切走之前，因此
-    // abort 路径上的顺序是 … → ComponentState{Failed} → TaskSwitch（先落账再切走）。
+    // IRQs stay masked until the incoming stack and escape guard are ready.
     if let Some(id) = next {
         crate::trace::emit(crate::trace::TraceEvent::TaskSwitch { from, to: id });
     }
-    // 当前执行（本调度帧）的 Core ABI 深度在切换期间挂起：incoming 是全新任务
-    // 时由 `enter_task` 归零，是被恢复的任务时由**它自己**挂起的调度帧在
-    // `context_switch` 之后恢复。任务 guard 每次切换都被覆盖，所以每个执行只能
-    // 在自己的调度帧里保存自己的深度（见 `containment::EscapeGuard::saved_depth`）。
-    // 必须在 `enter_task` 归零**之前**捕获。
     let suspended_depth = containment::core_abi_depth();
-
     match next {
-        Some(id) => containment::enter_task(id, next_owner.expect("task owner is known")),
+        Some(id) => containment::enter_task(id, next_owner.expect("task owner")),
         None => containment::enter_anchor(),
     }
-
-    // 单 CPU 协作式：此处无并发、无 yield 点。
-    // SAFETY: 两个指针分别指向任务记录的 Box（堆地址稳定）与锚点 Box
-    // （全局静态内，地址稳定）；to 侧上下文由 new_context 或上一次切换保存。
-    unsafe {
-        CpuImpl::context_switch(&mut *from_ptr, &*to_ptr);
-    }
-    // 本帧被重新调度：恢复它离开 CPU 时的 Core ABI 深度（组件代码 = 0，
-    // 若它是在导出体内让出 CPU 则是导出体的深度）。
+    // SAFETY: stable resident records; all locks are released. Task placement
+    // prevents another CPU entering a context before its outgoing save finishes.
+    unsafe { CpuImpl::context_switch(&mut *from_ptr, &*to_ptr) };
     containment::resume_core_abi_depth(suspended_depth);
+    finish_switch();
     Ok(())
+}
+
+/// Runs on the incoming stack, with metadata installed and IRQs still masked.
+/// Fresh tasks call it from task_entry_trampoline; suspended executions call it
+/// immediately after context_switch. IRQ flags belong to the incoming execution.
+pub(crate) fn finish_switch() {
+    let flags = cpu().lock().incoming_irq.take();
+    match flags {
+        Some(flags) => CpuImpl::restore_irq(flags),
+        None => CpuImpl::enable_irq(),
+    }
+    // A remote failure can race a committed switch. At this cooperative
+    // boundary stop the dead owner before returning to component code.
+    if let Some(id) = current_task()
+        && !owner_still_runnable(id)
+    {
+        let _ = exit_current();
+    }
 }
 
 /// 任务 panic 收尾：在 Core-owned abort 上下文里把已死任务 commit 为
@@ -641,10 +672,24 @@ pub(crate) fn abort_current_task(task: TaskId, owner: ComponentId) -> ! {
 /// 全部任务退出（或阻塞）后，控制权在锚点上下文回到调用者。
 pub fn run() -> Result<(), SchedError> {
     deny_scheduling_forbidden()?;
+    if current_task().is_some() {
+        return Err(SchedError::InvalidTransition);
+    }
     if collect_runnable().is_empty() {
         return Ok(());
     }
     schedule_next(None, None, None)
+}
+
+/// Service BSP anchor work at monitor/console safe points.
+pub(crate) fn service_local() {
+    if CPU_TABLE.get().is_some()
+        && !containment::scheduling_forbidden()
+        && current_task().is_none()
+        && has_claimable_for(current_cpu_id())
+    {
+        let _ = run();
+    }
 }
 
 /// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
@@ -665,8 +710,9 @@ pub fn exit_current() -> Result<(), SchedError> {
 /// 阻塞当前任务，直到其它执行流调用 [`unpark_task`]。
 ///
 /// 只有任务上下文可以 park；成功切走后，本调用会在任务被重新调度时返回。
-/// pending permit 检查和 `Running → Blocked` 提交共用一个 irq-save guard，避免
-/// IRQ 在检查与提交之间发出 unpark。guard 移交给调度器，在状态提交后、切换前释放。
+/// 快速路径先消费 permit；最终检查与 `Running → Blocked` 在同一次表锁事务内，
+/// 覆盖策略执行期间的远端 unpark。IRQ guard 转交保存值给 outgoing execution，
+/// 切换不携带 guard；在 incoming 栈上恢复该执行流自己的 IRQ 状态。
 pub fn park_current() -> Result<(), SchedError> {
     deny_scheduling_forbidden()?;
     let guard = IrqSaveGuard::new();
@@ -695,11 +741,33 @@ pub fn unpark_task(
     if containment::policy_call_in_chain() {
         return Err(crate::task::error::TaskError::InvalidTransition);
     }
-    let _guard = IrqSaveGuard::new();
-    task::get_task_table()
-        .lock()
-        .unpark(requester, task_id)
-        .map(|_| ())
+    let (outcome, target) = {
+        let _irq = IrqSaveGuard::new();
+        let registry = registry::get_registry().lock();
+        let mut table = task::get_task_table().lock();
+        let record = table.get(task_id).ok_or(task::TaskError::NotFound)?;
+        if record.owner() != requester {
+            return Err(task::TaskError::WrongOwner);
+        }
+        if !registry.may_run(requester) {
+            return Err(task::TaskError::RequesterNotReady);
+        }
+        let outcome = table.unpark(requester, task_id)?;
+        let target = table.get(task_id).and_then(|r| r.home_cpu());
+        (outcome, target)
+    };
+    if outcome == task::table::UnparkOutcome::Woke
+        && let Some(target) = target
+        && let Err(error) = request_reschedule(target)
+    {
+        crate::log!(
+            "sched",
+            "wake committed; CPU {} notification failed: {:?}",
+            target.raw(),
+            error
+        );
+    }
+    Ok(())
 }
 
 /// 时钟抢占入口（`timer::on_trap` 调用；中断上下文）。
@@ -759,12 +827,82 @@ mod tests {
         containment::enter_anchor();
     }
 
+    #[test]
+    fn concurrent_policy_calls_share_one_stack_without_retiring_provider() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+        struct Pause {
+            entered: std::sync::Barrier,
+            release: std::sync::Barrier,
+        }
+        extern "C" fn paused(
+            state: *mut (),
+            port: u32,
+            method: u32,
+            frame: *const KcompCallFrame,
+        ) -> i32 {
+            let pause = unsafe { &*state.cast::<Pause>() };
+            pause.entered.wait();
+            pause.release.wait();
+            first_runnable(ptr::null_mut(), port, method, frame)
+        }
+        let pause = Pause {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        };
+        let (provider, endpoint) = install_policy(
+            b"sched_concurrent",
+            paused as *const () as usize,
+            (&pause as *const Pause).cast_mut().cast(),
+        );
+        let owner = ready_component(b"sched_concurrent_owner");
+        let mut cleanup = TaskCleanup::new();
+        let a = runnable_task(owner);
+        cleanup.track(a);
+        let b = crate::task::get_task_table()
+            .lock()
+            .create(owner, ENTRY, ptr::null_mut())
+            .unwrap();
+        cleanup.track(b);
+        crate::task::get_task_table()
+            .lock()
+            .start_on(owner, b, CpuId(1))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let child = scope.spawn(|| {
+                unsafe { CpuImpl::install_per_cpu_base(CpuId(1), core::ptr::NonNull::dangling()) };
+                pause.entered.wait();
+                let replacement = set_policy(endpoint);
+                pause.release.wait();
+                let next =
+                    containment::with_test_policy_dispatch(first_runnable, || pick_next(&[b]));
+                assert_eq!(replacement, Err(SchedError::PolicyBusy));
+                assert_eq!(next, Ok(Some(b)));
+            });
+            assert_eq!(
+                containment::with_test_policy_dispatch(paused, || pick_next(&[a])),
+                Ok(Some(a))
+            );
+            child.join().unwrap();
+        });
+        assert!(!policy().lock().retired);
+        assert!(!policy().lock().busy);
+        assert_eq!(
+            registry::get_registry().lock().get(provider).unwrap().state,
+            ComponentState::Ready
+        );
+        clear_policy();
+    }
+
     /// 清空调度策略配置（丢弃准备好的执行栈）。
     fn clear_policy() {
         let mut slot = policy().lock();
         slot.endpoint = None;
         slot.stack = None;
         slot.retired = false;
+        slot.busy = false;
     }
 
     /// 全局 CPU 真相是进程级 `Once`：`run()` / `yield` / `exit` 会留下
@@ -1028,9 +1166,10 @@ mod tests {
         assert_eq!(park_current(), Ok(()));
         assert_eq!(
             arch::fake::take_last_switch_irq_enabled_for_test(),
-            Some(true),
-            "IRQ must be restored before switching away from A"
+            Some(false),
+            "IRQ stays masked until incoming metadata and stack are installed"
         );
+        assert!(arch::fake::irq_enabled_for_test());
         assert_eq!(state_of(a), TaskState::Blocked);
         assert_eq!(state_of(b), TaskState::Running(CpuId(0)));
         assert_eq!(current_task(), Some(b));
@@ -1040,9 +1179,10 @@ mod tests {
         assert_eq!(yield_current(), Ok(()));
         assert_eq!(
             arch::fake::take_last_switch_irq_enabled_for_test(),
-            Some(true),
-            "IRQ must be restored before switching back to A"
+            Some(false),
+            "IRQ stays masked through the context switch"
         );
+        assert!(arch::fake::irq_enabled_for_test());
         assert_eq!(state_of(a), TaskState::Running(CpuId(0)));
         assert_eq!(state_of(b), TaskState::Runnable);
         assert_eq!(current_task(), Some(a));
@@ -1118,10 +1258,11 @@ mod tests {
     /// frame 的 `args` = current TaskId（u32 LE；`KCOMP_SCHEDULER_NONE` = 无）。
     fn frame_current(frame: &KcompCallFrame) -> u32 {
         assert_eq!(
-            frame.args_len, KCOMP_SCHEDULER_TASK_ID_LEN,
-            "CHOOSE_NEXT 的 args = current TaskId"
+            frame.args_len,
+            crate::generated::abi::KCOMP_SCHEDULER_ARGS_LEN,
+            "CHOOSE_NEXT 的 args = current TaskId + CpuId"
         );
-        // SAFETY: Core 构造的 frame；args_len = 4，本调用期间有效。
+        // SAFETY: Core 构造的 frame；args_len = 8，读取前四字节，本调用期间有效。
         let bytes = unsafe { core::slice::from_raw_parts(frame.args, KCOMP_SCHEDULER_TASK_ID_LEN) };
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
@@ -1903,7 +2044,7 @@ mod tests {
     #[test]
     fn commit_gate_fails_closed_for_unknown_task() {
         let _sched = SCHED_TEST_LOCK.lock();
-        // `init_world` 回到锚点边界（`enter_anchor` 写进程全局 `ACTIVE_GUARD`），
+        // `init_world` 回到锚点边界（`enter_anchor` 写本 CPU 的 guard），
         // 必须持 BOUNDARY 锁。
         let _boundary = containment::test_boundary_lock();
         // `init_world` 还会释放上一个用例遗留的策略执行栈（全局堆）：持 memory GUARD。
@@ -1918,8 +2059,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Abort 交接（**bookkeeping 部分**；栈抛弃 / 永不返回是 QEMU 契约）：
-    /// 任务 panic 后 Core 在同一次 commit 里把死任务标 `Exited`、选好后继、
-    /// 再 `fail_component` 撤销 owner 的 authority——`ComponentState{Failed}`
+    /// 任务 panic 后先 `fail_component` 撤销 owner 的 authority，
+    /// 再从存活 owner 的候选中选择后继、commit 死任务为 `Exited`——`ComponentState{Failed}`
     /// 事件先于 `TaskSwitch` 落账，Core 不被失败组件挂起。
     #[test]
     #[cfg(feature = "trace")]
@@ -1932,8 +2073,7 @@ mod tests {
         init_world();
 
         // Given：已安装策略（提议 id 序首项）+ 活 owner 与活后继 owner；一个
-        // Running 的"panicking"任务 + 一个 Runnable 后继（后继必须在 owner 死亡前
-        // 完成选择）。
+        // Running 的"panicking"任务 + 另一个活 owner 的 Runnable 后继。
         let (provider, _endpoint) = install_policy(
             b"sched_abort_policy",
             first_runnable as *const () as usize,
@@ -2001,6 +2141,50 @@ mod tests {
         containment::enter_anchor();
         remove_task(dying);
         remove_task(successor);
+        reset_cpu();
+    }
+
+    #[test]
+    fn aborting_policy_owner_excludes_its_siblings_and_uses_fallback() {
+        let _sched = SCHED_TEST_LOCK.lock();
+        let _boundary = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        init_world();
+        let (provider, _) = install_policy(
+            b"sched_abort_provider",
+            first_runnable as *const () as usize,
+            ptr::null_mut(),
+        );
+        let healthy = ready_component(b"sched_abort_healthy");
+        let mut cleanup = TaskCleanup::new();
+        let dying = runnable_task(provider);
+        let sibling = runnable_task(provider);
+        let successor = runnable_task(healthy);
+        for id in [dying, sibling, successor] {
+            cleanup.track(id);
+        }
+        crate::task::get_task_table()
+            .lock()
+            .transition(dying, TaskState::Running(CpuId(0)))
+            .unwrap();
+        set_current(Some(dying));
+        assert_eq!(
+            schedule_next(
+                Some(dying),
+                Some(TaskState::Exited),
+                Some((dying, provider))
+            ),
+            Ok(())
+        );
+        assert_eq!(current_task(), Some(successor));
+        assert_eq!(state_of(dying), TaskState::Exited);
+        assert_eq!(state_of(sibling), TaskState::Runnable);
+        assert!(
+            collect_runnable().is_empty(),
+            "dead owner's sibling is excluded"
+        );
+        assert!(policy().lock().retired);
+        containment::enter_anchor();
         reset_cpu();
     }
 

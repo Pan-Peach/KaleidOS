@@ -5,14 +5,14 @@
 
 ## 组件 crates
 
-实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 是组件选择扩展点（当前无符号）。
+实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smp`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 是组件选择扩展点（当前无符号）。
 
 **test-only 与生产的分界**：test-only fixture / 组件一律放 `os/components/tests/`；`.kcomp` 名取目录 basename（`load <basename>`），所以搬路径不改组件名，`load core_test` / `load kcomp_c_smoke` 等运行时契约不变。
 
 | 组件 | 路径 | 形态 | 一句话 |
 |---|---|---|---|
-| `core_test` | `os/components/tests/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend） |
-| `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；cursor 是实例状态，只提议下一个 `TaskId` |
+| `core_test` | `os/components/tests/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend / smp） |
+| `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；每 CPU cursor 是实例状态，只提议下一个 `TaskId` |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | 协议无关设备 prober（总线角色）：opaque compatible 粗匹配；逐台以扁平 create config 下发 `(device_id, 结果端口名)`，create 返回后 pull 驱动的 `probe.result`，本地更新 cursor（**无环**，driver 不回调） |
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
 | `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
@@ -21,6 +21,7 @@
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
 | `kcomp_panic` | `os/components/tests/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
+| `kcomp_smp` | `os/components/tests/kcomp_smp/` | Rust `.kcomp` | CoreTest 的独立任务 panic 被测对象；普通 SMP 任务与所有断言在 core_test 内 |
 | `kcomp_isolated` | `os/components/tests/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供按域装载与页级权限强制用例在私有 AS 里执行 |
 | `kcomp_isolated_bad` | `os/components/tests/kcomp_isolated_bad/` | Rust `.kcomp` | **放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 白名单）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明组件 / 创建 AS 之前」 |
 | `kcomp_isolated_life` | `os/components/tests/kcomp_isolated_life/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：实现实例窗口协议（读 args / 写 `out_state` 上报 tp / satp / config；destroy 写标记），供 `isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-lifecycle-fault` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-restart` 经生产生命周期创建 / 销毁。故障注入：`FAIL_ABI`（create 返回 `-EINVAL`）、`FAULT_ABI`（create trap）、`DESTROY_FAULT_ABI`（create 成功、destroy trap）与 destroy 进入计数（`isolated-destroy-fault` 的「绝不重试析构」证据） |

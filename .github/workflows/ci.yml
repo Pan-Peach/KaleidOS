@@ -76,6 +76,8 @@ jobs:
           workspaces: os/boot/riscv -> target
       - name: Make test-arch
         run: make test-arch
+      - name: Make RISC-V SMP tests
+        run: make test-arch-smp-rv64
       - name: Upload ArchTest logs
         if: failure()
         uses: actions/upload-artifact@v4

@@ -226,6 +226,14 @@ int32_t kcore_component_load(const uint8_t *name, size_t len);
  * `*out_task`；失败 = `-Errno`。 */
 int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 int32_t kcore_task_start(uint32_t id);
+/* 提议将 caller 拥有的 Created 任务启动在逻辑 cpu 上。Core 校验 owner、生命周期与
+ * 目标 CPU Online，提交 Runnable 与固定 CPU 归属，再通知目标 CPU。无任务迁移。
+ * 普通 kcore_task_start 等价于请求当前 CPU。成功表示任务已提交，不保证已经执行。 */
+int32_t kcore_task_start_on(uint32_t id, uint32_t cpu);
+/* -- Machine query -- */
+/* 当前执行 CPU 的逻辑身份快照；不授予权限。 */
+uint32_t kcore_cpu_current(void);
+/* -- Task control -- */
 int32_t kcore_task_yield(void);
 /* 阻塞当前任务，直到它被 `kcore_task_unpark` 唤醒后再次获得 CPU 才返回。
  * 若已有 pending permit，则消费它并立即返回；否则提交 Blocked 并切走。只能从任务上下文调用。 */
@@ -487,9 +495,9 @@ _Static_assert(offsetof(struct kcomp_driver_create_config, endpoint_name_len) ==
  * 解析"当前调度器"。 */
 #define KCOMP_SCHEDULER_POLICY_NAME "scheduler.policy"
 
-/* exact ABI fingerprint（8 字节 ASCII "SCHEDULR" 的大端读数）。`kcore_sched_set_policy`
+/* exact ABI fingerprint（8 字节 ASCII "SCHEDCPU" 的大端读数）。`kcore_sched_set_policy`
  * 要求 endpoint 记录的 abi 与它逐位相等，否则拒绝选择。 */
-#define KCOMP_SCHEDULER_POLICY_ABI UINT64_C(0x5343484544554C52)
+#define KCOMP_SCHEDULER_POLICY_ABI UINT64_C(0x5343484544435055)
 
 /* `scheduler.policy` 的 endpoint 契约身份（`kcore_endpoint_*` 的 `contract` 参数）。
  * 数值 = 8 字节 ASCII tag `b"SCHEDPOL"` 的大端读数（与 `BLKCONTR` / `PRBCONTR` 同一约定）。 */
@@ -498,13 +506,16 @@ _Static_assert(offsetof(struct kcomp_driver_create_config, endpoint_name_len) ==
 /* `CHOOSE_NEXT` 的方法号：见本文件顶部的 wire 格式。 */
 #define KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT UINT32_C(0)
 
-/* 一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`args` 与 `output` 恰好这么长；
+/* 一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`output` 恰好这么长；
  * `input` 是它的整数倍。 */
 #define KCOMP_SCHEDULER_TASK_ID_LEN 4
 
 /* `args` 里的"当前无任务"哨兵（`UINT32_MAX`）：从锚点（monitor / 组件 init）进入
  * 调度时没有 current task。它是**编码值**，不是 TaskId。 */
 #define KCOMP_SCHEDULER_NONE UINT32_C(0xFFFFFFFF)
+
+/* CHOOSE_NEXT 的 args 长度：current TaskId + CpuId，各 u32 LE。 */
+#define KCOMP_SCHEDULER_ARGS_LEN 8
 
 #ifdef __cplusplus
 }

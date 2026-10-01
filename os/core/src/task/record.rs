@@ -16,12 +16,9 @@ pub struct TaskRecord {
     /// Core-controlled truth：状态只能由 `TaskTable::transition` 验证后改变，
     /// 组件（外部 crate）无法直接赋值。
     state: TaskState,
-    /// 任务上次运行所在的逻辑 CPU。
-    ///
-    /// `None` = 尚未运行过：它的上下文是创建时的 fresh 上下文，**任何 CPU 都可
-    /// 认领**；`Some(cpu)` = 已在该 CPU 上跑过，**只能由该 CPU 再认领**。这条规则
-    /// 规避「离场任务的上下文尚未保存完成就被另一 CPU 取走」的竞态（plan / Oracle
-    /// #1）——首次运行前的上下文不需要保存，所以可以安全跨 CPU。
+    /// start 时 Core 提交的固定 CPU。首次 dispatch 和 wake 后重入均需匹配。
+    /// `None` 只用于 Created / Core 内部尚未放置的 fresh context；第一次 dispatch
+    /// 也会固定归属，防止 outgoing 保存完成前被远端 CPU 取走。
     home_cpu: Option<CpuId>,
     /// `unpark` 早于 `park` 时暂存的一次通知；重复通知合并为一个 permit。
     park_pending: bool,
@@ -32,6 +29,8 @@ pub struct TaskRecord {
     /// 执行边界 = 本记录的 owner）。
     arg: *mut (),
     pub context: Box<ContextImpl>,
+    /// Interrupt state of this suspended execution; fresh tasks enable IRQs.
+    pub(crate) irq_flags: Option<<arch::CpuImpl as arch::CpuArch>::IrqFlags>,
     pub kstack: Kernelstack,
     pub(crate) memory: Option<MemoryLease>,
 }
@@ -58,6 +57,7 @@ impl TaskRecord {
             entry,
             arg,
             context,
+            irq_flags: None,
             kstack,
             memory: Some(memory),
         }
@@ -68,15 +68,15 @@ impl TaskRecord {
         self.owner
     }
 
-    /// 任务上次运行的逻辑 CPU（`None` = 从未运行过）。
+    /// 任务固定的逻辑 CPU（`None` = 尚未设置归属）。
     pub fn home_cpu(&self) -> Option<CpuId> {
         self.home_cpu
     }
 
     /// 该任务此刻能否被逻辑 CPU `cpu` 认领（`Runnable → Running` 的前置条件）。
     ///
-    /// - 从未运行（`home_cpu == None`）：任何 CPU 可认领（上下文 fresh）；
-    /// - 运行过：只有其上次所在 CPU 可再认领（跨 CPU 认领会踩离场上下文竞态）。
+    /// - 尚未设置归属（`home_cpu == None`）：Core 内部 fresh context 可首次认领；
+    /// - 已固定归属：只有目标 CPU 可认领（跨 CPU 认领会踩离场上下文竞态）。
     pub fn claimable_by(&self, cpu: CpuId) -> bool {
         self.home_cpu.is_none_or(|last| last == cpu)
     }

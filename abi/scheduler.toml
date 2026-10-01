@@ -27,10 +27,10 @@
 # CHOOSE_NEXT(0)：扁平 frame 的 wire 格式（**Core 编码 / provider 解码**）
 # ---------------------------------------------------------------------------
 #
-# `args`  : 恰好 `KCOMP_SCHEDULER_TASK_ID_LEN` 字节 —— 当前 TaskId（u32 LE；
-#           `KCOMP_SCHEDULER_NONE` = 当前没有任务，即从锚点进入调度）。
+# `args`  : 恰好 8 字节 —— 当前 TaskId（u32 LE；`KCOMP_SCHEDULER_NONE` = 无），
+#           然后是正在请求调度的逻辑 CpuId（u32 LE）。
 # `input` : 非空，长度是 `KCOMP_SCHEDULER_TASK_ID_LEN` 的整数倍 —— Core 裁剪过的
-#           runnable TaskId 列表，逐个 u32 LE 连接（id 升序）。
+#           本 CPU 可运行、owner 存活的 TaskId 列表，逐个 u32 LE 连接（id 升序）。
 # `output`: 恰好 `KCOMP_SCHEDULER_TASK_ID_LEN` 字节 —— provider 提议的 TaskId
 #           （u32 LE）。Core 验证它落在 `input` 列表内才提交；不在 → 提议被拒绝，
 #           provider 被隔离（逻辑死亡）。
@@ -56,10 +56,10 @@ doc = """
 [[const]]
 name = "KCOMP_SCHEDULER_POLICY_ABI"
 type = "u64"
-value = "0x5343_4845_4455_4C52"
+value = "0x5343_4845_4443_5055"
 targets = "c,sdk-rust,core-rust"
 doc = """
-exact ABI fingerprint（8 字节 ASCII "SCHEDULR" 的大端读数）。`kcore_sched_set_policy`
+exact ABI fingerprint（8 字节 ASCII "SCHEDCPU" 的大端读数）。`kcore_sched_set_policy`
 要求 endpoint 记录的 abi 与它逐位相等，否则拒绝选择。
 """
 
@@ -86,7 +86,7 @@ type = "usize"
 value = "4"
 targets = "c,sdk-rust,core-rust"
 doc = """
-一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`args` 与 `output` 恰好这么长；
+一个 TaskId 在扁平 frame 里的编码长度：`u32` LE。`output` 恰好这么长；
 `input` 是它的整数倍。
 """
 
@@ -99,3 +99,10 @@ doc = """
 `args` 里的"当前无任务"哨兵（`UINT32_MAX`）：从锚点（monitor / 组件 init）进入
 调度时没有 current task。它是**编码值**，不是 TaskId。
 """
+
+[[const]]
+name = "KCOMP_SCHEDULER_ARGS_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust,core-rust"
+doc = "CHOOSE_NEXT 的 args 长度：current TaskId + CpuId，各 u32 LE。"

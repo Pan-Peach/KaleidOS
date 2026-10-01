@@ -38,6 +38,8 @@ const STATE_DECLARED: u64 = 0;
 const STATE_RESOLVED: u64 = 1;
 const STATE_STARTING: u64 = 2;
 const STATE_READY: u64 = 3;
+#[cfg(target_arch = "riscv64")]
+const STATE_FAILED: u64 = 6;
 
 /// `ResourceKind` 的编码（Core `trace::abi::kind_code` 的镜像）。
 const RESOURCE_DEVICE: u64 = 0;
@@ -154,6 +156,22 @@ pub fn component_lifecycle(from: u64, id: i32) -> bool {
         }
     });
     ok && step == EXPECTED.len()
+}
+
+/// 指定实例在本次操作窗口内确实失败；不能用另一个组件的事件代替。
+#[cfg(target_arch = "riscv64")]
+pub fn component_failed(from: u64, id: u32) -> bool {
+    let mut failures = 0;
+    scan(from, |record| {
+        if record.kind == KIND_COMPONENT_STATE
+            && record.a == u64::from(id)
+            && (record.b == STATE_STARTING || record.b == STATE_READY)
+            && record.c == STATE_FAILED
+        {
+            failures += 1;
+        }
+    });
+    failures == 1
 }
 
 /// `sched_run` 产出的确切切换：窗口内每个 `TaskSwitch` 的目标都是本测试创建的

@@ -153,7 +153,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # 因此 test-only fixture 可以整体挪进 tests/ 而不改组件名。test-only fixture/组件
 # 一律放 os/components/tests/（见 AGENTS.md），生产组件留在 os/components/。
 # Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
+KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_smp tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs
@@ -288,6 +288,7 @@ fmt:
 	cd os/components/kbench && cargo fmt
 	cd os/components/tests/drivers/ram_blk && cargo fmt
 	cd os/components/tests/drivers/ram_blk_rw && cargo fmt
+	cd os/components/tests/kcomp_smp && cargo fmt
 	cd os/boot/riscv && cargo fmt
 	cd os/boot/x86_64 && cargo fmt
 	cd os/boot/aarch64 && cargo fmt
@@ -304,6 +305,7 @@ clippy:
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/tests/drivers/ram_blk_rw && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/tests/kcomp_smp && cargo clippy --target $(KCFG_TARGET)
 
 # host 单测：Core truth / parser / property / backend 纯逻辑（不需要 QEMU，不读 .config）
 test-host:
@@ -430,8 +432,9 @@ test-arch-new: _test-arch-x86_64 _test-arch-aarch64 _test-arch-loongarch64
 
 # Opt-in RISC-V SMP ArchTest: runs the `smp-*` cases with `--smp` (multi-CPU
 # QEMU).  The cases are always compiled now -- only the runner's case list gates
-# whether they run -- so no extra config fragment is needed.  `smp-ipi` /
-# `smp-percpu` stay `todo!()` until the IPI / per-CPU bring-up lands.
+# whether they run -- so no extra config fragment is needed. SMP includes
+# CPU bring-up, IPI and per-CPU hardware contracts. Component scheduling, remote
+# wake and panic containment are CoreTest integration checks in test-qemu.
 _test-arch-smp-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config qemu_rv64_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/archtest-smp-rv64/.config selftest_defconfig
@@ -452,6 +455,7 @@ check: init.kpkg
 	cd os/components/driver_prober && cargo fmt -- --check
 	cd os/components/kbench && cargo fmt -- --check
 	cd os/components/tests/drivers/ram_blk && cargo fmt -- --check
+	cd os/components/tests/kcomp_smp && cargo fmt -- --check
 	cd os/boot/riscv && cargo fmt -- --check
 	cd os/boot/x86_64 && cargo fmt -- --check
 	cd os/boot/aarch64 && cargo fmt -- --check
@@ -462,6 +466,7 @@ check: init.kpkg
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kbench && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/tests/drivers/ram_blk && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/tests/kcomp_smp && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	$(MAKE) _test-kconfig
 	$(MAKE) abi-check
 	$(MAKE) test-host

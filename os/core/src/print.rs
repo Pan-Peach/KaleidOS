@@ -92,6 +92,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 /// **永不挂死**：频率未知 / 投递未就绪 / arm 失败时不睡眠，回退到轮询自旋。
 /// `delivery_ready()` 与 `arm_deadline()` 在机制初始化前都不分配。
 pub(crate) fn idle_wait() {
+    crate::sched::service_local();
     // 频率未知（`None`）或换算失败：回退轮询。
     let Some(period) = idle_period() else {
         core::hint::spin_loop();

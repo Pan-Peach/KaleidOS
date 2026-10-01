@@ -131,8 +131,10 @@ pub fn create_task(
     if containment::scheduling_forbidden() {
         return Err(TaskError::InvalidTransition);
     }
-    // 单锁：provider 自己的 loaded image 就在记录里，无需二次查表。
-    let inside_image = {
+    // Keep lifecycle admission locked through insertion. stop_component uses
+    // the same registry → task order, so it cannot miss newly created work.
+    let _irq = IrqSaveGuard::new();
+    {
         let registry = crate::component::registry::get_registry().lock();
         let record = registry
             .get(requester)
@@ -145,13 +147,11 @@ pub fn create_task(
         }
         let base = record.loaded.base;
         let end = base + record.loaded.text_size;
-        entry >= base && entry < end
-    };
-    if !inside_image {
-        return Err(TaskError::EntryOutOfImage);
+        if entry < base || entry >= end {
+            return Err(TaskError::EntryOutOfImage);
+        }
+        get_task_table().lock().create(requester, entry, arg)
     }
-
-    get_task_table().lock().create(requester, entry, arg)
 }
 
 /// Core 语义入口：启动任务（Created → Runnable）。
@@ -162,10 +162,46 @@ pub fn create_task(
 /// 上下文种类门禁：IRQ 回调作用域或 service-call 边界内拒绝启动任务
 /// （`-EINVAL`），理由同 [`create_task`]。
 pub fn start_task(requester: ComponentId, task: TaskId) -> Result<(), TaskError> {
+    start_task_on(requester, task, crate::smp::current_cpu())
+}
+
+/// Owner-proposed initial placement; only Online CPUs may receive work.
+pub fn start_task_on(
+    requester: ComponentId,
+    task: TaskId,
+    cpu: crate::machine::CpuId,
+) -> Result<(), TaskError> {
     if containment::scheduling_forbidden() {
         return Err(TaskError::InvalidTransition);
     }
-    get_task_table().lock().start(requester, task)
+    if cpu.raw() >= crate::machine::MAX_CPUS
+        || (cpu != crate::smp::current_cpu()
+            && crate::smp::cpu_state(cpu) != Ok(crate::smp::CpuBootState::Online))
+    {
+        return Err(TaskError::InvalidTransition);
+    }
+    {
+        let _irq = IrqSaveGuard::new();
+        let registry = crate::component::registry::get_registry().lock();
+        let mut table = get_task_table().lock();
+        let record = table.get(task).ok_or(TaskError::NotFound)?;
+        if record.owner() != requester {
+            return Err(TaskError::WrongOwner);
+        }
+        if !registry.may_run(requester) {
+            return Err(TaskError::RequesterNotReady);
+        }
+        table.start_on(requester, task, cpu)?;
+    }
+    if let Err(error) = crate::sched::request_reschedule(cpu) {
+        crate::log!(
+            "sched",
+            "start committed; CPU {} notification failed: {:?}",
+            cpu.raw(),
+            error
+        );
+    }
+    Ok(())
 }
 
 /// Core 拥有的任务入口 trampoline：按 `typedef void (*KcompTaskEntry)(void *)`
@@ -177,6 +213,7 @@ pub fn start_task(requester: ComponentId, task: TaskId) -> Result<(), TaskError>
 /// - 入口返回违反"必须经 Core 退出"的契约：Core 兜底按 exit 处理，**绝不恢复
 ///   该任务**（返回后自旋，等调度器切走）。
 extern "C" fn task_entry_trampoline() -> ! {
+    crate::sched::finish_switch();
     let Some(id) = crate::sched::current_task() else {
         halt()
     };

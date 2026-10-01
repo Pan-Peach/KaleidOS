@@ -2161,7 +2161,8 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 44
+    assert len(core.functions) == 46
+    assert {"kcore_task_start_on", "kcore_cpu_current"} <= {func.name for func in core.functions}
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
         "kcore_trace_stats",
@@ -2242,10 +2243,11 @@ doc = "I/O error"
     scheduler_consts = {const.name: const.value for const in scheduler.constants}
     scheduler_literals = {const.name: const.literal for const in scheduler.constants}
     assert scheduler_literals["KCOMP_SCHEDULER_POLICY_NAME"] == "scheduler.policy"
-    assert scheduler_consts["KCOMP_SCHEDULER_POLICY_ABI"] == 0x5343_4845_4455_4C52
+    assert scheduler_consts["KCOMP_SCHEDULER_POLICY_ABI"] == 0x5343_4845_4443_5055
     assert scheduler_consts["KCOMP_SCHEDULER_POLICY_CONTRACT"] == 0x5343_4845_4450_4F4C
     assert scheduler_consts["KCOMP_SCHEDULER_METHOD_CHOOSE_NEXT"] == 0
     assert scheduler_consts["KCOMP_SCHEDULER_TASK_ID_LEN"] == 4
+    assert scheduler_consts["KCOMP_SCHEDULER_ARGS_LEN"] == 8
     assert scheduler_consts["KCOMP_SCHEDULER_NONE"] == 0xFFFF_FFFF
 
 
