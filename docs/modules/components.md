@@ -17,6 +17,8 @@
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
 | `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
 | `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
+| `vfs` | `os/components/filesystems/vfs/` | Rust `.kcomp` 骨架 | Namespace / File service 内部类型与操作占位；create 返回 `-ENOTSUP`，尚无服务 endpoint。现状与手写入口见 [`vfs.md`](vfs.md) |
+| `posix` | `os/components/personalities/posix/` | Rust `.kcomp` 骨架 | VFS 消费者与进程 / fd / syscall 语义接缝；仅 create 配置，无 service endpoint，create 返回 `-ENOTSUP`。见 [`posix.md`](posix.md) |
 | `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
@@ -59,7 +61,7 @@
 ```
 
 - **导出白名单**：`abi/core.toml` 声明 **44** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。Isolated 另有更窄的 import 支持面（诊断 / 只读查询 + `kcore_panic_escape`），装载前拒绝其余符号。
-- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust：`tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad drivers/virtio_blk driver_prober kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw`）与 `KCOMP_C_SRCS`（C：`tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs`）；`.kcomp` 名取目录 basename（`load <basename>`）。
+- **构建列表真相**：`Makefile` 的 `KCOMP_SRCS`（Rust，包含 `filesystems/vfs` / `personalities/posix` 骨架）与 `KCOMP_C_SRCS`（C：`tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs`）；完整列表直接见 Makefile，`.kcomp` 名取目录 basename（`load <basename>`）。SandboxedNative 是 Core 执行域，不是构建列表中的组件。
 
 ## 测试 / smoke vs 真实组件
 

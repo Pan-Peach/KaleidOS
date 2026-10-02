@@ -50,5 +50,7 @@
 | `os/arch` | ISA / firmware backend：`CpuArch` / `Timer` / `InterruptController` / `Console` / `SystemReset` + Sv39/Sv32/NoMMU + 重定位 | [`arch.md`](arch.md) |
 | `os/boot` | `_start` → FDT discovery → `MachineInfo` → `core::init` → monitor；镜像布局与启动页表 | [`boot.md`](boot.md) |
 | `os/components` | 组件 crates + `kcomp-sdk` + `.kcomp` 构建/打包/加载流水线 | [`components.md`](components.md) |
+| `os/components/filesystems/vfs` | VFS 骨架：Namespace / File service / provider 接入占位，尚未提供服务 | [`vfs.md`](vfs.md) |
+| `os/components/personalities/posix` | POSIX 消费者 / 进程语义骨架，尚无用户程序环境 | [`posix.md`](posix.md) |
 
 > 接口契约（ABI / 设备 / 文件系统语义）在 `docs/interfaces/`；此处只描述模块边界与代码位置。

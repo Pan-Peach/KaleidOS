@@ -22,16 +22,20 @@ docs/
 │   ├── porting.md               （第三方库移植 / 调包能力：设计契约 + 候选地图）
 │   └── memory-and-heap.md       （内存资源 vs 堆：Core Memory ↔ Runtime Heap 契约）
 ├── interfaces/                组件/驱动对外契约（ABI、设备语义、文件系统语义）
-│   └── filesystem.md            （文件系统抽象边界契约；未决问题待人类定稿）
+│   ├── filesystem.md            （文件系统抽象边界契约；未决问题待人类定稿）
+│   └── vfs.md                   （第一阶段 VFS 服务 ABI 草案，未实现）
 ├── modules/                    每个模块在干嘛：真相 / 机制 / 不做什么 / 代码在哪
 │   ├── README.md               （模块地图）
 │   ├── core/<module>.md
 │   ├── arch.md
 │   ├── boot.md
-│   └── components.md
+│   ├── components.md
+│   ├── vfs.md                  （VFS 组件骨架与手写入口）
+│   └── posix.md                （POSIX 消费者 / 语义聚合骨架）
 ├── development/               怎么在上面干活
 │   ├── testing.md
 │   ├── benchmark.md
+│   ├── userspace.md            （Core sandbox → POSIX → 用户 ELF / BusyBox 的实施顺序）
 │   └── docs-guide.md
 └── notes/                     历史与归档：非权威，不代表现状
     ├── resource-model-review.md
@@ -65,6 +69,7 @@ docs/
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
 | 第三方库移植 / 调包能力（候选库 + 许可、组件内 adapter、SDK host-glue） | `architecture/porting.md` | 设计契约 + 候选地图；候选不等于已集成 |
 | 组件对外契约（设备/FS/服务） | `interfaces/` | 接口语义契约；文件系统抽象见 `interfaces/filesystem.md` |
+| VFS 第一阶段 wire / 生命周期 | `interfaces/vfs.md` + `abi/vfs.toml` | 草案，未实现；布局 / 数值仅以 schema 为真相 |
 | 每个模块的真实行为与代码位置 | `modules/` | 描述现状；不确定就写"未实现/目标"，不臆造 |
 | 测试策略 | `development/testing.md` | —— |
 | 性能基准 | `development/benchmark.md` | —— |
@@ -85,6 +90,8 @@ docs/
 | 理解部署如何决定调用机制、跨域调用现状（K→I 已落地，其余未实现） | `architecture/deployment.md` |
 | 加载 / 停止一个组件 | `architecture/component-lifecycle.md` + `modules/core/component.md` |
 | 把第三方成熟库（FS / net / TLS / runtime）接成组件 | `architecture/porting.md` |
+| 接着手写 VFS / Namespace / File service | `interfaces/filesystem.md` + `modules/vfs.md` |
+| 接着手写 POSIX / Core sandbox / 用户 ELF | `modules/posix.md` + `development/userspace.md` |
 | 新加一个构建开关 | `architecture/kconfig.md` |
 | 加测试 | `development/testing.md` |
 | 加文档 | `development/docs-guide.md` |

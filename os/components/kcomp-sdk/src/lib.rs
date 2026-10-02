@@ -54,8 +54,10 @@ pub mod frame;
 pub mod generated;
 pub mod heap;
 pub mod mem;
+pub mod posix;
 pub mod probe;
 pub mod scheduler;
+pub mod vfs;
 
 mod dma;
 mod logging;

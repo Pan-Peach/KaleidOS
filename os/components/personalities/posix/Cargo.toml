@@ -1,0 +1,14 @@
+[package]
+name = "posix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Personality 是组件；VFS 由 create 配置选择，不是 Cargo 运行期依赖。
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk" }

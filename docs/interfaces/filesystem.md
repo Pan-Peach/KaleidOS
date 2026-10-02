@@ -129,6 +129,10 @@ read(已打开的 obj) →  File service  →  FS provider
 
 具体失败模式：把 permission-denied、share-conflict、delete-pending 三种情况塌缩成一个 `EACCES`，会让 NT 行为**无法恢复**，因为上层再也分不出是哪一种。这条一旦塌缩就不可逆，所以必须先决定再实现相关接口。
 
+VFS 第一阶段声明的局部选择见 `docs/interfaces/vfs.md` / `abi/vfs.toml`：保留负 errno，
+在回复头补 domain-status 区分共享冲突、delete-pending 等。适配器尚未实现；既有 FS 契约
+不变，通用原生权限模型与完整 POSIX / NT 映射仍未决。
+
 ## 7. Namespace：两个必须写下的细节
 
 ### 7.1 名字不是 Rust `str`
@@ -213,7 +217,7 @@ FsInstance + FsNode + 同一份 storage
 
 - `block.device` 设备接口已落地：块设备驱动认领设备后向上发布，单位、阻塞、`0/-errno` 等契约已在 SDK 中写清；
 - 一个最小 `filesystem` 服务契约已存在：只读、`mount/unmount/open/close/read`、不透明 u64 handle、singleton 端点名；**两个** provider 已落地并绑 `block.device`：FatFs（只读 FAT，自带最小 selftest）与 littlefs（v2.9.3，`mount` 内 format + 自检，真实走 prog/erase）；CoreTest（`littlefs-multi-instance` / `littlefs-isolation`）已端到端证明**两个同类型 FS 实例各自发布并各自被 bind**、存储互不相干（QEMU，rv64 + rv32）；
-- **没有** `vfs/` 模块：**没有** namespace 服务，**没有** File service，**没有** 独立的 generic FS 接口层；
+- `os/components/filesystems/vfs/` 已有组件骨架（见 `docs/modules/vfs.md`）；**没有**可用的 namespace 服务、File service 或独立的 generic FS 接口层；
 - **没有**稳定的 VFS / Page Cache 路径（与 `docs/development/benchmark.md` 一致）。
 
 **目标**（本契约要长成的样子）：

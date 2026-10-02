@@ -1,0 +1,30 @@
+# POSIX personality 的 create 配置。不是 Linux syscall ABI，也不是 Core ABI。
+# endpoint 由组合者选择，create 必须经 Endpoint<Vfs> 校验；不扫描“第一个 VFS”。
+# 当前仅定义布局，构造 / bind / syscall 路由均未实现。
+
+[[struct]]
+name = "PosixCreateConfig"
+c_name = "kcomp_posix_create_config"
+size = 8
+align = 8
+targets = "c,sdk-rust"
+doc = "config 恰好 8 字节，LE u64 VFS endpoint identity；create 需复制且校验 config_abi。"
+
+[[struct.field]]
+name = "vfs_endpoint"
+type = "u64"
+offset = 0
+
+[[const]]
+name = "KCOMP_POSIX_CREATE_CONFIG_ABI"
+type = "u64"
+value = "0x504F_5349_5843_4647"
+targets = "c,sdk-rust"
+doc = "exact create config fingerprint，ASCII POSIXCFG。"
+
+[[const]]
+name = "KCOMP_POSIX_CREATE_CONFIG_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust"
+doc = "config 扁平字节长度，非 Rust struct 内存重解释。"

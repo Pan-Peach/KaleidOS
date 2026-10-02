@@ -17,7 +17,8 @@
 - `mod.rs`：`ComponentId`、`ComponentState::can_transition`、`is_failed`、`may_run`。
 - `registry.rs`：`Registry`、`ComponentRecord`（`name: Vec<u8>` + `loaded: LoadedComponent`）、`RegistryError`；`declare` / `resolve` / `begin_start` / `finish_start` / `begin_stop` / `finish_stop` / `mark_failed` / `record_instance_state`；全局 `get_registry`。
 - `abi.rs`：`InterfaceAbi`（exact fingerprint）、`InterfaceKind`（生成物 re-export）。
-- `load.rs`：`ComponentLoadError`、`current_component()` / `with_current()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：创建入口**按域分派**（`KernelNative` 走 `loader.rs`；`IsolatedNative` 交 `isolated_lifecycle.rs` 真正创建；`SandboxedNative` 是 `todo!()` 占位）。**每次调用都重新 instantiate**（独立放段 / 重定位），同名 artifact 可并存多个组件；能力不足 / 支持面之外的 import → 装载前显式拒绝。见 `deployment.md` §6.2/§7.1/§10。
+- `load.rs`：`ComponentLoadError`、`current_component()` / `with_current()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：分派到 `create_kernel_native` / `create_isolated_native` / `create_sandboxed_native`（前两者分别走 `loader.rs` / `isolated_lifecycle.rs`；Sandbox 装载前返回 `-ENOTSUP`）。**每次调用都重新 instantiate**（独立放段 / 重定位），同名 artifact 可并存多个组件；能力不足 / 支持面之外的 import → 装载前显式拒绝。见 `deployment.md` §6.2/§7.1/§10。
+- `sandbox.rs`：SandboxedNative 执行域机制骨架；prepare_task / U-mode enter / 用户范围 copy 均显式拒绝，trap 路由与销毁未实现。创建入口在 `load.rs`。不是组件，不包含 POSIX 或 Linux syscall 语义。阶段顺序见 `docs/development/userspace.md`。
 - `loader.rs`：`load_component()`、`LoadedComponent`、`LoaderError`；解析 ELF、放置段、应用重定位、解析 `kcomp_instance_create` / `kcomp_instance_destroy` / `kcomp_abi`。
 - `elf.rs`：架构中立 ELF ET_REL 解析（`ElfObject`、`ElfError`、`ElfClass`、`Section`、`Symbol`、`Relocation`）。
 - `store.rs`：内嵌 `.initpkg` cpio store（`CpioEntry`、`EmbeddedStore`、`parse_entries`、`init`、`get_component_store`）。

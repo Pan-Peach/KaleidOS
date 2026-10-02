@@ -178,6 +178,7 @@ impl From<ComponentLoadError> for Errno {
             // 错误）。都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的
             // I/O。
             ComponentLoadError::IsolationUnsupported
+            | ComponentLoadError::SandboxUnsupported
             | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
             // 按域放段失败 / config 负载不合规：镜像 / 请求不适配该域（EINVAL）。
             ComponentLoadError::IsolatedPlacementFailed
@@ -536,6 +537,7 @@ mod tests {
             ComponentLoadError::PolicyRejected,
             ComponentLoadError::InPolicyContext,
             ComponentLoadError::IsolationUnsupported,
+            ComponentLoadError::SandboxUnsupported,
             ComponentLoadError::IsolatedImportUnsupported,
             ComponentLoadError::IsolatedPlacementFailed,
             ComponentLoadError::IsolatedConfigRejected,
@@ -564,6 +566,7 @@ mod tests {
                 ComponentLoadError::PolicyRejected => Errno::EIO,
                 ComponentLoadError::InPolicyContext => Errno::EINVAL,
                 ComponentLoadError::IsolationUnsupported
+                | ComponentLoadError::SandboxUnsupported
                 | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
                 ComponentLoadError::IsolatedPlacementFailed
                 | ComponentLoadError::IsolatedConfigRejected => Errno::EINVAL,

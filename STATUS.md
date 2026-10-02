@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-01。此次同步 SMP / task / scheduler 的实现与验证状态；其余章节仍保留此前审计快照。
+更新：2026-10-02。此次同步 SMP / task / scheduler 的实现与验证状态，并登记 VFS / SDK / POSIX 与 Core sandbox 骨架；其余章节仍保留此前审计快照。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -31,9 +31,9 @@ KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组�
 ## 2. 系统总览
 
 ```text
-Applications / System Personality        未实现（POSIX/Win32/WASI 都是未来）
+Applications / System Personality        未实现（POSIX 已有骨架；Win32/WASI 是未来）
         │
-Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；无 VFS/namespace
+Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS 只有骨架
         │
 Components（策略/服务/驱动 .kcomp）         scheduler_rr, driver_prober, virtio_blk, fatfs, littlefs
         │
@@ -188,11 +188,11 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.17 SandboxedNative（U-mode + syscall 边界） `▱▱▱▱▱` NOT IMPLEMENTED
 
-现状：`todo!()` 占位（`load.rs:183`、`exit.rs:129`），所有组合显式拒绝；没有 syscall wire ABI。
+现状：Core `component/sandbox.rs` 已有 prepare_task / enter / 用户范围 copy 的声明与 Unsupported 占位，尚无执行机制。`load.rs` 的创建分派装载前返回 `SandboxUnsupported`（ABI `-ENOTSUP`），不创建实例、不回退 native；销毁入口仍未实现。没有 sandbox.kcomp，也没有已接线的 syscall wire ABI。
 
 缺口：低特权执行、`ecall` 入口、syscall 编解码、页表强制的访问边界，全部没有。
 
-下一步：等 IsolatedNative 定位定下来再做。它是"部署形态即安全策略"里真正的硬件强制边界。
+下一步：用户 AS / task 绑定 → U-mode / trap → 用户 copy / syscall 路由，再接 POSIX 小程序。它是"部署形态即安全策略"里真正的硬件强制边界；阶段依赖与验收见 `docs/development/userspace.md`。
 
 #### 3.18 驱动组件 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -206,9 +206,13 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 现状：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3，mount 内 format 加自检）两个 C `.kcomp`，都绑 `block.device`；对外只有只读 filesystem 契约（mount/unmount/open/close/read，不透明 handle）。CoreTest `block-chain`、`block-chain-direct`、`littlefs-multi-instance`、`littlefs-isolation`、`littlefs-direct` 在 RV64/RV32 端到端验证，多实例存储互不影响。
 
-缺口：只读；没有 VFS、namespace、File service；没有两级缓存；`lwext4` 还是候选，GPLv2 许可策略要先定。
+VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name / namespace / node-provider / stream / file，明确路径引用、独立 open、share 计数、删除目标与 cleanup / close 生命周期；表与操作未实现。`abi/vfs.toml` / SDK 已声明第一阶段 API，适配器仍返回 ENOTSUP。create 返回 `-ENOTSUP`，不发布 endpoint。现状见 `docs/modules/vfs.md`，wire 草案见 `docs/interfaces/vfs.md`。VFS 服务仍是 NOT IMPLEMENTED。
 
-下一步：写支持；VFS/namespace 按 `docs/interfaces/filesystem.md` 的设计走；`lwext4` 许可先行；C 库用 picolibc 时补 `_write`/`sbrk`/`_exit` host-glue。
+骨架验证（构建层）：VFS / POSIX 的 RV64 / RV32 `.kcomp` 构建与 packer 检查通过，RV64 clippy（`-D warnings`）与 fmt 通过；当前 RV64 `make init.kpkg` 已包含两者。C ABI 的 RV32 / RV64 布局断言与 `make abi-check` 通过，SDK 现有 82 项 host 测试通过。尚无新增服务行为或用户态运行期验证。
+
+缺口：只读；没有可用的 VFS、namespace、File service；没有两级缓存；`lwext4` 还是候选，GPLv2 许可策略要先定。
+
+下一步：先 provider 节点 / 引用 / 枚举 / read_at，再只读 VFS 与 SDK adapter；写支持另定原子操作。用户态方向见 `docs/development/userspace.md`；`lwext4` 许可先行。
 
 ### SDK、测试与观测
 
@@ -264,11 +268,11 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.26 POSIX personality `▰▱▱▱▱` PLANNED
 
-现状：没有。连前置条件（task 与 AS 绑定、block/wake）都不满足。
+现状：`os/components/personalities/posix/` 已有独立 `.kcomp` 骨架，含进程 / fd / 用户 copy / 静态 ELF / syscall 接缝；操作返回 Unsupported，create 返回 `-ENOTSUP`。它消费 VFS，不导出 service。`abi/posix.toml` 仅定义组合者提供 VFS endpoint 的 create config。尚无进程、用户程序装载或 Linux syscall 兼容；见 `docs/modules/posix.md`。
 
 缺口：PCB、fd、signal、fork/exec/waitpid、mmap/brk 全部没有，而且都应该留在 personality。
 
-下一步：先做最小原型验证边界，模型是 Process = AddressSpaceId + N 个 Task。Core 不做成 POSIX 内核。详见第 9 节。
+下一步：Core sandbox 与 VFS → 用户 write/exit 小程序 → 静态 libc hello → 少量 BusyBox applet → shell。task-AS / trap 路由与等待机制要先定稿；Core 不做成 POSIX 内核。详见 `docs/development/userspace.md` 与第 9 节。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
@@ -293,7 +297,7 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 | ArchTest / SMP | 是 | `make test-arch-smp-rv64`：启动 / IPI / per-CPU；组件调度、远端 wake、双向 panic 在 CoreTest 的 `make test-qemu` 中验证 |
 | KernelNative（执行域） | 是 | CoreTest 全链加 ArchTest `panic-*` |
 | IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（27 case，RV64+RV32） |
-| SandboxedNative（U-mode） | 否 | `todo!()`（`load.rs:183`、`exit.rs:129`），全部组合显式拒绝 |
+| SandboxedNative（U-mode） | 否 | Core 骨架；create `-ENOTSUP`，U-mode / destroy 未实现，调用组合显式拒绝 |
 | RV32 / NoMMU | 仅配置解析 | `configs/qemu_rv32_nommu_defconfig` 只被 `tests/kconfig/test_glue.py` 解析；`make check` 的 `_test-build` 与所有 runner/CI 都不构建、不启动它 |
 | RV32 / M-mode（`PRIVILEGE_MACHINE`） | 否 | 仅可编译；无 defconfig；无 boot harness |
 | 真机（任何板卡） | 否 | 仓库没有任何真机代码或配置；`os/`、`configs/` 无 VisionFive/JH7110/ESP32 之类 |
@@ -769,7 +773,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | B | 多实例：一个 artifact 到实例 A/B，各自 state/resources/endpoints/tasks，无串扰 | PARTIAL | 已证：host `same_artifact_loads_produce_independent_components`、CoreTest `driver-multi-device`、ArchTest `isolated-restart`（并发同 artifact）、`ram_blk_rw` 每实例 buffer；endpoint/task 全维度无串扰与卸载后语义未系统证明 |
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；无 VFS、namespace、File service、两级缓存 |
 | D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit 路径已实现，但 host 调度集成测试因锁跨 schedule_next 失败；preemption（`on_timer_tick` 是 `todo!()` 且未接线）也缺失 |
-| E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | NOT-SATISFIED | 没有 POSIX personality；前置的 task↔AS 与 block/wake 也不满足 |
+| E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | NOT-SATISFIED | POSIX 只有骨架；task↔AS、用户 trap 与阻塞完成协议尚未接线 |
 | F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | K→I Gate 已真实验证（ArchTest `isolated-service*`：自定义 contract 加测试 provider，Core 侧代登记 endpoint）；没有任何生产契约（`scheduler_rr`、`block.device`、filesystem）在 Isolated 上运行过；Isolated provider 不能自己 publish endpoint；资源型契约全被 `-ENOTSUP` 拒绝 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
 | H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | 两种 profile 都存在，但 NoMMU 从未被构建或启动；无 MCU 真机 |
@@ -778,7 +782,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 ## 11. 明确未做
 
-- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：`todo!()`（`load.rs:183`、`exit.rs:129`），没有 syscall wire ABI。NOT IMPLEMENTED / PLANNED。
+- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，create `-ENOTSUP`；U-mode / trap / destroy 未实现，没有已接线 syscall ABI。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
 - block/wake：任务 permit、owner、最终检查与 commit 已落地；CoreTest 覆盖本地与跨 CPU 唤醒。独立 TaskBlock / TaskWake trace、event / waitqueue、join / stop 未做。
 - SMP 基础已落地（RV64）：AP 启动、BootGate、Online、IPI、per-CPU scheduler / timer / containment、固定 CPU 的真实组件调度、跨 CPU wake 与 panic containment。复杂 SMP 调度（迁移 / work stealing / 抢占 / hotplug）与私有 AS 任务调度未做。SMP 不是构建开关，无 `smp` Cargo feature。

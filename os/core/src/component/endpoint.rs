@@ -216,10 +216,8 @@ pub enum EndpointError {
 
 /// 一个组件实例的执行域（`docs/architecture/deployment.md` §3 的模式矩阵）。
 ///
-/// **今天只有 [`ExecutionDomain::KernelNative`] 真实存在**：Core 还没有部署 / 域
-/// 字段（deployment.md §7.3），所有实例都跑在共享内核地址空间里。其余变体是矩阵
-/// 的另一半——`select_mechanism` 的交叉臂已经在跑（host 测试覆盖），但**没有**
-/// 任何“假装已实现”的路径：需要未实现机制的组合一律显式拒绝。
+/// KernelNative 与 IsolatedNative 已有生命周期路径；SandboxedNative 只有
+/// Core 骨架，创建返回 ENOTSUP。需要未实现调用机制的组合一律显式拒绝。
 ///
 /// **本枚举只回答“在哪里、以什么特权 / 地址空间执行”**（placement）。**执行模型 /
 /// ISA / runtime**（native machine code vs Wasm）是**正交维度**，不属于这里：
@@ -229,9 +227,9 @@ pub enum EndpointError {
 /// 需要**单独的维度**表达，不要加回本枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDomain {
-    /// 与 Core 同特权、同地址空间（今天唯一存在的域）。
+    /// 与 Core 同特权、同地址空间。
     KernelNative,
-    /// 同特权、私有地址空间（**未实现**：无私有 AS / `satp` 切换）。
+    /// 同特权、私有地址空间（协作式，生命周期与 K→I Gate 已实现）。
     IsolatedNative,
     /// 低特权 + 私有地址空间（**未实现**：无 U-mode）。
     SandboxedNative,

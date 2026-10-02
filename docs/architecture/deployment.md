@@ -331,7 +331,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
-| 部署字段 | **已实现** | 组件实例 / 部署域记录 | `ComponentRecord::execution_domain` 落地 + 创建入口按域分派（见 §10）；`KernelNative` / `IsolatedNative` 两域可执行，`SandboxedNative` 是 `todo!()` 占位 |
+| 部署字段 | **已实现** | 组件实例 / 部署域记录 | `ComponentRecord::execution_domain` 落地 + 创建入口按域分派（见 §10）；`KernelNative` / `IsolatedNative` 两域可执行，`SandboxedNative` 是 Core `sandbox.rs` 骨架（create 装载前 `-ENOTSUP`，U-mode / destroy 未实现） |
 
 ### 7.4 consumer ABI 校验
 
@@ -473,7 +473,7 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
 | `kcore_endpoint_call` 文档与代码一致 | **已做（KernelNative 执行边界）**：abi doc 写"执行边界已落地"并指向 `component/call.rs`；跨域（Isolated provider）语义在同一模块文档与 §3/§10 | `abi/core.toml`（`kcore_endpoint_call` doc）、`component/call.rs` |
 | consumer exact ABI 校验（组合期） | **未做** | `kcore_endpoint_lookup` 无 abi 参数 |
-| 部署字段（`ComponentRecord::execution_domain`） | **已实现（两域可执行 + 跨域服务）**：字段落地 + 创建入口**按域分派**。`KernelNative` 走完整现有链；`IsolatedNative` **真正创建、启动、销毁、提供跨域服务**（私有 AS + **共享 Core 映射** + 按域装载 + Core 预置窗口 + 最小跨 AS trampoline；无私有 AS 能力 / 支持面之外的 import → 装载前显式拒绝；设备 / DMA / IRQ / 任务 / **出站**调用仍 `-ENOTSUP`）；`SandboxedNative` 是 `todo!()` 占位 | `registry.rs`、`load.rs`、`isolated_lifecycle.rs`、`exit.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
+| 部署字段（`ComponentRecord::execution_domain`） | **已实现（两域可执行 + 跨域服务）**：字段落地 + 创建入口**按域分派**。`KernelNative` 走完整现有链；`IsolatedNative` **真正创建、启动、销毁、提供跨域服务**（私有 AS + **共享 Core 映射** + 按域装载 + Core 预置窗口 + 最小跨 AS trampoline；无私有 AS 能力 / 支持面之外的 import → 装载前显式拒绝；设备 / DMA / IRQ / 任务 / **出站**调用仍 `-ENOTSUP`）；`SandboxedNative` 是 Core `sandbox.rs` 骨架（create 装载前 `-ENOTSUP`，U-mode / destroy 未实现） | `registry.rs`、`load.rs`、`isolated_lifecycle.rs`、`exit.rs`、`export.rs`、`call.rs`、`memory/address_space.rs` |
 | 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
 | 按 `(caller, callee)` 域选机制 | **部分实现**：`select_mechanism` 覆盖矩阵 + `bind` 在绑定时刻选定；**KernelNative caller → Isolated provider 的 Gate 已真正派发**。Isolated caller（出站）/ Sandbox 组合仍显式拒绝 | `endpoint.rs::select_mechanism`、`component/call.rs`、`isolated_lifecycle.rs::dispatch_service`、ArchTest `isolated-service*` |
 | Direct / Gate 作为**绑定机制**分离 | **部分实现**：Direct（KernelNative 同域）与 Gate（跨域 + 调度策略）都在跑；Gate 的 binding 只携带 opaque `EndpointId` + `port`（绝不交付 provider 域内裸入口） | `endpoint.rs::bind`、`component/call.rs` |

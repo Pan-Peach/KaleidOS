@@ -1,0 +1,14 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立组件镜像；Cargo 依赖不表达运行期 FS provider 组合。
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk" }

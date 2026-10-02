@@ -73,6 +73,8 @@ pub enum ComponentLoadError {
     /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
     /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
     IsolationUnsupported,
+    /// SandboxedNative 的 U-mode / task-AS / syscall 机制尚未实现：装载前 ENOTSUP。
+    SandboxUnsupported,
     /// `IsolatedNative` 装载发现**不在支持白名单里的 `kcore_*` import**：
     /// 只有诊断 / 只读查询与 `kcore_panic_escape` 可解析
     /// （[`crate::component::isolated_load::SUPPORTED_IMPORTS`]），面外符号在装载
@@ -151,8 +153,8 @@ pub fn load_and_start(
 /// `kind` 是**部署请求**（Policy proposes）：本函数**按执行域分派**创建路径——
 /// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative`
 /// 走 [`create_isolated_native`] 的门禁（能力 / import 白名单任一不满足即显式拒绝）
-/// 后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 尚无占位实现
-/// （`todo!()`）。任何域都**绝不静默降级成 native 跑**
+/// 后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 走 [`create_sandboxed_native`] 占位，
+/// 装载前返回 ENOTSUP。任何域都**绝不静默降级成 native 跑**
 /// （`docs/architecture/deployment.md` §2 ⑤/§10）。
 ///
 /// 锁纪律：registry / endpoint 锁只覆盖各自的查询与提交；`kcomp_instance_create`
@@ -177,7 +179,7 @@ pub fn create_component(
         // 再经跨 AS trampoline 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
         // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
-        ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
+        ExecutionDomain::SandboxedNative => create_sandboxed_native(name, args),
     }
 }
 
@@ -307,6 +309,16 @@ fn create_isolated_native(
 
     // (3) 生命周期编排。
     isolated_lifecycle::create(name, &blob, args)
+}
+
+/// `SandboxedNative` 的创建入口；执行器尚未实现，装载前返回 ENOTSUP。
+/// TODO: 平台能力 / import 门禁与实例生命周期编排；底层 U-mode 机制位于 `sandbox`。
+/// 当前不读 artifact、不声明实例，不降级成 KernelNative。
+fn create_sandboxed_native(
+    _name: &[u8],
+    _args: &KcompCreateArgs,
+) -> Result<ComponentId, ComponentLoadError> {
+    Err(ComponentLoadError::SandboxUnsupported)
 }
 
 /// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
@@ -488,15 +500,18 @@ mod tests {
         assert_eq!(current_component(), before, "最外层返回后恢复进入前的值");
     }
 
-    /// Sandbox 执行器未实现（`todo!()` 占位），不是静默降级成 native。
+    /// Sandbox 执行器未实现，装载前返回能力缺失，不静默降级成 native。
     ///
     /// 独立于 store：分派发生在装载之前，因此本用例不需要挂载仓库。仍取
     /// LOAD_TEST_LOCK 与上面的全局真相用例串行。
     #[test]
-    #[should_panic(expected = "Sandbox 执行器未实现")]
     fn sandboxed_deployment_is_an_unimplemented_placeholder() {
         let _serial = LOAD_TEST_LOCK.lock();
-        let _ = load_and_start(b"kcomp_smoke", ExecutionDomain::SandboxedNative);
+        let before = current_component();
+        let result = load_and_start(b"not_an_artifact", ExecutionDomain::SandboxedNative);
+        assert_eq!(result, Err(ComponentLoadError::SandboxUnsupported));
+        assert_eq!(result.unwrap_err().abi_status(), Errno::ENOTSUP.code());
+        assert_eq!(current_component(), before);
     }
 
     // -- Isolated 部署的显式拒绝包络 --------------------------------------------

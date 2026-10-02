@@ -32,6 +32,7 @@ pub mod isolated_load;
 pub mod load;
 pub mod loader;
 pub mod registry;
+pub mod sandbox;
 pub mod store;
 
 pub use containment::panic_escape;

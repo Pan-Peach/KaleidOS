@@ -1,0 +1,702 @@
+# KABI schema — vfs：第一阶段只读 Namespace / File service。
+# 分层契约见 docs/interfaces/filesystem.md；逐方法编码见 docs/interfaces/vfs.md。
+#
+# Rust 内部对象 / enum / 引用不跨边界；Direct 使用 VfsApi，Gate 使用 LE 扁平编码。
+# 两种 transport 逐方法同义，由 Core 在 bind 时选择。当前仅声明，尚无适配器。
+# 方法状态保持 0 / -errno。额外 domain-status 放 VfsReplyStatus / Gate 回复头，
+# 用于保留 sharing / delete-pending 等信息。传输失败仍是 Core 的独立 -errno。
+# 所有 ID 只在发布此 endpoint 的 VFS 实例内有效，不是权限，也不跨重启复用。
+# 所有 reserved 必须为 0，未知 flag / 编码拒绝；调用者缓冲区只借用本次调用。
+# schema 改变布局或语义时必须原地更换 exact ABI fingerprint，不能保留旧名。
+
+[[struct]]
+name = "VfsReplyStatus"
+c_name = "kcomp_vfs_reply_status"
+size = 8
+align = 4
+targets = "c,sdk-rust"
+doc = "每次正常回复均有效；domain 0 = 无额外分类，非零值见 STATUS 常量；reserved 必须为 0。成功时 domain 必须为 0。"
+
+[[struct.field]]
+name = "domain"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 4
+
+[[struct]]
+name = "VfsPath"
+c_name = "kcomp_vfs_path"
+size = 32
+align = 8
+targets = "c,sdk-rust"
+doc = "不透明路径位置；由 namespace 返回，不可自行拼接或把 node 当成 entry。"
+
+[[struct.field]]
+name = "mount"
+type = "u64"
+offset = 0
+
+[[struct.field]]
+name = "entry"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "fs"
+type = "u64"
+offset = 16
+
+[[struct.field]]
+name = "node"
+type = "u64"
+offset = 24
+
+[[struct]]
+name = "VfsStream"
+c_name = "kcomp_vfs_stream"
+size = 24
+align = 8
+targets = "c,sdk-rust"
+doc = "数据流身份，包含 FS incarnation 与节点；不暴露物理 extent。"
+
+[[struct.field]]
+name = "fs"
+type = "u64"
+offset = 0
+
+[[struct.field]]
+name = "node"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "stream"
+type = "u64"
+offset = 16
+
+[[struct]]
+name = "VfsLookup"
+c_name = "kcomp_vfs_lookup"
+size = 80
+align = 8
+targets = "c,sdk-rust"
+doc = "显式起点 / root / 遍历限制；flags 与编码定义见本 schema 常量。"
+
+[[struct.field]]
+name = "start"
+type = "VfsPath"
+offset = 0
+
+[[struct.field]]
+name = "root"
+type = "VfsPath"
+offset = 32
+
+[[struct.field]]
+name = "flags"
+type = "u32"
+offset = 64
+
+[[struct.field]]
+name = "max_symlinks"
+type = "u32"
+offset = 68
+
+[[struct.field]]
+name = "encoding"
+type = "u32"
+offset = 72
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 76
+
+[[struct]]
+name = "VfsOpenRequest"
+c_name = "kcomp_vfs_open_request"
+size = 48
+align = 8
+targets = "c,sdk-rust"
+doc = "一次独立 open；流名放 input。default 流的 input 为空且 encoding 为 0。"
+
+[[struct.field]]
+name = "path"
+type = "VfsPath"
+offset = 0
+
+[[struct.field]]
+name = "access"
+type = "u32"
+offset = 32
+
+[[struct.field]]
+name = "share"
+type = "u32"
+offset = 36
+
+[[struct.field]]
+name = "stream_kind"
+type = "u32"
+offset = 40
+
+[[struct.field]]
+name = "encoding"
+type = "u32"
+offset = 44
+
+[[struct]]
+name = "VfsNodeInfo"
+c_name = "kcomp_vfs_node_info"
+size = 24
+align = 8
+targets = "c,sdk-rust"
+doc = "provider 元数据快照；valid 位清除的字段为 0，不表示该属性值为 0。权限查询留待原生模型定稿。"
+
+[[struct.field]]
+name = "kind"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "valid"
+type = "u32"
+offset = 4
+
+[[struct.field]]
+name = "link_count"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "name_encoding"
+type = "u32"
+offset = 16
+
+[[struct.field]]
+name = "case_rule"
+type = "u32"
+offset = 20
+
+[[struct]]
+name = "VfsStreamInfo"
+c_name = "kcomp_vfs_stream_info"
+size = 56
+align = 8
+targets = "c,sdk-rust"
+doc = "流大小快照；size 总是有效，可选大小由 valid 标明。"
+
+[[struct.field]]
+name = "stream"
+type = "VfsStream"
+offset = 0
+
+[[struct.field]]
+name = "size"
+type = "u64"
+offset = 24
+
+[[struct.field]]
+name = "allocated_size"
+type = "u64"
+offset = 32
+
+[[struct.field]]
+name = "valid_data_length"
+type = "u64"
+offset = 40
+
+[[struct.field]]
+name = "valid"
+type = "u32"
+offset = 48
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 52
+
+[[struct]]
+name = "VfsDirReply"
+c_name = "kcomp_vfs_dir_reply"
+size = 56
+align = 8
+targets = "c,sdk-rust"
+doc = "目录枚举头；name_len 以字节计，无 NUL。END 时除 flags 外均为 0。"
+
+[[struct.field]]
+name = "path"
+type = "VfsPath"
+offset = 0
+
+[[struct.field]]
+name = "next_cursor"
+type = "u64"
+offset = 32
+
+[[struct.field]]
+name = "name_encoding"
+type = "u32"
+offset = 40
+
+[[struct.field]]
+name = "name_len"
+type = "u32"
+offset = 44
+
+[[struct.field]]
+name = "flags"
+type = "u32"
+offset = 48
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 52
+
+[[struct]]
+name = "VfsApi"
+c_name = "kcomp_vfs_api"
+size_ptrs = 13
+targets = "c,sdk-rust"
+doc = "只读 VFS Direct table；out_status 在正常方法回复中均有效，其他输出仅成功有效，read_dir ENOBUFS 除外。Gate 同义编码见 docs/interfaces/vfs.md。"
+
+[[struct.field]]
+name = "root"
+type = "fn(ctx: *mut void, out_path: *mut VfsPath, out_status: *mut VfsReplyStatus) -> i32"
+doc = "返回 create 配置建立的 namespace root；不替调用者选择进程 cwd。"
+
+[[struct.field]]
+name = "resolve"
+type = "fn(ctx: *mut void, request: *const VfsLookup, path: *const u8, len: usize, out_path: *mut VfsPath, out_status: *mut VfsReplyStatus) -> i32"
+doc = "按显式上下文解析有界路径；字节串无 NUL 终止，UTF-16 在 Gate 中编码为 LE。"
+
+[[struct.field]]
+name = "node_info"
+type = "fn(ctx: *mut void, path: *const VfsPath, out_info: *mut VfsNodeInfo, out_status: *mut VfsReplyStatus) -> i32"
+doc = "查询节点元数据；不返回 POSIX stat 或 NT 专属结构。"
+
+[[struct.field]]
+name = "read_dir"
+type = "fn(ctx: *mut void, directory: *const VfsPath, cursor: u64, name: *mut u8, len: usize, out_reply: *mut VfsDirReply, out_status: *mut VfsReplyStatus) -> i32"
+doc = "cursor 0 为起点；输出一个完整名字。ENOBUFS 时仅 name_len 有效，cursor 不前进。"
+
+[[struct.field]]
+name = "open"
+type = "fn(ctx: *mut void, request: *const VfsOpenRequest, stream_name: *const u8, len: usize, out_file: *mut u64, out_status: *mut VfsReplyStatus) -> i32"
+doc = "打开已有数据流。访问 / share 显式选择；创建、截断与删除尚不在此 ABI。"
+
+[[struct.field]]
+name = "retain"
+type = "fn(ctx: *mut void, file: u64, out_status: *mut VfsReplyStatus) -> i32"
+doc = "增加同一打开实例的用户引用，不再次 open；共享游标和 access/share。"
+
+[[struct.field]]
+name = "read"
+type = "fn(ctx: *mut void, file: u64, buf: *mut u8, len: usize, out_read: *mut usize, out_status: *mut VfsReplyStatus) -> i32"
+doc = "从共享游标读；返回长度不大于容量，0 表示 EOF / 零长读取。"
+
+[[struct.field]]
+name = "read_at"
+type = "fn(ctx: *mut void, file: u64, offset: u64, buf: *mut u8, len: usize, out_read: *mut usize, out_status: *mut VfsReplyStatus) -> i32"
+doc = "显式偏移读取，不改变共享游标；不以 seek + read 模拟。"
+
+[[struct.field]]
+name = "set_position"
+type = "fn(ctx: *mut void, file: u64, offset: u64, out_status: *mut VfsReplyStatus) -> i32"
+doc = "设定绝对游标；signed SEEK_* 的解释归 personality。"
+
+[[struct.field]]
+name = "stream_info"
+type = "fn(ctx: *mut void, file: u64, out_info: *mut VfsStreamInfo, out_status: *mut VfsReplyStatus) -> i32"
+doc = "查询此打开实例的流；默认流与命名流使用同一快照格式。"
+
+[[struct.field]]
+name = "close"
+type = "fn(ctx: *mut void, file: u64, out_status: *mut VfsReplyStatus) -> i32"
+doc = "消费一个用户引用；最后句柄 cleanup 与映射 / I/O 排空后的最终释放分开。"
+
+[[struct.field]]
+name = "retain_path"
+type = "fn(ctx: *mut void, path: *const VfsPath, out_status: *mut VfsReplyStatus) -> i32"
+doc = "增加路径位置的用户引用，用于 root/cwd 等独立持有者；复制结构不自动 retain。"
+
+[[struct.field]]
+name = "release_path"
+type = "fn(ctx: *mut void, path: *const VfsPath, out_status: *mut VfsReplyStatus) -> i32"
+doc = "消费一个路径位置引用；provider/mount 失效仍可使保留的引用逻辑失效。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_RETAIN_PATH"
+type = "u32"
+value = "11"
+targets = "c,sdk-rust"
+doc = "args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_RELEASE_PATH"
+type = "u32"
+value = "12"
+targets = "c,sdk-rust"
+doc = "args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。"
+
+[[const]]
+name = "KCOMP_VFS_NAME"
+type = "string"
+value = "vfs"
+targets = "c,sdk-rust"
+doc = "稳定契约名，实例端口名由组合配置选择。"
+
+[[const]]
+name = "KCOMP_VFS_CONTRACT"
+type = "u64"
+value = "0x5646_5353_4552_5643"
+targets = "c,sdk-rust"
+doc = "契约身份，ASCII VFSSERVC；与 filesystem provider 契约不同。"
+
+[[const]]
+name = "KCOMP_VFS_ABI"
+type = "u64"
+value = "0x5646_5346_4C41_5443"
+targets = "c,sdk-rust"
+doc = "exact fingerprint，ASCII VFSFLATC；不承诺陈旧组件兼容。"
+
+[[const]]
+name = "KCOMP_VFS_ENCODING_BYTES"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "不要求 UTF-8 的原生字节名字。"
+
+[[const]]
+name = "KCOMP_VFS_ENCODING_UTF16"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "UTF-16 code units；wire 字节为 LE，长度必须为偶数，不静默修复编码。"
+
+[[const]]
+name = "KCOMP_VFS_LOOKUP_BENEATH_START"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "相对解析，不能逃出 start；绝对输入返回 OUTSIDE_ROOT。"
+
+[[const]]
+name = "KCOMP_VFS_LOOKUP_FOLLOW_FINAL"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "跟随最终 symlink；中间 symlink 仍按 max_symlinks 限制。"
+
+[[const]]
+name = "KCOMP_VFS_LOOKUP_CROSS_MOUNTS"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "允许跨 namespace mount，仍须满足 root / beneath 边界。"
+
+[[const]]
+name = "KCOMP_VFS_ACCESS_READ"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "请求 read 类访问；不是已授予权限。"
+
+[[const]]
+name = "KCOMP_VFS_ACCESS_WRITE"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "预留 write 类访问；第一阶段必须返回 -ENOTSUP。"
+
+[[const]]
+name = "KCOMP_VFS_ACCESS_DELETE"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "预留 delete 类访问；第一阶段必须返回 -ENOTSUP。"
+
+[[const]]
+name = "KCOMP_VFS_SHARE_READ"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "允许其他独立 open 的 read 类访问。"
+
+[[const]]
+name = "KCOMP_VFS_SHARE_WRITE"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "允许其他独立 open 的 write 类访问。"
+
+[[const]]
+name = "KCOMP_VFS_SHARE_DELETE"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "允许其他独立 open 的 delete 类访问。"
+
+[[const]]
+name = "KCOMP_VFS_STREAM_DEFAULT"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust"
+doc = "默认数据流；无默认数据流的目录返回 NO_DATA_STREAM。"
+
+[[const]]
+name = "KCOMP_VFS_STREAM_NAMED"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "命名数据流，input 为单段名字；不支持时 -ENOTSUP。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_OTHER"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust"
+doc = "其他原生节点类型；不能伪造 regular。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_REGULAR"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "普通文件节点。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_DIRECTORY"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "目录节点。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_SYMLINK"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "符号链接节点。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_VALID_LINK_COUNT"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "link_count 有效；该计数来自 provider。"
+
+[[const]]
+name = "KCOMP_VFS_NODE_VALID_NAME_RULES"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "name_encoding / case_rule 有效，适用于目录。"
+
+[[const]]
+name = "KCOMP_VFS_CASE_SENSITIVE"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "大小写敏感提示；查找仍由 provider 实施。"
+
+[[const]]
+name = "KCOMP_VFS_CASE_INSENSITIVE"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "大小写不敏感提示；VFS 不据此统一转小写。"
+
+[[const]]
+name = "KCOMP_VFS_CASE_PROVIDER_DEFINED"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "原生比较规则不能由这些提示完整表示。"
+
+[[const]]
+name = "KCOMP_VFS_STREAM_VALID_ALLOCATED_SIZE"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "allocated_size 有效。"
+
+[[const]]
+name = "KCOMP_VFS_STREAM_VALID_DATA_LENGTH"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "valid_data_length 有原生语义，不由 VFS 推算。"
+
+[[const]]
+name = "KCOMP_VFS_DIR_END"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "目录枚举结束，无条目 / 无名字。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_SHARING_VIOLATION"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "与权限拒绝 -EACCES 区分。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_DELETE_PENDING"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "目标的删除协调状态不允许此次访问。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_UNSUPPORTED_NAME"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "provider 无法无损表示该编码 / 名字。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_STALE_REFERENCE"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "旧 FS incarnation / mount / path / open token 已失效。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_OUTSIDE_ROOT"
+type = "u32"
+value = "5"
+targets = "c,sdk-rust"
+doc = "实际路径遍历越过请求边界。"
+
+[[const]]
+name = "KCOMP_VFS_STATUS_NO_DATA_STREAM"
+type = "u32"
+value = "6"
+targets = "c,sdk-rust"
+doc = "节点不存在所请求的默认数据流。"
+
+[[const]]
+name = "KCOMP_VFS_PATH_MAX"
+type = "usize"
+value = "4096"
+targets = "c,sdk-rust"
+doc = "本阶段路径 input 最大字节数（UTF-16 同样按字节计，无 NUL）。"
+
+[[const]]
+name = "KCOMP_VFS_NAME_MAX"
+type = "usize"
+value = "1024"
+targets = "c,sdk-rust"
+doc = "本阶段单段名字最大字节数；不意味着所有 provider 都支持此上限。"
+
+[[const]]
+name = "KCOMP_VFS_IO_HEADER_LEN"
+type = "usize"
+value = "16"
+targets = "c,sdk-rust"
+doc = "read / read_at Gate output 的完整头：8 字节 status + 8 字节 LE u64 实际长度。"
+
+[[const]]
+name = "KCOMP_VFS_DIR_HEADER_LEN"
+type = "usize"
+value = "64"
+targets = "c,sdk-rust"
+doc = "read_dir Gate output 的完整头：8 字节 status + 56 字节目录回复。"
+
+[[const]]
+name = "KCOMP_VFS_FILE_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust"
+doc = "一个 LE u64 打开实例 token。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_ROOT"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust"
+doc = "root 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_RESOLVE"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "resolve 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_NODE_INFO"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "node_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_READ_DIR"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "read_dir 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_OPEN"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "open 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_RETAIN"
+type = "u32"
+value = "5"
+targets = "c,sdk-rust"
+doc = "retain 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_READ"
+type = "u32"
+value = "6"
+targets = "c,sdk-rust"
+doc = "read 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_READ_AT"
+type = "u32"
+value = "7"
+targets = "c,sdk-rust"
+doc = "read_at 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_SET_POSITION"
+type = "u32"
+value = "8"
+targets = "c,sdk-rust"
+doc = "set_position 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_STREAM_INFO"
+type = "u32"
+value = "9"
+targets = "c,sdk-rust"
+doc = "stream_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_METHOD_CLOSE"
+type = "u32"
+value = "10"
+targets = "c,sdk-rust"
+doc = "close 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。"
+
+[[const]]
+name = "KCOMP_VFS_REPLY_STATUS_LEN"
+type = "usize"
+value = "8"
+targets = "c,sdk-rust"
+doc = "每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。"
