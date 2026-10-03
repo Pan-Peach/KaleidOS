@@ -200,7 +200,9 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 缺口：只有 virtio，还是 QEMU virt 的 MMIO 变体；没有 PCIe/USB/NVMe/网卡；没有 UART driver component（`driver-model.md` 明说未实现）；没有真机；没有热插拔或驱动更换事务。
 
-下一步：网络组件优先考虑 smoltcp（0BSD）或 lwIP，前置是 `NetDevice` 契约。USB 走 TinyUSB，前提是同步原语。TLS 走 Mbed TLS，前提是 RNG/Clock/Socket。真机 bring-up 时补 SD/eMMC 与以太网，顺序见第 7 节。
+网络骨架：`os/components/network/netstack/` 是独立 Rust `.kcomp`，以 `third_party/smoltcp` submodule（v0.14.0，0BSD）作为私有 no_std / no-alloc 后端。已按 TCP 客户端 / 服务端 / UDP 查询用例声明 `abi/network.toml`、SDK NetworkBinding / TcpSocket / UdpSocket 和 NetworkProvider / NetworkInstance 分发；内部 connection / listener 分开，bind → listen 保留同一 ID / 端口，存储由服务分配。服务与 worker 经 Engine 共享状态，worker 独占协议推进，网卡调用在锁外；Busy 与网络 Pending 分开。业务 / 同步 / C-Gate adapters 仍待手写；SDK bind 和组件 create / destroy 返回 `-ENOTSUP`，无服务 endpoint。NetDevice / 网卡、跨组件 unpark 与 timer 尚未接线；契约见 `docs/interfaces/network.md`，代码见 `docs/modules/netstack.md`。
+
+下一步：定稿 `NetDevice` 契约与网卡 provider，手写 netstack adapter / 原语；事件驱动先补跨组件 unpark 与显式 timer 登记 / 取消，普通 park 不新增隐式 deadline。USB 走 TinyUSB，前提是同步原语。TLS 走 Mbed TLS，前提是 RNG/Clock/Socket。真机 bring-up 时补 SD/eMMC 与以太网，顺序见第 7 节。
 
 #### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED
 
@@ -364,7 +366,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 | 能力 | KaleidOS 现状 | 计划复用 | 前置 |
 |---|---|---|---|
 | 存储 / 文件系统 | 部分 IMPLEMENTED（只读）：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3）两个 C `.kcomp`，只读契约，无 VFS / namespace / 写支持 | C 路线：lwext4（ext2/3/4，许可待定）；Rust 路线：Hadris（MIT，FAT/exFAT）、ext4-view（MIT/Apache，只读 ext4）。写支持与 VFS 自研（`docs/interfaces/filesystem.md`） | lwext4 的 GPLv2 许可策略先定；FS 契约定稿；块设备路径已就绪 |
-| 网络（TCP/IP） | NOT IMPLEMENTED：没有 `NetDevice` 契约、没有网卡驱动、没有协议栈 | smoltcp（0BSD，首选）；lwIP（Modified BSD，后备） | `NetDevice` 契约 + 网卡驱动（virtio-net 可先用 virtio-drivers）；lwIP 还需 Thread/Sync |
+| 网络（TCP/IP） | SKELETON：服务 ABI / SDK 代理 / 用例与私有 smoltcp 后端占位；bind / create 拒绝，无运行服务 / 网卡驱动 / NetDevice ABI | smoltcp（0BSD，已引入）；lwIP（Modified BSD，后备） | `NetDevice` + 网卡驱动、原语 / 同步 / 服务 adapters、跨组件通知 / 显式 timer；lwIP 还需 Thread/Sync |
 | WiFi | NOT IMPLEMENTED | 按芯片：ESP32 系列 → esp-radio；Pico W → cyw43；参考 supplicant：wpa_supplicant/hostapd（BSD-3，Zephyr 移植）。多数芯片固件自带 802.11/WPA，主机侧只需驱动 + HCI/帧交换 | 对应硬件；SDIO/SPI 总线；固件加载机制（WiFi blob） |
 | 蓝牙 | NOT IMPLEMENTED | TrouBLE（trouble-host，MIT/Apache）+ bt-hci（Controller 缝）；C 后备 NimBLE（Apache-2.0） | HCI 传输（UART/USB/SDIO）+ 同步原语；本期不做 BR/EDR |
 | USB | NOT IMPLEMENTED | 设备侧：usb-device（MIT）+ usbd-*，或 embassy-usb（MIT/Apache）；C 后备 TinyUSB（MIT）。主机侧：xhci（MIT/Apache，只给寄存器/context/ring 原语）+ 自写驱动 | 主机侧先要 PCIe 枚举（DMA 机制已有，PCIe 没有）；设备侧要同步原语 |
@@ -480,7 +482,7 @@ NAND 坏块管理通常属于驱动/控制器（MTD），不是可移植 crate�
 
 | 项目 | 仓库 | 语言 | 许可 | no_std | 成熟度 | 前置 / 备注 |
 |---|---|---|---|---|---|---|
-| smoltcp | github.com/smoltcp-rs/smoltcp | Rust | 0BSD | ✅ no_std、无堆 | High（v0.13.1） | TCP/UDP/ICMP/raw、IPv4/IPv6、DHCP、DNS、ARP、802.15.4；`phy::Device` trait 就是 MAC 驱动缝；**首选**，已在 RISC-V 目标编译 |
+| smoltcp | github.com/smoltcp-rs/smoltcp | Rust | 0BSD | ✅ no_std、无堆 | High（调研 v0.13.1；骨架固定 v0.14.0） | TCP/UDP/ICMP/raw、IPv4/IPv6、DHCP、DNS、ARP、802.15.4；`phy::Device` trait 就是 MAC 驱动缝；已引入 netstack 骨架，RV64 / RV32 交叉编译与打包通过；没有网络实测 |
 | embassy-net | github.com/embassy-rs/embassy | Rust | MIT OR Apache-2.0 | ✅ async no_std / no-alloc | High（v0.9.1） | smoltcp 之上的 async 封装（TCP/UDP/DNS/DHCPv4、`embedded-io`）；要接受 embassy 执行器 |
 | embassy-net-driver / -driver-channel | github.com/embassy-rs/embassy | Rust | MIT OR Apache-2.0 | ✅ | High | 驱动 trait + 包队列 channel；组件 NIC ABI 可照抄 |
 | embassy-net-ppp / -nrf91 | github.com/embassy-rs/embassy | Rust | MIT OR Apache-2.0 | ✅ | Medium | PPP over UART；nRF91 蜂窝网卡 |
@@ -745,7 +747,7 @@ NAND 坏块管理通常属于驱动/控制器（MTD），不是可移植 crate�
 候选与前置条件：
 
 - `lwext4`（ext2/3/4，二档）：GPLv2，纳入前必须先定许可策略（独立 profile、只用 BSD 子集，或替换实现）。
-- `smoltcp`（TCP/IP，Rust，一档，0BSD）：前置是 `NetDevice` 契约，它今天还不存在。
+- `smoltcp`（TCP/IP，Rust，一档，0BSD）：已以 submodule 引入 `network/netstack` 骨架；设备 adapter / TCP / UDP 操作仍为 `todo!()`，前置 `NetDevice` 契约仍不存在。见 `docs/modules/netstack.md`。
 - `lwIP`（TCP/IP，C，二档，BSD-3-Clause）：前置是 `NetDevice` 加 Thread/Sync。
 - `Mbed TLS`（二档，Apache-2.0）：前置是 RNG、Clock、Socket。
 - `TinyUSB`（一档偏二档，MIT）：前置是同步原语。

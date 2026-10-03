@@ -1,0 +1,456 @@
+# KABI schema — network：TCP / UDP 网络服务骨架，尚未实现。
+# docs/interfaces/network.md 定义语义；本文件是布局 / 数值 / method 的唯一来源。
+# 方法返回 0 / -errno；尝试操作的 -EAGAIN = Pending；-EBUSY = 同步点竞争，未执行。
+# 所有指针只借用本次调用；Rust 对象 / enum / smoltcp 类型均不跨边界。
+# Gate 逐字段 LE 编码，无 padding；Direct 用 C table。未知值 / reserved 拒绝。
+
+[[struct]]
+name = "NetworkAddress"
+c_name = "kcomp_network_address"
+size = 24
+align = 8
+targets = "c,sdk-rust"
+doc = "family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；Gate 各整数 LE 编码，port 也是整数。"
+
+[[struct.field]]
+name = "family"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "port"
+type = "u16"
+offset = 4
+
+[[struct.field]]
+name = "flags"
+type = "u16"
+offset = 6
+
+[[struct.field]]
+name = "ip_high"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "ip_low"
+type = "u64"
+offset = 16
+
+[[struct]]
+name = "NetworkSocketInfo"
+c_name = "kcomp_network_socket_info"
+size = 48
+align = 8
+targets = "c,sdk-rust"
+doc = "端点快照；protocol TCP=1 / UDP=2，interface=0 表示未限定接口，reserved=0。"
+
+[[struct.field]]
+name = "id"
+type = "u64"
+offset = 0
+
+[[struct.field]]
+name = "protocol"
+type = "u32"
+offset = 8
+
+[[struct.field]]
+name = "family"
+type = "u32"
+offset = 12
+
+[[struct.field]]
+name = "local"
+type = "NetworkAddress"
+offset = 16
+
+[[struct.field]]
+name = "interface"
+type = "u32"
+offset = 40
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 44
+
+[[struct]]
+name = "NetworkEvents"
+c_name = "kcomp_network_events"
+size = 16
+align = 8
+targets = "c,sdk-rust"
+doc = "flags：RX=1、TX capacity=2、accept=4、closed=8。revision 也覆盖连接完成、失败与方向结束，reserved=0。"
+
+[[struct.field]]
+name = "revision"
+type = "u64"
+offset = 0
+
+[[struct.field]]
+name = "flags"
+type = "u32"
+offset = 8
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 12
+
+[[struct]]
+name = "NetworkTcpStatus"
+c_name = "kcomp_network_tcp_status"
+size = 64
+align = 8
+targets = "c,sdk-rust"
+doc = "phase：Idle=0、Connecting=1、Established=2、Listening=3、Closing=4、Closed=5；flags：send_finished=1、receive_ended=2；failure=0 或持久的负 errno；reserved=0。"
+
+[[struct.field]]
+name = "phase"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "flags"
+type = "u32"
+offset = 4
+
+[[struct.field]]
+name = "failure"
+type = "i32"
+offset = 8
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 12
+
+[[struct.field]]
+name = "local"
+type = "NetworkAddress"
+offset = 16
+
+[[struct.field]]
+name = "peer"
+type = "NetworkAddress"
+offset = 40
+
+[[struct]]
+name = "NetworkStreamRead"
+c_name = "kcomp_network_stream_read"
+size = 8
+align = 4
+targets = "c,sdk-rust"
+doc = "count 不大于 buffer；end 为 0/1，end=1 时 count=0。零长读 count=0 / end=0，不消费 EOF。"
+
+[[struct.field]]
+name = "count"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "end"
+type = "u32"
+offset = 4
+
+[[struct]]
+name = "NetworkDatagram"
+c_name = "kcomp_network_datagram"
+size = 64
+align = 8
+targets = "c,sdk-rust"
+doc = "实际包地址与长度。consumed 只能为 0/1；copied 不大于 buffer 或 original_len，零长度包合法。"
+
+[[struct.field]]
+name = "source"
+type = "NetworkAddress"
+offset = 0
+
+[[struct.field]]
+name = "destination"
+type = "NetworkAddress"
+offset = 24
+
+[[struct.field]]
+name = "interface"
+type = "u32"
+offset = 48
+
+[[struct.field]]
+name = "copied"
+type = "u32"
+offset = 52
+
+[[struct.field]]
+name = "original_len"
+type = "u32"
+offset = 56
+
+[[struct.field]]
+name = "consumed"
+type = "u32"
+offset = 60
+
+[[struct]]
+name = "NetworkApi"
+c_name = "kcomp_network_api"
+size_ptrs = 19
+targets = "c,sdk-rust"
+doc = "有界非阻塞服务 table；输出只在成功时有效。task 上下文调用，禁止 park / IRQ 调用 / 保留 buffer。"
+
+[[struct.field]]
+name = "tcp_open"
+type = "fn(ctx: *mut void, family: u32, out_socket: *mut u64) -> i32"
+doc = "创建 Idle TCP；缓冲由服务分配，未绑定。"
+
+[[struct.field]]
+name = "udp_open"
+type = "fn(ctx: *mut void, family: u32, out_socket: *mut u64) -> i32"
+doc = "创建未绑定 UDP；服务拥有 buffers / inbox。"
+
+[[struct.field]]
+name = "socket_bind"
+type = "fn(ctx: *mut void, socket: u64, local: *const NetworkAddress) -> i32"
+doc = "预留端口，port=0 分配临时端口；不延迟到 listen/connect 才检查冲突。"
+
+[[struct.field]]
+name = "tcp_connect"
+type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress) -> i32"
+doc = "Idle 开始握手；未绑定时自动选端口，成功不表示连接建立。"
+
+[[struct.field]]
+name = "tcp_listen"
+type = "fn(ctx: *mut void, socket: u64, pending_limit: u32) -> i32"
+doc = "同一 ID / 端口由 Idle 转 Listening；limit>0；失败保持原状态。"
+
+[[struct.field]]
+name = "tcp_accept"
+type = "fn(ctx: *mut void, socket: u64, out_socket: *mut u64) -> i32"
+doc = "无已建立连接返回 EAGAIN；成功交付独立 ID，失败不消费排队连接。"
+
+[[struct.field]]
+name = "tcp_status"
+type = "fn(ctx: *mut void, socket: u64, out_status: *mut NetworkTcpStatus) -> i32"
+doc = "纯状态快照；不清除错误。"
+
+[[struct.field]]
+name = "tcp_send"
+type = "fn(ctx: *mut void, socket: u64, data: *const u8, len: usize, out_sent: *mut u32) -> i32"
+doc = "部分写合法；背压 EAGAIN，无保留 caller buffer；入队不代表 ACK。"
+
+[[struct.field]]
+name = "tcp_receive"
+type = "fn(ctx: *mut void, socket: u64, buffer: *mut u8, len: usize, out_read: *mut NetworkStreamRead) -> i32"
+doc = "无数据 EAGAIN，排空 FIN 后 end=1；reset 是错误。"
+
+[[struct.field]]
+name = "tcp_finish_send"
+type = "fn(ctx: *mut void, socket: u64) -> i32"
+doc = "排空 TX 后发 FIN，RX 保留；不释放对象。"
+
+[[struct.field]]
+name = "tcp_abort"
+type = "fn(ctx: *mut void, socket: u64) -> i32"
+doc = "中止连接 / 必要的 RST，状态仍可查询。"
+
+[[struct.field]]
+name = "udp_send_to"
+type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress, data: *const u8, len: usize) -> i32"
+doc = "未绑定时自动选端口；整包入队或 EAGAIN。EAGAIN 不提交首次自动绑定。"
+
+[[struct.field]]
+name = "udp_receive"
+type = "fn(ctx: *mut void, socket: u64, mode: u32, buffer: *mut u8, len: usize, out_datagram: *mut NetworkDatagram) -> i32"
+doc = "mode Peek=0 / Whole=1 / Truncate=2；无包 EAGAIN，Whole 短缓冲成功返回所需长度且不消费。"
+
+[[struct.field]]
+name = "udp_set_receive_peer"
+type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress) -> i32"
+doc = "family=0 解除过滤；只影响后续包，保留已有 inbox。"
+
+[[struct.field]]
+name = "socket_info"
+type = "fn(ctx: *mut void, socket: u64, out_info: *mut NetworkSocketInfo) -> i32"
+doc = "查询实际绑定，不执行 poll。"
+
+[[struct.field]]
+name = "socket_events"
+type = "fn(ctx: *mut void, socket: u64, out_events: *mut NetworkEvents) -> i32"
+doc = "查询已发布快照，不消费事件。"
+
+[[struct.field]]
+name = "socket_subscribe"
+type = "fn(ctx: *mut void, socket: u64, task: u32, out_subscription: *mut u64, out_events: *mut NetworkEvents) -> i32"
+doc = "登记和快照原子提交；变化后通知 task，调用方须重试操作再 park。"
+
+[[struct.field]]
+name = "socket_unsubscribe"
+type = "fn(ctx: *mut void, subscription: u64) -> i32"
+doc = "撤销精确 ID；可能有在途无害唤醒，旧 ID 永不指向新登记。"
+
+[[struct.field]]
+name = "socket_release"
+type = "fn(ctx: *mut void, socket: u64) -> i32"
+doc = "逻辑退役，通知并撤销观察者；服务稍后完成协议清理，不要求 caller 等待。"
+
+[[const]]
+name = "KCOMP_NETWORK_NAME"
+type = "string"
+value = "network"
+targets = "c,sdk-rust"
+doc = "契约名；实例端口名由组合者选择。"
+
+[[const]]
+name = "KCOMP_NETWORK_CONTRACT"
+type = "u64"
+value = "0x4E45_5453_4552_5643"
+targets = "c,sdk-rust"
+doc = "NETSERVC；组件间服务身份，不是 Core 导出。"
+
+[[const]]
+name = "KCOMP_NETWORK_ABI"
+type = "u64"
+value = "0x4E45_5450_5249_4D53"
+targets = "c,sdk-rust"
+doc = "NETPRIMS；当前草案 exact fingerprint，语义 / 布局修改必须协调替换。"
+
+[[const]]
+name = "KCOMP_NETWORK_IO_MAX"
+type = "usize"
+value = "65535"
+targets = "c,sdk-rust"
+doc = "单次 payload 容量上限，TCP 可分段调用；UDP 超出协议 / 路径限制另报 EMSGSIZE。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_OPEN"
+type = "u32"
+value = "0"
+targets = "c,sdk-rust"
+doc = "args=4 family；input 空；output=8 socket ID。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_UDP_OPEN"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "args=4 family；input 空；output=8 socket ID。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_BIND"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+doc = "args=32：socket + local；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_CONNECT"
+type = "u32"
+value = "3"
+targets = "c,sdk-rust"
+doc = "args=32：socket + peer；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_LISTEN"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "args=12：socket + pending_limit；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_ACCEPT"
+type = "u32"
+value = "5"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input 空；output=8 新 socket。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_STATUS"
+type = "u32"
+value = "6"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input 空；output=64 status。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_SEND"
+type = "u32"
+value = "7"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input=数据；output=4 实际长度。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_RECEIVE"
+type = "u32"
+value = "8"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input 空；output>=8：read + 数据容量。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_FINISH_SEND"
+type = "u32"
+value = "9"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_TCP_ABORT"
+type = "u32"
+value = "10"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_UDP_SEND_TO"
+type = "u32"
+value = "11"
+targets = "c,sdk-rust"
+doc = "args=32：socket + peer；input=数据报；output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_UDP_RECEIVE"
+type = "u32"
+value = "12"
+targets = "c,sdk-rust"
+doc = "args=12：socket + mode；input 空；output>=64：datagram + 数据容量。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_UDP_SET_RECEIVE_PEER"
+type = "u32"
+value = "13"
+targets = "c,sdk-rust"
+doc = "args=32：socket + peer；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_INFO"
+type = "u32"
+value = "14"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input 空；output=48 info。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_EVENTS"
+type = "u32"
+value = "15"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input 空；output=16 events。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_SUBSCRIBE"
+type = "u32"
+value = "16"
+targets = "c,sdk-rust"
+doc = "args=12：socket + task；input 空；output=24：subscription + events。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_UNSUBSCRIBE"
+type = "u32"
+value = "17"
+targets = "c,sdk-rust"
+doc = "args=8 subscription；input/output 空。"
+
+[[const]]
+name = "KCOMP_NETWORK_METHOD_SOCKET_RELEASE"
+type = "u32"
+value = "18"
+targets = "c,sdk-rust"
+doc = "args=8 socket；input/output 空。"

@@ -14,3 +14,6 @@
 [submodule "third_party/littlefs"]
 	path = third_party/littlefs
 	url = https://github.com/littlefs-project/littlefs
+[submodule "third_party/smoltcp"]
+	path = third_party/smoltcp
+	url = https://github.com/smoltcp-rs/smoltcp.git

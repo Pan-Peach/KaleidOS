@@ -112,7 +112,7 @@ lwIP       → NetDevice API   → net provider
 | FAT / exFAT | FatFs | 一档 | 宽松（ChaN） | `disk_read` / `disk_write` / `disk_ioctl` → `block.device` | **已落地**（只读 kcomp 服务，见下） |
 | MCU flash FS | littlefs | 一档 | BSD-3-Clause | block read / program / erase adapter | **已落地**（C `.kcomp`，只读服务；见下） |
 | ext2/3/4 | lwext4 | **二档** | **GPLv2**（去 `ext4_extents.c`/`ext4_xattr.c` 才 BSD-3，但那正是 ext4 的意义） | block device adapter + malloc + C stdlib | 候选（**先定许可策略**） |
-| TCP/IP（Rust） | smoltcp | 一档 | 0BSD | `NetDevice` + clock adapter | 候选（前置：`NetDevice` 契约，§8） |
+| TCP/IP（Rust） | smoltcp | 一档 | 0BSD | `NetDevice` + clock adapter | **骨架**：`network/netstack` 私有携带 smoltcp；TCP / UDP 原语与 adapter 待手写，无网络服务（见 `docs/modules/netstack.md`）；仍需 `NetDevice` 契约（§8） |
 | TCP/IP（C） | lwIP | 二档 | BSD-3-Clause | `netif` + timer / OS（线程 / 同步）adapter | 候选（前置：`NetDevice` + Thread/Sync） |
 | TLS | Mbed TLS | 二档 | Apache-2.0 | RNG + clock + socket adapter | 候选（前置：RNG / Clock / Socket） |
 | USB | TinyUSB | 一档（可 bare-metal，需同步原语） | MIT | controller / HAL + 同步原语 | 候选 |

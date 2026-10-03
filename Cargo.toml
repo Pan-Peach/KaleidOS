@@ -9,6 +9,7 @@ members = [
 exclude = [
     "third_party/buddy_system_allocator",
     "third_party/fdt",
+    "third_party/smoltcp",
     # 组件 SDK：独立 workspace（自带 #![no_std] + 裸机 panic handler），
     # root 成员以 path 依赖引用；不参与 host workspace 的 test/clippy。
     "os/components/kcomp-sdk",

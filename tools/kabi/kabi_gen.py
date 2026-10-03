@@ -1799,6 +1799,7 @@ OUTPUTS: Tuple[Output, ...] = (
             "block.toml",
             "filesystem.toml",
             "vfs.toml",
+            "network.toml",
             "posix.toml",
             "probe.toml",
             "scheduler.toml",
@@ -1816,6 +1817,7 @@ OUTPUTS: Tuple[Output, ...] = (
     ),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/probe.rs", ("probe.toml",)),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/vfs.rs", ("vfs.toml",)),
+    Output("sdk-rust", "os/components/kcomp-sdk/src/generated/network.rs", ("network.toml",)),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/posix.rs", ("posix.toml",)),
     Output(
         "sdk-rust",

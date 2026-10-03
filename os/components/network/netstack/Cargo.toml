@@ -1,0 +1,21 @@
+[package]
+name = "netstack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# smoltcp 是本镜像的私有实现；网卡 provider 由运行期组合选择。
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kcomp-sdk = { path = "../../kcomp-sdk" }
+smoltcp = { path = "../../../../third_party/smoltcp", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }
