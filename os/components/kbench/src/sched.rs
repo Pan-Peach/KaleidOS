@@ -172,7 +172,13 @@ extern "C" fn task_b(arg: *mut ()) {
 /// 选择只提交 EndpointId（Core 准备策略执行栈）。
 fn ensure_scheduler() -> bool {
     let name = b"scheduler_rr";
-    let provider = unsafe { abi::kcore_component_load(name.as_ptr(), name.len()) };
+    let provider = unsafe {
+        abi::kcore_component_load(
+            name.as_ptr(),
+            name.len(),
+            abi::ExecutionDomain::KernelNative as u32,
+        )
+    };
     if provider < 0 {
         return false;
     }

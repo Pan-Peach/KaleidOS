@@ -22,7 +22,8 @@ the selected profile.  Select a profile first, e.g.
    orchestrator**: the filesystem chains, the driver_prober -> virtio_blk flow
    and the C-frontend lifecycle are asserted inside CoreTest, not here.  The
    runner only boots the machine and reads CoreTest's machine-readable verdict.
-4. shutdown —— type `shutdown`, expect QEMU to exit.
+4. ksh —— submit serial commands, check recovery and exit back to monitor;
+5. shutdown —— type `shutdown`, expect QEMU to exit.
 
 --scenario selects the QEMU **hardware topology only** (the runner controls the
 machine; CoreTest decides correctness by branching on the machine facts it
@@ -56,6 +57,7 @@ import select
 import subprocess
 import sys
 import time
+import ksh
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOGS_DIR = os.path.join(REPO, "tests", "qemu", "logs")
@@ -311,7 +313,11 @@ def main() -> int:
             f"{len(cases)} absorbed cases + all: PASS)"
         )
 
-        # -- 4) shutdown ---------------------------------------------------
+        # Serial user workflow: start -> commands -> recovery -> exit to monitor.
+        output += "\n" + ksh.run(proc, collect, send, RunFailure, FATAL_MARKERS)
+        summary.append("ksh: PASS (serial commands, cat, isolated load, overflow recovery, exit)")
+
+        # -- 5) shutdown ---------------------------------------------------
         send(proc, SHUTDOWN_CMD)
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         while time.monotonic() < deadline and proc.poll() is None:

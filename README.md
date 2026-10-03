@@ -103,6 +103,10 @@ make olddefconfig               # 用新默认值刷新 .config
 
 主工作流：`make <board>_defconfig && make qemu`。
 
+第一个组件 shell 已可手动启动：在 `core>` 输入 `load scheduler_rr`，再输入 `load ksh`。
+`ksh> help` 查看命令，`exit` 回到 monitor。命令、文件服务组合要求和当前限制见
+[`docs/modules/ksh.md`](docs/modules/ksh.md)。
+
 ## 文档
 
 索引与权威归属见 [`docs/README.md`](docs/README.md)（先看这个）。

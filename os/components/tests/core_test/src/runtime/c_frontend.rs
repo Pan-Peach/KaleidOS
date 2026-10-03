@@ -24,7 +24,13 @@ const C_SMOKE: &[u8] = b"kcomp_c_smoke";
 pub fn run(checks: &mut Checks) {
     checks.group("c frontend");
     let cursor = trace::cursor();
-    let id = unsafe { kcore_component_load(C_SMOKE.as_ptr(), C_SMOKE.len()) };
+    let id = unsafe {
+        kcore_component_load(
+            C_SMOKE.as_ptr(),
+            C_SMOKE.len(),
+            kcomp_sdk::abi::ExecutionDomain::KernelNative as u32,
+        )
+    };
     checks.check(
         41,
         "c-frontend",

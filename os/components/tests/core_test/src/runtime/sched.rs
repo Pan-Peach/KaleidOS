@@ -94,7 +94,13 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     // 加载 scheduler_rr（组件 → Core ABI → 加载链）。游标在操作前取样：
     // trace 组据此断言“这次加载”产生了 rr_id 的完整生命周期事件。
     let load_cursor = trace::cursor();
-    let rr_id = unsafe { kcore_component_load(b"scheduler_rr".as_ptr(), b"scheduler_rr".len()) };
+    let rr_id = unsafe {
+        kcore_component_load(
+            b"scheduler_rr".as_ptr(),
+            b"scheduler_rr".len(),
+            kcomp_sdk::abi::ExecutionDomain::KernelNative as u32,
+        )
+    };
     checks.check(4, "scheduler-load", rr_id >= 0);
 
     // 任务创建：requester = core_test（Core 从 call_init 上下文解析），

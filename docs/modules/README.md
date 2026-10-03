@@ -53,5 +53,6 @@
 | `os/components/filesystems/vfs` | VFS 骨架：Namespace / File service / provider 接入占位，尚未提供服务 | [`vfs.md`](vfs.md) |
 | `os/components/personalities/posix` | POSIX 消费者 / 进程语义骨架，尚无用户程序环境 | [`posix.md`](posix.md) |
 | `os/components/network/netstack` | TCP / UDP 服务 / SDK 代理与私有 smoltcp、设备 adapter 骨架 | [`netstack.md`](netstack.md) |
+| `os/components/ksh` | KernelNative shell：输入 / 命令、Core 值查询与文件服务前端 | [`ksh.md`](ksh.md) |
 
 > 接口契约（ABI / 设备 / 文件系统语义）在 `docs/interfaces/`；此处只描述模块边界与代码位置。

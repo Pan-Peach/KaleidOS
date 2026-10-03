@@ -42,7 +42,7 @@ static const struct kcomp_filesystem_api littlefs_api = {
     .read = littlefs_read,
 };
 
-const uint64_t kcomp_abi = UINT64_C(0x4B434F4D50414249);
+const uint64_t kcomp_abi = UINT64_C(0x9D73405BB2F816C0);
 
 int32_t kcomp_instance_create(
     const struct KcompCreateArgs *args,

@@ -80,6 +80,10 @@ mod exports;
 
 use exports::EXPORTS;
 
+#[path = "export/query.rs"]
+mod query;
+use query::*;
+
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
 /// 无需 build script / 运行时注册。
@@ -429,18 +433,22 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
 /// `kcomp_instance_create` 全链，与 monitor `load` 同源）。
 ///
 /// 这是 `kcore_component_create` 的便利入口（`config_abi = 0`，无 config 负载）。
-/// 返回 ComponentId raw（≥ 0）/ `-Errno`
+/// 返回 ComponentId raw / `-Errno`
 /// （`EINVAL` 名字非法；其余见 [`ComponentLoadError::abi_status`]——组件的 create
 /// 返回码**原样**透传，不塌缩成 `EIO`）。
-extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize) -> i32 {
+extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize, domain: u32) -> i32 {
     with_core_critical(|| {
         let Some(name) = checked_name(name_ptr, name_len) else {
             return Errno::EINVAL.code();
         };
-        // 组件 ABI 不携带部署域：默认请求 KernelNative。要指定 kind 需改
-        // `abi/core.toml` 的参数并重新生成 ABI（`KcompCreateArgs` 是组件自己的
-        // 配置负载，不塞部署选择）。
-        match crate::component::load::load_and_start(name, ExecutionDomain::KernelNative) {
+        use crate::generated::abi::ExecutionDomain as WireDomain;
+        let kind = match domain {
+            n if n == WireDomain::KernelNative as u32 => ExecutionDomain::KernelNative,
+            n if n == WireDomain::IsolatedNative as u32 => ExecutionDomain::IsolatedNative,
+            n if n == WireDomain::SandboxedNative as u32 => ExecutionDomain::SandboxedNative,
+            _ => return Errno::EINVAL.code(),
+        };
+        match crate::component::load::load_and_start(name, kind) {
             Ok(id) => id.raw() as i32,
             Err(error) => error.abi_status(),
         }
@@ -473,7 +481,7 @@ extern "C" fn kcore_component_create(
         // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
         // Core 只在本次调用内借用它。
         let args = unsafe { &*args };
-        // 同 `kcore_component_load`：ABI 未携带部署域 → 默认 KernelNative。
+        // create 带组件配置；未携带部署域，默认 KernelNative。
         match crate::component::load::create_component(name, args, ExecutionDomain::KernelNative) {
             Ok(id) => {
                 // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
@@ -989,8 +997,13 @@ extern "C" fn kcore_device_nth(
         if out_device_id.is_null() {
             return Errno::EFAULT.code();
         }
-        let Some(compatible) = checked_name(compatible_ptr, compatible_len) else {
-            return Errno::EINVAL.code();
+        let compatible = if compatible_len == 0 && !compatible_ptr.is_null() {
+            &[][..] // 无过滤发现；仍然只返回 DeviceId，不交付任何权限。
+        } else {
+            let Some(compatible) = checked_name(compatible_ptr, compatible_len) else {
+                return Errno::EINVAL.code();
+            };
+            compatible
         };
         match machine::nth_compatible(compatible, ordinal) {
             Ok(device) => {
@@ -1346,8 +1359,13 @@ mod tests {
             .split("\n#[cfg(test)]")
             .next()
             .expect("export.rs always carries its test module");
+        let query_half = include_str!("export/query.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
         let wrapped = implementation_half
             .lines()
+            .chain(query_half.lines())
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("with_core_critical("))
             .count();
@@ -1355,6 +1373,22 @@ mod tests {
             wrapped,
             EXPORTS.len() - 1,
             "every export except the escape request must wrap its body"
+        );
+    }
+
+    #[test]
+    fn observation_outputs_and_deployment_reject_invalid_inputs() {
+        assert_eq!(
+            kcore_component_nth(0, core::ptr::null_mut(), core::ptr::null_mut(), 0),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(
+            kcore_endpoint_nth(0, core::ptr::null_mut(), core::ptr::null_mut(), 0),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(
+            kcore_component_load(b"x".as_ptr(), 1, u32::MAX),
+            Errno::EINVAL.code()
         );
     }
 

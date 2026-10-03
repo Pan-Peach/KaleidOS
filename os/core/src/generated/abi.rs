@@ -59,9 +59,40 @@ const _: () = {
 };
 
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
-/// 边界与值。数值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；组件里的
+/// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0x4B43_4F4D_5041_4249;
+pub const KCOMP_ABI: u64 = 0x9D73_405B_B2F8_16C0;
+
+/// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDomain {
+    KernelNative = 0,
+    IsolatedNative = 1,
+    SandboxedNative = 2,
+}
+
+/// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentState {
+    Declared = 0,
+    Resolved = 1,
+    Starting = 2,
+    Ready = 3,
+    Stopping = 4,
+    Stopped = 5,
+    Failed = 6,
+}
+
+/// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointState {
+    Pending = 0,
+    Live = 1,
+    Invalid = 2,
+}
 
 /// 一条 trace 记录的**稳定编码**（Core `trace::abi::TraceRecordAbi`）。
 /// `kind` 决定 `a` / `b` / `c` 的含义，缺省字段写成 `ABSENT`（**不是** 0）。
@@ -147,6 +178,50 @@ const _: () = {
     assert!(core::mem::offset_of!(MemoryView, reserved) == 4);
     assert!(core::mem::offset_of!(MemoryView, base) == 8);
     assert!(core::mem::offset_of!(MemoryView, len) == 16);
+};
+
+/// 只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentInfo {
+    pub id: u32,
+    pub state: u32,
+    pub domain: u32,
+    pub name_len: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ComponentInfo>() == 16);
+    assert!(core::mem::align_of::<ComponentInfo>() == 4);
+    assert!(core::mem::offset_of!(ComponentInfo, id) == 0);
+    assert!(core::mem::offset_of!(ComponentInfo, state) == 4);
+    assert!(core::mem::offset_of!(ComponentInfo, domain) == 8);
+    assert!(core::mem::offset_of!(ComponentInfo, name_len) == 12);
+};
+
+/// 只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointInfo {
+    pub id: u64,
+    pub contract: u64,
+    pub abi: u64,
+    pub provider: u32,
+    pub port: u32,
+    pub state: u32,
+    pub name_len: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<EndpointInfo>() == 40);
+    assert!(core::mem::align_of::<EndpointInfo>() == 8);
+    assert!(core::mem::offset_of!(EndpointInfo, id) == 0);
+    assert!(core::mem::offset_of!(EndpointInfo, contract) == 8);
+    assert!(core::mem::offset_of!(EndpointInfo, abi) == 16);
+    assert!(core::mem::offset_of!(EndpointInfo, provider) == 24);
+    assert!(core::mem::offset_of!(EndpointInfo, port) == 28);
+    assert!(core::mem::offset_of!(EndpointInfo, state) == 32);
+    assert!(core::mem::offset_of!(EndpointInfo, name_len) == 36);
 };
 
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。

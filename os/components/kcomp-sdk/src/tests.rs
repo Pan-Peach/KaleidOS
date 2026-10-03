@@ -46,13 +46,11 @@ fn lifecycle_entry_types_are_anchored() {
     assert_eq!(core::mem::size_of::<KcompInstanceDestroy>(), ptr);
 }
 
-/// `kcomp_abi` 指纹锚定（ASCII "KCOMPABI"）：Core 校验组件 ELF 里该符号的值，
-/// 数值本身可当 8 字节大端 ASCII 读出来——两个断言同时钉死数值与 tag 拼写。
+/// 当前 exact ABI 指纹；Core 校验组件 ELF 里的同名符号。
 #[test]
 fn kcomp_abi_fingerprint_is_anchored() {
     let abi = crate::abi::KCOMP_ABI;
-    assert_eq!(abi, 0x4B43_4F4D_5041_4249);
-    assert_eq!(&abi.to_be_bytes(), b"KCOMPABI");
+    assert_eq!(abi, 0x9D73_405B_B2F8_16C0);
 }
 
 // ---------------------------------------------------------------------------

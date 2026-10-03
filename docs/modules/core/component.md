@@ -8,7 +8,7 @@
 - **组件身份与生命周期**：`ComponentId`（唯一的一等运行时身份）、`ComponentState`、`Registry`；状态机 `Declared → Resolved → Starting → Ready → Stopping → Stopped`，任意 → `Failed`。`ComponentId` 永不复用。
 - **已加载程序（loaded）**：`registry::ComponentRecord` 1:1 直接持有 `loaded: LoadedComponent`（`base` / `create` / `destroy` / `service_dispatch` / `text_size` / `memory`（常驻 MemoryLease））与 `name`——每次 instantiate 独立放段 / 重定位，`.data` / `.bss` 私有；没有 `ComponentImageId` / `ImageTable` 二级身份。
 - **Contract / Endpoint 真相（唯一绑定真相）**：`EndpointRegistry` 记录谁在哪个端口发布了哪个契约（`endpoint.rs`）；`EndpointId` 单调、绝不回收 / 重定向，provider 停止 / 失败 → 它的全部 endpoint 永久 `Invalid`。`bind` 是 Core 选定调用机制（Direct / Gate）的唯一选择点，并落 `TraceEvent::EndpointBind`。
-- **导出 ABI**：`kcore_*` 白名单（44 项）的实现与解析。
+- **导出 ABI**：`kcore_*` 白名单（49 项）的实现与解析。
 - **加载编排**：cpio store 解析 → ELF 段放置 / 重定位 → 入口校验。
 - **失败与退出**：`fail_component`（mark + revoke + quarantine）与 `stop_component`（`Stopping` / `Stopped`）。
 
@@ -25,7 +25,8 @@
 - `containment.rs`：panic containment（`CallOutcome`、`EscapeKind`、`EscapeInfo`、`call_component_create` / `call_component_destroy` / `call_component_service`、`enter_task` / `enter_anchor`、`panic_escape`、`with_irq_scope`、祖先遍历的 `scheduling_forbidden` / `irq_in_chain` / `provider_in_active_chain`）。
 - `endpoint.rs`：Contract / Endpoint 真相（`ContractId`、`EndpointId`、`EndpointState`、`EndpointRecord`、`EndpointRegistry`）；`stage_publish` / `commit_pending` / `discard_pending` / `resolve` / `lookup` / `discover` / `invalidate_endpoint` / `invalidate_provider`。
 - `call.rs`：`kcore_endpoint_call` 的 Core 实现（`CallError`）：**按 provider 执行域路由**（KernelNative → service-call 执行边界 `call_component_service`；Isolated → `isolated_lifecycle::dispatch_service` 的 caller 帧直接交付 + 跨 AS trampoline 路径；Sandboxed → 显式拒绝）、re-entry 门禁、IRQ 祖先门禁、`complete_call` / `handle_provider_panic` 收尾。
-- `export.rs`：`kcore_*` 导出 ABI 实现（44 项）与 `resolve(name) -> Option<usize>`。
+- `export/query.rs`：console 输入与 component / endpoint 只读值投影；名称完整拷贝，不交付私有指针。
+- `export.rs`：`kcore_*` 导出 ABI 实现（49 项）与 `resolve(name) -> Option<usize>`。
 - `failure.rs`：`fail_component`、`revoke_authority_and_unbind`。
 - `exit.rs`：`stop_component`、`ComponentStopError`。
 - `isolated.rs`：私有 AS 进入的 Core 侧准备（`PreparedTransition`、`EntryArgs`、`prepare`、`enter`、`ComponentFault`、`FaultPolicy`、`install` / `register_fault_policy`）+ **普通 trap 路径的异常钩子**（`on_exception`：按活动跨 AS 现场归因、默认拒绝恢复、放弃经 trampoline 交回 Core 延续）；进入参数（组件入口 `a0..a3`）由 Core 解释、arch 只搬运。**生产调用方 = `isolated_lifecycle.rs`**（Isolated 的 create / destroy / service dispatch 都经这里）；`prepare` 在锁内校验并取出 `Copy` 描述符，`enter` 在锁外组装 **per-invocation** trampoline 记录（CrossAsContext LIFO 链）。

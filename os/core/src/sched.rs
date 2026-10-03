@@ -682,13 +682,16 @@ pub fn run() -> Result<(), SchedError> {
 }
 
 /// Service BSP anchor work at monitor/console safe points.
-pub(crate) fn service_local() {
+/// Returns true when runnable component work was serviced successfully.
+pub(crate) fn service_local() -> bool {
     if CPU_TABLE.get().is_some()
         && !containment::scheduling_forbidden()
         && current_task().is_none()
         && has_claimable_for(current_cpu_id())
     {
-        let _ = run();
+        run().is_ok()
+    } else {
+        false
     }
 }
 

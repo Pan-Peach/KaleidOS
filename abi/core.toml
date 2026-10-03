@@ -532,6 +532,7 @@ type = "*mut u32"
 [[function]]
 name = "kcore_component_load"
 ret = "i32"
+doc = "请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。"
 category = "Component lifecycle（v2）"
 c_category = "Component lifecycle"
 [[function.param]]
@@ -541,6 +542,9 @@ type = "*const u8"
 name = "len"
 type = "usize"
 
+[[function.param]]
+name = "domain"
+type = "u32"
 [[function]]
 name = "kcore_task_create"
 ret = "i32"
@@ -699,6 +703,7 @@ type = "u64"
 [[function]]
 name = "kcore_device_nth"
 ret = "i32"
+doc = "纯发现：compatible 为空（非 NULL 指针，len = 0）时枚举全部设备；否则按 compatible 过滤。只返回 DeviceId，非权限。"
 category = "Device ownership（mechanism-first）"
 c_category = "Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）"
 [[function.param]]
@@ -1120,3 +1125,203 @@ name = "out_status"
 type = "*mut i32"
 
 # overrides: ['kcore_task_create']
+
+[[enum]]
+name = "ExecutionDomain"
+c_name = "KcoreExecutionDomain"
+repr = "u32"
+c_style = "enum"
+doc = "Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。"
+
+[[enum.variant]]
+name = "KernelNative"
+c_name = "KCORE_EXECUTIONDOMAIN_KERNEL_NATIVE"
+value = 0
+
+[[enum.variant]]
+name = "IsolatedNative"
+c_name = "KCORE_EXECUTIONDOMAIN_ISOLATED_NATIVE"
+value = 1
+
+[[enum.variant]]
+name = "SandboxedNative"
+c_name = "KCORE_EXECUTIONDOMAIN_SANDBOXED_NATIVE"
+value = 2
+
+[[enum]]
+name = "ComponentState"
+c_name = "KcoreComponentState"
+repr = "u32"
+c_style = "enum"
+doc = "Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。"
+
+[[enum.variant]]
+name = "Declared"
+c_name = "KCORE_COMPONENTSTATE_DECLARED"
+value = 0
+
+[[enum.variant]]
+name = "Resolved"
+c_name = "KCORE_COMPONENTSTATE_RESOLVED"
+value = 1
+
+[[enum.variant]]
+name = "Starting"
+c_name = "KCORE_COMPONENTSTATE_STARTING"
+value = 2
+
+[[enum.variant]]
+name = "Ready"
+c_name = "KCORE_COMPONENTSTATE_READY"
+value = 3
+
+[[enum.variant]]
+name = "Stopping"
+c_name = "KCORE_COMPONENTSTATE_STOPPING"
+value = 4
+
+[[enum.variant]]
+name = "Stopped"
+c_name = "KCORE_COMPONENTSTATE_STOPPED"
+value = 5
+
+[[enum.variant]]
+name = "Failed"
+c_name = "KCORE_COMPONENTSTATE_FAILED"
+value = 6
+
+[[enum]]
+name = "EndpointState"
+c_name = "KcoreEndpointState"
+repr = "u32"
+c_style = "enum"
+doc = "Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。"
+
+[[enum.variant]]
+name = "Pending"
+c_name = "KCORE_ENDPOINTSTATE_PENDING"
+value = 0
+
+[[enum.variant]]
+name = "Live"
+c_name = "KCORE_ENDPOINTSTATE_LIVE"
+value = 1
+
+[[enum.variant]]
+name = "Invalid"
+c_name = "KCORE_ENDPOINTSTATE_INVALID"
+value = 2
+
+[[struct]]
+name = "ComponentInfo"
+c_name = "kcore_component_info"
+size = 16
+align = 4
+doc = "只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。"
+
+[[struct.field]]
+name = "id"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "state"
+type = "u32"
+offset = 4
+
+[[struct.field]]
+name = "domain"
+type = "u32"
+offset = 8
+
+[[struct.field]]
+name = "name_len"
+type = "u32"
+offset = 12
+
+[[struct]]
+name = "EndpointInfo"
+c_name = "kcore_endpoint_info"
+size = 40
+align = 8
+doc = "只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。"
+
+[[struct.field]]
+name = "id"
+type = "u64"
+offset = 0
+
+[[struct.field]]
+name = "contract"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "abi"
+type = "u64"
+offset = 16
+
+[[struct.field]]
+name = "provider"
+type = "u32"
+offset = 24
+
+[[struct.field]]
+name = "port"
+type = "u32"
+offset = 28
+
+[[struct.field]]
+name = "state"
+type = "u32"
+offset = 32
+
+[[struct.field]]
+name = "name_len"
+type = "u32"
+offset = 36
+
+[[function]]
+name = "kcore_console_read_byte"
+ret = "i32"
+category = "Console / observation"
+c_category = "Console / observation"
+doc = "轮询诊断 console。字节 0..255；无输入 -EAGAIN。无输入时做一次有界 idle 等待，caller 可 yield 后重试。"
+
+[[function]]
+name = "kcore_component_nth"
+ret = "i32"
+category = "Console / observation"
+c_category = "Console / observation"
+doc = "按 ordinal 复制组件状态与完整名字（不含 NUL）。ENOENT = 枚举完；ENOBUFS = 名字缓冲不足（不截断）。逐次读取，不保证全表原子快照。"
+[[function.param]]
+name = "ordinal"
+type = "u32"
+[[function.param]]
+name = "out"
+type = "*mut ComponentInfo"
+[[function.param]]
+name = "name"
+type = "*mut u8"
+[[function.param]]
+name = "capacity"
+type = "usize"
+
+[[function]]
+name = "kcore_endpoint_nth"
+ret = "i32"
+category = "Console / observation"
+c_category = "Console / observation"
+doc = "按 ordinal 复制已提交 endpoint（含 Invalid）与完整端口名。ENOENT = 枚举完；ENOBUFS = 名字缓冲不足。不交付 api/ctx。"
+[[function.param]]
+name = "ordinal"
+type = "u32"
+[[function.param]]
+name = "out"
+type = "*mut EndpointInfo"
+[[function.param]]
+name = "name"
+type = "*mut u8"
+[[function.param]]
+name = "capacity"
+type = "usize"

@@ -159,7 +159,11 @@ int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len,
                                uint32_t *out_instance);
 ```
 
-现有 `kcore_component_load` 保留为"默认配置启动"的便利操作，不必立刻暴露完整的 image 管理 API。
+`kcore_component_load(name, len, domain)` 是“默认配置启动”的便利操作，返回组件 id / -errno。
+`domain` 使用 schema 的整数编码（KernelNative=0 / IsolatedNative=1 / SandboxedNative=2）；
+Core 验证支持面，不隐式回退，SandboxedNative 当前返回 ENOTSUP。带自定义 config 的
+`kcore_component_create` 仍为 KernelNative 入口，不扩充完整 image 管理 API。
+import 签名变化与生命周期布局变化一样必须原地协调替换 `KCOMP_ABI`，不保留旧签名兼容。
 
 ---
 
@@ -250,4 +254,3 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 **剩余的是编排缺口，不是模型限制**：prober 在第一个 `Match` 后停止，不为第二台设备 provision 第二个驱动组件。**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖编排问题。
 
 > 旧的 scoped HAL context gate 已随 image 私有化消失：每个组件有自己的 static，"同一份共享 static 被多实例争用"的补救不再需要。通用迁移模式（不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态）的其余部分属于实现进度，不入本契约；C 生命周期 smoke 已落地。
-

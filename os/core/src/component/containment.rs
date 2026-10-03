@@ -770,13 +770,33 @@ pub(crate) fn with_isolated_service_boundary<R>(
     caller_task: Option<TaskId>,
     f: impl FnOnce() -> R,
 ) -> R {
-    let mut guard = EscapeGuard {
-        kind: EscapeKind::ServiceCall {
+    with_cross_as_boundary(
+        EscapeKind::ServiceCall {
             owner,
             endpoint,
             caller_task,
         },
-        // 无 Core 栈切换、无可恢复的 Core 上下文（见本函数文档）。
+        f,
+    )
+}
+
+/// Cross-AS create/destroy must replace the caller's identity and suspend its
+/// Core ABI depth, just as native lifecycle boundaries do. The trampoline owns
+/// fault recovery; this guard only restores identity and depth after it returns.
+#[allow(dead_code)]
+pub(crate) fn with_isolated_create_boundary<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R {
+    with_cross_as_boundary(EscapeKind::Init { owner: Some(owner) }, f)
+}
+
+#[allow(dead_code)]
+pub(crate) fn with_isolated_destroy_boundary<R>(owner: ComponentId, f: impl FnOnce() -> R) -> R {
+    with_cross_as_boundary(EscapeKind::Exit { owner }, f)
+}
+
+fn with_cross_as_boundary<R>(kind: EscapeKind, f: impl FnOnce() -> R) -> R {
+    let mut guard = EscapeGuard {
+        kind,
+        // 无 Core 栈切换；可恢复的上下文由 cross-AS trampoline 持有。
         from_context: core::ptr::null_mut(),
         to_context: core::ptr::null_mut(),
         call: IsolatedCall::None,
@@ -1223,7 +1243,7 @@ fn escape_target() -> Option<*mut EscapeGuard> {
 pub fn panic_escape() -> bool {
     // 跨 AS（Isolated）执行：恢复出口是 trampoline 的 Core 延续（`isolated::enter`
     // 会返回 `Outcome::Faulted`，由调用方边界做清理）。组件在 Isolated AS 里
-    // panic 就是组件失败——无论有没有 EscapeGuard（create / destroy 没有 guard）。
+    // panic 就是组件失败；生命周期 / service guard 提供身份，恢复由跨 AS 现场负责。
     // Core-critical 深度 > 0 = Core 代码在栈上：Core panic，保持 fatal。
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", test))]
     if let Some(cross) = cross_as::active_cross_as() {
@@ -1563,10 +1583,8 @@ mod tests {
 
     #[test]
     fn kcomp_abi_is_the_manual_anchor() {
-        // 手工锚定值 = 8 字节 ASCII tag `b"KCOMPABI"` 的大端读数；单一来源是
-        // `abi/component.toml`（生成到 generated/abi.rs），这里独立钉死数值。
-        assert_eq!(KCOMP_ABI, 0x4B43_4F4D_5041_4249);
-        assert_eq!(&KCOMP_ABI.to_be_bytes(), b"KCOMPABI");
+        // 当前 Core import / 生命周期 exact 指纹；来源为 abi/component.toml。
+        assert_eq!(KCOMP_ABI, 0x9D73_405B_B2F8_16C0);
     }
 
     #[test]
@@ -2105,6 +2123,53 @@ mod tests {
         assert_eq!(info.task(), Some(TaskId::from_raw(7)));
         assert!(!scheduling_forbidden());
         assert!(!provider_in_active_chain(provider));
+        enter_anchor();
+    }
+
+    #[test]
+    fn isolated_lifecycle_fault_preserves_caller_identity_and_core_depth() {
+        let _boundary = test_boundary_lock();
+        enter_anchor();
+        let caller = ComponentId::from_raw(3);
+        let callee = ComponentId::from_raw(0x1A);
+        let task = TaskId::from_raw(7);
+        enter_task(task, caller);
+
+        with_core_critical(|| {
+            with_isolated_create_boundary(callee, || {
+                assert_eq!(core_abi_depth(), 0);
+                assert_eq!(
+                    active_escape().unwrap().kind,
+                    EscapeKind::Init {
+                        owner: Some(callee)
+                    }
+                );
+                let guard = active_guard().unwrap();
+                // Inspect without calling escape_target, which pops a guard
+                // when it refuses a null Core context.
+                assert!(unsafe { (*guard).from_context.is_null() });
+                test_mark_active_panicked();
+                assert!(test_active_panicked());
+            });
+            assert_eq!(core_abi_depth(), 1);
+            assert_eq!(active_escape().unwrap().owner(), Some(caller));
+            assert_eq!(active_escape().unwrap().task(), Some(task));
+            assert!(!test_active_panicked());
+
+            with_isolated_destroy_boundary(callee, || {
+                assert_eq!(core_abi_depth(), 0);
+                assert_eq!(
+                    active_escape().unwrap().kind,
+                    EscapeKind::Exit { owner: callee }
+                );
+                test_mark_active_panicked();
+            });
+            assert_eq!(core_abi_depth(), 1);
+            assert_eq!(active_escape().unwrap().owner(), Some(caller));
+            assert_eq!(active_escape().unwrap().task(), Some(task));
+            assert!(!test_active_panicked());
+        });
+        assert_eq!(core_abi_depth(), 0);
         enter_anchor();
     }
 

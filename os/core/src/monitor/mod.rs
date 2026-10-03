@@ -132,6 +132,12 @@ pub fn run() -> ! {
     loop {
         screen.put(PROMPT.as_bytes());
         loop {
+            // A yielding console task returns to this anchor while still
+            // Runnable. Resume component work before consuming its input.
+            // NoPolicy leaves the monitor available for initial composition.
+            if crate::sched::service_local() {
+                continue;
+            }
             match arch::ConsoleImpl::getc() {
                 Some(byte) => match editor.feed(PROMPT, byte, &names, &mut screen) {
                     Outcome::Pending => {}

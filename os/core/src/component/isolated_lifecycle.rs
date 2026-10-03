@@ -296,7 +296,9 @@ mod imp {
 
         // (8) 进入：组件在私有 AS 里执行 `kcomp_instance_create(args, out_state)`。
         //     期间 CURRENT = 本实例（与 KernelNative create 同一身份纪律）。
-        match load::with_current(id, || isolated::enter(transition)) {
+        match load::with_current(id, || {
+            containment::with_isolated_create_boundary(id, || isolated::enter(transition))
+        }) {
             Outcome::Returned(0) => {
                 // Core 从**自己的视图**读回组件写下的 opaque state（绝不把实例内
                 // VA 当 Core 指针解引用）。
@@ -382,7 +384,9 @@ mod imp {
                 return CallOutcome::Returned(Errno::EIO.code());
             }
         };
-        let outcome = match load::with_current(id, || isolated::enter(transition)) {
+        let outcome = match load::with_current(id, || {
+            containment::with_isolated_destroy_boundary(id, || isolated::enter(transition))
+        }) {
             Outcome::Returned(0) => CallOutcome::Returned(0),
             Outcome::Returned(code) => CallOutcome::Returned(code as u32 as i32),
             // Core trap 路径判为不可恢复：按 destroy panic 同档（Failed + 不重试）。

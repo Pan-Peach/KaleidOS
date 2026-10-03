@@ -33,7 +33,8 @@ docs/
 │   ├── components.md
 │   ├── vfs.md                  （VFS 组件骨架与手写入口）
 │   ├── posix.md                （POSIX 消费者 / 语义聚合骨架）
-│   └── netstack.md             （smoltcp 网络栈 / TCP / UDP 骨架）
+│   ├── netstack.md             （smoltcp 网络栈 / TCP / UDP 骨架）
+│   └── ksh.md                  （KernelNative shell、命令与当前边界）
 ├── development/               怎么在上面干活
 │   ├── testing.md
 │   ├── benchmark.md
@@ -92,6 +93,7 @@ docs/
 | 理解内存与堆的边界（组件怎么拿内存） | `architecture/memory-and-heap.md` |
 | 理解部署如何决定调用机制、跨域调用现状（K→I 已落地，其余未实现） | `architecture/deployment.md` |
 | 加载 / 停止一个组件 | `architecture/component-lifecycle.md` + `modules/core/component.md` |
+| 启动 shell / 查看 ksh 命令与限制 | `modules/ksh.md` |
 | 把第三方成熟库（FS / net / TLS / runtime）接成组件 | `architecture/porting.md` |
 | 调用或手写 smoltcp 网络服务 / TCP / UDP | `interfaces/network.md` + `modules/netstack.md` |
 | 接着手写 VFS / Namespace / File service | `interfaces/filesystem.md` + `modules/vfs.md` |

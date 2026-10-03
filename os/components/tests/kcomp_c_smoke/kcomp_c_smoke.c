@@ -21,9 +21,9 @@ _Static_assert(ENODEV == 19, "errno.h shim drift (ENODEV)");
 _Static_assert(EINVAL == 22, "errno.h shim drift (EINVAL)");
 _Static_assert(EKEYREVOKED == 128, "errno.h shim drift (EKEYREVOKED)");
 
-/* 精确契约指纹（值与 Rust 侧 KCOMP_ABI 一致：8 字节 ASCII "KCOMPABI"）。
+/* 精确契约指纹（值与 Rust 侧 KCOMP_ABI 一致；import 签名变化时协调替换）。
  * 必须定义，Core 在调用组件代码前校验其 ELF 定义、边界与值。 */
-const uint64_t kcomp_abi = 0x4B434F4D50414249ULL;
+const uint64_t kcomp_abi = 0x9D73405BB2F816C0ULL;
 
 int32_t kcomp_instance_create(const struct KcompCreateArgs *args, void **out_state) {
     (void)args;

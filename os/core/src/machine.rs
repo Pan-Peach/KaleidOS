@@ -200,7 +200,7 @@ pub enum DeviceLookupError {
     NoSuchOrdinal,
 }
 
-/// 纯设备发现：按 compatible 取第 `ordinal` 个匹配描述符（zero-based）。
+/// 纯设备发现：取第 `ordinal` 个匹配描述符；空 compatible 枚举所有设备。
 ///
 /// - **不分配、不预留、不触碰任何设备寄存器、不读取 claim 状态**；
 /// - 一条描述符匹配**任意** compatible 串即计一次；
@@ -227,7 +227,7 @@ fn nth_compatible_in(
     };
     let mut seen = 0u32;
     for (index, device) in info.devices.iter().enumerate() {
-        if !device.matches(compatible) {
+        if !compatible.is_empty() && !device.matches(compatible) {
             continue;
         }
         if seen == ordinal {
@@ -515,6 +515,23 @@ mod tests {
         assert_eq!(
             nth_compatible_in(None, b"virtio,mmio", 0),
             Err(DeviceLookupError::NoMachineInfo)
+        );
+    }
+
+    #[test]
+    fn unfiltered_discovery_includes_devices_without_compatible() {
+        let info = fixture(vec![device(&[], vec![]), device(&["virtio,mmio"], vec![])]);
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"", 0),
+            Ok(DeviceId::from_raw(0))
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"", 1),
+            Ok(DeviceId::from_raw(1))
+        );
+        assert_eq!(
+            nth_compatible_in(Some(&info), b"", 2),
+            Err(DeviceLookupError::NoSuchOrdinal)
         );
     }
 

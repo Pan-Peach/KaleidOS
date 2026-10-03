@@ -2167,7 +2167,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 46
+    assert len(core.functions) == 49
     assert {"kcore_task_start_on", "kcore_cpu_current"} <= {func.name for func in core.functions}
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
@@ -2177,7 +2177,7 @@ doc = "I/O error"
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
     assert len([func for func in core.functions if func.core_params != func.params]) == 1
-    assert len(core.structs) == 3 and len(component.structs) == 2
+    assert len(core.structs) == 5 and len(component.structs) == 2
     frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
     assert frame.c_name == "kcomp_call_frame" and frame.size_ptrs == 6
     assert [field.name for field in frame.fields] == [
@@ -2195,7 +2195,7 @@ doc = "I/O error"
     assert component.objects[0].name == "kcomp_abi" and component.objects[0].is_const
     assert component.enums[0].c_name == "KcompInterfaceKind"
     kcomp_abi = [const for const in component.constants if const.name == "KCOMP_ABI"][0]
-    assert kcomp_abi.value == 0x4B43_4F4D_5041_4249
+    assert kcomp_abi.value == 0x9D73_405B_B2F8_16C0
     kinds = [const for const in core.constants if const.name.startswith("KIND_")]
     assert [const.value for const in kinds] == list(range(1, 12))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]

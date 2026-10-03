@@ -604,6 +604,37 @@ impl EndpointRegistry {
         self.endpoints.len()
     }
 
+    /// 已提交 endpoint 的只读投影；绝不交付 Direct api / ctx。
+    pub(crate) fn observation(
+        &self,
+        ordinal: usize,
+    ) -> Option<(crate::generated::abi::EndpointInfo, &[u8])> {
+        use crate::generated::abi::{EndpointInfo, EndpointState as WireState};
+        let record = self.endpoints.get(ordinal)?;
+        let name = &self
+            .names
+            .iter()
+            .find(|name| name.endpoint == record.id)?
+            .name;
+        let state = match record.state {
+            EndpointState::Pending => WireState::Pending,
+            EndpointState::Live => WireState::Live,
+            EndpointState::Invalid => WireState::Invalid,
+        };
+        Some((
+            EndpointInfo {
+                id: record.id.raw(),
+                contract: record.contract.raw(),
+                abi: record.abi.raw(),
+                provider: record.owner.raw(),
+                port: record.port,
+                state: state as u32,
+                name_len: name.len() as u32,
+            },
+            name,
+        ))
+    }
+
     pub fn live_count(&self) -> usize {
         self.endpoints
             .iter()
@@ -756,6 +787,34 @@ mod tests {
     }
 
     // -- 1. staged publish + commit ----------------------------------------
+
+    #[test]
+    fn observation_preserves_identity_and_shows_invalidation() {
+        let (reg, ids) = ready_world();
+        let mut endpoints = EndpointRegistry::new();
+        assert!(endpoints.observation(0).is_none());
+        let id = publish_ready(&mut endpoints, &reg, ids[0], b"block", CONTRACT, 7);
+        let (info, name) = endpoints.observation(0).unwrap();
+        assert_eq!(name, b"block");
+        assert_eq!(info.id, id.raw());
+        assert_eq!(info.provider, ids[0].raw());
+        assert_eq!(info.contract, CONTRACT.raw());
+        assert_eq!(info.abi, ABI_A.raw());
+        assert_eq!(info.port, 7);
+        assert_eq!(info.name_len, 5);
+        assert_eq!(
+            info.state,
+            crate::generated::abi::EndpointState::Live as u32
+        );
+        endpoints.invalidate_provider(ids[0]);
+        let (dead, _) = endpoints.observation(0).unwrap();
+        assert_eq!(dead.id, info.id);
+        assert_eq!(
+            dead.state,
+            crate::generated::abi::EndpointState::Invalid as u32
+        );
+        assert!(endpoints.observation(1).is_none());
+    }
 
     #[test]
     fn staged_publish_creates_no_endpoint_until_commit() {

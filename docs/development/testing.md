@@ -51,7 +51,7 @@ Host Test（宿主单测 —— 主体，日常主力）
 ```text
 make check        质量快车道：fmt + clippy -D warnings + host 单测 + RV64 构建 + RV32 check
 make test-host    宿主单测
-make test-qemu    boot smoke + 加载 core_test 并判定 [core-test] all: PASS
+make test-qemu    boot smoke + CoreTest + ksh 串口流程 + shutdown
 make test-arch-smp-rv64  RV64：CPU 启动 / IPI / per-CPU（组件调度由 test-qemu 中的 CoreTest 验证）
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```
@@ -62,6 +62,10 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 
 - 新 Core 功能：host test + 实现同 PR；跨组件 / 系统集成场景进 CoreTest；平台白盒事实进 ArchTest。
 - CoreTest 只走真实 Core API；host fake 上下文后端不算跨域证明。
+
+`tests/qemu/ksh.py` 在 CoreTest 完成后提交真实串口命令，检查输入 / 输出、加载失败后的
+会话存活、cat 与 exit 回到 monitor。这是 shell 用户流程 smoke；driver / FS / scheduler
+的细粒度集成编排仍由 CoreTest 负责。两种硬件 topology 都走这条流程。
 - 同一事实只在一个层次证明，避免三层重复断言。
 
 ## 6. Task park/unpark 契约测试

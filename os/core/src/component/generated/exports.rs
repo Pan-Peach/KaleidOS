@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 46] = [
+pub(super) static EXPORTS: [Export; 49] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -142,7 +142,7 @@ pub(super) static EXPORTS: [Export; 46] = [
     Export {
         name: b"kcore_component_load",
         address: ExportAddress({
-            let implementation: extern "C" fn(*const u8, usize) -> i32 =
+            let implementation: extern "C" fn(*const u8, usize, u32) -> i32 =
                 super::kcore_component_load;
             implementation as *const ()
         }),
@@ -383,6 +383,30 @@ pub(super) static EXPORTS: [Export; 46] = [
                 usize,
                 *mut i32,
             ) -> i32 = super::kcore_endpoint_call;
+            implementation as *const ()
+        }),
+    },
+    // Category 10：Console / observation
+    Export {
+        name: b"kcore_console_read_byte",
+        address: ExportAddress({
+            let implementation: extern "C" fn() -> i32 = super::kcore_console_read_byte;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_component_nth",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, *mut ComponentInfo, *mut u8, usize) -> i32 =
+                super::kcore_component_nth;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_endpoint_nth",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, *mut EndpointInfo, *mut u8, usize) -> i32 =
+                super::kcore_endpoint_nth;
             implementation as *const ()
         }),
     },

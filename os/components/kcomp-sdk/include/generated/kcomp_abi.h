@@ -159,8 +159,67 @@ _Static_assert(offsetof(struct kcore_memory_view, reserved) == 4, "kcore_memory_
 _Static_assert(offsetof(struct kcore_memory_view, base) == 8, "kcore_memory_view.base offset drift");
 _Static_assert(offsetof(struct kcore_memory_view, len) == 16, "kcore_memory_view.len offset drift");
 
+/* 只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。 */
+struct kcore_component_info {
+    uint32_t id;
+    uint32_t state;
+    uint32_t domain;
+    uint32_t name_len;
+};
+_Static_assert(sizeof(struct kcore_component_info) == 16, "kcore_component_info layout drift");
+_Static_assert(_Alignof(struct kcore_component_info) == 4, "kcore_component_info alignment drift");
+_Static_assert(offsetof(struct kcore_component_info, id) == 0, "kcore_component_info.id offset drift");
+_Static_assert(offsetof(struct kcore_component_info, state) == 4, "kcore_component_info.state offset drift");
+_Static_assert(offsetof(struct kcore_component_info, domain) == 8, "kcore_component_info.domain offset drift");
+_Static_assert(offsetof(struct kcore_component_info, name_len) == 12, "kcore_component_info.name_len offset drift");
+
+/* 只读值投影，无 Core / provider 指针。名字写入 caller 缓冲，不含 NUL。 */
+struct kcore_endpoint_info {
+    uint64_t id;
+    uint64_t contract;
+    uint64_t abi;
+    uint32_t provider;
+    uint32_t port;
+    uint32_t state;
+    uint32_t name_len;
+};
+_Static_assert(sizeof(struct kcore_endpoint_info) == 40, "kcore_endpoint_info layout drift");
+_Static_assert(_Alignof(struct kcore_endpoint_info) == 8, "kcore_endpoint_info alignment drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, id) == 0, "kcore_endpoint_info.id offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, contract) == 8, "kcore_endpoint_info.contract offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, abi) == 16, "kcore_endpoint_info.abi offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, provider) == 24, "kcore_endpoint_info.provider offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, port) == 28, "kcore_endpoint_info.port offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, state) == 32, "kcore_endpoint_info.state offset drift");
+_Static_assert(offsetof(struct kcore_endpoint_info, name_len) == 36, "kcore_endpoint_info.name_len offset drift");
+
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
+
+/* Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。 */
+enum KcoreExecutionDomain {
+    KCORE_EXECUTIONDOMAIN_KERNEL_NATIVE = 0,
+    KCORE_EXECUTIONDOMAIN_ISOLATED_NATIVE = 1,
+    KCORE_EXECUTIONDOMAIN_SANDBOXED_NATIVE = 2,
+};
+
+/* Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。 */
+enum KcoreComponentState {
+    KCORE_COMPONENTSTATE_DECLARED = 0,
+    KCORE_COMPONENTSTATE_RESOLVED = 1,
+    KCORE_COMPONENTSTATE_STARTING = 2,
+    KCORE_COMPONENTSTATE_READY = 3,
+    KCORE_COMPONENTSTATE_STOPPING = 4,
+    KCORE_COMPONENTSTATE_STOPPED = 5,
+    KCORE_COMPONENTSTATE_FAILED = 6,
+};
+
+/* Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。 */
+enum KcoreEndpointState {
+    KCORE_ENDPOINTSTATE_PENDING = 0,
+    KCORE_ENDPOINTSTATE_LIVE = 1,
+    KCORE_ENDPOINTSTATE_INVALID = 2,
+};
 
 /* `kcore_endpoint_bind` 的机制编码：**Direct**（同域 KernelNative，provider 的
  * `#[repr(C)]` function table 直接调用；稳态零 Core 介入）。SDK / 组件只**执行**
@@ -219,7 +278,8 @@ uint32_t kcore_component_count(void);
 /* -- Component lifecycle -- */
 /* Core 侧的最小创建操作：按 artifact 名创建新实例（同一 artifact 允许多实例）。 */
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, const struct KcompCreateArgs *args, uint32_t *out_instance);
-int32_t kcore_component_load(const uint8_t *name, size_t len);
+/* 请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。 */
+int32_t kcore_component_load(const uint8_t *name, size_t len, uint32_t domain);
 /* -- Task control -- */
 /* 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
  * （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入
@@ -258,6 +318,7 @@ int32_t kcore_sched_run(void);
  * 存活 + dispatcher；IRQ / service-call / policy 执行上下文内拒绝。 */
 int32_t kcore_sched_set_policy(uint64_t endpoint);
 /* -- Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针） -- */
+/* 纯发现：compatible 为空（非 NULL 指针，len = 0）时枚举全部设备；否则按 compatible 过滤。只返回 DeviceId，非权限。 */
 int32_t kcore_device_nth(const uint8_t *compatible, size_t len, uint32_t ordinal, uint32_t *out_device_id);
 /* 认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。 */
 int32_t kcore_device_claim(uint32_t device_id, uint8_t **out_mmio, size_t *out_len);
@@ -302,6 +363,13 @@ int32_t kcore_endpoint_bind(uint64_t endpoint, uint64_t contract, uint64_t abi, 
  * *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
  * 执行（per-call 栈 / provider principal / re-entry 与 IRQ 门禁 / panic containment）。 */
 int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args, size_t args_len, const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len, int32_t *out_status);
+/* -- Console / observation -- */
+/* 轮询诊断 console。字节 0..255；无输入 -EAGAIN。无输入时做一次有界 idle 等待，caller 可 yield 后重试。 */
+int32_t kcore_console_read_byte(void);
+/* 按 ordinal 复制组件状态与完整名字（不含 NUL）。ENOENT = 枚举完；ENOBUFS = 名字缓冲不足（不截断）。逐次读取，不保证全表原子快照。 */
+int32_t kcore_component_nth(uint32_t ordinal, struct kcore_component_info *out, uint8_t *name, size_t capacity);
+/* 按 ordinal 复制已提交 endpoint（含 Invalid）与完整端口名。ENOENT = 枚举完；ENOBUFS = 名字缓冲不足。不交付 api/ctx。 */
+int32_t kcore_endpoint_nth(uint32_t ordinal, struct kcore_endpoint_info *out, uint8_t *name, size_t capacity);
 
 /* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
  * 

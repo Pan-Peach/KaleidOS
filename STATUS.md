@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-02。此次同步 SMP / task / scheduler 的实现与验证状态，并登记 VFS / SDK / POSIX 与 Core sandbox 骨架；其余章节仍保留此前审计快照。
+更新：2026-10-03。此次登记最小 ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点；SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -31,7 +31,7 @@ KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组�
 ## 2. 系统总览
 
 ```text
-Applications / System Personality        未实现（POSIX 已有骨架；Win32/WASI 是未来）
+Applications / System Personality        ksh 已有 KernelNative shell；应用执行未实现（POSIX 骨架；Win32/WASI 是未来）
         │
 Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS 只有骨架
         │
@@ -275,6 +275,30 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 缺口：PCB、fd、signal、fork/exec/waitpid、mmap/brk 全部没有，而且都应该留在 personality。
 
 下一步：Core sandbox 与 VFS → 用户 write/exit 小程序 → 静态 libc hello → 少量 BusyBox applet → shell。task-AS / trap 路由与等待机制要先定稿；Core 不做成 POSIX 内核。详见 `docs/development/userspace.md` 与第 9 节。
+
+#### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 最小 shell）
+
+现状：独立 `ksh.kcomp`，由 monitor `load scheduler_rr` → `load ksh` 启动普通任务。
+支持 help / echo / clear / components / endpoints / devices / load native 或 isolated /
+inspect 已加载实例 / cat / exit。业务代码只走 SDK。新增 Core 导出仅 console read 与
+component / endpoint 的值枚举；设备观察复用 `device_nth`，装载在既有 `component_load`
+上增加 domain 请求，协调替换 exact ABI fingerprint。命令与文件组合边界见 `docs/modules/ksh.md`。
+
+验证：ksh 8 个 host 用例、SDK 82 个、Core 536 个通过（Core 6 个既有 ignored）；
+`make check` 包括 fmt / Clippy / Kconfig / ABI 生成一致性 / 全部 host / RV64 构建 / RV32 check。
+RV64 与 RV32、default 与 no-block 四条 QEMU 串口链均 PASS：CoreTest → ksh 输入与查询 →
+native / isolated 装载 → 故障或 panic 加载返回 EIO 且 shell 存活 → cat → 超长行恢复 →
+exit → monitor unload → shutdown。回归修复：Isolated create / destroy 设置被调实例边界并
+挂起 caller Core ABI depth；monitor 在串口读取前恢复 Runnable 任务，避免 yield 后抢读。
+RV64 / RV32 各六项 ArchTest PASS：isolated-lifecycle / lifecycle-fault / destroy-fault /
+service-fault / direct-imports / panic-escape；覆盖此次边界复用的正常与失败出口。
+两种架构另验证不经过 CoreTest 的独立启动：先加载 ksh 而无策略时 monitor 仍可交互，
+随后加载 scheduler_rr 启动 shell；空闲输入、无 FS 的 cat 拒绝、exit / unload / shutdown 均 PASS。
+
+缺口：inspect 仅加载后元数据，无未加载 artifact / 任意文件格式检查；FS 无目录 / 工作目录
+契约，因此 ls / cd / pwd unsupported；多 provider 的 cat 无 namespace 选择；尚无 console
+session 仲裁、应用执行或 ExecService。`./hello` 仍依赖 task-AS 绑定、U-mode / trap / exit/fault
+与外置 loader / personality，不在本次范围。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
