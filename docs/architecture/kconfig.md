@@ -40,6 +40,7 @@ Kconfig 前端复用 `third_party/Kconfiglib`（git submodule，pin 到具体 co
 | `KCFG_QEMU_MEM` | QEMU 内存（`1G` / `4G`） |
 | `KCFG_BOOT_FEATURES` | 传给 boot crate 的 Cargo features（如 `supervisor,vm-mmu`） |
 | `KCFG_SELFTEST` | `y` / `n`，决定产物名与 selftest 入口 |
+| `CONFIG_BOOT_COMPONENT` | 启动 artifact basename；空串直接进入 monitor。genmk 校验字符范围，再由 Make 转发给 boot |
 | `CONFIG_<symbol>` | 每个 bool / int symbol 都按解析后的值镜像一份（符号自己的名字，一个数字不造第二个名字；Makefile 把 `CONFIG_TRACE_CAPACITY` 作为环境变量转发给 `os/core/build.rs`） |
 
 所有变量都以 `override` 写出：命令行上误加的 `make KCFG_...=...` 无法制造第二个真相，解析后的 config 永远获胜。构建命令形如：
@@ -61,6 +62,7 @@ cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KC
 | `make olddefconfig` | 用 Kconfig 新默认值刷新 `.config` |
 | `make syncconfig` | 手工改过 `.config` 后重新生成 `$(KCONFIG_CONFIG).mk` |
 | `make savedefconfig` | 导出一份最小 defconfig；文件名由 `OUT_DEFCONFIG=` 指定，默认 `defconfig.out` |
+| `make monitor_defconfig` | 在当前 profile 叠加 `configs/monitor.fragment`，关闭自动启动组件 |
 
 两条工作流：
 
@@ -85,7 +87,11 @@ make menuconfig && make qemu            # 第二条：交互调参后直接构�
 | `TRACE` | bool | y | 结构化 Core trace（`trace::emit`）。关掉即内联空操作、热路径零成本；**跑 benchmark 时应当关掉** |
 | `TRACE_CAPACITY` | int | 1024 | trace ring 容量（records，`range 64 8192`）；Makefile 把 `CONFIG_TRACE_CAPACITY` 交给 `os/core/build.rs` 校验 → OUT_DIR 常量，不是 Cargo feature |
 
-`os/components/Kconfig` 目前是空的扩展点：组件选择留到 loader + manifest 里程碑，Phase 1 不迁移（组件列表仍在 Makefile 的 `KCOMP_SRCS`）。
+`os/components/Kconfig` 定义 string `BOOT_COMPONENT`：普通 RISC-V profile 默认 `init`，
+其它默认空串；SELFTEST 启动路径不消费它。只允许字母、数字、`_`、`-` 或空串，
+genmk 在输出 Make 片段之前验证，避免把路径或 Make/shell 表达式传入构建命令。
+这只选择启动编排者；归档里的组件列表仍在 Makefile `KCOMP_SRCS`，实际运行图由
+[`init`](../modules/init.md) 等组件组合，Core 不决定 filesystem / driver / shell 策略。
 
 ## 4. 设计决策
 
@@ -123,15 +129,16 @@ Kconfig 本身让不可能的组合不可表达：
 - Rust `#[cfg]` / `compile_error!`。它们是**不变式与防御**（例如「build 没选 profile 就报错」），不是配置来源；
 - Cargo `default = [...]` features。`arch` / `core` 上的 default 只作为**独立 host-test 基线**保留；`bootstrap` 没有 default，且 managed kernel build 永远传 `--no-default-features`。
 
-Phase 1 **不迁移**：组件 / 驱动选择、调度器、PMP/MPU、平台发现、其余调试开关。
+本阶段仍不把归档库存里的每个组件 / 驱动做成 Kconfig 开关；只选择初始编排 artifact，
+运行图与调度器选择由它的策略决定。PMP/MPU、平台发现、其余调试开关也未迁移。
 
 ## 6. 如何新增一个 config symbol
 
-1. 加到正确的 `Kconfig`：架构 / 特权级 / VM 级别的东西放 `os/arch/Kconfig`，Core 构建开关放 `os/core/Kconfig`，组件选择（将来）放 `os/components/Kconfig`。优先用 `choice` / `depends on` / `default ... if` 表达约束，而不是事后用 Rust `compile_error!` 兜底；避免 `select`。
+1. 加到正确的 `Kconfig`：架构 / 特权级 / VM 级别的东西放 `os/arch/Kconfig`，Core 构建开关放 `os/core/Kconfig`，组件部署选择放 `os/components/Kconfig`。优先用 `choice` / `depends on` / `default ... if` 表达约束，而不是事后用 Rust `compile_error!` 兜底；避免 `select`。
 2. 如果这个 symbol 要改变构建，把它加进 `scripts/kconfig/genmk.py` 的映射表（**唯一**存放 config → build 的地方），例如往 `KCFG_BOOT_FEATURES` 追加一个 feature。
 3. 如果它改变**构建契约**（target triple、linker、QEMU 二进制、内存），扩展 `genmk.py` 里的 `ARCH_MAP`。
 4. 如果某个 profile 默认要打开它，加到对应的 `configs/*_defconfig`。
-5. 如果某个 Rust crate 编译期需要它，让它成为一个 Cargo feature，由 Makefile 通过生成的 `KCFG_*` 传入；**不要让 crate 自己决定**。
+5. Rust 条件编译开关可用 Cargo feature 传输；数字 / 字符串用同名 `CONFIG_*` 环境变量传入 build.rs 或 `option_env!`。转换与校验集中在 genmk，**不要让 crate 自己决定 profile**。
    **bool 之外的取值（int 等）不拆成"每个值一个 Cargo feature"**：Makefile 把镜像出的 `CONFIG_<symbol>` 作为**环境变量**传给 `os/core/build.rs`，build.rs 校验后写入 `OUT_DIR` 常量（见 `TRACE_CAPACITY`）。build.rs **不读 `.config`**；裸机构建缺值 / 越界直接报错，host 构建（`cargo test` / `clippy`）用显式默认。
 6. 命名禁止版本后缀（`V1`、`_v2`）：契约变了就原地替换，不做兼容别名。
 

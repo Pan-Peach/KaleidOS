@@ -5,13 +5,15 @@
 
 ## 组件 crates
 
-实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smp`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 是组件选择扩展点（当前无符号）。
+实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`、`init`、`ksh`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smp`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 定义初始编排者 `BOOT_COMPONENT`。
 
 **test-only 与生产的分界**：test-only fixture / 组件一律放 `os/components/tests/`；`.kcomp` 名取目录 basename（`load <basename>`），所以搬路径不改组件名，`load core_test` / `load kcomp_c_smoke` 等运行时契约不变。
 
 | 组件 | 路径 | 形态 | 一句话 |
 |---|---|---|---|
-| `core_test` | `os/components/tests/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend / smp） |
+| `core_test` | `os/components/tests/core_test/` | Rust `.kcomp` | CoreTest 板内自检 + **唯一的组件/系统集成测试编排者**；只走 `kcore_*` 白名单（分组 boot / sched / resource / trace + 场景 filesystem / driver / c_frontend / smp） |
+| `init` | `os/components/init/` | Rust `.kcomp` | 普通 profile 启动编排：scheduler / prober / FAT root / ksh；见 [`init.md`](init.md) |
+| `ksh` | `os/components/ksh/` | Rust `.kcomp` | KernelNative 交互会话与文件读取；见 [`ksh.md`](ksh.md) |
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；每 CPU cursor 是实例状态，只提议下一个 `TaskId` |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | 协议无关设备 prober（总线角色）：opaque compatible 粗匹配；逐台以扁平 create config 下发 `(device_id, 结果端口名)`，create 返回后 pull 驱动的 `probe.result`，本地更新 cursor（**无环**，driver 不回调） |
 | `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
@@ -66,8 +68,8 @@
 
 ## 测试 / smoke vs 真实组件
 
-- **真实策略 / 服务 / 驱动**：`scheduler_rr`（policy）、`driver_prober`（service）、`drivers/virtio_blk`（driver）、`filesystems/fatfs`（service）。
-- **测试 / smoke / 基准**：`core_test`（CoreTest **权威**：唯一的组件 / 系统集成编排者，见 [testing.md §3](../development/testing.md)，但仍只是 test-only 镜像，故与 fixture 同放 `tests/`）、`kcomp_smoke`、`kcomp_c_smoke`、`kcomp_panic`、`kcomp_isolated`（按域装载 fixture）、`kcomp_isolated_life`（Isolated 生命周期 / destroy 故障注入 fixture）、`kcomp_isolated_svc`（跨域服务 provider fixture）、`kcomp_isolated_bad`（放段失败 fixture）、`kcomp_min`（host fixture）——全部在 `os/components/tests/`；`kbench`（度量）留在生产位置。
+- **真实策略 / 服务 / 驱动**：`init`（启动编排）、`ksh`（会话）、`scheduler_rr`（policy）、`driver_prober`（service）、`drivers/virtio_blk`（driver）、`filesystems/fatfs`（service）。
+- **测试 / smoke / 基准**：`core_test`（CoreTest **权威**：唯一的组件 / 系统集成测试编排者，见 [testing.md §3](../development/testing.md)，但仍只是 test-only 镜像，故与 fixture 同放 `tests/`）、`kcomp_smoke`、`kcomp_c_smoke`、`kcomp_panic`、`kcomp_isolated`（按域装载 fixture）、`kcomp_isolated_life`（Isolated 生命周期 / destroy 故障注入 fixture）、`kcomp_isolated_svc`（跨域服务 provider fixture）、`kcomp_isolated_bad`（放段失败 fixture）、`kcomp_min`（host fixture）——全部在 `os/components/tests/`；`kbench`（度量）留在生产位置。
 
 ## 明确不做
 

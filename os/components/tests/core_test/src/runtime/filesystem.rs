@@ -108,9 +108,18 @@ fn create(image: &[u8]) -> Option<u32> {
 /// 创建“只带 EndpointId”的实例（config 布局与 ABI 指纹由调用方给出）。
 fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<u32> {
     let config = EndpointCreateConfig { endpoint };
+    // FatFs must decode opaque bytes even when the payload is not u64-aligned.
+    #[repr(align(8))]
+    struct UnalignedConfig([u8; 9]);
+    let mut bytes = UnalignedConfig([0; 9]);
+    bytes.0[1..].copy_from_slice(&endpoint.to_ne_bytes());
     let args = KcompCreateArgs {
         config_abi,
-        config: (&config as *const EndpointCreateConfig).cast(),
+        config: if image == FATFS {
+            bytes.0[1..].as_ptr().cast()
+        } else {
+            (&config as *const EndpointCreateConfig).cast()
+        },
         config_len: core::mem::size_of::<EndpointCreateConfig>(),
     };
     let mut instance = 0u32;

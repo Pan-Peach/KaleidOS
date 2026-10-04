@@ -44,7 +44,7 @@ scripts/       Kconfig 胶水脚本：kconfig/configure.py（创建/归一化 .c
 os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
   boot/            成品镜像层（bin，按目标架构分目录）：riscv/ ——
                    RV64/Sv39 与 RV32/Sv32 profile 共用 RISC-V family，
-                   _start → FDT discovery → MachineInfo → core::init() → Core Monitor，
+                   _start → FDT discovery → MachineInfo → core::init() → init → ksh（monitor 可回退），
                    与 core 链接成 kaleidos-<arch>（单镜像，职责分离装载合一）
   core/            Resource Core **library**（host-testable）：task/memory/resource/component/irq/timer/trace/machine/print
   arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
@@ -62,7 +62,7 @@ tools/         构建辅助脚本（build-kcomp.sh 等）
 
 **架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（全部 QEMU 端到端验证，RV64 + RV32 双 profile）：
 
-- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → **Core Monitor 交互 shell**（`core> help/machine/memory/tasks/load/components/catalog/shutdown/reboot`；行编辑支持光标移动/退格/Ctrl-U·K·W、8 条历史 ↑/↓、Tab 命令补全；空闲时不忙等——arm ~10ms one-shot timer 后 `wfi`，由时钟中断唤醒）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
+- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → profile 选中的 `init.kcomp` → scheduler / prober / FAT root → **ksh**；空启动配置或 init 失败回到 **Core Monitor**（`core> help/machine/memory/tasks/load/components/catalog/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
 - **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
 - **组件加载链**（Linux insmod 教学版，语言无关）：`.kcomp`（ELF32/ELF64 ET_REL；Rust 走 `tools/build-kcomp.sh`，freestanding C 走 `tools/build-kcomp-c.sh`）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令。C 组件只 `#include "kcomp.h"` 直调 `kcore_*`，SDK 的 C 运行时（`kcomp-sdk/c/kcomp_rt.c`，weak `mem*`）随组件私有携带；`make test-qemu`（CoreTest `c-frontend` + runner 机器级 `load`/`unload kcomp_c_smoke`）用最小 C 组件在 RV64/RV32 端到端验证
 - **导出白名单**（EXPORT_SYMBOL 教学版，一组 `kcore_*`：内存域视图 `kcore_memory_acquire/release` + 输出 + 机器/系统只读查询 + 组件加载 / endpoint 发布 / 任务 / 调度 + 设备/IRQ/DMA 机制 `kcore_device_nth`（纯发现）/`kcore_device_claim/release`（认领确切设备，返回本执行域 MMIO 窗口） + `kcore_irq_register/enable/disable/release`（锚在已认领 `(DeviceId, resource_index)`；设备中断资源可多条） + `kcore_dma_alloc/free/map/unmap`（allocation 与 mapping 分离，backing 撤销进 QUARANTINE），错误码统一 `0/-Errno`）
@@ -103,9 +103,11 @@ make olddefconfig               # 用新默认值刷新 .config
 
 主工作流：`make <board>_defconfig && make qemu`。
 
-第一个组件 shell 已可手动启动：在 `core>` 输入 `load scheduler_rr`，再输入 `load ksh`。
-`ksh> help` 查看命令，`exit` 回到 monitor。命令、文件服务组合要求和当前限制见
-[`docs/modules/ksh.md`](docs/modules/ksh.md)。
+普通 RISC-V profile 默认自动启动 `init.kcomp`，组合调度器、驱动、FAT 根盘并进入 ksh。
+`ksh> cat 0:/HELLO.TXT` 读取根盘，`help` 查看命令，`exit` 回到 monitor。
+`make monitor_defconfig` 关闭自动组合，下次启动可在 `core>` 手动 `load init`，或
+`load scheduler_rr` → `load ksh`。启动策略见 [`docs/modules/init.md`](docs/modules/init.md)，
+shell 命令与限制见 [`docs/modules/ksh.md`](docs/modules/ksh.md)。
 
 ## 文档
 

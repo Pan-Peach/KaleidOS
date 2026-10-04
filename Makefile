@@ -87,7 +87,7 @@ OUTPUT := kaleidos-$(KCFG_ARCH)$(if $(filter y,$(KCFG_SELFTEST)),-selftest,)
 CORE_OUTPUT := kaleidos-$(KCFG_ARCH)-core
 
 # ————————————————————————— configuration targets —————————————————————————
-.PHONY: menuconfig olddefconfig savedefconfig syncconfig defconfig help FORCE
+.PHONY: menuconfig olddefconfig savedefconfig syncconfig defconfig monitor_defconfig selftest_defconfig help FORCE
 
 menuconfig:
 	@KCONFIG_CONFIG=$(KCONFIG_CONFIG) python3 $(KCONFIGLIB)/menuconfig.py $(KCONFIG_TOP)
@@ -113,6 +113,10 @@ defconfig:
 	@$(CONFIGURE) --defconfig configs/$@ --out $(KCONFIG_CONFIG)
 	@echo "$@: $(KCONFIG_CONFIG) written"
 
+# Leave composition to the monitor (CoreTest uses this fragment).
+monitor_defconfig:
+	@$(CONFIGURE) --base $(KCONFIG_CONFIG) --fragment configs/monitor.fragment --out $(KCONFIG_CONFIG)
+
 # Lay the selftest fragment (CONFIG_SELFTEST=y) on top of the current profile.
 selftest_defconfig:
 	@$(CONFIGURE) --base $(KCONFIG_CONFIG) --fragment configs/selftest.fragment --out $(KCONFIG_CONFIG)
@@ -124,6 +128,7 @@ help:
 	@echo "  make qemu_rv64_defconfig         RV64 / supervisor / MMU"
 	@echo "  make qemu_rv32_defconfig         RV32 / supervisor / MMU"
 	@echo "  make qemu_rv32_nommu_defconfig   RV32 / supervisor / NoMMU"
+	@echo "  make monitor_defconfig           disable initial component; boot Core Monitor"
 	@echo "  make olddefconfig                refresh .config with new defaults"
 	@echo "KaleidOS — build"
 	@echo "  make kernel                      build kaleidos-\$$(KCFG_ARCH)"
@@ -132,6 +137,7 @@ help:
 	@echo "  make qemu-core                   run the Core-only dev image (no rootfs drive)"
 	@echo "  make rootfs                      build the small FAT image attached to make qemu"
 	@echo "  make check | test | test-host | test-qemu | test-arch"
+	@echo "  make test-init                   RV64/RV32 automatic boot composition workflows"
 	@echo "  make abi-gen | abi-check         ABI 单一来源：abi/*.toml → 生成 C/Rust（check 只校验）"
 
 # Materialise a configuration on first use.
@@ -152,8 +158,8 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # 列表是**相对 os/components 的源码目录**；.kcomp 名取目录 basename（`load <basename>`），
 # 因此 test-only fixture 可以整体挪进 tests/ 而不改组件名。test-only fixture/组件
 # 一律放 os/components/tests/（见 AGENTS.md），生产组件留在 os/components/。
-# Phase 1 不迁移组件选择：列表留在 Makefile，直到 loader + manifest 里程碑。
-KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_smp tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober filesystems/vfs personalities/posix network/netstack ksh kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
+# 归档库存列表留在 Makefile；运行图由 BOOT_COMPONENT 选中的组件编排。
+KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_smp tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober filesystems/vfs personalities/posix network/netstack init ksh kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs
@@ -201,7 +207,7 @@ init.kpkg:
 # os/core/build.rs 与 os/arch/build.rs 校验后写入 OUT_DIR 常量（Kconfig 仍是唯一
 # 真相，见 docs/architecture/kconfig.md）。
 kernel: init.kpkg
-	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && CONFIG_BOOT_COMPONENT="$(CONFIG_BOOT_COMPONENT)" CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(OUTPUT)
 	@echo "built: $(OUTPUT) (features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 
@@ -217,7 +223,7 @@ kernel: init.kpkg
 core:
 	@mkdir -p $(CURDIR)/tools/qemu
 	printf '' | cpio -o -H newc --quiet > $(CURDIR)/tools/qemu/init.kpkg
-	cd $(BOOT_DIR) && KALEIDOS_CORE_ONLY=1 CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
+	cd $(BOOT_DIR) && KALEIDOS_CORE_ONLY=1 CONFIG_BOOT_COMPONENT="$(CONFIG_BOOT_COMPONENT)" CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET) --release
 	cp $(KERNEL) $(CORE_OUTPUT)
 	@echo "built: $(CORE_OUTPUT) (core-only, features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 	@echo "WARNING: tools/qemu/init.kpkg is now EMPTY; the next 'make kernel' rebuilds the real one (init.kpkg is .PHONY)."
@@ -284,6 +290,7 @@ OUR_CRATES := -p kernel -p arch -p scheduler_rr -p core_test
 fmt:
 	cargo fmt $(OUR_CRATES)
 	cd os/components/kcomp-sdk && cargo fmt
+	cd os/components/init && cargo fmt
 	cd os/components/ksh && cargo fmt
 	cd os/components/driver_prober && cargo fmt
 	cd os/components/filesystems/vfs && cargo fmt
@@ -306,6 +313,7 @@ clippy:
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET)
 	cd os/components/kcomp-sdk && cargo clippy --all-targets
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET)
+	cd os/components/init && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/ksh && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/filesystems/vfs && cargo clippy --target $(KCFG_TARGET)
 	cd os/components/personalities/posix && cargo clippy --target $(KCFG_TARGET)
@@ -320,6 +328,7 @@ test-host:
 	cargo test --workspace
 	cd os/components/kcomp-sdk && cargo test
 	cd os/components/driver_prober && cargo test
+	cd os/components/init && cargo test
 	cd os/components/ksh && cargo test
 	cd os/components/kbench && cargo test
 	cd os/components/tests/drivers/ram_blk && cargo test
@@ -356,10 +365,10 @@ bench:
 
 # 交叉构建门禁：每个 profile 用一份私有 .config（互不污染，也不动用户的 .config）。
 boot-build:
-	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_BOOT_COMPONENT="$(CONFIG_BOOT_COMPONENT)" CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" RUSTFLAGS="$(BOOT_RUSTFLAGS)" cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 boot-check:
-	cd $(BOOT_DIR) && CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
+	cd $(BOOT_DIR) && CONFIG_BOOT_COMPONENT="$(CONFIG_BOOT_COMPONENT)" CONFIG_MAX_CPUS="$(CONFIG_MAX_CPUS)" CONFIG_TRACE_CAPACITY="$(CONFIG_TRACE_CAPACITY)" cargo check --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KCFG_TARGET)
 
 # 内部：两个架构的交叉构建门禁（`make check` 的一步）。
 _test-build:
@@ -377,18 +386,39 @@ _test-build:
 #             干净结束，CoreTest 断言 NoMatch 路径而不是 attach。
 _test-qemu-rv64:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config qemu_rv64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config monitor_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv64/.config _test-qemu-one
 
 _test-qemu-rv32:
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config qemu_rv32_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config monitor_defconfig
 	@$(MAKE) KCONFIG_CONFIG=build/configs/qemu-rv32/.config _test-qemu-one
 
 _test-qemu-one: kernel
 	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --scenario default
 	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --scenario no-block
 
-# 公开入口：两个架构各跑两个场景。
-test-qemu: _test-qemu-rv64 _test-qemu-rv32
+# 自动 init：实际 FAT 盘、无盘、坏 FAT 盘（挂载失败回 monitor）。
+.PHONY: test-init _test-init-rv64 _test-init-rv32 _test-init-one
+# These profiles share build/kpkg and the embedded archive; serialize builds.
+.NOTPARALLEL: test-qemu test-init
+_test-init-rv64:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/init-rv64/.config qemu_rv64_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/init-rv64/.config _test-init-one
+
+_test-init-rv32:
+	@$(MAKE) KCONFIG_CONFIG=build/configs/init-rv32/.config qemu_rv32_defconfig
+	@$(MAKE) KCONFIG_CONFIG=build/configs/init-rv32/.config _test-init-one
+
+_test-init-one: kernel rootfs
+	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario fat
+	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario no-block
+	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario bad-fat
+
+test-init: _test-init-rv64 _test-init-rv32
+
+# 公开入口：CoreTest / ksh 流程 + 默认 init 启动流程，均覆盖两个架构。
+test-qemu: _test-qemu-rv64 _test-qemu-rv32 test-init
 
 # White-box architectural selftests use a separate image: the private archtest
 # profile = the board defconfig + configs/selftest.fragment (CONFIG_SELFTEST=y),
@@ -462,6 +492,7 @@ check: init.kpkg
 	cargo fmt $(OUR_CRATES) -- --check
 	cd os/components/kcomp-sdk && cargo fmt -- --check
 	cd os/components/driver_prober && cargo fmt -- --check
+	cd os/components/init && cargo fmt -- --check
 	cd os/components/ksh && cargo fmt -- --check
 	cd os/components/filesystems/vfs && cargo fmt -- --check
 	cd os/components/personalities/posix && cargo fmt -- --check
@@ -477,6 +508,7 @@ check: init.kpkg
 	cargo clippy -p core_test -p scheduler_rr --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/kcomp-sdk && cargo clippy --all-targets -- -D warnings
 	cd os/components/driver_prober && cargo clippy --target $(KCFG_TARGET) -- -D warnings
+	cd os/components/init && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/ksh && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/filesystems/vfs && cargo clippy --target $(KCFG_TARGET) -- -D warnings
 	cd os/components/personalities/posix && cargo clippy --target $(KCFG_TARGET) -- -D warnings

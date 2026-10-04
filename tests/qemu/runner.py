@@ -7,7 +7,7 @@ Usage:  python3 tests/qemu/runner.py --arch <rv64|rv32> --kernel <path> \
 Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT),
 e.g. `kaleidos-rv64`), so the runner never has to guess which image belongs to
 the selected profile.  Select a profile first, e.g.
-`make qemu_<arch>_defconfig`, then `make kernel`:
+`make qemu_<arch>_defconfig`, `make monitor_defconfig`, then `make kernel`:
 
 1. boot smoke —— wait for the arch boot marker, then the Core Monitor banner;
 2. C frontend (machine level) —— `load kcomp_c_smoke` must print
@@ -18,7 +18,7 @@ the selected profile.  Select a profile first, e.g.
    lifecycle);
 3. CoreTest —— type `load core_test`, require `load core_test: OK`, every
    expected `[core-test] <case>: PASS` line and the `[core-test] all: PASS`
-   verdict.  CoreTest is the **single component/system integration
+   verdict.  CoreTest is the **single component/system integration test
    orchestrator**: the filesystem chains, the driver_prober -> virtio_blk flow
    and the C-frontend lifecycle are asserted inside CoreTest, not here.  The
    runner only boots the machine and reads CoreTest's machine-readable verdict.
@@ -237,7 +237,7 @@ def main() -> int:
     kernel = args.kernel if os.path.isabs(args.kernel) else os.path.join(REPO, args.kernel)
     if not os.path.exists(kernel):
         print(f"FAIL: kernel {kernel} not found "
-              f"(select a profile, e.g. `make qemu_{arch}_defconfig`, then `make kernel`)")
+              f"(select `make qemu_{arch}_defconfig`, `make monitor_defconfig`, then `make kernel`)")
         return 1
 
     os.makedirs(LOGS_DIR, exist_ok=True)

@@ -60,7 +60,7 @@ def expect_fail(result, what, *needles):
 
 def mk_var(text, name):
     """Value of an `override NAME := ...` line in a generated fragment."""
-    match = re.search(rf"^override {name}\s*:=\s*(.*)$", text, re.MULTILINE)
+    match = re.search(rf"^override {name}[ \t]*:=[ \t]*(.*)$", text, re.MULTILINE)
     if match is None:
         raise CheckFailed(f"{name} missing from the generated fragment")
     return match.group(1).strip()
@@ -162,6 +162,28 @@ def check_clean_kernel_gets_config(tmp):
                           + result.stdout)
 
 
+def check_initial_component_selection(tmp):
+    """The profile owns boot selection, including explicit monitor fallback."""
+    config = build_config(tmp, "qemu_rv64")
+    if mk_var(read(config + ".mk"), "CONFIG_BOOT_COMPONENT") != "init":
+        raise CheckFailed("normal RISC-V profile does not select init")
+    result = run(["make", "-n", f"KCONFIG_CONFIG={config}",
+                  "CONFIG_BOOT_COMPONENT=ignored", "kernel"])
+    expect_ok(result, "boot component transport")
+    if 'CONFIG_BOOT_COMPONENT="init"' not in result.stdout:
+        raise CheckFailed("boot component lost its resolved config:\n" + result.stdout)
+    expect_ok(configure(config, "--base", config, "--fragment",
+                        "configs/monitor.fragment"), "monitor fragment")
+    expect_ok(run(GENMK + ["--config", config, "--mk", config + ".mk"]), "monitor")
+    if mk_var(read(config + ".mk"), "CONFIG_BOOT_COMPONENT") != "":
+        raise CheckFailed("monitor fragment did not disable initial composition")
+    for name in ["../init", "init;echo", "$(shell false)"]:
+        expect_ok(configure(config, "--base", config, "--set",
+                            f'CONFIG_BOOT_COMPONENT="{name}"'), "invalid basename config")
+        expect_fail(run(GENMK + ["--config", config, "--mk", config + ".mk"]),
+                    "unsafe boot component", "BOOT_COMPONENT", "basename")
+
+
 def check_fmt_check_gets_config(tmp):
     """`make fmt check` 里 check 仍拿到 KCFG_*（config 驱动的递归构建门禁）。
 
@@ -224,6 +246,7 @@ CHECKS = (
     check_unknown_set_fails,
     check_trace_capacity_has_one_name,
     check_clean_kernel_gets_config,
+    check_initial_component_selection,
     check_fmt_check_gets_config,
     check_clean_on_fresh_checkout,
     check_fresh_tree_autocreates_default_profile,

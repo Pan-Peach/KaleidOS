@@ -26,7 +26,7 @@ Host Test（宿主单测 —— 主体，日常主力）
 |---|---|---|
 | **Host Test** | Core 与硬件无关的 truth logic：帧 / 区域所有权、任务状态机、设备·IRQ·DMA 归属、组件生命周期、地址空间语义、策略验证、ELF/parser；RISC-V 纯算法（重定位、Sv32/Sv39 页表编码与 walk）host 测**生产实现** | `cargo test`（`make test-host`） |
 | **Property Test** | Core 不变式的随机化验证（proptest，dev-dependency、仅 host）：AddressSpace 随机序列四不变式、parser never-panic、生命周期状态机 | host |
-| **CoreTest** | Core 与 Arch / Machine Discovery 的真实契约，以普通 `.kcomp` 身份运行（无 god-mode）；也是**唯一**的组件 / 系统集成编排者：用真实组件 + SDK client 复现 block / filesystem / prober / c-smoke 场景 | `make test-qemu` |
+| **CoreTest** | Core 与 Arch / Machine Discovery 的真实契约，以普通 `.kcomp` 身份运行（无 god-mode）；也是**唯一**的组件 / 系统集成测试编排者：用真实组件 + SDK client 复现 block / filesystem / prober / c-smoke 场景 | `make test-qemu` |
 | **ArchTest** | feature-gated test kernel，跑在**完整 `core::init` + runtime VM 之后**（device MMIO 已映射），直接验证 Arch/HAL 与真实 CPU/设备的契约：trap/scause、页表权限生效（RO/NX/未映射 fault）、context switch 寄存器保存、timer 与外部中断实际投递；每 case 单独 QEMU | `make test-arch` |
 | **Real Hardware** | 最终真机验证 | —— |
 
@@ -51,7 +51,8 @@ Host Test（宿主单测 —— 主体，日常主力）
 ```text
 make check        质量快车道：fmt + clippy -D warnings + host 单测 + RV64 构建 + RV32 check
 make test-host    宿主单测
-make test-qemu    boot smoke + CoreTest + ksh 串口流程 + shutdown
+make test-qemu    CoreTest + ksh 串口流程 + init 启动流程 + shutdown
+make test-init    RV64/RV32：默认 FAT 挂载、无盘会话、坏盘 monitor 回退
 make test-arch-smp-rv64  RV64：CPU 启动 / IPI / per-CPU（组件调度由 test-qemu 中的 CoreTest 验证）
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```
@@ -66,6 +67,11 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 `tests/qemu/ksh.py` 在 CoreTest 完成后提交真实串口命令，检查输入 / 输出、加载失败后的
 会话存活、cat 与 exit 回到 monitor。这是 shell 用户流程 smoke；driver / FS / scheduler
 的细粒度集成编排仍由 CoreTest 负责。两种硬件 topology 都走这条流程。
+
+CoreTest 的私有 profile 叠加 `configs/monitor.fragment`，避免默认 init 提前认领设备。
+`tests/qemu/init_runner.py` 另用普通 board profile 检查 boot → init → FAT root → ksh
+的用户流程，以及无盘 / 坏盘分支；使用独立磁盘副本，未把断言塞入生产 init。
+
 - 同一事实只在一个层次证明，避免三层重复断言。
 
 ## 6. Task park/unpark 契约测试

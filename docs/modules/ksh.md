@@ -9,7 +9,8 @@
 的存在与生命周期仍由 Core 裁决；文件语义由 filesystem provider 提供。业务代码只依赖
 SDK 值查询与服务前端，没有 Core registry 指针或执行域分支。
 
-普通 QEMU profile 已把 `ksh.kcomp` 打进 init.kpkg。在 Core Monitor 输入：
+普通 QEMU profile 默认由 [`init`](init.md) 组合调度器 / driver / FAT root 并启动 ksh。
+选择 `make monitor_defconfig` 后也可在 Core Monitor 手动输入：
 
 ```text
 core> load scheduler_rr
@@ -22,7 +23,7 @@ core>
 
 create 只启动一个普通组件任务；会话占用串口输入直到 `exit` 或空行 Ctrl-D。
 退出后任务 Exited，组件仍是 Ready，可由 monitor `unload ksh`。没有替换 boot monitor
-或加入自动启动策略。当前没有 console session 仲裁，不要并发启动多个 shell。
+的调试入口；自动启动策略在 init 组件。当前没有 console session 仲裁，不要并发启动多个 shell。
 monitor 在读输入前先服务本 CPU Runnable 任务；单个 shell 在 idle yield 后先恢复，
 monitor 不抢读它的下一条命令。未安装调度策略时 monitor 仍可用于完成初始组合。
 

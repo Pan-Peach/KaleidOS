@@ -15,6 +15,7 @@ Run from the repository root:
 
 import argparse
 import os
+import re
 import sys
 
 # Reuse the pinned Kconfiglib submodule (third_party/Kconfiglib); fall back to an
@@ -105,6 +106,9 @@ def variables(kconf):
         features.append("selftest")
 
     arch_name, target, linker, qemu, qemu_mem, boot_dir = ARCH_MAP[arch]
+    boot_component = kconf.syms["BOOT_COMPONENT"].str_value
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", boot_component):
+        sys.exit("error: BOOT_COMPONENT must be an artifact basename (letters, digits, _ or -)")
     lines = [
         ("KCFG_ARCH", arch_name),
         ("KCFG_TARGET", target),
@@ -114,6 +118,7 @@ def variables(kconf):
         ("KCFG_BOOT_DIR", boot_dir),
         ("KCFG_BOOT_FEATURES", ",".join(features)),
         ("KCFG_SELFTEST", "y" if is_y(kconf, "CONFIG_SELFTEST") else "n"),
+        ("CONFIG_BOOT_COMPONENT", boot_component),
     ]
     # Mirror every BOOL as CONFIG_<name>=y/n and every INT as its resolved
     # decimal value: 这是 Kconfig 符号自己的名字，Makefile 直接消费（例如把

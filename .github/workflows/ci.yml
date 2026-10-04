@@ -27,7 +27,7 @@ jobs:
       - name: Make check
         run: make check
 
-  # QEMU 车道：RV64/RV32 真实启动 + 自动 CoreTest（慢，独立 job）
+  # QEMU 车道：RV64/RV32 CoreTest + init/ksh 启动流程（慢，独立 job）
   qemu:
     runs-on: ubuntu-latest
     steps:
@@ -40,8 +40,8 @@ jobs:
         run: |
           rustup target add riscv64gc-unknown-none-elf
           rustup target add riscv32imac-unknown-none-elf
-      - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      - name: Install QEMU and FAT image tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc dosfstools mtools
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

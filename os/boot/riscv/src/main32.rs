@@ -338,6 +338,7 @@ extern "C" fn bootstrap_main(hart_id: usize, dtb_pa: usize, kernel_pa: usize) ->
         }
         // 显式开全局中断：各本地源已在 kernel::init 中解源。
         arch::CpuImpl::enable_irq();
+        crate::composition::start();
         kernel::monitor::run();
     }
 }

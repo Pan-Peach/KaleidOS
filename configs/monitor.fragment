@@ -1,0 +1,2 @@
+# CoreTest composes its own graph; leave initial composition to the monitor.
+CONFIG_BOOT_COMPONENT=""

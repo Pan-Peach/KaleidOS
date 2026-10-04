@@ -14,6 +14,23 @@ pub fn load(name: &[u8], domain: ExecutionDomain) -> Result<u32> {
     }
 }
 
+/// Flat create config borrowed only until the provider's create returns.
+pub fn create(name: &[u8], config_abi: u64, config: &[u8]) -> Result<u32> {
+    let args = abi::KcompCreateArgs {
+        config_abi,
+        config: config.as_ptr().cast(),
+        config_len: config.len(),
+    };
+    let mut id = 0;
+    // SAFETY: name/config/args remain valid for this synchronous call.
+    let code = unsafe { abi::kcore_component_create(name.as_ptr(), name.len(), &args, &mut id) };
+    if code == 0 {
+        Ok(id)
+    } else {
+        Err(Errno::from_code(code))
+    }
+}
+
 pub fn component_nth(ordinal: u32, name: &mut [u8]) -> Result<Option<ComponentInfo>> {
     let mut out = MaybeUninit::uninit();
     // SAFETY: outputs are caller-owned for this call.
@@ -80,6 +97,17 @@ pub fn start_task(entry: abi::KcompTaskEntry) -> Result<u32> {
 
 pub fn yield_task() -> Result<()> {
     let code = unsafe { abi::kcore_task_yield() };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_code(code))
+    }
+}
+
+/// Enter scheduling from an anchor (not from a task or service callback).
+/// Returns when control reaches that anchor again; this is not a task join.
+pub fn run_tasks() -> Result<()> {
+    let code = unsafe { abi::kcore_sched_run() };
     if code == 0 {
         Ok(())
     } else {

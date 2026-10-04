@@ -12,6 +12,7 @@
 #include "diskio_kaleidos.h"
 #include "fatfs_internal.h"
 #include <errno.h>
+#include <string.h>
 
 /* create config（组合策略提供；Core 视为不透明字节）。
  *
@@ -20,7 +21,7 @@
  *              没有 endpoint 就没有块设备。
  *
  * `config_abi` 是布局指纹（8 字节 ASCII "FATFSCFG" 的大端读数）：对不上直接拒绝
- * 创建，不静默按空配置跑。组合方（CoreTest）的 create config 定义见
+ * 创建，不静默按空配置跑。组合方（init / CoreTest）的 create config 定义见
  * `os/components/tests/core_test/src/runtime/filesystem.rs`（同一布局、同一指纹）。 */
 struct fatfs_create_config
 {
@@ -62,8 +63,9 @@ int32_t kcomp_instance_create(
         return -EINVAL;
     }
 
-    const struct fatfs_create_config *config =
-        (const struct fatfs_create_config *)args->config;
+    /* Opaque byte payloads need not have uint64_t alignment. */
+    struct fatfs_create_config config;
+    memcpy(&config, args->config, sizeof(config));
 
     /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
     struct kcore_memory_view state_region;
@@ -78,7 +80,7 @@ int32_t kcomp_instance_create(
      * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
      * 不选择、也看不到机制。 */
     int32_t result = kcomp_block_bind(
-        config->endpoint,
+        config.endpoint,
         KCOMP_BLOCK_DEVICE_CONTRACT,
         KCOMP_BLOCK_DEVICE_ABI,
         &state->block_binding);

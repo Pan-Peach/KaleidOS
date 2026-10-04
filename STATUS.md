@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-03。此次登记最小 ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点；SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
+更新：2026-10-03。此次登记最小 init / ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点；SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -278,7 +278,7 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 
 #### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 最小 shell）
 
-现状：独立 `ksh.kcomp`，由 monitor `load scheduler_rr` → `load ksh` 启动普通任务。
+现状：独立 `ksh.kcomp`，普通 profile 由 init 自动启动；monitor 也可 `load scheduler_rr` → `load ksh` 启动普通任务。
 支持 help / echo / clear / components / endpoints / devices / load native 或 isolated /
 inspect 已加载实例 / cat / exit。业务代码只走 SDK。新增 Core 导出仅 console read 与
 component / endpoint 的值枚举；设备观察复用 `device_nth`，装载在既有 `component_load`
@@ -299,6 +299,27 @@ service-fault / direct-imports / panic-escape；覆盖此次边界复用的正�
 契约，因此 ls / cd / pwd unsupported；多 provider 的 cat 无 namespace 选择；尚无 console
 session 仲裁、应用执行或 ExecService。`./hello` 仍依赖 task-AS 绑定、U-mode / trap / exit/fault
 与外置 loader / personality，不在本次范围。
+
+#### 3.28 init `▰▰▰▰▱` IMPLEMENTED（最小启动编排）
+
+现状：普通 KernelNative `init.kcomp`，create 选择 scheduler_rr → 运行 driver_prober →
+把唯一 Live block EndpointId 作为 FatFs config → 任务上下文挂载 FAT → 启动 ksh。
+无块盘进入纯 console 会话；挂载失败使 init Failed 并回到 monitor，部分组件图保留可诊断。
+`CONFIG_BOOT_COMPONENT` 由 Kconfig 选择启动 artifact，普通 RISC-V profile 默认 init；
+空串直接 monitor，SELFTEST 绕过组件启动链。没有新增 Core 导出或改变 ABI 指纹。
+实现、使用与失败边界见 `docs/modules/init.md`。
+
+验证：`make check` 通过；Core host 536 PASS / 6 ignored、SDK 82、init 2、ksh 8，
+Kconfig 胶水 12/12，ABI 16 个生成物一致。`make test-qemu` 全通过：RV64/RV32 各两条
+原 CoreTest / ksh 流程与各三条 FAT、no-block、bad-fat 自动 init 流程。真实 FAT 文件读回、
+init Ready/Failed、task-context 重入拒绝、坏盘 monitor 恢复与 shutdown 均有串口证据。
+FatFs 改为 memcpy 解码不透明 config 字节；CoreTest 的 block-chain 使用偏移 1 字节的
+非对齐配置，双架构 PASS。日志见 `tests/qemu/logs/*20261003-230*.log`。
+另用私有 `qemu_rv32_nommu` profile 验证自动 FAT 挂载、文件读回、exit / unload /
+shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动。
+
+缺口：无 VFS namespace、常驻 supervisor / reaper / watchdog、依赖解析或热插拔。
+当前 prober / mount 是有限任务；`sched_run` 不提供 join，异步启动需要组件侧完成契约。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 

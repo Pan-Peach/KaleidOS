@@ -40,6 +40,9 @@ pub(crate) mod bootmem;
 #[path = "discovery.rs"]
 pub(crate) mod discovery;
 
+#[cfg(not(feature = "selftest"))]
+mod composition;
+
 // SMP 的 boot 侧骨架（AP trampoline + 栈 + 描述符 + 调用点）。仅 RV64 MMU。
 // 恒编译：单 CPU 机器上 `start_secondaries` 自然空转；哪些用例跑由 runner 决定。
 #[cfg(all(target_arch = "riscv64", feature = "vm-mmu"))]
