@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-03。此次登记最小 init / ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点；SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
+更新：2026-10-04。此次在 §3.21 登记上游 libc-test 的双平台参考测试基础设施；此前最小 init / ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点的记录保留，SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -229,6 +229,23 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 #### 3.21 测试体系 `▰▰▰▰▱` IMPLEMENTED
 
 现状：host 单测含 proptest；CoreTest 是板内集成，RV64 双 CPU 为 56 项检查（bit 0 到 56，bit 23 未用），RV32 为原 49 项；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
+
+兼容性应用：`tests/compat/` 从 pinned `third_party/libc-test` 直接选择上游 source，
+13 项 ISO C 加 1 项纯计算在 Linux / Windows 共用，另有 2 项 Linux POSIX 文件测试。
+宿主 runner 构建普通 ELF / PE、原生参考运行、生成组合 manifest 与带许可证的 tar 包；
+`make compat-*` / `test-compat-*` 不消费或创建内核 `.config`。独立的
+`.github/workflows/compat.yml` 配置 Linux / Windows 原生参考与双平台打包 job。
+工具与具体用例见 `docs/development/compat-testing.md`。
+
+验证（2026-10-04）：Linux x86_64、系统 GCC 8.4 / 静态 glibc，16/16 PASS；
+MinGW-w64 GCC 9.3 交叉构建 14/14 Windows x86_64 PE，另外两项显式 UNSUPPORTED。
+全部 Linux 程序无 PT_INTERP；Windows PE imports 为 KERNEL32.dll / msvcrt.dll，
+不能宣称无 DLL 依赖。双平台包包含 30 个程序、可执行位、manifest、COPYRIGHT / AUTHORS。
+host runner 11 项 failure / crash / timeout / stale result / 平台拒绝 / config-free 检查通过；
+Kconfig 胶水原 12 项通过。报告与日志在 `build/compat/`，不提交生成物。
+当前无原生 Windows 环境，Windows reference 未验证，新增 CI 尚未运行；也没有任何
+KaleidOS application PASS。task-AS / U-mode / trap / exit-wait-fault / ExecService / 应用 loader /
+personality 缺口见 `docs/development/userspace.md`，本次不实现或伪造 guest runner。
 
 缺口：NoMMU 不在任何测试入口或 CI 里构建与启动，只有 Kconfig 解析用例；M-mode 无验证；runner 只显式断言 12 条，其余靠 `all: PASS`；host ring 是线程本地替身，不覆盖并发语义。
 

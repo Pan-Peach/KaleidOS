@@ -38,6 +38,7 @@ docs/
 │   └── ksh.md                  （KernelNative shell、命令与当前边界）
 ├── development/               怎么在上面干活
 │   ├── testing.md
+│   ├── compat-testing.md        （上游 libc-test、Linux / Windows 参考构建与组合包）
 │   ├── benchmark.md
 │   ├── userspace.md            （Core sandbox → POSIX → 用户 ELF / BusyBox 的实施顺序）
 │   └── docs-guide.md
@@ -102,6 +103,7 @@ docs/
 | 接着手写 POSIX / Core sandbox / 用户 ELF | `modules/posix.md` + `development/userspace.md` |
 | 新加一个构建开关 | `architecture/kconfig.md` |
 | 加测试 | `development/testing.md` |
+| 构建 / 跑 libc 与双平台兼容性参考测试 | `development/compat-testing.md` |
 | 加文档 | `development/docs-guide.md` |
 | 找参考论文 / OS | `philosophy/references.md` |
 

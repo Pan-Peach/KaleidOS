@@ -1,0 +1,18 @@
+# name                         targets        contract     upstream src/ path                     support
+# Test bodies and assertions stay in the pinned third_party/libc-test submodule.
+libc/memcpy                    linux,windows  iso-c        functional/string_memcpy.c              -
+libc/memset                    linux,windows  iso-c        functional/string_memset.c              -
+libc/strchr                    linux,windows  iso-c        functional/string_strchr.c              -
+libc/strcspn                   linux,windows  iso-c        functional/string_strcspn.c             -
+libc/strstr                    linux,windows  iso-c        functional/string_strstr.c              -
+libc/wcsstr                    linux,windows  iso-c        functional/wcsstr.c                     -
+libc/qsort                     linux,windows  iso-c        functional/qsort.c                      rand
+libc/strtod-simple             linux,windows  iso-c        functional/strtod_simple.c              -
+libc/iswspace-null             linux,windows  iso-c        regression/iswspace-null.c              -
+libc/snprintf-g-zeros          linux,windows  iso-c        regression/printf-fmt-g-zeros.c          -
+libc/sscanf-eof                linux,windows  iso-c        regression/sscanf-eof.c                 -
+libc/scanf-bytes-consumed      linux,windows  iso-c        regression/scanf-bytes-consumed.c       -
+libc/scanf-literal-eof         linux,windows  iso-c        regression/scanf-match-literal-eof.c    -
+compiler/udiv                 linux,windows  computation  functional/udiv.c                       -
+posix/fdopen                  linux          posix        functional/fdopen.c                     -
+posix/stat                    linux          posix        functional/stat.c                       -

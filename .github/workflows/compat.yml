@@ -1,0 +1,70 @@
+name: Compatibility references
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init libc-test
+        run: git submodule update --init third_party/libc-test
+      - name: Verify host runner failure reporting
+        run: python3 tests/compat/test_runner.py
+      - name: Build and run native Linux references
+        run: make test-compat-linux
+      - name: Upload Linux binaries, results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-linux
+          path: build/compat/linux/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init libc-test
+        run: git submodule update --init third_party/libc-test
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: Build and run native Windows references
+        shell: msys2 {0}
+        run: python3 tests/compat/runner.py test --target windows --cc gcc
+      - name: Upload Windows binaries, results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-windows
+          path: build/compat/windows/
+
+  package:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init libc-test license
+        run: git submodule update --init third_party/libc-test
+      - uses: actions/download-artifact@v4
+        with:
+          name: compat-linux
+          path: build/compat/linux/
+      - uses: actions/download-artifact@v4
+        with:
+          name: compat-windows
+          path: build/compat/windows/
+      - name: Package both targets
+        run: make compat-package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-package
+          path: build/compat/compat-package.tar.gz

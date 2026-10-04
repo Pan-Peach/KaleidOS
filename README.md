@@ -50,8 +50,8 @@ os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根
   arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
   components/      组件 crates：生产组件（策略 / 服务 / 驱动 / 文件系统 / SDK）+ tests/（test-only fixture 与 CoreTest）
   components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
-third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）/ fatfs/ / littlefs/ / smoltcp/（netstack 私有协议后端）——不修改上游实现
-tests/         测试 fixture：fixtures/fdt/（qemu-virt.dts，QEMU virt 真实 DTB 转储；供未来 parser 测试与人工对照）
+third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）/ fatfs/ / littlefs/ / smoltcp/（netstack 私有协议后端）/ libc-test/（宿主兼容性测试）——不修改上游实现
+tests/         宿主 / QEMU 测试与 fixture；compat/ 使用上游用例构建 Linux ELF / Windows PE 参考程序
 docs/          设计文档（索引 docs/README.md）：philosophy/（为什么）architecture/（是什么）interfaces/（契约）modules/（各模块现状）development/（怎么干活）notes/（历史归档）
 tools/         构建辅助脚本（build-kcomp.sh 等）
 ```
@@ -111,6 +111,10 @@ shell 命令与限制见 [`docs/modules/ksh.md`](docs/modules/ksh.md)。
 
 ## 文档
 
+libc / 兼容性参考测试：`make test-compat-linux`、`make compat-windows`、
+`make compat-package`。Windows 原生运行与工具链说明见
+[`docs/development/compat-testing.md`](docs/development/compat-testing.md)；这些应用尚不能在 KaleidOS 执行。
+
 索引与权威归属见 [`docs/README.md`](docs/README.md)（先看这个）。
 
 | 文档 | 内容 |
@@ -124,6 +128,7 @@ shell 命令与限制见 [`docs/modules/ksh.md`](docs/modules/ksh.md)。
 | `docs/architecture/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
 | `docs/modules/README.md` | 模块地图：每个 Core 模块 owns 什么真相、代码在哪 |
 | `docs/development/testing.md` | 测试策略（host test / CoreTest / trace） |
+| `docs/development/compat-testing.md` | 上游 libc-test、双平台参考构建 / 运行、组合包与应用执行前提 |
 | `docs/development/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
 | `STATUS.md`（仓库根） | 状态与计划：现状快照 + 里程碑 + 路线图（单一入口） |
 | `docs/philosophy/references.md` | 参考资料与借鉴方向 |

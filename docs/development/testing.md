@@ -2,6 +2,10 @@
 
 > 相关：`docs/development/benchmark.md`（性能）、`docs/architecture/deployment.md` §9（验证设计）、`os/components/tests/core_test/`（CoreTest）。
 
+普通应用的 libc / 双平台兼容性测试使用上游 libc-test，见
+[`docs/development/compat-testing.md`](compat-testing.md)。当前只做宿主参考构建 / 运行与
+组合包；尚未接入 KaleidOS 应用执行，不属于 CoreTest 组件编排。
+
 ## 1. 测试哲学
 
 > **Core 中所有与硬件无关的 truth logic 必须 host-testable；Core 与 Arch / Hardware 的真实契约通过 QEMU / CoreTest / 真机验证。**

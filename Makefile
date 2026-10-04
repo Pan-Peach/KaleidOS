@@ -46,7 +46,8 @@ KCONFIG_MK := $(KCONFIG_CONFIG).mk
 # `clean` / `rootfs` (both have to work on a fresh checkout where no .config
 # exists yet — the FAT image is built by mkfs.vfat/mtools, not by Kconfig).
 # `abi-gen` / `abi-check` are pure source transformations (abi/*.toml → C/Rust).
-CONFIG_FREE_GOALS := clean distclean help fmt test-host bench _test-kconfig rootfs abi-gen abi-check
+CONFIG_FREE_GOALS := clean distclean help fmt test-host bench _test-kconfig rootfs abi-gen abi-check \
+                     compat-linux compat-windows test-compat-linux test-compat-windows compat-package
 
 # Goals that CREATE a configuration: they must not generate/parse one, and they
 # cannot be combined with build goals in a single invocation.
@@ -138,6 +139,9 @@ help:
 	@echo "  make rootfs                      build the small FAT image attached to make qemu"
 	@echo "  make check | test | test-host | test-qemu | test-arch"
 	@echo "  make test-init                   RV64/RV32 automatic boot composition workflows"
+	@echo "  make compat-linux | compat-windows   build upstream libc-test ELF / PE programs"
+	@echo "  make test-compat-linux | test-compat-windows   run on the native reference OS"
+	@echo "  make compat-package              package both builds for future application exec"
 	@echo "  make abi-gen | abi-check         ABI 单一来源：abi/*.toml → 生成 C/Rust（check 只校验）"
 
 # Materialise a configuration on first use.
@@ -336,6 +340,28 @@ test-host:
 # 内部：Kconfig / Makefile 胶水契约（host-only，快速；见 tests/kconfig/test_glue.py）。
 _test-kconfig:
 	python3 tests/kconfig/test_glue.py
+
+# Compatibility applications are host-built references, independent of the
+# kernel profile. The explicit testcase corpus is tests/compat/cases.txt.
+COMPAT_LINUX_CC ?= cc
+COMPAT_WINDOWS_CC ?= x86_64-w64-mingw32-gcc
+COMPAT_LINKAGE ?= static
+COMPAT_RUNNER := python3 tests/compat/runner.py
+.PHONY: compat-linux compat-windows test-compat-linux test-compat-windows compat-package
+compat-linux:
+	$(COMPAT_RUNNER) build --target linux --cc "$(COMPAT_LINUX_CC)" --linkage $(COMPAT_LINKAGE)
+
+compat-windows:
+	$(COMPAT_RUNNER) build --target windows --cc "$(COMPAT_WINDOWS_CC)" --linkage $(COMPAT_LINKAGE)
+
+test-compat-linux:
+	$(COMPAT_RUNNER) test --target linux --cc "$(COMPAT_LINUX_CC)" --linkage $(COMPAT_LINKAGE)
+
+test-compat-windows:
+	$(COMPAT_RUNNER) test --target windows --cc "$(COMPAT_WINDOWS_CC)" --linkage $(COMPAT_LINKAGE)
+
+compat-package:
+	$(COMPAT_RUNNER) package
 
 # —— KABI：ABI 单一来源生成（abi/*.toml → C / SDK-Rust / Core-Rust）——
 # 生成物是**提交物**：普通构建只消费它们，绝不在 build 期生成。
