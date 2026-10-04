@@ -84,6 +84,12 @@ pub unsafe extern "C" fn trap_handler(trap_frame: *mut TrapFrame, raw_scause: us
     match trap {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             super::dispatch_timer();
+            // A user time slice returns to its own task stack. Never switch
+            // schedulable contexts on this per-CPU trap stack.
+            #[cfg(target_arch = "riscv64")]
+            if unsafe { (*trap_frame).status } & 0x100 == 0 {
+                let _ = super::dispatch_exception(trap_frame, raw_scause, stval);
+            }
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             super::dispatch_external();

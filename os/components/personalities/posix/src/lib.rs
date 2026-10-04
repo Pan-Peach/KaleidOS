@@ -1,11 +1,14 @@
-//! POSIX personality 骨架；当前不提供进程或 Linux syscall 兼容。
+//! Minimal RV64 process profile: static ELF, fork/exec/wait and console syscalls.
 //! 实现入口见 docs/modules/posix.md；用户态路线见 docs/development/userspace.md。
-//! 只声明组件内语义状态。Core 仍拥有 task / AS / trap / 生命周期真相。
+//! Core owns task / AS / trap truth; the general VFS/fd models remain placeholders.
 
 #![no_std]
+extern crate alloc;
 
 pub mod exec;
+pub mod execution;
 pub mod fd;
+pub mod image;
 pub mod process;
 pub mod syscall;
 pub mod usermem;
@@ -19,6 +22,7 @@ use process::{Process, Thread};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
+    BadExecutable,
     BadDescriptor,
     BadUserMemory,
     NoSuchProcess,
@@ -28,7 +32,7 @@ pub enum Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// 表存储由本实例拥有；不使用静态全局 PCB / fd 表。
-/// TODO: 解析 SDK PosixCreateConfig，校验并 bind 指定 VFS；不扫描 / 自动创建 VFS。
+/// Future VFS profile model. The current immutable-image profile uses execution::Family.
 pub struct PosixState<'a> {
     pub vfs: Option<VfsBinding>,
     pub processes: &'a mut [Option<Process>],

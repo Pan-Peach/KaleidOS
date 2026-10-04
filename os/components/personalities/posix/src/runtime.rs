@@ -1,17 +1,38 @@
-//! 生命周期占位；load posix 当前必须失败，不能宣称用户程序环境已就绪。
+//! Instantiate one immutable-image process family, not one component per PID.
+use crate::{execution::Family, image};
+use core::sync::atomic::Ordering;
+use kcomp_sdk::{Errno, posix::KCOMP_POSIX_CREATE_CONFIG_ABI};
 
-use kcomp_sdk::errno::Errno;
-
-kcomp_sdk::kcomp_instance_create!(|_args, _out_state| {
-    // TODO: 校验 config_abi / 长度，复制 PosixCreateConfig，验证 VFS endpoint；
-    // bind 后构造 per-instance process / thread / fd 状态，失败回滚。
-    // 用户 trap 路由和执行域机制就绪前，不创建假进程或发布 endpoint。
-    kcomp_sdk::klog!("posix: skeleton; userspace not implemented");
-    Errno::ENOTSUP.code()
+kcomp_sdk::kcomp_instance_create!(|args, out_state| {
+    let Some(args) = (unsafe { args.as_ref() }) else {
+        return Errno::EINVAL.code();
+    };
+    if out_state.is_null()
+        || args.config_abi != KCOMP_POSIX_CREATE_CONFIG_ABI
+        || args.config.is_null()
+        || args.config_len > 16 * 1024 * 1024
+    {
+        return Errno::EINVAL.code();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(args.config.cast::<u8>(), args.config_len) };
+    match image::decode(bytes).and_then(crate::execution::start) {
+        Ok(family) => {
+            unsafe { *out_state = family.cast() };
+            0
+        }
+        Err(error) => error.code(),
+    }
 });
-
-kcomp_sdk::kcomp_instance_destroy!(|_state| {
-    // TODO: 停止进程 / 用户任务，释放 fd 引用，完成协作式逻辑退役。
-    // create 不成功，正常生命周期不会进入此处。
-    Errno::ENOTSUP.code()
+kcomp_sdk::kcomp_instance_destroy!(|state| {
+    let Some(family) = (unsafe { state.cast::<Family>().as_ref() }) else {
+        return 0;
+    };
+    if family.live.load(Ordering::Acquire) != 0 {
+        return Errno::EBUSY.code();
+    }
+    family.alive.store(false, Ordering::Release);
+    // Direct observer ctx remains resident after logical teardown.
+    0
 });
+const PROCESS_PORT: u32 = 0;
+kcomp_sdk::kcomp_services!(state: Family; PROCESS_PORT => crate::execution::dispatch);

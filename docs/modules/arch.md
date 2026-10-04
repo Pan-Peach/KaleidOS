@@ -106,3 +106,10 @@
 | `os/arch/src/riscv/{mod,cpu,console,firmware,plic,elf,smp}.rs` | RISC-V family 机制 |
 | `os/arch/src/riscv/{context,trap,mmu,trampoline}/` | 上下文 / trap / 页表 / 跨 AS 原语 |
 | `os/arch/src/{x86_64,aarch64,loongarch64}/` | 新 ISA 同形骨架（`todo!()`） |
+
+## RV64 普通用户执行
+
+`riscv/user.rs` / `user64.S` 提供完整整数 / FP / FCSR 现场的 sret 与 trap 返回原语。
+Core 提供验证后的 U 映射和当前任务关联；Arch 不解释 Linux syscall。timer 从 U-mode
+中断时可经 Core hook 回到挂起的任务内核栈，随后才调度。该路径只在 RV64 supervisor /
+MMU 启用，未扩展 SandboxedNative 组件 loader 或其他 ISA。真实集成见 CoreTest exec 分组。

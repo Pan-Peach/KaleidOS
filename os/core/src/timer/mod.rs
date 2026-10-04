@@ -150,6 +150,70 @@ pub fn arm_deadline(deadline: u64) -> Result<(), TimerError> {
     Ok(())
 }
 
+/// Temporarily bound execution on this CPU without postponing an existing
+/// deadline. The caller must keep interrupts disabled outside the execution
+/// window and must not switch tasks until this guard is dropped.
+#[cfg(any(
+    test,
+    all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu")
+))]
+pub(crate) struct ExecutionDeadline {
+    cpu: CpuId,
+    previous: Option<u64>,
+    armed: u64,
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu")
+))]
+pub(crate) fn execution_deadline(deadline: u64) -> Result<ExecutionDeadline, TimerError> {
+    let cpu = crate::smp::current_cpu();
+    let slot = STATE
+        .get()
+        .and_then(|table| table.get(cpu))
+        .ok_or(TimerError::NotInitialized)?;
+    let mut state = slot.lock();
+    if !state.delivery_ready {
+        return Err(TimerError::NotInitialized);
+    }
+    let previous = state.next_deadline;
+    let armed = previous.map_or(deadline, |old| old.min(deadline));
+    <arch::TimerImpl as Timer>::set_deadline(armed).map_err(TimerError::Backend)?;
+    state.next_deadline = Some(armed);
+    Ok(ExecutionDeadline {
+        cpu,
+        previous,
+        armed,
+    })
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu")
+))]
+impl Drop for ExecutionDeadline {
+    fn drop(&mut self) {
+        let mut state = table().get(self.cpu).unwrap().lock();
+        // A periodic timer may already have advanced its deadline in on_trap.
+        if state.next_deadline.is_some_and(|next| next != self.armed) {
+            return;
+        }
+        let previous = self
+            .previous
+            .filter(|deadline| *deadline > arch::TimerImpl::now());
+        state.next_deadline = match previous {
+            Some(deadline) if <arch::TimerImpl as Timer>::set_deadline(deadline).is_ok() => {
+                Some(deadline)
+            }
+            _ => {
+                <arch::TimerImpl as Timer>::cancel_deadline();
+                None
+            }
+        };
+    }
+}
+
 #[cfg(feature = "preempt")]
 /// 为抢占 profile 在**当前 CPU** 上初始化周期性调度 tick。
 ///
@@ -401,6 +465,28 @@ mod tests {
         );
         assert_eq!(arch::fake::idle_sleeps_for_test(), 1);
         arch::fake::set_pending_wakeup_for_test(false);
+
+        // Execution bounds must preserve an earlier deadline and restore a
+        // later one on early syscall return, without leaving a stray timer.
+        arch::fake::reset_host_clock_for_test();
+        arm_deadline(900_000).unwrap();
+        {
+            let _irq = crate::irq::IrqSaveGuard::new();
+            let bound = execution_deadline(300_000).unwrap();
+            assert_eq!(arch::fake::timer_deadline_for_test(), Some(300_000));
+            drop(bound);
+            assert_eq!(arch::fake::timer_deadline_for_test(), Some(900_000));
+            let bound = execution_deadline(1_200_000).unwrap();
+            assert_eq!(arch::fake::timer_deadline_for_test(), Some(900_000));
+            drop(bound);
+            assert_eq!(cpu0().lock().next_deadline, Some(900_000));
+            cpu0().lock().next_deadline = None;
+            <arch::TimerImpl as Timer>::cancel_deadline();
+            let bound = execution_deadline(300_000).unwrap();
+            drop(bound);
+            assert_eq!(arch::fake::timer_deadline_for_test(), None);
+        }
+        let _ = arch::fake::take_timer_events_for_test();
 
         // When: init 之后编程 deadline。
         let armed = arm_deadline(500);

@@ -38,6 +38,7 @@ monitor 不抢读它的下一条命令。未安装调度策略时 monitor 仍可
 | `load <artifact> [native\|isolated]` | 默认 native；可省略 `.kcomp`；Core 验证请求，失败打印 errno；不隐式回退域 |
 | `inspect <loaded-artifact>` | 复用组件查询，显示该 artifact 的所有已加载实例、KCOMP 格式、域与状态 |
 | `cat <provider-relative-path>` | 查找唯一 Live、exact ABI 匹配的 filesystem endpoint，bind / mount / open / read / close |
+| `exec <provider-relative-path> [args...]` | 经唯一 FS 读静态 ELF，创建 POSIX 镜像快照进程族，等待退出并显示 exit / signal |
 | `ls` / `cd` / `pwd` | 明确报告 unsupported：现有 FS 没有目录枚举或工作目录 / namespace 契约 |
 
 `inspect` 当前不读取未加载 artifact 或任意路径的字节，也不解析 ELF / PE / WASM。
@@ -78,7 +79,7 @@ Endpoint / FileSystemBinding。没有加入 device metadata、artifact parser、
 | 文件 | 用途 |
 |---|---|
 | `os/components/ksh/src/{parser,input}.rs` | 有界解析与行编辑，8 个 host 用例 |
-| `os/components/ksh/src/shell.rs` | 确定性单行分派、查询显示、FS consumer；未来 ExecService 调用接缝 |
+| `os/components/ksh/src/shell.rs` | 确定性单行分派、查询显示、FS consumer；静态 ELF 读取与 POSIX profile 组合 |
 | `os/components/ksh/src/runtime.rs` | 组件入口与交互任务 |
 | `os/components/kcomp-sdk/src/{console,management}.rs` | 安全值前端与 task 包装 |
 | `os/core/src/component/export/query.rs` | 三个窄导出的 Core 实现 |
@@ -94,8 +95,10 @@ host 验证空行 / whitespace / tokenization / 命令识别 / 错参 / 未知�
 QEMU smoke 验证真实串口、组件查询、native / isolated load、失败后 shell 存活、cat、
 超长行恢复、exit 并回到 monitor。完整验证记录见 `STATUS.md`。
 
-## `./hello` 的剩余前提
+## 应用执行范围
 
-未实现应用执行。需要 Task ↔ AddressSpace 绑定、私有用户 AS、U-mode 初始任务、trap/ecall、
-task exit/fault 处理，再由外置 ExecService 识别格式、选择 ELF / PE loader、组合 personality / runtime
-并返回应用句柄与退出状态。应用不自动成为 ComponentId；这些能力不在本次 ksh 实现范围。
+`exec 0:/APP.ELF [args...]` 已能从真实 FAT 文件运行静态 RV64 ELF。当前需要唯一
+filesystem provider，读取上限 1MiB；stdin 为 EOF、stdout/stderr 为 SDK console。
+进程故障或非法 ELF 不结束 shell。POSIX profile 的镜像 key 固定为 `/main`，通用
+execve 路径、cwd、动态链接、文件 fd、重定向 / pipe 和 Win32 未实现；不支持 `./hello`
+隐式查找。实施与验证见 [userspace.md](../development/userspace.md)。

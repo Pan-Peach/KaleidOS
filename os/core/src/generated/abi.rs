@@ -224,6 +224,41 @@ const _: () = {
     assert!(core::mem::offset_of!(EndpointInfo, name_len) == 36);
 };
 
+/// Actual user-task trap; raw ISA cause/register values, no Linux interpretation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserTrap {
+    pub task: u32,
+    pub reserved: u32,
+    pub cause: u64,
+    pub pc: u64,
+    pub address: u64,
+    pub number: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub arg4: u64,
+    pub arg5: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<UserTrap>() == 88);
+    assert!(core::mem::align_of::<UserTrap>() == 8);
+    assert!(core::mem::offset_of!(UserTrap, task) == 0);
+    assert!(core::mem::offset_of!(UserTrap, reserved) == 4);
+    assert!(core::mem::offset_of!(UserTrap, cause) == 8);
+    assert!(core::mem::offset_of!(UserTrap, pc) == 16);
+    assert!(core::mem::offset_of!(UserTrap, address) == 24);
+    assert!(core::mem::offset_of!(UserTrap, number) == 32);
+    assert!(core::mem::offset_of!(UserTrap, arg0) == 40);
+    assert!(core::mem::offset_of!(UserTrap, arg1) == 48);
+    assert!(core::mem::offset_of!(UserTrap, arg2) == 56);
+    assert!(core::mem::offset_of!(UserTrap, arg3) == 64);
+    assert!(core::mem::offset_of!(UserTrap, arg4) == 72);
+    assert!(core::mem::offset_of!(UserTrap, arg5) == 80);
+};
+
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
 

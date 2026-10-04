@@ -142,6 +142,7 @@ help:
 	@echo "  make compat-linux | compat-windows   build upstream libc-test ELF / PE programs"
 	@echo "  make test-compat-linux | test-compat-windows   run on the native reference OS"
 	@echo "  make compat-package              package both builds for future application exec"
+	@echo "  make exec-fixtures               build RV64 static ELF execution probes"
 	@echo "  make abi-gen | abi-check         ABI 单一来源：abi/*.toml → 生成 C/Rust（check 只校验）"
 
 # Materialise a configuration on first use.
@@ -167,6 +168,9 @@ KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_smp t
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs
+ifeq ($(KCFG_ARCH),rv64)
+init.kpkg boot-build boot-check clippy: exec-fixtures
+endif
 # 构建暂存在仓库内的 build/（已 gitignore），不往 /tmp 或别处散。
 KPKG_DIR     := $(CURDIR)/build/kpkg
 KPKG_BUILD   := $(CURDIR)/build/kpkg-build
@@ -231,6 +235,12 @@ core:
 	cp $(KERNEL) $(CORE_OUTPUT)
 	@echo "built: $(CORE_OUTPUT) (core-only, features=$(KCFG_BOOT_FEATURES), target=$(KCFG_TARGET))"
 	@echo "WARNING: tools/qemu/init.kpkg is now EMPTY; the next 'make kernel' rebuilds the real one (init.kpkg is .PHONY)."
+
+# Ordinary application probes; config selects the ISA, never the .kcomp loader.
+EXEC_FIXTURE_CC ?= riscv64-unknown-elf-gcc
+.PHONY: exec-fixtures
+exec-fixtures:
+	python3 tests/compat/exec_fixtures.py --arch $(KCFG_ARCH) --cc $(EXEC_FIXTURE_CC)
 
 # —— 交互运行默认挂载的小 FAT 盘（块设备驱动有真实设备可读）——
 # 文本源在 tests/fixtures/rootfs/（mtools 按目录树原样拷进镜像根），成品进
@@ -334,6 +344,7 @@ test-host:
 	cd os/components/driver_prober && cargo test
 	cd os/components/init && cargo test
 	cd os/components/ksh && cargo test
+	cd os/components/personalities/posix && cargo test
 	cd os/components/kbench && cargo test
 	cd os/components/tests/drivers/ram_blk && cargo test
 

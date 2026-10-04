@@ -4,7 +4,8 @@
 
 普通应用的 libc / 双平台兼容性测试使用上游 libc-test，见
 [`docs/development/compat-testing.md`](compat-testing.md)。当前只做宿主参考构建 / 运行与
-组合包；尚未接入 KaleidOS 应用执行，不属于 CoreTest 组件编排。
+组合包。RV64 普通 ELF 的执行 / fork / exec / wait 机制由 CoreTest 的 exec 分组验证；
+当前上游 libc-test 尚未在 KaleidOS 通过，见 [userspace.md](userspace.md)。
 
 ## 1. 测试哲学
 

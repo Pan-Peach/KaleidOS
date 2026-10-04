@@ -10,6 +10,7 @@
 - 内核栈（`Kernelstack`）、任务执行上下文与该执行流的 IRQ 保存值。
 - start 时提交的固定逻辑 CPU，首次运行和 wake 后均受 Core 验证。见 `docs/architecture/scheduling.md`。
 - 每个任务最多一份 pending unpark permit（提前通知会被下一次 park 消费；重复通知合并）。
+- RV64 普通用户任务的私有 AS、U 映射、整数 / FP 现场与实际 trap 关联；PID / ELF / syscall 留在 personality。
 - 任务归属：`TaskRecord.owner`（组件停止 / 失败时按 owner 裁决，失败后 backing 保留驻留）。
 
 ## 暴露什么机制
@@ -39,4 +40,10 @@
 | `os/core/src/task/record.rs` | `TaskRecord`（owner / state / pending permit / stack / context） |
 | `os/core/src/task/table.rs` | `TaskTable`（`BTreeMap<TaskId, TaskRecord>`）、状态转换 |
 | `os/core/src/task/kstack.rs` | `Kernelstack` |
+| `os/core/src/task/user.rs` | 普通用户执行、逐页 copy、clone / replace / protect / staging 回滚；RV64 S/MMU，其他目标 ENOTSUP |
 | `os/core/src/task/error.rs` | `TaskError` |
+
+用户执行从同一 TaskRecord 的 KernelNative personality 入口进入，trap 恢复该任务的
+内核栈 / kernel satp，再允许 yield / park。复制和权限编辑只允许 owner 操作未启动
+任务或当前任务，不把原始页表 / 用户 backing 交付组件。成功替换与终态 backing 保持
+驻留；staging discard 仅针对 never-started 用户任务。ABI 以 `abi/core.toml` 为准。

@@ -254,6 +254,41 @@ const _: () = {
     assert!(core::mem::offset_of!(EndpointInfo, name_len) == 36);
 };
 
+/// Actual user-task trap; raw ISA cause/register values, no Linux interpretation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserTrap {
+    pub task: u32,
+    pub reserved: u32,
+    pub cause: u64,
+    pub pc: u64,
+    pub address: u64,
+    pub number: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub arg4: u64,
+    pub arg5: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<UserTrap>() == 88);
+    assert!(core::mem::align_of::<UserTrap>() == 8);
+    assert!(core::mem::offset_of!(UserTrap, task) == 0);
+    assert!(core::mem::offset_of!(UserTrap, reserved) == 4);
+    assert!(core::mem::offset_of!(UserTrap, cause) == 8);
+    assert!(core::mem::offset_of!(UserTrap, pc) == 16);
+    assert!(core::mem::offset_of!(UserTrap, address) == 24);
+    assert!(core::mem::offset_of!(UserTrap, number) == 32);
+    assert!(core::mem::offset_of!(UserTrap, arg0) == 40);
+    assert!(core::mem::offset_of!(UserTrap, arg1) == 48);
+    assert!(core::mem::offset_of!(UserTrap, arg2) == 56);
+    assert!(core::mem::offset_of!(UserTrap, arg3) == 64);
+    assert!(core::mem::offset_of!(UserTrap, arg4) == 72);
+    assert!(core::mem::offset_of!(UserTrap, arg5) == 80);
+};
+
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
 
@@ -651,4 +686,38 @@ unsafe extern "C" {
         name: *mut u8,
         capacity: usize,
     ) -> i32;
+    // -- User task execution --
+    /// Create an unstarted task and private user AS; caller owns it. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_create"]
+    pub fn kcore_user_create(entry: KcompTaskEntry, arg: *mut (), out_task: *mut u32) -> i32;
+    /// Map zeroed private backing. Page-aligned low VA; R=1 W=2 X=4; W^X. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_map"]
+    pub fn kcore_user_map(task: u32, address: u64, len: u64, permission: u32) -> i32;
+    /// Atomically replace permissions of a fully mapped user range; private AS and W^X checks remain in Core.
+    #[link_name = "kcore_user_protect"]
+    pub fn kcore_user_protect(task: u32, address: u64, len: u64, permission: u32) -> i32;
+    /// Initialize user mappings only before task start; kernel aliases, never SUM. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_load"]
+    pub fn kcore_user_load(task: u32, address: u64, buffer: *const u8, len: usize) -> i32;
+    /// Copy from actual user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_read"]
+    pub fn kcore_user_read(task: u32, address: u64, buffer: *mut u8, len: usize) -> i32;
+    /// Copy to writable user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_write"]
+    pub fn kcore_user_write(task: u32, address: u64, buffer: *const u8, len: usize) -> i32;
+    /// Validate U RX entry and RW-NX aligned stack; initialize registers. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_prepare"]
+    pub fn kcore_user_prepare(task: u32, pc: u64, sp: u64) -> i32;
+    /// Enter current task in U-mode until ecall/fault/interrupt, bounded by a caller-proposed absolute timer deadline. No lock or scheduling on trap stack. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_step"]
+    pub fn kcore_user_step(result: i64, deadline: u64, out: *mut UserTrap) -> i32;
+    /// Deep-copy current suspended user AS/registers to an unstarted task; no PID semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_clone"]
+    pub fn kcore_user_clone(entry: KcompTaskEntry, arg: *mut (), out_task: *mut u32) -> i32;
+    /// Atomically replace current user context with an unstarted prepared task; no exec semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_replace"]
+    pub fn kcore_user_replace(prepared_task: u32) -> i32;
+    /// Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP.
+    #[link_name = "kcore_user_discard"]
+    pub fn kcore_user_discard(task: u32) -> i32;
 }

@@ -125,6 +125,7 @@ CORE_TEST_SMP_CASES = (
     "smp-panic-bsp",
     "smp-scheduler-live",
 )
+CORE_TEST_EXEC_CASES = ("exec-elf", "exec-fork-exec-wait", "exec-timer")
 SHUTDOWN_CMD = "shutdown\n"
 
 FATAL_MARKERS = ("PANIC", "FAIL", "trap fatal")
@@ -291,7 +292,7 @@ def main() -> int:
 
         # -- 3) CoreTest: 唯一的组件/系统集成判定 --------------------------
         expected = [CORE_TEST_OK, CORE_TEST_ALL_PASS]
-        cases = CORE_TEST_CASES + (CORE_TEST_SMP_CASES if arch == "rv64" else ())
+        cases = CORE_TEST_CASES + (CORE_TEST_SMP_CASES + CORE_TEST_EXEC_CASES if arch == "rv64" else ())
         expected += [f"[core-test]   {case}: PASS" for case in cases]
         send(proc, CORE_TEST_CMD)
         output2, ok = collect(proc, CORE_TEST_TIMEOUT_S, expected, FATAL_MARKERS)

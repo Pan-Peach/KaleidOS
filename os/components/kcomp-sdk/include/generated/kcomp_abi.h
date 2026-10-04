@@ -193,6 +193,36 @@ _Static_assert(offsetof(struct kcore_endpoint_info, port) == 28, "kcore_endpoint
 _Static_assert(offsetof(struct kcore_endpoint_info, state) == 32, "kcore_endpoint_info.state offset drift");
 _Static_assert(offsetof(struct kcore_endpoint_info, name_len) == 36, "kcore_endpoint_info.name_len offset drift");
 
+/* Actual user-task trap; raw ISA cause/register values, no Linux interpretation. */
+struct kcore_user_trap {
+    uint32_t task;
+    uint32_t reserved;
+    uint64_t cause;
+    uint64_t pc;
+    uint64_t address;
+    uint64_t number;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint64_t arg2;
+    uint64_t arg3;
+    uint64_t arg4;
+    uint64_t arg5;
+};
+_Static_assert(sizeof(struct kcore_user_trap) == 88, "kcore_user_trap layout drift");
+_Static_assert(_Alignof(struct kcore_user_trap) == 8, "kcore_user_trap alignment drift");
+_Static_assert(offsetof(struct kcore_user_trap, task) == 0, "kcore_user_trap.task offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, reserved) == 4, "kcore_user_trap.reserved offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, cause) == 8, "kcore_user_trap.cause offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, pc) == 16, "kcore_user_trap.pc offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, address) == 24, "kcore_user_trap.address offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, number) == 32, "kcore_user_trap.number offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg0) == 40, "kcore_user_trap.arg0 offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg1) == 48, "kcore_user_trap.arg1 offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg2) == 56, "kcore_user_trap.arg2 offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg3) == 64, "kcore_user_trap.arg3 offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg4) == 72, "kcore_user_trap.arg4 offset drift");
+_Static_assert(offsetof(struct kcore_user_trap, arg5) == 80, "kcore_user_trap.arg5 offset drift");
+
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
 
@@ -370,6 +400,29 @@ int32_t kcore_console_read_byte(void);
 int32_t kcore_component_nth(uint32_t ordinal, struct kcore_component_info *out, uint8_t *name, size_t capacity);
 /* 按 ordinal 复制已提交 endpoint（含 Invalid）与完整端口名。ENOENT = 枚举完；ENOBUFS = 名字缓冲不足。不交付 api/ctx。 */
 int32_t kcore_endpoint_nth(uint32_t ordinal, struct kcore_endpoint_info *out, uint8_t *name, size_t capacity);
+/* -- User task execution -- */
+/* Create an unstarted task and private user AS; caller owns it. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
+/* Map zeroed private backing. Page-aligned low VA; R=1 W=2 X=4; W^X. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_map(uint32_t task, uint64_t address, uint64_t len, uint32_t permission);
+/* Atomically replace permissions of a fully mapped user range; private AS and W^X checks remain in Core. */
+int32_t kcore_user_protect(uint32_t task, uint64_t address, uint64_t len, uint32_t permission);
+/* Initialize user mappings only before task start; kernel aliases, never SUM. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_load(uint32_t task, uint64_t address, const uint8_t *buffer, size_t len);
+/* Copy from actual user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_read(uint32_t task, uint64_t address, uint8_t *buffer, size_t len);
+/* Copy to writable user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_write(uint32_t task, uint64_t address, const uint8_t *buffer, size_t len);
+/* Validate U RX entry and RW-NX aligned stack; initialize registers. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_prepare(uint32_t task, uint64_t pc, uint64_t sp);
+/* Enter current task in U-mode until ecall/fault/interrupt, bounded by a caller-proposed absolute timer deadline. No lock or scheduling on trap stack. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_step(int64_t result, uint64_t deadline, struct kcore_user_trap *out);
+/* Deep-copy current suspended user AS/registers to an unstarted task; no PID semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_clone(KcompTaskEntry entry, void *arg, uint32_t *out_task);
+/* Atomically replace current user context with an unstarted prepared task; no exec semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_replace(uint32_t prepared_task);
+/* Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
+int32_t kcore_user_discard(uint32_t task);
 
 /* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
  * 
@@ -1011,19 +1064,39 @@ _Static_assert(_Alignof(struct kcomp_network_api) == _Alignof(void *), "kcomp_ne
 /* args=8 socket；input/output 空。 */
 #define KCOMP_NETWORK_METHOD_SOCKET_RELEASE UINT32_C(18)
 
-/* config 恰好 8 字节，LE u64 VFS endpoint identity；create 需复制且校验 config_abi。 */
+/* LE fixed header followed by bounded image/argv/envp records. */
 struct kcomp_posix_create_config {
-    uint64_t vfs_endpoint;
+    uint32_t image_count;
+    uint32_t argc;
+    uint32_t envc;
+    uint32_t reserved;
 };
-_Static_assert(sizeof(struct kcomp_posix_create_config) == 8, "kcomp_posix_create_config layout drift");
-_Static_assert(_Alignof(struct kcomp_posix_create_config) == 8, "kcomp_posix_create_config alignment drift");
-_Static_assert(offsetof(struct kcomp_posix_create_config, vfs_endpoint) == 0, "kcomp_posix_create_config.vfs_endpoint offset drift");
+_Static_assert(sizeof(struct kcomp_posix_create_config) == 16, "kcomp_posix_create_config layout drift");
+_Static_assert(_Alignof(struct kcomp_posix_create_config) == 4, "kcomp_posix_create_config alignment drift");
+_Static_assert(offsetof(struct kcomp_posix_create_config, image_count) == 0, "kcomp_posix_create_config.image_count offset drift");
+_Static_assert(offsetof(struct kcomp_posix_create_config, argc) == 4, "kcomp_posix_create_config.argc offset drift");
+_Static_assert(offsetof(struct kcomp_posix_create_config, envc) == 8, "kcomp_posix_create_config.envc offset drift");
+_Static_assert(offsetof(struct kcomp_posix_create_config, reserved) == 12, "kcomp_posix_create_config.reserved offset drift");
 
-/* exact create config fingerprint，ASCII POSIXCFG。 */
-#define KCOMP_POSIX_CREATE_CONFIG_ABI UINT64_C(0x504F534958434647)
+struct kcomp_posix_process_api {
+    /* exited=0/1; wait_status valid iff exited; live counts tasks not yet exited. No scheduling. */
+    int32_t (*status)(void *ctx, uint32_t *out_exited, uint32_t *out_wait_status, uint32_t *out_live);
+};
+_Static_assert(sizeof(struct kcomp_posix_process_api) == 1 * sizeof(void *), "kcomp_posix_process_api layout drift");
+_Static_assert(_Alignof(struct kcomp_posix_process_api) == _Alignof(void *), "kcomp_posix_process_api alignment drift");
 
-/* config 扁平字节长度，非 Rust struct 内存重解释。 */
-#define KCOMP_POSIX_CREATE_CONFIG_LEN 8
+/* Exact immutable-image config fingerprint. Old VFS-only skeleton config rejected. */
+#define KCOMP_POSIX_CREATE_CONFIG_ABI UINT64_C(0x504F534958494D47)
+
+/* Minimum header length; records follow. */
+#define KCOMP_POSIX_CREATE_CONFIG_LEN 16
+
+#define KCOMP_POSIX_PROCESS_NAME "posix.process"
+
+#define KCOMP_POSIX_PROCESS_CONTRACT UINT64_C(0x504F53495850524F)
+
+/* Read-only family status: Direct C table; Gate method 0 empty input, 12-byte LE reply. */
+#define KCOMP_POSIX_PROCESS_ABI UINT64_C(0x50524F4353544154)
 
 /* `DriverCreateConfig` 的**固定头部**（本文件顶部定义完整布局）：
  * 

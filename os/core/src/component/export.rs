@@ -84,6 +84,10 @@ use exports::EXPORTS;
 mod query;
 use query::*;
 
+#[path = "export/user.rs"]
+mod user;
+use user::*;
+
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
 /// 无需 build script / 运行时注册。
@@ -1363,9 +1367,11 @@ mod tests {
             .split("\n#[cfg(test)]")
             .next()
             .unwrap();
+        let user_half = include_str!("export/user.rs");
         let wrapped = implementation_half
             .lines()
             .chain(query_half.lines())
+            .chain(user_half.lines())
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("with_core_critical("))
             .count();

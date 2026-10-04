@@ -28,6 +28,13 @@ def main():
         else:
             runner.make_disk(disk)
         disks.append(disk)
+    if args.arch == "rv64" and args.scenario == "fat":
+        for filename, source in [("EXIT0.ELF", "exit-zero"), ("EXIT7.ELF", "exit-seven"),
+                                 ("WRITE.ELF", "write"), ("STACK.ELF", "stack-bss"),
+                                 ("PRIV.ELF", "privileged"), ("TEXT.ELF", "text-write"),
+                                 ("PROTECT.ELF", "protect")]:
+            subprocess.run(["mcopy", "-o", "-i", disks[0],
+                            os.path.join("build/exec-fixtures", source), "::/"+filename], check=True)
     conf = runner.ARCH_CONF[args.arch]
     proc = subprocess.Popen(
         runner.qemu_command(conf, os.path.abspath(args.kernel), disks),
@@ -66,8 +73,22 @@ def main():
             if args.scenario == "fat":
                 command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
                 command("cat 0:/DOCS/ABOUT.TXT", ["KaleidOS test fixture:"])
+                if args.arch == "rv64":
+                    for filename, expected in [("EXIT0.ELF", "exec: exit=0"),
+                                               ("EXIT7.ELF", "exec: exit=7"),
+                                               ("WRITE.ELF", "exec: exit=0"),
+                                               ("STACK.ELF probe", "exec: exit=0"),
+                                               ("PRIV.ELF", "exec: signal=4"),
+                                               ("TEXT.ELF", "exec: signal=11"),
+                                               ("PROTECT.ELF", "exec: signal=11")]:
+                        markers = [expected]
+                        if filename == "WRITE.ELF": markers.append("EXEC_WRITE_OK")
+                        command("exec 0:/"+filename, markers)
+                    command("exec 0:/HELLO.TXT", ["exec: ENOEXEC"])
+                    command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
             else:
                 command("cat 0:/HELLO.TXT", ["cat: no filesystem provider"])
+                command("exec missing", ["exec: ENODEV"])
             # init is a boot-anchor composer, not an application launched by ksh.
             command("load init", ["load init: EINVAL"])
         command("echo INIT_SERIAL_OK", ["\nINIT_SERIAL_OK"])

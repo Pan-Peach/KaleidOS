@@ -1,30 +1,67 @@
-# POSIX personality 的 create 配置。不是 Linux syscall ABI，也不是 Core ABI。
-# endpoint 由组合者选择，create 必须经 Endpoint<Vfs> 校验；不扫描“第一个 VFS”。
-# 当前仅定义布局，构造 / bind / syscall 路由均未实现。
-
+# Minimal process-family profile. Config is an immutable named ELF snapshot;
+# it is not VFS, a Linux syscall ABI, or a general filesystem namespace.
+# Header LE u32 image_count/argc/envc/reserved, followed by image records:
+# u32 name_len, u32 image_len, name bytes, image bytes; then argc/envc records
+# u32 len + bytes. No NULs in names/strings; no trailing bytes. Maximum 8 images,
+# 128 strings, 16 MiB total. First image is initial program. Ownership is copied.
 [[struct]]
 name = "PosixCreateConfig"
 c_name = "kcomp_posix_create_config"
-size = 8
-align = 8
+size = 16
+align = 4
 targets = "c,sdk-rust"
-doc = "config 恰好 8 字节，LE u64 VFS endpoint identity；create 需复制且校验 config_abi。"
-
+doc = "LE fixed header followed by bounded image/argv/envp records."
 [[struct.field]]
-name = "vfs_endpoint"
-type = "u64"
+name = "image_count"
+type = "u32"
 offset = 0
+[[struct.field]]
+name = "argc"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "envc"
+type = "u32"
+offset = 8
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 12
 
 [[const]]
 name = "KCOMP_POSIX_CREATE_CONFIG_ABI"
 type = "u64"
-value = "0x504F_5349_5843_4647"
+value = "0x504F_5349_5849_4D47"
 targets = "c,sdk-rust"
-doc = "exact create config fingerprint，ASCII POSIXCFG。"
-
+doc = "Exact immutable-image config fingerprint. Old VFS-only skeleton config rejected."
 [[const]]
 name = "KCOMP_POSIX_CREATE_CONFIG_LEN"
 type = "usize"
-value = "8"
+value = "16"
 targets = "c,sdk-rust"
-doc = "config 扁平字节长度，非 Rust struct 内存重解释。"
+doc = "Minimum header length; records follow."
+[[const]]
+name = "KCOMP_POSIX_PROCESS_NAME"
+type = "string"
+value = "posix.process"
+targets = "c,sdk-rust"
+[[const]]
+name = "KCOMP_POSIX_PROCESS_CONTRACT"
+type = "u64"
+value = "0x504F_5349_5850_524F"
+targets = "c,sdk-rust"
+[[const]]
+name = "KCOMP_POSIX_PROCESS_ABI"
+type = "u64"
+value = "0x5052_4F43_5354_4154"
+targets = "c,sdk-rust"
+doc = "Read-only family status: Direct C table; Gate method 0 empty input, 12-byte LE reply."
+[[struct]]
+name = "PosixProcessApi"
+c_name = "kcomp_posix_process_api"
+size_ptrs = 1
+targets = "c,sdk-rust"
+[[struct.field]]
+name = "status"
+type = "fn(ctx: *mut void, out_exited: *mut u32, out_wait_status: *mut u32, out_live: *mut u32) -> i32"
+doc = "exited=0/1; wait_status valid iff exited; live counts tasks not yet exited. No scheduling."

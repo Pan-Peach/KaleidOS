@@ -33,6 +33,10 @@ pub struct TaskRecord {
     pub(crate) irq_flags: Option<<arch::CpuImpl as arch::CpuArch>::IrqFlags>,
     pub kstack: Kernelstack,
     pub(crate) memory: Option<MemoryLease>,
+    #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+    pub(crate) user: Option<Box<super::user::UserDomain>>,
+    #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+    pub(crate) retired_user: alloc::vec::Vec<super::user::UserDomain>,
 }
 
 // `arg` 是组件 opaque 指针：Core 只存/透传、永不解引用。跨线程使用由
@@ -60,6 +64,10 @@ impl TaskRecord {
             irq_flags: None,
             kstack,
             memory: Some(memory),
+            #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+            user: None,
+            #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+            retired_user: alloc::vec::Vec::new(),
         }
     }
 

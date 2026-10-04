@@ -1559,9 +1559,10 @@ class RustEmitter(Emitter):
         literal_asserts: List[str] = []
         width_asserts: List[str] = []
         if struct.size_ptrs is not None:
+            factor = "" if struct.size_ptrs == 1 else "%d * " % struct.size_ptrs
             literal_asserts.append(
-                "assert!(core::mem::size_of::<%s>() == %d * core::mem::size_of::<usize>());"
-                % (name, struct.size_ptrs)
+                "assert!(core::mem::size_of::<%s>() == %score::mem::size_of::<usize>());"
+                % (name, factor)
             )
             literal_asserts.append(
                 "assert!(core::mem::align_of::<%s>() == core::mem::align_of::<usize>());" % name
@@ -2167,7 +2168,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 49
+    assert len(core.functions) == 60
     assert {"kcore_task_start_on", "kcore_cpu_current"} <= {func.name for func in core.functions}
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
@@ -2176,8 +2177,15 @@ doc = "I/O error"
         "kcore_timebase_hz",
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
-    assert len([func for func in core.functions if func.core_params != func.params]) == 1
-    assert len(core.structs) == 5 and len(component.structs) == 2
+    assert len([func for func in core.functions if func.core_params != func.params]) == 3
+    assert len(core.structs) == 6 and len(component.structs) == 2
+    user_trap = next(struct for struct in core.structs if struct.name == "UserTrap")
+    assert user_trap.size64 == 88 and user_trap.size32 == 88 and user_trap.align == 8
+    posix = load_schema("abi/posix.toml")
+    process_api = next(struct for struct in posix.structs if struct.name == "PosixProcessApi")
+    one_pointer = RustEmitter()._struct(process_api)
+    assert "== core::mem::size_of::<usize>()" in one_pointer
+    assert "1 *" not in one_pointer
     frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
     assert frame.c_name == "kcomp_call_frame" and frame.size_ptrs == 6
     assert [field.name for field in frame.fields] == [

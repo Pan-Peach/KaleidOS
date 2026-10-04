@@ -64,6 +64,17 @@ make test-compat-linux
 make compat-windows
 ```
 
+首条 guest 路线为 RV64，可从同一份上游 source 交叉构建到独立输出目录：
+
+```sh
+python3 tests/compat/runner.py build --target linux --cc riscv64-linux-gnu-gcc \
+  --out build/compat-rv64
+```
+
+交叉构建不产生原生参考或 guest PASS。静态 glibc 仍带启动栈、TLS、内存与 Linux
+syscall 依赖；先用 `make exec-fixtures` 验证执行机制，细节见
+`docs/development/userspace.md` 的 exec 夹具说明。
+
 Linux 默认 `cc`，默认 `-static`，没有静态库时明确 BUILD_FAIL，不自动切换链接方式。
 Nix 的默认 cc 可能不带 libc.a/libm.a；有系统 GCC 时可用：
 
@@ -135,15 +146,19 @@ posix/fdopen posix windows x86_64-w64-mingw32 -
 构建也可通过 `--cc` 指定真实 Linux 交叉工具链；正常 Windows x86_64 PE 留给同 ISA 的
 KaleidOS 执行路径，当前不加 emulation / binary translation。
 
-KaleidOS 当前不能执行本套应用。还缺：task ↔ user AS 绑定、持久私有 AS 任务、U-mode
-进入 / trap / ecall、exit code / wait / fault 归因、用户启动栈与 libc 所需 syscall、
-应用 ELF / PE loader、外置 ExecService、Linux / Windows personality 及文件 / console 服务。
-Windows 另需处理实际 CRT startup 与系统 DLL imports。Core 的 ET_REL component loader
-不能代替应用 loader；普通测试程序不分配 ComponentId / Endpoint。
+KaleidOS 已能在 RV64 S/MMU 运行普通静态 ELF，包含独立用户 AS、真实 U-mode /
+trap / copy、启动栈、fork / execve / wait4 与退出 / fault 结果。ksh `exec` 从真实 FS
+读镜像，交给 POSIX 的不可变镜像 profile；机制验收在 CoreTest，见
+[userspace.md](userspace.md)。这不代替通用 VFS 或 SandboxedNative 组件装载。
 
-将来 guest runner 的工作是读清单 → 按应用选择 loader / personality → spawn → wait →
-收集结果。ksh 只调用该服务；一个 OS 实例顺序运行 Linux / Windows 应用，不切全局 boot mode。
-本次没有实现或伪造这条 guest 链，也不承诺已存在上述运行期 API。
+本套上游程序尚未在 KaleidOS PASS。已实际从 FAT 尝试 RV64 静态 glibc 的
+`compiler/udiv`：ELF 装载成功，启动因缺失 uname、mmap、signal 等 syscall 终止。
+涉及文件的 fdopen/stat 还需 VFS 与 POSIX fd；Windows 还需相同 guest ISA 的 PE loader、
+CRT startup 和 DLL imports。当前组合包为 x86_64，不能在 RV64 直接执行。
+
+后续 guest runner 应读清单、选择该应用的 loader / personality、等待并收集结果，
+每项区分装载失败、应用失败、故障、timeout 与 unsupported。现阶段未发布本 suite 的
+自动 guest runner；参考结果与执行探针结果分别保留，不互相替代。
 
 静态 libc 函数测试验证随程序链接的 libc，以及启动 / 退出链；涉及文件 / syscall 的测试才
 进一步覆盖 personality / 服务语义。参考平台 PASS 不是 KaleidOS PASS，两个参考也不能用来

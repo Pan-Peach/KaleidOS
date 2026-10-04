@@ -1,4 +1,4 @@
-//! 有界 whitespace tokenizer；不解释引号、管道、变量或程序执行。
+//! 有界 whitespace tokenizer；不解释引号、管道、变量，exec 只接受普通参数。
 
 use kcomp_sdk::management::ExecutionDomain;
 
@@ -16,6 +16,7 @@ pub enum Command<'a> {
     Load(&'a [u8], ExecutionDomain),
     Inspect(&'a [u8]),
     Cat(&'a [u8]),
+    Exec(&'a [u8]),
     Exit,
     Unsupported(&'a [u8]),
 }
@@ -93,6 +94,12 @@ pub fn parse(line: &[u8]) -> Result<Option<Command<'_>>, ParseError<'_>> {
             }
             Command::Inspect(artifact(args[0])?)
         }
+        b"exec" => {
+            if args.is_empty() {
+                return Err(ParseError::Usage("exec <provider-relative-path> [args...]"));
+            }
+            Command::Exec(line.trim_ascii()[words[0].len()..].trim_ascii())
+        }
         b"cat" => {
             if args.len() != 1 {
                 return Err(ParseError::Usage("cat <provider-relative-path>"));
@@ -162,6 +169,10 @@ mod tests {
             parse(b"inspect virtio_blk.kcomp"),
             Ok(Some(Command::Inspect(b"virtio_blk")))
         );
+        assert_eq!(
+            parse(b"exec APP.ELF probe"),
+            Ok(Some(Command::Exec(b"APP.ELF probe")))
+        );
         assert_eq!(parse(b"ls /"), Ok(Some(Command::Unsupported(b"ls"))));
     }
 
@@ -169,6 +180,7 @@ mod tests {
     fn malformed_arguments_and_unknown_commands() {
         for line in [
             b"load".as_slice(),
+            b"exec",
             b"load a native extra",
             b"inspect",
             b"cat a b",

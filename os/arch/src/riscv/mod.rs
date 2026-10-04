@@ -34,6 +34,9 @@ pub mod smp;
 ))]
 pub mod trampoline;
 
+#[cfg(all(feature = "vm-mmu", feature = "supervisor", target_arch = "riscv64"))]
+pub mod user;
+
 /// 重定位实现：纯字节/编码逻辑，任何目标可编译（host 也测它本身）。
 pub mod elf;
 

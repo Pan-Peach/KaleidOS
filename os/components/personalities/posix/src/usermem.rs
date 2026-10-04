@@ -3,7 +3,7 @@
 
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UserAddress(pub u64);
 
 pub struct UserRange {

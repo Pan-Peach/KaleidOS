@@ -214,6 +214,10 @@ pub fn install() {
 /// 通过后：策略缺失 = `Abandon`；`Resume` = 按（可能被修改的）帧恢复组件；
 /// `Abandon` = 经 [`CrossAsContext::abandon`] 交回进入前的 Core 调用者。
 fn on_exception(frame: *mut TrapFrame, cause: usize, stval: usize) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    if unsafe { crate::task::user::on_trap(frame, cause, stval) } {
+        return true;
+    }
     let Some(cross_ptr) = containment::cross_as::active_cross_as() else {
         return false;
     };

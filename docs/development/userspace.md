@@ -1,75 +1,96 @@
-# 用户态与 BusyBox 的实施顺序
+# 用户态、fork/exec 与后续 libc
 
-> 计划与手写入口，不是已实现能力或新增 Core 契约。状态以 `STATUS.md` 为准；
-> 执行域契约以 `docs/architecture/deployment.md`、
-> `docs/architecture/driver-model.md` 为准。第一条验证路线选择 RV64 / MMU / QEMU virt。
-
-## 组合关系
+第一条运行路线是 RV64 / supervisor / MMU / QEMU virt。当前已实现普通静态 ELF
+用户程序，尚未实现完整 POSIX、Win32 或 BusyBox。边界与代码见
+[POSIX 模块](../modules/posix.md)、[调度契约](../architecture/scheduling.md)。
 
 ```mermaid
-flowchart TB
-  App["用户 ELF：小程序 → 静态 BusyBox"]
-  Domain["Core / Arch：SandboxedNative、用户 AS、task、trap"]
-  Posix["posix.kcomp：进程、fd、ELF、syscall 语义"]
-  Vfs["vfs.kcomp：Namespace / File service"]
-  Fs["FS provider → BlockDevice → driver"]
-  App -->|U-mode trap| Domain
-  Domain -->|待定的窄回调契约| Posix
-  Posix -->|消费 VFS API| Vfs
-  Vfs --> Fs
+flowchart LR
+  Shell["ksh exec"] -->|"open/read/close"| FS["filesystem → block → driver"]
+  Shell -->|"ELF 快照 + argv"| Posix["posix.kcomp：ELF / PID / syscall / wait"]
+  Posix -->|"窄 C ABI"| Core["Core task / user AS / copy / trap"]
+  Core --> Arch["Arch sret → U-mode"]
+  Arch -->|"实际 task 的 trap"| Core
 ```
 
-SandboxedNative 是 Core 的执行域，不构建 sandbox.kcomp。POSIX 默认是消费者，
-不发布业务 service；Core 如何交付用户 trap 要另定窄 C ABI。用户 ELF 也不是
-`.kcomp`：POSIX 解释程序格式，Core 验证并提交映射 / task / 执行现场。
+## 运行与验证
 
-当前落点为 Core `component/sandbox.rs`、VFS `filesystems/vfs/`、
-POSIX `personalities/posix/` 和 SDK 的 `vfs` / `posix` 声明。全部为占位。
-Sandbox 创建在装载前返回 ENOTSUP；U-mode 进入、copy、trap 路由与销毁尚未实现。
+```sh
+make exec-fixtures              # .config 选择架构，目前只支持 RV64
+make test-host                  # 包含 POSIX ELF / stack / config 与 Core 纯逻辑
+make test-qemu                  # RV64/RV32 CoreTest、ksh、默认 init
+# 可选的 Linux syscall 模拟参考；不代表 KaleidOS 执行结果
+python3 tests/compat/exec_fixtures.py --arch rv64 --linux-reference
+```
 
-## 阶段与验收
+夹具编译需要 `riscv64-unknown-elf-gcc`；QEMU/真实 FAT 流程需要 qemu-system-riscv64、
+dosfstools、mtools。CI 已登记该编译器。Make 的 RV64 init.kpkg 和 clippy 会先构建
+夹具；生成物在 `build/exec-fixtures/`，不提交二进制。14 个镜像均为普通 ET_EXEC，
+不是 `.kcomp`；多数只用整数，fork/exec 与 timer 还验证浮点现场。
 
-| 阶段 | 手写范围 | 验收 |
-|---|---|---|
-| 1：只读 VFS | provider 的 root / node / lookup / 引用 / readlink / 枚举 / read_at；VFS 表、授权 / share、SDK Direct/Gate adapter | 真实 FS → VFS → consumer；路径引用、独立 open 游标、dup 共游标、EOF / 短读、旧实例失效 |
-| 2：Core 用户执行域 | task↔AS、U 权限映射、用户栈、trap 返回、Core ecall、用户范围 copy、故障逻辑退役 | 真实 U-mode 小探针；拒绝访问 Core / 其他域、拒绝特权指令、坏指针不破坏 Core、fault 不结束其他实例 |
-| 3：POSIX 小程序 | 用户 trap 路由、进程 / fd、Console、静态 ELF 段与 argc/argv/envp/auxv、最小 syscall | 先 freestanding write/exit，再静态 libc hello；确认实际为 U-mode，有真实 task / AS |
-| 4：静态 BusyBox applet | 按实际二进制补 Linux syscall 子集 / stat 布局 / 内存与目录操作，VFS 数据与控制台 I/O | 独立运行 true / echo，再 cat / ls；记录未实现 syscall，明确拒绝 |
-| 5：shell | 多进程 / spawn 或 fork-exec、wait、pipe、终端、阻塞完成、signal 与所需调度机制 | 能执行命令、等待退出、重定向和管道；再增加选定 applet |
+| 场景 | 实际验证 |
+|---|---|
+| exit-zero / exit-seven / write | 回到调用者，保留 0 / 7 退出码、stdout 字节与 write 返回数 |
+| stack-bss | 16 字节对齐、argv/envp/auxv、跨页 BSS 清零 / 可写 |
+| bad-pointer | 溢出、Core 地址、跨映射空洞的 write 返回 EFAULT |
+| privileged / core-read / text-write / stack-execute / breakpoint | U-mode 权限与进程故障状态；不结束 Core |
+| protect | 非法 mprotect 拒绝，实际只读页写入故障 |
+| fork-exec + target | 子进程复制 backing / FP；坏 ELF 的 exec 回滚；新 ELF / 栈 / BSS / FP；wait 与 EFAULT / ECHILD |
+| timer | 无 ecall 长循环也允许另一个任务运行；回来后整数 / FP 现场保持 |
 
-阶段 1 / 2 可以分别推进；阶段 3 同时依赖用户执行域与基本服务。Console 需要真实
-输入 / 输出契约，不能将 kcore_log_line 伪装成 fd 1。BusyBox applet 的具体 syscall
-集合由选定构建及实测决定，不从 POSIX API 名字推断。
+组件 / 系统集成的唯一编排者仍是 CoreTest，入口在
+`os/components/tests/core_test/src/runtime/exec.rs`。QEMU runner 要求 `exec-elf`、
+`exec-fork-exec-wait`、`exec-timer` 和整个 CoreTest PASS。
+`tests/qemu/init_runner.py` 在 FAT 盘副本放入短文件名 ELF，提交真实 ksh `exec` 命令；
+它还验证非法 ELF、进程故障、随后 cat/echo 和 shutdown。无盘分支返回 ENODEV。
 
-CoreTest / ArchTest 的新用例走真实 Core API；夹具如后续确有需要，放测试目录。
-本阶段只调整现有 host 拒绝路径检查，不构建或登记 sandbox 测试组件。
+手动执行可把同 ISA 静态 ELF 放入实际 FAT 镜像：
 
-## 在写 Core 机制前需要定稿的接缝
+```sh
+make rootfs
+mcopy -o -i build/rootfs.fat build/exec-fixtures/write ::/WRITE.ELF
+make qemu
+# ksh> exec 0:/WRITE.ELF
+# EXEC_WRITE_OK
+# exec: exit=0
+```
 
-1. 用户 task 对 AS 的关联与调度提交：由 Core 验证真实 owner / 状态；不能由 POSIX
-   直接写 task 状态、页表或复制 Isolated S-mode trampoline 作为 U-mode 实现。
-2. 用户 trap 的交付 / 返回：来源必须来自 Core 当前 task，不能信任寄存器中的 pid。
-   Linux syscall 号、fd 和 errno 由 POSIX 解释；Core 不内建 Linux dispatcher。
-3. Sandboxed 组件的 Core mechanism ecall 与用户程序的 personality syscall 是不同契约。
-   路由依据真实执行上下文，不能仅凭任意用户操作号冒充另一类调用。
-4. 用户指针 copy：按实际 AS 的映射 / U 权限逐页校验，处理溢出、fault、并发 unmap；
-   不依赖 SUM，也不将 user VA 直接 cast 为共享内核引用。
-5. 阻塞与完成：Gate service stack 禁止 park；用户 read / wait 的等待协议、跨 owner
-   完成通知须单独定稿。服务返回后如何唤醒正确用户 task 仍是机制缺口。
-6. 原生权限 / Linux 错误映射与装载策略：不把不支持的语义翻译成成功。
-   POSIX 进程身份与 ComponentId 的关系、多个进程 AS 的归属仍需设计。
-7. Sandboxed 组件的按域装载 / import：SDK 的 Core 调用需接 U-mode ecall 后端，
-   不能解析到 KernelNative 裸函数地址；堆使用本执行域后端，不导入共享 Core heap。
+当前 FatFs 配置使用短文件名；示例用 8.3 名称。shell 参数不支持引号 / 展开 / 管道。
+读取 ELF 使用真实 FS，POSIX 此 profile 的 execve 则只查显式配置的镜像集合。
+单镜像 ksh profile 的 key 是 `/main`；不能据此声称一般的路径 / cwd / VFS 已接通。
 
-这些接缝在 Core 与组件边界间另定 schema，不通过 Rust enum / trait / 编译器结构传递。
+## Core 与 POSIX 的执行接缝
 
-## BusyBox 构建目标
+Core `task/user.rs` 拥有 task↔AS、U 映射、全部整数与浮点现场、实际 trap 来源；
+`abi/core.toml` 的 `kcore_user_*` 是创建、映射、初始化、准备、copy、进入、clone、
+replace、protect、discard 的窄 C ABI。Core 不解释 Linux syscall 号或 PID。
 
-先选静态 ELF 的少量 applet，避免首个目标同时要求动态 linker 与 shell。
-BusyBox 支持静态构建，且 standalone shell 也有额外运行环境要求；参见
-[BusyBox 官方 FAQ](https://busybox.net/FAQ.html)。静态链接只减少装载依赖，
-并不取消 libc / Linux syscall 与启动栈要求；musl 自身是面向 Linux 的 libc，
-参见 [musl 官方介绍](https://wiki.musl-libc.org/)。
+每个用户 task 在 POSIX 的 KernelNative 任务入口中同步进入 U-mode。ecall / fault /
+到期 timer 恢复该 task 的内核栈与 kernel satp；POSIX 再处理 syscall / yield / park。
+用户 copy 全范围逐页验证实际 U 映射和读写权限后才通过 Core alias 复制，不打开 SUM。
+fork 深拷贝；exec 和 mprotect 构造完整新 AS 后提交，失败保留旧 AS。
 
-后续若引入 BusyBox / libc，使用 `third_party/` git submodule；构建目标与选择由
-Kconfig / `.config` 驱动。当前没有下载第三方源码、创建 BusyBox target 或承诺版本。
+一个 POSIX 组件实例管理进程族，族内 task 都有自己的 AS，不以 PID 冒充 ComponentId。
+进程族固定 CPU，状态 observer 只读原子字段。wait 在真实 task 栈 park，子进程退出
+经同 owner 的 unpark 唤醒。退出 / 成功替换的已发布 backing 保持驻留，尚无 COW 或
+完整物理回收。POSIX 选 10ms 用户执行界限，Core timer 保留已有更早 deadline；
+这没有实现 KernelNative 组件任务的通用抢占。
+
+普通用户 task 与 SandboxedNative `.kcomp` 是两条装载路径：后者仍未接 U-mode imports /
+Core ecall SDK / 私有 heap / lifecycle，组件装载仍返回 ENOTSUP。
+
+## 下一步：上游 libc 与文件语义
+
+上游 libc-test 的参考运行与组合包见 [compat-testing.md](compat-testing.md)。
+RV64 静态 glibc `compiler/udiv` 已实际从 FAT 装载，但启动终止；日志暴露缺失的
+uname、openat、writev、mmap、signal 等 syscall。当前不将这些缺失行为翻译成成功，
+也不宣称任何上游 libc-test 已在 KaleidOS PASS。
+
+后续按实际二进制逐项补 startup / TLS / 系统信息 / 内存 / 信号，再运行 shared C
+用例。文件用例 fdopen/stat 另需真实 FS → VFS → POSIX fd；现有 FS API 缺 node /
+lookup / read_at，VFS 仍是骨架。先实现只读 namespace、独立 open 游标与引用，再补
+写入、目录、dup、pipe、terminal。已有 FAT / littlefs / block provider 无需重写。
+
+Win32 后置：还需 PE loader、DLL imports、Win32 API / HANDLE，与用户执行机制可共用。
+当前 Windows 参考包是 x86_64，不能在 RV64 CPU 直接执行；共用测试源码不等于共用
+不同 ISA 的二进制。BusyBox applet 同样需要对应的真实 syscall / VFS，不只需要静态链接。

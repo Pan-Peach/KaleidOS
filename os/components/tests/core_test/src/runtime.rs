@@ -20,6 +20,8 @@
 mod boot;
 mod c_frontend;
 mod driver;
+#[cfg(target_arch = "riscv64")]
+mod exec;
 mod filesystem;
 mod report;
 mod resource;
@@ -125,6 +127,8 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         unsafe { core::ptr::addr_of_mut!((*state).smp) },
         sched.rr_id,
     );
+    #[cfg(target_arch = "riscv64")]
+    exec::group(&mut checks);
     checks.finish()
 });
 

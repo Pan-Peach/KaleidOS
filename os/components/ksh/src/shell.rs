@@ -32,7 +32,7 @@ fn domain(raw: u32) -> &'static str {
 }
 
 /// 确定性单行执行入口；返回 true = 退出会话。
-/// 未来 exec(path, argv) 在此分派到 ExecService，当前没有应用执行。
+/// exec reads a real FS image and composes a POSIX process family.
 pub fn execute(line: &[u8]) -> bool {
     let mut out = Console;
     let command = match parser::parse(line) {
@@ -63,7 +63,7 @@ pub fn execute(line: &[u8]) -> bool {
         Command::Help => {
             let _ = writeln!(
                 out,
-                "help | echo <args...> | clear | components | endpoints | devices\nload <artifact> [native|isolated] | inspect <loaded-artifact>\ncat <provider-relative-path> | exit\nls/cd/pwd: unavailable (no directory/namespace service)\nApplications: ExecService is not implemented"
+                "help | echo <args...> | clear | components | endpoints | devices\nload <artifact> [native|isolated] | inspect <loaded-artifact>\ncat <provider-relative-path> | exec <provider-relative-path> [args...] | exit\nls/cd/pwd: unavailable (no directory/namespace service)\nexec: static RV64 ELF; image snapshot, stdin EOF, stdout/stderr console"
             );
         }
         Command::Echo(words) => {
@@ -107,6 +107,15 @@ pub fn execute(line: &[u8]) -> bool {
             }
         },
         Command::Cat(path) => cat(path),
+        Command::Exec(words) => {
+            let argv: alloc::vec::Vec<_> = words
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Err(error) = exec(&argv) {
+                let _ = writeln!(out, "exec: {error}");
+            }
+        }
         Command::Unsupported(name) => {
             let _ = writeln!(
                 out,
@@ -296,4 +305,80 @@ fn cat(path: &[u8]) {
         let _ = writeln!(out, "cat: close failed: {error:?}");
     }
     Console::write(b"\n");
+}
+
+// This is shell composition: read an executable through the actual mounted FS,
+// then give POSIX an immutable image snapshot. It is not a VFS namespace.
+fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
+    use alloc::vec::Vec;
+    use kcomp_sdk::{Errno, posix};
+    let mut selected = None;
+    let mut name = [0u8; 256];
+    for ordinal in 0..u32::MAX {
+        let Some(info) = management::endpoint_nth(ordinal, &mut name)? else {
+            break;
+        };
+        if info.state == abi::EndpointState::Live as u32
+            && info.contract == FileSystem::ID
+            && info.abi == FileSystem::ABI
+            && selected.replace(info.id).is_some()
+        {
+            return Err(Errno::EBUSY);
+        }
+    }
+    let binding = Endpoint::<FileSystem>::from_id(selected.ok_or(Errno::ENODEV)?)?
+        .bind()
+        .map_err(fs_error)?;
+    binding.mount().map_err(fs_error)?;
+    let path = argv[0];
+    let mut bytes = [0u8; kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_PATH_MAX];
+    if path.len() >= bytes.len() {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    bytes[..path.len()].copy_from_slice(path);
+    let path = CStr::from_bytes_with_nul(&bytes[..path.len() + 1]).map_err(|_| Errno::EINVAL)?;
+    let handle = binding.open(path, FILESYSTEM_OPEN_READ).map_err(fs_error)?;
+    let loaded = (|| {
+        let mut image = Vec::new();
+        let mut buffer = [0u8; 520];
+        loop {
+            let len = binding.read(handle, &mut buffer).map_err(fs_error)?;
+            if len == 0 {
+                return Ok(image);
+            }
+            if image.len() + len > 1024 * 1024 {
+                return Err(Errno::E2BIG);
+            }
+            image.extend_from_slice(&buffer[8..8 + len]);
+            management::yield_task()?;
+        }
+    })();
+    let closed = binding.close(handle).map_err(fs_error);
+    let image = loaded?;
+    closed?;
+    let config = posix::encode(&[(b"/main", &image)], argv, &[])?;
+    let id = management::create(b"posix", posix::KCOMP_POSIX_CREATE_CONFIG_ABI, &config)?;
+    let process =
+        Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?.bind()?;
+    loop {
+        let status = process.status()?;
+        if status.exited && status.live == 0 {
+            let mut out = Console;
+            if status.wait_status & 127 != 0 {
+                let _ = writeln!(out, "exec: signal={}", status.wait_status & 127);
+            } else {
+                let _ = writeln!(out, "exec: exit={}", (status.wait_status >> 8) & 255);
+            }
+            return Ok(());
+        }
+        management::yield_task()?;
+    }
+}
+
+fn fs_error(error: kcomp_sdk::endpoint::InvokeError) -> kcomp_sdk::Errno {
+    use kcomp_sdk::endpoint::InvokeError;
+    match error {
+        InvokeError::Transport(errno) | InvokeError::Method(errno) => errno,
+        InvokeError::InvalidReply => kcomp_sdk::Errno::EIO,
+    }
 }

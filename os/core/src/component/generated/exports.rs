@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 49] = [
+pub(super) static EXPORTS: [Export; 60] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -407,6 +407,91 @@ pub(super) static EXPORTS: [Export; 49] = [
         address: ExportAddress({
             let implementation: extern "C" fn(u32, *mut EndpointInfo, *mut u8, usize) -> i32 =
                 super::kcore_endpoint_nth;
+            implementation as *const ()
+        }),
+    },
+    // Category 11：User task execution
+    Export {
+        name: b"kcore_user_create",
+        address: ExportAddress({
+            let implementation: extern "C" fn(usize, *mut (), *mut u32) -> i32 =
+                super::kcore_user_create;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_map",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, u64, u32) -> i32 = super::kcore_user_map;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_protect",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, u64, u32) -> i32 =
+                super::kcore_user_protect;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_load",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, *const u8, usize) -> i32 =
+                super::kcore_user_load;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_read",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, *mut u8, usize) -> i32 =
+                super::kcore_user_read;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_write",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, *const u8, usize) -> i32 =
+                super::kcore_user_write;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_prepare",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32, u64, u64) -> i32 = super::kcore_user_prepare;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_step",
+        address: ExportAddress({
+            let implementation: extern "C" fn(i64, u64, *mut UserTrap) -> i32 =
+                super::kcore_user_step;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_clone",
+        address: ExportAddress({
+            let implementation: extern "C" fn(usize, *mut (), *mut u32) -> i32 =
+                super::kcore_user_clone;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_replace",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_user_replace;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_user_discard",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_user_discard;
             implementation as *const ()
         }),
     },

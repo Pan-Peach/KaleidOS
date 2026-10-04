@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-04。此次在 §3.21 登记上游 libc-test 的双平台参考测试基础设施；此前最小 init / ksh、窄查询 ABI、Isolated 生命周期调用边界与 monitor 输入安全点的记录保留，SMP / VFS / SDK / POSIX 等其余章节保留此前审计快照。
+更新：2026-10-04。此次接通 RV64 普通用户 task / AS / trap 与 POSIX fork / exec / wait，登记 CoreTest 和 FAT→ksh exec 验证；上游 libc-test 的宿主参考记录保留，glibc guest startup 仍未通过。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -10,7 +10,7 @@ RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固
 
 ## 0. 一句话
 
-KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；当前主要缺口是 task 与私有地址空间的关系；它们决定未来 POSIX personality、驱动、服务会不会继续向 Core 要新的对象类型。
+KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS / libc startup、组件 SandboxedNative 后端和物理回收仍是主要缺口。
 
 底座侧 RISC-V 的 CPU 身份、启动、IPI 与 per-CPU 执行现场已接通组件调度。第二 ISA 的现状见模块文档，本轮不扩展它的实现或测试范围。
 
@@ -31,7 +31,7 @@ KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组�
 ## 2. 系统总览
 
 ```text
-Applications / System Personality        ksh 已有 KernelNative shell；应用执行未实现（POSIX 骨架；Win32/WASI 是未来）
+Applications / System Personality        ksh 可 exec 静态 RV64 ELF；最小 POSIX fork/exec/wait；Win32/WASI 是未来
         │
 Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS 只有骨架
         │
@@ -62,9 +62,9 @@ Hardware                                    目前只有 QEMU virt
 
 现状：`KernelAddressSpace` 是语义 ledger，`AddressSpaceBackend` 是 contract。`Sv39PageTable`/`Sv32PageTable` 在 host 上直驱生产实现，覆盖 map/unmap/translate、mid-map 回滚、`mapping_exact`、共享与私有别名排除；QEMU ArchTest 覆盖 `mapping`、`load-fault`、`store-readonly`、`execute-nx`、`tlb-flush`、`tlb-invalidate`。NoMMU 走 identity，`GRANULE=1`。
 
-缺口：没有 user AS，没有 COW/lazy，没有 mmap/brk（这些属于 personality）；NoMMU 的 protection（PMP/MPU）没落地；`adopt`（接管 boot root）有代码但没接线。
+缺口：RV64 user AS 已接普通进程；没有 COW/lazy 或 mmap（这些属于 personality）；NoMMU 的 protection（PMP/MPU）没落地；`adopt`（接管 boot root）有代码但没接线。
 
-下一步：user AS 留给 SandboxedNative；PMP/MPU 跟 NoMMU 启动一起做；`adopt` 等 boot `vm/runtime.rs` 重构时接入。
+下一步：复用普通 user AS 机制接 SandboxedNative 组件后端；PMP/MPU 跟 NoMMU 启动一起做；`adopt` 等 boot `vm/runtime.rs` 重构时接入。
 
 #### 3.3 任务对象 `▰▰▰▰▱` IMPLEMENTED
 
@@ -188,11 +188,11 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.17 SandboxedNative（U-mode + syscall 边界） `▱▱▱▱▱` NOT IMPLEMENTED
 
-现状：Core `component/sandbox.rs` 已有 prepare_task / enter / 用户范围 copy 的声明与 Unsupported 占位，尚无执行机制。`load.rs` 的创建分派装载前返回 `SandboxUnsupported`（ABI `-ENOTSUP`），不创建实例、不回退 native；销毁入口仍未实现。没有 sandbox.kcomp，也没有已接线的 syscall wire ABI。
+现状：Core `component/sandbox.rs` 已有 prepare_task / enter / 用户范围 copy 的声明与 Unsupported 占位，尚无执行机制。`load.rs` 的创建分派装载前返回 `SandboxUnsupported`（ABI `-ENOTSUP`），不创建实例、不回退 native；销毁入口仍未实现。没有 sandbox.kcomp。普通用户 task 已有单独的 kcore_user_* C ABI / U-mode 路径，不等于组件部署后端已实现。
 
-缺口：低特权执行、`ecall` 入口、syscall 编解码、页表强制的访问边界，全部没有。
+缺口：组件按域装载 / import、Core mechanism ecall SDK、私有 heap 与 destroy；普通程序的低特权执行 / trap / U 页表访问已有独立路径。
 
-下一步：用户 AS / task 绑定 → U-mode / trap → 用户 copy / syscall 路由，再接 POSIX 小程序。它是"部署形态即安全策略"里真正的硬件强制边界；阶段依赖与验收见 `docs/development/userspace.md`。
+下一步：复用已接通的普通用户 task / AS / trap / copy 机制，补组件按域装载与 Core ecall SDK。阶段依赖与验收见 `docs/development/userspace.md`。
 
 #### 3.18 驱动组件 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -243,9 +243,22 @@ MinGW-w64 GCC 9.3 交叉构建 14/14 Windows x86_64 PE，另外两项显式 UNSU
 不能宣称无 DLL 依赖。双平台包包含 30 个程序、可执行位、manifest、COPYRIGHT / AUTHORS。
 host runner 11 项 failure / crash / timeout / stale result / 平台拒绝 / config-free 检查通过；
 Kconfig 胶水原 12 项通过。报告与日志在 `build/compat/`，不提交生成物。
-当前无原生 Windows 环境，Windows reference 未验证，新增 CI 尚未运行；也没有任何
-KaleidOS application PASS。task-AS / U-mode / trap / exit-wait-fault / ExecService / 应用 loader /
-personality 缺口见 `docs/development/userspace.md`，本次不实现或伪造 guest runner。
+
+RV64 普通用户执行（2026-10-04）：14 个普通 ELF 夹具位于
+`os/components/tests/exec_probe/`。CoreTest exec 分组验证真实 U-mode、退出码、argv /
+auxv / BSS、坏指针、Core / text / stack 权限、mprotect、fork 深拷贝与 FP 独立性、
+exec 成功和失败回滚、wait 的 EFAULT / ECHILD，以及无 ecall 长循环的 timer 返回。
+系统集成编排留在 CoreTest；没有另建 exec_test 组件。
+
+默认 init 的 RV64 FAT / 无盘 / 坏盘三场景通过；FAT 串口流程使用实际文件
+open/read/close → ksh exec → POSIX → U-mode → exit/signal，故障后 cat / echo /
+shutdown 仍正常。RV32 普通用户执行返回 ENOTSUP，既有 CoreTest / init 流程回归保留。
+
+原 16 项上游用例另已交叉构建为 RV64 静态 ELF，QEMU Linux 用户态参考均退出 0；
+不是 KaleidOS PASS。实际从 FAT 装载 glibc `compiler/udiv` 后启动终止，观察到
+uname / openat / writev / mmap / signal 等缺口，没有伪造成功。
+当前无原生 Windows 环境，Windows reference 未验证；新增 CI 尚未远端运行。
+操作与边界见 `docs/development/userspace.md`。
 
 缺口：NoMMU 不在任何测试入口或 CI 里构建与启动，只有 Kconfig 解析用例；M-mode 无验证；runner 只显式断言 12 条，其余靠 `all: PASS`；host ring 是线程本地替身，不覆盖并发语义。
 
@@ -285,19 +298,26 @@ personality 缺口见 `docs/development/userspace.md`，本次不实现或伪造
 
 下一步：整节计划见第 8 节。
 
-#### 3.26 POSIX personality `▰▱▱▱▱` PLANNED
+#### 3.26 POSIX personality `▰▰▰▱▱` EXPERIMENTAL
 
-现状：`os/components/personalities/posix/` 已有独立 `.kcomp` 骨架，含进程 / fd / 用户 copy / 静态 ELF / syscall 接缝；操作返回 Unsupported，create 返回 `-ENOTSUP`。它消费 VFS，不导出 service。`abi/posix.toml` 仅定义组合者提供 VFS endpoint 的 create config。尚无进程、用户程序装载或 Linux syscall 兼容；见 `docs/modules/posix.md`。
+现状：静态 RV64 ELF / 启动栈、进程族、独立 task / AS、fork / execve / wait4、console
+write / EOF read / close、brk / mprotect、退出 / fault 状态已经接入真实运行。
+PID / Linux syscall 语义在组件；Core 只管理实际执行真相。create 配置原地替换成显式
+镜像快照 profile，最多 8 个命名镜像；只读 `posix.process` endpoint 提供退出状态。
+一个 POSIX instance 管进程族，不把 PID 登记为 ComponentId。详见 `docs/modules/posix.md`。
 
-缺口：PCB、fd、signal、fork/exec/waitpid、mmap/brk 全部没有，而且都应该留在 personality。
+缺口：一般 VFS / 文件 fd、mmap、signal delivery / handler、线程、vfork、pipe / terminal、
+动态链接、静态 PIE；上游 glibc startup 尚未通过。fork 深拷贝，无 COW；wait 与成功 exec
+旧 backing 尚无物理回收。SandboxedNative 组件部署仍未实现。
 
-下一步：Core sandbox 与 VFS → 用户 write/exit 小程序 → 静态 libc hello → 少量 BusyBox applet → shell。task-AS / trap 路由与等待机制要先定稿；Core 不做成 POSIX 内核。详见 `docs/development/userspace.md` 与第 9 节。
+下一步：按实际 libc 二进制补 startup 所需 syscall，再接只读 VFS / fd 与上游文件用例。
+现有 FAT/littlefs/block provider 可复用；Core 不收 POSIX 或文件系统语义。
 
 #### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 最小 shell）
 
 现状：独立 `ksh.kcomp`，普通 profile 由 init 自动启动；monitor 也可 `load scheduler_rr` → `load ksh` 启动普通任务。
 支持 help / echo / clear / components / endpoints / devices / load native 或 isolated /
-inspect 已加载实例 / cat / exit。业务代码只走 SDK。新增 Core 导出仅 console read 与
+inspect 已加载实例 / cat / exec 静态 ELF / exit。业务代码只走 SDK。新增 Core 导出仅 console read 与
 component / endpoint 的值枚举；设备观察复用 `device_nth`，装载在既有 `component_load`
 上增加 domain 请求，协调替换 exact ABI fingerprint。命令与文件组合边界见 `docs/modules/ksh.md`。
 
@@ -314,8 +334,8 @@ service-fault / direct-imports / panic-escape；覆盖此次边界复用的正�
 
 缺口：inspect 仅加载后元数据，无未加载 artifact / 任意文件格式检查；FS 无目录 / 工作目录
 契约，因此 ls / cd / pwd unsupported；多 provider 的 cat 无 namespace 选择；尚无 console
-session 仲裁、应用执行或 ExecService。`./hello` 仍依赖 task-AS 绑定、U-mode / trap / exit/fault
-与外置 loader / personality，不在本次范围。
+session 仲裁、通用 VFS / execve 路径、文件 fd、管道或 Win32。`exec` 已有显式静态 ELF
+入口；`./hello` 的隐式查找仍未实现。
 
 #### 3.28 init `▰▰▰▰▱` IMPLEMENTED（最小启动编排）
 
@@ -846,7 +866,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 ## 11. 明确未做
 
-- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，create `-ENOTSUP`；U-mode / trap / destroy 未实现，没有已接线 syscall ABI。NOT IMPLEMENTED / PLANNED。
+- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，组件 create `-ENOTSUP`；组件 import / Core ecall / heap / destroy 未实现。普通用户 task 的 U-mode / trap 单独已接通。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
 - block/wake：任务 permit、owner、最终检查与 commit 已落地；CoreTest 覆盖本地与跨 CPU 唤醒。独立 TaskBlock / TaskWake trace、event / waitqueue、join / stop 未做。
 - SMP 基础已落地（RV64）：AP 启动、BootGate、Online、IPI、per-CPU scheduler / timer / containment、固定 CPU 的真实组件调度、跨 CPU wake 与 panic containment。复杂 SMP 调度（迁移 / work stealing / 抢占 / hotplug）与私有 AS 任务调度未做。SMP 不是构建开关，无 `smp` Cargo feature。

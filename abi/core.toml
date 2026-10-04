@@ -1,4 +1,6 @@
 # KABI schema — core：`kcore_*` 导出面 + Core 侧边界结构 / 常量。
+
+
 #
 # 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
 #   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 声明 + _Static_assert
@@ -1325,3 +1327,307 @@ type = "*mut u8"
 [[function.param]]
 name = "capacity"
 type = "usize"
+
+
+# Ordinary user tasks: Core owns execution, personality owns syscall semantics.
+[[struct]]
+name = "UserTrap"
+c_name = "kcore_user_trap"
+size = 88
+align = 8
+doc = "Actual user-task trap; raw ISA cause/register values, no Linux interpretation."
+
+[[struct.field]]
+name = "task"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 4
+
+[[struct.field]]
+name = "cause"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "pc"
+type = "u64"
+offset = 16
+
+[[struct.field]]
+name = "address"
+type = "u64"
+offset = 24
+
+[[struct.field]]
+name = "number"
+type = "u64"
+offset = 32
+
+[[struct.field]]
+name = "arg0"
+type = "u64"
+offset = 40
+
+[[struct.field]]
+name = "arg1"
+type = "u64"
+offset = 48
+
+[[struct.field]]
+name = "arg2"
+type = "u64"
+offset = 56
+
+[[struct.field]]
+name = "arg3"
+type = "u64"
+offset = 64
+
+[[struct.field]]
+name = "arg4"
+type = "u64"
+offset = 72
+
+[[struct.field]]
+name = "arg5"
+type = "u64"
+offset = 80
+
+[[function]]
+name = "kcore_user_create"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Create an unstarted task and private user AS; caller owns it. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "entry"
+type = "KcompTaskEntry"
+
+[[function.param]]
+name = "arg"
+type = "*mut void"
+
+[[function.param]]
+name = "out_task"
+type = "*mut u32"
+
+
+[[function.core_param]]
+name = "entry"
+type = "usize"
+[[function.core_param]]
+name = "arg"
+type = "*mut void"
+[[function.core_param]]
+name = "out_task"
+type = "*mut u32"
+
+[[function]]
+name = "kcore_user_map"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Map zeroed private backing. Page-aligned low VA; R=1 W=2 X=4; W^X. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "address"
+type = "u64"
+
+[[function.param]]
+name = "len"
+type = "u64"
+
+[[function.param]]
+name = "permission"
+type = "u32"
+
+[[function]]
+name = "kcore_user_protect"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Atomically replace permissions of a fully mapped user range; private AS and W^X checks remain in Core."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "address"
+type = "u64"
+
+[[function.param]]
+name = "len"
+type = "u64"
+
+[[function.param]]
+name = "permission"
+type = "u32"
+
+[[function]]
+name = "kcore_user_load"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Initialize user mappings only before task start; kernel aliases, never SUM. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "address"
+type = "u64"
+
+[[function.param]]
+name = "buffer"
+type = "*const u8"
+
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_user_read"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Copy from actual user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "address"
+type = "u64"
+
+[[function.param]]
+name = "buffer"
+type = "*mut u8"
+
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_user_write"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Copy to writable user mappings after whole-range validation. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "address"
+type = "u64"
+
+[[function.param]]
+name = "buffer"
+type = "*const u8"
+
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_user_prepare"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Validate U RX entry and RW-NX aligned stack; initialize registers. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"
+
+[[function.param]]
+name = "pc"
+type = "u64"
+
+[[function.param]]
+name = "sp"
+type = "u64"
+
+[[function]]
+name = "kcore_user_step"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Enter current task in U-mode until ecall/fault/interrupt, bounded by a caller-proposed absolute timer deadline. No lock or scheduling on trap stack. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "result"
+type = "i64"
+
+[[function.param]]
+name = "deadline"
+type = "u64"
+
+[[function.param]]
+name = "out"
+type = "*mut UserTrap"
+
+[[function]]
+name = "kcore_user_clone"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Deep-copy current suspended user AS/registers to an unstarted task; no PID semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "entry"
+type = "KcompTaskEntry"
+
+[[function.param]]
+name = "arg"
+type = "*mut void"
+
+[[function.param]]
+name = "out_task"
+type = "*mut u32"
+
+
+[[function.core_param]]
+name = "entry"
+type = "usize"
+[[function.core_param]]
+name = "arg"
+type = "*mut void"
+[[function.core_param]]
+name = "out_task"
+type = "*mut u32"
+
+[[function]]
+name = "kcore_user_replace"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Atomically replace current user context with an unstarted prepared task; no exec semantics. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "prepared_task"
+type = "u32"
+
+[[function]]
+name = "kcore_user_discard"
+ret = "i32"
+category = "User task execution"
+c_category = "User task execution"
+doc = "Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP."
+
+[[function.param]]
+name = "task"
+type = "u32"

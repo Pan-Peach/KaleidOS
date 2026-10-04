@@ -8,6 +8,7 @@ pub mod kstack;
 pub mod record;
 pub mod state;
 pub mod table;
+pub mod user;
 
 pub use error::TaskError;
 pub use id::TaskId;

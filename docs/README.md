@@ -32,7 +32,7 @@ docs/
 │   ├── boot.md
 │   ├── components.md
 │   ├── vfs.md                  （VFS 组件骨架与手写入口）
-│   ├── posix.md                （POSIX 消费者 / 语义聚合骨架）
+│   ├── posix.md                （最小 RV64 ELF / fork / exec / wait 与 VFS 缺口）
 │   ├── netstack.md             （smoltcp 网络栈 / TCP / UDP 骨架）
 │   ├── init.md                 （KernelNative 启动编排、根挂载与 monitor 回退）
 │   └── ksh.md                  （KernelNative shell、命令与当前边界）
@@ -40,7 +40,7 @@ docs/
 │   ├── testing.md
 │   ├── compat-testing.md        （上游 libc-test、Linux / Windows 参考构建与组合包）
 │   ├── benchmark.md
-│   ├── userspace.md            （Core sandbox → POSIX → 用户 ELF / BusyBox 的实施顺序）
+│   ├── userspace.md            （RV64 用户 ELF / fork-exec 验证与 libc / VFS 后续）
 │   └── docs-guide.md
 └── notes/                     历史与归档：非权威，不代表现状
     ├── resource-model-review.md

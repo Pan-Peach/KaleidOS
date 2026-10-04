@@ -64,4 +64,10 @@ CHOOSE_NEXT 的 args 为 `current TaskId + CpuId`，各 u32 LE；input 是本 CP
 
 KernelNative 失败是协作式逻辑死亡、物理驻留，不构成内存隔离。失败 owner 不再进入候选；已在另一 CPU 运行的任务在下一次调度边界停止，不承诺立即中断不让出的执行流。生命周期与隔离契约见 `docs/architecture/component-lifecycle.md`、`docs/architecture/deployment.md`。
 
-当前范围是 RV64 KernelNative 的协作式 SMP；RV32 单核回归继续覆盖。私有 AS 任务调度、抢占、迁移、work stealing、CPU hotplug 和第二 ISA 调度另行推进。验证入口见 `docs/development/testing.md`。
+当前范围是 RV64 KernelNative 的协作式 SMP；RV32 单核回归继续覆盖。普通用户
+程序的 private AS 在每次 U-mode step 激活，trap 后先恢复同一 task 的内核栈 / kernel
+satp，再调度 personality 任务，调度器不在用户 AS 或 per-CPU trap 栈切换任务。
+personality 提议执行 deadline，Core 保留更早的已有 deadline 并交 timer 验证；
+到期返回 task，由 personality 决定 yield。这不改变 KernelNative 组件任务的协作式
+契约。通用内核抢占、迁移、work stealing、CPU hotplug 和第二 ISA 调度另行推进。
+验证入口见 `docs/development/testing.md`。
