@@ -144,7 +144,7 @@ fn enumerate_candidates(state: &mut State) -> bool {
 /// 第一段：枚举候选 + 加载真实 `driver_prober`（dispatch 任务留给 `sched_run`）。
 pub fn prepare(checks: &mut Checks, state: &mut State) {
     checks.group("driver chain");
-    checks.check(35, "driver-candidates", enumerate_candidates(state));
+    checks.check("driver-candidates", enumerate_candidates(state));
 
     state.cursor = trace::cursor();
     let mut prober = 0u32;
@@ -157,7 +157,7 @@ pub fn prepare(checks: &mut Checks, state: &mut State) {
         klog!("[core-test] create driver_prober failed (rc={})", rc);
         state.prober_id = -1;
     }
-    checks.check(36, "driver-prober-load", rc == 0);
+    checks.check("driver-prober-load", rc == 0);
 }
 
 /// 用 assignment 创建 `virtio_blk` 实例（assignment 经 create config 进入驱动，
@@ -406,7 +406,6 @@ pub fn report(checks: &mut Checks, state: &State) {
         .iter()
         .all(|&id| trace::component_lifecycle(state.cursor, id as i32));
     checks.check(
-        37,
         "driver-prober-dispatch",
         state.prober_id >= 0
             && state.candidate_count > 0
@@ -416,12 +415,11 @@ pub fn report(checks: &mut Checks, state: &State) {
 
     if no_block {
         checks.check(
-            38,
             "driver-attach",
             no_match_evidence(state, &declared[..declared_len]),
         );
-        checks.check(39, "driver-no-match", check_no_match());
-        checks.check(40, "driver-multi-device", no_block_ownership(state));
+        checks.check("driver-no-match", check_no_match());
+        checks.check("driver-multi-device", no_block_ownership(state));
         return;
     }
 
@@ -429,12 +427,12 @@ pub fn report(checks: &mut Checks, state: &State) {
     let (endpoint_count, attached_endpoint) = find_attached(state);
     let attach_ok =
         ownership_ok && endpoint_count == 1 && attached_endpoint.is_some_and(attach_serves);
-    checks.check(38, "driver-attach", attach_ok);
+    checks.check("driver-attach", attach_ok);
 
-    checks.check(39, "driver-no-match", check_no_match());
+    checks.check("driver-no-match", check_no_match());
 
     let multi_ok = check_multi_device(state, attached_device);
     // 被拒绝的第二次 attachment 不得复位已 attach 的设备：它仍能读盘。
     let still_serves = attached_endpoint.is_some_and(attach_serves);
-    checks.check(40, "driver-multi-device", multi_ok && still_serves);
+    checks.check("driver-multi-device", multi_ok && still_serves);
 }

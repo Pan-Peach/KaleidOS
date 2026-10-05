@@ -201,8 +201,8 @@ fn print_linker_layout() {
 // rustc 原生 link_section → ABI 与镜像一致，无需 objcopy。
 #[used]
 #[unsafe(link_section = ".initpkg")]
-static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
-    *include_bytes!("../../../../tools/qemu/init.kpkg");
+static INITPKG: [u8; include_bytes!(env!("KALEIDOS_INITPKG")).len()] =
+    *include_bytes!(env!("KALEIDOS_INITPKG"));
 
 /// OpenSBI 选定的 boot hart 进入 payload；其它 hart 留在 firmware 的 warm-boot 路径。
 #[unsafe(no_mangle)]

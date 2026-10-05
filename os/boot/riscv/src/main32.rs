@@ -29,8 +29,8 @@ unsafe extern "C" {
 
 #[used]
 #[unsafe(link_section = ".initpkg")]
-static INITPKG: [u8; include_bytes!("../../../../tools/qemu/init.kpkg").len()] =
-    *include_bytes!("../../../../tools/qemu/init.kpkg");
+static INITPKG: [u8; include_bytes!(env!("KALEIDOS_INITPKG")).len()] =
+    *include_bytes!(env!("KALEIDOS_INITPKG"));
 
 fn linker_addr(symbol: *const u8) -> usize {
     symbol as usize

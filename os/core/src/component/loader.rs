@@ -392,15 +392,20 @@ fn map_relocation_error(error: RelocationError) -> LoaderError {
     }
 }
 
-// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（core_test /
-// kcomp_smoke / smoke_min）；KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控。
-#[cfg(all(test, not(no_kcomp)))]
+// 这些用例需要 make test-host 准备的真实 `.kcomp` fixture（core_test /
+// kcomp_smoke / kcomp_min）；`test-fixtures` 显式启用工件测试。
+#[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
 
-    const CORETEST_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/core_test.kcomp"));
-    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_smoke.kcomp"));
-    const SMOKE_MIN_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smoke_min.kcomp"));
+    const CORETEST_KCOMP: &[u8] =
+        include_bytes!(concat!(env!("KALEIDOS_TEST_FIXTURES"), "/core_test.kcomp"));
+    const SMOKE_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("KALEIDOS_TEST_FIXTURES"),
+        "/kcomp_smoke.kcomp"
+    ));
+    const SMOKE_MIN_KCOMP: &[u8] =
+        include_bytes!(concat!(env!("KALEIDOS_TEST_FIXTURES"), "/kcomp_min.kcomp"));
 
     #[test]
     fn parses_header_of_core_test() {

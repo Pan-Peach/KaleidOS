@@ -452,14 +452,10 @@ pub fn spawn(state: *mut State) {
 /// 调度返回后报告本组（`state` 由场景 task 填写）。
 pub fn report(checks: &mut Checks, state: &State) {
     checks.group("filesystem chain");
-    checks.check(30, "block-chain", state.block_chain);
-    checks.check(31, "block-chain-direct", state.block_chain_direct);
-    checks.check(32, "littlefs-multi-instance", state.littlefs_multi);
-    checks.check(33, "littlefs-isolation", state.littlefs_isolation);
-    checks.check(
-        42,
-        "component-multi-instance",
-        state.component_multi_instance,
-    );
-    checks.check(34, "littlefs-direct", state.littlefs_direct);
+    checks.check("block-chain", state.block_chain);
+    checks.check("block-chain-direct", state.block_chain_direct);
+    checks.check("littlefs-multi-instance", state.littlefs_multi);
+    checks.check("littlefs-isolation", state.littlefs_isolation);
+    checks.check("component-multi-instance", state.component_multi_instance);
+    checks.check("littlefs-direct", state.littlefs_direct);
 }

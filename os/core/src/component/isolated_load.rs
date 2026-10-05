@@ -657,23 +657,32 @@ fn elf_error(error: ElfError) -> IsolatedLoadError {
     IsolatedLoadError::Loader(LoaderError::from(error))
 }
 
-// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（kcomp_isolated /
-// kcomp_smoke）；KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控。
-#[cfg(all(test, not(no_kcomp)))]
+// 这些用例需要 make test-host 准备的真实 `.kcomp` fixture（kcomp_isolated /
+// kcomp_smoke）；`test-fixtures` 显式启用工件测试。
+#[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
     use crate::component::containment::KCOMP_ABI;
     use crate::memory::test_support;
 
-    const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
-    const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
+    const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("KALEIDOS_TEST_FIXTURES"),
+        "/kcomp_isolated.kcomp"
+    ));
+    const SVC_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("KALEIDOS_TEST_FIXTURES"),
+        "/kcomp_isolated_svc.kcomp"
+    ));
     /// 支持面之外的 import 夹具（`kcore_heap_alloc`）。
     const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
+        env!("KALEIDOS_TEST_FIXTURES"),
         "/kcomp_isolated_unsupported.kcomp"
     ));
     /// 放段失败夹具（17 MiB `.bss` 超出实例窗口）。
-    const BAD_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_bad.kcomp"));
+    const BAD_KCOMP: &[u8] = include_bytes!(concat!(
+        env!("KALEIDOS_TEST_FIXTURES"),
+        "/kcomp_isolated_bad.kcomp"
+    ));
 
     fn in_range(segment: &PlacedSegment, address: usize) -> bool {
         address >= segment.virtual_range.base

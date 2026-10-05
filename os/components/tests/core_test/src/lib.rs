@@ -1,7 +1,7 @@
 //! CoreTest 测试组件（第一个 `.kcomp`）：核内自检 Core 的真实接口。
 //!
 //! - `kcomp_instance_create`：loader 放段 + 重定位后由 Core 调用；返回 0 = 全部
-//!   通过，非 0 = 失败位图（`load` 命令会据此报告 FAILED）。
+//!   通过，非 0 = 检查失败（逐项身份见 KTAP 报告）。
 //! - 报告分组（`runtime/`，模块边界 = 责任边界）：`boot`（.data / 机器真相 /
 //!   分配器 / 注册表）、`sched`（加载 → 任务 → RR 调度 → yield/exit）、`resource`
 //!   （MMIO / IRQ / DMA discover → claim → access → release + 拒绝路径）、`trace`

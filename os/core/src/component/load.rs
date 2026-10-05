@@ -398,16 +398,16 @@ pub(crate) fn read_artifact(name: &[u8]) -> Result<alloc::vec::Vec<u8>, Componen
     Ok(blob)
 }
 
-// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（REAL_KPKG）；
-// KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控。
-#[cfg(all(test, not(no_kcomp)))]
+// 这些用例需要 make test-host 准备的真实 `.kcomp` fixture（REAL_KPKG）；
+// 真实工件由 make test-host 准备，test-fixtures 显式启用集成测试。
+#[cfg(all(test, feature = "test-fixtures"))]
 mod tests {
     use super::*;
     use crate::component::ComponentState;
     use crate::test_support::{Rank, TestLock};
 
     /// 与 `store::tests` 同一份真实包（`manifest` + `kcomp_smoke.kcomp`）。
-    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
+    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("KALEIDOS_TEST_FIXTURES"), "/init.kpkg"));
 
     /// 串行化本模块触碰全局真相（store / image / registry / endpoint / handle /
     /// HEAP）的测试；新增 load 相关用例都必须先拿这把锁。
@@ -533,7 +533,7 @@ mod tests {
     /// 真实 `.kcomp` fixture（与 loader 用例同一份构建产物）。
     /// 明确不在 Isolated 支持面内的 import（`kcore_heap_alloc`）。
     const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
+        env!("KALEIDOS_TEST_FIXTURES"),
         "/kcomp_isolated_unsupported.kcomp"
     ));
 

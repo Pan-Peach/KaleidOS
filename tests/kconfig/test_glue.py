@@ -210,7 +210,7 @@ def check_clean_on_fresh_checkout(tmp):
     expect_ok(result, "make clean (no .config)")
     if os.path.exists(config):
         raise CheckFailed("`make clean` created a .config on a fresh checkout")
-    if "rm -f kaleidos-*" not in result.stdout:
+    if "rm -f " not in result.stdout or "kaleidos.elf" not in result.stdout:
         raise CheckFailed("`make clean` did not evaluate its recipe:\n" + result.stdout)
 
 
@@ -232,9 +232,9 @@ def check_arch_vm_vars_have_no_effect(tmp):
     result = run(["make", "-n", f"KCONFIG_CONFIG={config}",
                   "ARCH=rv32", "VM=nommu", "qemu"])
     expect_ok(result, "make ARCH=rv32 VM=nommu qemu")
-    if "kaleidos-rv64" not in result.stdout:
+    if "riscv64gc-unknown-none-elf" not in result.stdout or "qemu-system-riscv64" not in result.stdout:
         raise CheckFailed("the resolved config did not drive the build:\n" + result.stdout)
-    if "kaleidos-rv32" in result.stdout or "deprecated" in result.stderr.lower():
+    if "riscv32imac-unknown-none-elf" in result.stdout or "deprecated" in result.stderr.lower():
         raise CheckFailed("ARCH=/VM= still influence the build:\n" + result.stdout)
 
 

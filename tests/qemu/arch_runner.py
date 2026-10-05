@@ -1,50 +1,11 @@
 #!/usr/bin/env python3
-"""KaleidOS architectural selftest runner (host tooling, stdlib only).
-
-Usage:  python3 tests/qemu/arch_runner.py --arch <rv64|rv32> --kernel <path>
-
-Boots exactly the artifact given by --kernel (the Makefile passes $(OUTPUT),
-i.e. `kaleidos-<arch>-selftest` under the selftest profile) and drives the
-feature-gated RISC-V architectural selftests: every case boots a fresh QEMU
-process and must reach its serial-output contract (PASS marker, or PANIC plus
-the expected scause), with firmware shutdown exiting QEMU.
-
-Raw serial output → tests/qemu/logs/<arch>-archtest-<case>-<stamp>.log.
-Exit 0 = all cases PASS, non-zero = FAIL.
-"""
-
-from __future__ import annotations
-
+"""Hardware contracts: each case boots a fresh guest and keeps its fault evidence."""
 import argparse
-import datetime
-import os
 import re
-import select
-import subprocess
 import sys
 import time
-
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-LOGS_DIR = os.path.join(REPO, "tests", "qemu", "logs")
-READY = "[selftest] ready"
-CASE_TIMEOUT_S = 30
-EXIT_TIMEOUT_S = 10
-
-ARCH_CONF = {
-    "rv64": {"qemu": "qemu-system-riscv64", "mem": "4G",
-             "extra": ["-machine", "virt", "-bios", "default"]},
-    "rv32": {"qemu": "qemu-system-riscv32", "mem": "1G",
-             "extra": ["-machine", "virt", "-bios", "default"]},
-    # New-ISA skeletons: NOT part of the default `test-arch` aggregate; only the
-    # opt-in `test-arch-<arch>` targets run these, so the RISC-V baseline stays
-    # green while the boot paths are still `todo!()`.
-    "x86_64": {"qemu": "qemu-system-x86_64", "mem": "512M",
-               "extra": ["-machine", "q35", "-cpu", "qemu64"]},
-    "aarch64": {"qemu": "qemu-system-aarch64", "mem": "1G",
-                "extra": ["-machine", "virt", "-cpu", "cortex-a57"]},
-    "loongarch64": {"qemu": "qemu-system-loongarch64", "mem": "1G",
-                    "extra": ["-machine", "virt"]},
-}
+from common import (FATAL_MARKERS, RunFailure, Session, add_arguments,
+                    qemu_command)
 
 # (case name, expected scause, required serial substring)
 CASES = (
@@ -181,11 +142,8 @@ CASES = (
     ("isolated-nested-fault", None, None),
 )
 
-# New-ISA ArchTest cases.  The `boot` smoke case proves entry -> long mode /
-# EL boot -> discovery -> `MachineInfo` -> `kernel::init` -> console input; the
-# three hardware cases stay `todo!()`-backed and FAIL until their mechanisms
-# land (they must fail loudly, not fake a PASS).  Never run by the default
-# `test-arch` aggregate.
+# Experimental ISA suite, explicitly selected outside the RISC-V baseline.
+# Unsupported hardware must fail visibly. Current support is in the module docs.
 NEW_ARCH_CASES = (
     ("boot", None, None),
     ("smp-boot", None, None),
@@ -193,8 +151,7 @@ NEW_ARCH_CASES = (
     ("external-irq", None, None),
 )
 
-# RISC-V SMP cases.  Run only with `--smp` (multi-CPU QEMU); the default
-# `test-arch` never sends these names. Component scheduling is tested by CoreTest.
+# RISC-V SMP cases, selected separately without rerunning the base cases. Component scheduling is tested by CoreTest.
 SMP_CASES = (
     ("smp-boot", None, None),
     ("smp-ipi", None, None),
@@ -202,183 +159,78 @@ SMP_CASES = (
 )
 
 
-class RunFailure(Exception):
-    """A QEMU case did not meet its observable serial-output contract."""
+
+def select_cases(arch, smp_only=False, selected=None):
+    if smp_only and arch != "rv64":
+        raise RunFailure("the RISC-V SMP suite requires RV64")
+    cases = SMP_CASES if smp_only else (CASES if arch in ("rv64", "rv32") else NEW_ARCH_CASES)
+    if selected:
+        cases = tuple(case for case in cases if case[0] == selected)
+        if not cases:
+            raise RunFailure(f"case {selected!r} is not in the selected suite")
+    return cases
 
 
-def read_output(proc: subprocess.Popen[bytes], output: str, timeout_s: float) -> str:
-    """Append serial output available before the bounded wait expires."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 0.1)
-        if ready:
-            chunk = os.read(proc.stdout.fileno(), 4096)
-            if not chunk:
-                return output
-            output += chunk.decode("utf-8", "replace")
-            return output
-        if proc.poll() is not None:
-            return output
-    return output
-
-
-def wait_for_ready(proc: subprocess.Popen[bytes], output: str) -> str:
-    """Wait until the kernel is ready to accept precisely one selftest name."""
-    deadline = time.monotonic() + CASE_TIMEOUT_S
-    while READY not in output and time.monotonic() < deadline:
-        output = read_output(proc, output, 0.2)
-        if proc.poll() is not None:
-            break
-    if READY not in output:
-        raise RunFailure("selftest readiness marker missing")
-    return output
-
-
-def fail_if_fatal(output: str) -> None:
-    """Reject a selftest-declared failure or an unexpected panic immediately."""
-    if "[selftest]" in output and "FAIL" in output:
-        raise RunFailure("selftest reported FAIL")
-
-
-def wait_for_non_faulting_pass(proc: subprocess.Popen[bytes], output: str, name: str) -> str:
-    """Require a named PASS marker, then require firmware shutdown to exit QEMU."""
-    marker = f"[selftest] {name}: PASS"
-    deadline = time.monotonic() + CASE_TIMEOUT_S
-    while marker not in output and time.monotonic() < deadline:
-        output = read_output(proc, output, 0.2)
-        fail_if_fatal(output)
-        if "PANIC:" in output:
-            raise RunFailure("unexpected panic")
-        if proc.poll() is not None:
-            break
-    if marker not in output:
-        raise RunFailure(f"missing PASS marker {marker!r}")
-
-    deadline = time.monotonic() + EXIT_TIMEOUT_S
-    while proc.poll() is None and time.monotonic() < deadline:
-        output = read_output(proc, output, 0.2)
-        fail_if_fatal(output)
-    if proc.poll() is None:
-        raise RunFailure("QEMU did not exit after selftest shutdown")
-    return output
-
-
-def wait_for_fault(proc: subprocess.Popen[bytes], output: str, expected: int) -> str:
-    """Require PANIC plus exactly the requested scause; reject every mismatch."""
-    deadline = time.monotonic() + CASE_TIMEOUT_S
-    expected_marker = f"scause=0x{expected:x}"
-    while time.monotonic() < deadline:
-        output = read_output(proc, output, 0.2)
-        fail_if_fatal(output)
-        scauses = re.findall(r"scause=0x([0-9a-fA-F]+)", output)
-        if any(int(value, 16) != expected for value in scauses):
-            raise RunFailure(
-                f"unexpected scause(s) {scauses!r}; wanted {expected_marker}"
-            )
-        if "PANIC:" in output and expected_marker in output:
-            return output
-        if proc.poll() is not None:
-            break
-    raise RunFailure(f"missing PANIC plus {expected_marker}")
-
-
-def log_path(arch: str, name: str) -> str:
-    """Construct the per-case raw-serial log path."""
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return os.path.join(LOGS_DIR, f"{arch}-archtest-{name}-{stamp}.log")
-
-
-def run_case(
-    arch: str,
-    kernel: str,
-    name: str,
-    expected_scause: int | None,
-    required_text: str | None,
-) -> None:
-    """Boot a fresh QEMU process and judge exactly one architectural test."""
-    conf = ARCH_CONF[arch]
-    command = [
-        conf["qemu"],
-        *conf["extra"],
-        "-smp", "2",
-        "-m", conf["mem"],
-        "-kernel", kernel,
-        "-nographic",
-    ]
-    proc = subprocess.Popen(
-        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-    output = ""
-    path = log_path(arch, name)
-    verdict = "FAILED"
-
-    try:
-        output = wait_for_ready(proc, output)
-        proc.stdin.write(f"{name}\n".encode())
-        proc.stdin.flush()
+def run_case(args, name, expected_scause, required_text):
+    with Session(args, f"archtest-{args.arch}-{name}") as session:
+        proc = session.start(qemu_command(args, probe=False))
+        _, ready = session.collect(proc, 30, ["[selftest] ready"], FATAL_MARKERS)
+        if not ready:
+            raise RunFailure("selftest readiness marker missing")
+        session.send(proc, name + "\n")
         if expected_scause is None:
-            output = wait_for_non_faulting_pass(proc, output, name)
-            if required_text is not None and required_text not in output:
-                raise RunFailure(f"missing required serial text {required_text!r}")
-            print(f"[arch-{arch}] {name}: PASS")
+            expected = [f"[selftest] {name}: PASS"]
+            if required_text:
+                expected.append(required_text)
+            _, ok = session.collect(proc, 30, expected, FATAL_MARKERS)
+            if not ok:
+                raise RunFailure(f"missing serial markers: {expected!r}")
+            session.shutdown()
         else:
-            output = wait_for_fault(proc, output, expected_scause)
-            print(f"[arch-{arch}] {name}: PASS (scause=0x{expected_scause:x})")
-        verdict = "PASSED"
+            marker = f"scause=0x{expected_scause:x}"
+            _, ok = session.collect(proc, 30, ["PANIC:", marker], ["FAIL"])
+            # Fault guests halt rather than shut down. Drain the diagnostic and
+            # let an already-exiting emulator finish before deliberately killing it.
+            deadline = time.monotonic() + 0.5
+            while proc.poll() is None and time.monotonic() < deadline:
+                session.read(0.05)
+            causes = re.findall(r"scause=0x([0-9a-fA-F]+)", session.output)
+            wrong_cause = any(int(cause, 16) != expected_scause for cause in causes)
+            if not ok or "FAIL" in session.output or wrong_cause:
+                raise RunFailure(f"expected PANIC plus {marker}, observed {causes}")
+            if proc.poll() is not None and proc.returncode != 0:
+                raise RunFailure(f"QEMU exited with {proc.returncode} after fault")
+        print(f"[arch-{args.arch}] {name}: PASS")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arch", required=True,
+                        choices=("rv64", "rv32", "x86_64", "aarch64", "loongarch64"))
+    add_arguments(parser)
+    parser.add_argument("--smp-only", action="store_true")
+    parser.add_argument("--case", help="run exactly one case in this suite")
+    parser.add_argument("--list", action="store_true")
+    args = parser.parse_args()
+    try:
+        cases = select_cases(args.arch, args.smp_only, args.case)
     except RunFailure as error:
-        print(f"[arch-{arch}] {name}: FAIL ({error})")
-        raise
-    finally:
-        if proc.poll() is None:
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline:
-                output = read_output(proc, output, 0.2)
-            proc.kill()
-        proc.wait()
-        with open(path, "w", encoding="utf-8") as log:
-            log.write(output)
-            log.write(f"\n==== ARCHTEST {verdict} ====\n")
-        print(f"[arch-{arch}] log: {path}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Boot one KaleidOS selftest artifact and judge every ArchTest case.")
-    parser.add_argument("--arch", required=True, choices=sorted(ARCH_CONF),
-                        help="profile arch: selects the QEMU binary")
-    parser.add_argument("--kernel", required=True, metavar="PATH",
-                        help="boot artifact to test (the Makefile passes $(OUTPUT))")
-    parser.add_argument("--smp", action="store_true",
-                        help="also run the optional RISC-V SMP cases (multi-CPU QEMU)")
-    return parser.parse_args()
-
-
-def main() -> int:
-    """Run all cases for one RISC-V architecture and return a shell verdict."""
-    args = parse_args()
-    arch = args.arch
-    # 产物身份由调用方显式给出（Makefile 传 $(OUTPUT)），不再按 arch 猜镜像名。
-    kernel = args.kernel if os.path.isabs(args.kernel) else os.path.join(REPO, args.kernel)
-    if not os.path.exists(kernel):
-        print(f"FAIL: selftest kernel {kernel} not found")
-        return 1
-
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    cases = CASES if arch in ("rv64", "rv32") else NEW_ARCH_CASES
-    if args.smp:
-        cases = cases + SMP_CASES
+        parser.error(str(error))
+    if args.list:
+        for name, _, _ in cases:
+            print(name)
+        return 0
+    if not args.kernel.is_file():
+        parser.error(f"kernel not found: {args.kernel}")
     failures = 0
-    for name, expected_scause, required_text in cases:
+    for name, cause, text in cases:
         try:
-            run_case(arch, kernel, name, expected_scause, required_text)
-        except RunFailure:
+            run_case(args, name, cause, text)
+        except (RunFailure, OSError) as error:
+            print(f"[arch-{args.arch}] {name}: FAIL ({error})")
             failures += 1
-
-    if failures:
-        print(f"[arch-{arch}] FAIL ({failures} case(s))")
-        return 1
-    print(f"[arch-{arch}] ALL PASS")
-    return 0
+    print(f"[arch-{args.arch}] {len(cases) - failures}/{len(cases)} PASS")
+    return int(failures != 0)
 
 
 if __name__ == "__main__":

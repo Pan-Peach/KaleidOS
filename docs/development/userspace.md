@@ -24,8 +24,8 @@ python3 tests/compat/exec_fixtures.py --arch rv64 --linux-reference
 ```
 
 夹具编译需要 `riscv64-unknown-elf-gcc`；QEMU/真实 FAT 流程需要 qemu-system-riscv64、
-dosfstools、mtools。CI 已登记该编译器。Make 的 RV64 init.kpkg 和 clippy 会先构建
-夹具；生成物在 `build/exec-fixtures/`，不提交二进制。14 个镜像均为普通 ET_EXEC，
+dosfstools、mtools。CI 已登记该编译器。RV64 测试包与 clippy 会先构建
+夹具；普通生产包不需要它们。生成物在 `$(O)/exec-fixtures/`（默认 `build/default/exec-fixtures/`），不提交二进制。14 个镜像均为普通 ET_EXEC，
 不是 `.kcomp`；多数只用整数，fork/exec 与 timer 还验证浮点现场。
 
 | 场景 | 实际验证 |
@@ -39,8 +39,8 @@ dosfstools、mtools。CI 已登记该编译器。Make 的 RV64 init.kpkg 和 cli
 | timer | 无 ecall 长循环也允许另一个任务运行；回来后整数 / FP 现场保持 |
 
 组件 / 系统集成的唯一编排者仍是 CoreTest，入口在
-`os/components/tests/core_test/src/runtime/exec.rs`。QEMU runner 要求 `exec-elf`、
-`exec-fork-exec-wait`、`exec-timer` 和整个 CoreTest PASS。
+`os/components/tests/core_test/src/runtime/exec.rs`。CoreTest 报告 `exec-elf`、
+`exec-fork-exec-wait`、`exec-timer`，QEMU runner 校验完整 KTAP 计划与逐项 PASS。
 `tests/qemu/init_runner.py` 在 FAT 盘副本放入短文件名 ELF，提交真实 ksh `exec` 命令；
 它还验证非法 ELF、进程故障、随后 cat/echo 和 shutdown。无盘分支返回 ENODEV。
 
@@ -48,7 +48,7 @@ dosfstools、mtools。CI 已登记该编译器。Make 的 RV64 init.kpkg 和 cli
 
 ```sh
 make rootfs
-mcopy -o -i build/rootfs.fat build/exec-fixtures/write ::/WRITE.ELF
+mcopy -o -i build/default/rootfs.fat build/default/exec-fixtures/write ::/WRITE.ELF
 make qemu
 # ksh> exec 0:/WRITE.ELF
 # EXEC_WRITE_OK

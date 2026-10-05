@@ -104,7 +104,7 @@ component wrapper
 > C 前端 `tools/build-kcomp-c.sh` 编出 freestanding `.o`（clang，不链 libc），
 > 两者都把输入交给 `tools/kcomp-link.sh` 做 partial link + section GC + strip，产出
 > ET_REL `.kcomp`——因此 `.kcomp` 是**语言无关的组件二进制格式**，不是 Rust 格式。
-> Makefile 与 `os/core/build.rs` 共用这些脚本，两条构建路径不再分叉；packer 在输出前
+> 系统包与显式 host fixture 均经 `scripts/build/package.py` 调用这些脚本；packer 在输出前
 > 校验「ET_REL + `kcomp_instance_create` / `kcomp_instance_destroy` DEFINED + UNDEF 只有 `kcore_*` + 无 loader 不支持的重定位」。
 > 组件通过共用 `kcomp-sdk`（§2.3）使用 ABI / 入口 / 日志 / panic adapter。
 > 两条语言路径消费**同一个 `kcomp.h`**：C 组件只有这一份声明 + SDK 的 C 运行时

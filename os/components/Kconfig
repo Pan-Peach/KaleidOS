@@ -1,5 +1,13 @@
 # Boot selects one artifact; that component owns system composition.
 
+config TEST_COMPONENTS
+    bool "Include test components in the embedded package"
+    default y if SELFTEST
+    default n
+    help
+      Include CoreTest and test-only fixtures. Normal system packages contain
+      production components only. Test profiles select this explicitly.
+
 config BOOT_COMPONENT
     string "Initial component artifact (empty for Core Monitor)"
     default "init" if (ARCH_RISCV32 || ARCH_RISCV64) && !SELFTEST

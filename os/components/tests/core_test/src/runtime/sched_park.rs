@@ -264,7 +264,6 @@ pub fn group(checks: &mut Checks) {
 
     // ABI 拒绝不存在的任务，不改动任何其他任务。
     checks.check(
-        43,
         "task-unpark-missing",
         unsafe { kcore_task_unpark(u32::MAX) } == Errno::ESRCH.code(),
     );
@@ -287,7 +286,7 @@ pub fn group(checks: &mut Checks) {
         && early_unpark_a
         && early_unpark_b
         && unsafe { kcore_task_state(early_waiter_id) } == STATE_CREATED;
-    checks.check(44, "park-early-unpark-accepted", remains_created);
+    checks.check("park-early-unpark-accepted", remains_created);
 
     let early_waiter_started = waiter_created && unsafe { kcore_task_start(early_waiter_id) } == 0;
     let early_observer_started = observer_created
@@ -301,24 +300,20 @@ pub fn group(checks: &mut Checks) {
             && (*early_ptr).first_park_blocked == 0
             && (*early_ptr).errors == 0
     };
-    checks.check(
-        45,
-        "park-early-permit-fast-path",
-        early_run && early_fast_path,
-    );
+    checks.check("park-early-permit-fast-path", early_run && early_fast_path);
     let one_shot = unsafe {
         (*early_ptr).second_park_blocked == 1
             && (*early_ptr).second_unparks == 1
             && (*early_ptr).second_returns == 1
             && (*early_ptr).errors == 0
     };
-    checks.check(46, "park-permit-consumed-once", early_run && one_shot);
+    checks.check("park-permit-consumed-once", early_run && one_shot);
     let early_tasks = [early_waiter_id, early_observer_id];
     let early_exited = early_started
         && early_tasks
             .iter()
             .all(|&id| unsafe { kcore_task_state(id) } == STATE_EXITED);
-    checks.check(47, "park-early-task-completion", early_run && early_exited);
+    checks.check("park-early-task-completion", early_run && early_exited);
     recover(&early_tasks, 4);
 
     // 两个真实组件任务反复做：waiter park → notifier 观察 Blocked → unpark →
@@ -344,16 +339,12 @@ pub fn group(checks: &mut Checks) {
             && (*stress_ptr).unpark_rounds == PARK_STRESS_ROUNDS
             && (*stress_ptr).errors == 0
     };
-    checks.check(48, "park-unpark-64-rounds", stress_run && stress_counts);
+    checks.check("park-unpark-64-rounds", stress_run && stress_counts);
     let stress_tasks = [waiter_id, notifier_id];
     let stress_exited = stress_started
         && stress_tasks
             .iter()
             .all(|&id| unsafe { kcore_task_state(id) } == STATE_EXITED);
-    checks.check(
-        49,
-        "park-unpark-task-completion",
-        stress_run && stress_exited,
-    );
+    checks.check("park-unpark-task-completion", stress_run && stress_exited);
     recover(&stress_tasks, PARK_STRESS_ROUNDS + 4);
 }

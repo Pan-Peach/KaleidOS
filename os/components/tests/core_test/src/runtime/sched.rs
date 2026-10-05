@@ -101,7 +101,7 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
             kcomp_sdk::abi::ExecutionDomain::KernelNative as u32,
         )
     };
-    checks.check(4, "scheduler-load", rr_id >= 0);
+    checks.check("scheduler-load", rr_id >= 0);
 
     // 任务创建：requester = core_test（Core 从 call_init 上下文解析），
     // entry = task_a/task_b（本组件镜像内的函数地址），`arg` = 本实例状态
@@ -110,7 +110,7 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     let mut b = 0u32;
     let a_ok = unsafe { kcore_task_create(task_a, state as *mut (), &mut a) } == 0;
     let b_ok = unsafe { kcore_task_create(task_b, state as *mut (), &mut b) } == 0;
-    checks.check(5, "task-create", a_ok && b_ok && a != b);
+    checks.check("task-create", a_ok && b_ok && a != b);
 
     // 拒绝路径：entry 必须落在本组件**装载镜像内**（`[base, base+size)`）——
     // 镜像外的入口一律 -EFAULT，且被拒绝的创建不得留下任务（计数不变）。
@@ -126,7 +126,6 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     };
     let tasks_after = unsafe { kcore_task_count() };
     checks.check(
-        29,
         "task-entry-out-of-image",
         rogue == Errno::EFAULT.code() && tasks_after == tasks_before,
     );
@@ -142,7 +141,7 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     } else {
         false
     };
-    checks.check(6, "scheduler-select", selected);
+    checks.check("scheduler-select", selected);
 
     // 启动（Created → Runnable），游标取样后进入调度：trace 窗口只含本次 run。
     unsafe {
@@ -156,18 +155,18 @@ pub fn group(checks: &mut Checks, state: *mut State) -> Outcome {
     // SAFETY: state 在实例存活期间地址稳定；两个任务已退出，无并发写者。
     let counts_ok =
         unsafe { (*state).a_count == EXPECTED_ITERS && (*state).b_count == EXPECTED_ITERS };
-    checks.check(7, "task-switch", ran && counts_ok);
+    checks.check("task-switch", ran && counts_ok);
 
     // 退出验证：两个任务都已 Exited（终态由 Core 状态机提交）。
     let exited =
         unsafe { kcore_task_state(a) == STATE_EXITED && kcore_task_state(b) == STATE_EXITED };
-    checks.check(8, "task-exit", exited);
+    checks.check("task-exit", exited);
 
     // 策略 provider 仍 Ready：Core 每次调度都会重新解析存活，这里做一次只读复核
     // （discover + validate 都成功 = endpoint 仍 Live、provider 仍 Ready）。
     let rr_ready = rr_id >= 0
         && Endpoint::<SchedulerPolicy>::lookup(rr_id as u32, SCHEDULER_POLICY_NAME).is_ok();
-    checks.check(9, "scheduler-rr", rr_ready);
+    checks.check("scheduler-rr", rr_ready);
 
     // TODO(C5): 抢占链用例——两个"不 yield 的忙循环"任务被时钟强行切出
     //   （当前调度是协作式；timer 实现 + sched::on_timer_tick 接线后，

@@ -33,13 +33,15 @@ Kconfig 前端复用 `third_party/Kconfiglib`（git submodule，pin 到具体 co
 
 | 变量 | 含义 |
 |---|---|
-| `KCFG_ARCH` | 架构短名（`rv32` / `rv64`），用于产物名与 runner |
+| `KCFG_ARCH` | 架构短名（RISC-V、x86_64、AArch64、LoongArch64），用于 runner 与目标选择 |
 | `KCFG_TARGET` | Rust target triple（`riscv32imac-unknown-none-elf` / `riscv64gc-unknown-none-elf`） |
 | `KCFG_LINKER` | 链接脚本（`linker32.ld` / `linker.ld`） |
 | `KCFG_QEMU` | QEMU 可执行文件（`qemu-system-riscv32` / `qemu-system-riscv64`） |
+| `KCFG_QEMU_FLAGS` | 平台参数（machine / CPU / firmware），交互与测试共用 |
+| `KCFG_BOOT_DIR` | 各架构 boot crate 路径 |
 | `KCFG_QEMU_MEM` | QEMU 内存（`1G` / `4G`） |
 | `KCFG_BOOT_FEATURES` | 传给 boot crate 的 Cargo features（如 `supervisor,vm-mmu`） |
-| `KCFG_SELFTEST` | `y` / `n`，决定产物名与 selftest 入口 |
+| `KCFG_SELFTEST` | `y` / `n`，选择 selftest 入口 |
 | `CONFIG_BOOT_COMPONENT` | 启动 artifact basename；空串直接进入 monitor。genmk 校验字符范围，再由 Make 转发给 boot |
 | `CONFIG_<symbol>` | 每个 bool / int symbol 都按解析后的值镜像一份（符号自己的名字，一个数字不造第二个名字；Makefile 把 `CONFIG_TRACE_CAPACITY` 作为环境变量转发给 `os/core/build.rs`） |
 
@@ -62,6 +64,8 @@ cargo build --no-default-features --features $(KCFG_BOOT_FEATURES) --target $(KC
 | `make olddefconfig` | 用 Kconfig 新默认值刷新 `.config` |
 | `make syncconfig` | 手工改过 `.config` 后重新生成 `$(KCONFIG_CONFIG).mk` |
 | `make savedefconfig` | 导出一份最小 defconfig；文件名由 `OUT_DEFCONFIG=` 指定，默认 `defconfig.out` |
+| `make coretest_defconfig` | 叠加 monitor 启动与测试组件库存 |
+| `make selftest_defconfig` | 叠加硬件白盒入口与测试组件库存 |
 | `make monitor_defconfig` | 在当前 profile 叠加 `configs/monitor.fragment`，关闭自动启动组件 |
 
 两条工作流：
@@ -90,8 +94,18 @@ make menuconfig && make qemu            # 第二条：交互调参后直接构�
 `os/components/Kconfig` 定义 string `BOOT_COMPONENT`：普通 RISC-V profile 默认 `init`，
 其它默认空串；SELFTEST 启动路径不消费它。只允许字母、数字、`_`、`-` 或空串，
 genmk 在输出 Make 片段之前验证，避免把路径或 Make/shell 表达式传入构建命令。
-这只选择启动编排者；归档里的组件列表仍在 Makefile `KCOMP_SRCS`，实际运行图由
+这只选择启动编排者；归档库存由 `mk/components.mk` 维护，`CONFIG_TEST_COMPONENTS` 选择是否加入测试组件，实际运行图由
 [`init`](../modules/init.md) 等组件组合，Core 不决定 filesystem / driver / shell 策略。
+
+### 输出目录与测试库存
+
+`make O=build/<name> ...` 在该目录解析 `.config` 并生成包、镜像、缓存和日志。
+不指定 `O=` 时保留根 `.config`，输出到 `build/default/`；详细路径见
+[构建指南](../development/building.md)。独立 profile 不共用内嵌包或 kernel ELF。
+
+`TEST_COMPONENTS` 是 Kconfig 的 bool：普通 profile 默认关闭，SELFTEST 默认开启。
+`configs/coretest.fragment` 显式启用它并关闭自动 init；生产镜像只含生产库存，
+测试镜像另外包含 fixture。它不改变运行图或提供 Core 特权。
 
 ## 4. 设计决策
 
@@ -129,7 +143,7 @@ Kconfig 本身让不可能的组合不可表达：
 - Rust `#[cfg]` / `compile_error!`。它们是**不变式与防御**（例如「build 没选 profile 就报错」），不是配置来源；
 - Cargo `default = [...]` features。`arch` / `core` 上的 default 只作为**独立 host-test 基线**保留；`bootstrap` 没有 default，且 managed kernel build 永远传 `--no-default-features`。
 
-本阶段仍不把归档库存里的每个组件 / 驱动做成 Kconfig 开关；只选择初始编排 artifact，
+本阶段不把每个组件 / 驱动做成 Kconfig 开关；选择初始编排 artifact 与是否包含测试库存，
 运行图与调度器选择由它的策略决定。PMP/MPU、平台发现、其余调试开关也未迁移。
 
 ## 6. 如何新增一个 config symbol
@@ -147,5 +161,5 @@ Kconfig 本身让不可能的组合不可表达：
 - `make <board>_defconfig && make qemu` 对三个 profile 都能跑通：`qemu_rv64`、`qemu_rv32`、`qemu_rv32_nommu`；
 - MMU / NoMMU 与 supervisor / machine 由构造互斥（choice + `depends on`），不可能同时选中；
 - `make check`、`make test`、`make test-host`、`make test-qemu`、`make test-arch`（5 个公开测试入口；`test` = host + QEMU + ArchTest）在两个架构上都通过；
-- `make _test-kconfig`（内部助手，`make check` 的一步）覆盖本层胶水契约：不能存活的显式请求报错（`--set` / defconfig / fragment）、有效 fragment 栈不被误拒、混合 goal 的 include 粒度、config-free goal 不在全新 checkout 上创建 `.config`；
+- `make _test-kconfig`（内部助手，`test-host` / `check` 的一步）覆盖本层胶水契约：不能存活的显式请求报错（`--set` / defconfig / fragment）、有效 fragment 栈不被误拒、混合 goal 的 include 粒度、config-free goal 不在全新 checkout 上创建 `.config`；
 - `make clean` 在没有 `.config` 的全新 checkout 上也能工作。

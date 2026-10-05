@@ -13,15 +13,10 @@
 
 如果某段 Core 逻辑只能通过启动整个 OS 来测试，第一反应应该是：**它是不是和 Arch 耦合得太深了？** 正确姿势是把与硬件无关的 truth logic（任务状态机、所有权、设备·IRQ·DMA 归属）做成纯逻辑，在宿主上直接 `cargo test`。
 
-层次（从日常主力到最终验证）：
-
-```text
-Real Hardware（真实硬件）
-QEMU ArchTest（白盒内核 selftest，直接验证硬件契约）
-QEMU CoreTest（板内集成测试，黑盒组件身份）
-Property Test（属性测试，proptest）
-Host Test（宿主单测 —— 主体，日常主力）
-```
+测试按证明对象分工：host 验证纯逻辑，property 是 host 中的一种方法；
+CoreTest 验证公开组件接口的集成契约，ArchTest 验证实际硬件行为，真机提供最终硬件证据。
+默认入口 `make test` 聚合这些后端；构建、fixture 与 runner 的整理记录见
+[cleanup](cleanup.md)。
 
 （Concurrency Exploration / Model Checking 属未来工具链。）
 
@@ -62,6 +57,33 @@ make test-arch-smp-rv64  RV64：CPU 启动 / IPI / per-CPU（组件调度由 tes
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```
 
+`make test` 聚合 `test-host`、`test-qemu`、`test-arch`。
+`test-arch` 已包含 RV64 三个 SMP 硬件用例；单独运行
+`test-arch-smp-rv64` 只跑这三个，不重复基础套件。CI 使用同样的子入口。
+`test-host` 包含 Kconfig、ABI generator、compat runner、构建归属与 QEMU harness 自测。
+Linux/Windows 宿主兼容性参考 suite 仍单独选择。
+
+测试 profile 各自使用 `build/tests/<suite>-<arch>/`，不修改用户 `.config`；
+日志位于对应目录的 `logs/`。每个 guest 有唯一临时盘目录，退出时清理并保留串口日志。
+QEMU 可执行名、平台参数和默认内存只由 genmk 提供；OOM 的 128 MiB 是显式场景差异。
+
+只跑一个硬件用例或列出用例：
+
+```sh
+make _test-arch-rv64 TEST_CASE=timer
+make test-arch-smp-rv64 TEST_CASE=smp-ipi
+# 在已构建的 ArchTest profile 上列出基础用例
+make O=build/tests/archtest-rv64 _test-arch-list
+```
+
+普通 `cargo test -p kernel --lib` 只测逻辑，不隐式构建组件。
+`make test-host` 显式准备真实工件并启用 `kernel/test-fixtures`，覆盖 parser/loader/relocation。
+准备步骤见 [构建指南](building.md)。
+
+CoreTest 使用带 `[core-test] ` 前缀的 KTAP：header、连续编号与稳定名称、尾部 `1..N`
+计划及最终 PASS。runner 不另维护一份用例名清单；空计划、缺项、重复项、失败、
+任意 SKIP、超时与异常退出均不能算通过。RV64 默认要求两 CPU，不足时报告失败。
+
 观察面：结构化 trace ring（`TraceEvent`，固定容量、无分配、`seq` 单调；`kcore_trace_stats` 只读）。host 测试的 ring 是**线程本地替身**，不覆盖生产的锁 / 并发语义（SMP 行为由 QEMU / 真机承担）。
 
 ## 5. 新增功能测试纪律
@@ -73,7 +95,7 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 会话存活、cat 与 exit 回到 monitor。这是 shell 用户流程 smoke；driver / FS / scheduler
 的细粒度集成编排仍由 CoreTest 负责。两种硬件 topology 都走这条流程。
 
-CoreTest 的私有 profile 叠加 `configs/monitor.fragment`，避免默认 init 提前认领设备。
+CoreTest 的私有 profile 叠加 `configs/coretest.fragment`，避免默认 init 提前认领设备。
 `tests/qemu/init_runner.py` 另用普通 board profile 检查 boot → init → FAT root → ksh
 的用户流程，以及无盘 / 坏盘分支；使用独立磁盘副本，未把断言塞入生产 init。
 RV64 另在全新 128 MiB guest 中运行 `exec_probe/oom.S`：耗尽 `brk` backing 后，
@@ -111,3 +133,16 @@ host 调度集成用例失败时会 fail-fast，并用 RAII 清理全局任务/�
 `make test-arch-smp-rv64` 只负责启动 / IPI / per-CPU 三个硬件契约用例；CI 的 ArchTest job 也运行此门禁。组件调度集成的唯一编排者仍是 CoreTest，ArchTest 不读取私有表来替代公开 ABI 的集成验证。
 
 host 对提交竞争、park 快速检查后的远端通知、固定 CPU、并发 policy 栈占用与每 CPU 身份分别做确定性测试。QEMU 不替代这些状态机验证，也不证明真实硬件长期稳定性。
+
+## 部署场景的归属
+
+RV64 CoreTest 的 `runtime/deployment.rs` 通过公开 load、ComponentInfo、Endpoint 与 trace
+验证 K/I 堆后端、同一工件多实例、拒绝 Sandboxed 部署、K/K 与 K/I 调用，
+以及通过普通 Isolated fixture 的 block 服务入口执行 I/K、I/I、I→K→I、重入拒绝、
+provider panic、失败状态、新实例与过期绑定。测试控制属于 test-only fixture，
+没有增加 Core ABI 或修改 Core 私有状态。
+
+ArchTest 的 isolated 用例保留私有 AS、实际 backing、satp 恢复、访问权限、
+销毁故障与回收现场的证据。当前公开 create 固定 KernelNative，load 只支持默认配置，
+且没有 stop ABI；需要指定 Isolated config 或检查销毁现场的用例仍由 ArchTest 承担。
+这些约束不能靠测试后门绕过。

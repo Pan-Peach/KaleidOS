@@ -1,0 +1,3 @@
+# CoreTest owns system composition; include its fixtures in this build only.
+CONFIG_BOOT_COMPONENT=""
+CONFIG_TEST_COMPONENTS=y

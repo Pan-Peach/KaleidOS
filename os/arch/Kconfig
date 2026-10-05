@@ -26,22 +26,21 @@ config ARCH_RISCV64
 config ARCH_X86_64
 	bool "x86_64"
 	help
-	  Skeleton backend only (os/arch/src/x86_64 + os/boot/x86_64 are all
-	  `todo!()`).  It compiles and exposes the HAL contract; it does not boot
-	  or pass ArchTest until a human implements it.
+	  Experimental native backend. Core-only boot / selftests have their
+	  own opt-in targets; not part of the default RISC-V regression matrix.
+	  See docs/modules/arch.md and docs/modules/boot.md for current support.
 
 config ARCH_AARCH64
 	bool "AArch64"
 	help
-	  Skeleton backend only (os/arch/src/aarch64 + os/boot/aarch64 are all
-	  `todo!()`).  Compiles; not bootable yet.
+	  Experimental native backend. Use the opt-in Core-only selftest target.
+	  See docs/modules/arch.md and docs/modules/boot.md for current support.
 
 config ARCH_LOONGARCH64
 	bool "LoongArch64"
 	help
-	  Skeleton backend only (os/arch/src/loongarch64 + os/boot/loongarch64 are
-	  all `todo!()`).  Compiles; not bootable yet.  See DragonOS / Linux
-	  arch/loongarch for the abstraction to implement.
+	  Experimental native backend. Use the opt-in Core-only selftest target.
+	  See docs/modules/arch.md and docs/modules/boot.md for current support.
 
 endchoice
 

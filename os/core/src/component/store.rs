@@ -140,20 +140,20 @@ pub fn get_component_store() -> Option<&'static dyn ComponentStore> {
     STORE.get().map(|s| s as &dyn ComponentStore)
 }
 
-// 这些用例需要 os/core/build.rs 生成的真实 `.kcomp` fixture（REAL_KPKG）；
-// KALEIDOS_CORE_ONLY 下跳过组件构建，故用 `no_kcomp` 门控（其他测试照常运行）。
-#[cfg(all(test, not(no_kcomp)))]
+// Pure parser tests always run; linked-artifact tests use explicit fixtures.
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloc::boxed::Box;
     use alloc::format;
     use alloc::vec;
 
-    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.kpkg"));
+    #[cfg(feature = "test-fixtures")]
+    const REAL_KPKG: &[u8] = include_bytes!(concat!(env!("KALEIDOS_TEST_FIXTURES"), "/init.kpkg"));
 
-    // -- 手工构造 newc 归档（与 os/core/build.rs 的 write_newc 语义一致）----
+    // -- 手工构造 newc 归档（newc 格式）----
 
-    /// 手工拼一个 newc 条目（与 os/core/build.rs 的 write_newc 语义一致）：
+    /// 手工拼一个 newc 条目（newc 格式）：
     /// header + name(NUL 结尾) + 4 对齐 + data（含数据尾部对齐）。
     fn newc_raw(name: &str, data: &[u8]) -> Vec<u8> {
         let header = format!(
@@ -216,6 +216,7 @@ mod tests {
 
     // -- 合法路径 -----------------------------------------------------------
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn parses_real_kpkg_entries() {
         let entries = parse_entries(REAL_KPKG).expect("parse real kpkg");
@@ -226,6 +227,7 @@ mod tests {
         assert!(!entries[1].data.is_empty());
     }
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn entries_borrow_the_original_blob_zero_copy() {
         // 性质断言（不锁定 magic offset）：
@@ -279,6 +281,7 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn list_returns_directory_entries() {
         let store = EmbeddedStore::new(REAL_KPKG);
@@ -290,6 +293,7 @@ mod tests {
         assert!(entries[1].len > 0);
     }
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn read_manifest_returns_content() {
         let store = EmbeddedStore::new(REAL_KPKG);
@@ -298,6 +302,7 @@ mod tests {
         assert_eq!(&buf[..18], b"kcomp_smoke.kcomp\n");
     }
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn read_missing_name_is_not_found() {
         let store = EmbeddedStore::new(REAL_KPKG);
@@ -305,6 +310,7 @@ mod tests {
         assert_eq!(store.read(b"nope", &mut buf), Err(StoreError::NotFound));
     }
 
+    #[cfg(feature = "test-fixtures")]
     #[test]
     fn read_small_buffer_is_too_small() {
         let store = EmbeddedStore::new(REAL_KPKG);
@@ -443,6 +449,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-fixtures")]
     proptest! {
         /// 对真实归档做随机字节翻转 + 截断，也不允许 panic。
         #[test]

@@ -11,11 +11,11 @@ use super::report::Checks;
 
 pub fn group(checks: &mut Checks) {
     checks.group("boot basics");
-    checks.check(0, "data", crate::data_ok());
+    checks.check("data", crate::data_ok());
     let cpus = unsafe { kcore_machine_cpu_count() };
     let boot = unsafe { kcore_machine_boot_hart() };
     let boot_present = unsafe { kcore_machine_has_hart(boot) } != 0;
-    checks.check(1, "machine", crate::machine_ok(cpus, boot_present));
-    checks.check(2, "memory", unsafe { kcore_free_page_count() } > 0);
-    checks.check(3, "component", unsafe { kcore_component_count() } >= 1);
+    checks.check("machine", crate::machine_ok(cpus, boot_present));
+    checks.check("memory", unsafe { kcore_free_page_count() } > 0);
+    checks.check("component", unsafe { kcore_component_count() } >= 1);
 }

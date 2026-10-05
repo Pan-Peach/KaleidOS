@@ -32,7 +32,6 @@ pub fn run(checks: &mut Checks) {
         )
     };
     checks.check(
-        41,
         "c-frontend",
         id >= 0 && trace::component_lifecycle(cursor, id),
     );

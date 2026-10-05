@@ -3,20 +3,21 @@ use super::report::Checks;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcomp_sdk::{abi, endpoint::Endpoint, management, posix};
 
-const ZERO: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/exit-zero");
-const SEVEN: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/exit-seven");
-const WRITE: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/write");
-const STACK: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/stack-bss");
-const BAD: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/bad-pointer");
-const PRIVILEGED: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/privileged");
-const TEXT: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/text-write");
-const CORE_READ: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/core-read");
-const STACK_EXECUTE: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/stack-execute");
-const BREAKPOINT: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/breakpoint");
-const PROTECT: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/protect");
-const FORK: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/fork-exec");
-const TARGET: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/target");
-const TIMER: &[u8] = include_bytes!("../../../../../../build/exec-fixtures/timer");
+const ZERO: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/exit-zero"));
+const SEVEN: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/exit-seven"));
+const WRITE: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/write"));
+const STACK: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/stack-bss"));
+const BAD: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/bad-pointer"));
+const PRIVILEGED: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/privileged"));
+const TEXT: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/text-write"));
+const CORE_READ: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/core-read"));
+const STACK_EXECUTE: &[u8] =
+    include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/stack-execute"));
+const BREAKPOINT: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/breakpoint"));
+const PROTECT: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/protect"));
+const FORK: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/fork-exec"));
+const TARGET: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/target"));
+const TIMER: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/timer"));
 
 fn family(images: &[(&[u8], &[u8])], argv: &[&[u8]]) -> kcomp_sdk::Result<posix::ProcessBinding> {
     let config = posix::encode(images, argv, &[])?;
@@ -106,7 +107,7 @@ pub fn group(checks: &mut Checks) {
         super::schedule();
     }
     let bits = result.load(Ordering::Acquire);
-    checks.check(57, "exec-elf", bits & 1 != 0);
-    checks.check(58, "exec-fork-exec-wait", bits & 2 != 0);
-    checks.check(59, "exec-timer", bits & 4 != 0);
+    checks.check("exec-elf", bits & 1 != 0);
+    checks.check("exec-fork-exec-wait", bits & 2 != 0);
+    checks.check("exec-timer", bits & 4 != 0);
 }

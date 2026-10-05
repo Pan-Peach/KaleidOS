@@ -233,14 +233,12 @@ fn authority_events(from: u64, event_kind: u32, expected: &[(u64, u64)]) -> bool
 
 pub fn group(checks: &mut Checks, sched: &sched::Outcome, resource: &resource::Outcome) {
     checks.group("trace sequence");
-    checks.check(24, "trace-readable", readable());
+    checks.check("trace-readable", readable());
     checks.check(
-        25,
         "component-lifecycle",
         component_lifecycle(sched.load_cursor, sched.rr_id),
     );
     checks.check(
-        26,
         "sched-trace",
         sched_trace(sched.run_cursor, sched.rr_id, sched.task_a, sched.task_b),
     );
@@ -250,12 +248,10 @@ pub fn group(checks: &mut Checks, sched: &sched::Outcome, resource: &resource::O
         (RESOURCE_DMA, resource.dma),
     ];
     checks.check(
-        27,
         "authority-grant-trace",
         resource.grants_ok && authority_events(resource.cursor, KIND_RESOURCE_GRANT, &handles),
     );
     checks.check(
-        28,
         "authority-revoke-trace",
         resource.revokes_ok && authority_events(resource.cursor, KIND_RESOURCE_REVOKE, &handles),
     );

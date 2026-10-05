@@ -2,14 +2,12 @@
 //!
 //! 入口契约见 `docs/architecture/component-lifecycle.md` §4：经 SDK 宏
 //! `kcomp_instance_create!` / `kcomp_instance_destroy!` 导出，state 经 `*out_state`
-//! 交给 Core。create 全部通过返回 `0`，有检查失败返回**失败位图**（非 0；`load`
+//! 交给 Core。create 全部通过返回 `0`，有检查失败返回非零状态（非 0；`load`
 //! 命令据此报告 FAILED）/ `-errno`；destroy 释放本实例的状态分配，失败返回
 //! `-errno`（Core 置 Failed，绝不重试）。
 //!
-//! 输出契约（`tests/qemu/runner.py` 按连续子串匹配，改动即破坏 CI）：
-//! - 每项检查一行 `[core-test]   <name>: PASS|FAIL`；
-//! - 汇总 `[core-test]   N/N checks PASS`；
-//! - 终判 `[core-test] all: PASS`（颜色码只包在标记之外，实现点在 `report.rs`）。
+//! 报告采用带 `[core-test] ` 前缀的 KTAP：逐项编号、稳定名称、尾部计划，
+//! 最后输出 `[core-test] all: PASS|FAIL`。runner 校验报告完整性；见 `report.rs`。
 //!
 //! 分组顺序 = 依赖顺序：`boot` basics → `sched`（拿到 rr_id / task id）→
 //! `resource`（拿到 handle）→ `trace` 用这些 Core 返回值做"这个操作产生这个事件"
@@ -19,6 +17,8 @@
 
 mod boot;
 mod c_frontend;
+#[cfg(target_arch = "riscv64")]
+mod deployment;
 mod driver;
 #[cfg(target_arch = "riscv64")]
 mod exec;
@@ -63,7 +63,7 @@ fn schedule() {
 
 // 实例创建入口（C ABI，`docs/architecture/component-lifecycle.md` §4）。
 //
-// 返回值与旧的 `kcomp_init` 完全一致：`0` = 全部通过；非 0 = 失败位图。
+// 返回值与旧的 `kcomp_init` 完全一致：`0` = 全部通过；非 0 = 检查失败。
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let size = core::mem::size_of::<State>();
     let align = core::mem::align_of::<State>();
@@ -121,6 +121,8 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     driver::report(&mut checks, driver_state);
 
     c_frontend::run(&mut checks);
+    #[cfg(target_arch = "riscv64")]
+    deployment::group(&mut checks);
     #[cfg(target_arch = "riscv64")]
     smp::group(
         &mut checks,

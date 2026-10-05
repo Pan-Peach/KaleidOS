@@ -1,125 +1,17 @@
-// Kconfig → Rust 的窄运输契约（解析 / 校验的纯函数），与 host test 共用同一份
-// 实现：build script 侧以 `#[path]` 引入，kernel lib 侧只在 `cfg(test)` 编译。
+// Transport resolved build values; test artifacts are prepared by make test-host.
 #[path = "src/build_config.rs"]
 mod build_config;
-
 use build_config::parse_trace_capacity;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-const RV32_TARGET: &str = "riscv32imac-unknown-none-elf";
-const RV64_TARGET: &str = "riscv64gc-unknown-none-elf";
-
-/// Core-only 开发开关：非空且不等于 `0` 视为开启。开启时跳过下面全部组件
-/// fixture 构建，让 Core 在 `os/components/**` 暂时损坏时仍能单独构建 / host 测试
-/// （`make core` / `make qemu-core` 会导出它）。
-const CORE_ONLY_ENV: &str = "KALEIDOS_CORE_ONLY";
-
-/// 见 [`CORE_ONLY_ENV`]。
-fn core_only() -> bool {
-    matches!(std::env::var(CORE_ONLY_ENV).as_deref(), Ok(value) if !value.is_empty() && value != "0")
-}
 
 fn main() {
-    let target = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv32") {
-        RV32_TARGET
-    } else {
-        RV64_TARGET
-    };
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repo = manifest_dir.parent().unwrap().parent().unwrap();
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let target_dir = out.join("component-target");
-
-    // 两种模式都无条件声明 `no_kcomp`：Core-only 下由本脚本开启；默认模式下
-    // `cfg(no_kcomp)` 虽未定义但已被 check-cfg 声明，clippy 的 unexpected_cfgs
-    // 不会因测试上的 `not(no_kcomp)` 而报警。切换开关需重跑脚本。
-    println!("cargo:rustc-check-cfg=cfg(no_kcomp)");
-    println!("cargo:rerun-if-env-changed={CORE_ONLY_ENV}");
-
     transport_trace_capacity(&out);
-
-    // Benchmark 报告要写明 git commit（`bench::report_environment`）。commit 由
-    // 调用方（Makefile 的 `bench` target）通过环境变量传入，build.rs 只转发：
-    // 这样 build.rs 不碰 .git（否则每次 commit 都要重建三个组件），
-    // `rerun-if-env-changed` 又保证换 commit 时会重新生成。
     println!("cargo:rerun-if-env-changed=KALEIDOS_GIT_COMMIT");
     if let Ok(commit) = std::env::var("KALEIDOS_GIT_COMMIT") {
         println!("cargo:rustc-env=KALEIDOS_GIT_COMMIT={commit}");
     }
-
-    // Core-only：不构建任何组件 fixture（`os/components/**` 可能暂时损坏），
-    // 因此不产生 OUT_DIR 的 *.kcomp / init.kpkg；依赖这些 fixture 的测试由
-    // `cfg(no_kcomp)` 门控。上面的 trace capacity / git commit 已照常转发。
-    if core_only() {
-        println!("cargo:rustc-cfg=no_kcomp");
-        return;
-    }
-
-    // 组件 → .kcomp 的构建管线（与 Makefile 共用脚本）：Rust 前端
-    // tools/build-kcomp.sh 编出 staticlib，语言无关的 tools/kcomp-link.sh
-    // 做 partial link + --gc-sections + -u 入口 → strip → 契约校验。host 测试
-    // fixture 一律在 `os/components/tests/` 下（见 AGENTS.md）；产物名仍取目录
-    // basename（<name>.kcomp / init.kpkg / smoke_min.kcomp），组件名是运行时契约。
-    let script = repo.join("tools/build-kcomp.sh");
-    println!("cargo:rerun-if-changed={}", script.display());
-    let sdk_dir = repo.join("os/components/kcomp-sdk");
-    for changed in [
-        sdk_dir.join("Cargo.toml"),
-        // SDK 已拆成多模块：跟踪整个 src/ 目录，任一源文件变化都触发重建。
-        sdk_dir.join("src"),
-        sdk_dir.join("build.rs"),
-        sdk_dir.join("c"),
-        sdk_dir.join("include"),
-        repo.join("tools/build-kcomp.sh"),
-        repo.join("tools/kcomp-link.sh"),
-    ] {
-        println!("cargo:rerun-if-changed={}", changed.display());
-    }
-
-    let components = [
-        ("core_test", "tests/core_test"),
-        ("kcomp_smoke", "tests/kcomp_smoke"),
-        ("kcomp_heap", "tests/kcomp_heap"),
-        ("kcomp_domain_service", "tests/kcomp_domain_service"),
-        ("kcomp_min", "tests/kcomp_min"),
-        ("kcomp_isolated", "tests/kcomp_isolated"),
-        ("kcomp_isolated_life", "tests/kcomp_isolated_life"),
-        ("kcomp_isolated_svc", "tests/kcomp_isolated_svc"),
-        ("kcomp_isolated_bad", "tests/kcomp_isolated_bad"),
-        ("kcomp_isolated_direct", "tests/kcomp_isolated_direct"),
-        (
-            "kcomp_isolated_unsupported",
-            "tests/kcomp_isolated_unsupported",
-        ),
-    ];
-    let mut objects = Vec::new();
-    for (name, path) in components {
-        let component_dir = repo.join("os/components").join(path);
-        println!(
-            "cargo:rerun-if-changed={}",
-            component_dir.join("Cargo.toml").display()
-        );
-        // core_test 已拆成多模块（src/runtime.rs + src/runtime/*.rs）：跟踪整个
-        // src/ 目录，任一源文件变化都触发重建（与上面 SDK 的跟踪方式一致）。
-        println!(
-            "cargo:rerun-if-changed={}",
-            component_dir.join("src").display()
-        );
-        let destination = out.join(format!("{name}.kcomp"));
-        run_kcomp_build(&script, &component_dir, target, &destination, &target_dir);
-        objects.push((name, fs::read(&destination).unwrap()));
-    }
-
-    write_newc(
-        &out.join("init.kpkg"),
-        &[
-            ("manifest", b"kcomp_smoke.kcomp\n".to_vec()),
-            ("kcomp_smoke.kcomp", objects[1].1.clone()),
-        ],
-    );
-    fs::copy(out.join("kcomp_min.kcomp"), out.join("smoke_min.kcomp")).unwrap();
 }
 
 /// Kconfig `TRACE_CAPACITY` → Rust 常量的运输：Makefile 把生成的片段里的
@@ -147,76 +39,4 @@ fn transport_trace_capacity(out: &Path) {
         ),
     )
     .unwrap();
-}
-
-/// 调用共享构建脚本（与 Makefile 同一条管线），失败即 panic。
-fn run_kcomp_build(
-    script: &Path,
-    component_dir: &Path,
-    target: &str,
-    destination: &Path,
-    target_dir: &Path,
-) {
-    let status = Command::new(script)
-        .args([
-            component_dir.to_str().unwrap(),
-            target,
-            destination.to_str().unwrap(),
-            target_dir.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to run {} for {}: {error}",
-                script.display(),
-                component_dir.display()
-            )
-        });
-    assert!(
-        status.success(),
-        "kcomp build failed for {}",
-        component_dir.display()
-    );
-}
-
-fn write_newc(path: &Path, files: &[(&str, Vec<u8>)]) {
-    let mut archive = Vec::new();
-    for (name, data) in files {
-        append_newc_entry(&mut archive, name, data);
-    }
-    append_newc_entry(&mut archive, "TRAILER!!!", &[]);
-    fs::write(path, archive).unwrap();
-}
-
-fn append_newc_entry(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
-    let name_size = name.len() + 1;
-    let header = format!(
-        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
-        0,
-        0o100644,
-        0,
-        0,
-        1,
-        0,
-        data.len(),
-        0,
-        0,
-        0,
-        0,
-        name_size,
-        0
-    );
-    assert_eq!(header.len(), 110);
-    archive.extend_from_slice(header.as_bytes());
-    archive.extend_from_slice(name.as_bytes());
-    archive.push(0);
-    pad4(archive);
-    archive.extend_from_slice(data);
-    pad4(archive);
-}
-
-fn pad4(buffer: &mut Vec<u8>) {
-    while !buffer.len().is_multiple_of(4) {
-        buffer.push(0);
-    }
 }

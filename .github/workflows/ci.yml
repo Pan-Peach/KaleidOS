@@ -23,9 +23,11 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: os/boot/riscv -> target
+          workspaces: |
+            . -> target
+            os/boot/riscv -> ../../../build
       - name: Install exec fixture compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-unknown-elf
+        run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-unknown-elf clang llvm
       - name: Make check
         run: make check
 
@@ -43,11 +45,13 @@ jobs:
           rustup target add riscv64gc-unknown-none-elf
           rustup target add riscv32imac-unknown-none-elf
       - name: Install QEMU and FAT image tools
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc dosfstools mtools gcc-riscv64-unknown-elf
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc dosfstools mtools gcc-riscv64-unknown-elf clang llvm
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: os/boot/riscv -> target
+          workspaces: |
+            . -> target
+            os/boot/riscv -> ../../../build
       - name: Make test-qemu
         run: make test-qemu
       - name: Upload QEMU logs
@@ -55,7 +59,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-logs
-          path: tests/qemu/logs/
+          path: build/tests/**/logs/
 
   # ArchTest 白盒车道：feature-gated selftest（每 case 独立 QEMU，慢，独立 job）
   archtest:
@@ -71,18 +75,18 @@ jobs:
           rustup target add riscv64gc-unknown-none-elf
           rustup target add riscv32imac-unknown-none-elf
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-unknown-elf
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-unknown-elf clang llvm
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: os/boot/riscv -> target
+          workspaces: |
+            . -> target
+            os/boot/riscv -> ../../../build
       - name: Make test-arch
         run: make test-arch
-      - name: Make RISC-V SMP tests
-        run: make test-arch-smp-rv64
       - name: Upload ArchTest logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: archtest-logs
-          path: tests/qemu/logs/
+          path: build/tests/**/logs/

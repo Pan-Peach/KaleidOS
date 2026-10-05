@@ -63,6 +63,15 @@ VM_MAP = {
     "CONFIG_VM_NOMMU": "vm-nommu",
 }
 
+# QEMU platform defaults are emitted with the resolved build configuration.
+QEMU_FLAGS = {
+    "rv32": "-machine virt -bios default",
+    "rv64": "-machine virt -bios default",
+    "x86_64": "-machine q35 -cpu qemu64",
+    "aarch64": "-machine virt -cpu cortex-a57",
+    "loongarch64": "-machine virt",
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -115,6 +124,7 @@ def variables(kconf):
         ("KCFG_LINKER", linker),
         ("KCFG_QEMU", qemu),
         ("KCFG_QEMU_MEM", qemu_mem),
+        ("KCFG_QEMU_FLAGS", QEMU_FLAGS[arch_name]),
         ("KCFG_BOOT_DIR", boot_dir),
         ("KCFG_BOOT_FEATURES", ",".join(features)),
         ("KCFG_SELFTEST", "y" if is_y(kconf, "CONFIG_SELFTEST") else "n"),

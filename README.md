@@ -3,132 +3,120 @@
 组件化、多架构操作系统，面向学习、实验与个人创作。
 
 > A small mechanism-first core beneath a composable graph of operating-system components.
+> Build the machine, compose the system, run your own world.
 
-> **Build the machine, compose the system, run your own world.** 🎮
+KaleidOS 探索的是：用一个提供基础机制的小型 Core，支撑可组合的操作系统组件图。
+调度策略、驱动、文件系统与系统语义都可以成为组件；同一个底座，通过不同的
+组件组合与部署方式，形成不同的系统形态。POSIX 是其中一种可选方向。
 
-## 核心哲学
+## 核心特色
 
 > **Core owns truth. Components own policy and semantics.**
-> 少即是多：Core 只提供稳定极小的 mechanism，策略与语义在上层可替换；不同信任等级使用不同边界，**部署形态本身就是安全策略**。
+> **Policy proposes, Core validates and commits.**
 
-- **Core owns truth. Components own policy and semantics.** Core 保存不可撒谎的真相；Component 实现可替换的算法、策略与语义。
-- **Policy proposes, Core validates and commits.** 策略/调度器只能"提议"，由 Core 验证存在性、状态、所有权后才生效。
-- **机制与所有权 ≠ Interface。** Core 提供 mechanism，并**不伪造不存在的 security boundary**；真正的访问强制只来自执行域。Interface 是语义，传输是绑定策略。
+- **少即是多，能力默认外置。** Core 管理资源的存在性、状态、所有权与生命周期。
+  RR 调度算法、VirtIO 协议、文件系统格式与 POSIX 语义由组件实现，
+  Core 提供支撑它们所需的机制。
+- **策略可以替换，资源真相由 Core 裁决。** 调度器提出“下一步运行哪个任务”，
+  Core 验证任务状态、owner 与 CPU 归属后才提交，并记录结构化 trace。
+  这让实验不同策略时仍有明确的不变式与可观察的提交过程。
+- **部署形态本身就是安全策略。** KernelNative 与 Core 同特权、同地址空间，
+  适用于受信组件；IsolatedNative 使用私有地址空间。驱动向 Core 认领设备后，
+  在本执行域的访问窗口内操作硬件。访问边界取决于真实执行域及硬件能力。
+- **服务语义与调用机制分开。** 组件通过 Endpoint 发布和绑定服务；接口描述
+  “提供什么”，Core 在绑定时按双方部署域选择 Direct 或 Gate。
+  同一份组件业务代码与服务契约可以用于不同部署组合。
+- **组件是独立程序，也有独立实例。** `.kcomp` 使用窄 C ABI，支持 Rust 与
+  freestanding C 前端；加载同一工件两次得到两个组件，各自拥有可写镜像状态、
+  资源与生命周期。SDK 和第三方库随组件私有携带。
+- **Core 与机器发现解耦。** Arch 提供 ISA 原语，boot 将机器描述归一化为
+  `MachineInfo`，再交给 Core 验证与初始化。纯资源逻辑可在 host 测试，
+  CPU、页表和中断的真实行为通过 QEMU 与硬件验证。
 
-完整表述、判断标准与"什么进 Core"见 `docs/philosophy/core-philosophy.md`；驱动 / device claim / IRQ / DMA / 执行域细节见 `docs/architecture/driver-model.md`。
+设计原则与边界见 [核心哲学](docs/philosophy/core-philosophy.md)、
+[部署契约](docs/architecture/deployment.md) 和 [驱动契约](docs/architecture/driver-model.md)。
 
-## 架构
+## 架构与组合
+
+**OS = Resource Core + Component Graph + Profile。**
 
 ```text
 Applications / System Personality
-        │
- Services / Devices
-        │
-     Components          ← 可替换的算法、策略、驱动
-        │
-   Resource Core         ← 机制 + 所有权：存在性/状态/所有权/生命周期
-        │
-   Arch + Machine Discovery ← arch/（ISA） + 机器发现（FDT / ACPI / Probe）
-        │
-     Hardware
+              │
+        Services / Devices
+              │
+     Components（策略 / 服务 / 驱动）
+              │
+         Resource Core
+              │
+    Arch / Machine Discovery
+              │
+           Hardware
 ```
 
-OS = **Resource Core + Component Graph + Profile**。同一个底座，通过重新组合 Component，可以长出完全不同的操作系统。
+bootstrap 与 Core 职责分离，链接成一个内核镜像；组件独立构建为 `.kcomp`
+（ELF 可重定位程序），打包为 `init.kpkg`（cpio + manifest），由组件管理机制装载。
+启动组件负责组合调度器、驱动与服务。Cargo 依赖描述编译关系，运行时组件图由
+组件管理与启动编排建立。
 
-## 目录
+## 现在可以运行什么
 
-```
-Kconfig        构建配置顶层入口；`.config`（gitignored）是配置唯一真相，configs/*_defconfig 是具名 profile（见 docs/architecture/kconfig.md）
-configs/       具名 profile（defconfig）：qemu_rv64 / qemu_rv32 / qemu_rv32_nommu
-scripts/       Kconfig 胶水脚本：kconfig/configure.py（创建/归一化 .config）+ kconfig/genmk.py（生成 Make 片段）
-os/            全部 OS 源码（seL4/Theseus 式收敛，不再散在仓库根）：
-  boot/            成品镜像层（bin，按目标架构分目录）：riscv/ ——
-                   RV64/Sv39 与 RV32/Sv32 profile 共用 RISC-V family，
-                   _start → FDT discovery → MachineInfo → core::init() → init → ksh（monitor 可回退），
-                   与 core 链接成 kaleidos-<arch>（单镜像，职责分离装载合一）
-  core/            Resource Core **library**（host-testable）：task/memory/resource/component/irq/timer/trace/machine/print
-  arch/            统一 arch crate：CpuArch/Console/SystemReset backend traits + cfg 选择 riscv / fake
-  components/      组件 crates：生产组件（策略 / 服务 / 驱动 / 文件系统 / SDK）+ tests/（test-only fixture 与 CoreTest）
-  components/drivers/  驱动组件（驱动多而杂，统一归纳在这里）：uart/ virtio_blk/ …
-third_party/   外部依赖（git submodule）：fdt/（FDT 解析器）/ buddy_system_allocator/（MetadataHeap，O(1) buddy）/ Kconfiglib/（Kconfig 前端）/ fatfs/ / littlefs/ / smoltcp/（netstack 私有协议后端）/ libc-test/（宿主兼容性测试）——不修改上游实现
-tests/         宿主 / QEMU 测试与 fixture；compat/ 使用上游用例构建 Linux ELF / Windows PE 参考程序
-docs/          设计文档（索引 docs/README.md）：philosophy/（为什么）architecture/（是什么）interfaces/（契约）modules/（各模块现状）development/（怎么干活）notes/（历史归档）
-tools/         构建辅助脚本（build-kcomp.sh 等）
-```
+当前组件系统的主要开发与 QEMU 测试路径是 RV64/Sv39 与 RV32/Sv32。
+以下链路已经接通，具体支持范围与缺口以 [STATUS.md](STATUS.md) 和模块文档为准。
 
-> **Cargo 依赖图 ≠ Component 图。** 组件运行时的加载/组合由 Component Manager 决定（未来：.kcomp + cpio + manifest，Linux insmod/depmod/initramfs 模式）——不写在 Cargo.toml 里。
+| 能力 | 已接通的链路 |
+|---|---|
+| 启动与交互 | 机器发现 → Core → init → 驱动 / FAT 根盘 → ksh；monitor 支持观察机器、任务与组件，以及手工 load/unload |
+| 真实驱动与文件系统组件 | driver_prober 发现设备，virtio_blk 提供块服务，FatFs / littlefs 通过组件接口提供文件系统服务 |
+| 组件执行与调度 | scheduler_rr 提供策略，Core 验证并切换任务；RV64 支持固定 CPU 的协作式 SMP 与跨 CPU park/unpark |
+| 部署与服务绑定 | 受限的 IsolatedNative 私有地址空间、私有堆与 K/K、K/I、I/K、I/I 服务调用组合 |
+| 组件失败处理 | 独立栈上的协作式 panic containment、实例逻辑失效与新实例重启；已发布 backing 保守驻留 |
+| 普通用户程序 | RV64 静态 ELF 的 U-mode 执行，最小 POSIX fork/exec/wait，以及 FAT → ksh exec 流程 |
 
-## 当前状态
+IsolatedNative 当前仍是受限、协作式的执行边界；KernelNative panic containment
+只保证相应逻辑失效。SandboxedNative 组件后端、通用 VFS/libc 启动与完整物理回收
+仍待接通。各 ISA 的能力见 [Arch 模块](docs/modules/arch.md) 与
+[boot 模块](docs/modules/boot.md)。
 
-**架构定案：`kaleidos.elf` 单镜像（os/boot + core 链接，职责分离装载合一；组件未来独立 `.kcomp`=Linux insmod 模式）。** 当前完成（全部 QEMU 端到端验证，RV64 + RV32 双 profile）：
+## 启动
 
-- **Boot 全链**：FDT discovery → MachineInfo → `core::init` → profile 选中的 `init.kcomp` → scheduler / prober / FAT root → **ksh**；空启动配置或 init 失败回到 **Core Monitor**（`core> help/machine/memory/tasks/load/components/catalog/shutdown/reboot`）；RV64 走 Sv39 identity+高半区双映射，RV32 走 Sv32 identity
-- **MMU**：`KernelAddressSpace`（Core 语义 ledger + `AddressSpaceBackend` contract）+ `Sv39PageTable`/`Sv32PageTable`（buddy 回调分配页表页，mid-map 失败回滚，host 测试直驱生产实现）
-- **组件加载链**（Linux insmod 教学版，语言无关）：`.kcomp`（ELF32/ELF64 ET_REL；Rust 走 `tools/build-kcomp.sh`，freestanding C 走 `tools/build-kcomp-c.sh`）→ `make init.kpkg`（cpio+manifest）→ `.initpkg` 内嵌 → `store`（cpio 解析）→ `loader`（段放置 + RV32/RV64 重定位）→ `registry`（生命周期状态机：Declared → Resolved → Ready）→ monitor `load` 命令。C 组件只 `#include "kcomp.h"` 直调 `kcore_*`，SDK 的 C 运行时（`kcomp-sdk/c/kcomp_rt.c`，weak `mem*`）随组件私有携带；`make test-qemu`（CoreTest `c-frontend` + runner 机器级 `load`/`unload kcomp_c_smoke`）用最小 C 组件在 RV64/RV32 端到端验证
-- **导出白名单**（EXPORT_SYMBOL 教学版，一组 `kcore_*`：内存域视图 `kcore_memory_acquire/release` + 输出 + 机器/系统只读查询 + 组件加载 / endpoint 发布 / 任务 / 调度 + 设备/IRQ/DMA 机制 `kcore_device_nth`（纯发现）/`kcore_device_claim/release`（认领确切设备，返回本执行域 MMIO 窗口） + `kcore_irq_register/enable/disable/release`（锚在已认领 `(DeviceId, resource_index)`；设备中断资源可多条） + `kcore_dma_alloc/free/map/unmap`（allocation 与 mapping 分离，backing 撤销进 QUARANTINE），错误码统一 `0/-Errno`）
-- **Component Endpoint Registry**（骨架）：组件→组件依赖只走 endpoint binding（`EndpointId` opaque、绝不重定向；staged publish / lookup / discover / bind），exact ABI fingerprint + typed `#[repr(C)]` function table 或 Core call gate，不建立 flat ELF symbol 全局符号表
-- **C4 调度执行链**（第一条完整系统链，全程只走导出白名单）：`load core_test` → Core 加载 scheduler_rr（`kcore_component_load`）→ 接口 publish/bind（SchedulerPolicy）→ 任务创建/启动 → Core propose→validate→commit 调度（RR 交替）→ yield/exit → 状态验证；core_test 端到端自检全 PASS（RV64+RV32）
-- **组件 panic containment**（init + task 边界，协作式）：组件跑在 Core 拥有的独立栈上；panic 时先用直接 SBI 打印诊断（`[panic] component=<id> task=<id> at <loc>: <msg>`）再 stack-switch 回 Core 上下文，标记该 instance Failed 后重新调度。`panic=abort` 不变、无 unwinding，不承诺内存回收（containment ≠ fault isolation）。ArchTest `panic-containment` / `task-panic`（RV64+RV32）
-
-实机输出：
-
-```text
-core> load kcomp_smoke
-[smoke] hex=12            ← 组件调内核 console/count（通过白名单重定位）
-!load kcomp_smoke: OK (id=1, entry=0x81a00000)
-```
-
-日志走 `printk!`/`log!` 宏（格式化在 core，传输在 arch 的 `Console` backend：host=Fake/std，当前 RISC-V=OpenSBI）。质量工具链：`make fmt` / `make clippy` / `make check`（CI 快车道） + `make test-qemu`（自动 boot smoke + core_test 判定） + `make test-arch`（ArchTest 白盒 selftest，独立 CI job）。默认 profile 为 RV64；切换架构 / VM 走 Kconfig：`make qemu_rv32_defconfig` 或 `make qemu_rv32_nommu_defconfig`，再 `make qemu`（见 `docs/architecture/kconfig.md`）。
-
-## 构建
-
-外部依赖是 git submodule，克隆后先初始化：
+先按 [构建指南](docs/development/building.md) 准备 Rust、QEMU 与镜像工具，
+然后在仓库根目录运行：
 
 ```sh
 git submodule update --init --recursive
-cargo check
+make qemu_rv64_defconfig
+make qemu
 ```
 
-配置走 Linux Kconfig 风格：`.config` 是唯一配置真相，先选 profile 再构建（详见 `docs/architecture/kconfig.md`）：
+默认启动 `init`，组合驱动与 FAT 根盘后进入 `ksh`。输入 `help` 查看命令，
+`cat 0:/HELLO.TXT` 读取示例文件，`exit` 回到 Core Monitor。
+QEMU 用 `Ctrl-A`、`X` 退出。切换 RV32、进入 monitor 与配置说明见构建指南。
 
-```sh
-make qemu_rv64_defconfig        # RV64 / supervisor / MMU（默认 profile）
-make qemu_rv32_defconfig        # RV32 / supervisor / MMU
-make qemu_rv32_nommu_defconfig  # RV32 / supervisor / NoMMU
-make qemu                       # 构建并在 QEMU 中运行（Ctrl-A X 退出）
+## 开发与测试
 
-make menuconfig                 # 交互式编辑 .config
-make olddefconfig               # 用新默认值刷新 .config
-```
-
-主工作流：`make <board>_defconfig && make qemu`。
-
-普通 RISC-V profile 默认自动启动 `init.kcomp`，组合调度器、驱动、FAT 根盘并进入 ksh。
-`ksh> cat 0:/HELLO.TXT` 读取根盘，`help` 查看命令，`exit` 回到 monitor。
-`make monitor_defconfig` 关闭自动组合，下次启动可在 `core>` 手动 `load init`，或
-`load scheduler_rr` → `load ksh`。启动策略见 [`docs/modules/init.md`](docs/modules/init.md)，
-shell 命令与限制见 [`docs/modules/ksh.md`](docs/modules/ksh.md)。
-
-## 文档
-
-libc / 兼容性参考测试：`make test-compat-linux`、`make compat-windows`、
-`make compat-package`。Windows 原生运行与工具链说明见
-[`docs/development/compat-testing.md`](docs/development/compat-testing.md)；这些应用尚不能在 KaleidOS 执行。
-
-索引与权威归属见 [`docs/README.md`](docs/README.md)（先看这个）。
-
-| 文档 | 内容 |
+| 命令 | 用途 |
 |---|---|
-| `docs/README.md` | 文档索引：每个文件夹/文件干嘛、冲突时谁赢 |
-| `docs/philosophy/core-philosophy.md` | 核心哲学与判断标准 |
-| `docs/architecture/overview.md` | 架构总览（分层 / Core / Component / ExecutionDomain / Profile） |
-| `docs/architecture/component-model.md` | 组件模型（Interface / ResourceDomain / 依赖图） |
-| `docs/architecture/component-lifecycle.md` | 组件生命周期与实例契约（已冻结） |
-| `docs/architecture/driver-model.md` | 驱动与执行域模型（device claim / MMIO·IRQ·DMA / teardown 安全） |
-| `docs/architecture/kconfig.md` | 配置系统（Kconfig / `.config` 唯一真相） |
-| `docs/modules/README.md` | 模块地图：每个 Core 模块 owns 什么真相、代码在哪 |
-| `docs/development/testing.md` | 测试策略（host test / CoreTest / trace） |
-| `docs/development/compat-testing.md` | 上游 libc-test、双平台参考构建 / 运行、组合包与应用执行前提 |
-| `docs/development/benchmark.md` | 性能基准（harness / 拆 primitive / 回归策略 / FS roadmap） |
-| `STATUS.md`（仓库根） | 状态与计划：现状快照 + 里程碑 + 路线图（单一入口） |
-| `docs/philosophy/references.md` | 参考资料与借鉴方向 |
+| `make check` | 格式、lint、ABI/Kconfig 检查、host 测试与交叉构建 |
+| `make test-host` | 宿主逻辑测试 |
+| `make test-qemu` | RV64/RV32 CoreTest 与 init/ksh 用户流程 |
+| `make test-arch` | RV64/RV32 硬件白盒测试，含 RV64 SMP |
+| `make test` | 上述三条测试通道，与默认 CI 门禁一致 |
+
+CoreTest 是组件与系统集成测试的统一编排者，以普通组件身份调用真实 Core API。
+纯逻辑在 host 验证，寄存器、页表与中断等硬件契约由 ArchTest 验证。
+测试边界、SMP 门禁与新增用例方法见 [测试指南](docs/development/testing.md)。
+
+## 阅读与贡献
+
+| 入口 | 内容 |
+|---|---|
+| [docs/README.md](docs/README.md) | 按任务找文档，以及契约的权威归属 |
+| [核心哲学](docs/philosophy/core-philosophy.md) / [架构总览](docs/architecture/overview.md) | Core 与组件的分工 |
+| [模块地图](docs/modules/README.md) | 源码位置与模块职责 |
+| [STATUS.md](STATUS.md) | 当前能力、缺口与路线图 |
+| [AGENTS.md](AGENTS.md) | Agent 工作约定与必须遵守的边界 |
+
+OS 源码位于 `os/`；测试组件位于 `os/components/tests/`；外部依赖位于
+`third_party/`，使用 git submodule。文档组织规则见
+[文档指南](docs/development/docs-guide.md)。

@@ -77,9 +77,8 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let claimed =
         enumerated && unsafe { kcore_device_claim(virtio_device, &mut mmio, &mut mmio_len) } == 0;
     let magic_ok = claimed && unsafe { read_u32(mmio, 0) } == VIRTIO_MMIO_MAGIC;
-    checks.check(10, "device-claim-magic", magic_ok);
+    checks.check("device-claim-magic", magic_ok);
     checks.check(
-        11,
         "device-window-len",
         claimed && mmio_len == VIRTIO_MMIO_WINDOW,
     );
@@ -87,7 +86,6 @@ pub fn group(checks: &mut Checks) -> Outcome {
     // 拒绝路径：独占锚在**设备**上 —— 同一 DeviceId 重复认领 → -EBUSY。
     let (mut dup, mut dup_len) = (core::ptr::null_mut(), 0usize);
     checks.check(
-        12,
         "device-double-claim",
         claimed
             && unsafe { kcore_device_claim(virtio_device, &mut dup, &mut dup_len) }
@@ -106,7 +104,6 @@ pub fn group(checks: &mut Checks) -> Outcome {
     // 拒绝路径：使能前必须先注册 handler —— 未注册就 enable → -EINVAL。
     // UART 只有一条中断资源（resource_index = 0）。
     checks.check(
-        13,
         "irq-enable-order",
         uart_claimed && unsafe { kcore_irq_enable(uart_device, 0) } == Errno::EINVAL.code(),
     );
@@ -116,14 +113,12 @@ pub fn group(checks: &mut Checks) -> Outcome {
     let irq_enabled = irq_registered && unsafe { kcore_irq_enable(uart_device, 0) } == 0;
     let irq_disabled = irq_enabled && unsafe { kcore_irq_disable(uart_device, 0) } == 0;
     checks.check(
-        14,
         "irq-line-enable",
         irq_registered && irq_enabled && irq_disabled,
     );
 
     // 拒绝路径：仍有 live IRQ route 时释放 device → -EBUSY（拆机顺序）。
     checks.check(
-        15,
         "device-release-busy",
         irq_registered && unsafe { kcore_device_release(uart_device) } == Errno::EBUSY.code(),
     );
@@ -131,14 +126,14 @@ pub fn group(checks: &mut Checks) -> Outcome {
     // --- IRQ release：撤销 route 后重复释放 → -EINVAL（该设备已无 route）。 ---
     let irq_released = irq_registered && unsafe { kcore_irq_release(uart_device, 0) } == 0;
     let irq_double = unsafe { kcore_irq_release(uart_device, 0) } == Errno::EINVAL.code();
-    checks.check(16, "irq-release", irq_released && irq_double);
+    checks.check("irq-release", irq_released && irq_double);
 
     // --- Device release：释放后同一设备可被再次认领（无 quarantine）。 ---
     let uart_released = uart_claimed && unsafe { kcore_device_release(uart_device) } == 0;
     let (mut uart2, mut uart2_len) = (core::ptr::null_mut(), 0usize);
     let uart_reclaimed = uart_released
         && unsafe { kcore_device_claim(uart_device, &mut uart2, &mut uart2_len) } == 0;
-    checks.check(17, "device-release", uart_released && uart_reclaimed);
+    checks.check("device-release", uart_released && uart_reclaimed);
 
     // --- MMIO 直接写回读：goldfish RTC 的 IRQ_ENABLED（0x10，4 字节 RW）。 ---
     let mut rtc_device = 0u32;
@@ -161,7 +156,7 @@ pub fn group(checks: &mut Checks) -> Outcome {
         echo == 1
     };
     let rtc_released = rtc_claimed && unsafe { kcore_device_release(rtc_device) } == 0;
-    checks.check(18, "device-write-readback", rtc_state && rtc_released);
+    checks.check("device-write-readback", rtc_state && rtc_released);
 
     // --- DMA：allocation 与 mapping 分离；alloc → map → 写读回 → unmap → free。 ---
     let (mut dma_ptr, mut dma_len) = (core::ptr::null_mut(), 0usize);
@@ -188,12 +183,11 @@ pub fn group(checks: &mut Checks) -> Outcome {
         };
     let dma_unmapped = dma_roundtrip && unsafe { kcore_dma_unmap(dma_mapping) } == 0;
     let dma_freed = dma_unmapped && unsafe { kcore_dma_free(dma_ptr) } == 0;
-    checks.check(19, "dma-ring", dma_roundtrip && dma_unmapped && dma_freed);
+    checks.check("dma-ring", dma_roundtrip && dma_unmapped && dma_freed);
 
     // 拒绝路径：DMA 尺寸 0 非法 → -EINVAL。
     let (mut zero_ptr, mut zero_len) = (core::ptr::null_mut(), 0usize);
     checks.check(
-        20,
         "dma-invalid-size",
         unsafe { kcore_dma_alloc(0, &mut zero_ptr, &mut zero_len) } == Errno::EINVAL.code(),
     );
@@ -204,11 +198,10 @@ pub fn group(checks: &mut Checks) -> Outcome {
         kcore_device_nth(b"ns16550a".as_ptr(), b"ns16550a".len(), 1, &mut missing)
             == Errno::ENOENT.code()
     };
-    checks.check(21, "device-ordinal-miss", miss);
+    checks.check("device-ordinal-miss", miss);
 
     // 拒绝路径：释放未认领的设备 → -ENODEV（已释放的 RTC）。
     checks.check(
-        22,
         "device-release-unclaimed",
         unsafe { kcore_device_release(rtc_device) } == Errno::ENODEV.code(),
     );

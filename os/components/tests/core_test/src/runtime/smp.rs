@@ -201,7 +201,7 @@ fn panic_case(state: *mut State, failed_cpu: usize) -> bool {
 
 pub fn group(checks: &mut Checks, state: *mut State, rr_id: i32) {
     if unsafe { abi::kcore_machine_cpu_count() } < 2 {
-        kcomp_sdk::klog!("[core-test] SMP needs two CPUs; skipped");
+        checks.check("smp-requires-two-cpus", false);
         return;
     }
     checks.group("SMP component scheduling");
@@ -211,25 +211,22 @@ pub fn group(checks: &mut Checks, state: *mut State, rr_id: i32) {
         && start(state, helper, 0, 12)
         && start(state, helper, 1, 13);
     let exited = started && await_exited(state, &[6, 7, 12, 13]);
-    checks.check(50, "smp-parallel", exited && value(state, 0) == 3);
+    checks.check("smp-parallel", exited && value(state, 0) == 3);
     checks.check(
-        51,
         "smp-remote-park-wake",
         exited && value(state, 2) == 128 && value(state, 3) == 128,
     );
     checks.check(
-        52,
         "smp-local-rr",
         exited && value(state, 4) == 32 && value(state, 5) == 32,
     );
-    checks.check(53, "smp-task-completion", exited && value(state, 8) == 15);
+    checks.check("smp-task-completion", exited && value(state, 8) == 15);
     // Never reset storage still reachable by a live task after a failing check.
     let ap = exited && panic_case(state, 1);
-    checks.check(54, "smp-panic-ap", ap);
+    checks.check("smp-panic-ap", ap);
     let bsp = ap && panic_case(state, 0);
-    checks.check(55, "smp-panic-bsp", bsp);
+    checks.check("smp-panic-bsp", bsp);
     checks.check(
-        56,
         "smp-scheduler-live",
         rr_id >= 0
             && Endpoint::<SchedulerPolicy>::lookup(rr_id as u32, SCHEDULER_POLICY_NAME).is_ok(),

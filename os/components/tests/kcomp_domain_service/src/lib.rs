@@ -37,6 +37,49 @@ impl BlockDeviceProvider for Device {
         Ok(())
     }
     fn write(&self, lba: u64, input: &[u8]) -> Result<(), Errno> {
+        if lba == u64::MAX - 2 {
+            // Public test control: execute the same client operations from this
+            // provider's real deployment context. No private Core state access.
+            let words = |index: usize| {
+                u32::from_le_bytes(input[index * 4..index * 4 + 4].try_into().unwrap())
+            };
+            let mode = words(2);
+            for provider in [words(0), words(1)] {
+                let binding = Endpoint::<BlockDevice>::lookup(provider, BLOCK_DEVICE_NAME)?
+                    .bind()
+                    .map_err(errno)?;
+                let mut output = [0xceu8; 512];
+                match mode {
+                    0 => {
+                        if binding.capacity_sectors().map_err(errno)? != 64 {
+                            return Err(Errno::EIO);
+                        }
+                        binding.read(3, &mut output).map_err(errno)?;
+                        if output != [0x41 ^ 3; 512] {
+                            return Err(Errno::EIO);
+                        }
+                        binding.write(3, &output).map_err(errno)?;
+                    }
+                    1 => {
+                        if binding.read(u64::MAX, &mut output)
+                            != Err(InvokeError::Transport(Errno::EIO))
+                            || output != [0xce; 512]
+                            || binding.read(0, &mut output)
+                                != Err(InvokeError::Transport(Errno::ENOENT))
+                        {
+                            return Err(Errno::EIO);
+                        }
+                    }
+                    2 => {
+                        if binding.read(3, &mut output) != Err(InvokeError::Method(Errno::EBUSY)) {
+                            return Err(Errno::EIO);
+                        }
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
+            return Ok(());
+        }
         if lba == u64::MAX - 1 {
             RELAY.store(
                 u32::from_le_bytes(input[..4].try_into().unwrap()),
@@ -86,10 +129,16 @@ kcomp_sdk::kcomp_services! { state: State; PORT => dispatch, }
 
 kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     let args = unsafe { &*args };
-    if args.config_len != 16 || args.config.is_null() {
+    if args.config_len != 0 && (args.config_len != 16 || args.config.is_null()) {
         return Errno::EINVAL.code();
     }
-    let config = unsafe { core::slice::from_raw_parts(args.config.cast::<u32>(), 4) };
+    // An empty config is the public load() fixture: a plain provider.
+    let defaults = [0, 0, 0x41, 0];
+    let config = if args.config_len == 0 {
+        &defaults[..]
+    } else {
+        unsafe { core::slice::from_raw_parts(args.config.cast::<u32>(), 4) }
+    };
     let (provider, mode, seed, relay) = (config[0], config[1], config[2], config[3]);
     SEED.store(seed, Ordering::Relaxed);
     RELAY.store(relay, Ordering::Relaxed);
