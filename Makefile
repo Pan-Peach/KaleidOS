@@ -164,7 +164,7 @@ $(KCONFIG_MK): $(KCONFIG_CONFIG) scripts/kconfig/genmk.py $(KCONFIG_TREE)
 # 因此 test-only fixture 可以整体挪进 tests/ 而不改组件名。test-only fixture/组件
 # 一律放 os/components/tests/（见 AGENTS.md），生产组件留在 os/components/。
 # 归档库存列表留在 Makefile；运行图由 BOOT_COMPONENT 选中的组件编排。
-KCOMP_SRCS   := tests/core_test tests/kcomp_smoke scheduler_rr tests/kcomp_smp tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober filesystems/vfs personalities/posix network/netstack init ksh kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
+KCOMP_SRCS   := tests/core_test tests/kcomp_smoke tests/kcomp_heap tests/kcomp_domain_service scheduler_rr tests/kcomp_smp tests/kcomp_panic tests/kcomp_isolated tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported drivers/virtio_blk driver_prober filesystems/vfs personalities/posix network/netstack init ksh kbench tests/drivers/ram_blk tests/drivers/ram_blk_rw
 # C 组件（freestanding，clang 前端；可选用 kcomp-c-src.txt 列 third_party 源文件）。
 # SDK 的 C 运行时（kcomp-sdk/c/*.c）由 build-kcomp-c.sh 自动随每个 C 组件编入。
 KCOMP_C_SRCS := tests/kcomp_c_smoke filesystems/fatfs filesystems/littlefs

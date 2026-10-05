@@ -76,7 +76,7 @@ pub enum ComponentLoadError {
     /// SandboxedNative 的 U-mode / task-AS / syscall 机制尚未实现：装载前 ENOTSUP。
     SandboxUnsupported,
     /// `IsolatedNative` 装载发现**不在支持白名单里的 `kcore_*` import**：
-    /// 只有诊断 / 只读查询与 `kcore_panic_escape` 可解析
+    /// 支持诊断 / 只读、panic、私有 backing 与 endpoint API
     /// （[`crate::component::isolated_load::SUPPORTED_IMPORTS`]），面外符号在装载
     /// **之前**拒绝——绝不回退到 KernelNative 的裸 Core 函数地址。
     IsolatedImportUnsupported,
@@ -198,6 +198,7 @@ fn create_kernel_native(
     let blob = read_artifact(name)?;
     let loaded = loader::load_component(&blob).map_err(ComponentLoadError::Loader)?;
     let create_entry = loaded.create;
+    let runtime_entry = loaded.runtime_init;
 
     let id = {
         let mut reg = registry::get_registry().lock();
@@ -217,7 +218,17 @@ fn create_kernel_native(
     let mut instance_state: *mut () = core::ptr::null_mut();
     let previous = containment::creating();
     containment::replace_creating(Some(id));
-    let outcome = containment::call_component_create(create_entry, args, &mut instance_state);
+    let outcome = match runtime_entry.map(|entry| {
+        containment::call_component_runtime(
+            entry,
+            &crate::component::export::runtime_backend(ExecutionDomain::KernelNative),
+        )
+    }) {
+        None | Some(CallOutcome::Returned(0)) => {
+            containment::call_component_create(create_entry, args, &mut instance_state)
+        }
+        Some(outcome) => outcome,
+    };
     containment::replace_creating(previous);
 
     match outcome {
@@ -325,7 +336,7 @@ fn create_sandboxed_native(
 /// 字节，调用方用同一份 blob 装载。
 ///
 /// **import 白名单**（[`crate::component::isolated_load::SUPPORTED_IMPORTS`]）：
-/// 只有诊断 / 只读查询与 `kcore_panic_escape` 可解析；白名单外的 `kcore_*`
+/// 诊断 / 只读查询、`kcore_panic_escape` 与内存 acquire/release 可解析；面外的 `kcore_*`
 /// UNDEF 在这里拒绝（`-ENOTSUP`，绝不回退到裸 Core 地址）；其余具名 UNDEF 由
 /// 按域装载的白名单检查拒绝（`isolated_load::place`，`-EINVAL`）。
 ///
@@ -517,7 +528,7 @@ mod tests {
     // -- Isolated 部署的显式拒绝包络 --------------------------------------------
 
     /// 真实 `.kcomp` fixture（与 loader 用例同一份构建产物）。
-    /// 明确不在 Isolated 支持面内的 import（`kcore_memory_acquire`）。
+    /// 明确不在 Isolated 支持面内的 import（`kcore_heap_alloc`）。
     const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
         "/kcomp_isolated_unsupported.kcomp"
@@ -551,11 +562,11 @@ mod tests {
         assert_eq!(
             check_isolated_imports(UNSUPPORTED_KCOMP),
             Err(ComponentLoadError::IsolatedImportUnsupported),
-            "kcore_memory_acquire 必须被 Isolated 装载拒绝"
+            "kcore_heap_alloc 必须被 Isolated 装载拒绝"
         );
     }
 
-    /// 唯一支持面 = 诊断 / 只读查询 + `kcore_panic_escape`：面外（内存 / 调度 /
+    /// 唯一支持面由 isolated_load 定义；面外（调度 /
     /// 设备 / KernelNative 共享堆后端）一律不冒充"支持的 import"；空名（ELF NULL
     /// 符号）不算 import。
     #[test]
@@ -564,7 +575,8 @@ mod tests {
         assert!(import_supported(b"kcore_log_line"));
         assert!(import_supported(b"kcore_now"));
         assert!(import_supported(b"kcore_panic_escape"));
-        assert!(!import_supported(b"kcore_memory_acquire"));
+        assert!(import_supported(b"kcore_memory_acquire"));
+        assert!(import_supported(b"kcore_memory_release"));
         assert!(!import_supported(b"kcore_heap_alloc"));
         assert!(!import_supported(b"kcore_heap_dealloc"));
         assert!(!import_supported(b"kcore_device_claim"));

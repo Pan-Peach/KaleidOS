@@ -41,7 +41,7 @@
 
 - **C 作者面**：`include/kcomp.h`（umbrella，只 include 生成物 + 契约说明）、`include/generated/kcomp_abi.h`（`kcore_*` / 生命周期入口 / `block.device` / `filesystem` 的 C 声明，schema 单一来源）、`include/errno.h`、`include/string.h`、`include/inttypes.h`（freestanding shim 声明；`inttypes.h` 因 littlefs 的 `lfs_util.h` 无条件 include 它而补）。
 - **C 运行时**：`c/kcomp_rt.c`——freestanding **weak** `memcpy` / `memset` / `memmove` / `memcmp` / `strlen` / `strchr` / `strcpy` / `strspn` / `strcspn`（C 组件私有携带；只实现组件真正引用到的原语，不朝 libc 扩张；后三个为 littlefs 引入）。
-- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `kcomp_services!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`endpoint.rs`（typed `Endpoint<C>`）、`block.rs`（`block.device` 契约类型 + provider 包装，声明本体 re-export 生成物）、`filesystem.rs`、`probe.rs`（`DriverCreateConfig` 扁平编解码 / `ProbeReply` / `ProbeResult` 契约 + pull / publish helper）、`generated/{abi,block,filesystem,errno,probe}.rs`（schema 生成物）、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → **KernelNative 共享 Core 堆** `kcore_heap_alloc/dealloc`，部署形态决定的窄后端，非通用 / 跨域内存 ABI）、`heap.rs`（**未来私有执行域**的 freestanding C 分配器 facade；当前未接线，host 测试直接驱动 C 实现；契约见 `docs/architecture/memory-and-heap.md` §6）。
+- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `kcomp_services!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`endpoint.rs`（typed `Endpoint<C>`）、`block.rs`（`block.device` 契约类型 + provider 包装，声明本体 re-export 生成物）、`filesystem.rs`、`probe.rs`（`DriverCreateConfig` 扁平编解码 / `ProbeReply` / `ProbeResult` 契约 + pull / publish helper）、`generated/{abi,block,filesystem,errno,probe}.rs`（schema 生成物）、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → per-image 部署 adapter，create 前选择 K 共享堆 / I 私有堆）、`heap.rs`（私有执行域的 freestanding C 分配器 facade；`c/kcomp_heap_runtime.c` 生产消费，host 测试驱动真实 C 实现；契约见 `docs/architecture/memory-and-heap.md` §6）。
 - **ABI 目标**：稳定窄 C ABI（`kcore_*` 白名单）；target `riscv64gc-unknown-none-elf` / `riscv32imac-unknown-none-elf`。Rust ABI 永不成为组件 ABI。
 
 ## `.kcomp` 流水线（端到端）
@@ -89,3 +89,5 @@
 | `tools/kabi/kabi_gen.py` | ABI schema 生成器（源 `abi/*.toml`） |
 | `os/core/src/component/{store,loader,registry,export}.rs` | store / loader / registry / 导出白名单 |
 | `os/core/build.rs` | host fixture 组件构建 + `.initpkg` 内嵌 |
+
+执行域可移植性由 `tests/kcomp_heap` 与 `tests/kcomp_domain_service` 两个真实工件验证：前者覆盖 K/I 的 C/Rust 分配，后者通过相同 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，含跨页缓冲、嵌套、panic/stale 与循环重入。它们只验证堆和扁平服务，不代表 Isolated 硬件驱动或任务已可用。

@@ -367,6 +367,7 @@ pub(crate) mod test_support {
     /// 一份伪造的 loaded component（`.text` 段 64 字节；入口 = base + 8）。
     pub(crate) fn test_loaded(destroy: usize, service_dispatch: Option<usize>) -> LoadedComponent {
         LoadedComponent {
+            runtime_init: None,
             base: 0x1000,
             create: 0x1008,
             destroy,
@@ -387,6 +388,7 @@ pub(crate) mod test_support {
         let base = lease.region().base;
         let size = lease.region().size;
         LoadedComponent {
+            runtime_init: None,
             base,
             create: base + 8,
             destroy,

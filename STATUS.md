@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-04。此次接通 RV64 普通用户 task / AS / trap 与 POSIX fork / exec / wait，登记 CoreTest 和 FAT→ksh exec 验证；上游 libc-test 的宿主参考记录保留，glibc guest startup 仍未通过。
+更新：2026-10-04。此次接通 RV64 普通用户 task / AS / trap 与 POSIX fork / exec / wait，登记 CoreTest 和 FAT→ksh exec 验证；上游 libc-test 的宿主参考记录保留，glibc guest startup 仍未通过。 K/I 的 SDK 堆后端与双向服务 Gate 已接通，同一工件验证四种服务部署组合。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -172,25 +172,25 @@ Hardware                                    目前只有 QEMU virt
 
 现状：`ContractId` 加 exact ABI fingerprint 加 opaque `EndpointId`，绝不重定向；staged publish/lookup/discover/bind；bind 是 Core 选定机制的唯一选择点。host 覆盖 staged publication、abort 原子性、no-redirect、domain 矩阵、Gate/Direct 选择；CoreTest 有 scheduler/filesystem/driver 链；ArchTest 有 `isolated-service*`。
 
-ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 abi，只比 contract 与存活，交付 opaque capability。exact contract 加 abi 加存活的校验在 `kcore_endpoint_validate`（对已持有的 id，C ABI 可达，SDK `Endpoint<C>::from_id` 已接）和 `kcore_endpoint_bind`（第一步就走同一个 `EndpointRegistry::lookup`）。`deployment.md` §7.4/§11 仍写"consumer exact ABI 未做"，和 HEAD 代码冲突，见第 12 节。
+ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 abi，只比 contract 与存活，交付 opaque capability。exact contract 加 abi 加存活的校验在 `kcore_endpoint_validate`（对已持有的 id，C ABI 可达，SDK `Endpoint<C>::from_id` 已接）和 `kcore_endpoint_bind`（第一步就走同一个 `EndpointRegistry::lookup`）。`deployment.md` §7.4/§11 已同步这一落点，裸 lookup 只发现 id。
 
-缺口：跨域只有 KernelNative→IsolatedNative Gate 真正派发；出站 Isolated 与 Sandbox 组合显式拒绝。
+现有 K/I 矩阵均已派发：K/K Direct、K→I / I→K / I→I Gate。SDK `block.device` 同一工件验证；Sandbox 仍显式拒绝。
 
-下一步：把 `deployment.md` 的措辞收敛到代码，这不是代码缺口。新接口（NetDevice、Clock、RNG 等）都走同一条 bind 路径。
+下一步：新接口（NetDevice、Clock、RNG 等）继续走同一条 bind 路径；补齐各接口的扁平 wire adapter。
 
 #### 3.16 执行域 `▰▰▰▱▱` EXPERIMENTAL
 
-现状：`ExecutionDomain` 三个变体。KernelNative 完整并验证。IsolatedNative（S 加私有 AS）有真实的 create/destroy/service：私有 AS、共享 Core 映射（same VA→PA）、最小跨 AS trampoline（per-invocation context、satp 切换、全量 `sfence.vma`）、按域放段（页级权限）、Core 预置窗口、K→I service Gate、失败与重启清理。按验证层看是 PARTIALLY VALIDATED，能力止于 QEMU RV64+RV32 的 27 个 ArchTest case，不能再往上抬。
+现状：`ExecutionDomain` 三个变体。KernelNative 完整并验证。IsolatedNative（S 加私有 AS）有真实的 create/destroy/service：私有 AS、共享 Core 映射（same VA→PA）、最小跨 AS trampoline（per-invocation context、satp 切换、全量 `sfence.vma`）、按域放段（页级权限）、Core 预置窗口、K/I 双向 service Gate、失败与重启清理；SDK 在 create 前选择 K 共享堆 / I 私有堆，同一 `kcomp_heap.kcomp` 验证 Rust/C 分配、增长、精确 release、多实例与重启。按验证层看是 PARTIALLY VALIDATED，能力止于 QEMU RV64+RV32 的 29 个 ArchTest case，不能再往上抬。
 
-缺口：无 ASID（恒 0 加全量 flush）；无 U-mode/`ecall`，是协作式 S-mode 边界，不是对抗隔离；无出站 Isolated 调用；import 面只有诊断、只读查询加 `kcore_panic_escape`；不能 claim 设备、注册 IRQ/DMA、建任务、发布 endpoint；没有 I→I transport；没有压力或对抗测试。
+缺口：无 ASID（恒 0 加全量 flush）；无 U-mode/`ecall`，是协作式 S-mode 边界，不是对抗隔离；import 面支持诊断、只读查询、panic、私有 backing 与 endpoint 发布/发现/校验/绑定/调用；不能 claim 设备、注册 IRQ/DMA、建任务；没有压力或对抗测试；私有堆 backing 停止后驻留，自动回收仍需 drain / DMA 静默与 AS teardown。
 
-下一步：两条路选一条。继续补 ASID、U-mode、出站调用、更宽 import 面；或者明确冻结成教学实验，把资源投到 SandboxedNative 与真机。
+下一步：两条路选一条。继续补 ASID、U-mode、任务/设备 import 面；或者明确冻结成教学实验，把资源投到 SandboxedNative 与真机。
 
 #### 3.17 SandboxedNative（U-mode + syscall 边界） `▱▱▱▱▱` NOT IMPLEMENTED
 
 现状：Core `component/sandbox.rs` 已有 prepare_task / enter / 用户范围 copy 的声明与 Unsupported 占位，尚无执行机制。`load.rs` 的创建分派装载前返回 `SandboxUnsupported`（ABI `-ENOTSUP`），不创建实例、不回退 native；销毁入口仍未实现。没有 sandbox.kcomp。普通用户 task 已有单独的 kcore_user_* C ABI / U-mode 路径，不等于组件部署后端已实现。
 
-缺口：组件按域装载 / import、Core mechanism ecall SDK、私有 heap 与 destroy；普通程序的低特权执行 / trap / U 页表访问已有独立路径。
+缺口：组件按域装载 / import、Core mechanism ecall SDK 与 destroy；私有 allocator / runtime 选择可复用 Isolated 后端，但未接通 Sandbox 执行路径；普通程序的低特权执行 / trap / U 页表访问已有独立路径。
 
 下一步：复用已接通的普通用户 task / AS / trap / copy 机制，补组件按域装载与 Core ecall SDK。阶段依赖与验收见 `docs/development/userspace.md`。
 
@@ -220,7 +220,7 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 
 #### 3.20 SDK / C ABI / Rust ABI `▰▰▰▰▱` IMPLEMENTED
 
-现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；42 个 `kcore_*` 导出；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`。
+现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；60 个 `kcore_*` 导出；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
 
 缺口：没有 ABI 版本兼容，靠 exact fingerprint 加原地替换；组件外链只允许 `kcore_*`；SDK 刻意不朝 libc 或共享 runtime 扩张。
 
@@ -228,7 +228,7 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 
 #### 3.21 测试体系 `▰▰▰▰▱` IMPLEMENTED
 
-现状：host 单测含 proptest；CoreTest 是板内集成，RV64 双 CPU 为 56 项检查（bit 0 到 56，bit 23 未用），RV32 为原 49 项；ArchTest 41 个 case，每 case 独立 QEMU，其中 27 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
+现状：host 单测含 proptest；CoreTest 是板内集成，RV64 双 CPU 为 56 项检查（bit 0 到 56，bit 23 未用），RV32 为原 49 项；ArchTest 43 个 case，每 case 独立 QEMU，其中 29 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
 
 兼容性应用：`tests/compat/` 从 pinned `third_party/libc-test` 直接选择上游 source，
 13 项 ISO C 加 1 项纯计算在 Linux / Windows 共用，另有 2 项 Linux POSIX 文件测试。
@@ -375,12 +375,12 @@ shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动
 | Host 单测（Core truth / parser / property） | 是 | `make test-host`（`cargo test --workspace` 加 SDK/prober/kbench/ram_blk）；`kcomp_abi_drift.rs` |
 | CoreTest / QEMU RV64 / MMU / `default`+`no-block` | 是 | `make test-qemu` → `tests/qemu/runner.py` |
 | CoreTest / QEMU RV32 / MMU / `default`+`no-block` | 是 | 同上（`qemu_rv32_defconfig`） |
-| ArchTest / QEMU RV64 / MMU（41 case） | 是 | `make test-arch` → `tests/qemu/arch_runner.py` |
-| ArchTest / QEMU RV32 / MMU（41 case） | 是 | 同上 |
+| ArchTest / QEMU RV64 / MMU（43 case） | 是 | `make test-arch` → `tests/qemu/arch_runner.py` |
+| ArchTest / QEMU RV32 / MMU（43 case） | 是 | 同上 |
 | ArchTest / 新 ISA 骨架（opt-in） | 否 | `make test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`：镜像可构建（Core-only），boot 为 `todo!()`，用例现在会失败 |
 | ArchTest / SMP | 是 | `make test-arch-smp-rv64`：启动 / IPI / per-CPU；组件调度、远端 wake、双向 panic 在 CoreTest 的 `make test-qemu` 中验证 |
 | KernelNative（执行域） | 是 | CoreTest 全链加 ArchTest `panic-*` |
-| IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（27 case，RV64+RV32） |
+| IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（29 case，RV64+RV32） |
 | SandboxedNative（U-mode） | 否 | Core 骨架；create `-ENOTSUP`，U-mode / destroy 未实现，调用组合显式拒绝 |
 | RV32 / NoMMU | 仅配置解析 | `configs/qemu_rv32_nommu_defconfig` 只被 `tests/kconfig/test_glue.py` 解析；`make check` 的 `_test-build` 与所有 runner/CI 都不构建、不启动它 |
 | RV32 / M-mode（`PRIVILEGE_MACHINE`） | 否 | 仅可编译；无 defconfig；无 boot harness |
@@ -402,7 +402,7 @@ P0 地基（启动地址去硬编码、Sv39/Sv32 启动）                 —�
 P1 任务系统（context switch、调度执行链）                    —— 已完成
 P2 中断/驱动（timer 抢占 C5、设备·IRQ·DMA C6、第一个 driver）—— 部分：driver 已落地，抢占未接线
 P3 组件化进阶（区域分配 C7、域视图交付 C8、任务化组件 C9）    —— 部分：加载与生命周期已落地，只缺 `kcomp_task` 等
-P4 执行域/隔离（C10）                                        —— 部分：受限 IsolatedNative 已落地，ASID / U-mode / ecall / 出站 / SandboxedNative 未完成
+P4 执行域/隔离（C10）                                        —— 部分：受限 IsolatedNative 已落地，ASID / U-mode / ecall / Isolated 任务与设备 / SandboxedNative 未完成
 ```
 
 当前未完成项按依赖顺序排，前一项不成立，后一项无从谈起。
@@ -411,8 +411,8 @@ P4 执行域/隔离（C10）                                        —— 部�
 2. Task block/wake：permit 快速路径、阻塞后唤醒及 IRQ 恢复已接线并测试；下一步决定独立 trace 事件。等待条件与等待者列表留在组件。
 3. Task 与 AddressSpace：定义绑定语义，为将来的 POSIX "Process = AS + N Task" 铺路。
 4. 组件生命周期收敛：drain 协调协议，`kcomp_task`，卸载与重载的语义矩阵。
-5. IsolatedNative 收敛或冻结：补 ASID、U-mode、出站调用、更宽 import 面，或者明确冻结成教学实验。
-6. 消费路径 ABI 的文档收敛：代码侧没有缺口，`validate` 与 `bind` 都做 exact contract 加 abi 加存活，SDK 已接。要做的是把 `deployment.md` §7.4/§11 的"consumer exact ABI 未做"改到和代码一致，或明确声明 lookup 永远 contract-only。
+5. IsolatedNative 收敛或冻结：补 ASID、U-mode、任务/设备 import 面，或者明确冻结成教学实验。
+6. 消费路径 ABI 已收敛：`validate` 与 `bind` 都做 exact contract 加 abi 加存活，SDK 已接；lookup 保持 contract-only，文档与实现一致。
 7. RISC-V SMP 已接入真实组件任务调度，验证与职责见 §3.5 和 `docs/architecture/scheduling.md`。第二 ISA 暂不扩展；迁移 / work stealing / 抢占后置。
 
 三条贯穿约束（合并自原路线图 §3，仍在生效）：
@@ -858,7 +858,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；无 VFS、namespace、File service、两级缓存 |
 | D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit 路径已实现，但 host 调度集成测试因锁跨 schedule_next 失败；preemption（`on_timer_tick` 是 `todo!()` 且未接线）也缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | NOT-SATISFIED | POSIX 只有骨架；task↔AS、用户 trap 与阻塞完成协议尚未接线 |
-| F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | K→I Gate 已真实验证（ArchTest `isolated-service*`：自定义 contract 加测试 provider，Core 侧代登记 endpoint）；没有任何生产契约（`scheduler_rr`、`block.device`、filesystem）在 Isolated 上运行过；Isolated provider 不能自己 publish endpoint；资源型契约全被 `-ENOTSUP` 拒绝 |
+| F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的真实 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
 | H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | 两种 profile 都存在，但 NoMMU 从未被构建或启动；无 MCU 真机 |
 
@@ -866,7 +866,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 ## 11. 明确未做
 
-- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，组件 create `-ENOTSUP`；组件 import / Core ecall / heap / destroy 未实现。普通用户 task 的 U-mode / trap 单独已接通。NOT IMPLEMENTED / PLANNED。
+- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，组件 create `-ENOTSUP`；组件 import / Core ecall / destroy 未实现；私有 allocator / runtime 选择已有测试，尚未接到 Sandbox 执行路径。普通用户 task 的 U-mode / trap 单独已接通。NOT IMPLEMENTED / PLANNED。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
 - block/wake：任务 permit、owner、最终检查与 commit 已落地；CoreTest 覆盖本地与跨 CPU 唤醒。独立 TaskBlock / TaskWake trace、event / waitqueue、join / stop 未做。
 - SMP 基础已落地（RV64）：AP 启动、BootGate、Online、IPI、per-CPU scheduler / timer / containment、固定 CPU 的真实组件调度、跨 CPU wake 与 panic containment。复杂 SMP 调度（迁移 / work stealing / 抢占 / hotplug）与私有 AS 任务调度未做。SMP 不是构建开关，无 `smp` Cargo feature。
@@ -883,8 +883,8 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 
 只登记，不改写。
 
-- `docs/architecture/deployment.md` §7.4/§11 局部陈旧：仍把"consumer exact ABI（组合期）"标为未做。但 HEAD 的 `kcore_endpoint_bind` 第一步就走 contract 加 abi exact-match 的 `EndpointRegistry::lookup`，`kcore_endpoint_validate` 也已从 C ABI 可达（SDK 已接）。真正剩下的只是"`lookup` 发现路径不带 abi 参数"这个设计选择的措辞，`abi/core.toml` 和 `export.rs` 的 lookup 文档已自述不校验 abi，与代码一致。
+- `docs/architecture/deployment.md` §7.4/§11 的消费路径 ABI 陈旧描述已修正：裸 lookup 只发现 id，SDK 随后 validate，bind 再核对 exact ABI 与存活。
 - `docs/modules/components.md` 漏登记两个已在 `KCOMP_SRCS` 里的 fixture：`tests/kcomp_isolated_direct`、`tests/kcomp_isolated_unsupported`，全 `docs/` 没有引用。
 - `README.md` 目录说明列了 `components/drivers/ uart/ virtio_blk/ …`，但 `uart/` 不存在，`driver-model.md` §4 明说 uart 未实现；README 的 monitor 命令列表漏了 `unload` 和 `trace`，`docs/modules/core/monitor.md` 有。
-- 源码注释陈旧，不改 Core 代码：`os/core/src/component/endpoint.rs:234` 仍写 IsolatedNative"未实现：无私有 AS / `satp` 切换"，与已落地的私有 AS、trampoline、生命周期代码矛盾；`os/core/src/memory/address_space.rs:2030` 的"对应 roadmap 的 NoMMU 验收点"失去所指（路线图文档已删除，NoMMU 现状见 3.23 与第 7 节）。
-- 计数校验：CoreTest 在 RV64 双 CPU 上有 56 项 distinct 检查（bit 0 到 56，bit 23 未用）；RV32 保留 49 项。ArchTest 基线为 41 case，RV64 SMP 额外三个硬件契约 case。2026-09-27 的 `41/41` CoreTest 日志是旧快照。
+- 执行域注释已同步 K/I 双向 Gate；另有历史注释待处理：`os/core/src/memory/address_space.rs:2030` 的"对应 roadmap 的 NoMMU 验收点"失去所指（路线图文档已删除，NoMMU 现状见 3.23 与第 7 节）。
+- 计数校验：CoreTest 在 RV64 双 CPU 上有 56 项 distinct 检查（bit 0 到 56，bit 23 未用）；RV32 保留 49 项。ArchTest 基线为 43 case，RV64 SMP 额外三个硬件契约 case。2026-09-27 的 `41/41` CoreTest 日志是旧快照。

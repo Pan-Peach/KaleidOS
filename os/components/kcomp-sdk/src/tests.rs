@@ -50,7 +50,7 @@ fn lifecycle_entry_types_are_anchored() {
 #[test]
 fn kcomp_abi_fingerprint_is_anchored() {
     let abi = crate::abi::KCOMP_ABI;
-    assert_eq!(abi, 0x9D73_405B_B2F8_16C0);
+    assert_eq!(abi, 0x47AF_93E6_21B8_D054);
 }
 
 // ---------------------------------------------------------------------------

@@ -68,7 +68,7 @@ docs/
 | 组件生命周期、组件 ABI、组件身份（一个 `ComponentId` = 一个完整组件，`ComponentRecord` 直接拥有 `LoadedComponent`） | `architecture/component-lifecycle.md` | **已冻结**；与 `component-model.md` 冲突以它为准 |
 | 驱动、device claim、IRQ/DMA、执行域、teardown | `architecture/driver-model.md` | 驱动与执行域细节最终契约 |
 | 内存资源 vs 堆、region 归属（无账本）、执行域访问窗口、回收 | `architecture/memory-and-heap.md` | 内存/堆分层最终契约；访问窗口与 driver-model 的 device claim 同形 |
-| 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **补充** `component-lifecycle.md` §9"代码页去重不是 ABI / 生命周期承诺"的目标方向；KernelNative → Isolated 的 Gate 已落地，其余跨域机制未实现，见其 §10 |
+| 部署 → 调用机制、binding 作用域、模式矩阵、跨域可移植性 | `architecture/deployment.md` | **补充** `component-lifecycle.md` §9"代码页去重不是 ABI / 生命周期承诺"的目标方向；K/I 双向 Gate 已落地，Sandbox transport 未实现，见其 §10 |
 | 分层总览、ResourceDomain / ExecutionDomain 概念 | `architecture/overview.md` | 与 driver-model 细节冲突时以 driver-model 为准 |
 | 调度、Core / scheduler 分工、SMP 提交与 CPU 归属 | `architecture/scheduling.md` | 固定 CPU 的协作式组件任务调度契约 |
 | 构建配置（Kconfig / `.config`） | `architecture/kconfig.md` | 唯一配置真相的来源 |
@@ -93,7 +93,7 @@ docs/
 | 理解 SMP 调度与 scheduler / Core 分工 | `architecture/scheduling.md` + `modules/core/sched.md` |
 | 写一个驱动 / 认领设备 | `architecture/driver-model.md` + `modules/components.md` |
 | 理解内存与堆的边界（组件怎么拿内存） | `architecture/memory-and-heap.md` |
-| 理解部署如何决定调用机制、跨域调用现状（K→I 已落地，其余未实现） | `architecture/deployment.md` |
+| 理解部署如何决定调用机制、跨域调用现状（K/I 双向 Gate 已落地，Sandbox 未实现） | `architecture/deployment.md` |
 | 加载 / 停止一个组件 | `architecture/component-lifecycle.md` + `modules/core/component.md` |
 | 启动 shell / 查看 ksh 命令与限制 | `modules/ksh.md` |
 | 自动组合系统 / 根盘挂载 / 切回 monitor 启动 | `modules/init.md` |

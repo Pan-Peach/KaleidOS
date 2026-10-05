@@ -12,7 +12,7 @@ publish = false
 
 [features]
 default = []
-# opt-in：把组件的 GlobalAlloc adapter 挂到 Core 共享堆（无 per-component 堆）。
+# opt-in：启用 GlobalAlloc；Core 在 create 前选择共享堆或实例私有堆。
 # 非 alloc 组件保持精简，不拉入这条路径。
 alloc = []
 

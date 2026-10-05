@@ -40,7 +40,7 @@ static const struct kcomp_filesystem_api fatfs_api = {
     .read = fatfs_read,
 };
 
-const uint64_t kcomp_abi = UINT64_C(0x9D73405BB2F816C0);
+const uint64_t kcomp_abi = UINT64_C(0x47AF93E621B8D054);
 
 int32_t kcomp_instance_create(
     const struct KcompCreateArgs *args,

@@ -1,6 +1,6 @@
 /* kcomp_kalloc.h —— 私有执行域运行时堆的 C 接口（freestanding，无 libc）。
  *
- * **保留为未来 Isolated / Sandboxed 的私有分配器后端**（当前没有生产调用方）：
+ * Isolated 的私有分配器后端（Sandboxed 执行后端后置）：
  * KernelNative 组件与 Core 同特权、同地址空间，普通 malloc/free 直接走
  * `kcore_heap_alloc` / `kcore_heap_dealloc`（共享 Core 堆，契约 = Rust
  * `GlobalAlloc`）；私有执行域才在实例自己的可写 `.data` / `.bss` 里放本分配器。
@@ -9,7 +9,7 @@
  * 分配器实现是 **C**（`c/kalloc.c`），随每个 `.kcomp` 私有携带（"共享分配器
  * 实现代码，不是共享堆"）；Rust 侧 facade 见 `src/heap.rs`。
  *
- * 用法（未来私有域 bootstrap）：
+ * 用法（SDK 的 kcomp_heap_runtime.c 完成这些步骤）：
  *   region = kcore_memory_acquire(...)            // 先有 backing，才发布堆
  *   heap   = kcomp_heap_place(region.base, region.len, backing_fn)
  *   ptr    = kcomp_heap_alloc(heap, size, align)  // 普通 malloc 不再进 Core
@@ -22,8 +22,8 @@
  *     溢出与非 2 的幂 align 都在入口拒绝）。
  *   - `kcomp_heap_realloc` 失败返回 NULL 且**旧块原样保留**（旧指针仍可 free）；
  *     `size == 0` 视为失败（no-op），不释放旧块。
- *   - 只导出 `kcomp_heap_*`；**不**定义 malloc / free / calloc / realloc，
- *     避免与 `kcomp_rt.c` / picolibc 之类的提供者冲突。
+ *   - 此低层只定义 `kcomp_heap_*`；部署 adapter 在 kcomp_heap_runtime.c，
+ *     提供 weak malloc / free / calloc / realloc，不链接 host libc。
  *
  * v1 边界（明确记录，别当成 bug）：
  *   - **不支持 IRQ 上下文分配**：v1 无锁；将来若加单 CPU 自旋锁，中断里分配

@@ -30,8 +30,8 @@
 
 > **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
 > （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 最小跨 AS trampoline（共享 Core 映射） + 按域放段 +
-> Core 预置窗口 + KernelNative → Isolated 跨域 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
-> 证明）；**ASID / U-mode / `ecall` / 出站 Isolated 调用 / 更宽的按域 import 面仍未实现**（支持面 import 已落地），边界是
+> Core 预置窗口 + K/I 双向 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
+> 证明）；**ASID / U-mode / `ecall` / Isolated 任务与设备 import 面仍未实现**（支持面 import 已落地），边界是
 > 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。
 
 ---
@@ -122,12 +122,14 @@ int32_t kcomp_instance_create(const struct KcompCreateArgs *args, void **out_sta
 int32_t kcomp_instance_destroy(void *state);
 ```
 
+SDK 还可选导出 `kcomp_runtime_init(const struct kcomp_runtime *)`。Core 在业务 create 前以实例身份调用一次，交付部署后端：KernelNative 获得共享堆的窄 C alloc/dealloc 地址，私有域两项为零、使用镜像内分配器。失败按 create 失败收敛。描述符布局由 `abi/component.toml` 生成；没有堆的组件可省略入口，业务 create 签名不变。细节见 `memory-and-heap.md` §6.1。
+
 约定：
 - **返回值统一 `0 / -errno`**。**废弃**旧的"非零 = 失败 bitmap"约定（`kcomp_init` 的约定不继承）。
   组件侧不要手写 `const E*: i32`：Rust 用 `kcomp_sdk::Errno` / `Result<T>`，C 用 SDK 的
   `<errno.h>` shim（`return -ENODEV;`）。线格式仍是裸 `i32`（`0 / -errno`），类型只活在语言边界。
 - Core 把 `*out_state` 初始化为 `NULL`；成功时组件写入自己完成的 state 指针；**无状态组件可成功返回 NULL**。
-- 状态由该实例自己的分配器分配（**堆是 runtime / deployment 策略，不是 Core 资源、不是组件一等资源**；KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器）。Core 只存/传指针，不解释、不通用释放；组件身份是 `ComponentId` + `ComponentRecord.instance_state`，不与分配器 / runtime 状态合并。（分层与**无账本**契约见 `docs/architecture/memory-and-heap.md`：Core 不记 region owner，无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载；**不再有 per-instance runtime slot / runtime context**；backing 已由 `kcore_memory_acquire/release`（域视图）提供。）
+- 状态由该实例自己的分配器分配（**堆是 runtime / deployment 策略，不是 Core 资源、不是组件一等资源**；KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器）。Core 只存/传指针，不解释、不通用释放；组件身份是 `ComponentId` + `ComponentRecord.instance_state`，不与分配器 / runtime 状态合并。（分层与**无账本**契约见 `docs/architecture/memory-and-heap.md`：Core 不记 region owner，无隔离域不记归属、Isolated / Sandboxed 的归属由该实例的 AS / 页表承载；**不再有 per-instance runtime slot / ambient 堆指针**；backing 已由 `kcore_memory_acquire/release`（域视图）提供。）
 - `kcomp_abi` 是手工维护的精确契约指纹；**不加版本后缀、不做兼容协商、不自动生成哈希**。
 - **协调替换**：原地删除 `kcomp_init` / `kcomp_exit`，**不留 legacy fallback**（`AGENTS.md`：不保证陈旧 `.kcomp` 可加载）。
 

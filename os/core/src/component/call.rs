@@ -12,16 +12,12 @@
 //!   之下；panic 时 provider 标 `Failed`、endpoint 永久失效、inflight 归还，
 //!   caller 拿到 [`CallError::ProviderFailed`] 且 task 存活（绝不为 caller
 //!   `abort_current_task`）。
-//! - **IsolatedNative provider** → [`isolated_lifecycle::dispatch_service`]：caller
-//!   是 KernelNative，运行在共享 Core AS 里；共享 Core 映射让 caller 的
-//!   `KcompCallFrame` 与三个负载缓冲在 provider 的私有 AS 里**直接有效**
-//!   （same VA → same PA），因此描述符指针原样交给 dispatcher，provider 原地
-//!   读写 caller 缓冲——没有拷贝、没有中间页。
-//!   执行边界同形（provider principal / caller-task provenance / re-entry / 调度
-//!   门禁），真正的切换是跨 AS trampoline 的 `satp`；provider trap →
-//!   `Outcome::Faulted` → provider 逻辑死亡 + AS 退役 + 窗口归还。
-//! - **Sandboxed provider** → 显式拒绝（[`CallError::UnsupportedProviderDomain`]）；
-//!   **Isolated caller** → [`CallError::UnsupportedCallerDomain`]；**绝不静默降级**。
+//! - **IsolatedNative provider** → [`isolated_lifecycle::dispatch_service`]：在
+//!   私有 AS / 实例栈上运行 dispatcher，故障后只结束 provider。
+//! - **IsolatedNative caller** → `isolated_call`：验证并搬运扁平缓冲区，切到
+//!   Core 栈与 Core root 分派，返回后恢复 caller AS 并写回 output / status。
+//!   KernelNative caller 保留共享 Core 映射下的直接缓冲区路径。
+//! - **Sandboxed caller/provider** → 显式拒绝，U-mode/ecall transport 未实现。
 //!
 //! **诚实边界**：这条 Gate 是 Core 拥有的机制，**不是对抗隔离边界**——Isolated
 //! provider 与 Core 同特权级（S-mode，协作式），可以直接改 `satp` / 自己的映射；
@@ -109,16 +105,14 @@ pub enum CallError {
     /// Core 的调度路径经专用 PolicyCall 边界执行，组件不能把选中的调度算法当
     /// 普通服务跑 → `EPERM`。
     ReservedContract,
-    /// Core 无法分配 per-call service stack（`-ENOMEM`）：provider 入口从未执行，
+    /// Core 无法分配 service stack / transport buffer（`-ENOMEM`）：provider 入口从未执行，
     /// 传输失败，绝不写 `*out_status`。
     NoServiceStack,
     /// provider dispatcher 在 service 边界内 panic：provider 已被标记 `Failed`
     /// 且其全部 endpoint 永久失效；caller 存活且不变 → `EIO`。
     ProviderFailed,
-    /// **Isolated（非 KernelNative）caller 的出站调用**：跨 AS Gate 的**出站
-    /// 方向**未实现**（只落地了 KernelNative → Isolated 的入站方向）。
-    /// 显式拒绝 → `ENOTSUP`——绝不在 KernelNative 的 AS 里替 Isolated caller
-    /// 执行这次调用。
+    /// Caller 的执行后端不可用：Sandbox 尚未实现，或 Isolated 缺少真实
+    /// 私有 AS / 活动切换现场 → `ENOTSUP`，绝不回退到 native 调用。
     UnsupportedCallerDomain,
     /// provider 的执行域没有**已实现**的 dispatch 机制（今天只有 KernelNative
     /// 与 IsolatedNative 有；SandboxedNative provider 未实现）→ `ENOTSUP`。
@@ -186,6 +180,12 @@ fn prepare(
     // (4) inflight 记账门禁：只有 Ready provider 可以开始服务调用；拒绝
     //     （不在 Ready / 溢出 / 未知）统一映射成 EBUSY。此后任何提前返回
     //     都必须归还计数。
+    // Isolated has one private entry stack per instance. Serialize entry across
+    // CPUs as well as the same-CPU reentry check above; native providers have a
+    // separate Core-owned stack for each call and retain their existing behavior.
+    if domain == ExecutionDomain::IsolatedNative && components.active_calls(record.owner) != 0 {
+        return Err(CallError::ProviderBusy);
+    }
     components
         .begin_call(record.owner)
         .map_err(|_| CallError::ProviderBusy)?;
@@ -248,6 +248,15 @@ pub fn endpoint_call(
     // caller task 只作为 service 边界的**执行来源**（provenance）；它不是授权，
     // 也不会改写 caller 的任务归属。
     let caller_task = ambient.as_ref().and_then(|ctx| ctx.task);
+    if let Some(caller) = caller {
+        if crate::component::is_failed(caller) {
+            return Err(CallError::CallerFailed);
+        }
+        let domain = endpoint::instance_domain(&registry::get_registry().lock(), caller);
+        if domain == ExecutionDomain::IsolatedNative {
+            return super::isolated_call::call(caller, caller_task, id, method, &frame, out_status);
+        }
+    }
     dispatch(caller, caller_task, id, method, &frame, out_status)
 }
 
@@ -256,7 +265,7 @@ pub fn endpoint_call(
 /// caller / caller_task 作为显式参数：无 principal / 已 `Failed` 的 `EPERM` 门禁
 /// 因此可以脱离进程级边界栈直接测试（`RequestContext` 的 fallback 链由
 /// `resource::context` 自己的用例覆盖）。
-fn dispatch(
+pub(super) fn dispatch(
     caller: Option<ComponentId>,
     caller_task: Option<TaskId>,
     id: EndpointId,
@@ -270,11 +279,11 @@ fn dispatch(
         return Err(CallError::CallerFailed);
     }
 
-    // (1b) 部署域门禁：只有 KernelNative caller 有**已实现**的出站调用机制
-    //      （只落地了 KernelNative → Isolated 的入站方向）。Isolated
-    //      caller 的跨 AS Gate 需要 satp 切换——拒绝，绝不在共享内核 AS 里替它
-    //      执行（那会把跨域调用静默降级成 native）。
-    if !crate::component::is_kernel_native(caller) {
+    // Isolated callers reach this body only through the Core stack/root bridge.
+    // Sandboxed outbound transport needs U-mode/ecall and remains unsupported.
+    if endpoint::instance_domain(&registry::get_registry().lock(), caller)
+        == ExecutionDomain::SandboxedNative
+    {
         return Err(CallError::UnsupportedCallerDomain);
     }
 
@@ -899,31 +908,30 @@ mod tests {
         assert_eq!(out_status, 0, "失败调用不写 out_status");
     }
 
-    /// Isolated（非 KernelNative）caller 的**出站调用**被显式拒绝：跨 AS Gate 的
-    /// 出站方向未实现 → `ENOTSUP`，绝不在共享内核 AS 里替它执行。
+    /// Sandboxed caller 尚无 U-mode/ecall transport，必须在 dispatch 前拒绝。
     ///
     /// 门禁在 provider 解析 / inflight 记账**之前**，与其它 caller 门禁同序。
     #[test]
-    fn isolated_caller_is_rejected_before_any_dispatch() {
+    fn sandboxed_caller_is_rejected_before_any_dispatch() {
         let _serial = containment::test_boundary_lock();
         let _heap = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
         let provider = ready_provider(
-            b"call_isolated_provider",
+            b"call_sandboxed_provider",
             Some(dispatch_counting as *const () as usize),
             core::ptr::null_mut(),
         );
-        let endpoint = publish(provider, b"svc.isolated");
+        let endpoint = publish(provider, b"svc.sandboxed");
         let before = DISPATCH_CALLS.load(Ordering::SeqCst);
 
-        // Given：一个 Isolated 实例（Starting = 活实例，身份有效）。
-        let isolated = {
+        // Given：一个 Sandboxed 实例（Starting = 活实例，身份有效）。
+        let sandboxed = {
             let mut reg = registry::get_registry().lock();
             let id = reg
                 .declare(
-                    b"call_isolated_caller",
+                    b"call_sandboxed_caller",
                     crate::component::registry::test_support::test_loaded(0, None),
-                    ExecutionDomain::IsolatedNative,
+                    ExecutionDomain::SandboxedNative,
                 )
                 .unwrap();
             reg.resolve(id).unwrap();
@@ -934,7 +942,7 @@ mod tests {
         // When：它调用一个真实存活、Ready 的 provider。
         let mut out_status = 0i32;
         let error = dispatch(
-            Some(isolated),
+            Some(sandboxed),
             None,
             endpoint,
             0,
@@ -1446,6 +1454,45 @@ mod tests {
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
         assert_eq!(out_status, 0, "失败调用不写 out_status");
 
+        containment::enter_anchor();
+    }
+
+    #[test]
+    fn isolated_provider_cannot_enter_its_private_stack_concurrently() {
+        let _serial = containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let provider = ready_provider_in_domain(
+            b"call_isolated_busy_provider",
+            Some(dispatch_counting as *const () as usize),
+            core::ptr::null_mut(),
+            ExecutionDomain::IsolatedNative,
+        );
+        let endpoint = publish(provider, b"svc.isolated.busy");
+        // A call running on another CPU already owns the sole instance stack.
+        registry::get_registry()
+            .lock()
+            .begin_call(provider)
+            .unwrap();
+        enter_caller(52);
+        let mut status = 123;
+        assert_eq!(
+            endpoint_call(
+                endpoint,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+                &mut status
+            ),
+            Err(CallError::ProviderBusy)
+        );
+        assert_eq!(status, 123);
+        assert_eq!(registry::get_registry().lock().active_calls(provider), 1);
+        registry::get_registry().lock().finish_call(provider);
         containment::enter_anchor();
     }
 

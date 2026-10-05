@@ -5,6 +5,7 @@
 //! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
 
 pub mod abi;
+pub(crate) mod backing;
 pub mod call;
 pub mod containment;
 mod elf;
@@ -20,11 +21,11 @@ pub mod failure;
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
+mod isolated_call;
 /// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口，
 /// 经跨 AS trampoline 执行 `kcomp_instance_create` /
 /// `kcomp_instance_destroy`。无私有 AS backend 的构建显式拒绝，绝不降级。
-/// 同一模块还承载跨域 service dispatch（KernelNative caller → Isolated
-/// provider，经 caller 帧直接交付 + 跨 AS trampoline）。
+/// 同一模块还承载 Isolated provider 的跨 AS service dispatch。
 pub mod isolated_lifecycle;
 /// 按域装载：把一个已解析的 `.kcomp` 的段按页级权限放进实例的私有 AS。
 /// 由 `isolated_lifecycle` 调用。
@@ -55,7 +56,7 @@ pub fn may_run(id: ComponentId) -> bool {
 /// Core 真相查询：`id` 是否运行在 [`endpoint::ExecutionDomain::KernelNative`]。
 ///
 /// 只有 KernelNative 具备**已实现**的 Core ABI 资源 / 调用路径（MMIO、DMA、
-/// IRQ、任务、出站服务调用）。Isolated / Sandbox 的对应机制尚未实现，所有
+/// IRQ、任务）。Isolated 的堆和服务已走各自的后端；设备 / 任务对应机制尚未实现，
 /// acquiring 入口据此**显式拒绝**（`-ENOTSUP`），绝不静默跨域降级。
 ///
 /// 未声明的身份回退 `KernelNative`（`endpoint::instance_domain` 的既有防御

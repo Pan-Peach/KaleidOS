@@ -122,6 +122,27 @@ const _: () = {
 impl Context {
     /// 组装一次调用的上下文（调用者现场由汇编进入时填写）。
     pub const fn new(transition: Transition) -> Self {
+        Self::with_target(
+            transition.activation.satp(),
+            transition.entry,
+            transition.stack_top,
+            transition.interrupts_enabled,
+            [
+                transition.arg0,
+                transition.arg1,
+                transition.arg2,
+                transition.arg3,
+            ],
+        )
+    }
+
+    const fn with_target(
+        satp: usize,
+        entry: usize,
+        stack_top: usize,
+        interrupts_enabled: bool,
+        args: [usize; 4],
+    ) -> Self {
         Self {
             caller_ra: 0,
             caller_sp: 0,
@@ -130,14 +151,14 @@ impl Context {
             caller_s: [0; 12],
             caller_sstatus: 0,
             caller_satp: 0,
-            instance_satp: transition.activation.satp(),
-            entry: transition.entry,
-            stack_top: transition.stack_top,
-            interrupts: if transition.interrupts_enabled { 1 } else { 0 },
-            arg0: transition.arg0,
-            arg1: transition.arg1,
-            arg2: transition.arg2,
-            arg3: transition.arg3,
+            instance_satp: satp,
+            entry,
+            stack_top,
+            interrupts: if interrupts_enabled { 1 } else { 0 },
+            arg0: args[0],
+            arg1: args[1],
+            arg2: args[2],
+            arg3: args[3],
             result: 0,
             a0_result: 0,
         }
@@ -146,6 +167,14 @@ impl Context {
     /// 目标 AS 的预打包 satp（trap 路径归因比较用）。
     pub fn instance_satp(&self) -> usize {
         self.instance_satp
+    }
+
+    /// Prepare a synchronous callback into this invocation's suspended caller
+    /// address space. The new record and stack must be reachable in both roots.
+    /// Core uses this to leave an Isolated stack before dispatching an outbound
+    /// service call; the original invocation remains suspended.
+    pub fn return_call(&self, entry: usize, stack_top: usize, arg0: usize) -> Self {
+        Self::with_target(self.caller_satp, entry, stack_top, false, [arg0, 0, 0, 0])
     }
 }
 

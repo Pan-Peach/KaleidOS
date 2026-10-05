@@ -229,9 +229,9 @@ pub enum EndpointError {
 pub enum ExecutionDomain {
     /// 与 Core 同特权、同地址空间。
     KernelNative,
-    /// 同特权、私有地址空间（协作式，生命周期与 K→I Gate 已实现）。
+    /// 同特权、私有地址空间（协作式，生命周期与 K/I 双向 Gate 已实现）。
     IsolatedNative,
-    /// 低特权 + 私有地址空间（**未实现**：无 U-mode）。
+    /// 低特权 + 私有地址空间（组件执行后端尚未接线；普通用户任务另行实现）。
     SandboxedNative,
 }
 

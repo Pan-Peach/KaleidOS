@@ -4,7 +4,7 @@
 //! ```text
 //! .kcomp 字节
 //!   │  ElfObject::parse（复用 Core 私有 ELF API）
-//!   │  import 白名单检查（只放诊断 / 只读查询 + kcore_panic_escape；面外拒绝）
+//!   │  import 白名单检查（诊断 / 只读查询 / panic / 私有 backing；面外拒绝）
 //!   │  plan_sections：ALLOC 段 → 页对齐 VA + 权限（R+X / R / R+W），逐段独占页
 //!   │  loader::apply_relocations（同一份 RISC-V 重定位实现，按域 base 重算）
 //!   ▼
@@ -160,6 +160,7 @@ pub struct PlacedImage {
     create: usize,
     destroy: usize,
     service_dispatch: Option<usize>,
+    runtime_init: Option<usize>,
     text_size: usize,
     abi: u64,
     segments: Vec<PlacedSegment>,
@@ -241,6 +242,7 @@ impl PlacedImage {
             create: self.create,
             destroy: self.destroy,
             service_dispatch: self.service_dispatch,
+            runtime_init: self.runtime_init,
             text_size: self.text_size,
             abi: self.abi,
             memory: Some(self.region),
@@ -302,8 +304,8 @@ pub fn map_mappings(
 
 /// Isolated 组件允许的 import 白名单（**唯一**的支持面）。
 ///
-/// 只放**诊断 / 只读查询**与 `kcore_panic_escape`：Isolated 组件保持 S-mode，
-/// 直接调用 Core 代码（共享 Core 映射，`satp` 不切换）。内存 acquire/release、
+/// 支持**诊断 / 只读查询**、panic、私有 backing 与 endpoint 发布/发现/绑定/调用：
+/// Isolated 保持 S-mode；普通 Core 入口不切 root，出站 call 由 Core 桥接。
 /// **KernelNative 共享堆后端 `kcore_heap_alloc/dealloc`**、调度入口、组件创建、
 /// 设备 / DMA / IRQ 获取等**仍然显式拒绝**——它们需要 Core 侧的所有权 / 生命周期
 /// 裁决，或只是 KernelNative 受信部署形态的窄后端，不在本阶段的支持面内。
@@ -322,6 +324,13 @@ pub const SUPPORTED_IMPORTS: &[&[u8]] = &[
     b"kcore_task_count",
     b"kcore_component_count",
     b"kcore_panic_escape",
+    b"kcore_memory_acquire",
+    b"kcore_memory_release",
+    b"kcore_endpoint_publish",
+    b"kcore_endpoint_lookup",
+    b"kcore_endpoint_validate",
+    b"kcore_endpoint_bind",
+    b"kcore_endpoint_call",
 ];
 
 /// 该 UNDEF 符号是否是本阶段支持解析的 import（唯一判据）。
@@ -354,6 +363,9 @@ fn place_at(
     let symbol_table = object.symbol_table_index().map_err(elf_error)?;
     let service_dispatch =
         loader::symbol_offset(&object, symbol_table, b"kcomp_service_dispatch", STT_FUNC)
+            .map_err(IsolatedLoadError::Loader)?;
+    let runtime_symbol =
+        loader::symbol_offset(&object, symbol_table, b"kcomp_runtime_init", STT_FUNC)
             .map_err(IsolatedLoadError::Loader)?;
     let relocations = object.relocations().map_err(elf_error)?;
 
@@ -441,11 +453,21 @@ fn place_at(
         None => None,
     };
 
+    let runtime_init = match runtime_symbol {
+        Some(symbol) => {
+            let address = loader::resolve_symbol_address(&seg_place, base, symbol)
+                .map_err(IsolatedLoadError::Loader)?;
+            ensure_executable_entry(&segments, address)?;
+            Some(address)
+        }
+        None => None,
+    };
     Ok(PlacedImage {
         base,
         create,
         destroy,
         service_dispatch,
+        runtime_init,
         text_size: image_size,
         abi,
         segments,
@@ -648,7 +670,7 @@ mod tests {
 
     const ISOLATED_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated.kcomp"));
     const SVC_KCOMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kcomp_isolated_svc.kcomp"));
-    /// 支持面之外的 import 夹具（`kcore_memory_acquire`）。
+    /// 支持面之外的 import 夹具（`kcore_heap_alloc`）。
     const UNSUPPORTED_KCOMP: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
         "/kcomp_isolated_unsupported.kcomp"
@@ -805,7 +827,7 @@ mod tests {
         assert_eq!(
             place(UNSUPPORTED_KCOMP),
             Err(IsolatedLoadError::ImportsUnsupported),
-            "kcore_memory_acquire 必须被按域装载拒绝"
+            "kcore_heap_alloc 必须被按域装载拒绝"
         );
     }
 
@@ -827,13 +849,18 @@ mod tests {
             b"kcore_task_count",
             b"kcore_component_count",
             b"kcore_panic_escape",
+            b"kcore_memory_acquire",
+            b"kcore_memory_release",
+            b"kcore_endpoint_publish",
+            b"kcore_endpoint_lookup",
+            b"kcore_endpoint_validate",
+            b"kcore_endpoint_bind",
+            b"kcore_endpoint_call",
         ] {
             assert!(import_supported(name), "{name:?} must be supported");
         }
         for name in [
-            b"kcore_memory_acquire".as_slice(),
-            b"kcore_memory_release",
-            b"kcore_heap_alloc",
+            b"kcore_heap_alloc".as_slice(),
             b"kcore_heap_dealloc",
             b"kcore_sched_run",
             b"kcore_component_create",

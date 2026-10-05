@@ -183,6 +183,40 @@ impl KernelMappingPlan {
         })
     }
 
+    /// Original identity mappings covering an exact published allocation.
+    /// Reinstall these before removing the exclusion and returning the backing.
+    fn restoration(&self, extent: PhysicalRange) -> Result<Vec<Mapping>, PlanError> {
+        let index = self
+            .exclusions
+            .iter()
+            .position(|excluded| *excluded == extent)
+            .ok_or(PlanError::PrivateAliasesShared)?;
+        let end = extent
+            .base
+            .checked_add(extent.size)
+            .ok_or(PlanError::AddressOverflow)?;
+        // A shared alias must never reopen another still-private allocation,
+        // even if a caller has accidentally published overlapping exclusions.
+        if self.exclusions.iter().enumerate().any(|(i, other)| {
+            i != index && extent.base < other.base + other.size && other.base < end
+        }) {
+            return Err(PlanError::PrivateAliasesShared);
+        }
+        let mut mappings = Vec::new();
+        for entry in &self.entries {
+            if entry.class != MappingClass::SharedIdentity {
+                continue;
+            }
+            let pr = entry.mapping.physical_range;
+            let start = pr.base.max(extent.base);
+            let stop = (pr.base + pr.size).min(end);
+            if start < stop {
+                mappings.push(slice_identity_piece(entry.mapping, start, stop - start));
+            }
+        }
+        Ok(mappings)
+    }
+
     /// 生成要落进一个 Isolated AS 的共享映射集合：`SharedCore` / `Device` 原样，
     /// `SharedIdentity` 按已发布私有 extent **切段**（不覆盖任何私有字节）。
     pub fn shared_mappings(&self) -> Vec<Mapping> {
@@ -269,11 +303,31 @@ pub fn shared_mappings() -> Vec<Mapping> {
         .unwrap_or_default()
 }
 
+/// Keep root construction in the same transaction as backing publication and
+/// release. A snapshot installed later could otherwise restore a stale alias.
+#[cfg(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+))]
+pub(crate) fn with_shared_mappings<T>(build: impl FnOnce(Vec<Mapping>) -> T) -> T {
+    let slot = PLAN.lock();
+    let shared = slot
+        .as_ref()
+        .map(KernelMappingPlan::shared_mappings)
+        .unwrap_or_default();
+    let result = build(shared);
+    drop(slot);
+    result
+}
+
 /// **私有 backing 别名排除事务**：把一个刚分配、即将发布为组件私有的物理
 /// extent 从**所有**已存在的 Isolated root 的 identity 映射里摘掉，并登记为
 /// 后续 root 的排除项。
 ///
-/// 调用方必须在把 backing 映射进实例 AS **之前**调用；同时必须在 Core root 的
+/// 调用方必须在把 backing 交付给组件**之前**调用；同时必须在 Core root 的
 /// 视图里保留该 backing（loader / 拷贝 / 清理仍要访问）。
 ///
 /// 语义：创建 B 之后，早先创建的 A **不能**再经它先前装上的 identity 映射
@@ -283,16 +337,33 @@ pub fn publish_private_backing(
 ) -> Result<(), super::address_space::MapError> {
     use super::address_space::{self, MapError};
     let granule = super::ALLOC_GRANULE;
-    {
-        let mut slot = PLAN.lock();
-        if let Some(plan) = slot.as_mut() {
-            plan.exclude(extent, granule)
-                .map_err(|_| MapError::Unaligned)?;
-        }
-        // 没有安装计划（host / 未交棒）：没有共享 identity 映射可摘；
-        // 私有 backing 仍由该实例的页表承载。
+    let mut slot = PLAN.lock();
+    if let Some(plan) = slot.as_mut() {
+        plan.exclude(extent, granule)
+            .map_err(|_| MapError::Unaligned)?;
     }
-    address_space::exclude_identity_alias_from_live_spaces(extent)
+    // Lock order is PLAN → SPACES, shared by root construction and release.
+    let result = address_space::exclude_identity_alias_from_live_spaces(extent);
+    drop(slot);
+    result
+}
+
+/// An explicit release has ended the private mapping's lifetime. Restore
+/// shared aliases before returning its physical extent to the global allocator.
+/// On error the caller must retain the backing; it is never safe to guess.
+pub fn release_private_backing(
+    extent: PhysicalRange,
+) -> Result<(), super::address_space::MapError> {
+    use super::address_space::{self, MapError};
+    let mut slot = PLAN.lock();
+    if let Some(plan) = slot.as_mut() {
+        let mappings = plan.restoration(extent).map_err(|_| MapError::NotMapped)?;
+        for mapping in mappings {
+            address_space::restore_identity_alias_to_live_spaces(mapping)?;
+        }
+        plan.exclusions.retain(|excluded| *excluded != extent);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,6 +379,73 @@ mod tests {
             physical_range: PhysicalRange { base: pa, size },
             permission: MappingPermission::READ | MappingPermission::WRITE,
         }
+    }
+
+    #[test]
+    fn restoration_uses_exact_extent_and_keeps_sibling_excluded() {
+        let mut plan = KernelMappingPlan::empty();
+        plan.add(
+            MappingClass::SharedIdentity,
+            mapping(0x8000, 0x8000, 4 * PAGE),
+            PAGE,
+        )
+        .unwrap();
+        let first = PhysicalRange {
+            base: 0x8000,
+            size: PAGE,
+        };
+        let second = PhysicalRange {
+            base: 0xa000,
+            size: PAGE,
+        };
+        plan.exclude(first, PAGE).unwrap();
+        plan.exclude(second, PAGE).unwrap();
+        assert!(
+            plan.restoration(PhysicalRange {
+                base: 0x8000,
+                size: 2 * PAGE
+            })
+            .is_err()
+        );
+        assert_eq!(
+            plan.restoration(first).unwrap(),
+            alloc::vec![mapping(0x8000, 0x8000, PAGE)]
+        );
+        plan.exclusions.retain(|extent| *extent != first);
+        assert!(!plan.is_excluded(first));
+        assert!(plan.is_excluded(second));
+        assert!(
+            plan.shared_mappings()
+                .iter()
+                .any(|m| m.virtual_range.base == first.base)
+        );
+        assert!(!plan.shared_mappings().iter().any(|m| {
+            m.virtual_range.base <= second.base
+                && second.base < m.virtual_range.base + m.virtual_range.size
+        }));
+    }
+
+    #[test]
+    fn restoration_cannot_reopen_overlapping_private_backing() {
+        let mut plan = KernelMappingPlan::empty();
+        let extent = PhysicalRange {
+            base: 0x8000,
+            size: 2 * PAGE,
+        };
+        plan.exclude(extent, PAGE).unwrap();
+        plan.exclude(
+            PhysicalRange {
+                base: 0x9000,
+                size: PAGE,
+            },
+            PAGE,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.restoration(extent),
+            Err(PlanError::PrivateAliasesShared)
+        );
+        assert!(plan.is_excluded(extent));
     }
 
     #[test]

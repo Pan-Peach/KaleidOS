@@ -34,11 +34,11 @@ BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）�
 - **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
 - **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
 - **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。用 `BlockDeviceService` 发布的 provider 由 SDK 统一挡下（provider 不会被调用）；手写 table 的 provider 需自行保证同语义。
-- **buffer（临时契约）**：`buf` 是裸指针，实现要求它指向 **Core 可见 RAM**（v1 无 IOMMU：设备地址 == 物理地址 == 虚拟地址）。
+- **buffer**：Direct 接口的 `buf` 指向 Core 可见 RAM；Gate 前端接受 caller 本域切片，Isolated 出站由 Core 搬运为共享 Core 缓冲，provider 只在同步调用内借用。
 
 # `buf` 裸指针是刻意的临时选择（不是最终设计）
 
-按 AGENTS.md，"裸指针只来自 Core 派生并持有 provenance 的 typed Lease"——裸指针本身不是 authority。这里直接收裸指针，是因为 consumer 侧"分配 DMA-able 内存"的窄接口**尚不存在**，v1 只有这一种可行形状。**一旦出现跨执行域的调用方，该参数必须换成 Core 派生的 DMA lease / handle**（那时裸地址不再能证明 buffer 归属与设备可达性）；在那之前它只是暂时够用。
+裸指针只是本次调用的访问表示，不是内存 authority。跨 AS 的 Gate 不把 caller 私有指针交给 provider，而由 Core 搬运扁平输入/输出字节。此 CPU transport 不构成 DMA mapping 或 DMA 静默证明；硬件 provider 仍须用 Core 的 DMA allocation/mapping 机制管理设备可达 backing，不能保留调用缓冲。
 
 契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size / ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。
 """

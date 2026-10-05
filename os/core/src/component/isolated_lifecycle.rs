@@ -19,7 +19,7 @@
 //! 且 writable image state 回到 artifact 初始状态。同一 artifact
 //! 可以并发存在多个组件（各自私有 AS + backing）。
 //!
-//! service dispatch（KernelNative caller → Isolated provider）
+//! service dispatch（Core gate → Isolated provider）
 //!   └─ dispatch_service(...)：结构 sanity（长度非零时指针不得为空）→
 //!      `with_isolated_service_boundary` 包住 `enter` → caller 帧（共享 Core
 //!      映射，same VA → same PA）**直接**交给 provider，原地读写；Faulted 时
@@ -34,24 +34,20 @@
 //! - **组件提议**：`kcomp_instance_create` 返回的 opaque state（Core 只存）与其
 //!   内部行为；`kcomp_instance_destroy` 自行收尾。
 //!
-//! # 内存路径：窄 import 面 + Core 预置窗口
+//! # Core ABI 与服务传输
 //!
-//! Isolated 组件保持 S-mode，Core 代码 / 栈 / 全局状态在每个 Isolated AS 里
-//! same VA → same PA，因此 **Isolated → Core 是普通直接调用**（`satp` 不切换）；
-//! 装载前的 import 白名单只放诊断 / 只读查询与 `kcore_panic_escape`
-//! （[`isolated_load::SUPPORTED_IMPORTS`]），其余具名 UNDEF 显式拒绝。
-//! 跨域 service 调用仍由 **Core 主动发起**，provider 不需要回调 Core。create 的
-//! 交付面是 Core 预置的**实例内存窗口**（[`ISOLATED_WINDOW_BASE`]：Core backing、
-//! 零初始化、只映射在该实例私有 AS），交付 create args / out_state；
-//! 窗口表示是**实例内 VA**（归属由该实例页表承载，Core 不另立账本），
-//! 同一 VA 在别的实例 AS 里没有任何映射。
+//! Isolated 的诊断、只读查询、panic、私有 backing 与 endpoint imports 解析到
+//! 共享 Core 代码。publish / lookup / validate / bind 在当前实例 root 上调用；
+//! Core 只存 opaque provider 指针，跨域绑定不交付 Direct table。
 //!
-//! service dispatch 的帧**没有中间页**：caller 是 KernelNative，运行在共享 Core
-//! AS 里；共享 Core 映射让 caller 的 `KcompCallFrame` 与三个负载缓冲在 provider
-//! 的 AS 里**直接有效**（same VA → same PA），因此 Core 把描述符指针原样交给
-//! dispatcher，provider 原地读写 caller 缓冲。真正的跨组件 transport 是未来
-//! **Isolated A → Isolated B** 的问题（A 的私有 VA 在 B 的 AS 里不可达），
-//! 本阶段不实现、也不预置机制。
+//! KernelNative caller 的帧与缓冲由共享 Core 映射直接交付，保持原地读写。
+//! Isolated caller 的出站路径在 `isolated_call`：检查私有缓冲的页表权限、拷贝
+//! 扁平字节缓冲、切到独立 Core 栈与挂起的 Core root，随后走同一 provider
+//! 分派。返回后恢复 caller root，再写回 output / status。Core 不解释 payload，
+//! 不翻译嵌套指针，provider 不能保留本次帧的借用。
+//!
+//! create 仍通过预置实例窗口交付 config / out_state；窗口与动态堆 backing
+//! 的归属由实例 AS 承载，不另立堆对象账本。
 //!
 //! 窗口布局（**Core 内部**；组件只用 Core 经 `a0` .. `a3` 交给它的实例内
 //! VA，不需要知道偏移）：
@@ -62,6 +58,7 @@
 //! +64   config 负载拷贝（≤ WINDOW_CONFIG_MAX 字节）
 //! +320  本窗口的**域视图编码**（`kcore_memory_view`：kind = LOCAL_VA、
 //!       base = 本实例窗口 VA、len = 窗口长度）
+//! +352  可选 runtime 初始化的部署描述符（业务 create 前调用）
 //! ```
 //!
 //! # 失败 / 重启矩阵
@@ -83,13 +80,10 @@
 //!
 //! # 明确不做（当前边界）
 //!
-//! Isolated provider **不能自己 publish endpoint**：import 白名单只放诊断 / 只读
-//! 查询与 `kcore_panic_escape`，endpoint 真相仍由 Core 拥有；出站 Isolated caller
-//! 继续显式拒绝。destroy 后不做物理回收（窗口 / backing 驻留）。ASID 恒 0 + 全量
-//! `sfence.vma`；没有 U-mode / `ecall`。没有跨组件 transport（I→I 未实现）。
-//! **组件内 Rust `panic!` 经 `kcore_panic_escape` 逃逸**（跨 AS 现场 →
-//! trampoline 交回挂起的 Core 调用者，`Outcome::Faulted` 由调用方边界清理）；
-//! 组件没有其他 Core import 面，真正的强制边界仍是 U-mode（未实现）。
+//! Isolated 任务、设备 / DMA / IRQ 与 Sandboxed 执行器仍未接线。destroy 后
+//! 不做物理回收；ASID 恒 0 + 全量 `sfence.vma`，没有 U-mode / `ecall`。
+//! Isolated panic 通过活动跨 AS 现场交回 Core；出站桥接期间挂起 caller 的
+//! 逃逸现场，确保 native provider panic 由它自己的 service guard 收敛。
 //!
 //! # 诚实边界
 //!
@@ -144,6 +138,8 @@ pub const WINDOW_CONFIG_MAX: usize = 256;
 /// `base = ISOLATED_WINDOW_BASE`、`len = ISOLATED_WINDOW_SIZE`。表示是**实例内
 /// VA**（与域视图契约同形）；不会出现物理地址或 Core 私有 VA。
 pub const WINDOW_VIEW_OFF: usize = 320;
+/// Runtime deployment descriptor, kept apart from business config and reports.
+pub const WINDOW_RUNTIME_OFF: usize = 352;
 
 // 布局不变量（与上面的偏移常量放在一起，单一维护点）：
 // - 镜像窗口（开区间结束）== 栈基址；栈与窗口不重叠；
@@ -156,14 +152,17 @@ const _: () = {
     assert!(WINDOW_ARGS_OFF + core::mem::size_of::<KcompCreateArgs>() <= WINDOW_OUT_STATE_OFF);
     assert!(WINDOW_OUT_STATE_OFF + core::mem::size_of::<usize>() <= WINDOW_CONFIG_OFF);
     assert!(WINDOW_CONFIG_OFF + WINDOW_CONFIG_MAX <= WINDOW_VIEW_OFF);
-    assert!(WINDOW_VIEW_OFF + core::mem::size_of::<MemoryView>() <= ISOLATED_WINDOW_SIZE);
+    assert!(WINDOW_VIEW_OFF + core::mem::size_of::<MemoryView>() <= WINDOW_RUNTIME_OFF);
+    assert!(
+        WINDOW_RUNTIME_OFF + core::mem::size_of::<crate::generated::abi::KcompRuntime>() <= 512
+    );
 };
 
 /// 本实例窗口的**域视图编码**：Core 预交付给实例的那份 `kcore_memory_view`。
 ///
 /// `kind = LOCAL_VA`（表示是实例内 VA）、`base/len` = 本实例窗口；绝不出现物理
-/// 地址 / Core 私有 VA。它是 Core 预交付的记录；可调用的 `kcore_memory_acquire`
-/// 面不存在。
+/// 地址 / Core 私有 VA。它是 Core 预交付的记录；额外动态 backing 通过
+/// `kcore_memory_acquire` 获取。
 pub fn window_view() -> MemoryView {
     MemoryView {
         kind: KCORE_MEMORY_VIEW_LOCAL_VA,
@@ -275,6 +274,49 @@ mod imp {
             return Err(fail_with_as(id, handle, error));
         }
 
+        // Initialize the SDK inside the instance AS, before business create.
+        // No shared-heap address is delivered to a private deployment.
+        let runtime_entry = registry::get_registry()
+            .lock()
+            .get(id)
+            .unwrap()
+            .loaded
+            .runtime_init;
+        if let Some(entry) = runtime_entry {
+            let runtime =
+                crate::component::export::runtime_backend(ExecutionDomain::IsolatedNative);
+            // SAFETY: the descriptor fits in the Core-owned ABI window.
+            unsafe {
+                ((window_backing + WINDOW_RUNTIME_OFF) as *mut crate::generated::abi::KcompRuntime)
+                    .write(runtime);
+            }
+            isolated::install();
+            let prepared = isolated::prepare(
+                handle,
+                entry,
+                stack_range(),
+                true,
+                isolated::EntryArgs::pair(window.base + WINDOW_RUNTIME_OFF, 0),
+            )
+            .map_err(|error| fail_with_as(id, handle, map_prepare_error(error)))?;
+            let outcome = load::with_current(id, || {
+                containment::with_isolated_create_boundary(id, || isolated::enter(prepared))
+            });
+            match outcome {
+                Outcome::Returned(0) => {}
+                Outcome::Returned(code) => {
+                    return Err(fail_with_as(
+                        id,
+                        handle,
+                        ComponentLoadError::CreateFailed(code as u32 as i32),
+                    ));
+                }
+                Outcome::Faulted => {
+                    return Err(fail_with_as(id, handle, ComponentLoadError::CreateFaulted));
+                }
+            }
+        }
+
         // (7) Core 验证入口 / 栈（持锁阶段，返回后不持锁）。先把普通 trap 路径
         //     的异常钩子接到 Core：**没有显式策略就是 Abandon**（组件身份本身
         //     不是可恢复的证明），create 里的故障因此收敛成 `Outcome::Faulted`
@@ -310,8 +352,7 @@ mod imp {
                 {
                     return Err(fail_with_as(id, handle, ComponentLoadError::StartFailed));
                 }
-                // create 成功：原子提交 pending endpoints（Isolated 当前没有 import
-                // 面，因此不会真有 pending；路径与 KernelNative 保持一致）。
+                // create 成功：原子提交通过相同 endpoint ABI 发布的 pending endpoints。
                 let commit = {
                     let reg = registry::get_registry().lock();
                     endpoint::get_endpoints().lock().commit_pending(&reg, id)
@@ -397,44 +438,12 @@ mod imp {
         outcome
     }
 
-    /// 跨域 service dispatch：KernelNative caller → Isolated provider。
+    /// 在 provider 私有 AS 中运行 dispatcher。frame / buffers 此时均位于
+    /// 共享 Core 映射：K caller 直接交付，I caller 由 `isolated_call` 搬运。
+    /// provider status 与传输状态分离；panic / fault 只使 provider 失败。
     ///
-    /// 顺序（**Core 验证 vs 组件提议**）：
-    ///
-    /// 1. **Core 验证帧**：结构 sanity（长度非零时指针不得为空）；
-    /// 2. **Core 验证入口 / 栈**（[`isolated::prepare`]：入口必须落在可执行
-    ///    映射、栈被单条 R|W 映射覆盖）；
-    /// 3. **边界 + 进入**：[`containment::with_isolated_service_boundary`] 装上
-    ///    provider principal / caller-task provenance / re-entry / 调度门禁，然后
-    ///    [`isolated::enter`] 把组件切进它自己的 AS；组件故障由**普通** trap
-    ///    路径收敛（无显式策略 = `Abandon`）；
-    /// 4. **传输**：caller 是 KernelNative，运行在共享 Core AS 里；Core 代码 /
-    ///    栈 / 全局状态在每个 Isolated AS 里 same VA → same PA，因此 caller 的
-    ///    `KcompCallFrame` 与三个负载缓冲在 provider 的 AS 里**直接有效**——
-    ///    描述符指针原样交给 dispatcher，provider 原地读写 caller 缓冲，没有
-    ///    拷贝、没有中间页。provider 返回值 = **方法状态**写 `*out_status`，
-    ///    传输保持 `Ok`。
-    ///
-    /// provider 故障（`Outcome::Faulted`）或 Core 无法准备切换：provider 逻辑死亡、
-    /// AS 退役、Core 预置窗口归还（与 create 失败同一套清理），caller 拿到
-    /// [`CallError::ProviderFailed`]（EIO），**caller 的 task 存活且不变**。
-    ///
-    /// # 传输边界（诚实）
-    ///
-    /// 这不是"零拷贝传输"的完整答案：真正需要 transport 的是未来
-    /// **Isolated A → Isolated B**（A 的私有 VA 在 B 的 AS 里不可达，必须
-    /// copy / 共享 transport buffer / 临时映射）。当前只有 KernelNative →
-    /// Isolated 一条已实现路径，因此没有中间缓冲；I→I 落地时再按需重建。
-    ///
-    /// # 栈（为什么这里没有 per-call 新栈）
-    ///
-    /// provider 跑在该实例 **Core 预置的组件栈**（[`stack_range`]；Core-owned
-    /// backing、只映射在该实例的私有 AS 里）上，与同域 service 边界的 per-call 栈
-    /// 目的相同、手段不同：同域栈要解决"共享 AS 里不能踩 caller 的栈"，跨 AS 的
-    /// 隔离由页表承担（provider 看不到别的实例的私有映射）。调用是**同步且串行**
-    /// 的——单 CPU、`prepare` 的 re-entry 门禁、且 Isolated provider 没有出站调用
-    /// import 面（不能嵌套回调自己）——因此复用实例栈安全；故障时实例被放弃、
-    /// AS 退役，栈不再被进入。
+    /// 复用实例的 Core-owned 私有栈：同步、不可调度，prepare 的调用链门禁
+    /// 拒绝 A→B→A 重入。所有 Core 锁都在进入 provider 之前释放。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_service(
         provider: ComponentId,
@@ -626,8 +635,10 @@ mod imp {
     /// 解映射并归还 Core 预置窗口（best effort：状态提交不因回收失败而回滚）。
     fn release_instance_windows(handle: AddressSpaceHandle) {
         for range in [stack_range(), window_range()] {
-            if let Ok(Some(mapping)) = address_space::mapping_exact(handle, &range) {
-                let _ = address_space::unmap(handle, &range);
+            if let Ok(Some(mapping)) = address_space::mapping_exact(handle, &range)
+                && address_space::unmap(handle, &range).is_ok()
+                && memory::kernel_mappings::release_private_backing(mapping.physical_range).is_ok()
+            {
                 let _ = memory::free_region_raw(
                     mapping.physical_range.base,
                     mapping.physical_range.size,

@@ -48,6 +48,8 @@ ARCH_CONF = {
 
 # (case name, expected scause, required serial substring)
 CASES = (
+    ("isolated-heap", None, "isolated-heap: same artifact K/I"),
+    ("isolated-domain-service", None, "isolated-domain-service: K/K K/I I/K I/I"),
     ("mapping", None, None),
     ("context-switch", None, None),
     ("panic-containment", None, None),

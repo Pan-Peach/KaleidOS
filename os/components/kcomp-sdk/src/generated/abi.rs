@@ -9,6 +9,27 @@ pub enum InterfaceKind {
     Policy = 2,
 }
 
+/// Core 在业务 create 前交付的部署后端；只在初始化调用期间借用。
+/// domain 使用 ExecutionDomain 的整数编码。仅 KernelNative 交付共享堆的
+/// 窄 C ABI 地址（alloc(size, align)，dealloc(ptr, size, align)）；私有域两个地址
+/// 必须为零，SDK 使用镜像内的私有分配器。不是分配器内部状态或跨域权限。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcompRuntime {
+    pub domain: u32,
+    pub reserved: u32,
+    pub heap_alloc: usize,
+    pub heap_dealloc: usize,
+}
+
+const _: () = {
+    if core::mem::size_of::<usize>() == 8 {
+        assert!(core::mem::size_of::<KcompRuntime>() == 24);
+    } else {
+        assert!(core::mem::size_of::<KcompRuntime>() == 16);
+    }
+};
+
 /// `kcomp_instance_create` 的参数：仅在调用期间借用。
 /// `config` 必须拷贝后才能持久化；Core 视其为不透明字节。
 #[repr(C)]
@@ -63,6 +84,11 @@ const _: () = {
 /// 边界，**不是**来自 `arg`。
 pub type KcompTaskEntry = extern "C" fn(arg: *mut ());
 
+/// 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
+/// 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
+/// 组件业务不判断执行域；不携带 SDK 的无堆组件可省略此入口。
+pub type KcompRuntimeInit = extern "C" fn(runtime: *const KcompRuntime) -> i32;
+
 /// 组件实例创建入口（组件导出，Core 调用）。返回 0 / `-errno`。
 /// Core 调用前把 `*out_state` 初始化为 NULL；成功时组件写入自己完成的 state 指针，
 /// **无状态组件可以成功返回 NULL**（保持 NULL）。失败 / panic 走 Core 的 Failed
@@ -91,7 +117,7 @@ pub type KcompServiceDispatch = extern "C" fn(
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0x9D73_405B_B2F8_16C0;
+pub const KCOMP_ABI: u64 = 0x47AF_93E6_21B8_D054;
 
 /// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
 #[repr(u32)]
@@ -370,6 +396,8 @@ unsafe extern "C" {
     /// backing 粒度由 Core 决定，今天最小 4 KiB）。首次交付**零初始化**。
     /// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
     /// （`base` / `len`）就是身份；释放凭同一个 view 走 `kcore_memory_release`。
+    /// KernelNative 返回共享 AS 的 VA；Isolated 映射进调用实例的私有 AS，归属由映射
+    /// 承载，不另立账本。Sandboxed 的原生直调入口返回 ENOTSUP（ecall 后端尚未接线）。
     /// 成功 = `0`（view 写入 `*out_view`）；失败 = `-Errno`（`EFAULT` out 为空 /
     /// `EINVAL` size/align 非法 / `EOVERFLOW` `min_len` 超出本域指针宽 /
     /// `ENOMEM` 物理内存耗尽）。
@@ -379,6 +407,8 @@ unsafe extern "C" {
     ///
     /// KernelNative 是**受信操作**（不校验归属、无账本），`(base, len)` 必须与 acquire
     /// 交付的 view 完全一致。成功 = `0`；
+    /// Isolated 只接受动态 backing 窗口内的精确映射；先 unmap、恢复共享 identity 别名，
+    /// 再归还 physical extent。调用方保证无任务、回调或 DMA 继续借用；不接受 image/stack。
     /// 失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法、`reserved` 非 0，
     /// 或 `(base, len)` 不是一次 acquire 产物的形状）。
     #[link_name = "kcore_memory_release"]
@@ -639,20 +669,22 @@ unsafe extern "C" {
     /// （发现路径只校验 contract + 存活；abi 由 `kcore_endpoint_validate` 核对；
     /// **调用只重新校验存活**）；`method` / `port` 语义由 provider 定义，Core 从不解释。
     /// `args` / `input` / `output` 是调用方的内存，只在本次调用期间借用：Core 只做
-    /// 结构校验（长度非零时指针不得为空），**不解析其中的字节**。
+    /// 结构校验；Isolated 出站另检查页表权限并搬运三个扁平字节缓冲，返回后写回 output。
+    /// **不解析 payload，不翻译嵌套指针，provider 不得保留本次借用**。
     /// provider = 当前 provider 实例：Core 校验其 `Ready` 并记 inflight；provider 停止 /
     /// 失败后 endpoint 永久死亡，绝不重定向到新实例。
     /// **保留契约**：`SchedulerPolicy`（`scheduler.policy`）的 endpoint 不得经本入口调用
     /// （`-EPERM`）——调度策略只能由 Core 的调度路径经专用 PolicyCall 边界执行，
     /// 组件不能把选中的调度算法当普通服务跑。
-    /// **执行边界已落地**：dispatcher 跑在 Core 拥有的 per-call service stack 上、处于
-    /// provider principal 之下，带 re-entry 检测与 provider panic containment（见
+    /// **执行边界**：KernelNative provider 跑在 Core root / per-call service stack，
+    /// Isolated provider 跑在私有 root / 实例栈。Isolated caller 通过 Core 栈与 root 桥接。
+    /// provider principal、re-entry 检测与 provider panic containment 均由 Core 拥有（见
     /// `component/call.rs` 模块文档）。
     /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`（`EFAULT`
     /// `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或 caller 已
     /// `Failed`；`ENOENT` endpoint 未发布或已死；`ENODEV` owner / image 已不存在；
     /// `EBUSY` provider 不在 `Ready`、inflight 溢出或重入；`EINVAL` 调用链上有 IRQ
-    /// 作用域；`ENOMEM` Core 无法分配 service stack；`EIO` provider 在边界内 panic
+    /// 作用域；`ENOMEM` Core 无法分配 service stack / transport buffer；`EIO` provider 在边界内 panic
     /// （已被标记 `Failed`，caller 存活）；`ENOSYS` image 没有 `kcomp_service_dispatch`）。
     #[link_name = "kcore_endpoint_call"]
     pub fn kcore_endpoint_call(

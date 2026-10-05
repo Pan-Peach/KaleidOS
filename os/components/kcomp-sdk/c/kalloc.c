@@ -1,6 +1,6 @@
 /* kalloc.c —— 私有执行域运行时堆：freestanding C 实现（单一真相）。
  *
- * **保留为未来 Isolated / Sandboxed 的私有分配器后端**（当前没有生产调用方）：
+ * Isolated 的私有分配器后端（Sandboxed 执行后端后置）：
  * KernelNative 普通 malloc/free 走 Core 的 `kcore_heap_alloc` / `kcore_heap_dealloc`
  * （同特权同 AS 共享 Core 堆）；私有执行域才在自己的可写 image 里用本分配器。
  * 契约：docs/architecture/memory-and-heap.md §6。

@@ -69,6 +69,9 @@ fn main() {
         sdk_dir.join("Cargo.toml"),
         // SDK 已拆成多模块：跟踪整个 src/ 目录，任一源文件变化都触发重建。
         sdk_dir.join("src"),
+        sdk_dir.join("build.rs"),
+        sdk_dir.join("c"),
+        sdk_dir.join("include"),
         repo.join("tools/build-kcomp.sh"),
         repo.join("tools/kcomp-link.sh"),
     ] {
@@ -78,6 +81,8 @@ fn main() {
     let components = [
         ("core_test", "tests/core_test"),
         ("kcomp_smoke", "tests/kcomp_smoke"),
+        ("kcomp_heap", "tests/kcomp_heap"),
+        ("kcomp_domain_service", "tests/kcomp_domain_service"),
         ("kcomp_min", "tests/kcomp_min"),
         ("kcomp_isolated", "tests/kcomp_isolated"),
         ("kcomp_isolated_life", "tests/kcomp_isolated_life"),

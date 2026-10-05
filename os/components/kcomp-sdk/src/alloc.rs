@@ -1,38 +1,30 @@
-//! alloc adapter：`GlobalAlloc` → **KernelNative 共享堆**
-//!（Core `kcore_heap_alloc` / `kcore_heap_dealloc`）。
-//!
-//! KernelNative 组件与 Core 同特权、同地址空间，因此共享同一个 Core 堆——这是
-//! **部署形态决定的窄后端**，不是通用 / 跨域内存 ABI（契约见
-//! `docs/architecture/memory-and-heap.md` §6）。Isolated / Sandboxed 不解析这两个
-//! 符号；它们的运行时用私有分配器（[`crate::heap`] 的 freestanding C 实现，
-//! backing 经 `kcore_memory_acquire/release` 取）。
-//!
-//! 契约 = Rust `GlobalAlloc`：`dealloc` 的 `(ptr, size, align)` 必须与那次成功
-//! alloc **逐字一致**（共享堆按 `Layout` 路由 slab / buddy，不得从取整容量反推）；
-//! `realloc` = alloc + copy + dealloc（旧 Layout 原样传给 Core）。Core 侧对非法
-//! layout / 耗尽返回 null，adapter 不 panic。
-//!
-//! `#[global_allocator]` 只在裸机 + feature `alloc` 下注册；host `cargo test`
-//! 编译 adapter 类型（测试直接调用它，走 `test_support` 的 Core 替身），但用 std
-//! 自己的分配器。
+//! GlobalAlloc uses the deployment backend initialized by Core.
+//! KernelNative shares Core's heap; private domains keep their own allocator
+//! state and acquire backing only when their free list cannot satisfy a request.
+//! The component uses the same allocator and artifact in either deployment.
+//! Private allocation is not supported in IRQ context.
 
-use crate::abi::{kcore_heap_alloc, kcore_heap_dealloc};
 use core::alloc::{GlobalAlloc, Layout};
 
-/// 薄 adapter：不拥有内存，只把 `GlobalAlloc` 路由到 Core 的共享堆。
-pub struct KernelHeap;
+unsafe extern "C" {
+    fn kcomp_runtime_alloc(size: usize, align: usize) -> *mut u8;
+    fn kcomp_runtime_free(ptr: *mut u8, size: usize, align: usize);
+}
 
-unsafe impl GlobalAlloc for KernelHeap {
+/// Deployment adapter initialized by Core before the component's create entry.
+pub struct ComponentHeap;
+
+unsafe impl GlobalAlloc for ComponentHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: layout 由 GlobalAlloc 契约保证 size > 0、align 为 2 的幂；
         // Core 侧仍做 checked Layout 构造，非法输入返回 null。
-        unsafe { kcore_heap_alloc(layout.size(), layout.align()) }
+        unsafe { kcomp_runtime_alloc(layout.size(), layout.align()) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: ptr/layout 必须匹配一次成功 alloc（GlobalAlloc 契约）；Core 侧按
         // 原始 Layout 归还（slab / buddy 路由由 Layout 驱动）。
-        unsafe { kcore_heap_dealloc(ptr, layout.size(), layout.align()) };
+        unsafe { kcomp_runtime_free(ptr, layout.size(), layout.align()) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -60,4 +52,4 @@ unsafe impl GlobalAlloc for KernelHeap {
 /// host（`cargo test`）用 std 的分配器，adapter 类型仍被测试直接调用。
 #[cfg(all(target_os = "none", feature = "alloc"))]
 #[global_allocator]
-static KERNEL_HEAP: KernelHeap = KernelHeap;
+static COMPONENT_HEAP: ComponentHeap = ComponentHeap;

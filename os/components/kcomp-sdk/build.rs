@@ -23,37 +23,36 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("kcomp-sdk: OUT_DIR"));
     let target = env::var("TARGET").expect("kcomp-sdk: TARGET");
 
-    let source = manifest_dir.join("c").join("kalloc.c");
     let include_dir = manifest_dir.join("include");
-    let object = out_dir.join("kalloc.o");
     let archive = out_dir.join("libkalloc.a");
-
     let cc = pick_compiler();
-    let mut compile = Command::new(&cc);
-    compile
-        .arg("-c")
-        .arg(&source)
-        .arg("-o")
-        .arg(&object)
-        .arg(format!("-I{}", include_dir.display()));
-    for flag in target_flags(&target) {
-        compile.arg(flag);
-    }
-    let status = compile
-        .status()
-        .unwrap_or_else(|err| panic!("kcomp-sdk: failed to run C compiler {cc}: {err}"));
-    if !status.success() {
-        panic!(
-            "kcomp-sdk: C compiler {cc} failed to compile {} for {target}",
+    let mut objects = Vec::new();
+    for name in ["kalloc", "kcomp_heap_runtime"] {
+        let source = manifest_dir.join("c").join(format!("{name}.c"));
+        let object = out_dir.join(format!("{name}.o"));
+        let status = Command::new(&cc)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .arg(format!("-I{}", include_dir.display()))
+            .args(target_flags(&target))
+            .status()
+            .expect("kcomp-sdk: C compiler");
+        assert!(
+            status.success(),
+            "kcomp-sdk: failed to compile {}",
             source.display()
         );
+        objects.push(object);
+        println!("cargo:rerun-if-changed=c/{name}.c");
     }
 
     let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
     let status = Command::new(&ar)
         .arg("crs")
         .arg(&archive)
-        .arg(&object)
+        .args(&objects)
         .status()
         .unwrap_or_else(|err| panic!("kcomp-sdk: failed to run archiver {ar}: {err}"));
     if !status.success() {
@@ -67,6 +66,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=kalloc");
     println!("cargo:rerun-if-changed=c/kalloc.c");
     println!("cargo:rerun-if-changed=include/kcomp_kalloc.h");
+    println!("cargo:rerun-if-changed=include/kcomp.h");
+    println!("cargo:rerun-if-changed=include/generated/kcomp_abi.h");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=AR");
 }
@@ -106,9 +107,11 @@ fn target_flags(target: &str) -> Vec<String> {
             "-ffreestanding",
             "-fno-builtin",
             "-fno-stack-protector",
+            "-fPIC",
             "-O2",
             "-Wall",
             "-Wextra",
+            "-DKCOMP_HOST_TEST",
         ]
         .iter()
         .map(|flag| flag.to_string())

@@ -65,7 +65,7 @@ Ctrl-C 取消。超长行整行丢弃到换行，下一行恢复，绝不执行�
 查询每次返回一行的快照，名称缓冲不足返回 ENOBUFS，不截断；不承诺整张表原子快照。
 既有 `kcore_device_nth` 接受空 compatible 字节串以枚举全部设备；既有
 `kcore_component_load` 增加 domain 请求参数，沿用 id / -errno 返回编码。后者改变 import
-签名，所以 `KCOMP_ABI` 原地协调替换为 `0x9D73_405B_B2F8_16C0`；旧组件明确不兼容。
+签名，所以 `KCOMP_ABI` 原地协调替换为 `0x47AF_93E6_21B8_D054`；旧组件明确不兼容。
 SDK / C provider / test fixture 的指纹与既有 load 调用同步更新，生成的声明与导出表由
 `make abi-gen` 更新、`make abi-check` 检查。
 

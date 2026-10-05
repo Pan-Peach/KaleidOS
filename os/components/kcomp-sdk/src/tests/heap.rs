@@ -3,14 +3,14 @@
 //! - [`Heap`] facade 直接走**真实 C 实现**（build.rs 编出的 `libkalloc.a`），不是
 //!   Rust 复刻。覆盖：split / coalesce、对齐（含 > 16）、溢出、OOM、realloc 语义
 //!   （保留内容 / 失败保旧块）、backing 增长路径、两个独立堆互不干扰。
-//! - adapter（[`KernelHeap`]）走 `test_support` 的 `kcore_heap_alloc/dealloc` 替身，
+//! - adapter（[`ComponentHeap`]）走 `test_support` 的 `kcore_heap_alloc/dealloc` 替身，
 //!   钉死 ABI 契约：原始 layout 逐字传递、realloc = alloc + copy + dealloc。
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::alloc::KernelHeap;
+use crate::alloc::ComponentHeap;
 use crate::heap::Heap;
 
 /// 4096 对齐的静态 arena（分配器会写它 → 必须 UnsafeCell）。
@@ -336,7 +336,8 @@ fn heap_growth_calls_backing_geometrically() {
 fn global_alloc_adapter_roundtrips_through_core_heap_abi() {
     let _guard = crate::test_support::lock();
     crate::test_support::reset_script();
-    let adapter = KernelHeap;
+    init_native_runtime();
+    let adapter = ComponentHeap;
     let layout = Layout::from_size_align(32, 8).unwrap();
 
     // alloc：size / align 原样进入 Core ABI。
@@ -384,7 +385,8 @@ fn global_alloc_adapter_roundtrips_through_core_heap_abi() {
 fn global_alloc_adapter_surfaces_core_exhaustion_as_null() {
     let _guard = crate::test_support::lock();
     crate::test_support::reset_script();
-    let adapter = KernelHeap;
+    init_native_runtime();
+    let adapter = ComponentHeap;
     let layout = Layout::from_size_align(16, 8).unwrap();
 
     crate::test_support::script_heap_exhaustion();
@@ -444,5 +446,78 @@ fn independent_heaps_do_not_interfere() {
         (*heap_a).free(a2);
         (*heap_b).free(b2);
         (*heap_b).free(b);
+    }
+}
+
+unsafe extern "C" {
+    fn kcomp_runtime_init(runtime: *const crate::abi::KcompRuntime) -> i32;
+    fn kcomp_runtime_reset_for_test();
+}
+
+fn init_native_runtime() {
+    // SAFETY: caller holds the shared test lock; no allocation outlives reset.
+    unsafe {
+        kcomp_runtime_reset_for_test();
+    }
+    let runtime = crate::abi::KcompRuntime {
+        domain: 0,
+        reserved: 0,
+        heap_alloc: crate::test_support::kcore_heap_alloc as *const () as usize,
+        heap_dealloc: crate::test_support::kcore_heap_dealloc as *const () as usize,
+    };
+    assert_eq!(unsafe { kcomp_runtime_init(&runtime) }, 0);
+}
+
+arena!(RUNTIME_ARENA, 4096);
+arena!(RUNTIME_GROW, 16384);
+
+#[test]
+fn private_runtime_never_calls_shared_heap_and_preserves_realloc_failure() {
+    let _guard = crate::test_support::lock();
+    for domain in [1, 2] {
+        crate::test_support::reset_script();
+        unsafe {
+            kcomp_runtime_reset_for_test();
+        }
+        let bad = crate::abi::KcompRuntime {
+            domain,
+            reserved: 0,
+            heap_alloc: 1,
+            heap_dealloc: 1,
+        };
+        assert_eq!(unsafe { kcomp_runtime_init(&bad) }, -22);
+        let runtime = crate::abi::KcompRuntime {
+            heap_alloc: 0,
+            heap_dealloc: 0,
+            ..bad
+        };
+        assert_eq!(unsafe { kcomp_runtime_init(&runtime) }, 0);
+        assert_eq!(unsafe { kcomp_runtime_init(&runtime) }, -16);
+        crate::test_support::script_mem_acquire(0, RUNTIME_ARENA.base() as usize, 4096);
+        let heap = ComponentHeap;
+        let layout = Layout::from_size_align(128, 64).unwrap();
+        let p = unsafe { heap.alloc(layout) };
+        assert!(!p.is_null());
+        assert_eq!(p as usize % 64, 0);
+        unsafe {
+            p.write_bytes(0xa5, 128);
+        }
+        crate::test_support::script_mem_acquire(-12, 0, 0);
+        assert!(unsafe { heap.realloc(p, layout, 8192) }.is_null());
+        assert_eq!(unsafe { p.read() }, 0xa5);
+        crate::test_support::script_mem_acquire(0, RUNTIME_GROW.base() as usize, 16384);
+        let q = unsafe { heap.realloc(p, layout, 8192) };
+        assert!(!q.is_null());
+        for i in 0..128 {
+            assert_eq!(unsafe { q.add(i).read() }, 0xa5);
+        }
+        unsafe {
+            heap.dealloc(q, Layout::from_size_align(8192, 64).unwrap());
+        }
+        assert!(crate::test_support::last_heap_alloc().is_none());
+        assert!(crate::test_support::last_heap_dealloc().is_none());
+    }
+    unsafe {
+        kcomp_runtime_reset_for_test();
     }
 }

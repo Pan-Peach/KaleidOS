@@ -80,6 +80,30 @@ mod exports;
 
 use exports::EXPORTS;
 
+/// Only KernelNative receives callable shared-heap entries. Private domains
+/// initialize their image-local allocator and use the memory backing ABI.
+pub(crate) fn runtime_backend(domain: ExecutionDomain) -> crate::generated::abi::KcompRuntime {
+    let shared = domain == ExecutionDomain::KernelNative;
+    crate::generated::abi::KcompRuntime {
+        domain: match domain {
+            ExecutionDomain::KernelNative => 0,
+            ExecutionDomain::IsolatedNative => 1,
+            ExecutionDomain::SandboxedNative => 2,
+        },
+        reserved: 0,
+        heap_alloc: if shared {
+            kcore_heap_alloc as *const () as usize
+        } else {
+            0
+        },
+        heap_dealloc: if shared {
+            kcore_heap_dealloc as *const () as usize
+        } else {
+            0
+        },
+    }
+}
+
 #[path = "export/query.rs"]
 mod query;
 use query::*;
@@ -106,6 +130,20 @@ unsafe impl Sync for ExportAddress {}
 // Category 1：Memory resource（域视图，无账本）
 // ---------------------------------------------------------------------------
 
+fn private_memory_space() -> Result<Option<crate::memory::address_space::AddressSpaceHandle>, Errno>
+{
+    let Some(id) = current_task_requester() else {
+        return Ok(None);
+    };
+    let reg = registry::get_registry().lock();
+    let record = reg.get(id).ok_or(Errno::EPERM)?;
+    match record.execution_domain {
+        ExecutionDomain::KernelNative => Ok(None),
+        ExecutionDomain::IsolatedNative => record.address_space.map(Some).ok_or(Errno::EPERM),
+        ExecutionDomain::SandboxedNative => Err(Errno::ENOTSUP),
+    }
+}
+
 /// 取一段内存 backing，返回**本执行域访问窗口**（`kcore_memory_view`）。
 ///
 /// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
@@ -118,16 +156,37 @@ unsafe impl Sync for ExportAddress {}
 /// `EOVERFLOW` `min_len` 超出本域指针宽 / `ENOMEM` 物理内存耗尽）。
 extern "C" fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut MemoryView) -> i32 {
     with_core_critical(|| {
+        let space = match private_memory_space() {
+            Ok(space) => space,
+            Err(error) => return error.code(),
+        };
+        if let Some(id) = current_task_requester()
+            && let Some(error) = deny_if_failed(id)
+        {
+            return error;
+        }
         if out_view.is_null() {
             return Errno::EFAULT.code();
         }
         if min_len == 0 || min_align == 0 || !min_align.is_power_of_two() {
             return Errno::EINVAL.code();
         }
-        let Ok(size) = usize::try_from(min_len) else {
+        let (Ok(size), Ok(align)) = (usize::try_from(min_len), usize::try_from(min_align)) else {
             return Errno::EOVERFLOW.code();
         };
-        match memory::alloc_region(size) {
+        if let Some(space) = space {
+            return match crate::component::backing::acquire(space, size, align) {
+                Ok(view) => {
+                    // SAFETY: trusted native caller provides a writable output in its AS.
+                    unsafe {
+                        out_view.write_unaligned(view);
+                    }
+                    0
+                }
+                Err(error) => error.code(),
+            };
+        }
+        match memory::alloc_region(size.max(align)) {
             Ok(lease) => {
                 let base = lease.base();
                 let len = lease.size();
@@ -140,7 +199,7 @@ extern "C" fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut 
                 core::mem::forget(lease);
                 // SAFETY: out_view 已校验非空；可写性由调用方保证（C ABI 契约）。
                 unsafe {
-                    out_view.write(MemoryView {
+                    out_view.write_unaligned(MemoryView {
                         kind: KCORE_MEMORY_VIEW_LOCAL_VA,
                         reserved: 0,
                         base: base as u64,
@@ -168,13 +227,20 @@ extern "C" fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut 
 /// `reserved` 非 0 / `(base, len)` 不是一次 acquire 产物的形状）。
 extern "C" fn kcore_memory_release(view: *const MemoryView) -> i32 {
     with_core_critical(|| {
+        let space = match private_memory_space() {
+            Ok(space) => space,
+            Err(error) => return error.code(),
+        };
         if view.is_null() {
             return Errno::EFAULT.code();
         }
         // SAFETY: 调用方保证 view 指向调用期间有效的 MemoryView（C ABI 契约）。
-        let view = unsafe { *view };
+        let view = unsafe { view.read_unaligned() };
         if view.kind != KCORE_MEMORY_VIEW_LOCAL_VA || view.reserved != 0 {
             return Errno::EINVAL.code();
+        }
+        if let Some(space) = space {
+            return status(crate::component::backing::release(space, view));
         }
         let (Ok(base), Ok(len)) = (usize::try_from(view.base), usize::try_from(view.len)) else {
             return Errno::EINVAL.code();
@@ -721,16 +787,16 @@ extern "C" fn kcore_endpoint_bind(
 /// `endpoint` 是组合期经 [`kcore_endpoint_lookup`] 交付的 opaque `EndpointId`
 /// （发现路径只校验 contract + 存活；abi 由 [`kcore_endpoint_validate`] 核对；
 /// 这里只重新做**存活解析**）。
-/// `args` / `input` / `output` 只在本次调用期间借用：Core 只做结构校验
-/// （长度非零时指针不得为空），**不解析其中的字节**。
+/// `args` / `input` / `output` 只在本次调用期间借用：Core 不解析字节；
+/// Isolated 出站另按页表检查访问并搬运扁平缓冲。
 ///
 /// 成功 = `0`（provider status 在 `*out_status`）；失败 = `-Errno`
 /// （`EFAULT` `*out_status` 为空或 frame 结构非法；`EPERM` 无法解析 caller 或
-/// caller 已 `Failed`；`ENOTSUP` caller 不在 KernelNative 域（Isolated 出站调用
-/// 未实现）；`ENOENT` endpoint 未发布或已死；`ENODEV` owner /
+/// caller 已 `Failed`；`ENOTSUP` 执行后端不可用（Sandbox 或无真实 Isolated 现场）；
+/// `ENOENT` endpoint 未发布或已死；`ENODEV` owner /
 /// image 已不存在；`EBUSY` provider 不在 `Ready`、inflight 溢出或**重入**（provider
 /// 已在当前同步链上）；`EINVAL` 调用链上有 **IRQ 作用域**；`ENOMEM` Core 无法
-/// 分配 service stack；`EIO` provider 在边界内 **panic**（已被标记 `Failed` 且
+/// 分配 service stack / transport buffer；`EIO` provider 在边界内 **panic**（已被标记 `Failed` 且
 /// 其 endpoint 永久失效，caller 存活）；`ENOSYS` image 没有
 /// `kcomp_service_dispatch`）。
 #[allow(clippy::too_many_arguments)]
@@ -1296,6 +1362,23 @@ pub fn resolve(name: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_backend_delivers_shared_heap_only_to_kernel_native() {
+        let native = runtime_backend(ExecutionDomain::KernelNative);
+        assert_ne!(native.heap_alloc, 0);
+        assert_ne!(native.heap_dealloc, 0);
+        for domain in [
+            ExecutionDomain::IsolatedNative,
+            ExecutionDomain::SandboxedNative,
+        ] {
+            let private = runtime_backend(domain);
+            assert_eq!(
+                (private.heap_alloc, private.heap_dealloc, private.reserved),
+                (0, 0, 0)
+            );
+        }
+    }
+
     /// Direct function table 的替身地址（Core 只存、不解引用）。
     static TABLE: [u8; 8] = [0; 8];
 
@@ -1615,7 +1698,7 @@ mod tests {
     }
 
     /// Isolated 实例门禁：非 KernelNative 域没有已实现的 MMIO / DMA / IRQ / 任务 /
-    /// 出站调用路径 → acquiring 入口一律 `-ENOTSUP`（窄支持包络）。
+    /// 设备 / 任务路径 → acquiring 入口一律 `-ENOTSUP`（窄支持包络）。
     ///
     /// 对照：同一 `device_claim` 在 KernelNative 边界下**不**被域门禁拒绝，而是走到
     /// 设备解析（`-ENODEV`）——证明这是按域拒绝，不是"所有调用都拒绝"。
@@ -1682,7 +1765,7 @@ mod tests {
                     &mut out_status,
                 ),
                 Errno::ENOTSUP.code(),
-                "Isolated 出站调用（跨 AS Gate 未实现）必须显式拒绝"
+                "host 没有真实私有 AS / 活动现场，不能回退到 native"
             );
         });
 
@@ -1848,6 +1931,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn private_memory_rejects_unsupported_or_missing_domain_before_pointer_access() {
+        use crate::component::containment;
+        let _boundary = containment::test_boundary_lock();
+        registry::init();
+        for (domain, error) in [
+            (ExecutionDomain::SandboxedNative, Errno::ENOTSUP),
+            (ExecutionDomain::IsolatedNative, Errno::EPERM),
+        ] {
+            let id = registry::get_registry()
+                .lock()
+                .declare(
+                    b"memory-gate",
+                    registry::test_support::test_loaded(0, None),
+                    domain,
+                )
+                .unwrap();
+            containment::with_test_init_boundary(Some(id), || {
+                // Intentionally invalid pointers: no native address dereference
+                // or allocation may precede the execution-domain gate.
+                assert_eq!(
+                    kcore_memory_acquire(1, 8, core::ptr::dangling_mut::<MemoryView>()),
+                    error.code()
+                );
+                assert_eq!(
+                    kcore_memory_release(core::ptr::dangling::<MemoryView>()),
+                    error.code()
+                );
+            });
+        }
+    }
+
     /// `kcore_memory_acquire/release`：域视图往返（走真实导出函数，不是复刻逻辑）。
     ///
     /// 锁定契约语义：首次交付零初始化、`kind = KCORE_MEMORY_VIEW_LOCAL_VA`、
@@ -1857,76 +1972,89 @@ mod tests {
     /// **无账本**：release 只凭 view 自身。
     #[test]
     fn memory_acquire_release_roundtrip() {
+        use crate::component::containment;
+        let _boundary = containment::test_boundary_lock();
         let _g = crate::memory::test_support::GUARD.lock();
         crate::memory::test_support::ensure_init();
 
-        let acquire = resolve(b"kcore_memory_acquire").unwrap();
-        let acquire: extern "C" fn(u64, u64, *mut MemoryView) -> i32 =
-            unsafe { core::mem::transmute(acquire) };
-        let release = resolve(b"kcore_memory_release").unwrap();
-        let release: extern "C" fn(*const MemoryView) -> i32 =
-            unsafe { core::mem::transmute(release) };
+        registry::init();
+        let native = registry::get_registry()
+            .lock()
+            .declare(
+                b"native-memory-test",
+                registry::test_support::test_loaded(0, None),
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
+        containment::with_test_init_boundary(Some(native), || {
+            let acquire = resolve(b"kcore_memory_acquire").unwrap();
+            let acquire: extern "C" fn(u64, u64, *mut MemoryView) -> i32 =
+                unsafe { core::mem::transmute(acquire) };
+            let release = resolve(b"kcore_memory_release").unwrap();
+            let release: extern "C" fn(*const MemoryView) -> i32 =
+                unsafe { core::mem::transmute(release) };
 
-        let empty = MemoryView {
-            kind: 0,
-            reserved: 0,
-            base: 0,
-            len: 0,
-        };
-
-        // null out → EFAULT；size/align 非法 → EINVAL（都早于分配）。
-        let mut view = empty;
-        assert_eq!(acquire(1, 8, core::ptr::null_mut()), Errno::EFAULT.code());
-        assert_eq!(acquire(0, 8, &mut view), Errno::EINVAL.code());
-        assert_eq!(acquire(1, 0, &mut view), Errno::EINVAL.code());
-        assert_eq!(acquire(1, 3, &mut view), Errno::EINVAL.code());
-
-        // 成功：kind 由 Core 选定、len 覆盖请求、首次交付零初始化。
-        assert_eq!(acquire(1, 8, &mut view), 0);
-        assert_eq!(view.kind, KCORE_MEMORY_VIEW_LOCAL_VA);
-        assert!(view.len >= 1 && view.len.is_power_of_two());
-        assert_eq!(view.base % crate::memory::ALLOC_GRANULE as u64, 0);
-        // SAFETY: view.base 来自 alloc_region（块容量 = view.len），host 下是有效内存。
-        let head = unsafe { core::slice::from_raw_parts(view.base as *const u8, 16) };
-        assert!(head.iter().all(|&b| b == 0), "首次交付必须零初始化");
-
-        // release 归还 backing：同尺寸再次 acquire 必须复用同一块。
-        let first = view;
-        assert_eq!(release(&view), 0);
-        assert_eq!(acquire(1, 8, &mut view), 0);
-        assert_eq!((view.base, view.len), (first.base, first.len));
-        assert_eq!(release(&view), 0);
-
-        // null → EFAULT；absurd view → EINVAL（零 / 未页对齐 / 非 2 的幂 / 未知 kind）。
-        assert_eq!(release(core::ptr::null()), Errno::EFAULT.code());
-        assert_eq!(release(&empty), Errno::EINVAL.code());
-        assert_eq!(
-            release(&MemoryView {
-                kind: KCORE_MEMORY_VIEW_LOCAL_VA,
-                reserved: 0,
-                base: 0x1001,
-                len: 4096,
-            }),
-            Errno::EINVAL.code()
-        );
-        assert_eq!(
-            release(&MemoryView {
-                kind: KCORE_MEMORY_VIEW_LOCAL_VA,
-                reserved: 0,
-                base: 0x1000,
-                len: 5000,
-            }),
-            Errno::EINVAL.code()
-        );
-        assert_eq!(
-            release(&MemoryView {
+            let empty = MemoryView {
                 kind: 0,
                 reserved: 0,
-                base: first.base,
-                len: first.len,
-            }),
-            Errno::EINVAL.code()
-        );
+                base: 0,
+                len: 0,
+            };
+
+            // null out → EFAULT；size/align 非法 → EINVAL（都早于分配）。
+            let mut view = empty;
+            assert_eq!(acquire(1, 8, core::ptr::null_mut()), Errno::EFAULT.code());
+            assert_eq!(acquire(0, 8, &mut view), Errno::EINVAL.code());
+            assert_eq!(acquire(1, 0, &mut view), Errno::EINVAL.code());
+            assert_eq!(acquire(1, 3, &mut view), Errno::EINVAL.code());
+
+            // 成功：kind 由 Core 选定、len 覆盖请求、首次交付零初始化。
+            assert_eq!(acquire(1, 8, &mut view), 0);
+            assert_eq!(view.kind, KCORE_MEMORY_VIEW_LOCAL_VA);
+            assert!(view.len >= 1 && view.len.is_power_of_two());
+            assert_eq!(view.base % crate::memory::ALLOC_GRANULE as u64, 0);
+            // SAFETY: view.base 来自 alloc_region（块容量 = view.len），host 下是有效内存。
+            let head = unsafe { core::slice::from_raw_parts(view.base as *const u8, 16) };
+            assert!(head.iter().all(|&b| b == 0), "首次交付必须零初始化");
+
+            // release 归还 backing：同尺寸再次 acquire 必须复用同一块。
+            let first = view;
+            assert_eq!(release(&view), 0);
+            assert_eq!(acquire(1, 8, &mut view), 0);
+            assert_eq!((view.base, view.len), (first.base, first.len));
+            assert_eq!(release(&view), 0);
+
+            // null → EFAULT；absurd view → EINVAL（零 / 未页对齐 / 非 2 的幂 / 未知 kind）。
+            assert_eq!(release(core::ptr::null()), Errno::EFAULT.code());
+            assert_eq!(release(&empty), Errno::EINVAL.code());
+            assert_eq!(
+                release(&MemoryView {
+                    kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+                    reserved: 0,
+                    base: 0x1001,
+                    len: 4096,
+                }),
+                Errno::EINVAL.code()
+            );
+            assert_eq!(
+                release(&MemoryView {
+                    kind: KCORE_MEMORY_VIEW_LOCAL_VA,
+                    reserved: 0,
+                    base: 0x1000,
+                    len: 5000,
+                }),
+                Errno::EINVAL.code()
+            );
+            assert_eq!(
+                release(&MemoryView {
+                    kind: 0,
+                    reserved: 0,
+                    base: first.base,
+                    len: first.len,
+                }),
+                Errno::EINVAL.code()
+            );
+        });
     }
 
     /// `kcore_heap_alloc/dealloc`：KernelNative 共享堆后端往返（走**真实导出函数**，

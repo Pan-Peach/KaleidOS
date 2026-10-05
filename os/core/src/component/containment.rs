@@ -122,6 +122,10 @@ pub(crate) type ServiceDispatch = extern "C" fn(*mut (), u32, u32, *const KcompC
 enum IsolatedCall {
     /// 测试边界 / 无组件调用。
     None,
+    Runtime {
+        entry: usize,
+        runtime: *const crate::generated::abi::KcompRuntime,
+    },
     Create {
         entry: usize,
         args: *const KcompCreateArgs,
@@ -658,6 +662,18 @@ pub fn call_component_create(
     )
 }
 
+pub(crate) fn call_component_runtime(
+    entry: usize,
+    runtime: &crate::generated::abi::KcompRuntime,
+) -> CallOutcome {
+    call_on_isolated_stack_with(
+        IsolatedCall::Runtime { entry, runtime },
+        EscapeKind::Init {
+            owner: crate::component::load::current_component(),
+        },
+    )
+}
+
 /// Calls a component **destroy entry** (`kcomp_instance_destroy`) on a
 /// Core-owned stack.
 ///
@@ -1092,6 +1108,12 @@ extern "C" fn trampoline() -> ! {
     let call = unsafe { (*guard_ptr).call };
     let returned = match call {
         IsolatedCall::None => 0,
+        IsolatedCall::Runtime { entry, runtime } => {
+            // SAFETY: loader validated the C entry; runtime lives in the caller frame.
+            let init: extern "C" fn(*const crate::generated::abi::KcompRuntime) -> i32 =
+                unsafe { core::mem::transmute(entry) };
+            init(runtime)
+        }
         IsolatedCall::Create {
             entry,
             args,
@@ -1584,7 +1606,7 @@ mod tests {
     #[test]
     fn kcomp_abi_is_the_manual_anchor() {
         // 当前 Core import / 生命周期 exact 指纹；来源为 abi/component.toml。
-        assert_eq!(KCOMP_ABI, 0x9D73_405B_B2F8_16C0);
+        assert_eq!(KCOMP_ABI, 0x47AF_93E6_21B8_D054);
     }
 
     #[test]

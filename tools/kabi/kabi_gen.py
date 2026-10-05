@@ -2178,7 +2178,7 @@ doc = "I/O error"
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
     assert len([func for func in core.functions if func.core_params != func.params]) == 3
-    assert len(core.structs) == 6 and len(component.structs) == 2
+    assert len(core.structs) == 6 and len(component.structs) == 3
     user_trap = next(struct for struct in core.structs if struct.name == "UserTrap")
     assert user_trap.size64 == 88 and user_trap.size32 == 88 and user_trap.align == 8
     posix = load_schema("abi/posix.toml")
@@ -2196,14 +2196,17 @@ doc = "I/O error"
         "output",
         "output_len",
     ]
-    assert component.entries[0].alias == "KcompInstanceCreate"
-    assert component.entries[2].name == "kcomp_service_dispatch"
-    assert component.entries[2].alias == "KcompServiceDispatch"
+    entries = {entry.name: entry for entry in component.entries}
+    assert entries["kcomp_instance_create"].alias == "KcompInstanceCreate"
+    assert entries["kcomp_service_dispatch"].alias == "KcompServiceDispatch"
+    assert entries["kcomp_runtime_init"].alias == "KcompRuntimeInit"
+    runtime = next(struct for struct in component.structs if struct.name == "KcompRuntime")
+    assert runtime.size64 == 24 and runtime.size32 == 16
     assert component.aliases[0].name == "KcompTaskEntry"
     assert component.objects[0].name == "kcomp_abi" and component.objects[0].is_const
     assert component.enums[0].c_name == "KcompInterfaceKind"
     kcomp_abi = [const for const in component.constants if const.name == "KCOMP_ABI"][0]
-    assert kcomp_abi.value == 0x9D73_405B_B2F8_16C0
+    assert kcomp_abi.value == 0x47AF_93E6_21B8_D054
     kinds = [const for const in core.constants if const.name.startswith("KIND_")]
     assert [const.value for const in kinds] == list(range(1, 12))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]

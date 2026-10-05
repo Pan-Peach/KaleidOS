@@ -1,4 +1,4 @@
-//! 私有执行域运行时堆后端（**未来 Isolated / Sandboxed**；当前未接线）。
+//! 私有执行域运行时堆后端（Isolated 已接通；Sandboxed 执行后端后置）。
 //!
 //! 分配器实现是 **freestanding C**（`c/kalloc.c` + `include/kcomp_kalloc.h`），
 //! 一份源码私有链进每个 `.kcomp`；这里只是 Rust 侧最小 facade：
@@ -11,20 +11,21 @@
 //! KernelNative 组件与 Core 同特权、同地址空间：它们的 `GlobalAlloc`
 //!（[`crate::alloc`]）直接走 Core 的共享堆后端 `kcore_heap_alloc/dealloc`，
 //! **没有** per-instance 堆，也**没有** ambient 堆指针。本模块的
-//! C 分配器保留为**未来私有执行域**（Isolated / Sandboxed）的运行时堆后端：
+//! C 分配器作为私有执行域的运行时堆后端：
 //! 在实例自己的可写 `.data` / `.bss` 里 [`Heap::place`] 一段私有 backing（backing
-//! 由 `kcore_memory_acquire/release` 提供）。当前没有生产调用方；host 测试直接
-//! 驱动真实 C 实现（`src/tests/heap.rs`）。
+//! 由 `kcore_memory_acquire/release` 提供）。`c/kcomp_heap_runtime.c` 在首次分配
+//! 时放置堆，Rust `GlobalAlloc` 与 C `malloc` 共用这个部署 adapter。
 //!
 //! # 为什么是 C
 //!
 //! 契约 §6：私有域的分配器是"共享分配器**实现代码**，不是共享堆"。C 组件无法
 //! 链接 Rust，所以真相在 C；Rust facade 只是它的薄入口。
 //!
-//! # v1 边界（明确记录）
+//! # 当前边界
 //!
-//! - **IRQ 上下文分配不支持**：当前实现无锁，在中断里分配会自死锁。
-//! - **整段 region release 不在范围内**：v1 不记 region 列表（Core 无账本，
+//! - **IRQ 上下文分配不支持**：部署 adapter 的自旋锁不能在中断里重入。
+//!   本模块低层 facade 本身无锁，调用方负责串行。
+//! - **整段 region release 不在范围内**：分配器不记 region 列表（Core 无账本，
 //!   契约 §4）。已接受的副作用：两段独立 `acquire` 的 region 若地址恰好相邻，
 //!   free list 上的空闲块可能跨 region 合并。
 //!

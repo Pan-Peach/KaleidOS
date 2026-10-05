@@ -25,6 +25,7 @@
 #   kcomp_instance_destroy    必须 DEFINED（STT_FUNC）
 #   kcomp_abi                 必须 DEFINED（8 字节 STT_OBJECT；Core 校验其值）
 #   kcomp_service_dispatch    **可选**（存在才保留；缺失 = 不提供 endpoint 服务）
+#   kcomp_runtime_init        **可选**（SDK 部署后端初始化；业务 create 之前调用）
 # 旧的 kcomp_init / kcomp_exit 已原地删除——无 legacy fallback。
 
 set -euo pipefail
@@ -58,13 +59,15 @@ fi
 # 都是**必需导出**（docs/architecture/component-lifecycle.md §4），缺失 = packer 立即失败。
 force=(-u kcomp_instance_create -u kcomp_instance_destroy -u kcomp_abi)
 
-# 可选入口 kcomp_service_dispatch：**只在该符号存在时**钉住。
+# 可选服务 / runtime 入口：**只在该符号存在时**钉住。
 # - 无条件 -u 会让没有该入口的组件因 undefined symbol 链接失败；
 # - 完全不钉住又会被 --gc-sections 丢掉（没人引用它）。
 # 因此先探测输入（.o / .a 均可）：存在 DEFINED 的 STT_FUNC 才加根。
-if "$readelf" -s "$@" 2>/dev/null | awk '$4=="FUNC" && $8=="kcomp_service_dispatch" && $7!="UND" {found=1} END{exit !found}'; then
-    force+=(-u kcomp_service_dispatch)
-fi
+for entry in kcomp_service_dispatch kcomp_runtime_init; do
+    if "$readelf" -s "$@" 2>/dev/null | awk -v name="$entry" '$4=="FUNC" && $8==name && $7!="UND" {found=1} END{exit !found}'; then
+        force+=(-u "$entry")
+    fi
+done
 
 # partial link：只抽可达成员、GC 未引用段。--no-relax 避免 R_RISCV_ALIGN
 # （loader 不支持；relax 在本步骤没有收益）。

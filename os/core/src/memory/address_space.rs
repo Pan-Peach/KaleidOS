@@ -370,6 +370,75 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         self.mappings.iter().find(|m| m.virtual_range == *range)
     }
 
+    /// Validate a byte range before Core copies a private-domain call buffer.
+    /// Adjacent mappings may cover it; every byte must have the requested access.
+    pub fn range_has_permission(&self, range: VirtualRange, permission: MappingPermission) -> bool {
+        if self.state != AddressSpaceState::Ready {
+            return false;
+        }
+        let Some(end) = range.base.checked_add(range.size) else {
+            return false;
+        };
+        let mut cursor = range.base;
+        while cursor < end {
+            let Some(mapping) = self.mappings.iter().chain(&self.shared).find(|mapping| {
+                cursor >= mapping.virtual_range.base
+                    && cursor < mapping.virtual_range.base + mapping.virtual_range.size
+            }) else {
+                return false;
+            };
+            if !mapping.permission.contains(permission) {
+                return false;
+            }
+            cursor = end.min(mapping.virtual_range.base + mapping.virtual_range.size);
+        }
+        true
+    }
+
+    /// Find an aligned hole for a new region. This proposes a VA only; map
+    /// revalidates it before committing, including concurrent proposals.
+    pub fn find_free_range(
+        &self,
+        window: VirtualRange,
+        size: usize,
+        align: usize,
+    ) -> Result<VirtualRange, MapError> {
+        self.ensure_ready()?;
+        if size == 0 || align == 0 || !align.is_power_of_two() {
+            return Err(MapError::Unaligned);
+        }
+        let end = window
+            .base
+            .checked_add(window.size)
+            .ok_or(MapError::AddressOverflow)?;
+        let mut base = window.base;
+        loop {
+            base = base
+                .checked_add(align - 1)
+                .ok_or(MapError::AddressOverflow)?
+                & !(align - 1);
+            let candidate = VirtualRange { base, size };
+            if base.checked_add(size).ok_or(MapError::AddressOverflow)? > end {
+                return Err(MapError::Overlap);
+            }
+            let overlap = self
+                .mappings
+                .iter()
+                .chain(self.shared.iter())
+                .find(|mapping| ranges_overlap(&candidate, &mapping.virtual_range));
+            match overlap {
+                Some(mapping) => {
+                    base = mapping
+                        .virtual_range
+                        .base
+                        .checked_add(mapping.virtual_range.size)
+                        .ok_or(MapError::AddressOverflow)?
+                }
+                None => return Ok(candidate),
+            }
+        }
+    }
+
     /// 退役后的所有 mutation（含激活准备）一律拒绝；只读查询降级为 `None`。
     fn ensure_ready(&self) -> Result<(), MapError> {
         match self.state {
@@ -776,21 +845,68 @@ mod active {
         let backend =
             <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
                 .map_err(|_| MapError::BackendFailed)?;
-        let handle = SPACES.lock().create(owner, backend);
-        let shared = crate::memory::kernel_mappings::shared_mappings();
-        for mapping in shared {
-            let result = SPACES.lock().add_shared(handle, mapping);
-            if let Err(error) = result {
-                let _ = SPACES.lock().retire(handle);
-                return Err(error);
+        crate::memory::kernel_mappings::with_shared_mappings(|shared| {
+            let mut spaces = SPACES.lock();
+            let handle = spaces.create(owner, backend);
+            for mapping in shared {
+                if let Err(error) = spaces.add_shared(handle, mapping) {
+                    let _ = spaces.retire(handle);
+                    return Err(error);
+                }
             }
-        }
-        Ok(handle)
+            Ok(handle)
+        })
     }
 
     /// 在已建立的地址空间上落一段映射（Core 验证 → 后端写 PTE → Core 记录真相）。
     pub fn map(handle: AddressSpaceHandle, mapping: Mapping) -> Result<(), MapError> {
         SPACES.lock().map(handle, mapping)
+    }
+
+    pub fn find_free_range(
+        handle: AddressSpaceHandle,
+        window: VirtualRange,
+        size: usize,
+        align: usize,
+    ) -> Result<VirtualRange, MapError> {
+        SPACES
+            .lock()
+            .get(handle)
+            .ok_or(MapError::NoSuchSpace)?
+            .find_free_range(window, size, align)
+    }
+
+    pub fn range_has_permission(
+        handle: AddressSpaceHandle,
+        range: VirtualRange,
+        permission: super::MappingPermission,
+    ) -> bool {
+        SPACES
+            .lock()
+            .get(handle)
+            .is_some_and(|space| space.range_has_permission(range, permission))
+    }
+
+    /// Reinstall a released extent's shared identity alias before physical reuse.
+    pub fn restore_identity_alias_to_live_spaces(mapping: Mapping) -> Result<(), MapError> {
+        let mut spaces = SPACES.lock();
+        for space in &mut spaces.spaces {
+            if space.state() != AddressSpaceState::Ready {
+                continue;
+            }
+            if let Some(existing) = space.shared_mapping_at(mapping.virtual_range.base) {
+                let offset = mapping.virtual_range.base - existing.virtual_range.base;
+                if offset + mapping.virtual_range.size <= existing.virtual_range.size
+                    && existing.physical_range.base + offset == mapping.physical_range.base
+                    && existing.permission == mapping.permission
+                {
+                    continue;
+                }
+                return Err(MapError::Overlap);
+            }
+            space.add_shared(mapping)?;
+        }
+        Ok(())
     }
 
     /// **别名排除事务的逐空间一步**：把 `extent` 的 identity 别名从**所有**
@@ -868,8 +984,9 @@ mod active {
 ))]
 pub use active::{
     ActiveActivation, AddressSpaceImpl, create_isolated_address_space_for,
-    exclude_identity_alias_from_live_spaces, isolation_capable, map, mapping_exact,
-    prepare_activation, prepare_transition, retire, shared_executable_at, translate, unmap,
+    exclude_identity_alias_from_live_spaces, find_free_range, isolation_capable, map,
+    mapping_exact, prepare_activation, prepare_transition, range_has_permission,
+    restore_identity_alias_to_live_spaces, retire, shared_executable_at, translate, unmap,
 };
 
 /// 无后端构建（host test）：没有可用的私有地址空间实现——能力恒为 `false`，
@@ -925,6 +1042,20 @@ pub fn unmap(_handle: AddressSpaceHandle, _range: &VirtualRange) -> Result<(), M
     Err(MapError::BackendFailed)
 }
 
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn mapping_exact(
+    _handle: AddressSpaceHandle,
+    _range: &VirtualRange,
+) -> Result<Option<Mapping>, MapError> {
+    Err(MapError::Unsupported)
+}
+
 /// 无后端构建（host）：没有活的 Isolated root，别名排除事务没有可摘的映射。
 #[cfg(not(any(
     feature = "vm-nommu",
@@ -937,10 +1068,111 @@ pub fn exclude_identity_alias_from_live_spaces(_extent: PhysicalRange) -> Result
     Ok(())
 }
 
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn find_free_range(
+    _handle: AddressSpaceHandle,
+    _window: VirtualRange,
+    _size: usize,
+    _align: usize,
+) -> Result<VirtualRange, MapError> {
+    Err(MapError::Unsupported)
+}
+
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn restore_identity_alias_to_live_spaces(_mapping: Mapping) -> Result<(), MapError> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn byte_access_checks_permissions_holes_overflow_and_retirement() {
+        let mut space = space(FakeBackend::new());
+        space.map(mapping(0x1000, 0x1000, rw())).unwrap();
+        space
+            .map(mapping(0x2000, 0x1000, MappingPermission::READ))
+            .unwrap();
+        let range = VirtualRange {
+            base: 0x1fff,
+            size: 2,
+        };
+        assert!(space.range_has_permission(range, MappingPermission::READ));
+        assert!(!space.range_has_permission(range, MappingPermission::WRITE));
+        assert!(!space.range_has_permission(
+            VirtualRange {
+                base: 0x2fff,
+                size: 2
+            },
+            MappingPermission::READ
+        ));
+        assert!(!space.range_has_permission(
+            VirtualRange {
+                base: usize::MAX,
+                size: 2
+            },
+            MappingPermission::READ
+        ));
+        assert!(space.range_has_permission(
+            VirtualRange {
+                base: usize::MAX,
+                size: 0
+            },
+            MappingPermission::READ
+        ));
+        space.retire();
+        assert!(!space.range_has_permission(range, MappingPermission::READ));
+    }
+
+    #[test]
+    fn region_va_proposals_respect_alignment_shared_mappings_and_release() {
+        let mut space = space(FakeBackend::new());
+        let window = VirtualRange {
+            base: 0x1000,
+            size: 0x9000,
+        };
+        let shared = mapping(0x4000, 0x2000, MappingPermission::READ);
+        space.add_shared(shared).unwrap();
+        let first = space.find_free_range(window, 0x2000, 0x2000).unwrap();
+        assert_eq!(
+            first,
+            VirtualRange {
+                base: 0x2000,
+                size: 0x2000
+            }
+        );
+        space
+            .map(mapping(first.base, first.size, MappingPermission::READ))
+            .unwrap();
+        let next = space.find_free_range(window, 0x2000, 0x2000).unwrap();
+        assert_eq!(next.base, 0x6000);
+        space.unmap(&first).unwrap();
+        assert_eq!(
+            space.find_free_range(window, 0x2000, 0x2000).unwrap(),
+            first
+        );
+        assert!(space.find_free_range(window, 0xa000, 0x1000).is_err());
+        assert!(space.find_free_range(window, 0x1000, 3).is_err());
+        space.retire();
+        assert_eq!(
+            space.find_free_range(window, 0x1000, 0x1000),
+            Err(MapError::Retired)
+        );
+    }
 
     // -- FakeBackend：记录调用，可在宿主上锁定 Core invariant -------------
     /// 测试 fixture 的 VM 对齐常量：与 FakeBackend::GRANULE 一致（4 KiB），

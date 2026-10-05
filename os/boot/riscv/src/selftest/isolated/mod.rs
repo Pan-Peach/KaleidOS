@@ -22,11 +22,11 @@ use super::{fail, pass};
 use arch::Timer;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use kernel::component::ComponentId;
 use kernel::component::isolated::{
     self, ComponentFault, FaultDecision, IsolatedPrepareError, Outcome, PreparedTransition,
 };
 use kernel::component::isolated_load::{self, PlacedImage, PlacedSegment};
-use kernel::component::ComponentId;
 use kernel::memory::address_space::{
     self, AddressSpaceHandle, Mapping, MappingPermission, PhysicalRange, VirtualRange,
 };
@@ -50,8 +50,10 @@ unsafe extern "C" {
     fn isolated_roundtrip_probe();
 }
 
+mod domain_service;
 mod failure;
 mod fixtures;
+mod heap;
 mod image;
 mod imports;
 mod lifecycle;
@@ -62,8 +64,10 @@ mod service;
 mod transition;
 mod traps;
 
+pub(crate) use domain_service::*;
 pub(crate) use failure::*;
 pub(crate) use fixtures::*;
+pub(crate) use heap::*;
 pub(crate) use image::*;
 pub(crate) use imports::*;
 pub(crate) use lifecycle::*;

@@ -9,6 +9,27 @@ pub enum InterfaceKind {
     Policy = 2,
 }
 
+/// Core 在业务 create 前交付的部署后端；只在初始化调用期间借用。
+/// domain 使用 ExecutionDomain 的整数编码。仅 KernelNative 交付共享堆的
+/// 窄 C ABI 地址（alloc(size, align)，dealloc(ptr, size, align)）；私有域两个地址
+/// 必须为零，SDK 使用镜像内的私有分配器。不是分配器内部状态或跨域权限。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcompRuntime {
+    pub domain: u32,
+    pub reserved: u32,
+    pub heap_alloc: usize,
+    pub heap_dealloc: usize,
+}
+
+const _: () = {
+    if core::mem::size_of::<usize>() == 8 {
+        assert!(core::mem::size_of::<KcompRuntime>() == 24);
+    } else {
+        assert!(core::mem::size_of::<KcompRuntime>() == 16);
+    }
+};
+
 /// `kcomp_instance_create` 的参数：仅在调用期间借用。
 /// `config` 必须拷贝后才能持久化；Core 视其为不透明字节。
 #[repr(C)]
@@ -61,7 +82,7 @@ const _: () = {
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0x9D73_405B_B2F8_16C0;
+pub const KCOMP_ABI: u64 = 0x47AF_93E6_21B8_D054;
 
 /// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
 #[repr(u32)]

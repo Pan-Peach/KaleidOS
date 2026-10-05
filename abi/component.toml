@@ -9,6 +9,44 @@
 # （本 schema 只声明 extern 符号，绝不生成定义）。
 
 [[struct]]
+name = "KcompRuntime"
+c_name = "kcomp_runtime"
+doc = """
+Core 在业务 create 前交付的部署后端；只在初始化调用期间借用。
+domain 使用 ExecutionDomain 的整数编码。仅 KernelNative 交付共享堆的
+窄 C ABI 地址（alloc(size, align)，dealloc(ptr, size, align)）；私有域两个地址
+必须为零，SDK 使用镜像内的私有分配器。不是分配器内部状态或跨域权限。
+"""
+size64 = 24
+size32 = 16
+[[struct.field]]
+name = "domain"
+type = "u32"
+[[struct.field]]
+name = "reserved"
+type = "u32"
+[[struct.field]]
+name = "heap_alloc"
+type = "usize"
+[[struct.field]]
+name = "heap_dealloc"
+type = "usize"
+
+[[entry]]
+name = "kcomp_runtime_init"
+alias = "KcompRuntimeInit"
+doc = """
+可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
+返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
+组件业务不判断执行域；不携带 SDK 的无堆组件可省略此入口。
+"""
+ret = "i32"
+targets = "c,sdk-rust"
+[[entry.param]]
+name = "runtime"
+type = "*const KcompRuntime"
+
+[[struct]]
 name = "KcompCreateArgs"
 c_name = "KcompCreateArgs"
 doc = """
@@ -192,11 +230,10 @@ value = 2
 [[const]]
 name = "KCOMP_ABI"
 type = "u64"
-value = "0x9D73_405B_B2F8_16C0"
+value = "0x47AF_93E6_21B8_D054"
 doc = """
 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 `kcomp_abi` 符号由入口宏发出。
 """
 targets = "sdk-rust,core-rust"
-

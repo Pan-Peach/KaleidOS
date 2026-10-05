@@ -4,7 +4,7 @@
 //!   `kcore_panic_escape`：装载时重定位到 Core 导出的低别名（共享映射），
 //!   运行时是普通 C-ABI 调用，`satp` 保持实例 root。
 //! - `kcomp_isolated_unsupported` import 明确不在支持面内的
-//!   `kcore_memory_acquire`：装载前显式拒绝（`isolated-load-reject` 覆盖）。
+//!   `kcore_heap_alloc`：装载前显式拒绝（`isolated-load-reject` 覆盖）。
 //! - `PANIC_ABI` 触发组件 `panic!`：SDK panic adapter → `kcore_panic_escape`
 //!   → 跨 AS 延续（`Outcome::Faulted`）→ 实例 `Failed` + 窗口归还。
 
@@ -41,12 +41,12 @@ unsafe fn direct_slot(window_pa: usize, index: usize) -> usize {
 /// 直接 Core import：创建 `kcomp_isolated_direct` → Ready → 组件在私有 AS 里
 /// 直接调用支持面内的 Core 导出 → 上报（`satp` = 实例 root）→ destroy 执行。
 pub(crate) fn isolated_direct_imports() -> ! {
+    use kernel::component::ComponentState;
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
-    use kernel::component::ComponentState;
 
     let core_satp = read_satp();
     let id = match load::create_component(

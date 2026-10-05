@@ -6,9 +6,9 @@
 //! 1. [`abi`]：`kcore_*` 导出白名单的**单一来源**（组件不再各自复制 extern 块）；
 //! 2. 入口 / 日志 / panic adapter：`kcomp_instance_create!` /
 //!    `kcomp_instance_destroy!`、[`log`]/`klog!`、`#[panic_handler]`；
-//! 3. 可选的 alloc adapter（feature `alloc`）：`GlobalAlloc` → **KernelNative
-//!    共享堆**（Core `kcore_heap_alloc/dealloc`，部署形态决定的窄后端）。
-//!    私有执行域的 freestanding C 分配器（[`heap`]）保留为未来后端。
+//! 3. 可选的 alloc adapter（feature `alloc`）：Core 在 create 前经
+//!    `kcomp_runtime_init` 选择 KernelNative 共享堆或实例私有 C 分配器。
+//!    同一个镜像的 `Vec` / `Box` 不需要判断执行域。
 //!
 //! 其余模块：typed [`endpoint`]、flat [`frame`] 视图、[`block`]（契约 + provider
 //! wrapper + Core 在 bind 时选定的 Direct / Gate 调用后端）、[`scheduler`]
@@ -28,11 +28,12 @@
 //!
 //! # alloc adapter
 //!
-//! `#[global_allocator]` 把 Rust `GlobalAlloc` 契约路由到 **KernelNative 共享堆**
-//!（Core 的 `kcore_heap_alloc/dealloc`）：KernelNative 组件与 Core 同特权、同地址
+//! `#[global_allocator]` 经镜像内的部署 adapter 路由。KernelNative 使用 Core
+//! 的 `kcore_heap_alloc/dealloc`：组件与 Core 同特权、同地址
 //! 空间，共享同一个 Core 堆——这是部署形态决定的窄后端，不是通用 / 跨域内存 ABI
 //!（Isolated / Sandboxed 的装载显式拒绝这两个符号；它们用 [`heap`] 的 freestanding
 //! C 分配器放在自己的可写 image 里，backing 经 `kcore_memory_acquire/release` 取）。
+//! Isolated 已接通；Sandboxed 的运行时选择有 host 验证，组件执行后端尚未实现。
 //! 见 `docs/architecture/memory-and-heap.md` §6。默认关闭，组件按需通过
 //! `kcomp-sdk = { path = "...", features = ["alloc"] }` 开启；Core 侧非法 layout /
 //! 耗尽返回 null，adapter 绝不 panic。

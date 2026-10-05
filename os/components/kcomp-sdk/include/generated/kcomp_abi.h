@@ -10,6 +10,22 @@
 extern "C" {
 #endif
 
+/* Core 在业务 create 前交付的部署后端；只在初始化调用期间借用。
+ * domain 使用 ExecutionDomain 的整数编码。仅 KernelNative 交付共享堆的
+ * 窄 C ABI 地址（alloc(size, align)，dealloc(ptr, size, align)）；私有域两个地址
+ * 必须为零，SDK 使用镜像内的私有分配器。不是分配器内部状态或跨域权限。 */
+struct kcomp_runtime {
+    uint32_t domain;
+    uint32_t reserved;
+    size_t heap_alloc;
+    size_t heap_dealloc;
+};
+#if __SIZEOF_POINTER__ == 8
+_Static_assert(sizeof(struct kcomp_runtime) == 24, "kcomp_runtime layout drift on RV64");
+#else
+_Static_assert(sizeof(struct kcomp_runtime) == 16, "kcomp_runtime layout drift on RV32");
+#endif
+
 /* `kcomp_instance_create` 的参数：仅在调用期间借用。
  * `config` 必须拷贝后才能持久化；Core 视其为不透明字节。 */
 struct KcompCreateArgs {
@@ -68,6 +84,11 @@ enum KcompInterfaceKind {
  * 边界与值。组件必须定义 `const uint64_t kcomp_abi = ...;`——SDK 的
  * `kcomp_instance_create!` 宏会发出该定义（值 = Rust 镜像的 `KCOMP_ABI`）。 */
 extern const uint64_t kcomp_abi;
+
+/* 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
+ * 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
+ * 组件业务不判断执行域；不携带 SDK 的无堆组件可省略此入口。 */
+int32_t kcomp_runtime_init(const struct kcomp_runtime *runtime);
 
 /* 组件实例创建入口（组件导出，Core 调用）。返回 0 / `-errno`。
  * Core 调用前把 `*out_state` 初始化为 NULL；成功时组件写入自己完成的 state 指针，
@@ -281,10 +302,12 @@ uint64_t kcore_timebase_hz(void);
 /* -- Memory resource（域视图，无账本） -- */
 /* 取一段内存 backing，返回本执行域访问窗口（kind = KCORE_MEMORY_VIEW_LOCAL_VA）：
  * min_len > 0、min_align 为非零 2 的幂；成功时 view.len >= min_len，首次交付零初始化。
- * 无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。 */
+ * 无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。
+ * KernelNative 给共享 AS 的 VA；Isolated 给实例私有 VA；Sandboxed 直调返回 ENOTSUP。 */
 int32_t kcore_memory_acquire(uint64_t min_len, uint64_t min_align, struct kcore_memory_view *out_view);
 /* 交回一个 kcore_memory_acquire 交付的 view，把 backing 归还分配器。
- * KernelNative 受信操作；(base, len) 必须与 acquire 一致。 */
+ * KernelNative 受信操作；(base, len) 必须与 acquire 一致。
+ * Isolated 按私有 AS 精确映射释放动态 backing，调用方保证无继续借用；不释放 image/stack。 */
 int32_t kcore_memory_release(const struct kcore_memory_view *view);
 /* -- KernelNative heap backend（KernelNative 部署后端；Isolated import 拒绝） -- */
 /* KernelNative 部署后端：从 Core 共享堆分配（size / align 同 Rust GlobalAlloc）。
@@ -391,7 +414,8 @@ int32_t kcore_endpoint_validate(uint64_t endpoint, uint64_t contract, uint64_t a
 int32_t kcore_endpoint_bind(uint64_t endpoint, uint64_t contract, uint64_t abi, uint32_t *out_mechanism, size_t *out_api, size_t *out_ctx);
 /* 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
  * *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
- * 执行（per-call 栈 / provider principal / re-entry 与 IRQ 门禁 / panic containment）。 */
+ * 执行（provider 域内栈 / principal / re-entry 与 IRQ 门禁 / panic containment）。
+ * K/I caller 均支持；I 出站经 Core 栈/root 桥接与扁平缓冲搬运。Sandbox 未实现。 */
 int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args, size_t args_len, const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len, int32_t *out_status);
 /* -- Console / observation -- */
 /* 轮询诊断 console。字节 0..255；无输入 -EAGAIN。无输入时做一次有界 idle 等待，caller 可 yield 后重试。 */
@@ -433,11 +457,11 @@ int32_t kcore_user_discard(uint32_t task);
  * - **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
  * - **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
  * - **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。用 `BlockDeviceService` 发布的 provider 由 SDK 统一挡下（provider 不会被调用）；手写 table 的 provider 需自行保证同语义。
- * - **buffer（临时契约）**：`buf` 是裸指针，实现要求它指向 **Core 可见 RAM**（v1 无 IOMMU：设备地址 == 物理地址 == 虚拟地址）。
+ * - **buffer**：Direct 接口的 `buf` 指向 Core 可见 RAM；Gate 前端接受 caller 本域切片，Isolated 出站由 Core 搬运为共享 Core 缓冲，provider 只在同步调用内借用。
  * 
  * # `buf` 裸指针是刻意的临时选择（不是最终设计）
  * 
- * 按 AGENTS.md，"裸指针只来自 Core 派生并持有 provenance 的 typed Lease"——裸指针本身不是 authority。这里直接收裸指针，是因为 consumer 侧"分配 DMA-able 内存"的窄接口**尚不存在**，v1 只有这一种可行形状。**一旦出现跨执行域的调用方，该参数必须换成 Core 派生的 DMA lease / handle**（那时裸地址不再能证明 buffer 归属与设备可达性）；在那之前它只是暂时够用。
+ * 裸指针只是本次调用的访问表示，不是内存 authority。跨 AS 的 Gate 不把 caller 私有指针交给 provider，而由 Core 搬运扁平输入/输出字节。此 CPU transport 不构成 DMA mapping 或 DMA 静默证明；硬件 provider 仍须用 Core 的 DMA allocation/mapping 机制管理设备可达 backing，不能保留调用缓冲。
  * 
  * 契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size / ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。 */
 struct kcomp_block_device_api {

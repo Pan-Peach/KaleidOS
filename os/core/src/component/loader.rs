@@ -94,6 +94,8 @@ pub struct LoadedComponent {
     /// **可选**的 `kcomp_service_dispatch` 已重定位地址（组件不提供 endpoint
     /// 服务时为 `None`；加载不因此失败）。
     pub service_dispatch: Option<usize>,
+    /// Optional SDK deployment initialization entry.
+    pub runtime_init: Option<usize>,
     /// 装载镜像大小（放段结果）。
     pub text_size: usize,
     /// 已校验的 `kcomp_abi` 值（必等于 [`KCOMP_ABI`]）。
@@ -127,6 +129,8 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     // 可选入口：缺失合法（组件不提供 endpoint 服务）。
     let dispatch_offset =
         symbol_offset(&object, symbol_table, b"kcomp_service_dispatch", STT_FUNC)?;
+
+    let runtime_offset = symbol_offset(&object, symbol_table, b"kcomp_runtime_init", STT_FUNC)?;
 
     let image_memory = memory::alloc_region(image_size).map_err(|_| LoaderError::OutOfMemory)?;
     let base = image_memory.region().base;
@@ -162,11 +166,14 @@ pub fn load_component(blob: &[u8]) -> Result<LoadedComponent, LoaderError> {
     let abi = read_abi(image, base, &seg_place, abi_offset)?;
     let service_dispatch = resolve_optional_dispatch(&object, &seg_place, base, dispatch_offset)?;
 
+    let runtime_init = resolve_optional_dispatch(&object, &seg_place, base, runtime_offset)?;
+
     Ok(LoadedComponent {
         base,
         create,
         destroy,
         service_dispatch,
+        runtime_init,
         text_size: image_size,
         abi,
         memory: Some(image_memory),

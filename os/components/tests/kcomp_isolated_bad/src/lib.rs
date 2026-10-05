@@ -42,7 +42,7 @@ pub extern "C" fn kcomp_instance_destroy(_state: *mut ()) -> i32 {
 
 /// 精确契约指纹（手工锚定，与 `abi/component.toml` 的 `KCOMP_ABI` 同值）。
 #[unsafe(no_mangle)]
-pub static kcomp_abi: u64 = 0x9D73_405B_B2F8_16C0;
+pub static kcomp_abi: u64 = 0x47AF_93E6_21B8_D054;
 
 /// 组件私有 panic handler：存在只为满足链接前提，且**刻意不引 `kcore_*`**
 /// （空 import 包络——拒绝点必须是放段，不是 import 门禁）。

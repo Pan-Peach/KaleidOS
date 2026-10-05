@@ -210,6 +210,9 @@ pub fn run(info: &MachineInfo) -> ! {
         b"isolated-core-direct" => isolated_tests::isolated_core_direct(),
         // Isolated 生命周期（生产 create → Ready → destroy）。
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
+        b"isolated-heap" => isolated_tests::isolated_heap(),
+        b"isolated-domain-service" => isolated_tests::isolated_domain_service(),
+        #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle" => isolated_tests::isolated_lifecycle(),
         #[cfg(all(feature = "supervisor", feature = "vm-mmu"))]
         b"isolated-lifecycle-fail" => isolated_tests::isolated_lifecycle_fail(),
@@ -252,7 +255,7 @@ pub fn run(info: &MachineInfo) -> ! {
 }
 
 fn panic_containment() -> ! {
-    use kernel::component::containment::{call_component_create, CallOutcome, KcompCreateArgs};
+    use kernel::component::containment::{CallOutcome, KcompCreateArgs, call_component_create};
     let args = KcompCreateArgs::empty();
     let mut state: *mut () = core::ptr::null_mut();
     match call_component_create(
