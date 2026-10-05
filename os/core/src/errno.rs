@@ -155,6 +155,9 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::StoreNotMounted => Errno::ENODEV,
             ComponentLoadError::NotFound => Errno::ENOENT,
             ComponentLoadError::ReadFailed => Errno::EIO,
+            ComponentLoadError::Loader(crate::component::loader::LoaderError::OutOfMemory) => {
+                Errno::ENOMEM
+            }
             ComponentLoadError::Loader(_) => Errno::ENOEXEC,
             ComponentLoadError::DeclareFailed => Errno::EEXIST,
             ComponentLoadError::ResolveFailed => Errno::ENOENT,
@@ -523,6 +526,7 @@ mod tests {
             ComponentLoadError::NotFound,
             ComponentLoadError::ReadFailed,
             ComponentLoadError::Loader(LoaderError::BadMagic),
+            ComponentLoadError::Loader(LoaderError::OutOfMemory),
             ComponentLoadError::DeclareFailed,
             ComponentLoadError::ResolveFailed,
             ComponentLoadError::StartFailed,
@@ -548,6 +552,7 @@ mod tests {
                 ComponentLoadError::StoreNotMounted => Errno::ENODEV,
                 ComponentLoadError::NotFound => Errno::ENOENT,
                 ComponentLoadError::ReadFailed => Errno::EIO,
+                ComponentLoadError::Loader(LoaderError::OutOfMemory) => Errno::ENOMEM,
                 ComponentLoadError::Loader(_) => Errno::ENOEXEC,
                 ComponentLoadError::DeclareFailed => Errno::EEXIST,
                 ComponentLoadError::ResolveFailed => Errno::ENOENT,

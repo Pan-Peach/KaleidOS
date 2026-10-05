@@ -29,6 +29,9 @@ CASES = (
     ("target", "TARGET", "exit", 7, ("fresh",)),
     ("timer", "TIMER", "exit", 0, ()),
 )
+# Excluded from the ordinary guest manifest and the Linux reference run: this
+# probe depends on a fresh guest's limited physical RAM, not Linux brk policy.
+PRESSURE_CASES = (("oom", "OOM", "exit", 0, ()),)
 
 
 def inspect(binary, needs_bss):
@@ -76,7 +79,7 @@ def main():
              "# fault values are RISC-V synchronous scause; build metadata only; guest results are in CoreTest/QEMU logs"]
     # Concurrent kernel/lint builds must never observe missing or partial ELF.
     with tempfile.TemporaryDirectory(prefix=".exec-build-", dir=args.out) as staging:
-        for name, define, completion, expected, argv in CASES:
+        for name, define, completion, expected, argv in CASES + PRESSURE_CASES:
             binary = (args.out / name).resolve()
             staged = Path(staging) / name
             subprocess.run([
@@ -87,7 +90,8 @@ def main():
             ], check=True)
             inspect(staged, name == "stack-bss")
             staged.replace(binary)
-            lines.append(f"{name} {completion} {expected} {name} {argv[0] if argv else '-'}")
+            if name != "oom":
+                lines.append(f"{name} {completion} {expected} {name} {argv[0] if argv else '-'}")
             print(f"{name}: BUILT (no guest result asserted)")
         staged_manifest = Path(staging) / "manifest.txt"
         staged_manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")

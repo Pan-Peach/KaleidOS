@@ -119,6 +119,7 @@ pub enum MapError {
     /// 不支持的操作显式拒绝，绝不静默降级。
     Unsupported,
     BackendFailed,
+    OutOfMemory,
 }
 
 /// 私有 AS 一次进入准备阶段的失败。
@@ -257,6 +258,9 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
     pub fn add_shared(&mut self, mapping: Mapping) -> Result<(), MapError> {
         self.ensure_ready()?;
         self.validate(&mapping)?;
+        self.shared
+            .try_reserve(1)
+            .map_err(|_| MapError::OutOfMemory)?;
         let (va, pa, perm) = mapping.backend_parts();
         self.backend
             .map(va, pa, perm)
@@ -333,6 +337,7 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
                 permission: entry.permission,
             });
             removed += remove.size;
+            cuts.try_reserve(1).map_err(|_| MapError::OutOfMemory)?;
             cuts.push(Cut {
                 index,
                 remove,
@@ -343,6 +348,11 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         if cuts.is_empty() {
             return Ok(0);
         }
+        // Each cut replaces one record with at most two. Reserve all growth
+        // before unmapping; the record edits below never allocate.
+        self.shared
+            .try_reserve(cuts.len())
+            .map_err(|_| MapError::OutOfMemory)?;
 
         // 后端先撤（失败不触碰真相），再从后往前切真相记录。
         for cut in &cuts {
@@ -351,14 +361,13 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
                 .map_err(|_| MapError::BackendFailed)?;
         }
         for cut in cuts.into_iter().rev() {
-            let mut replacement: alloc::vec::Vec<Mapping> = alloc::vec::Vec::new();
-            if let Some(left) = cut.left {
-                replacement.push(left);
-            }
+            self.shared.remove(cut.index);
             if let Some(right) = cut.right {
-                replacement.push(right);
+                self.shared.insert(cut.index, right);
             }
-            self.shared.splice(cut.index..=cut.index, replacement);
+            if let Some(left) = cut.left {
+                self.shared.insert(cut.index, left);
+            }
         }
         Ok(removed)
     }
@@ -500,6 +509,9 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
     pub fn map(&mut self, mapping: Mapping) -> Result<(), MapError> {
         self.ensure_ready()?;
         self.validate(&mapping)?;
+        self.mappings
+            .try_reserve(1)
+            .map_err(|_| MapError::OutOfMemory)?;
         let (va, pa, perm) = mapping.backend_parts();
         self.backend
             .map(va, pa, perm)
@@ -583,7 +595,11 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         }
     }
 
-    pub fn create(&mut self, owner: ComponentId, backend: B) -> AddressSpaceHandle {
+    pub fn create(
+        &mut self,
+        owner: ComponentId,
+        backend: B,
+    ) -> Result<AddressSpaceHandle, MapError> {
         self.adopt(owner, backend, alloc::vec::Vec::new())
     }
 
@@ -600,13 +616,16 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
         owner: ComponentId,
         backend: B,
         mappings: alloc::vec::Vec<Mapping>,
-    ) -> AddressSpaceHandle {
+    ) -> Result<AddressSpaceHandle, MapError> {
+        self.spaces
+            .try_reserve(1)
+            .map_err(|_| MapError::OutOfMemory)?;
         let id = AddressSpaceId::from_raw(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.checked_add(1).ok_or(MapError::OutOfMemory)?;
         let mut space = KernelAddressSpace::new(id, 1, owner, backend);
         space.adopt_mappings(mappings);
         self.spaces.push(space);
-        self.spaces.last().unwrap().handle()
+        Ok(self.spaces.last().unwrap().handle())
     }
 
     /// 只读访问所有地址空间（用于 inspect / monitor）。
@@ -847,7 +866,7 @@ mod active {
                 .map_err(|_| MapError::BackendFailed)?;
         crate::memory::kernel_mappings::with_shared_mappings(|shared| {
             let mut spaces = SPACES.lock();
-            let handle = spaces.create(owner, backend);
+            let handle = spaces.create(owner, backend)?;
             for mapping in shared {
                 if let Err(error) = spaces.add_shared(handle, mapping) {
                     let _ = spaces.retire(handle);
@@ -914,14 +933,10 @@ mod active {
     /// 不能再看穿 B 的 backing）。
     pub fn exclude_identity_alias_from_live_spaces(extent: PhysicalRange) -> Result<(), MapError> {
         let mut spaces = SPACES.lock();
-        let handles: alloc::vec::Vec<AddressSpaceHandle> = spaces
-            .spaces()
-            .iter()
-            .filter(|space| space.state() == AddressSpaceState::Ready)
-            .map(|space| space.handle())
-            .collect();
-        for handle in handles {
-            spaces.exclude_identity_alias(handle, &extent)?;
+        for space in &mut spaces.spaces {
+            if space.state() == AddressSpaceState::Ready {
+                space.exclude_identity_alias(&extent)?;
+            }
         }
         Ok(())
     }
@@ -1574,7 +1589,9 @@ mod tests {
     #[test]
     fn mapping_exact_matches_only_the_identical_range() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         let full = VirtualRange {
             base: 0x1000,
             size: 0x3000,
@@ -1628,7 +1645,9 @@ mod tests {
     #[test]
     fn retired_space_rejects_operations_and_translate() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         let range = VirtualRange {
             base: 0x1000,
             size: 0x1000,
@@ -1679,7 +1698,9 @@ mod tests {
     #[test]
     fn prepared_activation_is_a_copy_snapshot_and_never_writes_satp() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         manager.map(handle, mapping(0x1000, 0x1000, rw())).unwrap();
 
         // When：持锁取一次描述符（快照）。
@@ -1719,7 +1740,7 @@ mod tests {
     fn address_space_lifecycle_needs_no_component_execution() {
         let owner = ComponentId::from_raw(0xDEAD_BEEF); // 未声明的身份也无所谓
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(owner, FakeBackend::new());
+        let handle = manager.create(owner, FakeBackend::new()).unwrap();
 
         let range = VirtualRange {
             base: 0x8000,
@@ -1745,11 +1766,13 @@ mod tests {
     fn adopt_registers_existing_backend_with_declared_mappings() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
         let declared = mapping(0x9000, 0x1000, rw());
-        let handle = manager.adopt(
-            ComponentId::from_raw(2),
-            FakeBackend::new(),
-            alloc::vec![declared],
-        );
+        let handle = manager
+            .adopt(
+                ComponentId::from_raw(2),
+                FakeBackend::new(),
+                alloc::vec![declared],
+            )
+            .unwrap();
 
         assert_eq!(
             manager.get(handle).unwrap().owner(),
@@ -1792,7 +1815,9 @@ mod tests {
     };
 
     fn ready_space(manager: &mut AddressSpaceManager<FakeBackend>) -> AddressSpaceHandle {
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
         manager
             .map(
                 handle,
@@ -1830,7 +1855,9 @@ mod tests {
     #[test]
     fn prepare_transition_accepts_a_shared_executable_entry() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
         // 共享高半区入口（RWX 的 identity RAM 也覆盖它，但类为 SharedCore）。
         let shared_entry = Mapping {
             virtual_range: VirtualRange {
@@ -1864,7 +1891,9 @@ mod tests {
     #[test]
     fn prepare_transition_requires_executable_entry_and_writable_stack() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
         // RW（无 X）→ 拒绝；未映射地址 → 同样拒绝。
         manager.map(handle, mapping(ENTRY, VM_PAGE, rw())).unwrap();
         manager
@@ -1881,7 +1910,9 @@ mod tests {
 
         // 只读栈 → 拒绝；部分覆盖 → 仍拒绝。
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
         manager
             .map(
                 handle,
@@ -1904,7 +1935,9 @@ mod tests {
         );
 
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
         manager
             .map(
                 handle,
@@ -1932,7 +1965,9 @@ mod tests {
     #[test]
     fn prepare_transition_rejects_invalid_stack_shape() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(7), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(7), FakeBackend::new())
+            .unwrap();
 
         let empty = VirtualRange {
             base: STACK.base,
@@ -1992,7 +2027,9 @@ mod tests {
     #[test]
     fn private_map_cannot_overlap_shared_core_mapping() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         let shared = mapping(0x8000_0000, 4 * VM_PAGE, rw());
         manager.add_shared(handle, shared).unwrap();
         assert_eq!(
@@ -2018,7 +2055,9 @@ mod tests {
     #[test]
     fn exclude_identity_alias_carves_the_extent_then_allows_private_mapping() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         let shared = mapping(0x8000_0000, 4 * VM_PAGE, rw());
         manager.add_shared(handle, shared).unwrap();
 
@@ -2079,7 +2118,9 @@ mod tests {
     #[test]
     fn exclude_identity_alias_rejects_a_real_alias_leak() {
         let mut manager: AddressSpaceManager<FakeBackend> = AddressSpaceManager::empty();
-        let handle = manager.create(ComponentId::from_raw(1), FakeBackend::new());
+        let handle = manager
+            .create(ComponentId::from_raw(1), FakeBackend::new())
+            .unwrap();
         // VA 高半区，PA 落在 RAM：不是 identity 映射。
         let shared = Mapping {
             virtual_range: VirtualRange {

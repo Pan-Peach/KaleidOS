@@ -56,11 +56,15 @@ pub enum PlanError {
     Overlap,
     /// 排除范围与非 identity 共享映射的物理范围重叠（真实别名泄漏）。
     PrivateAliasesShared,
+    OutOfMemory,
 }
 
 impl From<PlanError> for crate::memory::address_space::MapError {
-    fn from(_: PlanError) -> Self {
-        crate::memory::address_space::MapError::Unsupported
+    fn from(error: PlanError) -> Self {
+        match error {
+            PlanError::OutOfMemory => Self::OutOfMemory,
+            _ => Self::Unsupported,
+        }
     }
 }
 
@@ -139,6 +143,9 @@ impl KernelMappingPlan {
                 return Err(PlanError::PrivateAliasesShared);
             }
         }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| PlanError::OutOfMemory)?;
         self.entries.push(PlanEntry { class, mapping });
         Ok(())
     }
@@ -166,6 +173,9 @@ impl KernelMappingPlan {
                 return Err(PlanError::PrivateAliasesShared);
             }
         }
+        self.exclusions
+            .try_reserve(1)
+            .map_err(|_| PlanError::OutOfMemory)?;
         self.exclusions.push(extent);
         Ok(())
     }
@@ -211,6 +221,9 @@ impl KernelMappingPlan {
             let start = pr.base.max(extent.base);
             let stop = (pr.base + pr.size).min(end);
             if start < stop {
+                mappings
+                    .try_reserve(1)
+                    .map_err(|_| PlanError::OutOfMemory)?;
                 mappings.push(slice_identity_piece(entry.mapping, start, stop - start));
             }
         }
@@ -219,26 +232,34 @@ impl KernelMappingPlan {
 
     /// 生成要落进一个 Isolated AS 的共享映射集合：`SharedCore` / `Device` 原样，
     /// `SharedIdentity` 按已发布私有 extent **切段**（不覆盖任何私有字节）。
-    pub fn shared_mappings(&self) -> Vec<Mapping> {
+    pub fn shared_mappings(&self) -> Result<Vec<Mapping>, PlanError> {
         let mut out = Vec::new();
         for entry in &self.entries {
             match entry.class {
                 MappingClass::CoreRootOnly => {}
-                MappingClass::SharedCore | MappingClass::Device => out.push(entry.mapping),
+                MappingClass::SharedCore | MappingClass::Device => {
+                    out.try_reserve(1).map_err(|_| PlanError::OutOfMemory)?;
+                    out.push(entry.mapping);
+                }
                 MappingClass::SharedIdentity => {
-                    let mut pieces = alloc::vec![entry.mapping];
+                    let mut pieces = Vec::new();
+                    pieces.try_reserve(1).map_err(|_| PlanError::OutOfMemory)?;
+                    pieces.push(entry.mapping);
                     for exclusion in &self.exclusions {
                         let mut next = Vec::new();
                         for piece in pieces {
+                            next.try_reserve(2).map_err(|_| PlanError::OutOfMemory)?;
                             subtract_identity(piece, *exclusion, &mut next);
                         }
                         pieces = next;
                     }
+                    out.try_reserve(pieces.len())
+                        .map_err(|_| PlanError::OutOfMemory)?;
                     out.extend(pieces);
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -296,11 +317,12 @@ pub fn install(plan: KernelMappingPlan) -> bool {
 }
 
 /// 取共享映射快照（没有安装计划 = 空；绝不伪造共享映射）。
-pub fn shared_mappings() -> Vec<Mapping> {
+pub fn shared_mappings() -> Result<Vec<Mapping>, super::address_space::MapError> {
     PLAN.lock()
         .as_ref()
         .map(KernelMappingPlan::shared_mappings)
-        .unwrap_or_default()
+        .unwrap_or_else(|| Ok(Vec::new()))
+        .map_err(Into::into)
 }
 
 /// Keep root construction in the same transaction as backing publication and
@@ -312,12 +334,14 @@ pub fn shared_mappings() -> Vec<Mapping> {
         any(target_arch = "riscv32", target_arch = "riscv64")
     )
 ))]
-pub(crate) fn with_shared_mappings<T>(build: impl FnOnce(Vec<Mapping>) -> T) -> T {
+pub(crate) fn with_shared_mappings<T>(
+    build: impl FnOnce(Vec<Mapping>) -> Result<T, super::address_space::MapError>,
+) -> Result<T, super::address_space::MapError> {
     let slot = PLAN.lock();
     let shared = slot
         .as_ref()
         .map(KernelMappingPlan::shared_mappings)
-        .unwrap_or_default();
+        .unwrap_or_else(|| Ok(Vec::new()))?;
     let result = build(shared);
     drop(slot);
     result
@@ -339,8 +363,13 @@ pub fn publish_private_backing(
     let granule = super::ALLOC_GRANULE;
     let mut slot = PLAN.lock();
     if let Some(plan) = slot.as_mut() {
-        plan.exclude(extent, granule)
-            .map_err(|_| MapError::Unaligned)?;
+        plan.exclude(extent, granule).map_err(|error| {
+            if error == PlanError::OutOfMemory {
+                MapError::OutOfMemory
+            } else {
+                MapError::Unaligned
+            }
+        })?;
     }
     // Lock order is PLAN → SPACES, shared by root construction and release.
     let result = address_space::exclude_identity_alias_from_live_spaces(extent);
@@ -357,7 +386,13 @@ pub fn release_private_backing(
     use super::address_space::{self, MapError};
     let mut slot = PLAN.lock();
     if let Some(plan) = slot.as_mut() {
-        let mappings = plan.restoration(extent).map_err(|_| MapError::NotMapped)?;
+        let mappings = plan.restoration(extent).map_err(|error| {
+            if error == PlanError::OutOfMemory {
+                MapError::OutOfMemory
+            } else {
+                MapError::NotMapped
+            }
+        })?;
         for mapping in mappings {
             address_space::restore_identity_alias_to_live_spaces(mapping)?;
         }
@@ -416,10 +451,11 @@ mod tests {
         assert!(plan.is_excluded(second));
         assert!(
             plan.shared_mappings()
+                .unwrap()
                 .iter()
                 .any(|m| m.virtual_range.base == first.base)
         );
-        assert!(!plan.shared_mappings().iter().any(|m| {
+        assert!(!plan.shared_mappings().unwrap().iter().any(|m| {
             m.virtual_range.base <= second.base
                 && second.base < m.virtual_range.base + m.virtual_range.size
         }));
@@ -507,7 +543,7 @@ mod tests {
         )
         .unwrap();
 
-        let shared = plan.shared_mappings();
+        let shared = plan.shared_mappings().unwrap();
         assert_eq!(shared.len(), 3);
         assert_eq!(shared[0], mapping(0xffff_0000, 0x8020_0000, 2 * PAGE));
         assert_eq!(shared[1], mapping(0x8000_0000, 0x8000_0000, 8 * PAGE));
@@ -544,7 +580,7 @@ mod tests {
             size: PAGE
         }));
 
-        let shared = plan.shared_mappings();
+        let shared = plan.shared_mappings().unwrap();
         // identity 段被切成两段；Core 固定映射原样。
         assert_eq!(shared.len(), 3);
         assert_eq!(shared[0], mapping(0x8000_0000, 0x8000_0000, PAGE));
@@ -591,8 +627,8 @@ mod tests {
         )
         .unwrap();
 
-        let a = plan.shared_mappings();
-        let b = plan.shared_mappings();
+        let a = plan.shared_mappings().unwrap();
+        let b = plan.shared_mappings().unwrap();
         assert_eq!(a, b, "计划是确定性的：相同排除 → 相同共享映射");
         for m in &a {
             assert_eq!(

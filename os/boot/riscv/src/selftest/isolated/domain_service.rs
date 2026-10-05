@@ -10,10 +10,10 @@ mod block {
     ));
 }
 use kernel::component::{
-    ComponentState, call,
+    call,
     containment::KcompCreateArgs,
     endpoint::{self, ExecutionDomain},
-    exit, load, registry,
+    exit, load, registry, ComponentState,
 };
 
 fn create(domain: ExecutionDomain, provider: u32, mode: u32, seed: u32, relay: u32) -> ComponentId {
@@ -113,12 +113,10 @@ pub(crate) fn isolated_domain_service() -> ! {
         let reg = registry::get_registry().lock();
         assert_eq!(reg.get(provider).unwrap().state, ComponentState::Failed);
         assert_eq!(reg.active_calls(provider), 0);
-        assert!(
-            endpoint::get_endpoints()
-                .lock()
-                .resolve(&reg, old_endpoint)
-                .is_err()
-        );
+        assert!(endpoint::get_endpoints()
+            .lock()
+            .resolve(&reg, old_endpoint)
+            .is_err());
         drop(reg);
         exit::stop_component(caller).unwrap();
     }

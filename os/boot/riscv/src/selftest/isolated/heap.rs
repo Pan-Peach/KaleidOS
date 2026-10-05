@@ -1,7 +1,7 @@
 //! One allocation-using artifact, two deployments and independent private heaps.
 use super::*;
 use kernel::component::{
-    ComponentState, containment::KcompCreateArgs, endpoint::ExecutionDomain, exit, load, registry,
+    containment::KcompCreateArgs, endpoint::ExecutionDomain, exit, load, registry, ComponentState,
 };
 
 fn create(domain: ExecutionDomain, seed: u8) -> ComponentId {

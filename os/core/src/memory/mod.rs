@@ -68,7 +68,8 @@ pub enum MemoryError {
 /// **唯一的 RAII 分配属主**：拥有 `region` 这段物理区域的占用（buddy 块）。
 ///
 /// 它不是"借用 / 引用计数 pin"：没有 clone、没有共享计数，`Drop` 时把区域
-/// 整体归还 buddy heap。谁持有它，谁就独占这段物理内存；`forget` 即保活。
+/// 整体归还 buddy heap；已发布且不支持撤销的 backing 可显式设为常驻。
+/// 谁持有它，谁就独占这段物理内存；`forget` 同样保活。
 /// DMA backing 用 `Option<MemoryLease>` 承载这份占用，回收时 move 进 Core 私有
 /// `QUARANTINE`（见 `resource/dma.rs`）。
 ///
@@ -78,9 +79,16 @@ pub enum MemoryError {
 pub(crate) struct MemoryLease {
     region: PhysicalRange,
     order: usize,
+    resident: bool,
 }
 
 impl MemoryLease {
+    /// Publication can partially remove shared aliases even on error. Without
+    /// a completed alias restoration, Drop must never recycle this backing.
+    pub(crate) fn retain_on_drop(&mut self) {
+        self.resident = true;
+    }
+
     pub(crate) const fn region(&self) -> PhysicalRange {
         self.region
     }
@@ -98,7 +106,9 @@ impl MemoryLease {
 
 impl Drop for MemoryLease {
     fn drop(&mut self) {
-        let _ = release_region(self.region, self.order);
+        if !self.resident {
+            let _ = release_region(self.region, self.order);
+        }
     }
 }
 
@@ -222,6 +232,7 @@ pub(crate) fn alloc_region(size: usize) -> Result<MemoryLease, MemoryError> {
             size: 1usize << order,
         },
         order,
+        resident: false,
     })
 }
 
@@ -343,6 +354,23 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_backing_is_not_recycled_by_drop() {
+        let _g = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let mut lease = alloc_region(ALLOC_GRANULE).unwrap();
+        let region = lease.region();
+        let occupied = free_block_counts();
+        lease.retain_on_drop();
+        drop(lease);
+        assert_eq!(free_block_counts(), occupied);
+        let next = alloc_region(ALLOC_GRANULE).unwrap();
+        assert_ne!(next.region(), region, "resident pages must not be reused");
+        drop(next);
+        // This test never published an alias exclusion; explicit cleanup is safe.
+        free_region_raw(region.base, region.size).unwrap();
+    }
 
     #[test]
     fn init_region_alloc_and_free() {

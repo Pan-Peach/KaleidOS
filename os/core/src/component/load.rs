@@ -388,7 +388,10 @@ pub(crate) fn read_artifact(name: &[u8]) -> Result<alloc::vec::Vec<u8>, Componen
         .iter()
         .find(|e| e.name.as_slice() == kname.as_slice())
         .ok_or(ComponentLoadError::NotFound)?;
-    let mut blob = alloc::vec![0u8; entry.len];
+    let mut blob = alloc::vec::Vec::new();
+    blob.try_reserve_exact(entry.len)
+        .map_err(|_| ComponentLoadError::Loader(LoaderError::OutOfMemory))?;
+    blob.resize(entry.len, 0);
     store
         .read(&kname, &mut blob)
         .map_err(|_| ComponentLoadError::ReadFailed)?;

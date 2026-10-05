@@ -533,12 +533,6 @@ mod imp {
             // 防御：buddy 对 2 的幂请求必须原样返回（lease 随 Drop 归还）。
             return Err(ComponentLoadError::StartFailed);
         }
-        // 别名排除：Core 预置窗口是组件私有的——先摘掉所有活着的 Isolated root
-        // 里该 extent 的 identity 别名，再映射进本实例 AS。
-        crate::memory::kernel_mappings::publish_private_backing(
-            crate::memory::address_space::PhysicalRange { base, size },
-        )
-        .map_err(map_space_error)?;
         // 首次交付零初始化（与 `kcore_memory_acquire` 同一契约）。
         // SAFETY: base/size 来自 alloc_region；v1 identity / low-alias 视图下
         // 物理地址可写（与 loader / isolated_load 的放段方式相同）。
@@ -550,6 +544,16 @@ mod imp {
         };
         match address_space::map(handle, mapping) {
             Ok(()) => {
+                // Map first, publish second. A failed map has no exclusion to
+                // undo. A failed publication may already have removed aliases;
+                // unmap the private window and conservatively retain its pages.
+                if let Err(error) =
+                    crate::memory::kernel_mappings::publish_private_backing(mapping.physical_range)
+                {
+                    let _ = address_space::unmap(handle, &range);
+                    core::mem::forget(lease);
+                    return Err(map_space_error(error));
+                }
                 // backing 归该实例的 AS（页表即记录）；显式 release 走 unmap + free。
                 core::mem::forget(lease);
                 Ok(())

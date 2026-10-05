@@ -449,6 +449,7 @@ _test-init-rv32:
 
 _test-init-one: kernel rootfs
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario fat
+	@if [ "$(KCFG_ARCH)" = rv64 ]; then python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario oom; fi
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario no-block
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) --rootfs $(ROOTFS) --scenario bad-fat
 

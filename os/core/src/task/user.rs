@@ -48,6 +48,11 @@ fn protected_mappings(
         let finish = start + mapping.virtual_range.size;
         let cut_start = start.max(base);
         let cut_end = finish.min(end);
+        // Reserve before pushing: user-controlled memory pressure is ENOMEM,
+        // never a Core-critical allocator panic. An overlap adds at most 3 pieces.
+        result
+            .try_reserve(if cut_start < cut_end { 3 } else { 1 })
+            .map_err(|_| Errno::ENOMEM)?;
         if cut_start >= cut_end {
             result.push(*mapping);
             continue;
@@ -131,6 +136,9 @@ mod implementation {
             if !valid_mapping(base, len, flags) {
                 return Err(Errno::EINVAL);
             }
+            // Metadata must fit before either physical allocation or PTE commit.
+            self.mappings.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+            self.backing.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
             let lease = memory::alloc_region(len).map_err(|_| Errno::ENOMEM)?;
             unsafe { core::ptr::write_bytes(lease.base() as *mut u8, 0, lease.size()) };
             let permission = Permission::from_bits_retain(flags as u8) | Permission::USER;
@@ -142,7 +150,10 @@ mod implementation {
                 },
                 permission,
             };
-            spaces::map(self.space, mapping).map_err(|_| Errno::EINVAL)?;
+            spaces::map(self.space, mapping).map_err(|error| match error {
+                spaces::MapError::OutOfMemory | spaces::MapError::BackendFailed => Errno::ENOMEM,
+                _ => Errno::EINVAL,
+            })?;
             self.mappings.push(mapping);
             self.backing.push(lease);
             Ok(())
@@ -176,6 +187,7 @@ mod implementation {
                 let physical = spaces::translate(self.space, address)
                     .map_err(|_| Errno::EFAULT)?
                     .ok_or(Errno::EFAULT)?;
+                chunks.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
                 chunks.push((physical, count));
                 offset += count;
             }
@@ -397,7 +409,11 @@ mod implementation {
 
     /// # Safety
     /// frame must be the live frame supplied by the Arch trap hook on this CPU.
-    pub(crate) unsafe fn on_trap(frame: *mut arch::riscv::trap::TrapFrame, cause: usize, address: usize) -> bool {
+    pub(crate) unsafe fn on_trap(
+        frame: *mut arch::riscv::trap::TrapFrame,
+        cause: usize,
+        address: usize,
+    ) -> bool {
         let trap = unsafe { &*frame };
         if trap.status & 0x100 != 0 {
             return false;
@@ -478,6 +494,12 @@ mod implementation {
         {
             return Err(Errno::EINVAL);
         }
+        table
+            .get_mut(current)
+            .unwrap()
+            .retired_user
+            .try_reserve(1)
+            .map_err(|_| Errno::ENOMEM)?;
         let mut source = table.remove(staged).map_err(Errno::from)?;
         let target = table.get_mut(current).unwrap();
         let old = target.user.replace(source.user.take().unwrap()).unwrap();

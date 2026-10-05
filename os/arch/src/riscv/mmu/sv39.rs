@@ -1,5 +1,4 @@
 use crate::vm::{MappingPermission, PageAlloc, PhysicalRange, VirtualRange};
-use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
@@ -144,9 +143,11 @@ impl Sv39PageTable {
     /// - `alloc_page()` 失败（内存耗尽）时映射为 `MapError::Exhausted`。
     /// - root 页同时压入 `frames` 保活，后续销毁时可统一回收。
     pub fn new(alloc_page: PageAlloc) -> Result<Self, MapError> {
+        let mut frames = Vec::new();
+        frames.try_reserve(1).map_err(|_| MapError::Exhausted)?;
         let page = alloc_page().map_err(|_| MapError::Exhausted)?;
         let root_ppn = page >> 12;
-        let frames = vec![page];
+        frames.push(page);
         Ok(Self {
             root_ppn,
             frames,
@@ -193,6 +194,9 @@ impl Sv39PageTable {
                 return Ok(pte);
             }
             if !pte.is_valid() {
+                self.frames
+                    .try_reserve(1)
+                    .map_err(|_| MapError::Exhausted)?;
                 let page = (self.alloc_page)().map_err(|_| MapError::Exhausted)?;
                 self.frames.push(page);
                 // page 是物理地址；new_table_pa(pa) 内部会 >>12，这里不要再移。

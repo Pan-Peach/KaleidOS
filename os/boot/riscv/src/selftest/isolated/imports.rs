@@ -41,12 +41,12 @@ unsafe fn direct_slot(window_pa: usize, index: usize) -> usize {
 /// 直接 Core import：创建 `kcomp_isolated_direct` → Ready → 组件在私有 AS 里
 /// 直接调用支持面内的 Core 导出 → 上报（`satp` = 实例 root）→ destroy 执行。
 pub(crate) fn isolated_direct_imports() -> ! {
-    use kernel::component::ComponentState;
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
+    use kernel::component::ComponentState;
 
     let core_satp = read_satp();
     let id = match load::create_component(

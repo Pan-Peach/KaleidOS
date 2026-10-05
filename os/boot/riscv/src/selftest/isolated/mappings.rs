@@ -37,7 +37,7 @@ pub(crate) fn isolated_shared_mappings() -> ! {
     if !address_space::isolation_capable() {
         fail("isolated-shared-mappings: no private address space backend");
     }
-    let shared = kernel::memory::kernel_mappings::shared_mappings();
+    let shared = kernel::memory::kernel_mappings::shared_mappings().expect("shared mapping plan");
     if shared.is_empty() {
         fail("isolated-shared-mappings: boot installed no shared Core mappings");
     }

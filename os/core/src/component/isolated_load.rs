@@ -390,18 +390,9 @@ fn place_at(
         .map_err(IsolatedLoadError::Loader)?
         .ok_or(IsolatedLoadError::Loader(LoaderError::MissingAbi))?;
 
-    let region = memory::alloc_region(image_size)
+    let mut region = memory::alloc_region(image_size)
         .map_err(|_| IsolatedLoadError::Loader(LoaderError::OutOfMemory))?;
-    // 别名排除：镜像 backing 是组件私有的——从所有活着的 Isolated root 里摘掉它
-    // 的 identity 别名，并排除出后续 root 的共享计划（常驻 extent 跨逻辑重启保留）。
     let physical_base = region.base();
-    crate::memory::kernel_mappings::publish_private_backing(
-        crate::memory::address_space::PhysicalRange {
-            base: physical_base,
-            size: region.size(),
-        },
-    )
-    .map_err(IsolatedLoadError::Map)?;
     // SAFETY: region 刚从 buddy heap 独占分配，长度 = image_size；identity/low-alias
     // 视图在目标由 boot 建立，host 测试里就是宿主指针——与 KernelNative loader 的
     // 既有放段方式相同（`loader.rs::load_component`）。
@@ -462,6 +453,12 @@ fn place_at(
         }
         None => None,
     };
+    // All image validation precedes publication: rejected images can be freed
+    // without leaving alias exclusions. Published images remain resident even
+    // if publication or a later lifecycle step fails (phase 1 contract).
+    region.retain_on_drop();
+    crate::memory::kernel_mappings::publish_private_backing(region.region())
+        .map_err(IsolatedLoadError::Map)?;
     Ok(PlacedImage {
         base,
         create,
@@ -686,8 +683,7 @@ mod tests {
     /// 真实夹具：段按权限分类放段，每段独占页范围（页级权限分离）。
     #[test]
     fn places_fixture_with_page_separated_permissions() {
-        // 放段分配 backing，且 image 在用例结束时才释放：GUARD 必须覆盖整个
-        // 用例（不能只在 helper 内取锁后把 lease 带出来）。
+        // 放段分配并发布常驻 backing：GUARD 覆盖整个物理堆测试。
         let _guard = test_support::GUARD.lock();
         test_support::ensure_init();
         let image = place(ISOLATED_KCOMP).expect("kcomp_isolated must place");
@@ -785,6 +781,19 @@ mod tests {
         assert_eq!(loaded.text_size, text_size);
         assert_eq!(loaded.abi, abi);
         assert!(loaded.memory.is_some(), "lease 必须随转换转移给组件记录");
+    }
+
+    #[test]
+    fn published_image_remains_resident_after_owner_drop() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let image = place(ISOLATED_KCOMP).unwrap();
+        let region = image.region.region();
+        let occupied = memory::free_block_counts();
+        drop(image.into_loaded_component());
+        assert_eq!(memory::free_block_counts(), occupied);
+        // Host tests have no installed shared plan or live AS; cleanup is safe.
+        memory::free_region_raw(region.base, region.size).unwrap();
     }
 
     /// 放段是确定性的；换基址只平移 VA（重定位按域重算），偏移不变。
@@ -888,7 +897,39 @@ mod tests {
             .expect("fixture must have a non-executable ALLOC section");
         patch_symbol_shndx(&mut patched, b"kcomp_service_dispatch", data as u16)
             .expect("fixture defines the dispatcher symbol");
+        let free_before = memory::free_block_counts();
         assert_eq!(place(&patched), Err(IsolatedLoadError::EntryNotExecutable));
+        assert_eq!(
+            memory::free_block_counts(),
+            free_before,
+            "rejected image backing is reusable"
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_init_outside_an_executable_segment_without_publishing() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let mut patched = SVC_KCOMP.to_vec();
+        let data = ElfObject::parse(&patched)
+            .unwrap()
+            .sections()
+            .iter()
+            .position(|section| section.is_alloc() && !section.is_exec())
+            .unwrap();
+        patch_symbol_shndx(&mut patched, b"kcomp_service_dispatch", data as u16).unwrap();
+        // This import-free fixture supplies a function symbol we can rename to
+        // exercise the optional runtime entry's post-relocation validation.
+        let name = b"kcomp_service_dispatch\0";
+        let at = patched
+            .windows(name.len())
+            .position(|bytes| bytes == name)
+            .unwrap();
+        patched[at..at + name.len()].fill(0);
+        patched[at..at + b"kcomp_runtime_init".len()].copy_from_slice(b"kcomp_runtime_init");
+        let free_before = memory::free_block_counts();
+        assert_eq!(place(&patched), Err(IsolatedLoadError::EntryNotExecutable));
+        assert_eq!(memory::free_block_counts(), free_before);
     }
 
     /// `kcomp_service_dispatch` 夹具：真实定义了该入口的 `.kcomp` 按域放段
@@ -931,9 +972,15 @@ mod tests {
 
         let mut patched = ISOLATED_KCOMP.to_vec();
         patched[file_offset..file_offset + 8].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+        let free_before = memory::free_block_counts();
         assert_eq!(
             place(&patched),
             Err(IsolatedLoadError::Loader(LoaderError::AbiMismatch))
+        );
+        assert_eq!(
+            memory::free_block_counts(),
+            free_before,
+            "bad ABI must not publish its backing"
         );
     }
 
@@ -1070,7 +1117,7 @@ mod tests {
     /// 没有私有 AS 能力（host / NoMMU）→ `map_into` 显式拒绝，绝不静默落映射。
     #[test]
     fn map_into_rejects_profiles_without_private_address_space() {
-        // image 在用例结束时释放：GUARD 必须覆盖整个用例。
+        // 放段操作访问物理堆：GUARD 必须覆盖整个用例。
         let _guard = test_support::GUARD.lock();
         test_support::ensure_init();
         let image = place(ISOLATED_KCOMP).expect("kcomp_isolated must place");

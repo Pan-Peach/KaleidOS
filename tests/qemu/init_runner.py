@@ -16,14 +16,16 @@ def main():
     parser.add_argument("--arch", required=True, choices=sorted(runner.ARCH_CONF))
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--rootfs", required=True)
-    parser.add_argument("--scenario", choices=["fat", "no-block", "bad-fat"], default="fat")
+    parser.add_argument("--scenario", choices=["fat", "no-block", "bad-fat", "oom"], default="fat")
     args = parser.parse_args()
+    if args.scenario == "oom" and args.arch != "rv64":
+        parser.error("the user memory pressure probe requires RV64")
     os.makedirs(runner.BUILD_DIR, exist_ok=True)
     os.makedirs(runner.LOGS_DIR, exist_ok=True)
     disks = []
     if args.scenario != "no-block":
         disk = os.path.join(runner.BUILD_DIR, f"init-{args.arch}-{args.scenario}.img")
-        if args.scenario == "fat":
+        if args.scenario in ("fat", "oom"):
             shutil.copyfile(args.rootfs, disk)
         else:
             runner.make_disk(disk)
@@ -35,7 +37,12 @@ def main():
                                  ("PROTECT.ELF", "protect")]:
             subprocess.run(["mcopy", "-o", "-i", disks[0],
                             os.path.join("build/exec-fixtures", source), "::/"+filename], check=True)
-    conf = runner.ARCH_CONF[args.arch]
+    if args.scenario == "oom":
+        subprocess.run(["mcopy", "-o", "-i", disks[0],
+                        "build/exec-fixtures/oom", "::/OOM.ELF"], check=True)
+    conf = dict(runner.ARCH_CONF[args.arch])
+    if args.scenario == "oom":
+        conf["mem"] = "128M"
     proc = subprocess.Popen(
         runner.qemu_command(conf, os.path.abspath(args.kernel), disks),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -66,11 +73,13 @@ def main():
             # Partial composition is visible; monitor can still start a console.
             command("load ksh", ["load ksh: OK", "KaleidOS ksh"])
         else:
-            stage = "init: FAT root mounted" if args.scenario == "fat" else \
+            stage = "init: FAT root mounted" if args.scenario in ("fat", "oom") else \
                 "init: no block device; console session only"
             expect([stage, "[boot] init: ready", "KaleidOS ksh"])
             command("inspect init", ["Domain:   KernelNative", "State:    Ready"])
-            if args.scenario == "fat":
+            if args.scenario == "oom":
+                command("exec 0:/OOM.ELF", ["OOM_RECOVERED", "exec: exit=0"])
+            elif args.scenario == "fat":
                 command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
                 command("cat 0:/DOCS/ABOUT.TXT", ["KaleidOS test fixture:"])
                 if args.arch == "rv64":
@@ -90,10 +99,12 @@ def main():
                 command("cat 0:/HELLO.TXT", ["cat: no filesystem provider"])
                 command("exec missing", ["exec: ENODEV"])
             # init is a boot-anchor composer, not an application launched by ksh.
-            command("load init", ["load init: EINVAL"])
+            command("load init", ["load init: ENOMEM" if args.scenario == "oom" else "load init: EINVAL"])
         command("echo INIT_SERIAL_OK", ["\nINIT_SERIAL_OK"])
         command("exit", ["ksh: exit"])
-        command("unload ksh", ["unload ksh: OK"])
+        # Published user backing stays resident in phase 1. At exhaustion,
+        # destroy cannot acquire its Core-owned call stack; reject gracefully.
+        command("unload ksh", ["DestroyFailed(-12)" if args.scenario == "oom" else "unload ksh: OK"])
         runner.send(proc, "shutdown\n")
         try:
             proc.wait(timeout=10)

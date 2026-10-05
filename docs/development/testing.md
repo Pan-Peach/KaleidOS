@@ -76,6 +76,10 @@ make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scaus
 CoreTest 的私有 profile 叠加 `configs/monitor.fragment`，避免默认 init 提前认领设备。
 `tests/qemu/init_runner.py` 另用普通 board profile 检查 boot → init → FAT root → ksh
 的用户流程，以及无盘 / 坏盘分支；使用独立磁盘副本，未把断言塞入生产 init。
+RV64 另在全新 128 MiB guest 中运行 `exec_probe/oom.S`：耗尽 `brk` backing 后，
+`mprotect` 必须返回 `ENOMEM`、保留原有可写映射；程序正常退出后，再次装载组件
+须返回 `ENOMEM`，shell 继续响应。
+该探针不进入普通 exec corpus 或 Linux 参考测试，避免把硬件内存压力带入其它用例。
 
 - 同一事实只在一个层次证明，避免三层重复断言。
 

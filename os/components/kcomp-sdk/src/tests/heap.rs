@@ -161,6 +161,46 @@ fn heap_alloc_splits_and_free_coalesces() {
 // 对齐 / 溢出 / OOM
 // ---------------------------------------------------------------------------
 
+arena!(ARENA_ALIGN_FREE, 8192);
+backing_fn!(backing_align_free, POOL_ALIGN_FREE, 4096, true);
+
+#[test]
+fn aligned_allocations_return_the_entire_block_on_free() {
+    let heap = unsafe { Heap::place(ARENA_ALIGN_FREE.base(), 8192, backing_align_free) };
+    for _ in 0..16 {
+        let first = unsafe { (*heap).alloc(1, 16) };
+        let second = unsafe { (*heap).alloc(1, 16) };
+        assert!(!first.is_null() && !second.is_null());
+        unsafe {
+            (*heap).free(second);
+            (*heap).free(first);
+        }
+        let whole = unsafe { (*heap).alloc(8100, 8) };
+        assert!(!whole.is_null(), "alignment padding must coalesce too");
+        unsafe { (*heap).free(whole) };
+    }
+    assert_eq!(POOL_ALIGN_FREE.calls.load(Ordering::Relaxed), 0);
+}
+
+arena!(ARENA_ALIGN_REALLOC, 8192);
+backing_fn!(backing_align_realloc, POOL_ALIGN_REALLOC, 4096, true);
+
+#[test]
+fn aligned_realloc_preserves_the_entire_payload() {
+    let heap = unsafe { Heap::place(ARENA_ALIGN_REALLOC.base(), 8192, backing_align_realloc) };
+    let original = unsafe { (*heap).alloc(64, 64) };
+    assert!(!original.is_null());
+    unsafe { core::ptr::write_bytes(original, 0xa5, 64) };
+    let grown = unsafe { (*heap).realloc(original, 128, 64) };
+    assert!(!grown.is_null());
+    assert_eq!(grown as usize % 64, 0);
+    assert_eq!(
+        unsafe { core::slice::from_raw_parts(grown, 64) },
+        &[0xa5; 64]
+    );
+    unsafe { (*heap).free(grown) };
+}
+
 arena!(ARENA_ALIGN, 65536);
 backing_fn!(backing_align, POOL_ALIGN, 4096, false);
 

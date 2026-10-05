@@ -22,11 +22,11 @@ use super::{fail, pass};
 use arch::Timer;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel::component::ComponentId;
 use kernel::component::isolated::{
     self, ComponentFault, FaultDecision, IsolatedPrepareError, Outcome, PreparedTransition,
 };
 use kernel::component::isolated_load::{self, PlacedImage, PlacedSegment};
+use kernel::component::ComponentId;
 use kernel::memory::address_space::{
     self, AddressSpaceHandle, Mapping, MappingPermission, PhysicalRange, VirtualRange,
 };

@@ -164,13 +164,13 @@ pub(crate) fn isolated_config_reject() -> ! {
 /// （已由 create-entry 故障用例证明）；本用例钉住拒绝判据本身 + "拒绝不动
 /// 真相"。
 pub(crate) fn isolated_prepare_reject() -> ! {
-    use kernel::component::ComponentState;
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::isolated::{self, IsolatedPrepareError};
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
+    use kernel::component::ComponentState;
     use kernel::memory::address_space::{self, MapError, VirtualRange};
 
     let core_satp = read_satp();
@@ -296,12 +296,12 @@ pub(crate) fn isolated_prepare_reject() -> ! {
 /// （与优雅停止同一纪律）；**绝不自动重试析构**
 /// （第二次 stop 被状态机拒绝，destroy 计数不变）。
 pub(crate) fn isolated_destroy_fault() -> ! {
-    use kernel::component::ComponentStopError;
     use kernel::component::containment::KcompCreateArgs;
     use kernel::component::endpoint::ExecutionDomain;
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
+    use kernel::component::ComponentStopError;
     use kernel::errno::Errno;
     use kernel::memory::address_space;
 
@@ -413,7 +413,6 @@ pub(crate) fn isolated_destroy_fault() -> ! {
 /// （`EndpointDead` / ENOENT），provider **从未再次执行**（窗口计数不变），
 /// AS 仍退役、inflight 未泄漏、Core satp 不变。
 pub(crate) fn isolated_stale_access() -> ! {
-    use kernel::component::ComponentState;
     use kernel::component::abi::InterfaceAbi;
     use kernel::component::call::{self, CallError};
     use kernel::component::endpoint::{
@@ -422,6 +421,7 @@ pub(crate) fn isolated_stale_access() -> ! {
     use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
+    use kernel::component::ComponentState;
     use kernel::errno::Errno;
     use kernel::memory::address_space::{self, MapError};
 

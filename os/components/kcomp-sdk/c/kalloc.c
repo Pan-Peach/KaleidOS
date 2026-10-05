@@ -224,6 +224,7 @@ void *kcomp_heap_alloc(void *heap_ptr, size_t size, size_t align) {
             } else {
                 /* 前缀太小：吸收进分配块（块首仍是 block，free 按 pad 找回）。 */
                 header->pad = pad;
+                alloc_size += pad;
             }
             if (rest >= MIN_BLOCK) {
                 kcomp_block *remainder =

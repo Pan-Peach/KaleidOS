@@ -255,7 +255,7 @@ pub fn run(info: &MachineInfo) -> ! {
 }
 
 fn panic_containment() -> ! {
-    use kernel::component::containment::{CallOutcome, KcompCreateArgs, call_component_create};
+    use kernel::component::containment::{call_component_create, CallOutcome, KcompCreateArgs};
     let args = KcompCreateArgs::empty();
     let mut state: *mut () = core::ptr::null_mut();
     match call_component_create(

@@ -136,11 +136,14 @@ pub struct Sv32PageTable {
 
 impl Sv32PageTable {
     pub fn new(alloc_page: PageAlloc) -> Result<Self, MapError> {
+        let mut frames = Vec::new();
+        frames.try_reserve(1).map_err(|_| MapError::Exhausted)?;
         let page = alloc_page().map_err(|_| MapError::Exhausted)?;
         let root_ppn = page >> 12;
+        frames.push(page);
         Ok(Self {
             root_ppn,
-            frames: alloc::vec![page],
+            frames,
             alloc_page,
         })
     }
@@ -170,6 +173,9 @@ impl Sv32PageTable {
                 return Ok(pte);
             }
             if !pte.is_valid() {
+                self.frames
+                    .try_reserve(1)
+                    .map_err(|_| MapError::Exhausted)?;
                 let page = (self.alloc_page)().map_err(|_| MapError::Exhausted)?;
                 self.frames.push(page);
                 *pte = Pte::new_table_pa(page);

@@ -127,6 +127,7 @@ Isolated 初始化入口与 create 一样经私有 AS trampoline 调用，描述
 - **KernelNative**：runtime 初始化取得 Core 共享堆窄 C ABI；普通对象分配无 owner 账本。显式 backing acquire/release 仍是受信 region 操作。
 - **IsolatedNative**：支持 `kcore_memory_acquire/release` import；Core 从调用身份选择实例 AS，在动态 backing 窗口提议空闲 VA 并重新验证映射。SDK 在实例内放置、增长和串行访问私有堆。Core 只存 region 映射，不记录 malloc 对象。
 - **别名与复用**：发布私有 backing 时，从所有 Ready Isolated root 摘除其 identity 别名；以后创建的 root 也排除它。显式 release 撤销精确私有映射、恢复原共享别名后才归还物理 extent。root 创建与排除/恢复共用事务锁，避免安装过期快照。每次跨 AS 进入仍用 ASID 0 + 全量 flush；尚无私有 AS 的 SMP 任务调度或通用远端 TLB shootdown。
+- **装载失败**：镜像的重定位、ABI 与入口校验全部通过后才发布私有 backing；校验失败直接归还未发布区域。发布可能部分移除别名，因此从发布尝试开始 image backing 就保持驻留，后续声明或映射失败也不经 `Drop` 回收。预置窗口先映射再发布；映射失败可直接归还，发布失败则撤销私有窗口并保留 backing。
 - **SandboxedNative**：runtime 私有分配器选择有 host 测试；组件 loader / ecall / destroy 仍未实现，创建显式 `-ENOTSUP`。未来通过窄 ecall memory mechanism 获取用户 VA；不得将 Core export 表或原生输出指针直接交给 U-mode。
 - **验证**：host 测试驱动真实 C allocator / runtime；ArchTest `isolated-heap` 在 RV64/RV32 使用同一个 `kcomp_heap.kcomp` 验证 K/I 部署、Rust 与 C 分配、扩容、显式 backing release、并发实例互不干扰与全新实例重启。
 - **回收边界**：普通 free 归还实例 free list。runtime 当前没有 region list，不自动归还整块空闲堆 backing；停止/失败后的 image、heap backing 与页表页保持驻留。完整物理回收留给 drain / DMA 静默和 AS teardown。
