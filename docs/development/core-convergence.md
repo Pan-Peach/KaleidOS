@@ -107,3 +107,34 @@ ComponentId 注释不再暗示已存在 requires resolver、凭证 token 或 Res
 
 本阶段 `make test-host`、RV64 boot-build、RV32 boot-check 成功；纯 Core host
 507 passed / 5 ignored。构建使用系统 host linker，避免本机 Nix cc / glibc 混用。
+
+## Phase 3：形态验证与实验发现
+
+`tests/kcomp_checksum` 是一个 test-only 镜像，不是通用 Runtime crate。同一 create
+入口读取 config，所有模式只拥有普通 ComponentId、opaque state 与 owned Task：
+
+| 形态 | 状态 / 执行 | 实际验证 |
+|---|---|---|
+| Passive A/B | 两个实例，各有独立 mailbox / Direct counter，零 Task | task 总数不变、ctx / mailbox 不同、A 调用不改 B；发布后 Stop EBUSY，旧 ctx 仍可用 |
+| Active | 一个 provider-owned Worker，单槽 Runtime Request/Reply | 64 次原子发布与回复、拒绝覆盖已预留槽；业务请求不进入 Core |
+| Hybrid | 同一个 state / endpoint / Worker；同时 Direct checksum 与 Runtime 请求 | 64 次 Worker 回复与 64 次 Direct 调用；RV64 Worker CPU1 / Consumer CPU0，RV32 同 CPU 协作 |
+| Gate-only probe | 零 owned Task，api=NULL | RV64 consumer Task 在 CPU1 执行 provider Gate，CPU0 Stop EBUSY 且 Ready；释放后 Stop 成功、旧 endpoint 拒绝、重新创建身份不同 |
+
+mailbox 的 C-layout u32 全部用 AtomicU32::from_ptr；Acquire/Release 发布请求 / 回复，
+计数独立原子更新。不输出 Rust atomic layout，不为组件自动造锁框架。
+Consumer 对 provider Worker 执行 unpark 得到 EACCES，Direct 不改变 Task owner。
+Worker 的 exit 是组件自己的决定，退出不销毁实例；Direct 发布的实例与 state 驻留。
+
+B/C 只使用现有 Task / yield；没有 Core RequestId、队列、reply 或 waitqueue。
+原型限定单 consumer、一个请求槽与受信 Native 共享地址空间；错误路径有超时。
+跨 owner wake、通用取消 / Task join 和私有域 Worker 尚不可据此宣称完成。
+
+实验实际发现 RR 的旧“cursor += 1，取候选下标模 N”在候选排除 outgoing 时会饿死
+三个 Runnable 中的一个。修复仅在 scheduler_rr：原有每 CPU 游标保存上次 TaskId，
+选择升序候选的后继、尾部绕回。不改 Core 候选 / 提交 / 调度 ABI，不新增状态。
+原型仍保留三个同时 Runnable 的任务，没有通过顺序停止 Worker 绕过问题。
+Host 的动态候选回归检查与真实 RV32 Hybrid 场景均通过。
+
+ArchTest `isolated-domain-service` 原来要求 Native Direct provider 可销毁，现在验证
+DirectExports 拒绝；Isolated destroy / satp 恢复仍真实执行。ksh endpoints smoke 检查
+驻留 FS 的 Live，而不依赖被拒绝的 unload 产生 Invalid；stale 由生命周期用例证明。

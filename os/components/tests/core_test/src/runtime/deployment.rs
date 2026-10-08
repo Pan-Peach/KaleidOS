@@ -46,7 +46,7 @@ fn relay(provider: u32, target: u32) -> bool {
     binding.write(u64::MAX - 1, &input).is_ok()
 }
 
-fn state(id: u32) -> Option<u32> {
+pub(super) fn state(id: u32) -> Option<u32> {
     let mut name = [0; 64];
     let mut ordinal = 0;
     while let Some(info) = management::component_nth(ordinal, &mut name).ok()? {

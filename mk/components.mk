@@ -6,7 +6,7 @@ HOST_FIXTURE_RUST := tests/core_test tests/kcomp_smoke tests/kcomp_heap \
                      tests/kcomp_domain_service tests/kcomp_min tests/kcomp_isolated \
                      tests/kcomp_isolated_life tests/kcomp_isolated_svc tests/kcomp_isolated_bad \
                      tests/kcomp_isolated_direct tests/kcomp_isolated_unsupported
-GUEST_FIXTURE_RUST := tests/kcomp_smp tests/kcomp_panic tests/drivers/ram_blk tests/drivers/ram_blk_rw
+GUEST_FIXTURE_RUST := tests/kcomp_smp tests/kcomp_panic tests/kcomp_checksum tests/drivers/ram_blk tests/drivers/ram_blk_rw
 # kcomp_min pins relocation layout for host tests; it is not a guest scenario.
 TEST_RUST := $(filter-out tests/kcomp_min,$(HOST_FIXTURE_RUST)) $(GUEST_FIXTURE_RUST)
 TEST_C := tests/kcomp_c_smoke

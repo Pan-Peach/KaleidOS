@@ -5,7 +5,7 @@
 
 ## 组件 crates
 
-实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`、`init`、`ksh`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smp`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 定义初始编排者 `BOOT_COMPONENT`。
+实际目录（`os/components/`）：生产组件 —— `driver_prober`、`drivers/`、`filesystems/`、`kbench`、`kcomp-sdk`、`scheduler_rr`、`init`、`ksh`；test-only fixture 统一在 `tests/` —— `core_test`、`kcomp_c_smoke`、`kcomp_isolated`、`kcomp_isolated_bad`、`kcomp_isolated_life`、`kcomp_isolated_svc`、`kcomp_min`、`kcomp_panic`、`kcomp_smp`、`kcomp_checksum`、`kcomp_smoke`、`drivers/ram_blk`、`drivers/ram_blk_rw`；`Kconfig` 定义初始编排者 `BOOT_COMPONENT`。
 
 **test-only 与生产的分界**：test-only fixture / 组件一律放 `os/components/tests/`；`.kcomp` 名取目录 basename（`load <basename>`），所以搬路径不改组件名，`load core_test` / `load kcomp_c_smoke` 等运行时契约不变。
 
@@ -26,6 +26,7 @@
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
 | `kcomp_panic` | `os/components/tests/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
+| `kcomp_checksum` | `os/components/tests/kcomp_checksum/` | Rust `.kcomp` | 同一 create 入口的 Passive / Active / Hybrid 与 Gate-only 准入探针；私有 C-layout mailbox / 原子同步；CoreTest 唯一编排，见 [测试指南](../development/testing.md#component-形态与-stop-准入实验) |
 | `kcomp_smp` | `os/components/tests/kcomp_smp/` | Rust `.kcomp` | CoreTest 的独立任务 panic 被测对象；普通 SMP 任务与所有断言在 core_test 内 |
 | `kcomp_isolated` | `os/components/tests/kcomp_isolated/` | Rust `.kcomp` | **零依赖 / 零 import** 的 ArchTest fixture：text/rodata/data/bss + 控制页协议，供按域装载与页级权限强制用例在私有 AS 里执行 |
 | `kcomp_isolated_bad` | `os/components/tests/kcomp_isolated_bad/` | Rust `.kcomp` | **放段失败** fixture：合法 `.kcomp`（过 packer 契约 + import 白名单）但带一个 17 MiB 零初始化段，超出按域装载的实例镜像窗口 → `isolated_load::place` 显式拒绝（`SegmentOutsideWindow`），供 `isolated-load-reject` 证明「放段失败在声明组件 / 创建 AS 之前」 |

@@ -42,7 +42,7 @@ CoreTest 验证公开组件接口的集成契约，ArchTest 验证实际硬件�
 - 每个 Core 新功能：**先写 host test，再写实现**（至少同 PR 提交）。
 - **对抗性测试与功能测试同等重要**：Core 的"拒绝错误提案"行为必须显式测试。
   - 目标类别：double free / wrong owner / stale 资源身份 / invalid task transition / duplicate claim / illegal map / invalid scheduler proposal；
-  - 已落地子集：重复 `device_claim` → `-EBUSY`、quarantine 后再 claim → `-EBUSY`、仍有 live IRQ route / DMA mapping 时 `device_release` → `-EBUSY`、非 owner `irq_register` / `dma_map` → `-EACCES`、顺序错误 → `-EINVAL`、ordinal 越界 → `-ENOENT`、stale mapping id → `-ENOENT`。
+  - 已落地子集：重复 `device_claim` → `-EBUSY`、quarantine 后再 claim → `-EBUSY`、仍有 live IRQ route / DMA mapping 时 `device_release` → `-EBUSY`、非 owner `irq_register` → `-EACCES`、顺序错误 → `-EINVAL`、ordinal 越界 → `-ENOENT`、stale mapping id → `-ENOENT`。
 - **同一 artifact 多组件的独立 backing（关键不变量）**：host `same_artifact_loads_produce_independent_components`（同名 artifact 连续 load 两次 → 两个 `ComponentId`、独立常驻 backing、镜像区间不重叠、`.data` / `.bss` 不共享）；CoreTest `driver-multi-device`（第二个同 artifact `virtio_blk` 组件独立 attach 第二台设备，RV64+RV32）；ArchTest `isolated-restart`（同 artifact 的并发 Isolated 组件各自独立私有 AS / backing）。
 - Core 的 API 每多一个，就多一份必须验证的承诺——这反过来约束 Core 词汇表保持最小。
 
@@ -123,7 +123,7 @@ host 调度集成用例失败时会 fail-fast，并用 RAII 清理全局任务/�
 
 - **IRQ 电平触发**：`external-irq` 用 UART **THRE** 拉线；**先 claim 再关设备源**——先关 `IER` 会让 PLIC pending 随电平撤销，claim 取到 0。
 - **身份模型限制**：`ComponentId` 只在单个 `Registry` 实例内唯一，trace ring 是进程 / 整机全局；断言锚在"本组件刚加载的 `ComponentId` + 该次 load 前的游标"，这是当前身份模型允许的最强形式（全局唯一 ComponentId / boot epoch 未做）。
-- **DMA 归属**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是该设备 owner。**未决**：组件可 claim PLIC 等设备（"认领一台设备 = 拿到它的全部语义，含控制其他设备的中断线"），该边界问题无人回答，记录而非"修"。
+- **DMA 归属**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 当前按 device owner 记账，受信 Native Direct 路径不检查 ambient caller；unmap 无 caller 校验，普通借入 buffer 未 pin。详见 driver-model §6.3；不得声称已经验证私有域 DMA 权限。**未决**：组件可 claim PLIC 等设备（"认领一台设备 = 拿到它的全部语义，含控制其他设备的中断线"），该边界问题无人回答，记录而非"修"。
 - 未来工具链：CHESS / Test Scheduler / Hunt Mode（确定性并发）、Kani / Loom / Miri / Verus（模型检查 / UB / 演绎验证）、FSCQ（FS 崩溃一致性）。见 `references.md`。
 
 ## SMP 组件执行验证
@@ -146,3 +146,21 @@ ArchTest 的 isolated 用例保留私有 AS、实际 backing、satp 恢复、访
 销毁故障与回收现场的证据。当前公开 create 固定 KernelNative，load 只支持默认配置，
 且没有 stop ABI；需要指定 Isolated config 或检查销毁现场的用例仍由 ArchTest 承担。
 这些约束不能靠测试后门绕过。
+
+## Component 形态与 Stop 准入实验
+
+CoreTest `runtime/convergence.rs` 编排 test-only `kcomp_checksum`，同一 artifact / create
+入口的 config 选择 Passive、Active、Hybrid，所有实例仍使用 ComponentId 与普通 Task。
+两个 Passive 实例不创建任务；Active / Hybrid 各拥有一个 Worker。请求 / 回复是组件
+私有单槽协议，不经 Core 业务队列；所有共享 C-layout u32 只用原子访问。
+每种 Worker 完成 64 次回复，Hybrid 同时执行 64 次 Direct checksum；RV64 跨 CPU，
+RV32 单 CPU 协作运行。Consumer 错误 unpark provider-owned task 必须 EACCES。
+
+同一 fixture 的 Gate-only 模式没有 Worker / Direct 表。RV64 CPU1 在 consumer Task
+内执行 Gate，CPU0 Stop 返回 EBUSY 且仍 Ready；返回后 Stop 成功，旧 endpoint 拒绝，
+重新创建获得新身份。host 的 128 轮 begin_call/begin_stop 竞争只证明锁和状态机，
+QEMU 场景才证明真实双 CPU 在途调用。命令为 `make test-qemu`。
+
+Worker 使用已有 yield，错误路径有有限超时；没有跨 owner 的 wake、通用取消、Task
+join 或私有域 Worker 能力。这不是生产 RPC runtime。Direct 发布后 ctx 保留，停止
+Worker 不代表销毁实例；完整证据与未通过路径见 [收敛审计](core-convergence.md)。

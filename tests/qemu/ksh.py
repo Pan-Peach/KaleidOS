@@ -23,7 +23,7 @@ def run(proc, collect, send, failure, fatal_markers):
     command("echo KSH_SERIAL_OK", ["\nKSH_SERIAL_OK"])
     command("help", ["load <artifact> [native|isolated]", "cat <provider-relative-path>"])
     command("components", ["KernelNative", "Ready"])
-    command("endpoints", ["CONTRACT", "filesystem", "Invalid"])
+    command("endpoints", ["CONTRACT", "filesystem", "Live"])
     command("devices", ["DEVICE ID", "\n0"])
     command("inspect ksh.kcomp", ["Format:   KCOMP (loaded component)", "Domain:   KernelNative", "State:    Ready"])
     command("load kcomp_c_smoke native", ["load kcomp_c_smoke: OK"])

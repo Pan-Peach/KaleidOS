@@ -17,6 +17,7 @@
 
 mod boot;
 mod c_frontend;
+mod convergence;
 #[cfg(target_arch = "riscv64")]
 mod deployment;
 mod driver;
@@ -45,6 +46,7 @@ use report::Checks;
 /// 使用独立的原子状态，任务全部退出之后才能重置或释放。
 #[repr(C)]
 pub struct State {
+    convergence: convergence::State,
     sched: sched::State,
     filesystem: filesystem::State,
     driver: driver::State,
@@ -121,6 +123,9 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     driver::report(&mut checks, driver_state);
 
     c_frontend::run(&mut checks);
+    convergence::group(&mut checks, unsafe {
+        core::ptr::addr_of_mut!((*state).convergence)
+    });
     #[cfg(target_arch = "riscv64")]
     deployment::group(&mut checks);
     #[cfg(target_arch = "riscv64")]

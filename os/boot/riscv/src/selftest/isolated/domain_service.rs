@@ -89,8 +89,20 @@ pub(crate) fn isolated_domain_service() -> ! {
         verify(caller, 0x51 ^ 3, core_satp);
         verify(provider, 0xce, core_satp);
         assert_eq!(read_satp(), core_satp);
-        for id in [caller, provider] {
-            exit::stop_component(id).unwrap();
+        for (id, domain) in [(caller, caller_domain), (provider, provider_domain)] {
+            if domain == K {
+                // Published Native tables and ctx have no release protocol.
+                assert_eq!(
+                    exit::stop_component(id),
+                    Err(exit::ComponentStopError::DirectExports)
+                );
+                assert_eq!(
+                    registry::get_registry().lock().get(id).unwrap().state,
+                    ComponentState::Ready
+                );
+            } else {
+                exit::stop_component(id).unwrap();
+            }
         }
     }
 
@@ -99,7 +111,11 @@ pub(crate) fn isolated_domain_service() -> ! {
     let relay = create(K, 0, 0, 0x72, leaf.raw());
     let caller = create(I, relay.raw(), 0, 0x72, 0);
     verify(caller, 0x72 ^ 3, core_satp);
-    for id in [caller, relay, leaf] {
+    assert_eq!(
+        exit::stop_component(relay),
+        Err(exit::ComponentStopError::DirectExports)
+    );
+    for id in [caller, leaf] {
         exit::stop_component(id).unwrap();
     }
 
