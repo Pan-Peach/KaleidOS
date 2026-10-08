@@ -113,14 +113,9 @@ impl EndpointId {
     }
 }
 
-/// Endpoint 生命周期状态。
-///
-/// `Pending` 预留给"已预留 id、尚未提交"的路径；当前
-/// [`EndpointRegistry::stage_publish`] 不创建 endpoint，
-/// [`EndpointRegistry::commit_pending`] 直接产出 `Live`。
+/// 已提交 Endpoint 的生命周期状态；staging 不创建 endpoint 身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointState {
-    Pending,
     Live,
     Invalid,
 }
@@ -157,8 +152,6 @@ unsafe impl Sync for EndpointRecord {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractRecord {
     pub id: ContractId,
-    /// 诊断标签：首次建立该契约的发布所用端口名（契约身份 = id + kind + abi）。
-    pub name: Vec<u8>,
     pub kind: InterfaceKind,
     pub abi: InterfaceAbi,
 }
@@ -171,7 +164,6 @@ pub struct ContractRecord {
 pub struct EndpointName {
     pub provider: ComponentId,
     pub name: Vec<u8>,
-    pub contract: ContractId,
     pub endpoint: EndpointId,
 }
 
@@ -282,14 +274,13 @@ pub struct BoundEndpoint {
 ///
 /// ```text
 ///                KernelNative   IsolatedNative   SandboxedNative
-/// KernelNative   Direct         Gate             Gate
-/// Isolated       Gate           Gate (*)         Gate
+/// KernelNative   Direct         Gate             reject
+/// Isolated       Gate           Gate             reject
 /// Sandboxed      reject         reject           reject
 /// ```
 ///
-/// (*) `Isolated ↔ Isolated`：矩阵允许“同一 AS 时 Direct”，但今天**无法证明**
-/// 两个实例共享同一 AS（私有 AS 尚未实现），因此选 Gate——"同 AS 未知"绝不假设
-/// Direct。Sandbox 参与的组合需要 syscall-IPC（未实现）或可证明的同 AS，一律拒绝。
+/// 每个 Isolated 实例有自己的私有 AS，选 Gate。Sandbox transport 未实现，
+/// 涉及 Sandbox 的组合一律在绑定时拒绝。
 ///
 /// **执行模型 / runtime（native machine code vs Wasm）不在本矩阵**——它与执行域
 /// 正交（见 [`ExecutionDomain`] 文档），Wasm 需要单独的维度，不是第四个域。
@@ -301,16 +292,11 @@ pub fn select_mechanism(
     match (caller, provider) {
         // 同域 KernelNative：单一内核 AS + 同特权 → Direct。
         (KernelNative, KernelNative) => Ok(Mechanism::Direct),
-        // K ↔ I / K → S / I → S：同特权（或 Core 经 sret 进入 U）→ Gate。
-        (KernelNative, IsolatedNative)
-        | (IsolatedNative, KernelNative)
-        | (KernelNative, SandboxedNative)
-        | (IsolatedNative, SandboxedNative) => Ok(Mechanism::Gate),
+        // K ↔ I：同特权，跨地址空间。
+        (KernelNative, IsolatedNative) | (IsolatedNative, KernelNative) => Ok(Mechanism::Gate),
         // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
         (IsolatedNative, IsolatedNative) => Ok(Mechanism::Gate),
-        // Sandbox caller：需要 syscall-IPC（未实现）；同 AS 同样无法证明。
-        // Sandbox **作为 callee** 的组合（K→S / I→S）已在上面判为 Gate。
-        (SandboxedNative, _) => Err(BindError::UnsupportedMechanism),
+        (SandboxedNative, _) | (_, SandboxedNative) => Err(BindError::UnsupportedMechanism),
     }
 }
 
@@ -441,10 +427,9 @@ impl EndpointRegistry {
         // 应用阶段（校验已通过，不再有失败）：逐条创建新 endpoint + 发现名。
         for p in staging {
             if !self.contracts.iter().any(|c| c.id == p.contract) {
-                // 首次发布建立契约身份；`name` 只是诊断标签。
+                // 首次发布建立跨 provider 的 ABI 一致性记录。
                 self.contracts.push(ContractRecord {
                     id: p.contract,
-                    name: p.port_name.clone(),
                     kind: p.kind,
                     abi: p.abi,
                 });
@@ -464,7 +449,6 @@ impl EndpointRegistry {
             self.names.push(EndpointName {
                 provider: p.provider,
                 name: p.port_name,
-                contract: p.contract,
                 endpoint: id,
             });
         }
@@ -567,18 +551,10 @@ impl EndpointRegistry {
             .iter()
             .find(|n| n.provider == provider && n.name == port_name)
             .ok_or(EndpointError::EndpointNotFound)?;
-        if name.contract != contract {
+        let record = self.resolve(components, name.endpoint)?;
+        if record.contract != contract {
             return Err(EndpointError::ContractMismatch);
         }
-        let record = self
-            .endpoints
-            .iter()
-            .find(|r| r.id == name.endpoint)
-            .ok_or(EndpointError::EndpointNotFound)?;
-        if record.state != EndpointState::Live {
-            return Err(EndpointError::EndpointDead);
-        }
-        check_owner_live(components, record.owner)?;
         Ok(record.id)
     }
 
@@ -625,7 +601,6 @@ impl EndpointRegistry {
             .find(|name| name.endpoint == record.id)?
             .name;
         let state = match record.state {
-            EndpointState::Pending => WireState::Pending,
             EndpointState::Live => WireState::Live,
             EndpointState::Invalid => WireState::Invalid,
         };
@@ -1216,7 +1191,7 @@ mod tests {
     }
 
     /// `select_mechanism` 覆盖**全部 9 个 (caller, provider) 组合**：
-    /// 同域 KernelNative → Direct；同特权跨域（K↔I、I↔I、K→S、I→S）→ Gate；
+    /// 同域 KernelNative → Direct；同特权跨域（K↔I、I↔I）→ Gate；
     /// Sandbox 参与 → 显式拒绝（**绝不静默降级成 Direct**）。
     ///
     /// 执行模型 / runtime（native vs Wasm）不在矩阵内——它与执行域正交。
@@ -1231,11 +1206,11 @@ mod tests {
         ); 9] = [
             (K, K, Ok(Mechanism::Direct)),
             (K, I, Ok(Mechanism::Gate)),
-            (K, S, Ok(Mechanism::Gate)),
+            (K, S, Err(BindError::UnsupportedMechanism)),
             (I, K, Ok(Mechanism::Gate)),
             // I ↔ I：同特权但同 AS **无法证明** → Gate（绝不假设 Direct）。
             (I, I, Ok(Mechanism::Gate)),
-            (I, S, Ok(Mechanism::Gate)),
+            (I, S, Err(BindError::UnsupportedMechanism)),
             // Sandbox caller 需要 syscall-IPC（未实现）→ 拒绝。
             (S, K, Err(BindError::UnsupportedMechanism)),
             (S, I, Err(BindError::UnsupportedMechanism)),

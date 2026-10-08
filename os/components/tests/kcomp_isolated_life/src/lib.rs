@@ -39,6 +39,11 @@
 
 #![no_std]
 
+// Declaration-only schema mirror: no SDK runtime or new imports.
+#[allow(dead_code)]
+#[path = "../../../kcomp-sdk/src/generated/abi.rs"]
+mod abi;
+
 /// 与 Core 侧 `KcompCreateArgs` 逐字同形（`#[repr(C)]`，Core 视为不透明字节）。
 #[repr(C)]
 pub struct CreateArgs {
@@ -225,7 +230,7 @@ pub extern "C" fn kcomp_instance_destroy(state: *mut ()) -> i32 {
 
 /// 精确契约指纹（手工锚定，与 `abi/component.toml` 的 `KCOMP_ABI` 同值）。
 #[unsafe(no_mangle)]
-pub static kcomp_abi: u64 = 0xB136_5C28_A47D_E092;
+pub static kcomp_abi: u64 = abi::KCOMP_ABI;
 
 /// 组件私有 panic handler：本夹具没有 panic 源，存在只为满足链接前提，且
 /// **刻意不引 `kcore_*`**（空 import 包络）。

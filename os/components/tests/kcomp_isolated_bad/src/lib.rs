@@ -21,6 +21,11 @@
 
 #![no_std]
 
+// Declaration-only schema mirror: no SDK runtime or new imports.
+#[allow(dead_code)]
+#[path = "../../../kcomp-sdk/src/generated/abi.rs"]
+mod abi;
+
 /// 超出实例镜像窗口（16 MiB）的零初始化段：`.bss`（NOBITS）因此 `.kcomp`
 /// 文件本身仍然很小，但按域放段规划出来的段区间装不下。
 #[used]
@@ -42,7 +47,7 @@ pub extern "C" fn kcomp_instance_destroy(_state: *mut ()) -> i32 {
 
 /// 精确契约指纹（手工锚定，与 `abi/component.toml` 的 `KCOMP_ABI` 同值）。
 #[unsafe(no_mangle)]
-pub static kcomp_abi: u64 = 0xB136_5C28_A47D_E092;
+pub static kcomp_abi: u64 = abi::KCOMP_ABI;
 
 /// 组件私有 panic handler：存在只为满足链接前提，且**刻意不引 `kcore_*`**
 /// （空 import 包络——拒绝点必须是放段，不是 import 门禁）。

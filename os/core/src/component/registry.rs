@@ -19,7 +19,7 @@
 //! 不再各自硬编码 `state != X`。非法转换返回 Err（Core 验证后才提交状态，
 //! Policy proposes 原则）。
 //!
-//! `Resolved` = 所有 required Endpoints 都已找到 provider。`Starting` =
+//! `Resolved` = 已完成装载校验、尚未进入 create；当前没有 requires 解析。`Starting` =
 //! 正在执行 `kcomp_instance_create(args, &out_state)`（此期间 `kcore_endpoint_publish`
 //! 只记录 pending，不创建 endpoint）。`finish_start` 由 Core 在 create 返回 0、
 //! Core 记录 `instance_state`、且 pending endpoints 原子提交后调用（见
@@ -162,8 +162,7 @@ impl Registry {
         Ok(())
     }
 
-    /// Declared → Resolved：所有 required Endpoints 已成功绑定。
-    /// 无 requires 的组件同样经过此步（vacuous truth：零依赖 = 已满足）。
+    /// Declared → Resolved：装载校验后的 create 前阶段；不声明已完成依赖解析。
     pub fn resolve(&mut self, id: ComponentId) -> Result<(), RegistryError> {
         self.transition(id, ComponentState::Resolved)
     }

@@ -1,8 +1,6 @@
-//! ComponentId 与 ResourceDomain：组件身份、资源集合、最终回收。
-//! 回收不预设 universal revoke order（graceful shutdown / forced containment 双路径，
-//! 见 docs/architecture/component-model.md §3）：Core 保证 eventual revocation，
-//! 具体设备 shutdown 顺序由组件/驱动决定，不由 ResourceDomain 写死。
-//! ResourceDomain 的实现由人类完成；本模块只提供词汇表占位与 host test 样板。
+//! 唯一组件实例身份、生命周期、装载与调用边界。
+//! ResourceDomain 是资源归属视图，不是另一张表。停止与失败复用归属撤销；
+//! KernelNative 已发布的代码 / ctx 保持驻留，设备静默由驱动负责。
 
 pub mod abi;
 pub(crate) mod backing;
@@ -67,8 +65,8 @@ pub fn is_kernel_native(id: ComponentId) -> bool {
 }
 
 /// 组件身份（M1 最小词汇表）—— **Identity，不是 Authority**。
-/// 由 Core 分配；组件的 ResourceDomain 以 ComponentId 为键记录。
-/// 可被猜测/构造/传递，但真正的操作权限来自 Core 授予的组件凭证（token），
+/// 由 Core 分配；资源与任务记录以 ComponentId 为 owner。
+/// 可被猜测/构造/传递，权限来自 Core 的执行边界与所有权记录，
 /// 任何来自 Component/IPC/Wasm 的 ID 都要过 Core 验证。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComponentId(u32);
@@ -89,8 +87,7 @@ impl ComponentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComponentState {
     Declared,
-    /// 所有 required Endpoints 都已成功绑定。
-    /// 语义：Resolved = 依赖已就位，可以进入初始化。
+    /// 装载校验后、进入 create 前的阶段；当前没有运行期依赖解析器。
     Resolved,
     Starting,
     Ready,

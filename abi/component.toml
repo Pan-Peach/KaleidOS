@@ -236,4 +236,4 @@ doc = """
 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 `kcomp_abi` 符号由入口宏发出。
 """
-targets = "sdk-rust,core-rust"
+targets = "c,sdk-rust,core-rust"

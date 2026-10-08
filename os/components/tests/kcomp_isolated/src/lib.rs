@@ -46,6 +46,11 @@
 
 #![no_std]
 
+// Declaration-only schema mirror: no SDK runtime or new imports.
+#[allow(dead_code)]
+#[path = "../../../kcomp-sdk/src/generated/abi.rs"]
+mod abi;
+
 // 控制页 VA：由 ArchTest 以 R+W 映射进实例 AS（测试夹具 I/O，不是组件资源）。
 const CTL_BASE: usize = 0x3000_0000;
 
@@ -188,7 +193,7 @@ pub extern "C" fn kcomp_instance_destroy(_state: *mut ()) -> i32 {
 /// 精确契约指纹（手工锚定，与 `abi/component.toml` 的 `KCOMP_ABI` 同值：
 /// 与 `abi/component.toml` 协调替换；Core 在装载时逐位校验）。
 #[unsafe(no_mangle)]
-pub static kcomp_abi: u64 = 0xB136_5C28_A47D_E092;
+pub static kcomp_abi: u64 = abi::KCOMP_ABI;
 
 /// 组件私有 panic handler：Rust 要求 `no_std` staticlib 提供它。本夹具**没有
 /// 任何 panic 源**（不调用 SDK、不做可失败运算），因此它不会被引用、GC 后也

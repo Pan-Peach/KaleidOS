@@ -88,3 +88,22 @@ Phase 0 只建立本审计；基线纯 Core host：502 passed、5 ignored（忽�
   passed / 6 ignored）。host 竞争检查只证明锁与状态机，不证明 SMP 硬件执行。
 - 串口 smoke 的 `unload littlefs` 现在验证 DirectExports 拒绝；多 FS 存活时 ksh cat
   验证现有 ambiguity 拒绝。FAT 文件内容仍由 CoreTest 与普通 init smoke 验证。
+
+## Phase 2：收敛
+
+删除 `ContractRecord.name`（首次发布的端口名被误当契约标签，无消费者）、
+`EndpointName.contract`（与 endpoint 相同事实）、内部 `EndpointState::Pending`
+（stage 尚无 endpoint id）。必要职责分别由端口名称索引、EndpointRecord、pending
+publication 承担；减少两个重复字段与一个不可达状态，不改变隔离边界或 Direct 路径。
+公开 wire Pending 编码暂保留用于已有观测 ABI，不声称有生产状态构造者。
+
+KCOMP_ABI 同时生成 C 常量；三个 C provider 与四个无 SDK runtime 的 ArchTest fixture
+引用生成物，删除七处需要协调手工同步的生产指纹。Rust fixture 只编入声明，仍无
+新 UNDEF/import。独立的 known-answer 测试保留，职责与生成源不同。
+
+Sandbox bind 全部拒绝 ENOTSUP，删除 K/I→Sandbox 的假成功分支；Resolved 与
+ComponentId 注释不再暗示已存在 requires resolver、凭证 token 或 ResourceDomain 表。
+没有新增 ServiceManager、RPC subsystem、绑定 registry 或 Runtime crate。
+
+本阶段 `make test-host`、RV64 boot-build、RV32 boot-check 成功；纯 Core host
+507 passed / 5 ignored。构建使用系统 host linker，避免本机 Nix cc / glibc 混用。

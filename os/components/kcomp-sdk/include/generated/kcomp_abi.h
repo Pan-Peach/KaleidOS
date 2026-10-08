@@ -85,6 +85,11 @@ enum KcompInterfaceKind {
  * `kcomp_instance_create!` 宏会发出该定义（值 = Rust 镜像的 `KCOMP_ABI`）。 */
 extern const uint64_t kcomp_abi;
 
+/* 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
+ * 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
+ * `kcomp_abi` 符号由入口宏发出。 */
+#define KCOMP_ABI UINT64_C(0xB1365C28A47DE092)
+
 /* 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
  * 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
  * 组件业务不判断执行域；不携带 SDK 的无堆组件可省略此入口。 */
