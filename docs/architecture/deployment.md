@@ -142,9 +142,9 @@ Direct binding 携带的是 `(api, ctx)` 两个**裸指针**，只在 provider �
 - Direct 下 provider 与 caller 同特权、同地址空间：**没有** Core 拥有的边界来切换 owner，也**没有**可恢复的上下文来收敛 provider 的 panic。B panic = 进程级 abort 的一部分，Direct **不**承诺 caller 存活。
 - Gate 下 provider 跑在 Core 拥有的 per-call service stack 上，principal = provider 自己，provider panic 被 Core 收敛（标 `Failed`、撤销 authority、永久失效其 endpoint），**caller 存活且不变**。
 
-**`inflight` 只计 Gate 调用。** Core 的 endpoint `inflight` 计数只在**经 Core call gate** 的调用上递增；Direct 绑定**完全绕过 Core**，Core 看不到。因此：
+**`inflight` 计 Core 管理的 Gate、policy 与 IRQ 执行。** Core 的 endpoint `inflight` 计数在**经 Core 边界** 的执行上递增；Direct 绑定**完全绕过 Core**，Core 看不到。因此：
 
-> **"inflight == 0 → 可以 stop（否则 -EBUSY）"永远不能证明"所有调用都已结束"。** 它只证明"没有正在进行的 Gate 调用"。若存在 Direct 绑定，consumer 手里那张 function table 的调用对 Core 不可见——这正是 KernelNative 无隔离 + 物理驻留的直接后果。teardown 的正确性不能建立在 `inflight` 上。
+> **"inflight == 0 → 可以 stop（否则 -EBUSY）"永远不能证明"所有调用都已结束"。** 它只证明"没有正在进行的 Core-managed 调用 / 回调"。若存在 Direct 绑定，consumer 手里那张 function table 的调用对 Core 不可见——这正是 KernelNative 无隔离 + 物理驻留的直接后果。teardown 的正确性不能仅建立在 `inflight` 上。当前 Native 实例发布非空 Direct 表即保守拒绝 Stop/destroy（EBUSY），旧表、ctx 保持驻留；没有 Direct release 协议。
 
 ---
 

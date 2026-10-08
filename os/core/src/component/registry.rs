@@ -62,7 +62,7 @@ pub struct ComponentRecord {
     /// service_dispatch / text_size / abi / MemoryLease）。
     pub loaded: LoadedComponent,
     pub instance_state: *mut (),
-    /// 未完成的 consumer→provider 调用计数（`begin_call` / `finish_call`）。
+    /// 未返回的 Gate / policy / IRQ 执行；Direct 不经 Core，不计入。
     pub inflight: u32,
 }
 
@@ -81,6 +81,8 @@ pub enum RegistryError {
     NotReady,
     /// `begin_call`：`inflight` 计数溢出（u32）；拒绝且不改计数。
     CallOverflow,
+    /// Stop 准入：仍有未返回的 Core-managed 执行。
+    Busy,
     /// id 空间耗尽（单调递增）。
     IdExhausted,
 }
@@ -186,6 +188,13 @@ impl Registry {
     /// 提交后 `may_run` 立即不再放行该实例的任务——"停止中仍等待任务收尾"不在
     /// 本版语义内（drain variant 明确未实现）。
     pub fn begin_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let record = self.get(id).ok_or(RegistryError::NotFound)?;
+        if !record.state.can_transition(ComponentState::Stopping) {
+            return Err(RegistryError::InvalidTransition);
+        }
+        if record.inflight != 0 {
+            return Err(RegistryError::Busy);
+        }
         self.transition(id, ComponentState::Stopping)
     }
 
@@ -251,6 +260,22 @@ impl Registry {
         if record.state != ComponentState::Ready {
             return Err(RegistryError::NotReady);
         }
+        Self::count_execution(record)
+    }
+
+    /// IRQ 可在 create 期间投递；与 Gate 共用 Stop 准入与计数。
+    pub(crate) fn begin_irq(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let record = self.record_mut(id)?;
+        if !matches!(
+            record.state,
+            ComponentState::Starting | ComponentState::Ready
+        ) {
+            return Err(RegistryError::NotReady);
+        }
+        Self::count_execution(record)
+    }
+
+    fn count_execution(record: &mut ComponentRecord) -> Result<(), RegistryError> {
         record.inflight = record
             .inflight
             .checked_add(1)
@@ -601,6 +626,46 @@ mod tests {
         assert_ne!(fresh, stopped);
         assert_ne!(fresh, failed);
         assert_eq!(fresh.raw(), failed.raw() + 1);
+    }
+
+    #[test]
+    fn stop_and_call_admission_cannot_both_commit() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..128 {
+            let mut reg = Registry::new();
+            let id = reg
+                .declare(
+                    b"admission-race",
+                    test_support::test_loaded(0, None),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            reg.finish_start(id).unwrap();
+            let reg = Arc::new(spin::Mutex::new(reg));
+            let barrier = Arc::new(Barrier::new(2));
+            let remote_reg = reg.clone();
+            let remote_barrier = barrier.clone();
+            let call = std::thread::spawn(move || {
+                remote_barrier.wait();
+                remote_reg.lock().begin_call(id)
+            });
+            barrier.wait();
+            let stopped = reg.lock().begin_stop(id);
+            let called = call.join().unwrap();
+            match (called, stopped) {
+                (Ok(()), Err(RegistryError::Busy)) => {
+                    assert_eq!(reg.lock().get(id).unwrap().state, ComponentState::Ready);
+                    assert_eq!(reg.lock().active_calls(id), 1);
+                }
+                (Err(RegistryError::NotReady), Ok(())) => {
+                    assert_eq!(reg.lock().get(id).unwrap().state, ComponentState::Stopping);
+                    assert_eq!(reg.lock().active_calls(id), 0);
+                }
+                result => panic!("inconsistent admission: {result:?}"),
+            }
+        }
     }
 
     /// `begin_call` 溢出必须拒绝且不改计数。

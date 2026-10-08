@@ -333,6 +333,13 @@ uint32_t kcore_component_count(void);
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, const struct KcompCreateArgs *args, uint32_t *out_instance);
 /* 请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。 */
 int32_t kcore_component_load(const uint8_t *name, size_t len, uint32_t domain);
+/* 请求优雅停止实例，复用 monitor 的 Stop 编排；只支持 KernelNative caller。
+ * 需要组件执行身份，IRQ / Gate / policy 上下文拒绝。目标必须 Ready；有未退出 Task、
+ * Gate / policy / IRQ 在途执行，或 Native 已发布 Direct 表时返回 EBUSY，拒绝不改状态。
+ * 检查与 Stopping 提交共用准入事务；锁外调用 destroy。成功为 Stopped；destroy
+ * 失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
+ * KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。 */
+int32_t kcore_component_stop(uint32_t component);
 /* -- Task control -- */
 /* 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
  * （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入

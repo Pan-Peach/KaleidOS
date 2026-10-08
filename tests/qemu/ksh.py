@@ -13,9 +13,9 @@ def run(proc, collect, send, failure, fatal_markers):
         if not ok:
             raise failure(f"ksh command {line!r}: missing {expected!r}\n" + "\n".join(output))
 
-    # CoreTest has already composed one FAT and two littlefs providers. Retire
-    # littlefs through monitor so cat has one unambiguous live FS endpoint.
-    command("unload littlefs", ["unload littlefs: OK"])
+    # Published Direct ctx cannot be destroyed without a release protocol.
+    # CoreTest has composed several FS providers; shell must report ambiguity.
+    command("unload littlefs", ["DirectExports"])
     command("load ksh", ["load ksh: OK", "KaleidOS ksh"])
     # Let the sole shell task yield to the monitor anchor before new input.
     # The monitor must resume it rather than consume the next command itself.
@@ -39,7 +39,7 @@ def run(proc, collect, send, failure, fatal_markers):
     command("load virtio_blk isolated", ["load virtio_blk: ENOTSUP"])
     command("load x sandboxed", ["sandboxed is unavailable"])
     command("load missing", ["load missing: ENOENT"])
-    command("cat 0:/HELLO.TXT", ["KALEIDOS BLOCK CHAIN OK"])
+    command("cat 0:/HELLO.TXT", ["cat: multiple filesystem providers; selection is unavailable"])
     command("ls", ["ls: unsupported by current filesystem service"])
     command("load", ["usage: load <artifact>"])
     command("unknown", ["unknown command 'unknown'"])

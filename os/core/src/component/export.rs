@@ -478,6 +478,26 @@ extern "C" fn kcore_component_count() -> u32 {
 // Category 5：Component lifecycle（v2；语义入口，非裸 registry mutation）
 // ---------------------------------------------------------------------------
 
+extern "C" fn kcore_component_stop(component: u32) -> i32 {
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if let Some(denied) = deny_if_failed(caller.component) {
+            return denied;
+        }
+        if let Some(denied) = deny_if_isolated(caller.component) {
+            return denied;
+        }
+        if crate::component::containment::scheduling_forbidden() {
+            return Errno::EINVAL.code();
+        }
+        status(crate::component::stop_component(ComponentId::from_raw(
+            component,
+        )))
+    })
+}
+
 /// C ABI `(ptr, len)` → 短切片。长度上限防御野指针/超长输入（组件名受
 /// `MAX_NAME_LEN` 约束）。返回的切片只在调用期间有效。
 fn checked_name(ptr: *const u8, len: usize) -> Option<&'static [u8]> {
@@ -1381,6 +1401,38 @@ mod tests {
 
     /// Direct function table 的替身地址（Core 只存、不解引用）。
     static TABLE: [u8; 8] = [0; 8];
+
+    #[test]
+    fn stop_export_rejects_missing_irq_and_failed_callers() {
+        use crate::component::containment;
+        let _boundary = containment::test_boundary_lock();
+        registry::init();
+        containment::enter_anchor();
+        crate::task::init();
+        crate::sched::init();
+        assert_eq!(kcore_component_stop(u32::MAX), Errno::EPERM.code());
+        let id = {
+            let mut reg = registry::get_registry().lock();
+            let id = reg
+                .declare(
+                    b"stop-export",
+                    registry::test_support::test_loaded(0, None),
+                    ExecutionDomain::KernelNative,
+                )
+                .unwrap();
+            reg.resolve(id).unwrap();
+            reg.begin_start(id).unwrap();
+            id
+        };
+        containment::with_test_init_boundary(Some(id), || {
+            assert_eq!(kcore_component_stop(u32::MAX), Errno::ENOENT.code());
+            containment::with_irq_scope(id, || {
+                assert_eq!(kcore_component_stop(u32::MAX), Errno::EINVAL.code());
+            });
+            registry::get_registry().lock().mark_failed(id).unwrap();
+            assert_eq!(kcore_component_stop(u32::MAX), Errno::EPERM.code());
+        });
+    }
 
     #[test]
     fn resolves_all_entries() {

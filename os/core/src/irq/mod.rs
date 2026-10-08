@@ -98,7 +98,7 @@ pub(crate) fn init_cpu(cpu: crate::machine::CpuId) -> Result<(), arch::smp::Init
 /// principal = 该线 owner，`task = None`；作用域同步、不可 yield。
 pub fn on_irq(_cpu: CpuId, irq: u32) {
     crate::trace::emit(crate::trace::TraceEvent::IrqEnter { irq });
-    let target = route(irq);
+    let target = prepare_callback(irq);
     let owner = target.map(|(owner, _, _)| owner);
     crate::trace::emit(crate::trace::TraceEvent::IrqDispatch {
         irq,
@@ -109,8 +109,20 @@ pub fn on_irq(_cpu: CpuId, irq: u32) {
         // 会自死锁）。Core 用该线的 owner 建立 IRQ 归属作用域：回调内
         // `ambient()` 解析为 line owner、task = None。
         dispatch_callback(handler, ctx, owner);
+        crate::component::registry::get_registry()
+            .lock()
+            .finish_call(owner);
     }
     crate::trace::emit(crate::trace::TraceEvent::IrqAck { irq });
+}
+
+/// Resolve and admit under registry → IRQ locks. Stop sees the callback count
+/// even after its route is released. All locks are gone before running code.
+fn prepare_callback(number: u32) -> Option<(ComponentId, IrqHandler, *mut ())> {
+    let mut registry = crate::component::registry::get_registry().lock();
+    let target = route(number)?;
+    registry.begin_irq(target.0).ok()?;
+    Some(target)
 }
 
 /// 在 Core 建立的 IRQ 归属作用域内调用一个组件回调：principal = 该中断线的
@@ -148,6 +160,23 @@ mod tests {
     /// 用自己的 fixture 覆盖同一全局槽，MACHINE guard 把它们串行化。
     fn install_test_irq_table() {
         irq::install_for_test(&[1; 8]);
+    }
+
+    fn ready_owner() -> ComponentId {
+        use crate::component::{endpoint::ExecutionDomain, registry};
+        registry::init();
+        let mut reg = registry::get_registry().lock();
+        let id = reg
+            .declare(
+                b"irq-owner",
+                registry::test_support::test_loaded(0, None),
+                ExecutionDomain::KernelNative,
+            )
+            .unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        id
     }
 
     /// Nested irq-save guards restore the state they observed, so only the outer
@@ -190,7 +219,7 @@ mod tests {
         // （本模块 init → arch 后端）。
         install_test_irq_table();
         crate::irq::init();
-        let owner = ComponentId::from_raw(0xfeed);
+        let owner = ready_owner();
         irq::get_table()
             .lock()
             .register(
@@ -252,6 +281,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admitted_callback_blocks_stop_after_route_release() {
+        let _serial = IRQ_TEST_LOCK.lock();
+        let _machine = crate::machine::test_support::GUARD.lock();
+        install_test_irq_table();
+        let owner = ready_owner();
+        irq::get_table()
+            .lock()
+            .register(
+                owner,
+                DeviceId::from_raw(0),
+                0,
+                42,
+                bump,
+                core::ptr::null_mut(),
+            )
+            .unwrap();
+        assert!(prepare_callback(42).is_some());
+        irq::get_table().lock().revoke_owner(owner);
+        let mut reg = crate::component::registry::get_registry().lock();
+        assert_eq!(
+            reg.begin_stop(owner),
+            Err(crate::component::registry::RegistryError::Busy)
+        );
+        reg.finish_call(owner);
+        reg.begin_stop(owner).unwrap();
+        drop(reg);
+        irq::get_table()
+            .lock()
+            .register(
+                owner,
+                DeviceId::from_raw(0),
+                0,
+                42,
+                bump,
+                core::ptr::null_mut(),
+            )
+            .unwrap();
+        assert!(prepare_callback(42).is_none());
+    }
+
     // ------------------------------------------------------------------
     // IRQ 归属：回调在 Core 建立的 line-owner 作用域内执行
     // ------------------------------------------------------------------
@@ -286,7 +356,7 @@ mod tests {
         // （本模块 init → arch 后端）。
         install_test_irq_table();
         crate::irq::init();
-        let owner = ComponentId::from_raw(0xfeed);
+        let owner = ready_owner();
         irq::get_table()
             .lock()
             .register(

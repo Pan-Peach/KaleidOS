@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 60] = [
+pub(super) static EXPORTS: [Export; 61] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -147,7 +147,15 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 6：Task control（v2）
+    // Category 6：Component lifecycle
+    Export {
+        name: b"kcore_component_stop",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_component_stop;
+            implementation as *const ()
+        }),
+    },
+    // Category 7：Task control（v2）
     Export {
         name: b"kcore_task_create",
         address: ExportAddress({
@@ -178,7 +186,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 6（续）：Task control（v2）
+    // Category 7（续）：Task control（v2）
     Export {
         name: b"kcore_task_yield",
         address: ExportAddress({
@@ -214,7 +222,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 6（续）：Panic containment（v2）
+    // Category 7（续）：Panic containment（v2）
     Export {
         name: b"kcore_panic_escape",
         address: ExportAddress({
@@ -222,7 +230,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 7：Scheduler（v2）
+    // Category 8：Scheduler（v2）
     Export {
         name: b"kcore_sched_run",
         address: ExportAddress({
@@ -237,7 +245,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 8：Device ownership（mechanism-first）
+    // Category 9：Device ownership（mechanism-first）
     Export {
         name: b"kcore_device_nth",
         address: ExportAddress({
@@ -261,7 +269,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 8（续）：IRQ routes
+    // Category 9（续）：IRQ routes
     Export {
         name: b"kcore_irq_register",
         address: ExportAddress({
@@ -291,7 +299,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 8（续）：DMA（allocation / mapping 分离）
+    // Category 9（续）：DMA（allocation / mapping 分离）
     Export {
         name: b"kcore_dma_alloc",
         address: ExportAddress({
@@ -322,7 +330,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 9：Component endpoints（Contract / Endpoint）
+    // Category 10：Component endpoints（Contract / Endpoint）
     Export {
         name: b"kcore_endpoint_publish",
         address: ExportAddress({
@@ -386,7 +394,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 10：Console / observation
+    // Category 11：Console / observation
     Export {
         name: b"kcore_console_read_byte",
         address: ExportAddress({
@@ -410,7 +418,7 @@ pub(super) static EXPORTS: [Export; 60] = [
             implementation as *const ()
         }),
     },
-    // Category 11：User task execution
+    // Category 12：User task execution
     Export {
         name: b"kcore_user_create",
         address: ExportAddress({

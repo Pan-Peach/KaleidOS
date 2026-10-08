@@ -84,7 +84,7 @@ declare component → Resolved → Starting
 停止：
 
 ```text
-拒绝存活任务 → Stopping
+同一准入事务：拒绝存活任务 / 在途 Gate、policy、IRQ / Native Direct 发布 → Stopping
     → 在该实例身份下调用 kcomp_instance_destroy(state)
     → Core 兜底撤销归属（device quarantine / DMA 停车）/ unbind
     → Stopped
@@ -165,6 +165,9 @@ int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len,
 `domain` 使用 schema 的整数编码（KernelNative=0 / IsolatedNative=1 / SandboxedNative=2）；
 Core 验证支持面，不隐式回退，SandboxedNative 当前返回 ENOTSUP。带自定义 config 的
 `kcore_component_create` 仍为 KernelNative 入口，不扩充完整 image 管理 API。
+`kcore_component_stop(id)` 复用同一个 Stop 操作，供受信 KernelNative 组合方使用；
+IRQ / Gate / policy 上下文拒绝，没有父子权限表。Stop 拒绝不改状态，销毁入口在锁外运行。
+
 import 签名变化与生命周期布局变化一样必须原地协调替换 `KCOMP_ABI`，不保留旧签名兼容。
 
 ---
@@ -229,7 +232,7 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 - 沿用现状：failure **不调用** exit/destroy（`failure.rs`），MMIO 设备与 DMA backing 被**隔离（quarantine）**。
 - **设备隔离持续到重启**。创建新实例**不得**清除隔离。
-- destroy 的命名**不得**暗示 Core 能安全回收全部状态。本轮**保留已暴露的 state 存储**——尤其通过 `'static` SDK 引用交出去的。现有 consumer 可能持有拷贝过的 binding；释放其 ctx 会把今天的"stale 逻辑访问"变成 use-after-free。
+- destroy 的命名**不得**暗示 Core 能安全回收全部状态。Native 实例发布非空 Direct 表后，Core **拒绝 Stop/destroy（EBUSY）**；即使 endpoint 已失效，也不能证明表已归还。不新增 Direct 引用计数，不追踪每次调用。failure 不调用 destroy，已暴露的 state 必须驻留。本轮**保留已暴露的 state 存储**——尤其通过 `'static` SDK 引用交出去的。现有 consumer 可能持有拷贝过的 binding；释放其 ctx 会把今天的"stale 逻辑访问"变成 use-after-free。
 - destroy 可以 quiesce 设备并显式清理私有资源，但仅此而已。
 
 ---

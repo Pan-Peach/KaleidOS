@@ -117,7 +117,7 @@ pub type KcompServiceDispatch = extern "C" fn(
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0x47AF_93E6_21B8_D054;
+pub const KCOMP_ABI: u64 = 0xB136_5C28_A47D_E092;
 
 /// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
 #[repr(u32)]
@@ -468,6 +468,14 @@ unsafe extern "C" {
     /// 请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。
     #[link_name = "kcore_component_load"]
     pub fn kcore_component_load(name: *const u8, len: usize, domain: u32) -> i32;
+    /// 请求优雅停止实例，复用 monitor 的 Stop 编排；只支持 KernelNative caller。
+    /// 需要组件执行身份，IRQ / Gate / policy 上下文拒绝。目标必须 Ready；有未退出 Task、
+    /// Gate / policy / IRQ 在途执行，或 Native 已发布 Direct 表时返回 EBUSY，拒绝不改状态。
+    /// 检查与 Stopping 提交共用准入事务；锁外调用 destroy。成功为 Stopped；destroy
+    /// 失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
+    /// KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。
+    #[link_name = "kcore_component_stop"]
+    pub fn kcore_component_stop(component: u32) -> i32;
     // -- Task control --
     /// 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
     /// （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入

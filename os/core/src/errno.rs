@@ -201,7 +201,9 @@ impl From<ComponentStopError> for Errno {
             // 状态机拒绝 `Ready → Stopping`（重复 stop / 非 Ready 实例）。
             ComponentStopError::NotReady => Errno::EINVAL,
             // 实例仍被任务占用（Linux `delete_module` 的 EBUSY 类比）。
-            ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
+            ComponentStopError::OwnsLiveTasks
+            | ComponentStopError::ActiveExecutions
+            | ComponentStopError::DirectExports => Errno::EBUSY,
             ComponentStopError::DestroyFailed(_) => Errno::EIO,
             ComponentStopError::DestroyPanicked => Errno::EIO,
             ComponentStopError::StateRejected => Errno::EIO,
@@ -625,6 +627,8 @@ mod tests {
             ComponentStopError::NotFound,
             ComponentStopError::NotReady,
             ComponentStopError::OwnsLiveTasks,
+            ComponentStopError::ActiveExecutions,
+            ComponentStopError::DirectExports,
             ComponentStopError::DestroyFailed(1),
             ComponentStopError::DestroyPanicked,
             ComponentStopError::StateRejected,
@@ -632,7 +636,9 @@ mod tests {
             let expected = match error {
                 ComponentStopError::NotFound => Errno::ENOENT,
                 ComponentStopError::NotReady => Errno::EINVAL,
-                ComponentStopError::OwnsLiveTasks => Errno::EBUSY,
+                ComponentStopError::OwnsLiveTasks
+                | ComponentStopError::ActiveExecutions
+                | ComponentStopError::DirectExports => Errno::EBUSY,
                 ComponentStopError::DestroyFailed(_) => Errno::EIO,
                 ComponentStopError::DestroyPanicked => Errno::EIO,
                 ComponentStopError::StateRejected => Errno::EIO,

@@ -1606,7 +1606,7 @@ mod tests {
     #[test]
     fn kcomp_abi_is_the_manual_anchor() {
         // 当前 Core import / 生命周期 exact 指纹；来源为 abi/component.toml。
-        assert_eq!(KCOMP_ABI, 0x47AF_93E6_21B8_D054);
+        assert_eq!(KCOMP_ABI, 0xB136_5C28_A47D_E092);
     }
 
     #[test]

@@ -2,12 +2,12 @@
 //!
 //! 与 [`super::failure`]（forced containment）对称：本模块是**优雅停止**的唯一
 //! 汇合点——`Ready → Stopping → Stopped`，中途调用组件的销毁入口
-//! `kcomp_instance_destroy(state)`。生产调用方是 monitor 的 `unload <name>` 命令。
+//! `kcomp_instance_destroy(state)`。生产调用方是 monitor 与 `kcore_component_stop`。
 //!
 //! # 停止顺序（拒绝门在任何提交之前；拒绝不改 Core 真相）
 //!
 //! ```text
-//! 1. 拒绝门：实例不拥有任何未退出任务，且存在且处于 Ready
+//! 1. 同一准入事务：Ready、无未退出任务 / 在途执行 / Native Direct 发布
 //!    （不存在 → NotFound；非 Ready → NotReady）；
 //! 2. registry.begin_stop(id)      Ready → Stopping：提交"不再接受新 work"
 //! 3. 调用 kcomp_instance_destroy(state)  必需导出；按执行域选 Core 栈 / 私有 AS
@@ -75,6 +75,10 @@ pub enum ComponentStopError {
     /// 实例仍拥有未退出的任务，拒绝停止（小方案不做 join / 不等待）。
     /// errno 语义：`EBUSY`（in use）。
     OwnsLiveTasks,
+    /// Gate / policy / IRQ 尚未返回；拒绝且保持 Ready。
+    ActiveExecutions,
+    /// Native 已发布 Direct 表，无 release 协议，不能销毁可能外借的 ctx。
+    DirectExports,
     /// `kcomp_instance_destroy` 返回非零（实例 → `Failed` + 兜底，不重试）。
     /// errno 语义：`EIO`。
     DestroyFailed(i32),
@@ -92,11 +96,22 @@ pub enum ComponentStopError {
 /// `kcomp_instance_destroy` 是**必需导出**（loader 保证每个 image 都有）。
 pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     // 步骤 1：拒绝门。必须在任何提交之前——拒绝不得改变 Core 真相。
-    // Creation and stop admission share registry → task lock order. No remote
+    // Stop checks publication, execution and task admission under registry → endpoint/task locks. No remote
     // create can slip between checking live work and committing Stopping.
     {
         let _irq = crate::irq::IrqSaveGuard::new();
         let mut registry = registry::get_registry().lock();
+        let record = registry.get(id).ok_or(ComponentStopError::NotFound)?;
+        if record.state != crate::component::ComponentState::Ready {
+            return Err(ComponentStopError::NotReady);
+        }
+        if record.execution_domain == ExecutionDomain::KernelNative
+            && crate::component::endpoint::get_endpoints()
+                .lock()
+                .has_direct_exports(id)
+        {
+            return Err(ComponentStopError::DirectExports);
+        }
         let table = crate::task::get_task_table().lock();
         if table.has_live_tasks(id) {
             return Err(ComponentStopError::OwnsLiveTasks);
@@ -104,6 +119,7 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
         if let Err(error) = registry.begin_stop(id) {
             return Err(match error {
                 RegistryError::NotFound => ComponentStopError::NotFound,
+                RegistryError::Busy => ComponentStopError::ActiveExecutions,
                 _ => ComponentStopError::NotReady,
             });
         }
@@ -263,6 +279,57 @@ mod tests {
 
     extern "C" fn destroy_hook_ok(_state: *mut ()) -> i32 {
         0
+    }
+
+    #[test]
+    fn stop_refuses_gate_execution_without_owned_tasks() {
+        let _heap = setup();
+        let id = ready_component(b"exit_gate", 0);
+        registry::get_registry().lock().begin_call(id).unwrap();
+        assert_eq!(
+            stop_component(id),
+            Err(ComponentStopError::ActiveExecutions)
+        );
+        let mut reg = registry::get_registry().lock();
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
+        assert_eq!(reg.active_calls(id), 1);
+        reg.finish_call(id);
+        reg.begin_stop(id).unwrap();
+        assert_eq!(reg.begin_call(id), Err(RegistryError::NotReady));
+    }
+
+    #[test]
+    fn direct_publication_pins_ctx_even_after_endpoint_invalidation() {
+        use crate::component::abi::{InterfaceAbi, InterfaceKind};
+        use crate::component::endpoint::{self, ContractId};
+        let _heap = setup();
+        let id = ready_component(b"exit_direct", 0);
+        let mut state = 7u32;
+        {
+            let reg = registry::get_registry().lock();
+            let mut endpoints = endpoint::get_endpoints().lock();
+            endpoints
+                .stage_publish(
+                    &reg,
+                    id,
+                    b"direct",
+                    ContractId::from_raw(0xE217),
+                    InterfaceKind::Service,
+                    InterfaceAbi::from_raw(1),
+                    0,
+                    core::ptr::from_ref(&state).cast(),
+                    core::ptr::from_mut(&mut state).cast(),
+                )
+                .unwrap();
+            endpoints.commit_pending(&reg, id).unwrap();
+            endpoints.invalidate_provider(id);
+        }
+        assert_eq!(stop_component(id), Err(ComponentStopError::DirectExports));
+        assert_eq!(
+            registry::get_registry().lock().get(id).unwrap().state,
+            ComponentState::Ready
+        );
+        assert_eq!(state, 7);
     }
 
     #[test]

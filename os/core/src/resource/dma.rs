@@ -310,11 +310,12 @@ pub fn map(
     let Some(owner) = device_table.owner(device) else {
         return Err(DmaError::NotOwner);
     };
-    drop(device_table);
-
     let mapping = get_table()
         .lock()
         .insert_mapping(owner, device, ptr as usize, len);
+    // device release checks child mappings under this same device lock.
+    // Keep ownership stable until the new child is visible.
+    drop(device_table);
     emit(TraceEvent::ResourceGrant {
         component: owner,
         kind: ResourceKind::Dma,

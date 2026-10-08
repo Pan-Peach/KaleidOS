@@ -71,3 +71,20 @@ DMA map 的实现锚在 **device owner**，忽略 ambient ctx；unmap 不解析 
 
 Phase 0 只建立本审计；基线纯 Core host：502 passed、5 ignored（忽略项不是通过）。
 后续阶段的变更、命令、规模与实际结果在完成后追加。
+
+## Phase 1：正确性
+
+- Stop 在 registry 准入锁内检查在途执行、Direct 发布与 live Task，再提交 Stopping；
+  Gate、policy、IRQ 后续准入均被阻断。组件代码在锁外执行。
+- IRQ 复用 inflight，允许 Starting/Ready；回调已取出后撤销 route 不会丢失在途事实。
+- Native 发布非空 Direct table 即保守拒绝 destroy，包括 Invalid endpoint 的旧表；
+  无新增 pin/refcount 表。Isolated 的表从未通过跨域 binding 外借，不受此限制。
+- DMA map 保持 device 锁到子 mapping 插入完成，device release 不能漏掉新子项。
+  不改变现有 device-owner 归属与无 caller 的 unmap 规则。
+- 唯一新增 ABI 是 `kcore_component_stop(id)`：已有生命周期机制的窄导出，实际消费者
+  是 CoreTest 的跨 CPU Stop/Gate 竞争与普通组合方 teardown；不提供测试后门。
+  ABI 60→61，exact fingerprint 协调替换，所有旧工件需要重建。
+- Core host 507 passed / 5 ignored；`make test-host` 成功（含真实工件 kernel 554
+  passed / 6 ignored）。host 竞争检查只证明锁与状态机，不证明 SMP 硬件执行。
+- 串口 smoke 的 `unload littlefs` 现在验证 DirectExports 拒绝；多 FS 存活时 ksh cat
+  验证现有 ambiguity 拒绝。FAT 文件内容仍由 CoreTest 与普通 init smoke 验证。

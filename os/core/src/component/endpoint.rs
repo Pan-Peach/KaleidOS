@@ -600,6 +600,14 @@ impl EndpointRegistry {
         }
     }
 
+    /// 已发布的 Native 函数表可能已被复制，失效 endpoint 也不能追回 ctx。
+    /// 没有 Direct release 协议时，Stop 保守地拒绝销毁这种实例。
+    pub(crate) fn has_direct_exports(&self, provider: ComponentId) -> bool {
+        self.endpoints
+            .iter()
+            .any(|record| record.owner == provider && !record.api.is_null())
+    }
+
     pub fn endpoint_count(&self) -> usize {
         self.endpoints.len()
     }

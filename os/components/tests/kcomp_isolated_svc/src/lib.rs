@@ -275,7 +275,7 @@ pub extern "C" fn kcomp_service_dispatch(
 
 /// 精确契约指纹（手工锚定，与 `abi/component.toml` 的 `KCOMP_ABI` 同值）。
 #[unsafe(no_mangle)]
-pub static kcomp_abi: u64 = 0x47AF_93E6_21B8_D054;
+pub static kcomp_abi: u64 = 0xB136_5C28_A47D_E092;
 
 /// 组件私有 panic handler：本夹具没有 panic 源，存在只为满足链接前提，且
 /// **刻意不引 `kcore_*`**（本夹具不需要 import 白名单里的任何一项）。
