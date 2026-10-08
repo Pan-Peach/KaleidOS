@@ -37,7 +37,7 @@ use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME};
 /// 选中 `scheduler.policy` 契约。单端口组件用 0。
 pub const SCHEDULER_POLICY_PORT: u32 = 0;
 
-/// RR 调度器**实例状态**：每 CPU cursor 指向本地 runnable 列表中的下一个槽位。
+/// RR 调度器**实例状态**：每 CPU cursor 保存上次提议的 TaskId。
 ///
 /// 经 Core backing 分配（地址稳定）、作为实例 state 交给 Core；不同实例各自独立
 /// 轮转（不再是 image-global 的共享 cursor）。
@@ -47,17 +47,26 @@ struct SchedulerState {
     cpu_count: usize,
 }
 
-/// RR 提议：在 Core 传入的 runnable（id 升序）里轮流选择。
-///
-/// **算法**：cursor 每次 +1，对 `count` 取模；runnable 列表每次
-/// 由 Core 重新收集（yield 者不在自己看到的列表里），count 收缩时取模也保持
-/// 有效选择。
-fn rr_slot(state: &SchedulerState, cpu: usize, count: usize) -> usize {
-    if count == 0 {
-        return 0; // 不可达：Core 的 frame 契约保证 input 非空；防御性返回。
-    }
+/// RR 游标保存上次提议的 TaskId，而不是易变候选列表的下标。
+/// Core 按 id 升序给出候选；选择后继，末尾绕回首项。
+fn rr_next(
+    state: &SchedulerState,
+    cpu: usize,
+    request: scheduler::ChooseNextRequest<'_>,
+) -> Option<u32> {
     // SAFETY: create initialized cpu_count cursors; caller validated cpu.
-    unsafe { &*state.cursors.add(cpu) }.fetch_add(1, Ordering::Relaxed) as usize % count
+    let cursor = unsafe { &*state.cursors.add(cpu) };
+    let last = cursor.load(Ordering::Relaxed);
+    let mut next = request.runnable_at(0)?;
+    for slot in 0..request.runnable_count() {
+        let candidate = request.runnable_at(slot)?;
+        if candidate > last {
+            next = candidate;
+            break;
+        }
+    }
+    cursor.store(next, Ordering::Relaxed);
+    Some(next)
 }
 
 /// `CHOOSE_NEXT` 的处理：解码 frame → RR 选择 → 把提议写进 output。
@@ -75,9 +84,8 @@ fn choose_next(state: &SchedulerState, method: u32, call: frame::Call<'_>) -> i3
     if cpu >= state.cpu_count {
         return Errno::EINVAL.code();
     }
-    let slot = rr_slot(state, cpu, request.runnable_count());
-    let Some(proposed) = request.runnable_at(slot) else {
-        return Errno::EINVAL.code(); // 不可达：slot < runnable_count。
+    let Some(proposed) = rr_next(state, cpu, request) else {
+        return Errno::EINVAL.code(); // 防御性拒绝无法解码的候选。
     };
     match scheduler::write_proposal(call.output, proposed) {
         Ok(()) => 0,
@@ -97,7 +105,7 @@ kcomp_sdk::kcomp_services! {
 //
 // `0` = 成功（`*out_state` = 本实例 state）；负 errno = 失败，Core 走 Failed 且
 // **不会**调用 destroy（构造期清理由本入口负责）。config 不进状态：RR 无配置，
-// 默认配置 = cursor 0。
+// 默认配置 = 无前次提议。
 kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let cpu_count = unsafe { kcomp_sdk::abi::kcore_machine_cpu_count() } as usize;
     let header = core::mem::size_of::<SchedulerState>();
@@ -112,7 +120,9 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     for cpu in 0..cpu_count {
         // SAFETY: backing includes the header and every aligned cursor.
         unsafe {
-            cursors.add(cpu).write(AtomicU32::new(0));
+            cursors
+                .add(cpu)
+                .write(AtomicU32::new(scheduler::SCHEDULER_NONE));
         }
     }
     // 每 CPU 独立轮转；Core 仅传 CPU 身份和候选，不保存算法状态。
@@ -168,50 +178,51 @@ mod tests {
         }
     }
 
-    /// RR 轮转的纯逻辑：新实例 cursor=0，对 count=2 连续提议必须是 0 1 0 1。
-    #[test]
-    fn rr_alternates_over_runnable_list() {
-        let state = instance_state(0);
-        assert_eq!(rr_slot(&state, 0, 2), 0, "从 cursor 0 起严格交替");
-        assert_eq!(rr_slot(&state, 0, 2), 1);
-        assert_eq!(rr_slot(&state, 0, 2), 0, "第三次回到首项（模 2 轮转）");
+    fn propose(state: &SchedulerState, cpu: usize, ids: &[u32]) -> u32 {
+        let args = [SCHEDULER_NONE.to_le_bytes(), (cpu as u32).to_le_bytes()].concat();
+        let input: std::vec::Vec<_> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let request = scheduler::ChooseNextRequest::decode(&args, &input).unwrap();
+        rr_next(state, cpu, request).unwrap()
     }
 
-    /// 收缩列表仍然给出有效槽位（cursor 对 count 取模）。
     #[test]
-    fn rr_stays_valid_when_list_shrinks() {
-        let state = instance_state(0);
-        for _ in 0..4 {
-            assert_eq!(rr_slot(&state, 0, 1), 0);
+    fn rr_visits_three_tasks_when_outgoing_is_excluded() {
+        let state = instance_state(SCHEDULER_NONE);
+        let mut current = 7;
+        for expected in [3, 5, 7].into_iter().cycle().take(30) {
+            let candidates: std::vec::Vec<_> =
+                [3, 5, 7].into_iter().filter(|id| *id != current).collect();
+            current = propose(&state, 0, &candidates);
+            assert_eq!(
+                current, expected,
+                "no continuously runnable task may starve"
+            );
         }
     }
 
-    /// cursor 是 per-instance 的：两个实例状态各自独立轮转，新实例从 0 开始。
     #[test]
-    fn rr_cursors_are_per_instance() {
-        let first = instance_state(0);
-        let second = instance_state(0);
-        assert_eq!(rr_slot(&first, 0, 2), 0);
-        assert_eq!(rr_slot(&first, 0, 2), 1);
-        assert_eq!(
-            rr_slot(&second, 0, 2),
-            0,
-            "另一个实例从自己的 cursor 0 开始"
-        );
+    fn rr_handles_removed_cursor_and_list_growth() {
+        let state = instance_state(SCHEDULER_NONE);
+        assert_eq!(propose(&state, 0, &[3, 5]), 3);
+        assert_eq!(propose(&state, 0, &[3, 5]), 5);
+        assert_eq!(propose(&state, 0, &[3, 7]), 7);
+        assert_eq!(propose(&state, 0, &[3]), 3);
+        assert_eq!(propose(&state, 0, &[3, 9]), 9);
+        assert_eq!(propose(&state, 0, &[3, 9]), 3);
     }
 
     #[test]
-    fn rr_progress_on_another_cpu_does_not_advance_the_local_cursor() {
-        let state = instance_state(0);
-        assert_eq!(rr_slot(&state, 0, 3), 0);
-        for _ in 0..5 {
-            rr_slot(&state, 1, 2);
-        }
-        assert_eq!(rr_slot(&state, 0, 3), 1);
-        assert_eq!(rr_slot(&state, 1, 2), 1);
+    fn rr_cursors_are_per_instance_and_cpu() {
+        let first = instance_state(SCHEDULER_NONE);
+        let second = instance_state(SCHEDULER_NONE);
+        assert_eq!(propose(&first, 0, &[3, 5]), 3);
+        assert_eq!(propose(&first, 1, &[3, 5]), 3);
+        assert_eq!(propose(&first, 0, &[3, 5]), 5);
+        assert_eq!(propose(&second, 0, &[3, 5]), 3);
+        assert_eq!(propose(&first, 1, &[3, 5]), 5);
     }
 
-    /// 端到端 wire：CHOOSE_NEXT 解码 → RR 槽位 → 写 output。
+    /// 端到端 wire：CHOOSE_NEXT 解码 → RR TaskId → 写 output。
     #[test]
     fn choose_next_writes_the_cursor_slot_proposal() {
         let state = instance_state(0);
@@ -236,7 +247,7 @@ mod tests {
         assert_eq!(status, Ok(0));
         assert_eq!(u32::from_le_bytes(output), 3, "第一次提议首项");
 
-        // 第二次：cursor=1 → 提议次项。
+        // 第二次：cursor=3 → 提议次项。
         let status = unsafe {
             frame::with_call(&frame, |call| {
                 choose_next(&state, SCHEDULER_METHOD_CHOOSE_NEXT, call)
