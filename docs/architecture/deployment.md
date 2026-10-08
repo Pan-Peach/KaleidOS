@@ -1,4 +1,4 @@
-# 部署与绑定：部署决定调用机制（deployment.md）
+# 部署与绑定：执行域约束交互机制（deployment.md）
 
 > 本文件是**"部署（deployment）决定调用机制"**的设计契约：谁提议部署、Core 验证什么、`(caller domain, callee domain)` 如何选出调用机制、binding 携带什么、不支持的组合如何拒绝。
 > 它是**设计契约，不是进度快照**。**KernelNative 与受限的 IsolatedNative 两种部署真实存在**：K/I 双向 Gate 已真正派发（§10）；Sandbox transport 仍**未实现**（§10 是实现状态表，§7 是逐条缺口）。
@@ -6,9 +6,10 @@
 
 ---
 
-## 1. 五个分离概念与推荐架构图
+## 1. 分离概念与职责图
 
-"部署决定调用机制"要把五件事分开，任何一件混进另一件都会重造框架或伪造边界：
+组件实例、执行域、接口契约与交互机制分别描述身份、部署环境、语义与双方关系。
+Artifact 是程序字节，Endpoint 是一次发布；它们不另建组件生命周期。
 
 | 概念 | 回答什么 | 身份 / 载体 | 代码锚点 |
 |---|---|---|---|
@@ -16,13 +17,14 @@
 | **Artifact** | 一个**组件程序字节**（不是运行实例） | `.kcomp`（ET_REL）；artifact 名 | `tools/kcomp-link.sh`、`os/core/src/component/loader.rs` |
 | **Component** | **一个完整运行组件**：instantiate 后拥有自己的已加载程序 | `ComponentId`；`loaded`（`base` + `create` / `destroy` / `service_dispatch`）+ 资源归属（device / irq / dma / task / publication） | `os/core/src/component/registry.rs`、`os/core/src/component/load.rs` |
 | **Endpoint** | provider **发布的服务点** | `EndpointId`（provider ComponentId + port_name + contract） | `os/core/src/component/endpoint.rs` |
-| **Transport / deployment** | 这次调用**怎么跨过去** | 由 Core 在 **bind 时**按 `(caller domain, callee domain)` 选定 | 本文件 §2、§3 |
+| **Execution Domain** | 在什么特权与地址空间环境执行 | Component 的部署属性；Core 保存域与 AS | 本文件 §6、§7 |
+| **Interaction Mechanism** | 这次交互怎么执行 | Direct / Gate 是两端的关系；bind 按两端域约束选定，不是整个组件的唯一属性 | 本文件 §2、§3 |
 
 **核心判断（不可违背）：**
 
 - **Core owns the execution-domain truth。** 组合器（composer / profile）**提议**部署（哪个组件跑在哪个执行域），Core **验证并提交**。Core **不硬编码信任级策略**（不写"所有组件都必须走同一套重型机制"）。
-- **同一份组件业务代码 + 服务契约不得按部署重写。** 按域入口点、SDK import、transport adapter 是**运行环境**的事，不是业务代码的事。
-- **Binding 以调用者的执行域为作用域，不是可搬运的 POD。** 合法机制取决于**两端**（caller domain **且** callee domain），**绝不**只看 provider 的部署标签。
+- **尽量复用业务实现与契约。** SDK adapter 承担可支持的部署差异；不承诺任意 `.kcomp` 跨 ISA、特权级或 import 面原样运行。
+- **Binding 以调用者的执行域为作用域，不能跨调用域转交。** 合法机制取决于**两端**（caller domain **且** callee domain），**绝不**只看 provider 的部署标签。
 - **Core 在 bind 时一次性选定机制**，运行期**不按调用重新决策**。SDK **实现**每种机制，但**不得选择**机制；否则组件可能悄悄降级到 native，这是**禁止**的。不支持的部署 / 绑定必须**显式拒绝**。
 
 ```text
@@ -32,7 +34,7 @@
 ┌─────────────────────────────── Core ────────────────────────────────┐
 │ owns execution-domain truth                                         │
 │ validate：owner / liveness / exact ABI / trust + platform capability│
-│ commit  ：绑定记录（EndpointId, caller domain, callee domain）      │
+│ resolve ：Endpoint 发布真相 + 两端执行域 → 调用窗口               │
 │           → 选定 mechanism：Direct / Gate / syscall-IPC / rejected  │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │ binding（scoped to caller domain）
@@ -79,16 +81,16 @@
 
 ③ Core 选定 mechanism（一次性，bind 时）
      输入：(caller domain, callee domain)
-     输出：Direct | Gate | syscall-IPC | rejected
+     输出：Direct | Gate | rejected（syscall-IPC 未实现）
      规则见 §3 模式矩阵
 
-④ Core 提交绑定记录（记录 trace）
+④ Core 交付 binding 并记录 trace（没有单独的 binding registry）
      binding 携带：
        - Direct：provider 的 repr(C) function table 指针 + opaque ctx
                  （endpoint 记录上的 `api` / `ctx`，Core 只存不解引用）
        - Gate  ：Core call-gate handle（不透明 EndpointId；provider principal +
                  per-call service stack + panic containment 由 Core 拥有）
-       - 另记：caller domain / callee domain / mechanism（Core 真相）
+       - SDK 缓存已选机制；域 / owner / 存活仍从 Core 实例与 endpoint 真相解析
 
 ⑤ 不支持的组合 → 显式拒绝
      绝不静默降级。例：跨域绑定绝不返回裸 function table；平台无 U-mode / 无私有 AS
@@ -97,7 +99,7 @@
 
 > `lookup` 比较 contract + 存活；SDK 的 `Endpoint<C>::from_id` 经 `kcore_endpoint_validate` 补齐 exact ABI 校验，`bind` 再验证契约与存活。
 
-**机制选择只发生在 bind 时。** 运行期的每次 `block.read(...)` 只走绑定已经选定的那条路，**不再**判断 caller / callee 域，也**不再**问 Core。SDK 的调用后端只**实现**机制，不**选择**机制。
+**SDK 在 bind 后沿已选机制调用。** Direct 直接执行表，不逐次进入 Core；Gate 每次进入 Core，重新检查 caller / provider 身份、存活、域与重入条件。SDK 不自行重新协商或降级机制。
 
 ---
 
@@ -107,19 +109,20 @@
 
 > **实现状态**：K/K Direct（及显式 Gate）、K→I、I→K、I→I Gate 均已接线；Sandbox 参与的调用仍显式拒绝。ArchTest `isolated-domain-service` 在 RV64/RV32 以同一工件、同一 SDK `block.device` 前端验证四种组合、嵌套、panic、stale 与循环重入。
 
-| caller ↓ \ callee → | KernelNative（S，共享 AS） | IsolatedNative（S，私有 AS） | SandboxedNative（U，私有 AS） |
+| caller ↓ \ callee → | KernelNative | IsolatedNative | SandboxedNative |
 |---|---|---|---|
-| **KernelNative** | **Direct**（可选 **Gate**） | **Gate** | **Gate** |
-| **IsolatedNative** | **Gate** | **Direct**（同域）/ **Gate** | **Gate** |
-| **SandboxedNative** | **syscall-IPC** | **syscall-IPC** | **Direct**（同域）/ **syscall-IPC** |
+| **KernelNative** | **Direct**（可显式 Gate） | **Gate** | **rejected** |
+| **IsolatedNative** | **Gate** | **Gate** | **rejected** |
+| **SandboxedNative** | **rejected** | **rejected** | **rejected** |
 
-读法：
+这是当前支持矩阵。每个 Isolated 实例有自己的 AS，I/I 不交付裸指针。Sandbox
+部署和参与的 binding 都返回 ENOTSUP；没有隐式 KernelNative fallback。
+未来跨特权交互需要真实 U-mode 进入、ecall 与访问检查，不能从现有 Gate 推导。
 
-- **同域（K↔K、I↔I、S↔S 同一 AS）**：`Direct` 合法（同地址空间、同特权级，就是普通函数调用）。**Gate 也合法**——同一部署可以选择**受控绑定**。
-- **跨域**：`Direct` **非法**，必须是 `Gate`（同特权、跨 AS）或 `syscall-IPC`（跨特权）。任何跨域组合都**不得**返回裸 function table。
-- **跨特权**：S caller → U callee 走 `Gate`（Core 经 `sret` 进入 U，provider 经 `ecall` 返回）；U caller → S/kernel callee 走 `syscall-IPC`（`ecall` 进 Core，Core 分派）。
-- **能力不足**：`rejected`。平台没有对应能力时，Core 拒绝该部署或该绑定，而不是假装能跑。
-- **执行模型 / ISA / runtime（native machine code vs Wasm）不在本矩阵**：它与执行域是**正交维度**——`KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，`SandboxedNative` 也都可以是 native code。把 Wasm 放进 `ExecutionDomain` 是把两个正交维度揉到一起。Wasm 是未来 Component 的一种**执行后端**（`AGENTS.md`），需要**单独的维度**表达，**不是第四个执行域**（登记见 §10）。
+同一个实例可以零 Task、多个 Task、Direct 与 Worker 共存；Worker 请求编码、
+队列、reply、取消和业务同步属于组件 / Runtime。Gate 的同步调用栈不可 yield，
+不能把它与可阻塞的 Task Request/Reply 当成同一执行上下文。Wasm 是未来执行后端，
+不是第四个 ExecutionDomain。没有通用 Core RPC 子系统。
 
 **为什么 native binding 绝不能跨域传递：**
 
@@ -129,7 +132,7 @@ Direct binding 携带的是 `(api, ctx)` 两个**裸指针**，只在 provider �
 2. **绕过 callee 域的入口与强制**：直接调 function table 跳过了 callee 域的进入 / 退出、provider principal、per-call service stack、panic containment。U-mode 的强制边界（页表 + 特权级）在裸指针下**完全失效**。
 3. **作用域错配**：binding 是"**以调用者执行域为作用域**"的；跨域复制它，等于把 A 域的访问窗口塞给 B 域。
 
-因此 **binding 不是 POD**：Core 必须**按 caller 域重新解析**，产出该域合法的机制，而不是把 A 的绑定拷贝给 B。
+因此 **binding 不能跨调用域转交**：Core 必须**按 caller 域重新解析**，产出该域合法的机制，而不是把 A 的绑定拷贝给 B。
 
 **Direct 买到速度，但买不到两件事（写清楚，别高估）：**
 
@@ -254,7 +257,7 @@ KcompCallFrame（kcomp_call_frame）
   output  : *mut   u8   output_len : usize    ← 输出负载（可写）
 ```
 
-- 六个字段**全部指针宽**（`size_ptrs = 6`），因此 **32/64 位布局一致、可跨执行域搬运**；**没有嵌套 raw pointer**，标量参数编码在 `args` 的扁平字节区里。
+- 六个字段**全部指针宽**（`size_ptrs = 6`）：RV32 为 24 B、RV64 为 48 B；同一 ISA 内按字段跨执行域搬运，不能跨 XLEN 直接复制结构；**没有嵌套 raw pointer**，标量参数编码在 `args` 的扁平字节区里。
 - `method` / `port` 是独立标量参数（`kcomp_service_dispatch`），Core **从不解释**语义。
 - Direct 路径**不用这个 frame**：直接调 function table，参数就是普通的 C 参数。这正是 Direct 快的原因。
 
@@ -373,51 +376,17 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 ---
 
-## 8. 逐文件迁移清单与分阶段顺序
+## 8. 已收敛边界与后续缺口
 
-### 8.1 逐文件
+旧“全局名字 → 单 binding”实现已删除，Endpoint 是唯一发布真相。lookup 只发现
+contract 与存活；validate / bind 执行 exact ABI 校验。无需给 lookup 再加一份校验参数。
+SDK typed 前端与 K/I 调用后端均已接通，不能再列为待迁移步骤。
 
-| 文件 | 现状 | 目标动作 |
-|---|---|---|
-| `os/core/src/component/endpoint.rs` | Endpoint 真相（publish / discover / lookup / bind / invalidate）；`bind` 落 `TraceEvent::EndpointBind` | 补齐 `lookup` 的 C ABI 可达路径 + abi 校验（消费路径） |
-| `os/core/src/component/export.rs` | 导出 `kcore_endpoint_*`（旧的 interface 导出面已删除） | 修 `kcore_endpoint_lookup` 增加 abi 校验 |
-| `os/core/src/component/call.rs` | service-call 边界（per-call stack + principal + panic containment） | Gate 机制的落点；补嵌套深度策略（可选） |
-| `os/core/src/trace/event.rs` | `EndpointBind` 事件（endpoint / provider / mechanism） | **已完成**：旧 interface 绑定事件已随模型一起删除 |
-| `abi/core.toml` | `KIND_ENDPOINT_BIND` + 其余 10 个 kind（连续编号）；`kcore_endpoint_lookup` 无 abi | 加 abi 参数 |
-| `os/components/kcomp-sdk/src/abi.rs` | 共享 ABI 值类型（`InterfaceAbi` / `InterfaceKind`）；旧 `Service` / binding 层已删除 | typed 前端 + 调用后端（Direct / Gate） |
-| `os/components/kcomp-sdk/src/block.rs` | `BlockDeviceService`（Direct 形状） | 保持 Direct；接调用后端 |
-| `os/components/scheduler_rr/src/lib.rs` | 旧的全局名字绑定已删除 | **已完成**：发布 `scheduler.policy` **Gate-only** endpoint（无共享 vtable、无全局名字）+ `kcomp_services!` dispatcher；组合方（core_test / kbench / monitor / ArchTest）显式 discover + `kcore_sched_set_policy` 选择 |
-| `os/core/src/component/containment.rs` | native service 栈/guard 与 Isolated 身份边界 | 出站桥接挂起 caller 的跨 AS 逃逸目标，确保 native provider panic 由自己的 guard 收敛 |
-| `os/core/src/component/isolated.rs` | Core 侧准备（入口 / 栈校验 + `PreparedActivation`）+ **普通 trap 路径的异常钩子**（跨 AS 现场归因：活动 satp / 私有可执行 PC / 非嵌套 / 非 Core-critical / 无 IRQ scope；默认拒绝恢复；放弃经 trampoline 交回 Core 延续）+ 窄故障策略 seam；由 `isolated_lifecycle.rs` 调用；入口参数 `a0..a3` 由 Core 解释 | 已完成（生命周期 + 跨域 service + panic escape 接线） |
-| `os/core/src/component/isolated_load.rs` | 按域放段 / 页级权限分离 / 逐段映射（`place` / `place_artifact` / `map_into` / `map_mappings`）；由 `isolated_lifecycle.rs` 生产消费；可选 `kcomp_service_dispatch` 解析成实例域 VA；import 白名单（诊断 / 只读、panic、私有 backing 与 endpoint API + 内存 acquire/release）解析到共享 Core 低别名，面外符号装载前拒绝 | 更宽的按域 import 面（未实现） |
-| `os/core/src/component/call.rs` | K/I caller 按 provider 域分派；I 出站先经 `isolated_call.rs` Core 栈/root 桥接 | Sandbox 未实现 |
-| `os/core/src/component/loader.rs` | 按域放段/重定位；I import 白名单含诊断、只读、panic、私有 backing 与五个 endpoint 入口 | heap_alloc/dealloc、任务、设备/DMA/IRQ 与组件创建仍显式拒绝 |
-| `os/arch/src/riscv/mmu/mod.rs`、`cpu.rs`、`trap/`、`trampoline/` | 最小跨 AS trampoline + 安全 trap 栈（32 KiB，trap 入口按 `sscratch` 换栈）+ Core 异常钩子已落地；`activate()` 无生产调用方；无 U-mode；ASID 恒 0 + 全量 `sfence.vma` | 按域激活接入更多路径 / U-mode / `ecall` / ASID（未实现） |
-| `os/core/src/component/store.rs`（manifest） | 无支持范围字段 | 组件支持范围元数据（未实现） |
-
-### 8.2 分阶段顺序
-
-```text
-阶段 1  design
-        本文件定稿；显式取代 component-lifecycle.md:237 的结论。
-
-阶段 2  converge identity（收敛身份）
-        Endpoint 取代"全局名字 → 单 binding"；
-        kcore_endpoint_lookup 增加 exact ABI 校验；
-        trace 事件迁到 Endpoint（EndpointBind：endpoint / provider / mechanism）；
-        **已完成**：旧的"全局名字 → 单 binding"模型（Core 模块、C ABI 导出面、
-        SDK 层、scheduler 名字绑定）已全部删除（协调替换，无 legacy alias）。
-
-阶段 3  Native path（唯一真实存在的部署）
-        typed 前端 + 调用后端（Direct）落地；
-        业务代码零 mode 分支；
-        验证稳态 direct call **不经** kcore_endpoint_call、**不**分配 service stack。
-
-阶段 4  Isolated / Sandbox gap list（只登记，不实现）
-        私有 AS / satp 切换 / U-mode / ecall / 按域 loader / 支持范围元数据。
-```
-
-**最后一步已完成：** 旧的"全局名字 → 单 binding"模型——Core 的 interface 模块、`abi/core.toml` 的对应导出面、SDK 的类型化 Service / publish / bind / refresh / available 层——已随本次协调替换全部删除（不保留 legacy alias，不保留旧 ABI 编号）。删除顺序遵守了"**先迁 trace，再删接口模型**"：`TraceEvent::EndpointBind` 由 `EndpointRegistry::bind` 在 Core 选定机制后发射（kind 重新编号保持连续，见 `os/core/src/trace/abi.rs` 的 payload 分配表）。
+当前剩余工作按 §7 依赖顺序推进：支持范围元数据、私有域任务 / 设备、真实低特权
+transport、AS 并发回收与 DMA 静默条件。每项先有消费者与验证，再扩展支持面。
+业务发现 / provider 选择可以外置，但现有目录有 init、ksh 和 SDK 消费者；没有迁移
+证据时保留简单索引，不复制成第二个长期 Registry。收敛审计与实验见
+[Core convergence](../development/core-convergence.md)。
 
 ---
 
@@ -438,12 +407,14 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 - **稳态 direct call**：typed 前端直接走 function table，**不经 `kcore_endpoint_call`**，**不分配 service stack**（用 trace / 计数器证明）。
 - **RV32 / RV64 布局与宽度一致**：`KcompCallFrame` `size_ptrs = 6`（32/64 同布局）；kcore ABI 宽度规则（`overview.md` §5）。
 
-### 9.3 Isolated / Sandbox（**仅当实现后**）
+### 9.3 执行域验证
 
-- **真实 QEMU** 页表切换 / 栈切换、参数可达性、U-mode `ecall`。
-- **明确：host fake 测试与 `activate()` 不算跨域证明。**
-  - host fake 上下文后端**不执行**组件入口体，只覆盖边界记账。
-  - `activate()`（`os/arch/src/riscv/mmu/mod.rs:56-68`）当前**无人调用**；service call（`containment.rs:773`）**只切 `ra/sp/s0-s11`，没有 satp 切换**。所以任何"已隔离"的结论都必须由真机 / QEMU 上的真实页表与特权级切换证明。
+- Isolated 的真实 satp / 栈切换、参数可达性、权限、panic、重入与重启由 QEMU
+  ArchTest 的 `isolated-*` 验证；CoreTest 通过公开 ABI 验证 K/I 业务调用组合。
+- host fake 不执行组件入口，只证明协议和状态记账；不作为硬件隔离证据。
+- Native containment 的寄存器 / 栈切换不是 AS 切换；Isolated 经专用跨 AS trampoline。
+- SandboxedNative 尚未实现。U-mode 普通用户程序的测试不等于 Sandbox 组件实现。
+- RV64 Gate/Stop 的双 CPU 在途执行验证由 CoreTest 编排，不用私有表模拟并行。
 
 ### 9.4 性能
 

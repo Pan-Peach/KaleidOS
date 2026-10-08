@@ -177,7 +177,7 @@ struct Mapping {               // DMA mapping（device-related）
 
 > **ResourceDomain 不记受管内存**：Core 不做内存记账（无 region owner 记录），只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine；堆是 runtime / deployment 策略，不是 ResourceDomain 资源。契约见 `docs/architecture/memory-and-heap.md`。`ComponentId` 与 `DeviceId` 都是 identity（不是权限），所有权记录只存在于各资源表。
 
-> **DMA 归属模型（已决，刻意如此）**：`kcore_dma_alloc` 是 device-agnostic；`kcore_dma_map` 要求 caller 是**该设备的 owner**（Core 查 device 表，不接受组件自报），并把 mapping 记在 device owner 名下。不建模"设备是不是 DMA master"（FDT 无可靠来源），按**协作式信任**处理。**未决**：组件可自行 claim PLIC 等设备，边界问题无人回答。规范契约见 `docs/architecture/driver-model.md`；记录见 `docs/development/testing.md` §6。
+> **DMA 归属模型**：allocation 与 mapping 的归属 / 权限边界以 [驱动契约](driver-model.md#63-dma-模型allocation-与-mapping-分离) 为准；当前受信 Native mapping 锚在 device owner，不检查 ambient caller。DeviceId 是身份，不能把记账推导为跨隔离域权限。
 
 ### 3.1 归属表可以非常普通
 

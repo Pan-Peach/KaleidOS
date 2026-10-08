@@ -247,7 +247,7 @@ int32_t kcore_dma_unmap(uint64_t mapping);
 - `kcore_device_release`：`-EACCES` 非 owner；`-EBUSY` 仍有 live IRQ/DMA 子项；`-ENODEV` 不存在 / 未认领。
 - `kcore_irq_*`：`-ENODEV` 设备不存在、`resource_index` 越界或无（未绑定）中断线；`-EACCES` 非 owner；`-EINVAL` enable 前尚未 register handler；`-EBUSY` 该逻辑线已挂在别的资源 key 下（不做 shared-line fanout）。
 - `kcore_dma_alloc`：`-EINVAL` 尺寸非法；`-ENOMEM` 物理内存耗尽。
-- `kcore_dma_map`：`-EINVAL` direction 非法或范围非法；`-ENODEV` 设备不存在；`-EACCES` 非 owner。
+- `kcore_dma_map`：`-EINVAL` direction 非法或范围非法；`-ENODEV` 设备不存在 / 未认领。当前受信 Native 实现按 device owner 记 mapping，不校验 ambient caller；见 §6.3 的支持边界。
 - `kcore_dma_unmap`：`-ENOENT` mapping 不存在。
 
 ### 6.2 IRQ 模型
@@ -283,11 +283,12 @@ allocation（device-agnostic）            mapping（device-related）
 ```
 
 - **分配是 device-agnostic 的**：`kcore_dma_alloc(size)` 只要求后端给一块**物理连续**内存，不知道 VirtIO / NVMe / 具体 `DeviceId`。未来后端可以换 DMA pool / buddy / low-memory / coherent / bounce-buffer pool，上传接口不变。
-- **映射是 device-related 的**：`kcore_dma_map(device_id, ptr, len, direction)` 返回 `(device_addr, mapping_id)`。只有设备 owner 能把 buffer 映射给该设备。
+- **映射是 device-related 的**：`kcore_dma_map(device_id, ptr, len, direction)` 返回 `(device_addr, mapping_id)`。mapping 归设备 owner；当前受信 Native 路径允许 Direct provider 在 consumer task 身份下调用，不检查 ambient owner。
   - **No-IOMMU：`device_addr` 就是 buffer 地址（identity）**；
   - 未来 IOMMU 在**同一 seam** 内把 PA → IOVA；受限设备地址经 bounce buffer。**上层 driver 不变**。
 - **`mapping_id` 单调递增 `u64`，从不复用**：这是唯一保留的 "id" 对象，理由是 DMA mapping 有真实的长生命周期（map → 设备使用 → unmap）。
-- `kcore_dma_free` / `kcore_dma_unmap` 做拆除。
+- `kcore_dma_free` / `kcore_dma_unmap` 做拆除。Native `unmap` 只按 mapping id 查找，没有 caller 校验；id 不是跨隔离域授权凭证。
+- **当前支持边界**：Isolated / Sandbox 的设备、IRQ、DMA import 未接通，不能把 Native 的 device-owner 记账解释为私有域权限检查。普通借入 buffer 没有 pin；device→dma 锁序只保证 map 插入与 device release 原子，不能证明 backing 存活或设备静默。未来支持私有域前必须补访问来源 / backing 检查。
 
 ### 6.4 未来 syscall 线格式（SandboxedNative 方向）
 

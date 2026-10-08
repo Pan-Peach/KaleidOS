@@ -116,7 +116,7 @@ Hardware                                    目前只有 QEMU virt
 
 #### 3.9 IRQ `▰▰▰▱▱` EXPERIMENTAL
 
-现状：`IrqTable` 按二维 `(DeviceId, resource_index)` 锚定 route（设备中断资源下标），存 owner/handler/ctx；`register`/`enable`/`disable`/`release`/`revoke_owner`；投递走 trap→route→锁外 callback，回调带 IRQ 归属作用域。固件 specifier（`InterruptSpecifier`：控制器 + 完整 cells）与逻辑 `line` 分离；RISC-V discovery 只把属于已配置 PLIC、source 在范围内的资源绑定成 `line`（AArch64/x86 `line: None`）。同一逻辑线换 key 重复注册 → `-EBUSY`（不做 shared-line fanout）。QEMU ArchTest `external-irq` 证明 PLIC 恰好投递一次 UART THRE 线；host 覆盖多资源独立路由、全宽 DeviceId、未绑定/越界/非 owner 拒绝与重复线拒绝。
+现状：`IrqTable` 按二维 `(DeviceId, resource_index)` 锚定 route（设备中断资源下标），存 owner/handler/ctx；`register`/`enable`/`disable`/`release`/`revoke_owner`；投递走 trap→route→实例准入/在途计数→锁外 callback，回调带 IRQ 归属作用域；route 撤销不等待已取回调返回。固件 specifier（`InterruptSpecifier`：控制器 + 完整 cells）与逻辑 `line` 分离；RISC-V discovery 只把属于已配置 PLIC、source 在范围内的资源绑定成 `line`（AArch64/x86 `line: None`）。同一逻辑线换 key 重复注册 → `-EBUSY`（不做 shared-line fanout）。QEMU ArchTest `external-irq` 证明 PLIC 恰好投递一次 UART THRE 线；host 覆盖多资源独立路由、全宽 DeviceId、未绑定/越界/非 owner 拒绝与重复线拒绝。
 
 缺口：polled、计数、掩蔽、ack 已删并推迟；回调内 panic 会致命；只在 QEMU/PLIC 验证；无 GIC/PIC/APIC 路由（对应资源保留 `line: None`）。
 
@@ -124,9 +124,9 @@ Hardware                                    目前只有 QEMU virt
 
 #### 3.10 DMA `▰▰▰▱▱` EXPERIMENTAL
 
-现状：allocation（与设备无关）和 mapping（与设备相关）分离，`alloc`/`free`/`map`/`unmap` 齐备；失败 backing 进 Core 私有 `QUARANTINE`，不归还 buddy；mapping id 单调不复用。host 覆盖单调、quarantine、revoke；QEMU 有 `dma-ring`、`dma-invalid-size`，virtio_blk 真实走 `dma_alloc` 加 `map`。
+现状：allocation（与设备无关）和 mapping（与设备相关）分离，`alloc`/`free`/`map`/`unmap` 齐备；map 插入持 device→dma 锁，release 不能漏掉新 mapping；失败 backing 进 Core 私有 `QUARANTINE`，不归还 buddy；mapping id 单调不复用。host 覆盖单调、quarantine、revoke；QEMU 有 `dma-ring`、`dma-invalid-size`，virtio_blk 真实走 `dma_alloc` 加 `map`。
 
-缺口：没有 IOMMU，设备地址是 identity，DMA 隔离只有偶然故障隔离；CPU 隔离不等于 DMA 隔离；没有 bounce buffer 或多 pool；`free` 后 backing 不归还，这是 correctness 决定，不是安全结论。
+缺口：Native map 按 device owner 记账、不检查 ambient caller，unmap 没有 caller 检查；普通借入 buffer 未 pin；没有 IOMMU，设备地址是 identity，不能声称 DMA 隔离；CPU 隔离不等于 DMA 隔离；没有 bounce buffer 或多 pool；`free` 后 backing 不归还，这是 correctness 决定，不是安全结论。
 
 下一步：IOMMU 与 bounce/pool 等真机或安全需求出现再做；回收前提是设备静默。
 
@@ -136,7 +136,7 @@ Hardware                                    目前只有 QEMU virt
 
 现状：FDT → `MachineInfo` → `core::init` → monitor 全链打通。FDT 解析用 third_party 的 `fdt` crate。RV64 用 identity 加高半区双映射（Sv39），RV32 用 identity（Sv32）。`make test-qemu` 在 RV64/RV32 双 profile 有 boot smoke。
 
-缺口：只认 FDT 和 QEMU virt；没有真机、板级 quirk、ACPI；M-mode 没有启动路径（无 defconfig，未构建）；NoMMU 启动没有任何 runner 跑过。
+缺口：只认 FDT 和 QEMU virt；没有真机、板级 quirk、ACPI；M-mode/NoMMU 有入口与可编译配置，但 QEMU 尚未启动成功；固件/console 交接不自洽。RV32 S-mode/NoMMU 已在本次收敛审计用私有 profile 实跑 CoreTest，尚未进入默认门禁。
 
 下一步：VisionFive 2 的 bring-up 从这里开始，串口出 `core>` 是第一步验收。板级差异集中在 boot，不进 Core。
 
@@ -164,9 +164,11 @@ Hardware                                    目前只有 QEMU virt
 
 "一个 `.kcomp` 到多个独立实例"是真实支持，不只是 ID 类型上可表达：host 断言两次 instantiate 的 backing 独立且镜像区间不重叠，CoreTest `driver-multi-device`，ArchTest `isolated-restart` 接受同 artifact 的并发第二实例（各自 AS、backing、窗口），`ram_blk_rw` 每实例独立 buffer。
 
-缺口：unload 是 tombstone，不回收 backing；没有 drain 变体；没有意外退出的独立终态；endpoint、task、crosstalk、卸载后语义的完整矩阵没有逐个证明；组件自有任务入口 `kcomp_task` 不存在。
+Stop 在 registry 准入锁内检查 live Task 与 Gate/policy/IRQ 在途执行，再提交 Stopping；Native 发布过 Direct 表即拒绝 destroy（EBUSY），保留表与 ctx。公开 `kcore_component_stop` 复用相同编排。Checksum CoreTest 验证零 Task 的 Passive、多实例、Active/Hybrid Worker 与 RV64 跨 CPU Gate/Stop；普通 `kcore_task_create(entry,arg)` 已提供零到多个 owned Task，不需要另造 `kcomp_task` 生命周期。
 
-下一步：先补 drain 协调协议（停止新工作、排空 IRQ 与回调、确认零活跃执行），它是物理回收的前提；再补 `kcomp_task` 与卸载语义矩阵。
+缺口：记录与镜像留 tombstone，Direct 无 release 协议；没有 drain、Task join、自动物理回收与完整跨域任务矩阵。
+
+下一步：出现真实物理回收需求后验证 drain、Direct 引用释放与 DMA 静默；私有域 owned Task 另按部署依赖接通，不增加第二套实例生命周期。
 
 #### 3.15 Endpoint / Contract / Binding `▰▰▰▱▱` EXPERIMENTAL
 
@@ -220,7 +222,7 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 
 #### 3.20 SDK / C ABI / Rust ABI `▰▰▰▰▱` IMPLEMENTED
 
-现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；60 个 `kcore_*` 导出；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
+现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；61 个 `kcore_*` 导出（本轮仅新增已有 Stop 机制的窄导出）；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
 
 缺口：没有 ABI 版本兼容，靠 exact fingerprint 加原地替换；组件外链只允许 `kcore_*`；SDK 刻意不朝 libc 或共享 runtime 扩张。
 
@@ -228,7 +230,7 @@ VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name
 
 #### 3.21 测试体系 `▰▰▰▰▱` IMPLEMENTED
 
-现状：host 单测含 proptest；CoreTest 是板内集成，RV64 双 CPU 为 56 项检查（bit 0 到 56，bit 23 未用），RV32 为原 49 项；ArchTest 43 个 case，每 case 独立 QEMU，其中 29 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
+现状：host 单测含 proptest；CoreTest 是板内集成，本轮 RV64 双 CPU 为 79 项 KTAP 检查、RV32 为 57 项，两个 block topology 均运行；ArchTest 43 个 case，每 case 独立 QEMU，其中 29 个 `isolated-*`。入口是 `make check/test/test-host/test-qemu/test-arch`；另有 opt-in 的 `test-arch-smp-rv64` 与 `test-arch-{x86_64,aarch64,loongarch64}` / `test-arch-new`（SMP 已实现并纳入 ArchTest CI；新 ISA 仍独立 opt-in）；CI 三个 job（check/qemu/archtest）。
 
 兼容性应用：`tests/compat/` 从 pinned `third_party/libc-test` 直接选择上游 source，
 13 项 ISO C 加 1 项纯计算在 Linux / Windows 共用，另有 2 项 Linux POSIX 文件测试。
@@ -260,7 +262,7 @@ uname / openat / writev / mmap / signal 等缺口，没有伪造成功。
 当前无原生 Windows 环境，Windows reference 未验证；新增 CI 尚未远端运行。
 操作与边界见 `docs/development/userspace.md`。
 
-缺口：NoMMU 不在任何测试入口或 CI 里构建与启动，只有 Kconfig 解析用例；M-mode 无验证；runner 只显式断言 12 条，其余靠 `all: PASS`；host ring 是线程本地替身，不覆盖并发语义。
+缺口：NoMMU 尚未进入默认门禁 / CI，本轮 S-mode 有私有 profile 实跑证据；M-mode 启动失败；runner 校验完整 KTAP 计划、连续编号、失败与 Skip；host ring 是线程本地替身，不覆盖并发语义。
 
 下一步：NoMMU 进 `_test-build` 与 CI；Isolated 补压力与失败注入；并发用 Loom，形式化用 Kani/Miri/Verus，另有 Test Scheduler / Hunt Mode，这些是登记的方向，不是排期。
 
@@ -276,7 +278,7 @@ uname / openat / writev / mmap / signal 等缺口，没有伪造成功。
 
 #### 3.23 平台 profile 与真机 `▰▱▱▱▱` PLANNED（按最弱一环取）
 
-现状：仓库零真机支持。RV32 NoMMU 有 backend 代码和 defconfig（`nommu.rs`、`entry32-nommu.S`、`qemu_rv32_nommu_defconfig`），但当前没有任何测试入口或 CI 构建、启动它，所以不给 EXPERIMENTAL。M-mode 代码可编译（Kconfig 自述 compile-verified only），没有 defconfig 和 boot harness，不在任何测试入口。
+现状：仓库零真机支持。RV32 NoMMU 有 backend / defconfig，本轮 S-mode 私有 profile 已构建并在 QEMU 通过 CoreTest；默认入口与 CI 仍未覆盖，不等于 M-mode 或 MCU 验证。M-mode 代码可编译；本轮私有 profile 编译并尝试 QEMU，默认 OpenSBI 在 S-mode 交接、裸 M-mode console 仍走 SBI，未启动成功；不计为通过。
 
 缺口：没有板卡、没有板级 quirk、没有非 FDT 发现路径。
 
@@ -363,7 +365,7 @@ shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动
 1. block/wake 已接通固定 CPU 的协作式 SMP；组件持有条件与等待者集合，Core 只提供 permit / park / unpark。继续检验真实驱动与服务负载。
 2. task 与地址空间没有绑定。`TaskRecord` 和 `AddressSpaceId` 之间没有关系，`Running(CpuId)` 没有 AS 概念。将来一个 POSIX 进程等于一个 AS 加 N 个 task，这个语义必须由 Core 先提供，否则进程语义会漏进 Core。
 3. 抢占没接线。`timer::on_trap` 不调用 `sched::on_timer_tick`，后者是 `todo!()`。纯协作模型下，不协作或死循环的执行域拿不回控制权。
-4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。unload 是 tombstone，backing 驻留到 reboot，没有 drain。consumer 缓存的裸 function table 在 provider `Stopped`/`Failed` 后仍能调用成功，这是物理驻留的直接后果，不是 bug，但 teardown 正确性不能建立在它上面。
+4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。unload 是 tombstone，backing 驻留到 reboot，没有 drain。发布 Direct 的 Native provider 不能进入 Stopped/destroy；Failure 后旧表仍可能调用，必须保留 ctx，代码页驻留本身不能保证其安全。Gate 的 stop/admission 竞争已由 host 与 RV64 双 CPU CoreTest 验证，完整 DMA/drain 回收仍未证明。
 5. IsolatedNative 的缺口。机制真实，覆盖很窄，详见 3.16。
 6. 真机验证缺失。设备、中断、DMA、timer 都只在 QEMU virt 证明过。
 7. 组件模型仍在演进。`ExecutionDomain` 与生命周期接口是 ACTIVE DESIGN，SandboxedNative 参与的所有组合都被 `todo!()` 或显式拒绝。
@@ -382,8 +384,8 @@ shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动
 | KernelNative（执行域） | 是 | CoreTest 全链加 ArchTest `panic-*` |
 | IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（29 case，RV64+RV32） |
 | SandboxedNative（U-mode） | 否 | Core 骨架；create `-ENOTSUP`，U-mode / destroy 未实现，调用组合显式拒绝 |
-| RV32 / NoMMU | 仅配置解析 | `configs/qemu_rv32_nommu_defconfig` 只被 `tests/kconfig/test_glue.py` 解析；`make check` 的 `_test-build` 与所有 runner/CI 都不构建、不启动它 |
-| RV32 / M-mode（`PRIVILEGE_MACHINE`） | 否 | 仅可编译；无 defconfig；无 boot harness |
+| RV32 / NoMMU | S-mode 私有 profile 实跑 | 本轮 QEMU CoreTest 通过；默认 `_test-build` / CI 未覆盖。M-mode 编译成功、启动失败，证据见 [审计](docs/development/core-convergence.md) |
+| RV32 / M-mode（`PRIVILEGE_MACHINE`） | 编译通过，启动失败 | 本轮 NoMMU 私有 profile 通过 Cargo 构建；默认 BIOS 与裸启动分别尝试，均未到 monitor，见收敛审计 |
 | 真机（任何板卡） | 否 | 仓库没有任何真机代码或配置；`os/`、`configs/` 无 VisionFive/JH7110/ESP32 之类 |
 | CI | 是 | `.github/workflows/ci.yml` 三个 job：`check` / `qemu` / `archtest`；只覆盖 RV64+RV32 MMU。SMP 已进入 archtest job，新 ISA 的 opt-in 目标仍不在 CI |
 
@@ -401,7 +403,7 @@ shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动
 P0 地基（启动地址去硬编码、Sv39/Sv32 启动）                 —— 已完成
 P1 任务系统（context switch、调度执行链）                    —— 已完成
 P2 中断/驱动（timer 抢占 C5、设备·IRQ·DMA C6、第一个 driver）—— 部分：driver 已落地，抢占未接线
-P3 组件化进阶（区域分配 C7、域视图交付 C8、任务化组件 C9）    —— 部分：加载与生命周期已落地，只缺 `kcomp_task` 等
+P3 组件化进阶（区域分配 C7、域视图交付 C8、任务化组件 C9）    —— 部分：身份与生命周期已落地，普通 owned Task 可实现 Passive / Active / Hybrid；缺私有域任务与回收协议
 P4 执行域/隔离（C10）                                        —— 部分：受限 IsolatedNative 已落地，ASID / U-mode / ecall / Isolated 任务与设备 / SandboxedNative 未完成
 ```
 
@@ -410,7 +412,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 1. Timer 与抢占接线：让 `timer::on_trap` 真正到达调度。先决定用延迟重调度标志还是 trap 内直接切换，并正面回答 `sstatus.SIE` 的保存恢复。
 2. Task block/wake：permit 快速路径、阻塞后唤醒及 IRQ 恢复已接线并测试；下一步决定独立 trace 事件。等待条件与等待者列表留在组件。
 3. Task 与 AddressSpace：定义绑定语义，为将来的 POSIX "Process = AS + N Task" 铺路。
-4. 组件生命周期收敛：drain 协调协议，`kcomp_task`，卸载与重载的语义矩阵。
+4. 组件生命周期收敛：按真实消费者推进 drain、Direct 引用释放与私有域 Task，扩展停止/失败语义矩阵。
 5. IsolatedNative 收敛或冻结：补 ASID、U-mode、任务/设备 import 面，或者明确冻结成教学实验。
 6. 消费路径 ABI 已收敛：`validate` 与 `bind` 都做 exact contract 加 abi 加存活，SDK 已接；lookup 保持 contract-only，文档与实现一致。
 7. RISC-V SMP 已接入真实组件任务调度，验证与职责见 §3.5 和 `docs/architecture/scheduling.md`。第二 ISA 暂不扩展；迁移 / work stealing / 抢占后置。
@@ -856,11 +858,11 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | A | Driver：真设备 → claim → MMIO/IRQ/DMA → driver component → Endpoint，最好在真 SoC 上 | PARTIAL | 机制齐全，`virtio_blk` 加 `driver_prober` 在 QEMU 跑通；无真 SoC；IRQ 单线；无 PCIe/USB/NVMe |
 | B | 多实例：一个 artifact 到实例 A/B，各自 state/resources/endpoints/tasks，无串扰 | PARTIAL | 已证：host `same_artifact_loads_produce_independent_components`、CoreTest `driver-multi-device`、ArchTest `isolated-restart`（并发同 artifact）、`ram_blk_rw` 每实例 buffer；endpoint/task 全维度无串扰与卸载后语义未系统证明 |
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；无 VFS、namespace、File service、两级缓存 |
-| D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit 路径已实现，但 host 调度集成测试因锁跨 schedule_next 失败；preemption（`on_timer_tick` 是 `todo!()` 且未接线）也缺失 |
+| D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit、host 调度集成与 RV64 远端 wake 已通过；RR 三常驻任务的下标饥饿已修复；preemption（`on_timer_tick` 是 `todo!()` 且未接线）仍缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | NOT-SATISFIED | POSIX 只有骨架；task↔AS、用户 trap 与阻塞完成协议尚未接线 |
 | F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的真实 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
-| H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | 两种 profile 都存在，但 NoMMU 从未被构建或启动；无 MCU 真机 |
+| H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | RV32 S-mode/NoMMU 私有 profile 已通过 CoreTest；M-mode 启动失败，无 MCU 真机 |
 
 结论：A/B/C/F 是 PARTIAL，D/E/G/H 未满足。Core 还没到 freeze-candidate。已经满足的机制侧说明词汇表方向是对的，缺的是等待语义、task 与 AS 的关系，以及真机与异构机器验证。
 
@@ -887,4 +889,4 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 - `docs/modules/components.md` 漏登记两个已在 `KCOMP_SRCS` 里的 fixture：`tests/kcomp_isolated_direct`、`tests/kcomp_isolated_unsupported`，全 `docs/` 没有引用。
 - `README.md` 目录说明列了 `components/drivers/ uart/ virtio_blk/ …`，但 `uart/` 不存在，`driver-model.md` §4 明说 uart 未实现；README 的 monitor 命令列表漏了 `unload` 和 `trace`，`docs/modules/core/monitor.md` 有。
 - 执行域注释已同步 K/I 双向 Gate；另有历史注释待处理：`os/core/src/memory/address_space.rs:2030` 的"对应 roadmap 的 NoMMU 验收点"失去所指（路线图文档已删除，NoMMU 现状见 3.23 与第 7 节）。
-- 计数校验：CoreTest 在 RV64 双 CPU 上有 56 项 distinct 检查（bit 0 到 56，bit 23 未用）；RV32 保留 49 项。ArchTest 基线为 43 case，RV64 SMP 额外三个硬件契约 case。2026-09-27 的 `41/41` CoreTest 日志是旧快照。
+- 测试计数以 §3.21 的当前 KTAP 计划为准，2026-09-27 的 `41/41` 和旧 bitmap 计数是历史快照。

@@ -187,7 +187,8 @@ import 签名变化与生命周期布局变化一样必须原地协调替换 `KC
 
 ## 6. 任务 ABI
 
-`kcore_task_create` 现在只收 entry 地址，导致 task 只能读 globals（`driver_prober/src/runtime.rs:101-145`）。必须加 opaque 参数：
+`kcore_task_create` 接受入口和 opaque 参数；一个实例可以没有任务，也可以拥有多个任务。
+后台 Worker 与 Direct 入口共用该实例身份、资源与生命周期，不另设 Server 基类：
 
 ```c
 typedef void (*KcompTaskEntry)(void *arg);   /* 契约：必须经 Core 退出 */

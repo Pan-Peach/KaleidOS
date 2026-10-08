@@ -1390,7 +1390,9 @@ mod tests {
             ptr::null_mut(),
         );
         let dead = publish_policy_endpoint(provider, 0);
-        endpoint::get_endpoints().lock().invalidate_endpoint(dead);
+        endpoint::get_endpoints()
+            .lock()
+            .invalidate_provider(provider);
         assert_eq!(
             set_policy(dead),
             Err(SchedError::PolicyEndpoint(EndpointError::EndpointDead))

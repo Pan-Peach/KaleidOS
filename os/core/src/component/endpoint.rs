@@ -558,14 +558,6 @@ impl EndpointRegistry {
         Ok(record.id)
     }
 
-    /// 使一个 endpoint 永久失效（provider 停止 / 失败路径）。
-    /// 幂等；未知 id 静默 no-op（调用方不持有 endpoint 生命周期的完整视图）。
-    pub fn invalidate_endpoint(&mut self, id: EndpointId) {
-        if let Some(record) = self.endpoints.iter_mut().find(|r| r.id == id) {
-            record.state = EndpointState::Invalid;
-        }
-    }
-
     /// 使某 provider 的全部 endpoint 永久失效（组件失败 / 卸载时由 Core 调用）。
     /// 其它 provider 的 endpoint 不受影响。
     pub fn invalidate_provider(&mut self, provider: ComponentId) {
@@ -584,6 +576,7 @@ impl EndpointRegistry {
             .any(|record| record.owner == provider && !record.api.is_null())
     }
 
+    #[cfg(test)]
     pub fn endpoint_count(&self) -> usize {
         self.endpoints.len()
     }
@@ -618,6 +611,7 @@ impl EndpointRegistry {
         ))
     }
 
+    #[cfg(test)]
     pub fn live_count(&self) -> usize {
         self.endpoints
             .iter()
@@ -1343,7 +1337,7 @@ mod tests {
         );
 
         // provider 停止 / 失败 → endpoint 永久死亡，bind 绝不交付。
-        er.invalidate_endpoint(endpoint);
+        er.invalidate_provider(ids[0]);
         assert_eq!(
             er.bind(
                 &reg,
@@ -1458,7 +1452,7 @@ mod tests {
         );
 
         // endpoint 永久失效 → EndpointDead。
-        er.invalidate_endpoint(endpoint);
+        er.invalidate_provider(ids[0]);
         assert_eq!(er.resolve(&reg, endpoint), Err(EndpointError::EndpointDead));
 
         // owner 离开 Ready（停止 / 失败）→ EndpointDead；身份消失 → ProviderNotFound。
@@ -1473,34 +1467,6 @@ mod tests {
     }
 
     // -- 5. invalidate：永久失效 ---------------------------------------------
-
-    #[test]
-    fn invalidate_endpoint_is_permanent() {
-        let (reg, ids) = ready_world();
-        let mut er = EndpointRegistry::new();
-        let endpoint = publish_ready(&mut er, &reg, ids[0], b"blk0", CONTRACT, 7);
-
-        er.invalidate_endpoint(endpoint);
-        assert_eq!(
-            er.lookup(&reg, endpoint, CONTRACT, ABI_A),
-            Err(EndpointError::EndpointDead)
-        );
-        // discover 也不交付死 endpoint。
-        assert_eq!(
-            er.discover(&reg, ids[0], b"blk0", CONTRACT),
-            Err(EndpointError::EndpointDead)
-        );
-        // 幂等、不复活；记录保留（tombstone，id 不复用）。
-        er.invalidate_endpoint(endpoint);
-        assert_eq!(
-            er.lookup(&reg, endpoint, CONTRACT, ABI_A),
-            Err(EndpointError::EndpointDead)
-        );
-        assert_eq!(er.endpoint_count(), 1);
-        assert_eq!(er.live_count(), 0);
-        // 未知 id：静默 no-op。
-        er.invalidate_endpoint(EndpointId::from_raw(999));
-    }
 
     #[test]
     fn invalidate_provider_only_affects_its_own_endpoints() {

@@ -1,7 +1,7 @@
 # components（os/components/ + tools/）
 
 > 组件层：**组件 crates** + **`kcomp-sdk`（SDK / CRT）** + **`.kcomp` 构建 / 打包 / 加载流水线**。
-> 组件是热插拔边界；`.kcomp` 是**语言无关**的组件二进制（ET_REL），不是 rustc `.o`。
+> 组件是独立镜像与生命周期边界；`.kcomp` 是**语言无关**的组件二进制（ET_REL），不是 rustc `.o`。
 
 ## 组件 crates
 

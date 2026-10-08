@@ -34,7 +34,7 @@
 //!   不受生命周期门禁限制（见 `export.rs` 的门禁说明），销毁入口能在 `Stopping`
 //!   状态下自行释放资源；入口返回后 Core 仍兜底撤销一切**剩余** authority（多撤
 //!   不少撤；设备宁可进 quarantine 也不留悬空授权）。反向地，入口在 `Stopping`
-//!   期间调用 `kcore_mmio_claim` / `kcore_dma_alloc` 等仍会成功，随后被第 4 步
+//!   期间调用 `kcore_device_claim` / `kcore_dma_alloc` 等仍会成功，随后被第 4 步
 //!   兜底撤销——现有 export 门禁只拦 `Failed`。
 //! - **失败路径刻意不调用本入口**（Linux 类比：崩溃的模块不值得信任）：
 //!   [`super::failure::fail_component`] 直接 `mark_failed` + 同一兜底，不经过
@@ -61,9 +61,8 @@ use crate::component::{ComponentId, failure};
 
 /// 停止的拒绝 / 失败原因（`stop_component` 的返回错误）。
 ///
-/// ABI 语义：当前只有 monitor `unload` 与 host 测试消费；errno 映射已定
-/// （`errno.rs::From<ComponentStopError>`），若导出 `kcore_component_stop`
-/// 直接复用，不需要重新定档。
+/// monitor `unload` 与 `kcore_component_stop` 共用此结果；errno 的唯一映射
+/// 位于 `errno.rs::From<ComponentStopError>`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentStopError {
     /// 实例不存在（未声明；无 unload）。errno 语义：`ENOENT`。
@@ -96,8 +95,8 @@ pub enum ComponentStopError {
 /// `kcomp_instance_destroy` 是**必需导出**（loader 保证每个 image 都有）。
 pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
     // 步骤 1：拒绝门。必须在任何提交之前——拒绝不得改变 Core 真相。
-    // Stop checks publication, execution and task admission under registry → endpoint/task locks. No remote
-    // create can slip between checking live work and committing Stopping.
+    // Registry → endpoint/task admission covers publication, execution and
+    // task creation through the Stopping commit, including remote callers.
     {
         let _irq = crate::irq::IrqSaveGuard::new();
         let mut registry = registry::get_registry().lock();

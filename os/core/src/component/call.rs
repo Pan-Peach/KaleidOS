@@ -823,7 +823,7 @@ mod tests {
         // When：endpoint 被永久失效（provider 停止 / 失败的等价终态）。
         endpoint::get_endpoints()
             .lock()
-            .invalidate_endpoint(endpoint);
+            .invalidate_provider(provider);
         let mut out_status = 0i32;
         let error = endpoint_call(
             endpoint,

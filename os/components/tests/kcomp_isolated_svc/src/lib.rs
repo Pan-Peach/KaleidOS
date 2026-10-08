@@ -55,7 +55,7 @@
 #![no_std]
 
 // Declaration-only schema mirror: no SDK runtime or new imports.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 #[path = "../../../kcomp-sdk/src/generated/abi.rs"]
 mod abi;
 
