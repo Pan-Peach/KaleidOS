@@ -55,6 +55,8 @@ pub(crate) fn revoke_authority_and_unbind(id: ComponentId) {
     endpoints.invalidate_provider(id);
     // staged endpoint publish：pending 全丢弃，旧 provider 完全不受影响。
     endpoints.discard_pending(id);
+    drop(endpoints);
+    crate::component::exchange::owner_failed(id);
 }
 
 #[cfg(test)]

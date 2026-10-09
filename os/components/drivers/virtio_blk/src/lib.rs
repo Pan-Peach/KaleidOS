@@ -65,8 +65,7 @@ use core::sync::atomic::Ordering;
 
 use hal::{CoreHal, DEVICE_ID, MMIO_BASE, device_id, rollback_attachment, unmap_residual_mappings};
 use kcomp_sdk::abi;
-use kcomp_sdk::block::dispatch::dispatch as block_dispatch;
-use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDeviceProvider, BlockDeviceService};
+use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceProvider};
 use kcomp_sdk::errno::{Errno, Result};
 use kcomp_sdk::frame::Call;
 use kcomp_sdk::probe::{
@@ -94,7 +93,6 @@ const VIRTIO_MMIO_STATUS_OFFSET: u32 = 0x070;
 const VIRTIO_ID_BLOCK: u32 = 2;
 
 /// Gate dispatch token：`block.device` 契约（provider 私有；组合策略不需要知道）。
-const BLOCK_PORT: u32 = 1;
 /// Gate dispatch token：`probe.result` 契约。
 const PROBE_RESULT_PORT: u32 = 2;
 
@@ -134,20 +132,13 @@ impl BlockDeviceProvider for VirtioBlkProvider {
     }
 }
 
-/// publish 只在成功 attach 之后调用（staged：Core 在 `kcomp_instance_create`
-/// 返回 0 后提交）。Direct 的 `ctx` 是 `&'static` provider（无协议状态），
-/// Gate 的 port token 是 [`BLOCK_PORT`]。
-static BLOCK_SERVICE: BlockDeviceService<VirtioBlkProvider> =
-    BlockDeviceService::new(VirtioBlkProvider);
-
-// ---------------------------------------------------------------------------
-// Gate 入口：image 级 port switch（block.device + probe.result）
-// ---------------------------------------------------------------------------
-
-/// `block.device` 的 Gate 路径：与 Direct 共用同一份业务后端。
-fn dispatch_block(_state: &VirtioBlkState, method: u32, call: Call<'_>) -> i32 {
-    klog!("virtio_blk: gate dispatch method={}", method);
-    block_dispatch::<VirtioBlkProvider>(&VirtioBlkProvider, method, call)
+/// The driver owns its Server Task and device; no Direct table is published.
+extern "C" fn block_server(_arg: *mut ()) {
+    let owner = kcomp_sdk::management::current_component().unwrap();
+    let endpoint =
+        kcomp_sdk::endpoint::Endpoint::<BlockDevice>::lookup(owner, BLOCK_DEVICE_NAME).unwrap();
+    let _ = kcomp_sdk::block::server::serve(&VirtioBlkProvider, endpoint.id());
+    kcomp_sdk::management::exit_task();
 }
 
 /// `probe.result` 的 `RESULT` 方法：把本实例的 8 字节回复写进 output。
@@ -170,7 +161,6 @@ fn dispatch_probe_result(state: &VirtioBlkState, method: u32, call: Call<'_>) ->
 
 kcomp_services! {
     state: VirtioBlkState;
-    BLOCK_PORT => dispatch_block,
     PROBE_RESULT_PORT => dispatch_probe_result,
 }
 
@@ -307,7 +297,7 @@ kcomp_instance_create!(|args, out_state| {
     //     Core 丢弃全部 pending，prober 记为 creation failure）。
     // SAFETY: state 由本实例 create 分配、存活期地址稳定。
     unsafe { (*state).result = ProbeReply::matched().encode() };
-    if let Err(error) = BLOCK_SERVICE.publish_endpoint(BLOCK_DEVICE_NAME, BLOCK_PORT) {
+    if let Err(error) = kcomp_sdk::endpoint::publish_ipc::<BlockDevice>(BLOCK_DEVICE_NAME) {
         klog!("virtio_blk: publish block.device failed (rc={})", error);
         drop(blk);
         rollback_attachment(device_id);
@@ -332,6 +322,10 @@ kcomp_instance_create!(|args, out_state| {
     unsafe { (*state).attached = true };
     // SAFETY: out_state 由 Core 保证可写。
     unsafe { *out_state = state.cast::<()>() };
+    if let Err(error) = kcomp_sdk::management::start_task(block_server) {
+        // A Created Task may retain its image; failed Native backing stays resident.
+        return error.code();
+    }
     klog!("virtio_blk: probe.result published (outcome=0)");
     klog!("virtio_blk test passed");
     0

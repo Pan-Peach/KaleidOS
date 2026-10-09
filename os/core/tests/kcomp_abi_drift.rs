@@ -459,13 +459,8 @@ fn component_contract_literals_are_pinned() {
     // filesystem：名字 + 指纹 + 只读 open flag。
     assert_eq!(
         generated_filesystem::KCOMP_FILESYSTEM_ABI,
-        0x4653_4E4F_4445_524F,
+        0xEC25_B01F_768A_394D,
         "filesystem ABI 指纹值漂移"
-    );
-    assert_eq!(
-        &generated_filesystem::KCOMP_FILESYSTEM_ABI.to_be_bytes(),
-        b"FSNODERO",
-        "filesystem ABI 指纹不再是 ASCII tag"
     );
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NAME, b"filesystem");
     assert_eq!(
@@ -494,6 +489,17 @@ fn component_contract_literals_are_pinned() {
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_ROOT, 5);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_LOOKUP, 6);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_NODE_INFO, 7);
+    assert_eq!(
+        generated_filesystem::KCOMP_FILESYSTEM_METHOD_NODE_DETAILS,
+        8
+    );
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_OPEN_NODE, 9);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_READ_AT, 10);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_SHUTDOWN, 11);
+    assert_eq!(
+        generated_filesystem::KCOMP_FATFS_CREATE_CONFIG_ABI,
+        0x45D2_189A_CF06_73BE
+    );
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_HANDLE_LEN, 8);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_FLAGS_LEN, 4);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_READ_HEADER_LEN, 8);

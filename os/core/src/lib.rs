@@ -100,6 +100,7 @@ pub fn init(
 
     component::registry::init();
     component::endpoint::init();
+    component::exchange::init();
     // resource 表按已提交快照的**设备数**定容（长度即真相，全宽 DeviceId）。
     resource::init();
     irq::init();

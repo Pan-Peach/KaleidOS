@@ -56,7 +56,7 @@ const _: () = {
 pub const KCOMP_FILESYSTEM_NAME: &[u8] = b"filesystem";
 
 /// exact ABI fingerprint（8 字节 ASCII "FSNODERO" 的大端读数）。
-pub const KCOMP_FILESYSTEM_ABI: u64 = 0x4653_4E4F_4445_524F;
+pub const KCOMP_FILESYSTEM_ABI: u64 = 0xEC25_B01F_768A_394D;
 
 /// 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。
 pub const KCOMP_FILESYSTEM_OPEN_READ: u32 = 0x00000001;
@@ -111,3 +111,18 @@ pub const KCOMP_FILESYSTEM_NAME_MAX: usize = 255;
 
 /// 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。
 pub const KCOMP_FILESYSTEM_ENCODING_BYTES: u32 = 1;
+
+/// IPC: args node u64; reply kind u32, canonical name length u32, size u64, canonical ASCII name[12] (28 bytes).
+pub const KCOMP_FILESYSTEM_METHOD_NODE_DETAILS: u32 = 8;
+
+/// IPC: args node u64; reply open handle u64. Owner is verified consumer Task.
+pub const KCOMP_FILESYSTEM_METHOD_OPEN_NODE: u32 = 9;
+
+/// IPC: args handle u64 + offset u64; reply actual u64 + bytes. No exposed cursor change.
+pub const KCOMP_FILESYSTEM_METHOD_READ_AT: u32 = 10;
+
+/// LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC.
+pub const KCOMP_FATFS_CREATE_CONFIG_ABI: u64 = 0x45D2_189A_CF06_73BE;
+
+/// IPC control consumer only: args/input/output empty; close files, unmount, invalidate endpoint and exit server.
+pub const KCOMP_FILESYSTEM_METHOD_SHUTDOWN: u32 = 11;

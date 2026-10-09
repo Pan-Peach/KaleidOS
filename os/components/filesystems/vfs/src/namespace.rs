@@ -1,87 +1,237 @@
-//! Namespace：挂载关系与路径遍历，不拥有 fd / HANDLE / 进程 cwd。
-//! 所有记录均应放在 VFS 实例状态中，不使用可变全局表。
-
-use crate::name::PathInput;
-use crate::provider::{FsInstanceId, NodeRef};
-use crate::{Error, Result};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MountId(pub u64);
-
-/// 路径位置草案：挂载位置、目录项与底层节点是不同身份。
-/// TODO: 引用保活、目录项代次与 rename 后的 parent 关系。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathRef {
-    pub mount: MountId,
-    pub entry: u64,
-    pub node: NodeRef,
+//! One namespace for Local and Remote Nodes. Mounts attach to dentry positions.
+use crate::{
+    Error, Result,
+    name::NameRef,
+    provider::{Node, NodeKind},
+};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use spin::Mutex;
+struct Dentry {
+    node: Node,
+    name: Vec<u8>,
+    parent: Option<Arc<Dentry>>,
+    children: Mutex<Vec<Weak<Dentry>>>,
 }
-
-pub struct Mount {
-    pub id: MountId,
-    /// None 表示 namespace 根；其余挂载指向父 namespace 中的位置。
-    pub at: Option<PathRef>,
-    pub root: NodeRef,
+impl Dentry {
+    fn root(node: Node) -> Arc<Self> {
+        Arc::new(Self {
+            node,
+            name: Vec::new(),
+            parent: None,
+            children: Mutex::new(Vec::new()),
+        })
+    }
+    fn lookup(self: &Arc<Self>, name: &[u8]) -> Result<Arc<Self>> {
+        // No namespace or cache lock across a backend call (which may park).
+        let found = self.node.lookup(NameRef::Bytes(name))?;
+        crate::name::check_component(&found.name)?;
+        if found.node.identity().fs != self.node.identity().fs {
+            return Err(Error::EIO);
+        }
+        let mut cache = self.children.lock();
+        cache.retain(|entry| entry.strong_count() != 0);
+        if let Some(entry) = cache.iter().filter_map(Weak::upgrade).find(|entry| {
+            entry.name == found.name && entry.node.identity() == found.node.identity()
+        }) {
+            return Ok(entry);
+        }
+        let entry = Arc::new(Self {
+            node: found.node,
+            name: found.name,
+            parent: Some(self.clone()),
+            children: Mutex::new(Vec::new()),
+        });
+        cache.push(Arc::downgrade(&entry));
+        Ok(entry)
+    }
 }
-
-/// 遍历范围草案。Root 允许在 root 下解析绝对 / 相对路径；
-/// BeneathStart 还限制在起点之下，不能靠 .. / symlink / mount 跳出。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LookupBoundary {
-    Root,
-    BeneathStart,
+struct Mount {
+    id: u64,
+    root: Arc<Dentry>,
+    covered: Option<Path>,
 }
-
-pub struct LookupOptions {
-    pub boundary: LookupBoundary,
-    pub follow_final_symlink: bool,
+#[derive(Clone)]
+pub struct Path {
+    mount: Arc<Mount>,
+    entry: Arc<Dentry>,
+}
+impl Path {
+    pub fn node(&self) -> &Node {
+        &self.entry.node
+    }
+    pub fn mount_id(&self) -> u64 {
+        self.mount.id
+    }
+    pub fn same_position(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mount, &other.mount) && Arc::ptr_eq(&self.entry, &other.entry)
+    }
+    fn parent(&self) -> Self {
+        if let Some(parent) = &self.entry.parent {
+            return Self {
+                mount: self.mount.clone(),
+                entry: parent.clone(),
+            };
+        }
+        if let Some(covered) = &self.mount.covered {
+            return covered.parent();
+        }
+        self.clone()
+    }
+    fn below(&self, root: &Self) -> bool {
+        let mut path = self.clone();
+        loop {
+            if path.same_position(root) {
+                return true;
+            }
+            let parent = path.parent();
+            if parent.same_position(&path) {
+                return false;
+            }
+            path = parent;
+        }
+    }
+}
+pub struct LookupContext<'a> {
+    pub start: &'a Path,
+    pub root: &'a Path,
+    pub beneath: bool,
     pub cross_mounts: bool,
-    pub max_symlinks: u32,
 }
-
-/// 每次遍历显式传入起点和边界；personality 自己保存 cwd / preopened dir。
-/// TODO: 在实际 symlink / mount 遍历中检查边界，不能只清洗路径字符串。
-pub struct LookupContext {
-    pub start: PathRef,
-    pub root: PathRef,
-    pub options: LookupOptions,
+pub struct Namespace {
+    root: Path,
+    mounts: Vec<Arc<Mount>>,
+    next_mount: u64,
 }
-
-/// 表存储由实例运行时提供；暂不决定堆分配器、容量或缓存算法。
-/// TODO: 目录项记录 / 名字保活、mount / entry 发号与锁，由人类实现。
-pub struct Namespace<'a> {
-    pub mounts: &'a mut [Option<Mount>],
-}
-
-impl Namespace<'_> {
-    /// TODO: 记录挂载关系；不能把 namespace attach 等同于再次 mount provider。
-    pub fn attach(&mut self, _at: Option<PathRef>, _root: NodeRef) -> Result<MountId> {
-        Err(Error::Unsupported)
+impl Namespace {
+    pub fn new(root: Node) -> Result<Self> {
+        if root.metadata()?.kind != NodeKind::Directory {
+            return Err(Error::ENOTDIR);
+        }
+        let mount = Arc::new(Mount {
+            id: 1,
+            root: Dentry::root(root),
+            covered: None,
+        });
+        Ok(Self {
+            root: Path {
+                mount: mount.clone(),
+                entry: mount.root.clone(),
+            },
+            mounts: alloc::vec![mount],
+            next_mount: 2,
+        })
     }
-
-    /// TODO: busy / detach 语义与路径引用保活；detach 不等于 provider unmount。
-    pub fn detach(&mut self, _mount: MountId) -> Result<()> {
-        Err(Error::Unsupported)
+    pub fn root(&self) -> Path {
+        self.root.clone()
     }
-
-    /// TODO: 引用表与 mount / entry / node 保活；复制 PathRef 本身不增加用户引用。
-    pub fn retain(&mut self, _path: PathRef) -> Result<()> {
-        Err(Error::Unsupported)
+    fn contains(&self, path: &Path) -> bool {
+        self.mounts
+            .iter()
+            .any(|mount| Arc::ptr_eq(mount, &path.mount))
     }
-
-    pub fn release(&mut self, _path: PathRef) -> Result<()> {
-        Err(Error::Unsupported)
+    pub fn attach(&mut self, at: &Path, root: Node) -> Result<u64> {
+        if !self.contains(at) {
+            return Err(Error::ESTALE);
+        }
+        if at.same_position(&self.root) {
+            return Err(Error::ENOTSUP);
+        }
+        if at.node().metadata()?.kind != NodeKind::Directory
+            || root.metadata()?.kind != NodeKind::Directory
+        {
+            return Err(Error::ENOTDIR);
+        }
+        if self.mounts.iter().any(|mount| {
+            mount
+                .covered
+                .as_ref()
+                .is_some_and(|path| path.same_position(at))
+        }) {
+            return Err(Error::EBUSY);
+        }
+        let id = self.next_mount;
+        self.next_mount = id.checked_add(1).ok_or(Error::ENOSPC)?;
+        self.mounts.push(Arc::new(Mount {
+            id,
+            root: Dentry::root(root),
+            covered: Some(at.clone()),
+        }));
+        Ok(id)
     }
-
-    /// TODO: 逐段解析并保活结果；检查目录、symlink 次数、实际 mount 跨越与边界。
-    /// 不得静默替换不可表示字符，也不得统一转小写。
-    pub fn resolve(&self, _context: &LookupContext, _path: PathInput<'_>) -> Result<PathRef> {
-        Err(Error::Unsupported)
+    pub fn detach(&mut self, id: u64) -> Result<()> {
+        let index = self
+            .mounts
+            .iter()
+            .position(|mount| mount.id == id)
+            .ok_or(Error::ENOENT)?;
+        if index == 0 || Arc::strong_count(&self.mounts[index]) != 1 {
+            return Err(Error::EBUSY);
+        }
+        self.mounts.remove(index);
+        Ok(())
     }
-
-    /// provider 失败后这些挂载 / 路径逻辑失效；不能把它们重绑到新 incarnation。
-    /// TODO: 和 FileService 失效在同一实例生命周期中协调。
-    pub fn invalidate_provider(&mut self, _instance: FsInstanceId) -> Result<()> {
-        Err(Error::Unsupported)
+    pub fn resolve(&self, ctx: &LookupContext<'_>, path: &[u8]) -> Result<Path> {
+        if !self.contains(ctx.start) || !self.contains(ctx.root) {
+            return Err(Error::ESTALE);
+        }
+        if !ctx.start.below(ctx.root) {
+            return Err(Error::EXDEV);
+        }
+        if path.is_empty() || path.contains(&0) || path.len() > 512 {
+            return Err(Error::EINVAL);
+        }
+        let absolute = path.starts_with(b"/");
+        if ctx.beneath && absolute {
+            return Err(Error::EXDEV);
+        }
+        let mut current = if absolute {
+            ctx.root.clone()
+        } else {
+            ctx.start.clone()
+        };
+        for name in path.split(|b| *b == b'/').filter(|part| !part.is_empty()) {
+            if current.node().metadata()?.kind != NodeKind::Directory {
+                return Err(Error::ENOTDIR);
+            }
+            if name == b"." {
+                continue;
+            }
+            if name == b".." {
+                if ctx.beneath && current.same_position(ctx.start) {
+                    return Err(Error::EXDEV);
+                }
+                if !current.same_position(ctx.root) {
+                    let parent = current.parent();
+                    if !ctx.cross_mounts && !Arc::ptr_eq(&parent.mount, &current.mount) {
+                        return Err(Error::EXDEV);
+                    }
+                    current = parent;
+                }
+                continue;
+            }
+            crate::name::check_component(name)?;
+            current.entry = current.entry.lookup(name)?;
+            if let Some(mount) = self.mounts.iter().find(|mount| {
+                mount
+                    .covered
+                    .as_ref()
+                    .is_some_and(|path| path.same_position(&current))
+            }) {
+                if !ctx.cross_mounts {
+                    return Err(Error::EXDEV);
+                }
+                current = Path {
+                    mount: mount.clone(),
+                    entry: mount.root.clone(),
+                };
+            }
+        }
+        if path.ends_with(b"/") && current.node().metadata()?.kind != NodeKind::Directory {
+            return Err(Error::ENOTDIR);
+        }
+        Ok(current)
     }
 }

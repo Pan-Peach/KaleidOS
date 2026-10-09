@@ -39,6 +39,7 @@ docs/
 | Memory/Heap、region 归属、访问窗口与回收 | [内存与堆](architecture/memory-and-heap.md) | 内存/堆最终契约；与 device claim 同形 |
 | 部署、binding 作用域与调用机制 | [部署契约](architecture/deployment.md) | 补充 lifecycle §9 的代码共享目标，不取代生命周期承诺 |
 | 服务执行模型、组合策略与业务会话归属 | [服务执行](architecture/service-execution.md) | 不替代部署、生命周期或文件对象契约；候选机制明确标注 |
+| Endpoint Request/Reply、授权、等待与退出 | [IPC](architecture/ipc.md) + [core ABI](../abi/core.toml) | 当前 KernelNative 窄传输契约；私有域 IPC 尚未接线 |
 | 分层与 ResourceDomain/ExecutionDomain 概念 | [架构总览](architecture/overview.md) / [组件模型](architecture/component-model.md) | 细节服从上述主题契约 |
 | 调度、CPU 归属与 SMP 提交 | [调度契约](architecture/scheduling.md) | Core 与策略分工 |
 | 构建配置 | [Kconfig 契约](architecture/kconfig.md) | resolved .config 是本次构建真相 |
@@ -51,6 +52,8 @@ docs/
 | 性能验证 | [benchmark](development/benchmark.md) | 基准与回归策略 |
 | 现状、里程碑与路线图 | [STATUS.md](../STATUS.md) | 进度的单一入口；事实以代码和验证证据为准 |
 | 参考系统与论文 | [参考资料](philosophy/references.md) | 阅读清单 |
+| 成熟内核调查方法、版本与可借鉴范围 | [参考系统](development/reference-systems.md) | 研究入口，不替代架构契约 |
+| 统一 IPC / 混合 VFS 重构 | [源码审计](development/component-communication-audit.md)、[IPC ADR](development/ipc-request-reply-adr.md)、[VFS ADR](development/hybrid-vfs-adr.md)、[迁移计划](development/component-communication-migration.md) | 历史审计、阶段实现与后续提议；现行 architecture/interfaces 为契约 |
 
 `notes/` 不参与权威判定。旧 resource-model-review 中的 Handle/Slot/authority 模型
 已被替代；需要现行资源与生命周期契约时查 architecture。
@@ -65,6 +68,8 @@ docs/
 | Core 收敛职责审计、变更与验证证据 | [Core convergence](development/core-convergence.md)（审计记录，非契约） |
 | 执行身份、资源归属与 Direct/Gate/Worker 语义审计 | [Execution & ownership review](development/execution-ownership-review.md)（审计记录与建议，非契约） |
 | 研究吸收、双盘/双 FS 纵向负载与源码问题矩阵 | [服务研究](development/service-runtime-study.md)（研究与审计，非契约） |
+| 统一组件通信、Local/Remote VFS 与逐文件迁移 | [通信审计](development/component-communication-audit.md)、[IPC ADR](development/ipc-request-reply-adr.md)、[混合 VFS ADR](development/hybrid-vfs-adr.md)、[迁移计划](development/component-communication-migration.md) |
+| 调查成熟内核，核对源码快照与借鉴边界 | [参考系统](development/reference-systems.md) |
 | 理解项目与寻找源码 | [核心哲学](philosophy/core-philosophy.md)、[架构总览](architecture/overview.md)、[模块地图](modules/README.md) |
 | 理解 scheduler 与 SMP | [调度契约](architecture/scheduling.md)、[sched 模块](modules/core/sched.md) |
 | 写驱动、认领设备 | [驱动契约](architecture/driver-model.md)、[组件地图](modules/components.md) |

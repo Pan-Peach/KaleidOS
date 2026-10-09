@@ -122,7 +122,7 @@ doc = "filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字�
 [[const]]
 name = "KCOMP_FILESYSTEM_ABI"
 type = "u64"
-value = "0x4653_4E4F_4445_524F"
+value = "0xEC25_B01F_768A_394D"
 targets = "c,sdk-rust"
 doc = "exact ABI fingerprint（8 字节 ASCII \"FSNODERO\" 的大端读数）。"
 
@@ -253,3 +253,36 @@ type = "u32"
 value = "1"
 targets = "c,sdk-rust"
 doc = "原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。"
+
+# Request/Reply additions; old Direct table remains during staged migration.
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_NODE_DETAILS"
+type = "u32"
+value = "8"
+targets = "c,sdk-rust"
+doc = "IPC: args node u64; reply kind u32, canonical name length u32, size u64, canonical ASCII name[12] (28 bytes)."
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_OPEN_NODE"
+type = "u32"
+value = "9"
+targets = "c,sdk-rust"
+doc = "IPC: args node u64; reply open handle u64. Owner is verified consumer Task."
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_READ_AT"
+type = "u32"
+value = "10"
+targets = "c,sdk-rust"
+doc = "IPC: args handle u64 + offset u64; reply actual u64 + bytes. No exposed cursor change."
+
+[[const]]
+name = "KCOMP_FATFS_CREATE_CONFIG_ABI"
+type = "u64"
+value = "0x45D2_189A_CF06_73BE"
+targets = "c,sdk-rust"
+doc = "LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC."
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_SHUTDOWN"
+type = "u32"
+value = "11"
+targets = "c,sdk-rust"
+doc = "IPC control consumer only: args/input/output empty; close files, unmount, invalidate endpoint and exit server."

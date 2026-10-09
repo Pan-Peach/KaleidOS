@@ -46,7 +46,20 @@ static API: Api = Api {
     checksum: direct,
     mailbox,
     worker: worker_id,
+    echo,
 };
+
+// Test-only copy workload shared by Direct and Gate measurements. The caller
+// provides disjoint readable/writable buffers, borrowed until return.
+unsafe extern "C" fn echo(_ctx: *mut (), input: *const u8, output: *mut u8, len: usize) -> i32 {
+    if len > ECHO_MAX || (len != 0 && (input.is_null() || output.is_null())) {
+        return Errno::EINVAL.code();
+    }
+    if len != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(input, output, len) };
+    }
+    0
+}
 
 extern "C" fn worker(ctx: *mut ()) {
     let mailbox = mailbox(ctx);
@@ -180,10 +193,19 @@ pub unsafe extern "C" fn kcomp_service_dispatch(
     method: u32,
     frame: *const abi::KcompCallFrame,
 ) -> i32 {
-    if port != 0 || method != 0 || frame.is_null() {
+    if port != 0 || frame.is_null() {
         return Errno::EINVAL.code();
     }
     let frame = unsafe { &*frame };
+    if method == ECHO {
+        if frame.args_len != 0 || frame.input_len != frame.output_len {
+            return Errno::EINVAL.code();
+        }
+        return unsafe { echo(_state, frame.input, frame.output, frame.input_len) };
+    }
+    if method != 0 {
+        return Errno::EINVAL.code();
+    }
     if frame.output.is_null() || frame.output_len != 8 || !(frame.output as usize).is_multiple_of(4)
     {
         return Errno::EINVAL.code();

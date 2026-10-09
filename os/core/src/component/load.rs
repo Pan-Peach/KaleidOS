@@ -207,8 +207,12 @@ pub(crate) fn declare_instance(
     if caller.is_some_and(|id| !reg.may_run(id)) {
         return Err(ComponentLoadError::CallerNotReady);
     }
-    reg.declare(name, loaded, domain)
-        .map_err(|_| ComponentLoadError::DeclareFailed)
+    let id = reg
+        .declare(name, loaded, domain)
+        .map_err(|_| ComponentLoadError::DeclareFailed)?;
+    reg.record_creator(id, caller)
+        .map_err(|_| ComponentLoadError::DeclareFailed)?;
+    Ok(id)
 }
 
 /// `KernelNative` 的创建路径。

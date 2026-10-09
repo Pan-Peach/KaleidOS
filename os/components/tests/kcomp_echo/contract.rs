@@ -1,0 +1,10 @@
+pub const CONFIG_ABI: u64 = 0xEA31_042F_D293_1786;
+pub const CONTRACT: u64 = 0xB318_3E66_02A9_75CF;
+pub const ABI: u64 = 0x198A_D0F2_CACE_5264;
+pub const NAME: &[u8] = b"echo";
+pub const STOP: u8 = 0xfe;
+pub const PANIC: u8 = 0xfd;
+pub const EXIT: u8 = 0xfc;
+pub const SELF_CALL: u8 = 0xf9;
+pub const FOREIGN_GRANT: u8 = 0xf8;
+pub const SERVICE_ECHO: u32 = 0xf7;

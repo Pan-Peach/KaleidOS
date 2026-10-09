@@ -250,10 +250,11 @@ static int32_t fatfs_close_locked(void *ctx, uint64_t handle)
         return -EBADF;
 
     FRESULT result = f_close(&slot->file);
+    slot->handle = 0;
+    slot->consumer = 0;
+    slot->consumer_task = 0;
     if (result != FR_OK)
         return fatfs_result(result);
-
-    slot->handle = 0;
     FATFS_LOG_LINE("[fatfs] close");
     return 0;
 }
@@ -408,6 +409,7 @@ static int32_t fatfs_lookup_locked(struct fatfs_state *state, uint64_t parent,
     free_node->kind = (info.fattrib & AM_DIR) ? KCOMP_FILESYSTEM_NODE_DIRECTORY
                                              : KCOMP_FILESYSTEM_NODE_FILE;
     free_node->id = ++state->last_node;
+    free_node->size = (uint64_t)info.fsize;
     *out_node = free_node->id;
     return 0;
 }
@@ -462,6 +464,64 @@ int32_t fatfs_node_info(void *ctx, uint64_t id, uint32_t *out_kind)
     }
     if (result == 0)
         FATFS_LOG_LINE("[fatfs] node_info");
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_node_details(void *ctx, uint64_t id, uint8_t out[28])
+{
+    struct fatfs_state *state = ctx;
+    if (!state || !out) return -EINVAL;
+    if (!fatfs_enter(state)) return -EBUSY;
+    struct fatfs_node *node = fatfs_find_node(state, id);
+    int32_t result = (!state->alive || !state->mounted) ? -ENODEV : (node ? 0 : -EBADF);
+    if (!result) {
+        const char *name = node->path;
+        for (const char *p = name; *p; ++p) if (*p == '/') name = p + 1;
+        size_t len = node->parent ? strlen(name) : 0;
+        if (len > 12) result = -EIO;
+        else {
+            memset(out, 0, 28);
+            for (size_t i = 0; i < 4; ++i) out[i] = KCOMP_FILESYSTEM_U32_BYTE(node->kind, i);
+            out[4] = (uint8_t)len;
+            for (size_t i = 0; i < 8; ++i) out[8 + i] = KCOMP_FILESYSTEM_U64_BYTE(node->size, i);
+            memcpy(out + 16, name, len);
+        }
+    }
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_open_node(void *ctx, uint64_t id, uint64_t *out_handle)
+{
+    struct fatfs_state *state = ctx;
+    if (!state || !out_handle) return -EINVAL;
+    if (!fatfs_enter(state)) return -EBUSY;
+    struct fatfs_node *node = fatfs_find_node(state, id);
+    int32_t result = !node ? -EBADF : node->kind != KCOMP_FILESYSTEM_NODE_FILE ? -EISDIR :
+        fatfs_open_locked(state, node->path, KCOMP_FILESYSTEM_OPEN_READ, out_handle);
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_read_at(void *ctx, uint64_t handle, uint64_t offset,
+                      uint8_t *buf, size_t len, size_t *out_read)
+{
+    struct fatfs_state *state = ctx;
+    if (!state || !buf || !out_read) return -EINVAL;
+    *out_read = 0;
+    if (!fatfs_enter(state)) return -EBUSY;
+    struct fatfs_file_slot *slot = fatfs_find(state, handle);
+    int32_t result = (!state->alive || !state->mounted) ? -ENODEV : !slot ? -EBADF : 0;
+    if (!result && offset > (uint64_t)(FSIZE_t)-1) result = -EOVERFLOW;
+    if (!result) {
+        FSIZE_t saved = f_tell(&slot->file);
+        result = fatfs_result(f_lseek(&slot->file, (FSIZE_t)offset));
+        if (!result) result = fatfs_read_locked(state, handle, buf, len, out_read);
+        int32_t restored = fatfs_result(f_lseek(&slot->file, saved));
+        if (!result) result = restored;
+        if (result) *out_read = 0;
+    }
     fatfs_leave(state);
     return result;
 }

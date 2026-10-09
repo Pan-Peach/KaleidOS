@@ -14,7 +14,7 @@ def run(proc, collect, send, failure, fatal_markers):
             raise failure(f"ksh command {line!r}: missing {expected!r}\n" + "\n".join(output))
 
     # Published Direct ctx cannot be destroyed without a release protocol.
-    # CoreTest has composed several FS providers; shell must report ambiguity.
+    # Standalone shell has no composed VFS; legacy FS endpoints are not a fallback.
     command("unload littlefs", ["DirectExports"])
     command("load ksh", ["load ksh: OK", "KaleidOS ksh"])
     # Let the sole shell task yield to the monitor anchor before new input.
@@ -52,7 +52,7 @@ def run(proc, collect, send, failure, fatal_markers):
     command("load virtio_blk isolated", ["load virtio_blk: ENOTSUP"])
     command("load x sandboxed", ["sandboxed is unavailable"])
     command("load missing", ["load missing: ENOENT"])
-    command("cat 0:/HELLO.TXT", ["cat: multiple filesystem providers; selection is unavailable"])
+    command("cat 0:/HELLO.TXT", ["cat: no filesystem provider"])
     command("ls", ["ls: unsupported by current filesystem service"])
     command("load", ["usage: load <artifact>"])
     command("exit extra", ["usage: this command takes no arguments"])

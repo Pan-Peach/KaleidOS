@@ -188,6 +188,12 @@ fn create_driver(device_id: u32, result_name: &[u8], out_instance: &mut u32) -> 
 /// 再用边界读校验**报告的容量确实等于设备的可寻址范围**
 /// （`capacity - 1` 可读、`capacity` 越界拒绝）——比硬编码 runner 的磁盘大小更强。
 fn attach_serves(endpoint: Endpoint<BlockDevice>) -> bool {
+    let Ok(owner) = kcomp_sdk::management::current_component() else {
+        return false;
+    };
+    if kcomp_sdk::ipc::grant(endpoint.id(), owner).is_err() {
+        return false;
+    }
     let Ok(binding) = endpoint.bind() else {
         return false;
     };

@@ -113,6 +113,88 @@ fn runtime_requests(binding: &Binding, hybrid: bool) -> bool {
             == if hybrid { 64 } else { 0 }
 }
 
+// Informational target baseline, outside trace assertion windows. Gate is the
+// real Core entry; this does not measure a future Request/Reply implementation.
+fn transport_baseline(provider: u32, binding: &Binding) -> bool {
+    let Some(endpoint) = lookup(provider) else {
+        return false;
+    };
+    let input = [0x5a; ECHO_MAX];
+    let mut output = [0; ECHO_MAX];
+    let mut stats = abi::TraceStatsAbi {
+        capacity: 0,
+        oldest_seq: 0,
+        next_seq: 0,
+        overwritten_total: 0,
+        enabled_mask: 0,
+    };
+    let trace = unsafe { abi::kcore_trace_stats(&mut stats) } == 0;
+    kcomp_sdk::klog!(
+        "[ipc-baseline] unit=timebase-ticks hz={} trace_mask={} trace_known={} batches=31 operations_per_batch=32",
+        unsafe { abi::kcore_timebase_hz() },
+        stats.enabled_mask,
+        trace
+    );
+    for size in [0, 8, 64, ECHO_MAX] {
+        for gate in [false, true] {
+            let mut samples = [0u64; 31];
+            // Warm up four batches, then retain every measured batch.
+            for batch in 0..35 {
+                let begin = unsafe { abi::kcore_now() };
+                for _ in 0..32 {
+                    let result = if gate {
+                        let mut method = i32::MIN;
+                        let transport = unsafe {
+                            abi::kcore_endpoint_call(
+                                endpoint,
+                                ECHO,
+                                core::ptr::null(),
+                                0,
+                                input.as_ptr(),
+                                size,
+                                output.as_mut_ptr(),
+                                size,
+                                &mut method,
+                            )
+                        };
+                        if transport != 0 { transport } else { method }
+                    } else {
+                        unsafe {
+                            (binding.api.echo)(
+                                binding.ctx,
+                                input.as_ptr(),
+                                output.as_mut_ptr(),
+                                size,
+                            )
+                        }
+                    };
+                    if core::hint::black_box(result) != 0 {
+                        return false;
+                    }
+                }
+                let end = unsafe { abi::kcore_now() };
+                if end < begin || output[..size] != input[..size] {
+                    return false;
+                }
+                if batch >= 4 {
+                    samples[batch - 4] = end - begin;
+                }
+            }
+            samples.sort_unstable();
+            kcomp_sdk::klog!(
+                "[ipc-baseline] transport={} size={} min={} median={} p95={} max={}",
+                if gate { "gate" } else { "direct" },
+                size,
+                samples[0],
+                samples[15],
+                samples[29],
+                samples[30]
+            );
+        }
+    }
+    true
+}
+
 fn exercise(state: &State) -> Option<u32> {
     let a = bind(state.providers[0])?;
     let b = bind(state.providers[1])?;
@@ -155,6 +237,9 @@ fn exercise(state: &State) -> Option<u32> {
         && unsafe { abi::kcore_component_stop(provider) } == 0
     {
         result |= 32;
+    }
+    if transport_baseline(state.providers[0], &a) {
+        result |= 64;
     }
     Some(result)
 }
@@ -311,6 +396,7 @@ pub fn group(checks: &mut Checks, state: *mut State) {
         ("hybrid-direct-worker", 8),
         ("worker-owner", 16),
         ("nested-lifecycle-switch-denied", 32),
+        ("direct-gate-echo-baseline", 64),
     ] {
         checks.check(name, result & mask != 0);
     }

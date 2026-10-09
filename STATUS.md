@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-09。本次补齐 ksh 行编辑、历史、命令补全、引号解析与设备描述 / owner 显示；host 与 RV64/RV32 QEMU 验证见 §3.27。服务执行/组合研究与近期依赖链仍按现行契约推进。既有 RV64 用户 task / AS / trap、POSIX fork / exec / wait 与 FAT→ksh exec 证据保留；glibc guest startup 仍未通过。K/I 双向 Gate 的合成服务矩阵不代表真实驱动/FS 任意跨域可用。
+更新：2026-10-09。本次增加 KernelNative Endpoint Request/Reply 与生产只读 Local VFS 对象模块（§3.29）；Remote FatFs、VFS 服务与消费者迁移尚未接线。本次补齐 ksh 行编辑、历史、命令补全、引号解析与设备描述 / owner 显示；host 与 RV64/RV32 QEMU 验证见 §3.27。服务执行/组合研究与近期依赖链仍按现行契约推进。既有 RV64 用户 task / AS / trap、POSIX fork / exec / wait 与 FAT→ksh exec 证据保留；glibc guest startup 仍未通过。K/I 双向 Gate 的合成服务矩阵不代表真实驱动/FS 任意跨域可用。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -33,7 +33,7 @@ KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组�
 ```text
 Applications / System Personality        ksh 可 exec 静态 RV64 ELF；最小 POSIX fork/exec/wait；Win32/WASI 是未来
         │
-Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS 只有骨架
+Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS Local 对象可用，服务未接线
         │
 Components（策略/服务/驱动 .kcomp）         scheduler_rr, driver_prober, virtio_blk, fatfs, littlefs
         │
@@ -216,11 +216,11 @@ C/Rust SDK 的 Direct / Gate 路径已接线；littlefs 显式返回 ENOTSUP。
 host 测试、SDK 93 项 host 测试、ABI 校验与两个 C provider 的 RV64/RV32 `.kcomp`
 构建通过；新增节点行为尚未经过 QEMU，VFS provider 适配仍未接线。
 
-VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name / namespace / node-provider / stream / file，明确路径引用、独立 open、share 计数、删除目标与 cleanup / close 生命周期；表与操作未实现。`abi/vfs.toml` / SDK 已声明第一阶段 API，适配器仍返回 ENOTSUP。create 返回 `-ENOTSUP`，不发布 endpoint。现状见 `docs/modules/vfs.md`，wire 草案见 `docs/interfaces/vfs.md`。VFS 服务仍是 NOT IMPLEMENTED。
+VFS：生产只读 LocalFs / FsNode / FsOpen / Namespace / Path / OpenFile 已实现，有直接验证生产模块的 host 测试；两个 Local 实例、目录项别名、挂载位置/保活和独立游标可用。组件 create、SDK VFS binding 仍 ENOTSUP，无外部服务句柄表或 RemoteFat 接线。对象模块 IMPLEMENTED，VFS 服务 NOT IMPLEMENTED。见 [模块页](docs/modules/vfs.md)、[ADR](docs/development/hybrid-vfs-adr.md) 与 §3.29。
 
 骨架验证（构建层）：VFS / POSIX 的 RV64 / RV32 `.kcomp` 构建与 packer 检查通过，RV64 clippy（`-D warnings`）与 fmt 通过；当前 RV64 `make init.kpkg` 已包含两者。C ABI 的 RV32 / RV64 布局断言与 `make abi-check` 通过，SDK 现有 82 项 host 测试通过。尚无新增服务行为或用户态运行期验证。
 
-缺口：只读；没有可用的 VFS、namespace、File service；没有两级缓存；`lwext4` 还是候选，GPLv2 许可策略要先定。
+缺口：只读；namespace/OpenFile 已有 Local 对象实现，但没有可用 VFS 服务与 Remote FS；没有两级缓存；`lwext4` 还是候选，GPLv2 许可策略要先定。
 
 本次源码核对：FatFs REENTRANT=0，实例 files 表无同步；同实例双 CPU Direct/KernelNative
 Gate 并发的风险为 INFERRED，未实际复现。集成前须先明确并实施 provider 同步纪律，
@@ -335,7 +335,7 @@ component / endpoint 的值枚举；设备发现复用 `device_nth`，`device_in
 
 本次交互改进：512 字节有界行、引号 / 转义 / 空参数 / 注释、历史与草稿恢复、光标插入 / 删除、
 编辑控制键、命令名补全与单命令帮助。基础解析和历史不分配堆；会话 / 解码缓冲驻留各实例
-自己的可写 image，参数使用有界短偏移，避免在单 granule 任务栈上存放大数组。
+自己的可写 image，参数使用有界短偏移，避免在任务栈上存放大数组（当前栈预算 16 KiB）。
 未支持的管道 / 重定向 / 命令列表、超长或非 ASCII 输入整行拒绝，不执行截断前缀。
 
 交互改进阶段验证：ksh 14 个 host 用例 PASS；host tests 与 RV64/RV32 的 ksh Clippy `-D warnings`、
@@ -392,6 +392,33 @@ shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动
 
 缺口：无 VFS namespace、常驻 supervisor / reaper / watchdog、依赖解析或热插拔。
 当前 prober / mount 是有限任务；`sched_run` 不提供 join，异步启动需要组件侧完成契约。
+
+#### 3.29 Endpoint Request/Reply 与 Local VFS `▰▰▰▱▱` EXPERIMENTAL
+
+授权范围：用户明确授权 Agent 直接实现本任务，采用逐阶段迁移。Phase 0 审计/官方参考/
+ADRs 与文件计划已补；Phase 1 的 KernelNative 真 IPC、Phase 2 的 Local 对象模块已落地。
+通信权威见 [IPC 契约](docs/architecture/ipc.md)，设计与迁移见
+[审计](docs/development/component-communication-audit.md)、[IPC ADR](docs/development/ipc-request-reply-adr.md)、
+[VFS ADR](docs/development/hybrid-vfs-adr.md)、[迁移计划](docs/development/component-communication-migration.md)。
+
+Core 新增 listen/grant/submit/receive/reply/collect/wait/cancel/close 和当前 principal 查询。
+请求槽、listener/grant 与 wake storage 有界预留；不保存 caller 指针，只有 opaque bytes，
+不理解 FS 对象。创建者授权不改变资源 owner。等待登记和首个终态共用锁；Core 内部 wake
+沿真实 Task owner 执行。Task 退出、端口 close 和组件失败接到真实清理路径。Task 栈固定
+16 KiB，以容纳 SDK 请求/回复和 Core wait/switch 帧；新增存储换来独立可 park 的 Server Task，
+不是旧 Gate 改名，也未因新 IPC 删除旧同步 Gate。
+
+验证层次：生产 Exchange host 测试覆盖副本、逆序回复、权限、容量、取消/回复/close 六种
+终态顺序、caller/server exit、等待谓词与环；Local VFS 五项 host 测试覆盖只读对象、两个
+挂载与引用释放。CoreTest 用独立 `kcomp_echo.kcomp`、真实公开 API 验证 KernelNative
+RV64 跨 CPU / RV32 同 CPU IPC、两个 caller、满队列恢复、caller 退出、Provider panic、
+Server exit、关闭/停止、非法参数和 SDK envelope。完整验证结果在审计的后续实现记录。
+
+限制：新 IPC 的私有域进口、持久 Isolated Task、跨 AS copy、任意坏 VA containment、
+timer deadline/强制终止、通知和通用 capability 均未实现。Local host 不是混合 VFS 整机证据；
+Remote FatFs owning lease、创建取消 orphan、非阻塞 release、VFS runtime/SDK、ksh/exec
+和 Block/littlefs 迁移属于后续 Phase 3..4。现有 FAT/双盘/exec 仍走旧路径。Phase 5 删除旧
+Direct/Gate 的门禁尚未满足，不能宣称整个重构完成。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 

@@ -1,6 +1,7 @@
 """Host concurrency/session regressions against actual C providers and upstream FS."""
 from pathlib import Path
 import subprocess
+import re
 import tempfile
 import unittest
 
@@ -31,7 +32,9 @@ class Providers(unittest.TestCase):
                 subprocess.run(["mcopy", "-i", str(disk),
                                 str(ROOT / "tests/fixtures/rootfs/HELLO.TXT"),
                                 "::/" + name + "/HELLO.TXT"], check=True)
-            for name in ("N1", "N2", "N3"):
+            header = (ROOT / "os/components/filesystems/fatfs/fatfs_internal.h").read_text()
+            capacity = int(re.search(r"#define FATFS_MAX_NODES (\d+)", header).group(1))
+            for name in ("N" + str(index) for index in range(1, capacity + 1)):
                 subprocess.run(["mcopy", "-i", str(disk),
                                 str(ROOT / "tests/fixtures/rootfs/HELLO.TXT"), "::/" + name], check=True)
             for fs in ("fatfs", "littlefs"):

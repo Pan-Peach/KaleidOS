@@ -1,10 +1,9 @@
 //! 命令只走 SDK 值查询 / 服务前端；没有 Core 指针或域特例。
 use crate::parser::{self, Command, ParseError};
-use core::ffi::CStr;
 use core::fmt::Write;
 use kcomp_sdk::console::Console;
 use kcomp_sdk::endpoint::{Contract, Endpoint};
-use kcomp_sdk::filesystem::{FILESYSTEM_OPEN_READ, FileSystem};
+use kcomp_sdk::vfs::{Vfs as FileSystem, *};
 use kcomp_sdk::{abi, management};
 
 fn text(bytes: &[u8]) -> &str {
@@ -408,28 +407,14 @@ fn cat(path: &[u8]) {
             return;
         }
     };
-    let binding = match endpoint.bind() {
+    let binding = match VfsBinding::bind(endpoint) {
         Ok(binding) => binding,
         Err(error) => {
-            let _ = writeln!(out, "cat: bind failed: {error:?}");
+            let _ = writeln!(out, "cat: bind failed: {error}");
             return;
         }
     };
-    if let Err(error) = binding.mount() {
-        let _ = writeln!(out, "cat: mount failed: {error:?}");
-        return;
-    }
-    let mut bytes = [0u8; kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_PATH_MAX];
-    if path.len() >= bytes.len() {
-        let _ = writeln!(out, "cat: path too long");
-        return;
-    }
-    bytes[..path.len()].copy_from_slice(path);
-    let Ok(path) = CStr::from_bytes_with_nul(&bytes[..path.len() + 1]) else {
-        let _ = writeln!(out, "cat: invalid path");
-        return;
-    };
-    let handle = match binding.open(path, FILESYSTEM_OPEN_READ) {
+    let handle = match open_file(&binding, path) {
         Ok(handle) => handle,
         Err(error) => {
             let _ = writeln!(out, "cat: open failed: {error:?}");
@@ -458,23 +443,15 @@ fn cat(path: &[u8]) {
 }
 
 // This is shell composition: read an executable through the actual mounted FS,
-// then give POSIX an immutable image snapshot. It is not a VFS namespace.
+// then give POSIX an immutable image snapshot. Both cat and exec use VFS IPC.
 fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
     use alloc::vec::Vec;
     use kcomp_sdk::{Errno, posix};
     let selected = filesystem_endpoint()?;
-    let binding = Endpoint::<FileSystem>::from_id(selected.ok_or(Errno::ENODEV)?)?
-        .bind()
-        .map_err(fs_error)?;
-    binding.mount().map_err(fs_error)?;
-    let path = argv[0];
-    let mut bytes = [0u8; kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_PATH_MAX];
-    if path.len() >= bytes.len() {
-        return Err(Errno::ENAMETOOLONG);
-    }
-    bytes[..path.len()].copy_from_slice(path);
-    let path = CStr::from_bytes_with_nul(&bytes[..path.len() + 1]).map_err(|_| Errno::EINVAL)?;
-    let handle = binding.open(path, FILESYSTEM_OPEN_READ).map_err(fs_error)?;
+    let binding = VfsBinding::bind(Endpoint::<FileSystem>::from_id(
+        selected.ok_or(Errno::ENODEV)?,
+    )?)?;
+    let handle = open_file(&binding, argv[0]).map_err(fs_error)?;
     let loaded = (|| {
         let mut image = Vec::new();
         let mut buffer = [0u8; 520];
@@ -517,10 +494,67 @@ fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
     }
 }
 
-fn fs_error(error: kcomp_sdk::endpoint::InvokeError) -> kcomp_sdk::Errno {
-    use kcomp_sdk::endpoint::InvokeError;
+fn fs_error(error: VfsError) -> kcomp_sdk::Errno {
     match error {
-        InvokeError::Transport(errno) | InvokeError::Method(errno) => errno,
-        InvokeError::InvalidReply => kcomp_sdk::Errno::EIO,
+        VfsError::Transport(errno) => errno,
+        VfsError::Method(code) | VfsError::Domain { errno: code, .. } => {
+            kcomp_sdk::Errno::from_code(code)
+        }
+        _ => kcomp_sdk::Errno::EIO,
     }
+}
+
+fn open_file(binding: &VfsBinding, path: &[u8]) -> VfsResult<u64> {
+    // Preserve the existing shell's selected-volume 0:/ spelling in personality glue.
+    let volume_path = path.starts_with(b"0:");
+    let path = path.strip_prefix(b"0:").unwrap_or(path);
+    // The boot composer chooses this shell's root view, preserving selected-volume paths.
+    let namespace = binding.root()?;
+    let prefix = if !volume_path && path.starts_with(b"/") {
+        &b"/"[..]
+    } else {
+        crate::runtime::default_root()
+    };
+    let root = if prefix.is_empty() {
+        namespace
+    } else {
+        let root = binding.resolve(
+            &VfsLookup {
+                start: namespace,
+                root: namespace,
+                flags: KCOMP_VFS_LOOKUP_CROSS_MOUNTS,
+                max_symlinks: 0,
+                encoding: KCOMP_VFS_ENCODING_BYTES,
+                reserved: 0,
+            },
+            prefix,
+        );
+        let _ = binding.release_path(&namespace);
+        root?
+    };
+    let found = binding.resolve(
+        &VfsLookup {
+            start: root,
+            root,
+            flags: KCOMP_VFS_LOOKUP_CROSS_MOUNTS | KCOMP_VFS_LOOKUP_FOLLOW_FINAL,
+            max_symlinks: 0,
+            encoding: KCOMP_VFS_ENCODING_BYTES,
+            reserved: 0,
+        },
+        path,
+    );
+    let _ = binding.release_path(&root);
+    let found = found?;
+    let opened = binding.open(
+        &VfsOpenRequest {
+            path: found,
+            access: KCOMP_VFS_ACCESS_READ,
+            share: KCOMP_VFS_SHARE_READ,
+            stream_kind: KCOMP_VFS_STREAM_DEFAULT,
+            encoding: 0,
+        },
+        &[],
+    );
+    let _ = binding.release_path(&found);
+    opened
 }

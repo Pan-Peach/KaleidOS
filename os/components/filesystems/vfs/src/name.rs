@@ -42,3 +42,17 @@ pub struct NameRules {
     pub encoding: NameEncoding,
     pub case: CaseRule,
 }
+
+/// One borrowed byte component; filesystem-specific encoding/case stays backend.
+pub fn check_component(name: &[u8]) -> crate::Result<()> {
+    if name.is_empty()
+        || name.len() > 255
+        || name == b"."
+        || name == b".."
+        || name.iter().any(|b| *b == 0 || *b == b'/')
+    {
+        Err(crate::Error::EINVAL)
+    } else {
+        Ok(())
+    }
+}

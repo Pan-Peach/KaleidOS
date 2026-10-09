@@ -53,6 +53,8 @@ use spin::{Mutex, Once};
 #[derive(Debug, PartialEq)]
 pub struct ComponentRecord {
     pub id: ComponentId,
+    /// Immutable composition parent, resolved by Core before child create.
+    pub creator: Option<ComponentId>,
     /// artifact 名（不含 `.kcomp` 后缀）；诊断 / monitor 用。
     pub name: Vec<u8>,
     pub state: ComponentState,
@@ -118,6 +120,7 @@ impl Registry {
         self.next_id += 1;
         self.records.push(ComponentRecord {
             id,
+            creator: None,
             name: name.to_vec(),
             state: ComponentState::Declared,
             execution_domain: kind,
@@ -147,6 +150,35 @@ impl Registry {
     ) -> Result<(), RegistryError> {
         self.record_mut(id)?.instance_state = instance_state;
         Ok(())
+    }
+
+    pub(crate) fn record_creator(
+        &mut self,
+        id: ComponentId,
+        creator: Option<ComponentId>,
+    ) -> Result<(), RegistryError> {
+        // Creation edges always point to an older existing instance, so the
+        // immutable composition tree cannot contain a cycle or forged parent.
+        if creator.is_some_and(|parent| parent.raw() >= id.raw() || self.get(parent).is_none()) {
+            return Err(RegistryError::InvalidTransition);
+        }
+        let record = self.record_mut(id)?;
+        if record.state != ComponentState::Declared {
+            return Err(RegistryError::InvalidTransition);
+        }
+        record.creator = creator;
+        Ok(())
+    }
+    /// KernelNative composition authority follows actual immutable creation
+    /// edges. It does not change resource ownership or imply send permission.
+    pub(crate) fn created_by(&self, ancestor: ComponentId, mut instance: ComponentId) -> bool {
+        while let Some(parent) = self.get(instance).and_then(|record| record.creator) {
+            if parent == ancestor {
+                return true;
+            }
+            instance = parent;
+        }
+        false
     }
 
     pub fn record_address_space(
@@ -471,6 +503,48 @@ mod tests {
         let b = declare(&mut reg, b"b");
         assert_eq!(a.raw(), 1);
         assert_eq!(b.raw(), 2);
+    }
+
+    #[test]
+    fn creator_is_recorded_before_resolve_and_preserved_after_restart() {
+        let mut reg = r();
+        let parent = declare(&mut reg, b"parent");
+        let child = declare(&mut reg, b"child");
+        reg.record_creator(child, Some(parent)).unwrap();
+        reg.resolve(child).unwrap();
+        assert_eq!(
+            reg.record_creator(child, None),
+            Err(RegistryError::InvalidTransition)
+        );
+        reg.mark_failed(child).unwrap();
+        let replacement = declare(&mut reg, b"child");
+        assert_eq!(reg.get(child).unwrap().creator, Some(parent));
+        assert_eq!(reg.get(replacement).unwrap().creator, None);
+        assert_ne!(replacement, child);
+    }
+    #[test]
+    fn composition_grant_walks_only_immutable_creation_edges() {
+        let mut reg = r();
+        let root = declare(&mut reg, b"root");
+        let prober = declare(&mut reg, b"prober");
+        let driver = declare(&mut reg, b"driver");
+        let sibling = declare(&mut reg, b"sibling");
+        reg.record_creator(prober, Some(root)).unwrap();
+        reg.record_creator(driver, Some(prober)).unwrap();
+        assert!(reg.created_by(root, driver));
+        assert!(reg.created_by(prober, driver));
+        assert!(!reg.created_by(sibling, driver));
+        assert!(!reg.created_by(driver, root));
+        assert_eq!(
+            reg.record_creator(root, Some(driver)),
+            Err(RegistryError::InvalidTransition)
+        );
+        assert_eq!(
+            reg.record_creator(sibling, Some(ComponentId::from_raw(u32::MAX))),
+            Err(RegistryError::InvalidTransition)
+        );
+        let replacement = declare(&mut reg, b"root");
+        assert!(!reg.created_by(replacement, driver));
     }
 
     /// 每次 declare 得到的组件拥有**自己**的 loaded image（不是共享镜像）。

@@ -82,7 +82,7 @@ const _: () = {
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0xD58F_B296_4E73_A10C;
+pub const KCOMP_ABI: u64 = 0xF091_A62D_39C8_740B;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,11 +390,17 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
 
+/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback.
+pub const KCORE_ENDPOINT_MECHANISM_IPC: u32 = 2;
+
 /// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
 pub const KCORE_MEMORY_VIEW_LOCAL_VA: u32 = 1;
 
 /// `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。
 pub const KCORE_MEMORY_VIEW_LINEAR_OFFSET: u32 = 2;
+
+/// 复制式 IPC 每条消息最大字节数，request 与 reply 各自受限。
+pub const KCORE_IPC_MESSAGE_MAX: u32 = 1024;
 
 /// `scheduler.policy` 契约的 endpoint 端口名（组合期 discover 用；provider 实例内唯一）。
 /// 名字不是全局身份：Core 只按 `(provider, port_name, contract)` 发现，绝不按名字

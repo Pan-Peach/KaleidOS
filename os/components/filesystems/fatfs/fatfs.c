@@ -11,6 +11,7 @@
 #include "kcomp.h"
 #include "diskio_kaleidos.h"
 #include "fatfs_internal.h"
+#include "kcomp_ipc.h"
 #include <errno.h>
 #include <string.h>
 
@@ -26,9 +27,11 @@
 struct fatfs_create_config
 {
     uint64_t endpoint;
+    uint32_t control;
+    uint32_t flags;
 };
 
-#define FATFS_CREATE_CONFIG_ABI UINT64_C(0x4641544653434647)
+#define FATFS_CREATE_CONFIG_ABI KCOMP_FATFS_CREATE_CONFIG_ABI
 
 /* Direct transport：endpoint 发布时作为 api/ctx 交付的 `#[repr(C)]` function table。
  * 同一份业务实现也服务 Gate（fatfs_service.c 的扁平 method switch）。 */
@@ -69,6 +72,11 @@ int32_t kcomp_instance_create(
     /* Opaque byte payloads need not have uint64_t alignment. */
     struct fatfs_create_config config;
     memcpy(&config, args->config, sizeof(config));
+    const uint8_t *bytes = args->config;
+    config.endpoint = kcomp_ipc_u64(bytes);
+    config.control = kcomp_ipc_u32(bytes + 8);
+    config.flags = kcomp_ipc_u32(bytes + 12);
+    if (config.flags > 1) return -EINVAL;
 
     /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
     struct kcore_memory_view state_region;
@@ -94,6 +102,8 @@ int32_t kcomp_instance_create(
     }
 
     state->alive = 1;
+    state->control = config.control;
+    state->ipc_only = config.flags;
 
     result = fatfs_disk_attach(&state->block_binding);
     if (result < 0)
@@ -113,9 +123,9 @@ int32_t kcomp_instance_create(
         KCOMP_FILESYSTEM_CONTRACT,
         KCOMP_IFACE_SERVICE,
         KCOMP_FILESYSTEM_ABI,
-        FATFS_PORT,
-        &fatfs_api,
-        state);
+        state->ipc_only ? 0 : FATFS_PORT,
+        state->ipc_only ? NULL : &fatfs_api,
+        state->ipc_only ? NULL : state);
 
     if (result < 0)
     {
@@ -125,6 +135,15 @@ int32_t kcomp_instance_create(
     }
 
     *out_state = state;
+    uint32_t task = 0;
+    result = kcore_task_create(fatfs_server, state, &task);
+    if (result == 0) result = kcore_task_start(task);
+    if (result < 0) {
+        state->alive = 0;
+        fatfs_disk_detach();
+        /* Created Task may retain its arg; backing remains resident on failure. */
+        return result;
+    }
     FATFS_LOG_LINE("[fatfs] endpoint published");
 
     return 0;

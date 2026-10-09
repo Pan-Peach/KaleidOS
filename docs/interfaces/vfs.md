@@ -1,19 +1,21 @@
 # VFS 第一阶段服务契约
 
-> 阶段契约草案，尚未实现或冻结。分层以 `docs/interfaces/filesystem.md` 为准；
+> 当前只读 IPC 契约。分层以 `docs/interfaces/filesystem.md` 为准；
 > 布局、数值、方法号与 exact fingerprint 以 `abi/vfs.toml` 为唯一来源。
-> SDK 目前只有声明与 ENOTSUP 占位，不能 bind / 发布可用服务。
+> 实现与限制见 [模块页](../modules/vfs.md)，传输见 [IPC](../architecture/ipc.md)。
 
 ## 范围与身份
 
 一个 `vfs` endpoint 先组合 Namespace 和 File service；实例端口名由组合者选择。
 它消费 FS providers，供 POSIX / NT / WASI 等 personality 使用。fd、HANDLE、cwd
-和平台错误表示由 personality 保存。挂载配置由 VFS create 提供，尚无配置 wire。
+和平台错误表示由 personality 保存。挂载配置由 VFS create 提供：LE u32 control、LE u32 count（0..2），
+后接 count 个 LE u64 filesystem endpoint；指纹为 schema 的 CREATE_CONFIG_ABI。
+Local `/local` 总存在，远程依次挂在 `/fat` 与 `/second`。
 
-本阶段只声明已有节点的解析、查询、枚举和只读数据流打开。write / delete 访问位
+本阶段实现已有节点的解析、查询和只读默认数据流打开；目录枚举明确 ENOTSUP。write / delete 访问位
 虽已预留，但当前必须拒绝为 `-ENOTSUP`；不能忽略位后按 read 成功。创建、截断、
 原子 append、rename、unlink、权限 descriptor 查询和目录 open 不在此阶段 ABI。
-目录可枚举，也可能支持命名流；不得伪造其默认数据流。
+目录 open 返回 EISDIR，命名流 ENOTSUP。未来目录枚举不得伪造默认数据流。
 
 | 身份 | 含义 / 有效期 |
 |---|---|
@@ -22,11 +24,13 @@
 | file token | 一次独立 open；retain 共享它，重新 open 创建另一对象 |
 | directory cursor | 本次目录枚举的位置；0 为起点，不是数组下标 |
 
-这些数值不是 authority。所有引用受发布 endpoint 的 VFS 实例有效期约束，
+这些数值不是 authority。当前引用绑定 Core 核验的 ComponentId 与 TaskId；
+同 Component 的另一 Task 使用返回 EACCES，尚无跨 Task 引用转移。
+所有引用受发布 endpoint 的 VFS 实例有效期约束，
 provider 重启必须创建新 incarnation，不能重绑旧 token 到新 provider。
 验证须同时检查身份、存活与请求所需权限，不能只看数值是否存在。
 
-root / resolve / 非 END 的 read_dir 成功均交付一个路径用户引用。
+root / resolve 成功交付一个路径用户引用；未来 read_dir 需遵守相同引用规则。
 复制 `VfsPath` 内存不增加引用；独立持有 root/cwd 等需 retain_path，并配对 release_path。
 操作期间 path 参数只借用；open 成功后独立保活所需对象，caller 可以 release_path。
 路径保活不保证原目录项仍在 namespace 中，也不阻止 provider 失败导致逻辑失效。
@@ -39,11 +43,12 @@ close 是不同阶段；不以计数归零承诺物理回收。有效引用被�
 
 ## 名字与解析
 
-路径和名字均有显式编码，没有 NUL 终止符。Bytes 不要求 UTF-8；UTF-16 的 payload
+路径和名字均有显式编码，没有 NUL 终止符。当前只接受 Bytes，UTF-16 为 ENOTSUP。
+Bytes 不要求 UTF-8；未来 UTF-16 的 payload
 是 LE code units，长度按字节计且必须为偶数。不得把 surrogate 或不可表示字符
 静默替换；provider 无法无损表示时返回 UNSUPPORTED_NAME。NUL 不可进入名字。
 
-本阶段 namespace 路径语法使用 `/`（UTF-16 中为 U+002F）分隔；
+本阶段 namespace 路径语法使用 `/` 分隔；
 反斜杠和冒号不在这里自动解释为 Win32 路径或 ADS。personality 先转换自己的路径语法，
 命名流用 open 的独立 stream selector / input 表达。名字大小写匹配由所在目录的
 provider 执行，VFS 不依据 case 提示自行折叠。
@@ -51,8 +56,8 @@ provider 执行，VFS 不依据 case 提示自行折叠。
 - 非空绝对路径从请求 root 开始；相对路径从 start 开始。
 - 重复分隔符、`.`、`..` 在逐段遍历时处理；Root 模式的 `..` 在 root 处停留。
 - BENEATH_START 拒绝绝对输入及绝对 symlink 目标，并拒绝实际逃出 start。
-- 尾部分隔符要求目标为目录。中间 symlink 总须跟随；FOLLOW_FINAL 控制最后一段。
-- max_symlinks 为可跟随的最大次数，0 禁止跟随；超过次数返回 `-ELOOP`。
+- 尾部分隔符要求目标为目录。当前后端无 symlink；未来中间 symlink 总须跟随，FOLLOW_FINAL 控制最后一段。
+- max_symlinks 当前无效于无 symlink 的后端；未来为可跟随的最大次数，0 禁止跟随。
 - 未设置 CROSS_MOUNTS 时拒绝跨 mount；发生越界返回 OUTSIDE_ROOT。
 - 无法取得请求要求的原生语义时返回 `-ENOTSUP`，不清洗字符串后假装符合边界。
 
@@ -62,16 +67,12 @@ PATH_MAX / NAME_MAX 是本阶段服务输入上限，UTF-16 同样按字节计�
 named stream input 必须为非空单段名字。默认流不存在返回 NO_DATA_STREAM，
 不支持命名流返回 `-ENOTSUP`。
 
-## Direct 与 Gate
+## IPC 编码
 
-Direct 使用生成的 `VfsApi` function table + opaque ctx，标量是 C ABI 参数；
-payload 的编码与 Gate 一致。指针只借用本次调用，provider 不保留、不改写 input，
-也不把调用者的用户态 VA 当成可解引用的 table 参数。
-
-Gate 使用 `kcore_endpoint_call` 的 args / input / output 平面。
-所有标量逐字段 LE 编码，不能将 Rust struct / C padding 直接当成 wire。
-每个 output 都先有 8 字节 VfsReplyStatus（u32 domain + u32 reserved），
-再放业务 payload；Direct 则使用独立 out_status 指针。下表长度包含此回复头。
+VFS 只发布 Request/Reply endpoint，不发布 Direct table 或 Gate dispatcher。
+SDK envelope 的 args/input/output 承载以下布局；所有标量逐字段 LE 编码，不复制
+Rust struct/C padding。每个业务 output 先有 8 字节 VfsReplyStatus（u32 domain +
+u32 reserved），SDK 外层再有 4 字节 method status；下表长度只含业务 output。
 
 | 方法 | args | input | output |
 |---|---|---|---|
@@ -86,11 +87,14 @@ Gate 使用 `kcore_endpoint_call` 的 args / input / output 平面。
 | set_position | 16：u64 file + u64 offset | 空 | 8：status |
 | stream_info | 8：u64 file | 空 | 64：status + VfsStreamInfo |
 | retain_path / release_path | 32：VfsPath | 空 | 8：status |
+| shutdown | 空 | 空 | 8：status；仅配置 control Component 可用 |
 
 read / read_at 的实际读取长度不得超过数据容量；零长读仍验证引用和访问状态。
-顺序 read 的游标更新与并发操作须协调，read_at 不改变游标，也不能用 seek + read 模拟。
+顺序 read 的游标更新与并发操作须协调，read_at 不改变公开游标。单 Server 串行 FatFs 内部用 seek/read 并恢复 FIL 位置，
+不把中间 cursor 暴露给其他请求；不允许无同步的两次远程 seek/read 拼接。
 
-read_dir 一次返回一个完整名字与一个路径引用，不截断名字。END 时只有 END flag，
+read_dir 当前返回 ENOTSUP。以下是未来实现必须满足的规则：一次返回一个完整名字
+与一个路径引用，不截断名字。END 时只有 END flag，
 其他 header 字段为 0。非 END 时 name_len 为实际字节数，name_encoding 显式给出。
 名字容量不足返回 `-ENOBUFS`，仅 header.name_len 有效，表示所需字节数；cursor 不前进，
 也不交付路径引用。SDK 将这个失败保留为 `BufferTooSmall { required }`。
@@ -100,9 +104,10 @@ node_info / stream_info 是 provider 查询快照。valid 位区分“属性未�
 无效字段填 0。link_count 不由 VFS 的句柄计数推导；allocated_size 和 valid_data_length
 不由逻辑长度推导。权限原生模型尚未决定，不能从这些查询伪造授权。
 
-Core 在 bind 时选择调用机制；SDK 不降级、不替换失效 endpoint。
-Direct/Gate 适配器需逐方法同义，尚未实现。Gate service stack 禁止 park / 调度切换，
-阻塞完成协议必须先另定契约。
+当前只支持 read + share-read；不实现写、删除或共享拒绝组合。PATH_MAX=512，
+NAME_MAX=255；单次 read/read_at 至多 512 字节。32 个 path、32 个 open 表项；
+新引用回复失败时回滚。已交付引用按 verified Task/Component 活性在后续请求清理，
+空闲时不承诺立即回收。服务 shutdown drain 后可走 Core stop，不透明重连旧 endpoint。
 
 ## 错误通道
 
@@ -118,7 +123,7 @@ domain-status 当前保留 SHARING_VIOLATION、DELETE_PENDING、UNSUPPORTED_NAME
 STALE_REFERENCE、OUTSIDE_ROOT、NO_DATA_STREAM；权限拒绝用 `-EACCES` / domain 0，
 共享 / 删除拒绝即使 errno 相同也可区分。正常业务失败的 status 头仍有效；
 read_dir 的 ENOBUFS 另外保留所需名字长度。malformed frame 在调用业务后端前拒绝，
-不写回复；SDK 需先校验 shape，初始化 status，并区分传输失败和正常方法回复。
+shape 可回复时填有效错误头；SDK 需先校验 shape，初始化 status，并区分传输失败和正常方法回复。
 内部 provider 调用的 transport 失败不能冒充本次外层 Core transport 结果。
 
 这是 VFS 第一阶段的局部选择；既有 filesystem / block 契约继续使用 0 / -errno。

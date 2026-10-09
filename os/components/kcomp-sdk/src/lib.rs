@@ -55,6 +55,7 @@ pub mod filesystem;
 pub mod frame;
 pub mod generated;
 pub mod heap;
+pub mod ipc;
 pub mod management;
 pub mod mem;
 pub mod network;

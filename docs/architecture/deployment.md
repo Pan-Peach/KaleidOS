@@ -2,6 +2,11 @@
 
 > 本文件是**"部署（deployment）决定调用机制"**的设计契约：谁提议部署、Core 验证什么、`(caller domain, callee domain)` 如何选出调用机制、binding 携带什么、不支持的组合如何拒绝。
 > 它是**设计契约，不是进度快照**。**KernelNative 与受限的 IsolatedNative 两种部署真实存在**：K/I 双向 Gate 已真正派发（§10）；Sandbox transport 仍**未实现**（§10 是实现状态表，§7 是逐条缺口）。
+
+新增的 KernelNative Task Request/Reply 使用独立窄入口，契约见 [IPC](ipc.md)。它沿用
+Endpoint identity、exact ABI 校验与部署准入，但不经过下述 legacy bind 机制选择。
+Core 每次复验双方域与 grant，SDK 不旁路或回退。本文的 Direct/Gate 矩阵继续描述旧
+服务；syscall-IPC 与持久私有域 Server Task 仍未实现。
 > 与 `docs/architecture/component-lifecycle.md` 在"同一份组件代码能否跨执行域原样运行"上冲突时，**以本文件为准**：`component-lifecycle.md` §9"代码页去重是未来的 loader / MM 优化，不是 ABI / 生命周期承诺"的结论**由本文件补充**（见 §6、§8）。本文件不否认它的现状描述，而是把目标写清楚，并把缺口显式登记。
 
 ---

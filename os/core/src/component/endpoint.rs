@@ -142,6 +142,12 @@ pub struct EndpointRecord {
     /// provider 的 opaque state（Direct；Core 原样回传）。
     pub ctx: *mut (),
 }
+impl EndpointRecord {
+    /// Port zero with no callable publication is reserved for owned IPC.
+    pub(crate) fn is_ipc_only(&self) -> bool {
+        self.port == 0 && self.api.is_null() && self.ctx.is_null()
+    }
+}
 
 // `api` / `ctx` 是 opaque provider 指针：Registry 只存取、永不解引用。Send/Sync
 // 安全（指针本身只是字节；跨线程使用由外层 Mutex 串行化）。
@@ -234,6 +240,8 @@ pub enum Mechanism {
     Direct,
     /// 跨域 / 需 containment：调用走 `kcore_endpoint_call` 的 Core call gate。
     Gate,
+    /// Owned Server Task Request/Reply, without callable provider pointers.
+    Ipc,
 }
 
 /// bind 的拒绝原因（`kcore_endpoint_bind` 的 ABI 翻译在 `errno.rs`）。
@@ -522,7 +530,17 @@ impl EndpointRegistry {
         // (1) 校验：contract + abi exact-match + 存活（与 validate 同一入口）。
         let record = self.lookup(components, id, contract, abi)?;
         // (2) 机制选择：两端执行域缺一不可。
-        let mechanism = select_mechanism(caller_domain, instance_domain(components, record.owner))?;
+        let provider_domain = instance_domain(components, record.owner);
+        let mechanism = if record.is_ipc_only() {
+            if caller_domain != ExecutionDomain::KernelNative
+                || provider_domain != ExecutionDomain::KernelNative
+            {
+                return Err(BindError::UnsupportedMechanism);
+            }
+            Mechanism::Ipc
+        } else {
+            select_mechanism(caller_domain, provider_domain)?
+        };
         // (3) Direct 必须真的有 function table 可交付（结构性检查，不解引用）。
         if mechanism == Mechanism::Direct && record.api.is_null() {
             return Err(BindError::DirectWithoutApi);
@@ -565,6 +583,13 @@ impl EndpointRegistry {
             if record.owner == provider {
                 record.state = EndpointState::Invalid;
             }
+        }
+    }
+
+    /// Retire a server Task's endpoint; numeric identity never redirects.
+    pub(crate) fn invalidate(&mut self, id: EndpointId) {
+        if let Some(record) = self.endpoints.iter_mut().find(|r| r.id == id) {
+            record.state = EndpointState::Invalid;
         }
     }
 
@@ -1243,6 +1268,39 @@ mod tests {
         assert_eq!(bound.record.api, api);
         assert_eq!(bound.record.ctx, ctx);
         assert_eq!(bound.record.owner, ids[0]);
+    }
+    #[test]
+    fn ipc_only_binding_rejects_private_domains_and_never_hands_out_pointers() {
+        let (reg, ids) = ready_world();
+        let mut er = EndpointRegistry::new();
+        let id = publish_ready_with_table(
+            &mut er,
+            &reg,
+            ids[0],
+            b"ipc",
+            0,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        let bound = er
+            .bind(&reg, id, CONTRACT, ABI_A, ExecutionDomain::KernelNative)
+            .unwrap();
+        assert_eq!(bound.mechanism, Mechanism::Ipc);
+        assert!(bound.record.api.is_null() && bound.record.ctx.is_null());
+        for domain in [
+            ExecutionDomain::IsolatedNative,
+            ExecutionDomain::SandboxedNative,
+        ] {
+            assert!(matches!(
+                er.bind(&reg, id, CONTRACT, ABI_A, domain),
+                Err(BindError::UnsupportedMechanism)
+            ));
+        }
+        er.invalidate(id);
+        assert!(
+            er.bind(&reg, id, CONTRACT, ABI_A, ExecutionDomain::KernelNative)
+                .is_err()
+        );
     }
 
     /// bind 成功发射 `TraceEvent::EndpointBind`（endpoint / provider / Core 在

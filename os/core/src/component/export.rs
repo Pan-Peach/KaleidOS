@@ -112,6 +112,10 @@ use query::*;
 mod user;
 use user::*;
 
+#[path = "export/ipc.rs"]
+mod ipc;
+use ipc::*;
+
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
 /// 无需 build script / 运行时注册。
@@ -795,6 +799,14 @@ extern "C" fn kcore_endpoint_bind(
                                 crate::generated::abi::KCORE_ENDPOINT_MECHANISM_GATE,
                             );
                             // Gate 不写 api/ctx：binding 不携带裸 function table。
+                        }
+                        endpoint::Mechanism::Ipc => {
+                            core::ptr::write_unaligned(
+                                out_mechanism,
+                                crate::generated::abi::KCORE_ENDPOINT_MECHANISM_IPC,
+                            );
+                            core::ptr::write_unaligned(out_api, 0);
+                            core::ptr::write_unaligned(out_ctx, 0);
                         }
                     }
                 }
@@ -1578,6 +1590,7 @@ mod tests {
             .lines()
             .chain(query_half.lines())
             .chain(user_half.lines())
+            .chain(include_str!("export/ipc.rs").lines())
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("with_core_critical("))
             .count();

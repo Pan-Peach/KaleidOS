@@ -39,23 +39,23 @@ monitor 不抢读它的下一条命令。未安装调度策略时 monitor 仍可
 | `devices` | DeviceId / 主 compatible / 认领状态 / owner 组件名与 ID；主 MMIO 或 PIO 窗口、首个 IRQ 与资源总数 |
 | `load <artifact> [native\|isolated]` | 默认 native；可省略 `.kcomp`；Core 验证请求，失败打印 errno；不隐式回退域 |
 | `inspect <loaded-artifact>` | 复用组件查询，显示该 artifact 的所有已加载实例、KCOMP 格式、域与状态 |
-| `cat <provider-relative-path>` | 使用 init 指定的 filesystem endpoint；无配置时查找唯一 Live、exact ABI 匹配端口，bind / mount / open / read / close |
-| `exec <provider-relative-path> [args...]` | 经选定 FS 读静态 ELF，创建 POSIX 镜像快照进程族，等待退出并显示 exit / signal |
-| `ls` / `cd` / `pwd` | 明确报告 unsupported：现有 FS 没有目录枚举或工作目录 / namespace 契约 |
+| `cat <provider-relative-path>` | 使用 init 指定的 VFS endpoint 与默认根；经 IPC resolve / open / read / close |
+| `exec <provider-relative-path> [args...]` | 经同一 VFS 读静态 ELF，创建 POSIX 镜像快照进程族，等待退出并显示 exit / signal |
+| `ls` / `cd` / `pwd` | 明确报告 unsupported：当前未接目录枚举和 cwd 命令 |
 
 `inspect` 当前不读取未加载 artifact 或任意路径的字节，也不解析 ELF / PE / WASM。
 这需要外置的只读文件 / artifact inspection helper；Core 不新增格式识别 API。
 
-init 经 config ABI `0x4B53_4846_5343_4647` + 8 字节 native-endian u64 交付 FS
-EndpointId；0 表示无预设（空 config 也表示无预设），非零 ID 在 create 时校验 exact
-contract/ABI/liveness。config 无对齐要求，两个 32 位原子仅在 create 写入、任务启动后
-只读，保持完整 ID 并支持 RV32。`cat` / `exec` 复用同一选择，不再每次全局重选。
+init 经 config ABI `0x72BD_51C9_340F_A806` 交付 LE u64 VFS EndpointId，后跟
+1..256 字节无 NUL 的绝对默认根路径。端点在 create 校验 exact contract/ABI/liveness，
+配置仅 create 写、会话 Task 只读；双 32 位原子保存端点，RV32 不依赖 AtomicU64。
+普通有盘启动默认根 `/fat`，无盘为 `/`。相对路径与兼容的 `0:/HELLO.TXT` 从默认根
+解析；绝对 `/fat/HELLO.TXT` 与 `/local/README.TXT` 遍历同一个 VFS Namespace。
 
-monitor 无配置加载 shell 时仍只接受唯一 provider，多个 Live FS 明确报歧义。
-路径解释交给 provider；FAT 示例为 `0:/HELLO.TXT`，littlefs 使用其自身路径。
-mount 幂等；退出 shell 不 unmount 共享 provider。传输与方法错误分别保留，打开的
-文件在正常完成或 read 错误后都 close。SDK read 接受普通数据缓冲区，不向 shell
-暴露 Gate 的长度头；Direct 直接写入，Gate 单次最多 512 字节数据、校验后复制。
+monitor 零配置加载时只发现唯一 Live、exact ABI 的 VFS，不回退到 filesystem provider。
+多个 VFS 明确报歧义。cat 与 exec 使用同一 VFS binding，打开对象和临时路径引用在
+正常与读取失败路径都释放；退出 shell 不 shutdown 共享 VFS。read 单次最多 512 字节，
+传输与方法错误保留区别；不向 shell 暴露 wire 长度头或 provider 的 FIL/cursor。
 
 ## 输入与编辑
 
@@ -63,7 +63,7 @@ mount 幂等；退出 shell 不 unmount 共享 provider。传输与方法错误�
 不要求堆分配。输入限 ASCII；非 ASCII 字节或超长输入使整行失效，丢弃到换行后恢复，
 绝不执行截断前缀。支持 CR / LF / CRLF，Ctrl-C 取消也能恢复失效行。
 会话输入 / 历史 / 解码缓冲放在各实例自己的可写 image，仅由该实例的唯一会话任务访问，避免占用
-Core 分配的单 granule 任务栈；不另建会话组件或扩大 Core 栈机制。
+Core 分配的任务栈（当前固定 16 KiB）；ksh 不另建会话组件或自定义栈机制。
 
 | 按键 | 行为 |
 |---|---|
@@ -130,7 +130,7 @@ shell 使用的观察导出（源在 `abi/core.toml`）：
 既有 `kcore_device_nth` 接受空 compatible 字节串以枚举全部设备；既有
 `kcore_component_load` 增加 domain 请求参数，沿用 id / -errno 返回编码。后者改变 import
 签名；后续 create 同步增加 domain。本次设备查询扩充 import 集，`KCOMP_ABI` 原地协调替换为
-`0xD58F_B296_4E73_A10C`；旧组件明确不兼容，Core 与全部组件一起重建。
+`0xF091_A62D_39C8_740B`；旧组件明确不兼容，Core 与全部组件一起重建。
 SDK / C provider / test fixture 的指纹同步更新，生成的声明与导出表由
 `make abi-gen` 更新、`make abi-check` 检查。
 

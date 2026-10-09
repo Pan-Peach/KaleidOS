@@ -187,23 +187,12 @@ static int32_t dispatch_node_info(struct fatfs_state *state, const struct kcomp_
     return result;
 }
 
-int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t method,
-                               const struct kcomp_call_frame *frame)
+int32_t fatfs_dispatch(struct fatfs_state *state, uint32_t method,
+                        const struct kcomp_call_frame *frame)
 {
-    if (instance_state == NULL) {
+    if (state == NULL || frame == NULL) {
         return -EINVAL;
     }
-    if (port != FATFS_PORT) {
-        /* 本 image 只发布 filesystem endpoint；其它 port 是能力缺失。 */
-        return -ENOSYS;
-    }
-
-    log_gate_dispatch(method);
-
-    if (frame == NULL) {
-        return -EINVAL;
-    }
-    struct fatfs_state *state = instance_state;
 
     switch (method) {
     case KCOMP_FILESYSTEM_METHOD_MOUNT:
@@ -230,8 +219,37 @@ int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t met
     case KCOMP_FILESYSTEM_METHOD_NODE_INFO:
         return dispatch_node_info(state, frame);
 
+    case KCOMP_FILESYSTEM_METHOD_NODE_DETAILS:
+        return frame->args_len == 8 && frame->input_len == 0 && frame->output_len == 28 ?
+            fatfs_node_details(state, read_le64(frame->args), frame->output) : -EINVAL;
+
+    case KCOMP_FILESYSTEM_METHOD_OPEN_NODE: {
+        if (frame->args_len != 8 || frame->input_len || frame->output_len != 8) return -EINVAL;
+        uint64_t handle = 0;
+        int32_t result = fatfs_open_node(state, read_le64(frame->args), &handle);
+        if (!result) write_le64(frame->output, handle);
+        return result;
+    }
+    case KCOMP_FILESYSTEM_METHOD_READ_AT: {
+        if (frame->args_len != 16 || frame->input_len || frame->output_len < 8) return -EINVAL;
+        size_t actual = 0;
+        int32_t result = fatfs_read_at(state, read_le64(frame->args), read_le64(frame->args + 8),
+            frame->output + 8, frame->output_len - 8, &actual);
+        if (!result) write_le64(frame->output, (uint64_t)actual);
+        return result;
+    }
+
     default:
         /* 能力缺失（不是畸形帧）：与 Core 对"没有 dispatcher"的档位一致。 */
         return -ENOSYS;
     }
+}
+
+int32_t kcomp_service_dispatch(void *state, uint32_t port, uint32_t method,
+                               const struct kcomp_call_frame *frame)
+{
+    if (port != FATFS_PORT) return -ENOSYS;
+    if (state != NULL && ((struct fatfs_state *)state)->ipc_only) return -ENOTSUP;
+    log_gate_dispatch(method);
+    return fatfs_dispatch(state, method, frame);
 }

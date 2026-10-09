@@ -1,89 +1,71 @@
 # vfs（os/components/filesystems/vfs/）
 
-> 现状描述。职责契约见 `docs/interfaces/filesystem.md`；组件生命周期见
-> `docs/architecture/component-lifecycle.md`。本文不冻结 VFS API 或 ABI。
+> 现状描述。外部语义见 [文件系统](../interfaces/filesystem.md) 与
+> [VFS wire](../interfaces/vfs.md)；Local/Remote 取舍见 [ADR](../development/hybrid-vfs-adr.md)。
 
 ## 当前状态
 
-只有 Rust `.kcomp` 骨架。已接入组件构建、fmt 与 clippy；create / destroy 返回
-`-ENOTSUP`，内部操作入口返回 `Error::Unsupported`。有表槽位的借用形状，但没有
-实际表管理、endpoint、任务或 I/O。`load vfs` 会创建失败，不提供可用服务。
+独立 `vfs.kcomp` 的 Server Task 通过 Request/Reply 提供只读路径与文件服务。
+一个 Namespace/OpenFile 同时管理静态 Rust LocalFs 和独立 C FatFs 的 RemoteFs。
+组件内部使用 trait、Arc、Box 和普通方法，跨镜像只传有界 LE 消息。
+init 显式组合 FatFs→VFS→ksh，cat 与 ELF 文件读取使用同一 VFS；Block 尚用旧绑定。
 
-源码里的 Rust 类型与签名是内部草案，不跨组件边界。第一阶段 ABI 声明已放在
-`abi/vfs.toml`，生成 C / Rust 布局；逐方法编码见 `docs/interfaces/vfs.md`。
-SDK `vfs.rs` 提供 Contract / provider trait / Binding 占位；bind 与操作返回 ENOTSUP，
-尚无 Direct/Gate adapter。
+create 的配置由 `abi/vfs.toml` 定义：control ComponentId、0..2 个 filesystem EndpointId。
+Local 文件 `/local/README.TXT` 总可用，远程卷依次挂在 `/fat` 与 `/second`。
+零配置仅创建 Local 服务且无控制 consumer。创建者可通过 Core grant 授权消费者。
+配置先确定图，不进行全局唯一 FS 名字发现，也不重连失败实例。
 
 ## 职责与代码
 
-| 文件 | 职责 / 当前落点 |
+| 文件 | 已实现职责 |
 |---|---|
-| `src/lib.rs` | 模块入口；内部错误草案，保留权限拒绝、共享冲突、delete-pending 的区别 |
-| `src/provider.rs` | FS incarnation、节点元数据 / 原生权限；root / lookup / 引用 / readlink / 枚举 / 流 / read_at / cleanup / close 占位 |
-| `src/name.rs` | Bytes / UTF-16 表示、调用者缓冲区、目录匹配规则提示 |
-| `src/stream.rs` | 默认 / 命名流选择、StreamRef、流大小快照；无物理 extent |
-| `src/namespace.rs` | mount 槽位、路径位置 / 遍历限制；attach / detach / retain / release / resolve / 失效占位 |
-| `src/file.rs` | open / stream / delete 槽位、用户 / I/O / mapping 引用、share 计数与删除状态；操作占位 |
-| `src/runtime.rs` | 生命周期入口；实例创建与清理的待实现位置 |
+| `src/provider.rs` | object-safe FileSystem/FsNode/FsOpen；FS/Node 身份、kind/size、canonical lookup |
+| `src/local.rs` | 只读内存树；独立实例身份，Arc 数据保活，独立 backend open |
+| `src/name.rs` | 名字表示、单段 Bytes 校验；当前后端只支持 Bytes |
+| `src/namespace.rs` | 强父/弱子 Dentry 缓存、Path=(Mount,Dentry)、挂载保活、root/beneath/no-cross |
+| `src/file.rs` | OpenFile 持 Path/backend；独立游标、read_at、一次 close |
+| `src/remote.rs` | 固定连接与借用 NodeId；owned OpenLease；预留槽的非阻塞 drop/close drain |
+| `src/service.rs` | 32 个 Path 与 32 个 Open 槽，verified Component/Task 归属；wire 解码、引用与回滚 |
+| `src/runtime.rs` | 生命周期、混合挂载、owned Server Task、请求驱动 reaper、控制 shutdown |
+| `src/tests.rs` | 六项生产 host 测试，对象语义及服务错误/回滚；不冒充 IPC 隔离 |
 
-目标是由 VFS 实例保存 mount、目录项、打开引用与共享访问状态。Core 管组件、
-任务和执行域生命周期；personality 管 fd / HANDLE、cwd、进程语义和错误表示。
-Namespace 与 File service 先保持在同一组件的普通模块中。
+LocalFs 隐式 root；配置 parent 指向此前的目录。名字非空、最多 255 字节，拒绝
+`/`、NUL、`.`、`..` 和同父重复名字；按字节区分大小写。文件数据复制到实例 Arc。
+Node identity 不强求 Arc 指针相同，未增加 Core inode 注册表。
 
-## 状态形状与关系
+Dentry 保存 canonical 名字与父关系；每次查询后端后按名字和 NodeIdentity 合并活跃
+弱缓存，不持缓存锁跨 IPC，不缓存磁盘数据或负项。Mount 按 covered 路径位置匹配，
+不能按 NodeIdentity 合并。Path 保活 Mount/Dentry，OpenFile 保活 Path；活动引用时
+内部 detach 为 EBUSY。`.`/`..`、root、beneath 与 mount crossing 均由 Namespace 裁决。
+空路径、NUL、超过 512 字节、尾 `/` 指向文件均拒绝；外国 Namespace Path 为 ESTALE。
 
-| 记录 | 保存什么 | 不代替什么 |
-|---|---|---|
-| NodeInfo | provider 的 kind / link_count / 目录名字规则 / 原生权限快照 | 物理块映射、VFS 打开引用 |
-| StreamInfo | node 范围内的流 token、逻辑大小和可选原生大小属性 | ExtentList、每 inode 的强制 ADS map |
-| PathRef | mount / entry / node 的路径位置；引用必须显式 retain / release | 单独 node ID、打开实例 |
-| OpenFile | stream、provider handle、游标、access/share、引用与生命周期 | fd / HANDLE、硬链接计数 |
-| StreamState | 同一流的独立 open share 计数 | 用户复制句柄数 |
-| PendingDelete | 删除目录项或命名流的目标、时机、请求者与状态 | 普通 inode 上一个 DELETE_PENDING 位 |
+FatFs Node 是挂载期借用身份，在 provider 的 64 槽有界表驻留；unmount 使其失效。
+RemoteNode 的 Arc 只保活本地连接，无每-node retain/release。独立 open 则拥有 provider
+lease；创建前预留 8 个 close 槽之一，drop 只排队，Server Task 在请求后 drain。
+provider 失败使旧连接操作失败，不重定向；Local 和其他挂载继续可用。
 
-| 场景 | 待实现的状态转换 / 协调 |
-|---|---|
-| 独立 open | 新 OpenFile、新游标；双向 share 检查与提交不能分开 |
-| retain / dup | 增加同一 OpenFile 的 handles；不增加 share.opens / link_count |
-| 最后用户引用关闭 | Live → Handleless；已有请求处理后 cleanup，再进入 Cleaned |
-| mapping / I/O 排空 | 最终 provider close / 对象退役；不承诺物理 backing 回收 |
-| 删除（未来写支持） | 区分名字移除和延迟删除；文件删除检查所有流上的 share |
-| provider 失败 | 引用逻辑失效；OpenState / DeleteState 记录失败，不重绑到新 incarnation |
+VFS 外部 Path/Open 引用绑定 Core 验证的 ComponentId 与 TaskId，跨 Task 数字复制
+返回 EACCES，未知/过期 path 为 ESTALE，file 为 EBADF。retain 共享同一 open 游标，
+重新 open 游标独立。最终 close 先消费本地引用，后端清理错误也不能重试旧 token。
+新引用在 reply 取消/退出时回滚；成功交付后 Task/Component 失效，由后续请求 reaper
+清理。空闲时没有独立 watchdog。控制 shutdown drain 所有 opens 后结束 server，随后
+公开 Core stop 才能通过 live-Task 门禁；Native 已发布 backing 的驻留承诺仍适用。
 
-这些枚举只是未实现的内部状态位置。删除计数范围、取消 / commit 原子性、权限检查
-与跨 personality 冲突仍未定稿；当前 readonly ABI 不暴露删除操作。
+## 限制与验证
 
-## 手写实现顺序
-
-1. 定下 FS 实例、节点、目录项与打开引用的有效期和失效规则。身份要区别
-   provider 重启 / 重新挂载；多个路径入口共享同一底层对象。
-2. 补齐 provider 契约所需的 root / lookup / node_info / 引用 / readlink / 枚举与偏移读取。
-   当前 `abi/filesystem.toml` 已补 root / 单段 lookup / node_info，FatFs 与 C/Rust SDK
-   已接线；littlefs 对节点操作返回 ENOTSUP。节点保活、readlink、枚举与 read_at
-   尚未实现，VFS provider 适配仍为占位。
-3. 实现 per-instance 表与遍历；名字编码、匹配和 symlink / mount 边界须显式定义。
-4. 实现只读打开与读取；验证独立 open 的游标、复制引用的共享状态、短读 / EOF、
-   provider 失败后旧引用失效。共享状态和锁的覆盖范围必须明确。
-5. 实现 SDK 第一阶段 ABI 适配器，定下组合配置、补构造失败清理，再发布 endpoint；集成编排放到
-   `os/components/tests/core_test/`，只走真实 SDK / Core API。
-
-Gate 服务回调当前禁止 park / 调度切换；unpark 只允许同 owner。需要等待磁盘或
-跨组件完成通知时，先定等待与完成机制，不能在 service stack 中直接 park。
-
-写支持后再补原子追加、排他创建、rename/unlink、共享访问 / delete-pending 与
-落盘保证。权限模型、错误 wire 编码、跨 personality 冲突规则仍需人类定稿。
-缓存、异步 I/O 与完整 NT 对象 namespace 留到真实需求出现后。
-
-## 骨架验证
-
-在仓库根运行；显式 target 仅用于验证两个现有 RISC-V 后端，正式镜像仍由
-`.config` 经 Makefile 选择 target。
+未实现写、目录枚举、UTF-16、symlink/readlink、命名流、share/delete/ACL、page cache、
+运行期 mount 协议或引用转移。只接受 read + share-read，其他访问明确拒绝。
+64 个不同 Fat 节点耗尽返回 ENOSPC，8 个 provider open 耗尽返回 EMFILE；预算不是
+可无限增长的 inode cache。服务调用只能在 KernelNative Task 中进行。
 
 ```sh
-cargo fmt --manifest-path os/components/filesystems/vfs/Cargo.toml -- --check
-cargo clippy --manifest-path os/components/filesystems/vfs/Cargo.toml --target riscv64gc-unknown-none-elf -- -D warnings
-tools/build-kcomp.sh os/components/filesystems/vfs riscv64gc-unknown-none-elf build/vfs-rv64/vfs.kcomp build/vfs-rv64/target
-tools/build-kcomp.sh os/components/filesystems/vfs riscv32imac-unknown-none-elf build/vfs-rv32/vfs.kcomp build/vfs-rv32/target
+cargo test --manifest-path os/components/filesystems/vfs/Cargo.toml
+make check
+make test-qemu
 ```
 
-packer 验证 ELF / 生命周期符号 / import / 重定位；这些检查不证明 VFS 行为。
+CoreTest [hybrid_vfs](../../os/components/tests/core_test/src/runtime/hybrid_vfs.rs) 用真实
+C FatFs 镜像与两个独立 FAT12 Block 实例，验证混合路径、身份、游标、wrong Task、
+close/stale、短读/EOF、取消创建、退出回收、provider 失效/重启与 IPC-only stop。
+init runner 另用真实 virtio FAT 盘验证 cat、Local/Remote 绝对路径、双盘选择及 RV64 ELF。
+逐次结果与剩余迁移门禁统一记录在 [STATUS](../../STATUS.md)，host/构建不证明隔离。

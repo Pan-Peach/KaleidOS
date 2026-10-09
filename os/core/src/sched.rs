@@ -551,7 +551,7 @@ fn schedule_next_with_guard(
     );
     // Policy sees a snapshot. Registry -> CPU slot -> task table protects
     // admission and the two-sided commit; no lock spans provider execution.
-    let (from_ptr, to_ptr, next, next_owner) = loop {
+    let (from_ptr, to_ptr, next, next_owner, retired) = loop {
         let runnable = collect_runnable();
         let choice = choose_next(&runnable)?;
         let mut next = choice.task;
@@ -572,6 +572,7 @@ fn schedule_next_with_guard(
         {
             after = Some(TaskState::Exited);
         }
+        let retired = after == Some(TaskState::Exited);
         match table
             .commit_switch(current_cpu_id(), from, after, next)
             .map_err(|_| SchedError::InvalidTransition)?
@@ -614,8 +615,12 @@ fn schedule_next_with_guard(
             )
         };
         cpu_guard.current = next;
-        break (from_ptr, to_ptr, next, owner);
+        break (from_ptr, to_ptr, next, owner, retired);
     };
+
+    if retired && let Some(task) = from {
+        crate::component::exchange::task_exited(task);
+    }
 
     // IRQs stay masked until the incoming stack and escape guard are ready.
     if let Some(id) = next {

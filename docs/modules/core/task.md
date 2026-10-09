@@ -8,6 +8,7 @@
 - Task 身份（`TaskId`）与 owner（`ComponentId`）。
 - 任务状态机（`TaskState`：Created / Runnable / Running(CpuId) / Blocked / Exited）。
 - 内核栈（`Kernelstack`）、任务执行上下文与该执行流的 IRQ 保存值。
+- 当前每个 Task 栈固定 16 KiB（四个分配 granule），容纳有界 IPC 副本与 Core 切换帧；无 guard page 或逐任务可调栈。
 - start 时提交的固定逻辑 CPU，首次运行和 wake 后均受 Core 验证。见 `docs/architecture/scheduling.md`。
 - 每个任务最多一份 pending unpark permit（提前通知会被下一次 park 消费；重复通知合并）。
 - RV64 普通用户任务的私有 AS、U 映射、整数 / FP 现场与实际 trap 关联；PID / ELF / syscall 留在 personality。

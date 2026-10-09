@@ -162,109 +162,6 @@ const _: () = {
     assert!(core::mem::offset_of!(VfsDirReply, reserved) == 52);
 };
 
-/// 只读 VFS Direct table；out_status 在正常方法回复中均有效，其他输出仅成功有效，read_dir ENOBUFS 除外。Gate 同义编码见 docs/interfaces/vfs.md。
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct VfsApi {
-    /// 返回 create 配置建立的 namespace root；不替调用者选择进程 cwd。
-    pub root: unsafe extern "C" fn(
-        ctx: *mut (),
-        out_path: *mut VfsPath,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 按显式上下文解析有界路径；字节串无 NUL 终止，UTF-16 在 Gate 中编码为 LE。
-    pub resolve: unsafe extern "C" fn(
-        ctx: *mut (),
-        request: *const VfsLookup,
-        path: *const u8,
-        len: usize,
-        out_path: *mut VfsPath,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 查询节点元数据；不返回 POSIX stat 或 NT 专属结构。
-    pub node_info: unsafe extern "C" fn(
-        ctx: *mut (),
-        path: *const VfsPath,
-        out_info: *mut VfsNodeInfo,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// cursor 0 为起点；输出一个完整名字。ENOBUFS 时仅 name_len 有效，cursor 不前进。
-    pub read_dir: unsafe extern "C" fn(
-        ctx: *mut (),
-        directory: *const VfsPath,
-        cursor: u64,
-        name: *mut u8,
-        len: usize,
-        out_reply: *mut VfsDirReply,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 打开已有数据流。访问 / share 显式选择；创建、截断与删除尚不在此 ABI。
-    pub open: unsafe extern "C" fn(
-        ctx: *mut (),
-        request: *const VfsOpenRequest,
-        stream_name: *const u8,
-        len: usize,
-        out_file: *mut u64,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 增加同一打开实例的用户引用，不再次 open；共享游标和 access/share。
-    pub retain:
-        unsafe extern "C" fn(ctx: *mut (), file: u64, out_status: *mut VfsReplyStatus) -> i32,
-    /// 从共享游标读；返回长度不大于容量，0 表示 EOF / 零长读取。
-    pub read: unsafe extern "C" fn(
-        ctx: *mut (),
-        file: u64,
-        buf: *mut u8,
-        len: usize,
-        out_read: *mut usize,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 显式偏移读取，不改变共享游标；不以 seek + read 模拟。
-    pub read_at: unsafe extern "C" fn(
-        ctx: *mut (),
-        file: u64,
-        offset: u64,
-        buf: *mut u8,
-        len: usize,
-        out_read: *mut usize,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 设定绝对游标；signed SEEK_* 的解释归 personality。
-    pub set_position: unsafe extern "C" fn(
-        ctx: *mut (),
-        file: u64,
-        offset: u64,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 查询此打开实例的流；默认流与命名流使用同一快照格式。
-    pub stream_info: unsafe extern "C" fn(
-        ctx: *mut (),
-        file: u64,
-        out_info: *mut VfsStreamInfo,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 消费一个用户引用；最后句柄 cleanup 与映射 / I/O 排空后的最终释放分开。
-    pub close:
-        unsafe extern "C" fn(ctx: *mut (), file: u64, out_status: *mut VfsReplyStatus) -> i32,
-    /// 增加路径位置的用户引用，用于 root/cwd 等独立持有者；复制结构不自动 retain。
-    pub retain_path: unsafe extern "C" fn(
-        ctx: *mut (),
-        path: *const VfsPath,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-    /// 消费一个路径位置引用；provider/mount 失效仍可使保留的引用逻辑失效。
-    pub release_path: unsafe extern "C" fn(
-        ctx: *mut (),
-        path: *const VfsPath,
-        out_status: *mut VfsReplyStatus,
-    ) -> i32,
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<VfsApi>() == 13 * core::mem::size_of::<usize>());
-    assert!(core::mem::align_of::<VfsApi>() == core::mem::align_of::<usize>());
-};
-
 /// args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。
 pub const KCOMP_VFS_METHOD_RETAIN_PATH: u32 = 11;
 
@@ -278,7 +175,7 @@ pub const KCOMP_VFS_NAME: &[u8] = b"vfs";
 pub const KCOMP_VFS_CONTRACT: u64 = 0x5646_5353_4552_5643;
 
 /// exact fingerprint，ASCII VFSFLATC；不承诺陈旧组件兼容。
-pub const KCOMP_VFS_ABI: u64 = 0x5646_5346_4C41_5443;
+pub const KCOMP_VFS_ABI: u64 = 0x7A36_D501_C29F_084B;
 
 /// 不要求 UTF-8 的原生字节名字。
 pub const KCOMP_VFS_ENCODING_BYTES: u32 = 1;
@@ -374,10 +271,10 @@ pub const KCOMP_VFS_STATUS_OUTSIDE_ROOT: u32 = 5;
 pub const KCOMP_VFS_STATUS_NO_DATA_STREAM: u32 = 6;
 
 /// 本阶段路径 input 最大字节数（UTF-16 同样按字节计，无 NUL）。
-pub const KCOMP_VFS_PATH_MAX: usize = 4096;
+pub const KCOMP_VFS_PATH_MAX: usize = 512;
 
 /// 本阶段单段名字最大字节数；不意味着所有 provider 都支持此上限。
-pub const KCOMP_VFS_NAME_MAX: usize = 1024;
+pub const KCOMP_VFS_NAME_MAX: usize = 255;
 
 /// read / read_at Gate output 的完整头：8 字节 status + 8 字节 LE u64 实际长度。
 pub const KCOMP_VFS_IO_HEADER_LEN: usize = 16;
@@ -423,3 +320,9 @@ pub const KCOMP_VFS_METHOD_CLOSE: u32 = 10;
 
 /// 每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。
 pub const KCOMP_VFS_REPLY_STATUS_LEN: usize = 8;
+
+/// LE control ComponentId u32, count u32, then 0..2 filesystem EndpointId u64; mounts /fat and /second. Local /local always exists.
+pub const KCOMP_VFS_CREATE_CONFIG_ABI: u64 = 0x82BE_46A1_09CF_753D;
+
+/// Only configured control consumer: args/input empty, output status[8]; close files, invalidate endpoint, exit Server Task.
+pub const KCOMP_VFS_METHOD_SHUTDOWN: u32 = 13;

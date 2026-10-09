@@ -34,7 +34,12 @@ pub(super) enum Backend {
         ctx: *mut (),
     },
     /// 跨域 / 需 containment：opaque EndpointId（Core call-gate handle）。
-    Gate { endpoint: u64 },
+    Gate {
+        endpoint: u64,
+    },
+    Ipc {
+        endpoint: u64,
+    },
 }
 
 /// 调 `kcore_endpoint_bind`：Core 校验（exact contract + abi + 存活）并**一次性**
@@ -69,6 +74,7 @@ pub(super) fn bind(endpoint: u64) -> Result<Backend, InvokeError> {
             })
         }
         abi::KCORE_ENDPOINT_MECHANISM_GATE => Ok(Backend::Gate { endpoint }),
+        abi::KCORE_ENDPOINT_MECHANISM_IPC if api == 0 && ctx == 0 => Ok(Backend::Ipc { endpoint }),
         // 未知机制编码 = Core 回复违反契约（不猜测、不降级成 Direct）。
         _ => Err(InvokeError::InvalidReply),
     }
@@ -86,6 +92,11 @@ pub(super) fn capacity_sectors(backend: &Backend) -> Result<u64, InvokeError> {
         Backend::Gate { endpoint } => {
             let mut reply = [0u8; KCOMP_BLOCK_CAPACITY_LEN];
             invoke_gate(*endpoint, KCOMP_BLOCK_METHOD_CAPACITY, &[], &[], &mut reply)?;
+            Ok(u64::from_le_bytes(reply))
+        }
+        Backend::Ipc { endpoint } => {
+            let mut reply = [0; 8];
+            invoke_ipc(*endpoint, KCOMP_BLOCK_METHOD_CAPACITY, &[], &[], &mut reply)?;
             Ok(u64::from_le_bytes(reply))
         }
     }
@@ -107,6 +118,19 @@ pub(super) fn read(backend: &Backend, lba: u64, buf: &mut [u8]) -> Result<(), In
             &[],
             buf,
         ),
+        Backend::Ipc { endpoint } => {
+            check_lba_range(lba, buf.len())?;
+            for (index, sector) in buf.chunks_exact_mut(512).enumerate() {
+                invoke_ipc(
+                    *endpoint,
+                    KCOMP_BLOCK_METHOD_READ,
+                    &(lba + index as u64).to_le_bytes(),
+                    &[],
+                    sector,
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -125,7 +149,36 @@ pub(super) fn write(backend: &Backend, lba: u64, buf: &[u8]) -> Result<(), Invok
             buf,
             &mut [],
         ),
+        Backend::Ipc { endpoint } => {
+            check_lba_range(lba, buf.len())?;
+            for (index, sector) in buf.chunks_exact(512).enumerate() {
+                invoke_ipc(
+                    *endpoint,
+                    KCOMP_BLOCK_METHOD_WRITE,
+                    &(lba + index as u64).to_le_bytes(),
+                    sector,
+                    &mut [],
+                )?;
+            }
+            Ok(())
+        }
     }
+}
+fn check_lba_range(lba: u64, bytes: usize) -> Result<(), InvokeError> {
+    lba.checked_add((bytes / 512 - 1) as u64)
+        .map(|_| ())
+        .ok_or(InvokeError::Method(Errno::EOVERFLOW))
+}
+fn invoke_ipc(
+    endpoint: u64,
+    method: u32,
+    args: &[u8],
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<(), InvokeError> {
+    let status = crate::ipc::service::invoke(endpoint, method, args, input, output)
+        .map_err(InvokeError::Transport)?;
+    map_status(status)
 }
 
 /// Core bind 交付的 function table：`'static`（provider image pinned-until-reboot）。

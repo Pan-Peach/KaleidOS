@@ -2168,7 +2168,17 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 62
+    assert len(core.functions) == 72
+    core_exports = {func.name for func in core.functions}
+    assert {"kcore_component_current"} | {
+        "kcore_ipc_" + name for name in
+        ("listen", "grant", "submit", "receive", "reply", "collect", "wait", "cancel", "close")
+    } <= core_exports
+    core_constants = {const.name: const.value for const in core.constants}
+    component_constants = {const.name: const.value for const in component.constants}
+    assert core_constants["KCORE_IPC_MESSAGE_MAX"] == 1024
+    assert component_constants["KCOMP_REQUEST_HEADER_LEN"] == 16
+    assert component_constants["KCOMP_REPLY_HEADER_LEN"] == 4
     assert {"kcore_task_start_on", "kcore_cpu_current"} <= {func.name for func in core.functions}
     assert [func.name for func in core.functions][:4] == [
         "kcore_trace_read",
@@ -2206,7 +2216,7 @@ doc = "I/O error"
     assert component.objects[0].name == "kcomp_abi" and component.objects[0].is_const
     assert component.enums[0].c_name == "KcompInterfaceKind"
     kcomp_abi = [const for const in component.constants if const.name == "KCOMP_ABI"][0]
-    assert kcomp_abi.value == 0xD58F_B296_4E73_A10C
+    assert kcomp_abi.value == 0xF091_A62D_39C8_740B
     kinds = [const for const in core.constants if const.name.startswith("KIND_")]
     assert [const.value for const in kinds] == list(range(1, 12))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]
@@ -2243,7 +2253,7 @@ doc = "I/O error"
     filesystem_abi = [
         const for const in filesystem.constants if const.name == "KCOMP_FILESYSTEM_ABI"
     ][0]
-    assert filesystem_abi.value == 0x4653_4E4F_4445_524F
+    assert filesystem_abi.value == 0xEC25_B01F_768A_394D
     filesystem_consts = {const.name: const.value for const in filesystem.constants}
     assert filesystem_consts["KCOMP_FILESYSTEM_CONTRACT"] == 0x5646_5343_4F4E_5452
     assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_MOUNT"] == 0

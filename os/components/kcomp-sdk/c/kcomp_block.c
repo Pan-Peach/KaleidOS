@@ -12,6 +12,7 @@
  */
 #include "kcomp.h"
 #include "kcomp_block.h"
+#include "kcomp_ipc.h"
 #include <errno.h>
 
 /* 不透明绑定的内部表示。header 的 `opaque[4]` 至少这么大、对齐至少这么强
@@ -82,7 +83,8 @@ int32_t kcomp_block_bind(uint64_t endpoint, uint64_t contract, uint64_t abi,
         return 0;
     }
 
-    if (mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
+    if (mechanism == KCORE_ENDPOINT_MECHANISM_GATE || mechanism == KCORE_ENDPOINT_MECHANISM_IPC) {
+        if (mechanism == KCORE_ENDPOINT_MECHANISM_IPC && (api_raw || ctx_raw)) return -EPROTO;
         /* Gate 不携带裸 function table：只留 opaque EndpointId。 */
         binding->mechanism = mechanism;
         binding->endpoint = endpoint;
@@ -128,6 +130,20 @@ struct kcomp_call_result kcomp_block_read(const struct kcomp_block_binding *bind
         return result;
     }
 
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_IPC) {
+        if (!output || !output_len || output_len % 512) return error_result(-EINVAL);
+        uint64_t sectors = output_len / 512;
+        if (lba > UINT64_MAX - (sectors - 1)) return (struct kcomp_call_result){0, -EOVERFLOW};
+        for (size_t i = 0; i < sectors; ++i) {
+            uint8_t args[8]; kcomp_ipc_put64(args, lba + i);
+            struct kcomp_call_result result = {0, 0};
+            result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_READ,
+                args, sizeof(args), NULL, 0, (uint8_t *)output + i * 512, 512, &result.method);
+            if (result.transport || result.method) return result;
+        }
+        return (struct kcomp_call_result){0, 0};
+    }
+
     return error_result(-EINVAL);
 }
 
@@ -164,6 +180,20 @@ struct kcomp_call_result kcomp_block_write(const struct kcomp_block_binding *bin
         return result;
     }
 
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_IPC) {
+        if (!input || !input_len || input_len % 512) return error_result(-EINVAL);
+        uint64_t sectors = input_len / 512;
+        if (lba > UINT64_MAX - (sectors - 1)) return (struct kcomp_call_result){0, -EOVERFLOW};
+        for (size_t i = 0; i < sectors; ++i) {
+            uint8_t args[8]; kcomp_ipc_put64(args, lba + i);
+            struct kcomp_call_result result = {0, 0};
+            result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_WRITE,
+                args, sizeof(args), (const uint8_t *)input + i * 512, 512, NULL, 0, &result.method);
+            if (result.transport || result.method) return result;
+        }
+        return (struct kcomp_call_result){0, 0};
+    }
+
     return error_result(-EINVAL);
 }
 
@@ -174,6 +204,13 @@ struct kcomp_call_result kcomp_block_capacity(const struct kcomp_block_binding *
         return error_result(-EINVAL);
     }
     const struct kcomp_block_binding_internal *b = binding_ref(binding);
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_IPC) {
+        uint8_t reply[8]; struct kcomp_call_result result = {0, 0};
+        result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_CAPACITY,
+            NULL, 0, NULL, 0, reply, sizeof(reply), &result.method);
+        if (!result.transport && !result.method) *out_sectors = kcomp_ipc_u64(reply);
+        return result;
+    }
 
     if (b->mechanism == KCORE_ENDPOINT_MECHANISM_DIRECT) {
         if (b->api == NULL || b->api->capacity_sectors == NULL) {

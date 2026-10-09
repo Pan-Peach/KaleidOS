@@ -380,6 +380,13 @@ doc = """
 targets = "c,sdk-rust,core-rust"
 
 [[const]]
+name = "KCORE_ENDPOINT_MECHANISM_IPC"
+type = "u32"
+value = "2"
+doc = "Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback."
+targets = "c,sdk-rust,core-rust"
+
+[[const]]
 name = "KCORE_MEMORY_VIEW_LOCAL_VA"
 type = "u32"
 value = "1"
@@ -1802,3 +1809,161 @@ doc = "Destroy a never-started task and retire its AS; rollback only. RV64 super
 [[function.param]]
 name = "task"
 type = "u32"
+
+[[function]]
+name = "kcore_ipc_listen"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+
+[[function]]
+name = "kcore_ipc_grant"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "Endpoint owner 或 Core 记录的不可变实例创建者明确允许 consumer Component 发送；允许启动锚点编排，拒绝 Gate/IRQ/policy；ID 不是 capability。仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "consumer"
+type = "u32"
+
+[[function]]
+name = "kcore_ipc_submit"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "bytes"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+[[function.param]]
+name = "request"
+type = "*mut u64"
+
+[[function]]
+name = "kcore_ipc_receive"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "bytes"
+type = "*mut u8"
+[[function.param]]
+name = "capacity"
+type = "usize"
+[[function.param]]
+name = "request"
+type = "*mut u64"
+[[function.param]]
+name = "consumer"
+type = "*mut u32"
+[[function.param]]
+name = "consumer_task"
+type = "*mut u32"
+[[function.param]]
+name = "length"
+type = "*mut usize"
+
+[[function]]
+name = "kcore_ipc_reply"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "request"
+type = "u64"
+[[function.param]]
+name = "bytes"
+type = "*const u8"
+[[function.param]]
+name = "len"
+type = "usize"
+
+[[function]]
+name = "kcore_ipc_collect"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "request"
+type = "u64"
+[[function.param]]
+name = "bytes"
+type = "*mut u8"
+[[function.param]]
+name = "capacity"
+type = "usize"
+[[function.param]]
+name = "length"
+type = "*mut usize"
+[[function.param]]
+name = "completion"
+type = "*mut i32"
+
+[[function]]
+name = "kcore_ipc_wait"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+[[function.param]]
+name = "request"
+type = "u64"
+
+[[function]]
+name = "kcore_ipc_cancel"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "request"
+type = "u64"
+
+[[function]]
+name = "kcore_ipc_close"
+ret = "i32"
+category = "Endpoint Request/Reply"
+c_category = "Endpoint Request/Reply"
+doc = "owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+[[function.param]]
+name = "endpoint"
+type = "u64"
+
+[[const]]
+name = "KCORE_IPC_MESSAGE_MAX"
+type = "u32"
+value = "1024"
+targets = "c,sdk-rust,core-rust"
+doc = "复制式 IPC 每条消息最大字节数，request 与 reply 各自受限。"
+
+[[function]]
+name = "kcore_component_current"
+ret = "i32"
+category = "Component identity"
+c_category = "Component identity"
+doc = "返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。"
+[[function.param]]
+name = "out"
+type = "*mut u32"

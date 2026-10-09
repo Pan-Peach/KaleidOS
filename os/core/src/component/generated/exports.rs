@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 62] = [
+pub(super) static EXPORTS: [Export; 72] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -509,6 +509,89 @@ pub(super) static EXPORTS: [Export; 62] = [
         name: b"kcore_user_discard",
         address: ExportAddress({
             let implementation: extern "C" fn(u32) -> i32 = super::kcore_user_discard;
+            implementation as *const ()
+        }),
+    },
+    // Category 13：Endpoint Request/Reply
+    Export {
+        name: b"kcore_ipc_listen",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64) -> i32 = super::kcore_ipc_listen;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_grant",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64, u32) -> i32 = super::kcore_ipc_grant;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_submit",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64, *const u8, usize, *mut u64) -> i32 =
+                super::kcore_ipc_submit;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_receive",
+        address: ExportAddress({
+            let implementation: extern "C" fn(
+                u64,
+                *mut u8,
+                usize,
+                *mut u64,
+                *mut u32,
+                *mut u32,
+                *mut usize,
+            ) -> i32 = super::kcore_ipc_receive;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_reply",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64, *const u8, usize) -> i32 =
+                super::kcore_ipc_reply;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_collect",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64, *mut u8, usize, *mut usize, *mut i32) -> i32 =
+                super::kcore_ipc_collect;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_wait",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64, u64) -> i32 = super::kcore_ipc_wait;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_cancel",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64) -> i32 = super::kcore_ipc_cancel;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_ipc_close",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u64) -> i32 = super::kcore_ipc_close;
+            implementation as *const ()
+        }),
+    },
+    // Category 14：Component identity
+    Export {
+        name: b"kcore_component_current",
+        address: ExportAddress({
+            let implementation: extern "C" fn(*mut u32) -> i32 = super::kcore_component_current;
             implementation as *const ()
         }),
     },

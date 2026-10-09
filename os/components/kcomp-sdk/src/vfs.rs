@@ -1,9 +1,8 @@
 //! VFS 只读契约声明。ABI 单一来源为 `abi/vfs.toml`；编码见
 //! `docs/interfaces/vfs.md`。内部 Rust 对象不会跨组件边界。
 //!
-//! 当前提供 Contract / C table / Rust API 形状，尚无 Direct/Gate 适配器。
-//! Binding 的所有入口显式返回 ENOTSUP，不调用 provider；不能发布可用服务。
-//! 适配器实现须保持两种 transport 同义，由 Core 在 bind 时选择。
+//! 只通过真实 Request/Reply IPC 消费服务；Path 与 Open 引用绑定调用 Task。
+//! 不支持的目录枚举、写入和命名流返回 ENOTSUP。
 
 use crate::abi::InterfaceKind;
 use crate::endpoint::{Contract, Endpoint};
@@ -41,57 +40,152 @@ pub enum VfsError {
 
 pub type VfsResult<T> = core::result::Result<T, VfsError>;
 
-/// 组件内 provider 接口草案；仅跨 C table / flat frame，不传递此 trait object。
-/// read_dir 返回的 name_len 必须不超过 name.len()；错误时不返回截断条目。
-/// read_dir 的 ENOBUFS 映射为 VfsError::BufferTooSmall，适配器保留 required。
-pub trait VfsProvider {
-    fn root(&self) -> VfsResult<VfsPath>;
-    fn retain_path(&self, path: &VfsPath) -> VfsResult<()>;
-    fn release_path(&self, path: &VfsPath) -> VfsResult<()>;
-    fn resolve(&self, request: &VfsLookup, path: &[u8]) -> VfsResult<VfsPath>;
-    fn node_info(&self, path: &VfsPath) -> VfsResult<VfsNodeInfo>;
-    fn read_dir(&self, directory: &VfsPath, cursor: u64, name: &mut [u8])
-    -> VfsResult<VfsDirReply>;
-    fn open(&self, request: &VfsOpenRequest, stream_name: &[u8]) -> VfsResult<u64>;
-    fn retain(&self, file: u64) -> VfsResult<()>;
-    fn read(&self, file: u64, buffer: &mut [u8]) -> VfsResult<usize>;
-    fn read_at(&self, file: u64, offset: u64, buffer: &mut [u8]) -> VfsResult<usize>;
-    fn set_position(&self, file: u64, offset: u64) -> VfsResult<()>;
-    fn stream_info(&self, file: u64) -> VfsResult<VfsStreamInfo>;
-    fn close(&self, file: u64) -> VfsResult<()>;
-}
-
-/// consumer 的绑定形状；不能缓存失效后重新发现的同名 endpoint 来重定向旧引用。
-/// TODO: 持有 Core bind 选定的后端，并实现 C table / flat frame 编解码。
+pub mod codec;
+/// Fixed IPC endpoint; never reconnect an old object to a new instance.
 pub struct VfsBinding {
     pub endpoint: Endpoint<Vfs>,
 }
-
 impl VfsBinding {
-    pub fn bind(_endpoint: Endpoint<Vfs>) -> crate::errno::Result<Self> {
-        Err(Errno::ENOTSUP)
+    pub fn bind(endpoint: Endpoint<Vfs>) -> crate::Result<Self> {
+        Ok(Self { endpoint })
     }
-
+    fn invoke(&self, method: u32, args: &[u8], input: &[u8], output: &mut [u8]) -> VfsResult<()> {
+        let status = crate::ipc::service::invoke(self.endpoint.id(), method, args, input, output)
+            .map_err(VfsError::Transport)?;
+        if output.len() < 8 || codec::u32_at(output, 4) != 0 {
+            return Err(VfsError::InvalidReply);
+        }
+        let domain = codec::u32_at(output, 0);
+        if domain > KCOMP_VFS_STATUS_NO_DATA_STREAM || (status == 0 && domain != 0) {
+            return Err(VfsError::InvalidReply);
+        }
+        if status == 0 {
+            Ok(())
+        } else if domain != 0 {
+            Err(VfsError::Domain {
+                errno: status,
+                detail: domain,
+            })
+        } else {
+            Err(VfsError::Method(status))
+        }
+    }
     pub fn root(&self) -> VfsResult<VfsPath> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+        let mut out = [0; 40];
+        self.invoke(KCOMP_VFS_METHOD_ROOT, &[], &[], &mut out)?;
+        Ok(codec::path(&out[8..]))
     }
-
-    pub fn retain_path(&self, _path: &VfsPath) -> VfsResult<()> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+    /// Composition control only; drains opens and ends the owned server Task.
+    pub fn shutdown(&self) -> VfsResult<()> {
+        self.invoke(KCOMP_VFS_METHOD_SHUTDOWN, &[], &[], &mut [0; 8])
     }
-
-    pub fn release_path(&self, _path: &VfsPath) -> VfsResult<()> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+    pub fn resolve(&self, request: &VfsLookup, path: &[u8]) -> VfsResult<VfsPath> {
+        let mut args = [0; 80];
+        codec::put_lookup(&mut args, request);
+        let mut out = [0; 40];
+        self.invoke(KCOMP_VFS_METHOD_RESOLVE, &args, path, &mut out)?;
+        Ok(codec::path(&out[8..]))
     }
-
-    pub fn resolve(&self, _request: &VfsLookup, _path: &[u8]) -> VfsResult<VfsPath> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+    pub fn retain_path(&self, path: &VfsPath) -> VfsResult<()> {
+        self.path_operation(KCOMP_VFS_METHOD_RETAIN_PATH, path)
     }
-
-    pub fn node_info(&self, _path: &VfsPath) -> VfsResult<VfsNodeInfo> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+    pub fn release_path(&self, path: &VfsPath) -> VfsResult<()> {
+        self.path_operation(KCOMP_VFS_METHOD_RELEASE_PATH, path)
     }
-
+    fn path_operation(&self, method: u32, path: &VfsPath) -> VfsResult<()> {
+        let mut args = [0; 32];
+        codec::put_path(&mut args, path);
+        self.invoke(method, &args, &[], &mut [0; 8])
+    }
+    pub fn node_info(&self, path: &VfsPath) -> VfsResult<VfsNodeInfo> {
+        let mut args = [0; 32];
+        codec::put_path(&mut args, path);
+        let mut out = [0; 32];
+        self.invoke(KCOMP_VFS_METHOD_NODE_INFO, &args, &[], &mut out)?;
+        Ok(VfsNodeInfo {
+            kind: codec::u32_at(&out, 8),
+            valid: codec::u32_at(&out, 12),
+            link_count: codec::u64_at(&out, 16),
+            name_encoding: codec::u32_at(&out, 24),
+            case_rule: codec::u32_at(&out, 28),
+        })
+    }
+    pub fn open(&self, request: &VfsOpenRequest, name: &[u8]) -> VfsResult<u64> {
+        let mut args = [0; 48];
+        codec::put_open(&mut args, request);
+        let mut out = [0; 16];
+        self.invoke(KCOMP_VFS_METHOD_OPEN, &args, name, &mut out)?;
+        let id = codec::u64_at(&out, 8);
+        if id == 0 {
+            Err(VfsError::InvalidReply)
+        } else {
+            Ok(id)
+        }
+    }
+    pub fn retain(&self, file: u64) -> VfsResult<()> {
+        self.invoke(
+            KCOMP_VFS_METHOD_RETAIN,
+            &file.to_le_bytes(),
+            &[],
+            &mut [0; 8],
+        )
+    }
+    pub fn close(&self, file: u64) -> VfsResult<()> {
+        self.invoke(
+            KCOMP_VFS_METHOD_CLOSE,
+            &file.to_le_bytes(),
+            &[],
+            &mut [0; 8],
+        )
+    }
+    pub fn set_position(&self, file: u64, offset: u64) -> VfsResult<()> {
+        let mut args = [0; 16];
+        codec::put64(&mut args, 0, file);
+        codec::put64(&mut args, 8, offset);
+        self.invoke(KCOMP_VFS_METHOD_SET_POSITION, &args, &[], &mut [0; 8])
+    }
+    fn read_method(&self, method: u32, args: &[u8], buffer: &mut [u8]) -> VfsResult<usize> {
+        let count = buffer.len().min(512);
+        let mut out = [0; 528];
+        self.invoke(method, args, &[], &mut out[..16 + count])?;
+        let actual = codec::u64_at(&out, 8);
+        if actual > count as u64 {
+            return Err(VfsError::InvalidReply);
+        }
+        let actual = actual as usize;
+        buffer[..actual].copy_from_slice(&out[16..16 + actual]);
+        Ok(actual)
+    }
+    pub fn read(&self, file: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+        self.read_method(KCOMP_VFS_METHOD_READ, &file.to_le_bytes(), buffer)
+    }
+    pub fn read_at(&self, file: u64, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+        let mut args = [0; 16];
+        codec::put64(&mut args, 0, file);
+        codec::put64(&mut args, 8, offset);
+        self.read_method(KCOMP_VFS_METHOD_READ_AT, &args, buffer)
+    }
+    pub fn stream_info(&self, file: u64) -> VfsResult<VfsStreamInfo> {
+        let mut out = [0; 64];
+        self.invoke(
+            KCOMP_VFS_METHOD_STREAM_INFO,
+            &file.to_le_bytes(),
+            &[],
+            &mut out,
+        )?;
+        Ok(VfsStreamInfo {
+            stream: VfsStream {
+                fs: codec::u64_at(&out, 8),
+                node: codec::u64_at(&out, 16),
+                stream: codec::u64_at(&out, 24),
+            },
+            size: codec::u64_at(&out, 32),
+            allocated_size: codec::u64_at(&out, 40),
+            valid_data_length: codec::u64_at(&out, 48),
+            valid: codec::u32_at(&out, 56),
+            reserved: codec::u32_at(&out, 60),
+        })
+    }
     pub fn read_dir(
         &self,
         _directory: &VfsPath,
@@ -100,32 +194,33 @@ impl VfsBinding {
     ) -> VfsResult<VfsDirReply> {
         Err(VfsError::Method(Errno::ENOTSUP.code()))
     }
-
-    pub fn open(&self, _request: &VfsOpenRequest, _stream_name: &[u8]) -> VfsResult<u64> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn retain(&self, _file: u64) -> VfsResult<()> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn read(&self, _file: u64, _buffer: &mut [u8]) -> VfsResult<usize> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn read_at(&self, _file: u64, _offset: u64, _buffer: &mut [u8]) -> VfsResult<usize> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn set_position(&self, _file: u64, _offset: u64) -> VfsResult<()> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn stream_info(&self, _file: u64) -> VfsResult<VfsStreamInfo> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
-    }
-
-    pub fn close(&self, _file: u64) -> VfsResult<()> {
-        Err(VfsError::Method(Errno::ENOTSUP.code()))
+    /// Convenience for one file; both path references are consumed even on error.
+    pub fn open_path(&self, path: &[u8]) -> VfsResult<u64> {
+        let root = self.root()?;
+        let resolved = self.resolve(
+            &VfsLookup {
+                start: root,
+                root,
+                flags: KCOMP_VFS_LOOKUP_CROSS_MOUNTS | KCOMP_VFS_LOOKUP_FOLLOW_FINAL,
+                max_symlinks: 0,
+                encoding: KCOMP_VFS_ENCODING_BYTES,
+                reserved: 0,
+            },
+            path,
+        );
+        let _ = self.release_path(&root);
+        let found = resolved?;
+        let opened = self.open(
+            &VfsOpenRequest {
+                path: found,
+                access: KCOMP_VFS_ACCESS_READ,
+                share: KCOMP_VFS_SHARE_READ,
+                stream_kind: KCOMP_VFS_STREAM_DEFAULT,
+                encoding: 0,
+            },
+            &[],
+        );
+        let _ = self.release_path(&found);
+        opened
     }
 }

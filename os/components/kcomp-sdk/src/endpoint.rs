@@ -32,6 +32,27 @@ pub trait Contract {
     /// 领域分类（`Device` / `Service` / `Policy`）。
     const KIND: InterfaceKind;
 }
+/// Publish only a message endpoint. Core reserves port zero plus null api/ctx
+/// for Request/Reply and rejects unsupported execution-domain bindings.
+pub fn publish_ipc<C: Contract>(name: &[u8]) -> Result<()> {
+    let status = unsafe {
+        abi::kcore_endpoint_publish(
+            name.as_ptr(),
+            name.len(),
+            C::ID,
+            C::KIND as u32,
+            C::ABI,
+            0,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_code(status))
+    }
+}
 
 /// 某契约 `C` 的一个**已校验** endpoint（consumer 侧句柄）。
 ///

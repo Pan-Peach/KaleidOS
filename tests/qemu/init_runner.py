@@ -89,6 +89,8 @@ def run(args, session):
         if args.scenario == "oom":
             command("exec 0:/OOM.ELF", ["OOM_RECOVERED", "exec: exit=0"])
         elif args.scenario in ("fat", "dual-fat"):
+            command("cat /local/README.TXT", ["KaleidOS local filesystem"])
+            command("cat /fat/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
             command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
             command('cat "0:/HELLO.TXT"', ["HELLO FROM KALEIDOS FAT ROOTFS"])
             command("cat 0:/HELLO\\.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
@@ -107,8 +109,9 @@ def run(args, session):
                 command("exec 0:/HELLO.TXT", ["exec: ENOEXEC"])
                 command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
         else:
-            command("cat 0:/HELLO.TXT", ["cat: no filesystem provider"])
-            command("exec missing", ["exec: ENODEV"])
+            command("cat /local/README.TXT", ["KaleidOS local filesystem"])
+            command("cat 0:/HELLO.TXT", ["cat: open failed:"])
+            command("exec missing", ["exec: ENOENT"])
         # init is a boot-anchor composer, not an application launched by ksh.
         command("load init", ["load init: ENOMEM" if args.scenario == "oom" else "load init: EINVAL"])
     command("echo INIT_SERIAL_OK", ["\nINIT_SERIAL_OK"])

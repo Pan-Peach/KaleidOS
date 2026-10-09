@@ -182,6 +182,19 @@ pub(super) extern "C" fn kcore_device_info(
     })
 }
 
+pub(super) extern "C" fn kcore_component_current(out: *mut u32) -> i32 {
+    with_core_critical(|| {
+        if out.is_null() || !(out as usize).is_multiple_of(4) {
+            return Errno::EFAULT.code();
+        }
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        unsafe { out.write(ctx.component.raw()) };
+        0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

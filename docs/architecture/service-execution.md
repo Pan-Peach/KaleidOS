@@ -1,7 +1,7 @@
 # 服务执行与系统组合
 
 > **设计契约：职责与语义边界。** 本文规定服务执行模型、组合策略和业务会话的归属；
-> 不新增 Core 对象、ABI、manifest 字段或运行能力。标为「候选」的机制尚未定案。
+> Endpoint Request/Reply 的当前传输规则见 [IPC](ipc.md)。标为「候选」的机制尚未定案。
 > binding/transport 以 [部署契约](deployment.md) 为准，身份与停止/失败以
 > [组件生命周期](component-lifecycle.md) 为准，文件对象以 [文件系统契约](../interfaces/filesystem.md)
 > 和 [VFS 草案](../interfaces/vfs.md) 为准。实现进度统一见 [STATUS](../../STATUS.md)。
@@ -14,7 +14,7 @@
 | Service / Contract | 提供什么能力、请求何时完成、失败如何表达 | 接口契约与 provider |
 | Endpoint | 哪个实例发布的哪个端口 | Core 发布真相 |
 | Binding | consumer 如何使用确切 endpoint、有效期到哪里 | Core 交付调用窗口，SDK 保存；无独立 binding registry |
-| Transport | 请求如何到达 provider | Direct / Synchronous Gate；IPC、Wasm host call 是未来路径 |
+| Transport | 请求如何到达 provider | Direct / Synchronous Gate / KernelNative Request/Reply；Wasm host call 是未来路径 |
 | Execution Model | 谁处理请求、是否排队、能否等待、怎样并发 | provider 的 adapter / Runtime |
 | ExecutionDomain | 特权级、地址空间、可用 import 与保护条件 | 组合方提议，Core 验证并提交 |
 | Session | 一次 open / connection / stream 的业务状态 | provider / 服务组件，不默认成为 Core endpoint |
@@ -38,6 +38,7 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
 
 请求数据路径：consumer → SDK binding
   ├─ Direct → provider 本地入口
+  ├─ IPC    → Core 拥有副本 → Provider Server Task receive / reply
   └─ Gate   → Core 验证并同步进入 provider 本地入口
                 ↓
        Inline 业务处理，或 Runtime 入队 → owned Worker
@@ -58,7 +59,8 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
 | Direct + Inline | caller 的栈直接运行 provider 方法，同步返回 | 已有；不切 principal，不提供独立 panic 边界 |
 | Gate + Inline | Core 管理的同步服务栈执行 dispatcher，同步返回 | 已有；不是独立 Server Task 的 receive/reply |
 | Direct + Queued | 本地入口提交，owned Worker 处理 | 组件侧候选；唤醒 Worker 的 owner 条件必须满足 |
-| Gate / IPC + Queued | 受控入口提交，owned Worker 处理 | Queued 完成协议是候选；IPC 未实现 |
+| Gate + Queued | 同步入口由 Runtime 入队，owned Worker 处理 | 业务完成协议仍为候选 |
+| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative 已接线；私有域 Task IPC 未实现 |
 
 Inline 表示执行者没有被移交，**不自动表示可阻塞或线程安全**。当前 Gate 栈不可
 yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可能使用 caller 的调度
@@ -79,8 +81,8 @@ yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可
 Gate 中不得持有需要当前 CPU 上另一个 Task 才能释放的锁并无限等待。
 
 SDK 的 typed 前端应让业务看到数据缓冲与业务长度；wire 头、method 编号和搬运留在
-调用后端。既有 filesystem read 暴露 8 字节头是现状，收敛是后续 SDK 工作，不能据此
-假定当前 API 已支持 `read(&mut data)`。
+调用后端。当前 Rust/C filesystem read 前端已接受普通数据缓冲区；Gate 的 8 字节
+长度头与分块 scratch 留在 SDK，不交给业务调用者。
 
 ## 4. principal 与 Worker
 
@@ -95,12 +97,11 @@ caller 的临时 backing 与 device 锚定的 DMA mapping 各自服从已有对�
 
 `unpark` 仅允许 owner。A 的 Direct 入口调用 B 的代码时，不因此获得唤醒 B.Worker
 的权限；B.Worker 也不能凭 A.TaskId 唤醒 A。已有 Gate 可以在合法上下文中通知自己的
-Worker，但不能由此推导出跨 owner 完成通知已存在。
+Worker。新 IPC 的跨 owner 完成唤醒由 Core 对真实请求执行，不放宽公开 unpark owner 检查。
 
-**候选实验**：先由组件 Runtime 的有界队列、轮询/协作式 yield 验证请求状态与取消。
-这只验证协议。确需阻塞完成后，再评估窄通知原语或明确授权的回调；不得放宽通用
-unpark owner 检查。通知设计须明确 signal/wait 权限、完成早于等待的竞态、SMP 内存序、
-销毁/失败唤醒与撤销；业务 Request/Reply/Session 不因此移入 Core。
+Core 的 IPC 等待、匹配、取消与退出规则以 [IPC 契约](ipc.md) 为准；业务队列、Session
+和对象表仍属于 Provider。普通设备 notification 与 timer 登记仍是后续能力，不能从 IPC
+完成唤醒推导任意跨组件 signal 权限。
 
 ## 5. 连接、会话与失效
 

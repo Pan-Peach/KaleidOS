@@ -166,6 +166,17 @@ pub fn exit_task() -> ! {
     }
 }
 
+/// Core's current principal; returned identity grants no authority.
+pub fn current_component() -> Result<u32> {
+    let mut id = 0;
+    let code = unsafe { abi::kcore_component_current(&mut id) };
+    if code == 0 {
+        Ok(id)
+    } else {
+        Err(Errno::from_code(code))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

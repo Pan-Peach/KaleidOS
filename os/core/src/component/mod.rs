@@ -8,6 +8,7 @@ pub mod call;
 pub mod containment;
 mod elf;
 pub mod endpoint;
+pub mod exchange;
 pub mod exit;
 pub mod export;
 pub mod failure;

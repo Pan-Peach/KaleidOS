@@ -91,6 +91,7 @@ const fn mechanism_code(mechanism: Mechanism) -> u64 {
     match mechanism {
         Mechanism::Direct => 0,
         Mechanism::Gate => 1,
+        Mechanism::Ipc => 2,
     }
 }
 

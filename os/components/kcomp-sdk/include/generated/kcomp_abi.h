@@ -88,7 +88,13 @@ extern const uint64_t kcomp_abi;
 /* 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
  * 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
  * `kcomp_abi` 符号由入口宏发出。 */
-#define KCOMP_ABI UINT64_C(0xD58FB2964E73A10C)
+#define KCOMP_ABI UINT64_C(0xF091A62D39C8740B)
+
+/* SDK 服务消息头：LE u32 method / output capacity / args length / input length；Core 不解析。 */
+#define KCOMP_REQUEST_HEADER_LEN UINT32_C(16)
+
+/* SDK 服务回复头：LE i32 business status，后接业务输出；transport status 独立。 */
+#define KCOMP_REPLY_HEADER_LEN UINT32_C(4)
 
 /* 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
  * 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
@@ -337,11 +343,17 @@ enum KcoreEndpointState {
  * `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。 */
 #define KCORE_ENDPOINT_MECHANISM_GATE UINT32_C(1)
 
+/* Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback. */
+#define KCORE_ENDPOINT_MECHANISM_IPC UINT32_C(2)
+
 /* `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。 */
 #define KCORE_MEMORY_VIEW_LOCAL_VA UINT32_C(1)
 
 /* `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。 */
 #define KCORE_MEMORY_VIEW_LINEAR_OFFSET UINT32_C(2)
+
+/* 复制式 IPC 每条消息最大字节数，request 与 reply 各自受限。 */
+#define KCORE_IPC_MESSAGE_MAX UINT32_C(1024)
 
 /* -- Trace（只读观察面；无写入口） -- */
 /* 读 `seq >= since` 的第一条记录；没有更多时返回 -ENOENT（不返回 0）。 */
@@ -516,6 +528,28 @@ int32_t kcore_user_clone(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 int32_t kcore_user_replace(uint32_t prepared_task);
 /* Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
 int32_t kcore_user_discard(uint32_t task);
+/* -- Endpoint Request/Reply -- */
+/* 将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_listen(uint64_t endpoint);
+/* Endpoint owner 或 Core 记录的不可变实例创建者明确允许 consumer Component 发送；允许启动锚点编排，拒绝 Gate/IRQ/policy；ID 不是 capability。仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_grant(uint64_t endpoint, uint32_t consumer);
+/* 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_submit(uint64_t endpoint, const uint8_t *bytes, size_t len, uint64_t *request);
+/* 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_receive(uint64_t endpoint, uint8_t *bytes, size_t capacity, uint64_t *request, uint32_t *consumer, uint32_t *consumer_task, size_t *length);
+/* Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_reply(uint64_t request, const uint8_t *bytes, size_t len);
+/* caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_collect(uint64_t request, uint8_t *bytes, size_t capacity, size_t *length, int32_t *completion);
+/* 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_wait(uint64_t endpoint, uint64_t request);
+/* caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_cancel(uint64_t request);
+/* owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+int32_t kcore_ipc_close(uint64_t endpoint);
+/* -- Component identity -- */
+/* 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。 */
+int32_t kcore_component_current(uint32_t *out);
 
 /* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
  * 
@@ -606,7 +640,7 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 #define KCOMP_FILESYSTEM_NAME "filesystem"
 
 /* exact ABI fingerprint（8 字节 ASCII "FSNODERO" 的大端读数）。 */
-#define KCOMP_FILESYSTEM_ABI UINT64_C(0x46534E4F4445524F)
+#define KCOMP_FILESYSTEM_ABI UINT64_C(0xEC25B01F768A394D)
 
 /* 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。 */
 #define KCOMP_FILESYSTEM_OPEN_READ UINT32_C(0x00000001)
@@ -661,6 +695,21 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 
 /* 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。 */
 #define KCOMP_FILESYSTEM_ENCODING_BYTES UINT32_C(1)
+
+/* IPC: args node u64; reply kind u32, canonical name length u32, size u64, canonical ASCII name[12] (28 bytes). */
+#define KCOMP_FILESYSTEM_METHOD_NODE_DETAILS UINT32_C(8)
+
+/* IPC: args node u64; reply open handle u64. Owner is verified consumer Task. */
+#define KCOMP_FILESYSTEM_METHOD_OPEN_NODE UINT32_C(9)
+
+/* IPC: args handle u64 + offset u64; reply actual u64 + bytes. No exposed cursor change. */
+#define KCOMP_FILESYSTEM_METHOD_READ_AT UINT32_C(10)
+
+/* LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC. */
+#define KCOMP_FATFS_CREATE_CONFIG_ABI UINT64_C(0x45D2189ACF0673BE)
+
+/* IPC control consumer only: args/input/output empty; close files, unmount, invalidate endpoint and exit server. */
+#define KCOMP_FILESYSTEM_METHOD_SHUTDOWN UINT32_C(11)
 
 /* 每次正常回复均有效；domain 0 = 无额外分类，非零值见 STATUS 常量；reserved 必须为 0。成功时 domain 必须为 0。 */
 struct kcomp_vfs_reply_status {
@@ -784,38 +833,6 @@ _Static_assert(offsetof(struct kcomp_vfs_dir_reply, name_len) == 44, "kcomp_vfs_
 _Static_assert(offsetof(struct kcomp_vfs_dir_reply, flags) == 48, "kcomp_vfs_dir_reply.flags offset drift");
 _Static_assert(offsetof(struct kcomp_vfs_dir_reply, reserved) == 52, "kcomp_vfs_dir_reply.reserved offset drift");
 
-/* 只读 VFS Direct table；out_status 在正常方法回复中均有效，其他输出仅成功有效，read_dir ENOBUFS 除外。Gate 同义编码见 docs/interfaces/vfs.md。 */
-struct kcomp_vfs_api {
-    /* 返回 create 配置建立的 namespace root；不替调用者选择进程 cwd。 */
-    int32_t (*root)(void *ctx, struct kcomp_vfs_path *out_path, struct kcomp_vfs_reply_status *out_status);
-    /* 按显式上下文解析有界路径；字节串无 NUL 终止，UTF-16 在 Gate 中编码为 LE。 */
-    int32_t (*resolve)(void *ctx, const struct kcomp_vfs_lookup *request, const uint8_t *path, size_t len, struct kcomp_vfs_path *out_path, struct kcomp_vfs_reply_status *out_status);
-    /* 查询节点元数据；不返回 POSIX stat 或 NT 专属结构。 */
-    int32_t (*node_info)(void *ctx, const struct kcomp_vfs_path *path, struct kcomp_vfs_node_info *out_info, struct kcomp_vfs_reply_status *out_status);
-    /* cursor 0 为起点；输出一个完整名字。ENOBUFS 时仅 name_len 有效，cursor 不前进。 */
-    int32_t (*read_dir)(void *ctx, const struct kcomp_vfs_path *directory, uint64_t cursor, uint8_t *name, size_t len, struct kcomp_vfs_dir_reply *out_reply, struct kcomp_vfs_reply_status *out_status);
-    /* 打开已有数据流。访问 / share 显式选择；创建、截断与删除尚不在此 ABI。 */
-    int32_t (*open)(void *ctx, const struct kcomp_vfs_open_request *request, const uint8_t *stream_name, size_t len, uint64_t *out_file, struct kcomp_vfs_reply_status *out_status);
-    /* 增加同一打开实例的用户引用，不再次 open；共享游标和 access/share。 */
-    int32_t (*retain)(void *ctx, uint64_t file, struct kcomp_vfs_reply_status *out_status);
-    /* 从共享游标读；返回长度不大于容量，0 表示 EOF / 零长读取。 */
-    int32_t (*read)(void *ctx, uint64_t file, uint8_t *buf, size_t len, size_t *out_read, struct kcomp_vfs_reply_status *out_status);
-    /* 显式偏移读取，不改变共享游标；不以 seek + read 模拟。 */
-    int32_t (*read_at)(void *ctx, uint64_t file, uint64_t offset, uint8_t *buf, size_t len, size_t *out_read, struct kcomp_vfs_reply_status *out_status);
-    /* 设定绝对游标；signed SEEK_* 的解释归 personality。 */
-    int32_t (*set_position)(void *ctx, uint64_t file, uint64_t offset, struct kcomp_vfs_reply_status *out_status);
-    /* 查询此打开实例的流；默认流与命名流使用同一快照格式。 */
-    int32_t (*stream_info)(void *ctx, uint64_t file, struct kcomp_vfs_stream_info *out_info, struct kcomp_vfs_reply_status *out_status);
-    /* 消费一个用户引用；最后句柄 cleanup 与映射 / I/O 排空后的最终释放分开。 */
-    int32_t (*close)(void *ctx, uint64_t file, struct kcomp_vfs_reply_status *out_status);
-    /* 增加路径位置的用户引用，用于 root/cwd 等独立持有者；复制结构不自动 retain。 */
-    int32_t (*retain_path)(void *ctx, const struct kcomp_vfs_path *path, struct kcomp_vfs_reply_status *out_status);
-    /* 消费一个路径位置引用；provider/mount 失效仍可使保留的引用逻辑失效。 */
-    int32_t (*release_path)(void *ctx, const struct kcomp_vfs_path *path, struct kcomp_vfs_reply_status *out_status);
-};
-_Static_assert(sizeof(struct kcomp_vfs_api) == 13 * sizeof(void *), "kcomp_vfs_api layout drift");
-_Static_assert(_Alignof(struct kcomp_vfs_api) == _Alignof(void *), "kcomp_vfs_api alignment drift");
-
 /* args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。 */
 #define KCOMP_VFS_METHOD_RETAIN_PATH UINT32_C(11)
 
@@ -829,7 +846,7 @@ _Static_assert(_Alignof(struct kcomp_vfs_api) == _Alignof(void *), "kcomp_vfs_ap
 #define KCOMP_VFS_CONTRACT UINT64_C(0x5646535345525643)
 
 /* exact fingerprint，ASCII VFSFLATC；不承诺陈旧组件兼容。 */
-#define KCOMP_VFS_ABI UINT64_C(0x564653464C415443)
+#define KCOMP_VFS_ABI UINT64_C(0x7A36D501C29F084B)
 
 /* 不要求 UTF-8 的原生字节名字。 */
 #define KCOMP_VFS_ENCODING_BYTES UINT32_C(1)
@@ -925,10 +942,10 @@ _Static_assert(_Alignof(struct kcomp_vfs_api) == _Alignof(void *), "kcomp_vfs_ap
 #define KCOMP_VFS_STATUS_NO_DATA_STREAM UINT32_C(6)
 
 /* 本阶段路径 input 最大字节数（UTF-16 同样按字节计，无 NUL）。 */
-#define KCOMP_VFS_PATH_MAX 4096
+#define KCOMP_VFS_PATH_MAX 512
 
 /* 本阶段单段名字最大字节数；不意味着所有 provider 都支持此上限。 */
-#define KCOMP_VFS_NAME_MAX 1024
+#define KCOMP_VFS_NAME_MAX 255
 
 /* read / read_at Gate output 的完整头：8 字节 status + 8 字节 LE u64 实际长度。 */
 #define KCOMP_VFS_IO_HEADER_LEN 16
@@ -974,6 +991,12 @@ _Static_assert(_Alignof(struct kcomp_vfs_api) == _Alignof(void *), "kcomp_vfs_ap
 
 /* 每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。 */
 #define KCOMP_VFS_REPLY_STATUS_LEN 8
+
+/* LE control ComponentId u32, count u32, then 0..2 filesystem EndpointId u64; mounts /fat and /second. Local /local always exists. */
+#define KCOMP_VFS_CREATE_CONFIG_ABI UINT64_C(0x82BE46A109CF753D)
+
+/* Only configured control consumer: args/input empty, output status[8]; close files, invalidate endpoint, exit Server Task. */
+#define KCOMP_VFS_METHOD_SHUTDOWN UINT32_C(13)
 
 /* family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；Gate 各整数 LE 编码，port 也是整数。 */
 struct kcomp_network_address {

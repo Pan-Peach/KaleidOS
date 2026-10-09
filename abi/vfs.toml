@@ -1,8 +1,8 @@
 # KABI schema — vfs：第一阶段只读 Namespace / File service。
 # 分层契约见 docs/interfaces/filesystem.md；逐方法编码见 docs/interfaces/vfs.md。
 #
-# Rust 内部对象 / enum / 引用不跨边界；Direct 使用 VfsApi，Gate 使用 LE 扁平编码。
-# 两种 transport 逐方法同义，由 Core 在 bind 时选择。当前仅声明，尚无适配器。
+# Rust 内部对象 / enum / 引用不跨边界；仅使用 Request/Reply 的 LE 扁平编码。
+# Core 按真实 Task/domain/grant 验证 IPC，不发布 Direct table/Gate dispatcher。
 # 方法状态保持 0 / -errno。额外 domain-status 放 VfsReplyStatus / Gate 回复头，
 # 用于保留 sharing / delete-pending 等信息。传输失败仍是 Core 的独立 -errno。
 # 所有 ID 只在发布此 endpoint 的 VFS 实例内有效，不是权限，也不跨重启复用。
@@ -258,78 +258,6 @@ name = "reserved"
 type = "u32"
 offset = 52
 
-[[struct]]
-name = "VfsApi"
-c_name = "kcomp_vfs_api"
-size_ptrs = 13
-targets = "c,sdk-rust"
-doc = "只读 VFS Direct table；out_status 在正常方法回复中均有效，其他输出仅成功有效，read_dir ENOBUFS 除外。Gate 同义编码见 docs/interfaces/vfs.md。"
-
-[[struct.field]]
-name = "root"
-type = "fn(ctx: *mut void, out_path: *mut VfsPath, out_status: *mut VfsReplyStatus) -> i32"
-doc = "返回 create 配置建立的 namespace root；不替调用者选择进程 cwd。"
-
-[[struct.field]]
-name = "resolve"
-type = "fn(ctx: *mut void, request: *const VfsLookup, path: *const u8, len: usize, out_path: *mut VfsPath, out_status: *mut VfsReplyStatus) -> i32"
-doc = "按显式上下文解析有界路径；字节串无 NUL 终止，UTF-16 在 Gate 中编码为 LE。"
-
-[[struct.field]]
-name = "node_info"
-type = "fn(ctx: *mut void, path: *const VfsPath, out_info: *mut VfsNodeInfo, out_status: *mut VfsReplyStatus) -> i32"
-doc = "查询节点元数据；不返回 POSIX stat 或 NT 专属结构。"
-
-[[struct.field]]
-name = "read_dir"
-type = "fn(ctx: *mut void, directory: *const VfsPath, cursor: u64, name: *mut u8, len: usize, out_reply: *mut VfsDirReply, out_status: *mut VfsReplyStatus) -> i32"
-doc = "cursor 0 为起点；输出一个完整名字。ENOBUFS 时仅 name_len 有效，cursor 不前进。"
-
-[[struct.field]]
-name = "open"
-type = "fn(ctx: *mut void, request: *const VfsOpenRequest, stream_name: *const u8, len: usize, out_file: *mut u64, out_status: *mut VfsReplyStatus) -> i32"
-doc = "打开已有数据流。访问 / share 显式选择；创建、截断与删除尚不在此 ABI。"
-
-[[struct.field]]
-name = "retain"
-type = "fn(ctx: *mut void, file: u64, out_status: *mut VfsReplyStatus) -> i32"
-doc = "增加同一打开实例的用户引用，不再次 open；共享游标和 access/share。"
-
-[[struct.field]]
-name = "read"
-type = "fn(ctx: *mut void, file: u64, buf: *mut u8, len: usize, out_read: *mut usize, out_status: *mut VfsReplyStatus) -> i32"
-doc = "从共享游标读；返回长度不大于容量，0 表示 EOF / 零长读取。"
-
-[[struct.field]]
-name = "read_at"
-type = "fn(ctx: *mut void, file: u64, offset: u64, buf: *mut u8, len: usize, out_read: *mut usize, out_status: *mut VfsReplyStatus) -> i32"
-doc = "显式偏移读取，不改变共享游标；不以 seek + read 模拟。"
-
-[[struct.field]]
-name = "set_position"
-type = "fn(ctx: *mut void, file: u64, offset: u64, out_status: *mut VfsReplyStatus) -> i32"
-doc = "设定绝对游标；signed SEEK_* 的解释归 personality。"
-
-[[struct.field]]
-name = "stream_info"
-type = "fn(ctx: *mut void, file: u64, out_info: *mut VfsStreamInfo, out_status: *mut VfsReplyStatus) -> i32"
-doc = "查询此打开实例的流；默认流与命名流使用同一快照格式。"
-
-[[struct.field]]
-name = "close"
-type = "fn(ctx: *mut void, file: u64, out_status: *mut VfsReplyStatus) -> i32"
-doc = "消费一个用户引用；最后句柄 cleanup 与映射 / I/O 排空后的最终释放分开。"
-
-[[struct.field]]
-name = "retain_path"
-type = "fn(ctx: *mut void, path: *const VfsPath, out_status: *mut VfsReplyStatus) -> i32"
-doc = "增加路径位置的用户引用，用于 root/cwd 等独立持有者；复制结构不自动 retain。"
-
-[[struct.field]]
-name = "release_path"
-type = "fn(ctx: *mut void, path: *const VfsPath, out_status: *mut VfsReplyStatus) -> i32"
-doc = "消费一个路径位置引用；provider/mount 失效仍可使保留的引用逻辑失效。"
-
 [[const]]
 name = "KCOMP_VFS_METHOD_RETAIN_PATH"
 type = "u32"
@@ -361,7 +289,7 @@ doc = "契约身份，ASCII VFSSERVC；与 filesystem provider 契约不同。"
 [[const]]
 name = "KCOMP_VFS_ABI"
 type = "u64"
-value = "0x5646_5346_4C41_5443"
+value = "0x7A36_D501_C29F_084B"
 targets = "c,sdk-rust"
 doc = "exact fingerprint，ASCII VFSFLATC；不承诺陈旧组件兼容。"
 
@@ -585,14 +513,14 @@ doc = "节点不存在所请求的默认数据流。"
 [[const]]
 name = "KCOMP_VFS_PATH_MAX"
 type = "usize"
-value = "4096"
+value = "512"
 targets = "c,sdk-rust"
 doc = "本阶段路径 input 最大字节数（UTF-16 同样按字节计，无 NUL）。"
 
 [[const]]
 name = "KCOMP_VFS_NAME_MAX"
 type = "usize"
-value = "1024"
+value = "255"
 targets = "c,sdk-rust"
 doc = "本阶段单段名字最大字节数；不意味着所有 provider 都支持此上限。"
 
@@ -700,3 +628,16 @@ type = "usize"
 value = "8"
 targets = "c,sdk-rust"
 doc = "每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。"
+
+[[const]]
+name = "KCOMP_VFS_CREATE_CONFIG_ABI"
+type = "u64"
+value = "0x82BE_46A1_09CF_753D"
+targets = "c,sdk-rust"
+doc = "LE control ComponentId u32, count u32, then 0..2 filesystem EndpointId u64; mounts /fat and /second. Local /local always exists."
+[[const]]
+name = "KCOMP_VFS_METHOD_SHUTDOWN"
+type = "u32"
+value = "13"
+targets = "c,sdk-rust"
+doc = "Only configured control consumer: args/input empty, output status[8]; close files, invalidate endpoint, exit Server Task."

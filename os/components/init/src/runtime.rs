@@ -1,28 +1,32 @@
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use kcomp_sdk::endpoint::{Endpoint, InvokeError};
+use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::filesystem::{FILESYSTEM_NAME, FileSystem};
+use kcomp_sdk::generated::filesystem::KCOMP_FATFS_CREATE_CONFIG_ABI;
 use kcomp_sdk::management::{self, ExecutionDomain};
 use kcomp_sdk::scheduler::{self, SCHEDULER_POLICY_NAME, SchedulerPolicy};
+use kcomp_sdk::vfs::{KCOMP_VFS_CREATE_CONFIG_ABI, VFS_NAME, Vfs, VfsError};
 use kcomp_sdk::{Errno, Result};
 
-// FatFs create config is one native-endian u64 opaque block EndpointId.
-const FATFS_CONFIG_ABI: u64 = 0x4641_5446_5343_4647;
 static FILESYSTEM_PROVIDER: AtomicU32 = AtomicU32::new(0);
 static MOUNT_STATUS: AtomicI32 = AtomicI32::new(Errno::EAGAIN.code());
 
 extern "C" fn mount_root(_arg: *mut ()) {
     let provider = FILESYSTEM_PROVIDER.load(Ordering::Acquire);
-    let result = Endpoint::<FileSystem>::lookup(provider, FILESYSTEM_NAME)
-        .map_err(InvokeError::Transport)
-        .and_then(|endpoint| endpoint.bind())
-        .and_then(|filesystem| filesystem.mount());
+    let result = Endpoint::<Vfs>::lookup(provider, VFS_NAME)
+        .map_err(VfsError::Transport)
+        .and_then(|ep| kcomp_sdk::vfs::VfsBinding::bind(ep).map_err(VfsError::Transport))
+        .and_then(|vfs| {
+            let root = vfs.root()?;
+            vfs.release_path(&root)
+        });
     let status = match result {
         Ok(()) => 0,
         Err(error) => {
             kcomp_sdk::klog!("init: root mount failed: {error:?}");
             match error {
-                InvokeError::Transport(errno) | InvokeError::Method(errno) => errno.code(),
-                InvokeError::InvalidReply => Errno::EIO.code(),
+                VfsError::Transport(errno) => errno.code(),
+                VfsError::Method(code) | VfsError::Domain { errno: code, .. } => code,
+                _ => Errno::EIO.code(),
             }
         }
     };
@@ -60,37 +64,67 @@ fn compose(root_ordinal: u32) -> Result<()> {
     // The current prober has one finite, non-yielding dispatch task. run_tasks
     // is not a join; an asynchronous prober will need a completion contract.
     management::run_tasks()?;
-    let mut root_filesystem = 0;
-    if let Some(block) = root_endpoint(root_ordinal)? {
-        let filesystem = management::create(
+    let owner = management::current_component()?;
+    let filesystem = if let Some(block) = root_endpoint(root_ordinal)? {
+        let mut config = [0; 16];
+        config[..8].copy_from_slice(&block.to_le_bytes());
+        config[8..12].copy_from_slice(&owner.to_le_bytes());
+        config[12..].copy_from_slice(&1u32.to_le_bytes());
+        let fat = management::create(
             b"fatfs",
             ExecutionDomain::KernelNative,
-            FATFS_CONFIG_ABI,
-            &block.to_ne_bytes(),
+            KCOMP_FATFS_CREATE_CONFIG_ABI,
+            &config,
         )?;
-        FILESYSTEM_PROVIDER.store(filesystem, Ordering::Release);
-        root_filesystem = filesystem;
-        management::start_task(mount_root)?;
-        management::run_tasks()?;
-        let status = MOUNT_STATUS.load(Ordering::Acquire);
-        if status != 0 {
-            return Err(Errno::from_code(status));
-        }
+        kcomp_sdk::ipc::grant(block, fat)?;
+        Some(fat)
+    } else {
+        None
+    };
+    // Let Fat's owned server register its listener before composition grants.
+    management::run_tasks()?;
+    let mut config = alloc::vec::Vec::new();
+    config.extend_from_slice(&owner.to_le_bytes());
+    config.extend_from_slice(&u32::from(filesystem.is_some()).to_le_bytes());
+    let fs_endpoint = filesystem
+        .map(|id| Endpoint::<FileSystem>::lookup(id, FILESYSTEM_NAME))
+        .transpose()?
+        .map(|ep| ep.id());
+    if let Some(endpoint) = fs_endpoint {
+        config.extend_from_slice(&endpoint.to_le_bytes());
+    }
+    let vfs = management::create(
+        b"vfs",
+        ExecutionDomain::KernelNative,
+        KCOMP_VFS_CREATE_CONFIG_ABI,
+        &config,
+    )?;
+    if let Some(endpoint) = fs_endpoint {
+        kcomp_sdk::ipc::grant(endpoint, vfs)?;
+    }
+    FILESYSTEM_PROVIDER.store(vfs, Ordering::Release);
+    management::run_tasks()?;
+    management::start_task(mount_root)?;
+    management::run_tasks()?;
+    let status = MOUNT_STATUS.load(Ordering::Acquire);
+    if status != 0 {
+        return Err(Errno::from_code(status));
+    }
+    if filesystem.is_some() {
         kcomp_sdk::klog!("init: FAT root mounted");
     } else {
         kcomp_sdk::klog!("init: no block device; console session only");
     }
-    let endpoint = if root_filesystem == 0 {
-        0
-    } else {
-        Endpoint::<FileSystem>::lookup(root_filesystem, FILESYSTEM_NAME)?.id()
-    };
+    let endpoint = Endpoint::<Vfs>::lookup(vfs, VFS_NAME)?.id();
+    let mut shell_config = alloc::vec::Vec::from(endpoint.to_le_bytes());
+    shell_config.extend_from_slice(if filesystem.is_some() { b"/fat" } else { b"/" });
     let shell = management::create(
         b"ksh",
         ExecutionDomain::KernelNative,
-        0x4B53_4846_5343_4647,
-        &endpoint.to_ne_bytes(),
+        0x72BD_51C9_340F_A806,
+        &shell_config,
     )?;
+    kcomp_sdk::ipc::grant(endpoint, shell)?;
     kcomp_sdk::klog!("init: ksh queued (id={shell})");
     Ok(())
 }

@@ -97,6 +97,22 @@ static void test_lookup(void)
         assert(file != root && file == alias);
         expect_method(kcomp_filesystem_node_info(&binding, file, &kind), 0);
         assert(kind == KCOMP_FILESYSTEM_NODE_FILE);
+        uint8_t details[28];
+        assert(fatfs_node_details(&state, file, details) == 0);
+        assert(details[0] == KCOMP_FILESYSTEM_NODE_FILE && details[4] == 9);
+        assert(memcmp(details + 16, "HELLO.TXT", 9) == 0);
+        uint64_t opened = 0;
+        assert(fatfs_open_node(&state, root, &opened) == -EISDIR && opened == 0);
+        assert(fatfs_open_node(&state, file, &opened) == 0 && opened != 0);
+        uint8_t bytes[5]; size_t count = 999;
+        assert(fatfs_read_at(&state, opened, 6, bytes, sizeof(bytes), &count) == 0);
+        assert(count == 5 && memcmp(bytes, "FROM ", 5) == 0);
+        assert(fatfs_read(&state, opened, bytes, sizeof(bytes), &count) == 0);
+        assert(count == 5 && memcmp(bytes, "HELLO", 5) == 0);
+        assert(fatfs_read_at(&state, opened, UINT64_MAX, bytes, sizeof(bytes), &count) == -EOVERFLOW);
+        assert(count == 0);
+        assert(fatfs_close(&state, opened) == 0);
+        assert(fatfs_read_at(&state, opened, 0, bytes, sizeof(bytes), &count) == -EBADF);
         expect_method(lookup(&binding, file, "HELLO.TXT", &alias), -ENOTDIR);
         expect_method(lookup(&binding, 0, "HELLO.TXT", &alias), -EBADF);
         expect_method(lookup(&binding, UINT64_MAX, "HELLO.TXT", &alias), -EBADF);
@@ -130,9 +146,14 @@ static void test_lookup(void)
         expect_method(lookup(&binding, root, "HELLO.TXT", &alias), 0);
         assert(alias == file);
         state.last_node = saved;
-        expect_method(lookup(&binding, root, "N1", &alias), 0);
-        expect_method(lookup(&binding, root, "N2", &alias), 0);
-        expect_method(lookup(&binding, root, "N3", &alias), -ENOSPC);
+        /* Six Nodes above; exercise the production budget rather than a fixed 8. */
+        char capacity_name[16];
+        for (size_t i = 1; i <= FATFS_MAX_NODES - 6; ++i) {
+            snprintf(capacity_name, sizeof(capacity_name), "N%zu", i);
+            expect_method(lookup(&binding, root, capacity_name, &alias), 0);
+        }
+        snprintf(capacity_name, sizeof(capacity_name), "N%u", FATFS_MAX_NODES - 5);
+        expect_method(lookup(&binding, root, capacity_name, &alias), -ENOSPC);
         expect_method(lookup(&binding, root, "MISSING", &alias), -ENOENT);
         expect_method(lookup(&binding, root, "HELLO.TXT", &alias), 0);
         assert(alias == file);

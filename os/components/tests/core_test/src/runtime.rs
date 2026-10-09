@@ -24,6 +24,8 @@ mod driver;
 #[cfg(target_arch = "riscv64")]
 mod exec;
 mod filesystem;
+mod hybrid_vfs;
+mod ipc;
 mod report;
 mod resource;
 mod sched;
@@ -136,6 +138,8 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     convergence::group(&mut checks, unsafe {
         core::ptr::addr_of_mut!((*state).convergence)
     });
+    ipc::group(&mut checks);
+    hybrid_vfs::group(&mut checks);
     #[cfg(target_arch = "riscv64")]
     deployment::group(&mut checks);
     #[cfg(target_arch = "riscv64")]

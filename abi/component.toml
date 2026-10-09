@@ -230,10 +230,24 @@ value = 2
 [[const]]
 name = "KCOMP_ABI"
 type = "u64"
-value = "0xD58F_B296_4E73_A10C"
+value = "0xF091_A62D_39C8_740B"
 doc = """
 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 `kcomp_abi` 符号由入口宏发出。
 """
 targets = "c,sdk-rust,core-rust"
+
+[[const]]
+name = "KCOMP_REQUEST_HEADER_LEN"
+type = "u32"
+value = "16"
+targets = "c,sdk-rust"
+doc = "SDK 服务消息头：LE u32 method / output capacity / args length / input length；Core 不解析。"
+
+[[const]]
+name = "KCOMP_REPLY_HEADER_LEN"
+type = "u32"
+value = "4"
+targets = "c,sdk-rust"
+doc = "SDK 服务回复头：LE i32 business status，后接业务输出；transport status 独立。"

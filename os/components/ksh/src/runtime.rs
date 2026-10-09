@@ -10,6 +10,13 @@ static FILESYSTEM: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 // history off the one-granule task stack, especially on RV32; no heap needed.
 static mut INPUT: Input = Input::new();
 static mut DECODED: [u8; crate::parser::LINE_MAX] = [0; crate::parser::LINE_MAX];
+static mut DEFAULT_ROOT: [u8; 256] = [0; 256];
+static ROOT_LEN: AtomicU32 = AtomicU32::new(0);
+
+pub fn default_root() -> &'static [u8] {
+    // Set during create before the single session Task starts.
+    unsafe { &(&*core::ptr::addr_of!(DEFAULT_ROOT))[..ROOT_LEN.load(Ordering::Acquire) as usize] }
+}
 
 pub fn filesystem() -> u64 {
     u64::from(FILESYSTEM[0].load(Ordering::Acquire))
@@ -103,17 +110,26 @@ kcomp_sdk::kcomp_instance_create!(|args, _out_state| {
     };
     let endpoint = if args.config_abi == 0 && args.config_len == 0 {
         0
-    } else if args.config_abi == 0x4B53_4846_5343_4647
-        && args.config_len == 8
+    } else if args.config_abi == 0x72BD_51C9_340F_A806
+        && (9..=264).contains(&args.config_len)
         && !args.config.is_null()
     {
-        unsafe { core::ptr::read_unaligned(args.config.cast::<u64>()) }
+        let config =
+            unsafe { core::slice::from_raw_parts(args.config.cast::<u8>(), args.config_len) };
+        let root = &config[8..];
+        if !root.starts_with(b"/") || root.contains(&0) {
+            return Errno::EINVAL.code();
+        }
+        unsafe {
+            (&mut *core::ptr::addr_of_mut!(DEFAULT_ROOT))[..root.len()].copy_from_slice(root)
+        };
+        ROOT_LEN.store(root.len() as u32, Ordering::Release);
+        u64::from_le_bytes(config[..8].try_into().unwrap())
     } else {
         return Errno::EINVAL.code();
     };
     if endpoint != 0
-        && let Err(error) =
-            kcomp_sdk::endpoint::Endpoint::<kcomp_sdk::filesystem::FileSystem>::from_id(endpoint)
+        && let Err(error) = kcomp_sdk::endpoint::Endpoint::<kcomp_sdk::vfs::Vfs>::from_id(endpoint)
     {
         return error.code();
     }

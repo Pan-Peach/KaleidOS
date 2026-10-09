@@ -39,6 +39,7 @@ use crate::errno::{Errno, Result};
 mod backend;
 pub mod client;
 pub mod dispatch;
+pub mod server;
 
 #[cfg(test)]
 pub(crate) mod tests_support;

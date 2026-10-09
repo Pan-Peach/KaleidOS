@@ -117,7 +117,13 @@ pub type KcompServiceDispatch = extern "C" fn(
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0xD58F_B296_4E73_A10C;
+pub const KCOMP_ABI: u64 = 0xF091_A62D_39C8_740B;
+
+/// SDK 服务消息头：LE u32 method / output capacity / args length / input length；Core 不解析。
+pub const KCOMP_REQUEST_HEADER_LEN: u32 = 16;
+
+/// SDK 服务回复头：LE i32 business status，后接业务输出；transport status 独立。
+pub const KCOMP_REPLY_HEADER_LEN: u32 = 4;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,11 +431,17 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
 
+/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback.
+pub const KCORE_ENDPOINT_MECHANISM_IPC: u32 = 2;
+
 /// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
 pub const KCORE_MEMORY_VIEW_LOCAL_VA: u32 = 1;
 
 /// `kcore_memory_view.kind`：**linear-memory offset**（WASM 执行后端；不是"沙箱特权"的属性）。
 pub const KCORE_MEMORY_VIEW_LINEAR_OFFSET: u32 = 2;
+
+/// 复制式 IPC 每条消息最大字节数，request 与 reply 各自受限。
+pub const KCORE_IPC_MESSAGE_MAX: u32 = 1024;
 
 unsafe extern "C" {
     // -- Trace（只读观察面；无写入口） --
@@ -833,4 +845,50 @@ unsafe extern "C" {
     /// Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP.
     #[link_name = "kcore_user_discard"]
     pub fn kcore_user_discard(task: u32) -> i32;
+    // -- Endpoint Request/Reply --
+    /// 将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_listen"]
+    pub fn kcore_ipc_listen(endpoint: u64) -> i32;
+    /// Endpoint owner 或 Core 记录的不可变实例创建者明确允许 consumer Component 发送；允许启动锚点编排，拒绝 Gate/IRQ/policy；ID 不是 capability。仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_grant"]
+    pub fn kcore_ipc_grant(endpoint: u64, consumer: u32) -> i32;
+    /// 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_submit"]
+    pub fn kcore_ipc_submit(endpoint: u64, bytes: *const u8, len: usize, request: *mut u64) -> i32;
+    /// 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_receive"]
+    pub fn kcore_ipc_receive(
+        endpoint: u64,
+        bytes: *mut u8,
+        capacity: usize,
+        request: *mut u64,
+        consumer: *mut u32,
+        consumer_task: *mut u32,
+        length: *mut usize,
+    ) -> i32;
+    /// Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_reply"]
+    pub fn kcore_ipc_reply(request: u64, bytes: *const u8, len: usize) -> i32;
+    /// caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_collect"]
+    pub fn kcore_ipc_collect(
+        request: u64,
+        bytes: *mut u8,
+        capacity: usize,
+        length: *mut usize,
+        completion: *mut i32,
+    ) -> i32;
+    /// 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_wait"]
+    pub fn kcore_ipc_wait(endpoint: u64, request: u64) -> i32;
+    /// caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_cancel"]
+    pub fn kcore_ipc_cancel(request: u64) -> i32;
+    /// owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    #[link_name = "kcore_ipc_close"]
+    pub fn kcore_ipc_close(endpoint: u64) -> i32;
+    // -- Component identity --
+    /// 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。
+    #[link_name = "kcore_component_current"]
+    pub fn kcore_component_current(out: *mut u32) -> i32;
 }

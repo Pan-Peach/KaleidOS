@@ -30,7 +30,9 @@ use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::filesystem::client::FileSystemBinding;
 use kcomp_sdk::filesystem::{FILESYSTEM_NAME, FILESYSTEM_OPEN_READ, FileSystem};
 use kcomp_sdk::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
-use kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_METHOD_MOUNT;
+use kcomp_sdk::generated::filesystem::{
+    KCOMP_FATFS_CREATE_CONFIG_ABI as FATFS_CREATE_CONFIG_ABI, KCOMP_FILESYSTEM_METHOD_MOUNT,
+};
 use kcomp_sdk::klog;
 
 use super::report::Checks;
@@ -51,7 +53,6 @@ struct EndpointCreateConfig {
     endpoint: u64,
 }
 
-const FATFS_CREATE_CONFIG_ABI: u64 = 0x4641_5446_5343_4647; // "FATFSCFG"
 const LITTLEFS_CREATE_CONFIG_ABI: u64 = 0x4C49_5454_4C45_4353; // "LITTLECS"
 
 /// `ram_blk` 的合成 FAT12 卷里 `HELLO.TXT` 的内容（与 provider 的 `fat12.rs` 一致）。
@@ -111,9 +112,14 @@ fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<
     let config = EndpointCreateConfig { endpoint };
     // FatFs must decode opaque bytes even when the payload is not u64-aligned.
     #[repr(align(8))]
-    struct UnalignedConfig([u8; 9]);
-    let mut bytes = UnalignedConfig([0; 9]);
-    bytes.0[1..].copy_from_slice(&endpoint.to_ne_bytes());
+    struct UnalignedConfig([u8; 17]);
+    let mut bytes = UnalignedConfig([0; 17]);
+    bytes.0[1..9].copy_from_slice(&endpoint.to_le_bytes());
+    bytes.0[9..13].copy_from_slice(
+        &kcomp_sdk::management::current_component()
+            .ok()?
+            .to_le_bytes(),
+    );
     let args = KcompCreateArgs {
         config_abi,
         config: if image == FATFS {
@@ -121,7 +127,11 @@ fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<
         } else {
             (&config as *const EndpointCreateConfig).cast()
         },
-        config_len: core::mem::size_of::<EndpointCreateConfig>(),
+        config_len: if image == FATFS {
+            16
+        } else {
+            core::mem::size_of::<EndpointCreateConfig>()
+        },
     };
     let mut instance = 0u32;
     (unsafe { abi::kcore_component_create(image.as_ptr(), image.len(), 0, &args, &mut instance) }
@@ -454,6 +464,14 @@ extern "C" fn physical_task(arg: *mut ()) {
         }
         if state.physical_count != 2 {
             return false;
+        }
+        let Ok(owner) = kcomp_sdk::management::current_component() else {
+            return false;
+        };
+        for block in state.physical_blocks {
+            if kcomp_sdk::ipc::grant(block, owner).is_err() {
+                return false;
+            }
         }
         let Some(fat) =
             create_with_endpoint(FATFS, FATFS_CREATE_CONFIG_ABI, state.physical_blocks[0])

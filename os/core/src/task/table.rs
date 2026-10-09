@@ -13,6 +13,11 @@ use alloc::collections::btree_map::Entry;
 use arch::{CpuArch, CpuImpl};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+// A bounded service envelope needs two 1 KiB buffers, backend locals, and the
+// Core wait/switch frames at once. Four pages keep those real Task frames apart
+// from neighbouring allocations; this is a stack budget, not isolation.
+pub(crate) const TASK_STACK_BYTES: usize = 4 * memory::ALLOC_GRANULE;
+
 pub struct TaskTable {
     tasks: BTreeMap<TaskId, TaskRecord>,
     next_id: AtomicU32,
@@ -58,10 +63,9 @@ impl TaskTable {
         arg: *mut (),
     ) -> Result<TaskId, TaskError> {
         let id = self.alloc();
-        let memory =
-            memory::alloc_region(memory::ALLOC_GRANULE).map_err(|_| TaskError::NoMemory)?;
+        let memory = memory::alloc_region(TASK_STACK_BYTES).map_err(|_| TaskError::NoMemory)?;
         let region = memory.region();
-        let kstack = Kernelstack::new(region.base, memory::ALLOC_GRANULE);
+        let kstack = Kernelstack::new(region.base, TASK_STACK_BYTES);
         let trampoline = crate::task::task_entry_trampoline as *const () as usize;
         let context = CpuImpl::new_context(trampoline, kstack.base + kstack.size);
         let record = TaskRecord::new(owner, entry, arg, Box::new(context), kstack, memory);
@@ -419,7 +423,7 @@ mod tests {
             rec.kstack.base.is_multiple_of(memory::ALLOC_GRANULE),
             "kstack base page-aligned"
         );
-        assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
+        assert_eq!(rec.kstack.size, TASK_STACK_BYTES);
     }
 
     #[test]
@@ -528,7 +532,7 @@ mod tests {
         let mut t = TaskTable::new();
         let id = t.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
         let rec = t.remove(id).expect("remove");
-        assert_eq!(rec.kstack.size, memory::ALLOC_GRANULE);
+        assert_eq!(rec.kstack.size, TASK_STACK_BYTES);
         assert!(t.is_empty());
         assert_eq!(
             t.remove(id),

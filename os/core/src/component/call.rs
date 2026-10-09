@@ -150,6 +150,9 @@ fn prepare(
     // (1) 存活解析：死 endpoint / 死 owner 绝不派发（`resolve` 只查存活，
     //     contract / abi 已在组合期交付 id 之前校验）。
     let record = endpoints.resolve(components, id)?;
+    if record.is_ipc_only() {
+        return Err(CallError::NoDispatcher);
+    }
 
     // (1b) 保留契约：`scheduler.policy` 不得经通用调用路径执行——调度策略只能
     //      由 Core 的调度路径经专用 PolicyCall 边界调用（`sched::pick_next`）。
