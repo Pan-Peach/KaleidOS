@@ -58,8 +58,9 @@ Namespace 与 File service 先保持在同一组件的普通模块中。
 1. 定下 FS 实例、节点、目录项与打开引用的有效期和失效规则。身份要区别
    provider 重启 / 重新挂载；多个路径入口共享同一底层对象。
 2. 补齐 provider 契约所需的 root / lookup / node_info / 引用 / readlink / 枚举与偏移读取。
-   当前 `abi/filesystem.toml` 只有 mount/unmount、路径 open、顺序 read 和 close，
-   不能用拼接路径或 open handle 代替节点身份。
+   当前 `abi/filesystem.toml` 已补 root / 单段 lookup / node_info，FatFs 与 C/Rust SDK
+   已接线；littlefs 对节点操作返回 ENOTSUP。节点保活、readlink、枚举与 read_at
+   尚未实现，VFS provider 适配仍为占位。
 3. 实现 per-instance 表与遍历；名字编码、匹配和 symlink / mount 边界须显式定义。
 4. 实现只读打开与读取；验证独立 open 的游标、复制引用的共享状态、短读 / EOF、
    provider 失败后旧引用失效。共享状态和锁的覆盖范围必须明确。

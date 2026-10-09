@@ -208,7 +208,13 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 #### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED
 
-现状：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3，mount 内 format 加自检）两个 C `.kcomp`，都绑 `block.device`；对外只有只读 filesystem 契约（mount/unmount/open/close/read，不透明 handle）。CoreTest `block-chain`、`block-chain-direct`、`littlefs-multi-instance`、`littlefs-isolation`、`littlefs-direct` 在 RV64/RV32 端到端验证，多实例存储互不影响。
+现状：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3，mount 内 format 加自检）两个 C `.kcomp`，都绑 `block.device`；共用只读 filesystem 契约的 mount/unmount/open/close/read（不透明 handle）。CoreTest `block-chain`、`block-chain-direct`、`littlefs-multi-instance`、`littlefs-isolation`、`littlefs-direct` 在 RV64/RV32 端到端验证，多实例存储互不影响。
+
+节点操作：FatFs 已实现 `root / lookup(parent, name, encoding) / node_info`，
+C/Rust SDK 的 Direct / Gate 路径已接线；littlefs 显式返回 ENOTSUP。
+名字限制与 token 有效期见 [filesystem schema](abi/filesystem.toml)。真实 FAT 镜像
+host 测试、SDK 93 项 host 测试、ABI 校验与两个 C provider 的 RV64/RV32 `.kcomp`
+构建通过；新增节点行为尚未经过 QEMU，VFS provider 适配仍未接线。
 
 VFS：`os/components/filesystems/vfs/` 已有 Rust `.kcomp` 骨架，包含 name / namespace / node-provider / stream / file，明确路径引用、独立 open、share 计数、删除目标与 cleanup / close 生命周期；表与操作未实现。`abi/vfs.toml` / SDK 已声明第一阶段 API，适配器仍返回 ENOTSUP。create 返回 `-ENOTSUP`，不发布 endpoint。现状见 `docs/modules/vfs.md`，wire 草案见 `docs/interfaces/vfs.md`。VFS 服务仍是 NOT IMPLEMENTED。
 
@@ -444,7 +450,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 |---|---|---|---|
 | 0：架构基线 | Service / Binding / Transport / Execution / Session / Recovery 分开；问题矩阵带证据等级 | 现行契约、代码事实和提案分别登记 | 文档已整理；未新增硬件验证 |
 | 1：双设备与显式组合 | raw block 可 attach，prober 遍历全部设备并关联实例；组合方显式选择两条 Block→FS 连接；init 配置根序号和 shell FS endpoint | 真实两盘/两驱动有效读写；错指纹、过期选择、创建失败；不以改 Core ABI 为起点 | DONE：raw attach、全枚举/去重、显式选择；真实两盘双 FS 直连通过，见下文 |
-| 2：只读 VFS | 补 provider 节点/lookup/read_at 所需语义、同步纪律与 SDK 数据缓冲前端；/fat、/little 并存 | FS ABI 演进与 adapter 前置；两个 FS 的路径、独立 open 与共享引用分别验证；ksh 消费选定 VFS | provider 串行纪律、旧句柄拒绝与 SDK 数据前端已实现；VFS/节点接口仍未接线 |
+| 2：只读 VFS | 补 provider 节点/lookup/read_at 所需语义、同步纪律与 SDK 数据缓冲前端；/fat、/little 并存 | FS ABI 演进与 adapter 前置；两个 FS 的路径、独立 open 与共享引用分别验证；ksh 消费选定 VFS | provider 串行纪律、旧句柄拒绝与 SDK 数据前端已实现；FatFs 节点与 SDK 已接线，littlefs 节点/read_at/VFS 适配仍待实现 |
 | 3：POSIX 文件 I/O | fd 引用 VFS 打开对象，用户内存 copy 与 openat/read/close 接通 | 普通 ELF 运行期访问两个挂载；坏指针、短读、fork/close 引用语义 | BLOCKED：阶段 2，通用 fd 表未接 |
 | 4：动态逻辑故障 | 依赖失效、旧对象错误、新实例显式重新挂载 | 一项 FS 失败不误伤另一项；旧 handle 不改指向；不要求现有 Direct FS 热卸载 | BLOCKED：对象/失效协议；无新增恢复实验 |
 | 5：Queued 实验 | Runtime 队列/Worker 原型；有需求再设计最小授权通知 | 先证提交/取消，最终阻塞完成无忙轮询；完成早于等待与失败收尾；不放宽 unpark owner | PLANNED：跨 owner notification 未实现 |

@@ -7,7 +7,7 @@
 /// 分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
 ///
 /// 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
-/// u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。
+/// u64 file handle 与节点 token（provider 侧具体格式如 FatFs 对 caller 不可见）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FileSystemApi {
@@ -32,18 +32,31 @@ pub struct FileSystemApi {
         len: usize,
         out_read: *mut usize,
     ) -> i32,
+    /// 返回当前 FS 实例的根节点 token。
+    pub root: unsafe extern "C" fn(ctx: *mut (), out_node: *mut u64) -> i32,
+    /// 在目录 parent 中查找名字，返回节点 token。
+    pub lookup: unsafe extern "C" fn(
+        ctx: *mut (),
+        parent: u64,
+        name: *const u8,
+        name_len: usize,
+        encoding: u32,
+        out_node: *mut u64,
+    ) -> i32,
+    /// 查询节点的类型等元数据。
+    pub node_info: unsafe extern "C" fn(ctx: *mut (), node: u64, out_kind: *mut u32) -> i32,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<FileSystemApi>() == 5 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<FileSystemApi>() == 8 * core::mem::size_of::<usize>());
     assert!(core::mem::align_of::<FileSystemApi>() == core::mem::align_of::<usize>());
 };
 
 /// filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字节一致）。
 pub const KCOMP_FILESYSTEM_NAME: &[u8] = b"filesystem";
 
-/// exact ABI fingerprint（8 字节 ASCII "FILESYST" 的大端读数）。
-pub const KCOMP_FILESYSTEM_ABI: u64 = 0x4649_4C45_5359_5354;
+/// exact ABI fingerprint（8 字节 ASCII "FSNODERO" 的大端读数）。
+pub const KCOMP_FILESYSTEM_ABI: u64 = 0x4653_4E4F_4445_524F;
 
 /// 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。
 pub const KCOMP_FILESYSTEM_OPEN_READ: u32 = 0x00000001;
@@ -81,3 +94,20 @@ pub const KCOMP_FILESYSTEM_READ_HEADER_LEN: usize = 8;
 
 /// `open` 的 `input` 上限（**含**结尾 NUL）：provider 用定长 scratch 拷贝路径，超过即 `-EINVAL`。
 pub const KCOMP_FILESYSTEM_PATH_MAX: usize = 256;
+
+pub const KCOMP_FILESYSTEM_NODE_FILE: u32 = 1;
+
+pub const KCOMP_FILESYSTEM_NODE_DIRECTORY: u32 = 2;
+
+pub const KCOMP_FILESYSTEM_METHOD_ROOT: u32 = 5;
+
+pub const KCOMP_FILESYSTEM_METHOD_LOOKUP: u32 = 6;
+
+pub const KCOMP_FILESYSTEM_METHOD_NODE_INFO: u32 = 7;
+
+pub const KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN: usize = 12;
+
+pub const KCOMP_FILESYSTEM_NAME_MAX: usize = 255;
+
+/// 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。
+pub const KCOMP_FILESYSTEM_ENCODING_BYTES: u32 = 1;

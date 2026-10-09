@@ -580,7 +580,7 @@ _Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kco
  * 分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
  * 
  * 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
- * u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。 */
+ * u64 file handle 与节点 token（provider 侧具体格式如 FatFs 对 caller 不可见）。 */
 struct kcomp_filesystem_api {
     /* 挂载该 filesystem 实例（provider 自己决定具体语义）。 */
     int32_t (*mount)(void *ctx);
@@ -592,15 +592,21 @@ struct kcomp_filesystem_api {
     int32_t (*close)(void *ctx, uint64_t handle);
     /* 从 handle 当前位置读 `len` 字节；实际读到的字节数写回 `out_read`。 */
     int32_t (*read)(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read);
+    /* 返回当前 FS 实例的根节点 token。 */
+    int32_t (*root)(void *ctx, uint64_t *out_node);
+    /* 在目录 parent 中查找名字，返回节点 token。 */
+    int32_t (*lookup)(void *ctx, uint64_t parent, const uint8_t *name, size_t name_len, uint32_t encoding, uint64_t *out_node);
+    /* 查询节点的类型等元数据。 */
+    int32_t (*node_info)(void *ctx, uint64_t node, uint32_t *out_kind);
 };
-_Static_assert(sizeof(struct kcomp_filesystem_api) == 5 * sizeof(void *), "kcomp_filesystem_api layout drift");
+_Static_assert(sizeof(struct kcomp_filesystem_api) == 8 * sizeof(void *), "kcomp_filesystem_api layout drift");
 _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp_filesystem_api alignment drift");
 
 /* filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字节一致）。 */
 #define KCOMP_FILESYSTEM_NAME "filesystem"
 
-/* exact ABI fingerprint（8 字节 ASCII "FILESYST" 的大端读数）。 */
-#define KCOMP_FILESYSTEM_ABI UINT64_C(0x46494C4553595354)
+/* exact ABI fingerprint（8 字节 ASCII "FSNODERO" 的大端读数）。 */
+#define KCOMP_FILESYSTEM_ABI UINT64_C(0x46534E4F4445524F)
 
 /* 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。 */
 #define KCOMP_FILESYSTEM_OPEN_READ UINT32_C(0x00000001)
@@ -638,6 +644,23 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 
 /* `open` 的 `input` 上限（**含**结尾 NUL）：provider 用定长 scratch 拷贝路径，超过即 `-EINVAL`。 */
 #define KCOMP_FILESYSTEM_PATH_MAX 256
+
+#define KCOMP_FILESYSTEM_NODE_FILE UINT32_C(1)
+
+#define KCOMP_FILESYSTEM_NODE_DIRECTORY UINT32_C(2)
+
+#define KCOMP_FILESYSTEM_METHOD_ROOT UINT32_C(5)
+
+#define KCOMP_FILESYSTEM_METHOD_LOOKUP UINT32_C(6)
+
+#define KCOMP_FILESYSTEM_METHOD_NODE_INFO UINT32_C(7)
+
+#define KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN 12
+
+#define KCOMP_FILESYSTEM_NAME_MAX 255
+
+/* 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。 */
+#define KCOMP_FILESYSTEM_ENCODING_BYTES UINT32_C(1)
 
 /* 每次正常回复均有效；domain 0 = 无额外分类，非零值见 STATUS 常量；reserved 必须为 0。成功时 domain 必须为 0。 */
 struct kcomp_vfs_reply_status {

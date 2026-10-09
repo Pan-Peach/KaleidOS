@@ -69,6 +69,22 @@ impl FileSystemProvider for FileSystemMock {
         buf[..len].copy_from_slice(&MOCK_CONTENT[..len]);
         Ok(len)
     }
+
+    fn root(&self) -> Result<u64> {
+        self.error.map_or(Ok(MOCK_HANDLE), Err)
+    }
+
+    fn lookup(&self, parent: u64, name: &[u8], encoding: u32) -> Result<u64> {
+        assert_eq!(parent, MOCK_HANDLE);
+        assert_eq!(name, b"A");
+        assert_eq!(encoding, 1);
+        self.error.map_or(Ok(MOCK_HANDLE + 1), Err)
+    }
+
+    fn node_info(&self, node: u64) -> Result<u32> {
+        assert_eq!(node, MOCK_HANDLE + 1);
+        self.error.map_or(Ok(1), Err)
+    }
 }
 
 /// 一被调用就 panic：证明适配器在 provider 之前挡下非法帧。
@@ -93,5 +109,17 @@ impl FileSystemProvider for NeverCalled {
 
     fn read(&self, _handle: u64, _buf: &mut [u8]) -> Result<usize> {
         panic!("read must not be called for a malformed frame")
+    }
+
+    fn root(&self) -> Result<u64> {
+        panic!("root must not be called for a malformed frame")
+    }
+
+    fn lookup(&self, _parent: u64, _name: &[u8], _encoding: u32) -> Result<u64> {
+        panic!("lookup must not be called for a malformed frame")
+    }
+
+    fn node_info(&self, _node: u64) -> Result<u32> {
+        panic!("node_info must not be called for a malformed frame")
     }
 }

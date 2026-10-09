@@ -303,3 +303,92 @@ struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_bin
 
     return error_result(-EINVAL);
 }
+
+struct kcomp_call_result kcomp_filesystem_root(const struct kcomp_filesystem_binding *binding,
+                                               uint64_t *out_node)
+{
+    if (binding == NULL || out_node == NULL)
+        return error_result(-EINVAL);
+    *out_node = 0;
+    const struct kcomp_filesystem_binding_internal *b = binding_ref(binding);
+    struct kcomp_call_result result = {0, 0};
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_DIRECT) {
+        if (b->api == NULL || b->api->root == NULL)
+            return error_result(-EPROTO);
+        result.method = b->api->root(b->ctx, out_node);
+    } else if (b->mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
+        uint8_t reply[KCOMP_FILESYSTEM_HANDLE_LEN];
+        result.transport = kcore_endpoint_call(b->endpoint, KCOMP_FILESYSTEM_METHOD_ROOT,
+                                               NULL, 0, NULL, 0, reply, sizeof(reply), &result.method);
+        if (result.transport == 0 && result.method == 0)
+            *out_node = read_le64(reply);
+    } else {
+        return error_result(-EINVAL);
+    }
+    if (result.transport == 0 && result.method == 0 && *out_node == 0)
+        return error_result(-EPROTO);
+    return result;
+}
+
+struct kcomp_call_result kcomp_filesystem_lookup(const struct kcomp_filesystem_binding *binding,
+                                                 uint64_t parent, const uint8_t *name,
+                                                 size_t name_len, uint32_t encoding,
+                                                 uint64_t *out_node)
+{
+    if (binding == NULL || name == NULL || out_node == NULL || name_len == 0 ||
+        name_len > KCOMP_FILESYSTEM_NAME_MAX)
+        return error_result(-EINVAL);
+    *out_node = 0;
+    const struct kcomp_filesystem_binding_internal *b = binding_ref(binding);
+    struct kcomp_call_result result = {0, 0};
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_DIRECT) {
+        if (b->api == NULL || b->api->lookup == NULL)
+            return error_result(-EPROTO);
+        result.method = b->api->lookup(b->ctx, parent, name, name_len, encoding, out_node);
+    } else if (b->mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
+        uint8_t args[KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN];
+        uint8_t reply[KCOMP_FILESYSTEM_HANDLE_LEN];
+        write_le64(args, parent);
+        for (size_t i = 0; i < KCOMP_FILESYSTEM_FLAGS_LEN; ++i)
+            args[KCOMP_FILESYSTEM_HANDLE_LEN + i] = KCOMP_FILESYSTEM_U32_BYTE(encoding, i);
+        result.transport = kcore_endpoint_call(b->endpoint, KCOMP_FILESYSTEM_METHOD_LOOKUP,
+                                               args, sizeof(args), name, name_len,
+                                               reply, sizeof(reply), &result.method);
+        if (result.transport == 0 && result.method == 0)
+            *out_node = read_le64(reply);
+    } else {
+        return error_result(-EINVAL);
+    }
+    if (result.transport == 0 && result.method == 0 && *out_node == 0)
+        return error_result(-EPROTO);
+    return result;
+}
+
+struct kcomp_call_result kcomp_filesystem_node_info(const struct kcomp_filesystem_binding *binding,
+                                                    uint64_t node, uint32_t *out_kind)
+{
+    if (binding == NULL || out_kind == NULL)
+        return error_result(-EINVAL);
+    *out_kind = 0;
+    const struct kcomp_filesystem_binding_internal *b = binding_ref(binding);
+    struct kcomp_call_result result = {0, 0};
+    if (b->mechanism == KCORE_ENDPOINT_MECHANISM_DIRECT) {
+        if (b->api == NULL || b->api->node_info == NULL)
+            return error_result(-EPROTO);
+        result.method = b->api->node_info(b->ctx, node, out_kind);
+    } else if (b->mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
+        uint8_t args[KCOMP_FILESYSTEM_HANDLE_LEN];
+        uint8_t reply[KCOMP_FILESYSTEM_FLAGS_LEN];
+        write_le64(args, node);
+        result.transport = kcore_endpoint_call(b->endpoint, KCOMP_FILESYSTEM_METHOD_NODE_INFO,
+                                               args, sizeof(args), NULL, 0,
+                                               reply, sizeof(reply), &result.method);
+        if (result.transport == 0 && result.method == 0) {
+            for (size_t i = 0; i < sizeof(reply); ++i)
+                *out_kind |= (uint32_t)reply[i] << (8u * (uint32_t)i);
+        }
+    } else {
+        return error_result(-EINVAL);
+    }
+    return result;
+}

@@ -1,6 +1,6 @@
 //! FS provider 接入点。消费 SDK typed binding，调用机制由 Core 在 bind 时选择。
-//! 当前 `filesystem` 只有路径 open 与顺序 read；节点身份、目录枚举、read_at
-//! 等尚无 provider 契约，不能用路径或 open handle 冒充节点身份。
+//! `filesystem` 已有 root / 单段 lookup / node_info（FatFs 已实现，littlefs 不支持）。
+//! 本适配器仍为占位；目录枚举、read_at、节点引用保活等尚无 provider 契约。
 
 use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::filesystem::FileSystem;
@@ -17,7 +17,7 @@ use crate::{Error, Result};
 pub struct FsInstanceId(pub u64);
 
 /// 节点引用草案：身份与路径、打开实例分离。
-/// TODO: provider 必须保证 token 在本实例内的有效期；当前 FS ABI 尚不提供它。
+/// TODO: 对接 FS ABI 的挂载期 token，并在 provider 重新挂载后失效旧引用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeRef {
     pub instance: FsInstanceId,
@@ -99,7 +99,7 @@ pub struct FsProvider {
 }
 
 impl FsProvider {
-    // 下列入口全是未来 provider 契约的接缝；现有 binding 不能实现这些语义。
+    // root / lookup / node_info 已有 binding 入口，尚未适配到 VFS 类型；其余契约待补齐。
     // 不降级为字符串拼路径、重复顺序读取或临时打开来伪造节点 / 偏移读取。
 
     pub fn features(&self) -> Result<ProviderFeatures> {

@@ -177,6 +177,21 @@ int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t met
     case KCOMP_FILESYSTEM_METHOD_READ:
         return dispatch_read(state, frame);
 
+    case KCOMP_FILESYSTEM_METHOD_ROOT:
+        return frame->args_len == 0 && frame->input_len == 0 && frame->output != NULL &&
+               frame->output_len == KCOMP_FILESYSTEM_HANDLE_LEN ? -ENOTSUP : -EINVAL;
+
+    case KCOMP_FILESYSTEM_METHOD_LOOKUP:
+        return frame->args != NULL && frame->args_len == KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN &&
+               frame->input != NULL && frame->input_len > 0 &&
+               frame->input_len <= KCOMP_FILESYSTEM_NAME_MAX && frame->output != NULL &&
+               frame->output_len == KCOMP_FILESYSTEM_HANDLE_LEN ? -ENOTSUP : -EINVAL;
+
+    case KCOMP_FILESYSTEM_METHOD_NODE_INFO:
+        return frame->args != NULL && frame->args_len == KCOMP_FILESYSTEM_HANDLE_LEN &&
+               frame->input_len == 0 && frame->output != NULL &&
+               frame->output_len == KCOMP_FILESYSTEM_FLAGS_LEN ? -ENOTSUP : -EINVAL;
+
     default:
         /* 能力缺失（不是畸形帧）：与 Core 对"没有 dispatcher"的档位一致。 */
         return -ENOSYS;

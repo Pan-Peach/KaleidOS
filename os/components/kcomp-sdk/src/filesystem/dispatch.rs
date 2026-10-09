@@ -27,9 +27,11 @@ use crate::errno::Errno;
 use crate::filesystem::FileSystemProvider;
 use crate::frame::Call;
 use crate::generated::filesystem::{
-    KCOMP_FILESYSTEM_FLAGS_LEN, KCOMP_FILESYSTEM_HANDLE_LEN, KCOMP_FILESYSTEM_METHOD_CLOSE,
-    KCOMP_FILESYSTEM_METHOD_MOUNT, KCOMP_FILESYSTEM_METHOD_OPEN, KCOMP_FILESYSTEM_METHOD_READ,
-    KCOMP_FILESYSTEM_METHOD_UNMOUNT, KCOMP_FILESYSTEM_PATH_MAX, KCOMP_FILESYSTEM_READ_HEADER_LEN,
+    KCOMP_FILESYSTEM_FLAGS_LEN, KCOMP_FILESYSTEM_HANDLE_LEN, KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN,
+    KCOMP_FILESYSTEM_METHOD_CLOSE, KCOMP_FILESYSTEM_METHOD_LOOKUP, KCOMP_FILESYSTEM_METHOD_MOUNT,
+    KCOMP_FILESYSTEM_METHOD_NODE_INFO, KCOMP_FILESYSTEM_METHOD_OPEN, KCOMP_FILESYSTEM_METHOD_READ,
+    KCOMP_FILESYSTEM_METHOD_ROOT, KCOMP_FILESYSTEM_METHOD_UNMOUNT, KCOMP_FILESYSTEM_NAME_MAX,
+    KCOMP_FILESYSTEM_PATH_MAX, KCOMP_FILESYSTEM_READ_HEADER_LEN,
 };
 
 /// 分派一次 `filesystem` 调用：`port` 已由 image 级 switch
@@ -43,6 +45,9 @@ pub fn dispatch<P: FileSystemProvider>(p: &P, method: u32, call: Call<'_>) -> i3
         KCOMP_FILESYSTEM_METHOD_OPEN => open(p, call),
         KCOMP_FILESYSTEM_METHOD_CLOSE => close(p, call),
         KCOMP_FILESYSTEM_METHOD_READ => read(p, call),
+        KCOMP_FILESYSTEM_METHOD_ROOT => root(p, call),
+        KCOMP_FILESYSTEM_METHOD_LOOKUP => lookup(p, call),
+        KCOMP_FILESYSTEM_METHOD_NODE_INFO => node_info(p, call),
         // 能力缺失（不是畸形帧）：与 Core 对"没有 dispatcher"的档位一致。
         _ => Errno::ENOSYS.code(),
     }
@@ -128,6 +133,56 @@ fn read<P: FileSystemProvider>(p: &P, call: Call<'_>) -> i32 {
     }
 }
 
+fn root<P: FileSystemProvider>(p: &P, call: Call<'_>) -> i32 {
+    if !call.args.is_empty() || !call.input.is_empty() || call.output.len() != 8 {
+        return Errno::EINVAL.code();
+    }
+    match p.root() {
+        Ok(node) if node != 0 => {
+            call.output.copy_from_slice(&node.to_le_bytes());
+            0
+        }
+        Ok(_) => Errno::EIO.code(),
+        Err(error) => error.code(),
+    }
+}
+
+fn lookup<P: FileSystemProvider>(p: &P, call: Call<'_>) -> i32 {
+    if call.args.len() != KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN
+        || call.input.is_empty()
+        || call.input.len() > KCOMP_FILESYSTEM_NAME_MAX
+        || call.output.len() != 8
+    {
+        return Errno::EINVAL.code();
+    }
+    let parent = decode_handle(&call.args[..8]).expect("checked args length");
+    let encoding = decode_flags(&call.args[8..]).expect("checked args length");
+    match p.lookup(parent, call.input, encoding) {
+        Ok(node) if node != 0 => {
+            call.output.copy_from_slice(&node.to_le_bytes());
+            0
+        }
+        Ok(_) => Errno::EIO.code(),
+        Err(error) => error.code(),
+    }
+}
+
+fn node_info<P: FileSystemProvider>(p: &P, call: Call<'_>) -> i32 {
+    let Some(node) = decode_handle(call.args) else {
+        return Errno::EINVAL.code();
+    };
+    if !call.input.is_empty() || call.output.len() != 4 {
+        return Errno::EINVAL.code();
+    }
+    match p.node_info(node) {
+        Ok(kind) => {
+            call.output.copy_from_slice(&kind.to_le_bytes());
+            0
+        }
+        Err(error) => error.code(),
+    }
+}
+
 /// `flags` 的 `args` 编码：一个 LE `u32`（与 C 包装逐字节一致，见
 /// `kcomp_filesystem.h`）。
 pub(super) fn encode_flags(flags: u32) -> [u8; KCOMP_FILESYSTEM_FLAGS_LEN] {
@@ -173,6 +228,8 @@ pub(super) fn is_read_output_len(len: usize) -> bool {
 
 #[cfg(test)]
 mod behaviour_tests;
+#[cfg(test)]
+mod node_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

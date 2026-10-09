@@ -31,6 +31,20 @@
 #   read(4)   ：args 恰好 8 字节（LE `u64` handle）、input 空、output ≥ 8 字节：
 #               前 8 字节 = LE `u64` 实际读取长度（**仅当方法返回 0 时有效**），
 #               随后是数据区（容量 = `output_len` - 8；`output_len` **含** 8 字节头）
+#   root(5)   ：args 空、input 空、output 恰好 8 字节 LE u64 node token
+#   lookup(6) ：args 恰好 12 字节（LE u64 parent + LE u32 encoding）、
+#               input = 单个名字（无 NUL，1..=NAME_MAX 字节）、output = 8 字节 LE u64 node
+#   node_info(7)：args = 8 字节 LE u64 node、input 空、output = 4 字节 LE u32 kind
+#
+# 节点 token 在本 provider 的本次挂载期间有效；0 无效，重复 lookup 同一对象
+# 返回相同 token。成功 unmount 后全部失效，重新 mount 不复用旧 token。
+# token 仅在所属 provider 实例内有意义；调用方不得把 token 换给另一实例。
+# 当前只读节点表要求介质在挂载期间不被外部修改；不提供介质热替换语义。
+# node 与 open handle 是独立身份。节点表容量由 provider 决定，耗尽返回 ENOSPC。
+# lookup 只查 parent 的一个子名字；空名、NUL、分隔符、. / .. 返回 EINVAL。
+# encoding 不支持或字符不可表示返回 ENOTSUP；不存在返回 ENOENT；过期 token
+# 返回 EBADF；非目录 parent 返回 ENOTDIR；未挂载 / 已停止返回 ENODEV。
+# 无节点能力的 provider 对 root / lookup / node_info 返回 ENOTSUP。
 #
 # 为什么 `read` 需要一个 8 字节头：扁平 frame 的 `output` 是**一个** caller 数据
 # 区，无法同时表达"数据 buffer"与"out 参数"（旧 table 的 `out_read`）；实际长度
@@ -46,7 +60,7 @@
 [[struct]]
 name = "FileSystemApi"
 c_name = "kcomp_filesystem_api"
-size_ptrs = 5
+size_ptrs = 8
 doc = """
 `filesystem` provider/consumer function table（**Direct** transport 的共享布局）。
 
@@ -55,7 +69,7 @@ doc = """
 分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
 
 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
-u64 file handle（provider 侧具体格式如 FatFs 对 caller 不可见）。
+u64 file handle 与节点 token（provider 侧具体格式如 FatFs 对 caller 不可见）。
 """
 
 [[struct.field]]
@@ -83,6 +97,21 @@ name = "read"
 type = "fn(ctx: *mut void, handle: u64, buf: *mut u8, len: usize, out_read: *mut usize) -> i32"
 doc = "从 handle 当前位置读 `len` 字节；实际读到的字节数写回 `out_read`。"
 
+[[struct.field]]
+name = "root"
+type = "fn(ctx: *mut void, out_node: *mut u64) -> i32"
+doc = "返回当前 FS 实例的根节点 token。"
+
+[[struct.field]]
+name = "lookup"
+type = "fn(ctx: *mut void, parent: u64, name: *const u8, name_len: usize, encoding: u32, out_node: *mut u64) -> i32"
+doc = "在目录 parent 中查找名字，返回节点 token。"
+
+[[struct.field]]
+name = "node_info"
+type = "fn(ctx: *mut void, node: u64, out_kind: *mut u32) -> i32"
+doc = "查询节点的类型等元数据。"
+
 [[const]]
 name = "KCOMP_FILESYSTEM_NAME"
 type = "string"
@@ -93,9 +122,9 @@ doc = "filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字�
 [[const]]
 name = "KCOMP_FILESYSTEM_ABI"
 type = "u64"
-value = "0x4649_4C45_5359_5354"
+value = "0x4653_4E4F_4445_524F"
 targets = "c,sdk-rust"
-doc = "exact ABI fingerprint（8 字节 ASCII \"FILESYST\" 的大端读数）。"
+doc = "exact ABI fingerprint（8 字节 ASCII \"FSNODERO\" 的大端读数）。"
 
 [[const]]
 name = "KCOMP_FILESYSTEM_OPEN_READ"
@@ -175,3 +204,52 @@ type = "usize"
 value = "256"
 targets = "c,sdk-rust"
 doc = "`open` 的 `input` 上限（**含**结尾 NUL）：provider 用定长 scratch 拷贝路径，超过即 `-EINVAL`。"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_NODE_FILE"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_NODE_DIRECTORY"
+type = "u32"
+value = "2"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_ROOT"
+type = "u32"
+value = "5"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_LOOKUP"
+type = "u32"
+value = "6"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_METHOD_NODE_INFO"
+type = "u32"
+value = "7"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN"
+type = "usize"
+value = "12"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_NAME_MAX"
+type = "usize"
+value = "255"
+targets = "c,sdk-rust"
+
+[[const]]
+name = "KCOMP_FILESYSTEM_ENCODING_BYTES"
+type = "u32"
+value = "1"
+targets = "c,sdk-rust"
+doc = "原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。"

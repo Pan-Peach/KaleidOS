@@ -217,6 +217,10 @@ FsInstance + FsNode + 同一份 storage
 
 - `block.device` 设备接口已落地：块设备驱动认领设备后向上发布，单位、阻塞、`0/-errno` 等契约已在 SDK 中写清；
 - 一个最小 `filesystem` 服务契约已存在：只读、`mount/unmount/open/close/read`、不透明 u64 handle、singleton 端点名；**两个** provider 已落地并绑 `block.device`：FatFs（只读 FAT，自带最小 selftest）与 littlefs（v2.9.3，`mount` 内 format + 自检，真实走 prog/erase）；CoreTest（`littlefs-multi-instance` / `littlefs-isolation`）已端到端证明**两个同类型 FS 实例各自发布并各自被 bind**、存储互不相干（QEMU，rv64 + rv32）；
+- 节点操作 `root / lookup(parent, name, encoding) / node_info` 已在 FatFs 与 C/Rust SDK
+  的 Direct / Gate 路径接通；生命周期、名字与错误编码见
+  [`abi/filesystem.toml`](../../abi/filesystem.toml)。littlefs 尚不支持节点操作。
+  本次新增行为由真实 FatFs 库 + FAT 镜像的 host 测试验证，尚无新增 QEMU 行为证据；
 - `os/components/filesystems/vfs/` 已有组件骨架（见 `docs/modules/vfs.md`）；**没有**可用的 namespace 服务、File service 或独立的 generic FS 接口层；
 - **没有**稳定的 VFS / Page Cache 路径（与 `docs/development/benchmark.md` 一致）。
 

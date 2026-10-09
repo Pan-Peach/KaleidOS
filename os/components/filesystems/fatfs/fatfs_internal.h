@@ -7,6 +7,9 @@
 /* 同时在线的 open 文件上限（handle 单调增长、不复用，0 永久保留为无效值）。 */
 #define FATFS_MAX_OPEN_FILES 8
 
+/* 只读挂载期间节点驻留；含根节点。卸载清表，token 单调增长、不复用。 */
+#define FATFS_MAX_NODES 8
+
 /* provider 定义的端口 token（**Gate** 路径经 kcomp_service_dispatch 用它选中本
  * 契约；Direct 路径不使用它）。provider 私有——组合策略不需要知道。 */
 #define FATFS_PORT 1
@@ -16,12 +19,22 @@
  * 没有走 Core call gate）。只接受字符串字面量（`sizeof` 求长度）。 */
 #define FATFS_LOG_LINE(text) kcore_log_line((const uint8_t *)(text), sizeof(text) - 1)
 
-struct fatfs_file_slot {
+struct fatfs_file_slot
+{
     uint64_t handle;
     FIL file;
 };
 
-struct fatfs_state {
+struct fatfs_node
+{
+    uint64_t id;
+    uint64_t parent;
+    char path[KCOMP_FILESYSTEM_PATH_MAX];
+    uint32_t kind;
+};
+
+struct fatfs_state
+{
     FATFS filesystem;
 
     /* Core 在 create 里选定的块调用绑定（机制藏在绑定内部）。 */
@@ -33,6 +46,8 @@ struct fatfs_state {
     int alive;
 
     struct fatfs_file_slot files[FATFS_MAX_OPEN_FILES];
+    struct fatfs_node nodes[FATFS_MAX_NODES];
+    uint64_t last_node;
 };
 
 /* 不等待：同 CPU 的重入不能自旋；竞争返回 EBUSY，调用方决定重试。 */
@@ -53,5 +68,9 @@ int32_t fatfs_unmount(void *ctx);
 int32_t fatfs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle);
 int32_t fatfs_close(void *ctx, uint64_t handle);
 int32_t fatfs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read);
+int32_t fatfs_root(void *ctx, uint64_t *out_node);
+int32_t fatfs_lookup(void *ctx, uint64_t parent, const uint8_t *name,
+                     size_t name_len, uint32_t encoding, uint64_t *out_node);
+int32_t fatfs_node_info(void *ctx, uint64_t node, uint32_t *out_kind);
 
 #endif /* KALEIDOS_FATFS_INTERNAL_H */

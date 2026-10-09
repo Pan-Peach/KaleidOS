@@ -34,7 +34,7 @@ pub struct FileSystemService<P: FileSystemProvider> {
 }
 
 impl<P: FileSystemProvider> FileSystemService<P> {
-    /// 由 `P` 生成 `#[repr(C)]` table：五个字段分别指向 `P` 的**单态化** adapter。
+    /// 由 `P` 生成 `#[repr(C)]` table：各字段指向 `P` 的**单态化** adapter。
     pub const fn new(provider: P) -> Self {
         Self {
             provider,
@@ -44,6 +44,9 @@ impl<P: FileSystemProvider> FileSystemService<P> {
                 open: open::<P>,
                 close: close::<P>,
                 read: read::<P>,
+                root: root::<P>,
+                lookup: lookup::<P>,
+                node_info: node_info::<P>,
             },
         }
     }
@@ -200,6 +203,75 @@ unsafe extern "C" fn read<P: FileSystemProvider>(
         }
         // provider 返回超过 buffer 的长度 = 契约违约（不是 UB 兜底）。
         Ok(_) => Errno::EIO.code(),
+        Err(error) => error.code(),
+    }
+}
+
+/// # Safety
+/// 同 mount；out_node 必须在调用期间可写。
+unsafe extern "C" fn root<P: FileSystemProvider>(ctx: *mut (), out_node: *mut u64) -> i32 {
+    if out_node.is_null() {
+        return Errno::EINVAL.code();
+    }
+    // SAFETY: ctx 由本模块生成，out_node 由 caller 保证可写。
+    let provider = unsafe { &*ctx.cast::<P>() };
+    match provider.root() {
+        Ok(node) if node != 0 => {
+            unsafe { *out_node = node };
+            0
+        }
+        Ok(_) => Errno::EIO.code(),
+        Err(error) => error.code(),
+    }
+}
+
+/// # Safety
+/// 同 mount；name 指向 name_len 个可读字节，out_node 可写。
+unsafe extern "C" fn lookup<P: FileSystemProvider>(
+    ctx: *mut (),
+    parent: u64,
+    name: *const u8,
+    name_len: usize,
+    encoding: u32,
+    out_node: *mut u64,
+) -> i32 {
+    if name.is_null()
+        || out_node.is_null()
+        || name_len == 0
+        || name_len > crate::generated::filesystem::KCOMP_FILESYSTEM_NAME_MAX
+    {
+        return Errno::EINVAL.code();
+    }
+    // SAFETY: ctx 由本模块生成，name 与 out_node 在调用期间有效。
+    let provider = unsafe { &*ctx.cast::<P>() };
+    let name = unsafe { core::slice::from_raw_parts(name, name_len) };
+    match provider.lookup(parent, name, encoding) {
+        Ok(node) if node != 0 => {
+            unsafe { *out_node = node };
+            0
+        }
+        Ok(_) => Errno::EIO.code(),
+        Err(error) => error.code(),
+    }
+}
+
+/// # Safety
+/// 同 mount；out_kind 必须在调用期间可写。
+unsafe extern "C" fn node_info<P: FileSystemProvider>(
+    ctx: *mut (),
+    node: u64,
+    out_kind: *mut u32,
+) -> i32 {
+    if out_kind.is_null() {
+        return Errno::EINVAL.code();
+    }
+    // SAFETY: ctx 由本模块生成，out_kind 由 caller 保证可写。
+    let provider = unsafe { &*ctx.cast::<P>() };
+    match provider.node_info(node) {
+        Ok(kind) => {
+            unsafe { *out_kind = kind };
+            0
+        }
         Err(error) => error.code(),
     }
 }

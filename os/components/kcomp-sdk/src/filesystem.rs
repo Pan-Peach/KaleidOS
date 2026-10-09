@@ -65,7 +65,7 @@ pub struct FileSystem;
 ///
 /// `ID` 与 `ABI` 是**两个不同的值**：`ID` = `KCOMP_FILESYSTEM_CONTRACT`
 /// （契约身份，ASCII `"VFSCONTR"`），`ABI` = `KCOMP_FILESYSTEM_ABI`
-/// （逐位布局指纹，ASCII `"FILESYST"`）。
+/// （逐位布局指纹，ASCII `"FSNODERO"`）。
 impl Contract for FileSystem {
     const ID: u64 = KCOMP_FILESYSTEM_CONTRACT;
     const ABI: u64 = KCOMP_FILESYSTEM_ABI;
@@ -107,6 +107,21 @@ pub trait FileSystemProvider {
 
     /// 从 handle 当前位置读 `buf.len()` 字节；返回实际读到的字节数（`<= buf.len()`）。
     fn read(&self, handle: u64, buf: &mut [u8]) -> Result<usize>;
+
+    /// 本次挂载的根 token；不支持节点操作的 provider 显式拒绝。
+    fn root(&self) -> Result<u64> {
+        Err(crate::errno::Errno::ENOTSUP)
+    }
+
+    /// 查找 parent 中一个原生名字；token 与 open handle 分离。
+    fn lookup(&self, _parent: u64, _name: &[u8], _encoding: u32) -> Result<u64> {
+        Err(crate::errno::Errno::ENOTSUP)
+    }
+
+    /// 节点类型（KCOMP_FILESYSTEM_NODE_*）。
+    fn node_info(&self, _node: u64) -> Result<u32> {
+        Err(crate::errno::Errno::ENOTSUP)
+    }
 }
 
 pub use service::FileSystemService;

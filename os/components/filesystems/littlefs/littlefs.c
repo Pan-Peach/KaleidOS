@@ -32,6 +32,34 @@ struct littlefs_create_config
 
 #define LITTLEFS_CREATE_CONFIG_ABI UINT64_C(0x4C4954544C454353)
 
+/* 本 provider 尚未实现节点契约；函数表保持完整，显式拒绝。 */
+static int32_t unsupported_root(void *ctx, uint64_t *out_node)
+{
+    (void)ctx;
+    if (out_node == NULL)
+        return -EINVAL;
+    *out_node = 0;
+    return -ENOTSUP;
+}
+
+static int32_t unsupported_lookup(void *ctx, uint64_t parent, const uint8_t *name,
+                                   size_t name_len, uint32_t encoding, uint64_t *out_node)
+{
+    (void)parent; (void)encoding;
+    if (name == NULL || name_len == 0 || name_len > KCOMP_FILESYSTEM_NAME_MAX)
+        return -EINVAL;
+    return unsupported_root(ctx, out_node);
+}
+
+static int32_t unsupported_node_info(void *ctx, uint64_t node, uint32_t *out_kind)
+{
+    (void)ctx; (void)node;
+    if (out_kind == NULL)
+        return -EINVAL;
+    *out_kind = 0;
+    return -ENOTSUP;
+}
+
 /* Direct transport：endpoint 发布时作为 api/ctx 交付的 `#[repr(C)]` function
  * table。同一份业务实现也服务 Gate（littlefs_service.c 的扁平 method switch）。 */
 static const struct kcomp_filesystem_api littlefs_api = {
@@ -40,6 +68,9 @@ static const struct kcomp_filesystem_api littlefs_api = {
     .open = littlefs_open,
     .close = littlefs_close,
     .read = littlefs_read,
+    .root = unsupported_root,
+    .lookup = unsupported_lookup,
+    .node_info = unsupported_node_info,
 };
 
 const uint64_t kcomp_abi = KCOMP_ABI;

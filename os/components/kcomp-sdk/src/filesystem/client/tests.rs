@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 mod bind;
 mod errors;
 mod gate_read;
+mod nodes;
 
 /// Direct 路径的调用计数（"真的走了 function table"的证据）。
 pub(super) static DIRECT_CALLS: AtomicU32 = AtomicU32::new(0);
@@ -82,12 +83,47 @@ pub(super) unsafe extern "C" fn direct_read(
     0
 }
 
+pub(super) unsafe extern "C" fn direct_root(_ctx: *mut (), out: *mut u64) -> i32 {
+    // SAFETY: SDK 提供可写 out。
+    unsafe { *out = 11 };
+    0
+}
+
+pub(super) unsafe extern "C" fn direct_lookup(
+    _ctx: *mut (),
+    parent: u64,
+    name: *const u8,
+    len: usize,
+    encoding: u32,
+    out: *mut u64,
+) -> i32 {
+    assert_eq!(parent, 11);
+    assert_eq!(encoding, 1);
+    // SAFETY: SDK 提供有效 name / out。
+    assert_eq!(
+        unsafe { core::slice::from_raw_parts(name, len) },
+        b"HELLO.TXT"
+    );
+    unsafe { *out = 12 };
+    0
+}
+
+pub(super) unsafe extern "C" fn direct_node_info(_ctx: *mut (), node: u64, out: *mut u32) -> i32 {
+    assert_eq!(node, 12);
+    // SAFETY: SDK 提供可写 out。
+    unsafe { *out = 1 };
+    0
+}
+
 pub(super) static DIRECT_TABLE: FileSystemApi = FileSystemApi {
     mount: direct_mount,
     unmount: direct_unmount,
     open: direct_open,
     close: direct_close,
     read: direct_read,
+    root: direct_root,
+    lookup: direct_lookup,
+    node_info: direct_node_info,
 };
 
 pub(super) fn endpoint() -> Endpoint<FileSystem> {

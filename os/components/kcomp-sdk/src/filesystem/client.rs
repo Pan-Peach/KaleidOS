@@ -76,6 +76,24 @@ impl FileSystemBinding {
     pub fn read(&self, handle: u64, buf: &mut [u8]) -> Result<usize, InvokeError> {
         backend::read(&self.backend, handle, buf)
     }
+
+    /// 本次挂载的根节点 token；卸载后失效。
+    pub fn root(&self) -> Result<u64, InvokeError> {
+        backend::root(&self.backend)
+    }
+
+    /// 在 parent 中查找一个名字；编码与原生匹配规则由 provider 检查。
+    pub fn lookup(&self, parent: u64, name: &[u8], encoding: u32) -> Result<u64, InvokeError> {
+        if name.is_empty() || name.len() > crate::generated::filesystem::KCOMP_FILESYSTEM_NAME_MAX {
+            return Err(InvokeError::Method(Errno::EINVAL));
+        }
+        backend::lookup(&self.backend, parent, name, encoding)
+    }
+
+    /// 返回 KCOMP_FILESYSTEM_NODE_* 类型。
+    pub fn node_info(&self, node: u64) -> Result<u32, InvokeError> {
+        backend::node_info(&self.backend, node)
+    }
 }
 
 #[cfg(test)]

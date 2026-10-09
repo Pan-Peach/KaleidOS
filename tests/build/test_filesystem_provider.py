@@ -26,6 +26,14 @@ class Providers(unittest.TestCase):
             subprocess.run(["mkfs.fat", "-F", "12", str(disk)], check=True, capture_output=True)
             subprocess.run(["mcopy", "-i", str(disk),
                             str(ROOT / "tests/fixtures/rootfs/HELLO.TXT"), "::/HELLO.TXT"], check=True)
+            for name in ("DIR1", "DIR2"):
+                subprocess.run(["mmd", "-i", str(disk), "::/" + name], check=True)
+                subprocess.run(["mcopy", "-i", str(disk),
+                                str(ROOT / "tests/fixtures/rootfs/HELLO.TXT"),
+                                "::/" + name + "/HELLO.TXT"], check=True)
+            for name in ("N1", "N2", "N3"):
+                subprocess.run(["mcopy", "-i", str(disk),
+                                str(ROOT / "tests/fixtures/rootfs/HELLO.TXT"), "::/" + name], check=True)
             for fs in ("fatfs", "littlefs"):
                 with self.subTest(provider=fs):
                     component = ROOT / "os/components/filesystems" / fs
@@ -38,6 +46,8 @@ class Providers(unittest.TestCase):
                         command += ["-DTEST_FATFS", "-include", str(component / "ffconf.h"),
                                     "-I" + str(ROOT / "third_party/fatfs/source"),
                                     str(component / "diskio_kaleidos.c"),
+                                    str(component / "fatfs_service.c"),
+                                    str(ROOT / "os/components/kcomp-sdk/c/kcomp_filesystem.c"),
                                     str(ROOT / "third_party/fatfs/source/ff.c")]
                     else:
                         command += ["-DLFS_NO_MALLOC", "-DLFS_NO_ASSERT", "-DLFS_NO_DEBUG",
@@ -50,3 +60,5 @@ class Providers(unittest.TestCase):
                     result = subprocess.run([str(binary), str(disk)], check=True,
                                             capture_output=True, text=True, timeout=10)
                     self.assertIn("interleaving PASS", result.stdout)
+                    if fs == "fatfs":
+                        self.assertIn("lookup/direct/gate/stale/capacity PASS", result.stdout)

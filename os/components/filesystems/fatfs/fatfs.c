@@ -38,6 +38,9 @@ static const struct kcomp_filesystem_api fatfs_api = {
     .open = fatfs_open,
     .close = fatfs_close,
     .read = fatfs_read,
+    .root = fatfs_root,
+    .lookup = fatfs_lookup,
+    .node_info = fatfs_node_info,
 };
 
 const uint64_t kcomp_abi = KCOMP_ABI;

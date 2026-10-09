@@ -459,12 +459,12 @@ fn component_contract_literals_are_pinned() {
     // filesystem：名字 + 指纹 + 只读 open flag。
     assert_eq!(
         generated_filesystem::KCOMP_FILESYSTEM_ABI,
-        0x4649_4C45_5359_5354,
+        0x4653_4E4F_4445_524F,
         "filesystem ABI 指纹值漂移"
     );
     assert_eq!(
         &generated_filesystem::KCOMP_FILESYSTEM_ABI.to_be_bytes(),
-        b"FILESYST",
+        b"FSNODERO",
         "filesystem ABI 指纹不再是 ASCII tag"
     );
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NAME, b"filesystem");
@@ -474,7 +474,7 @@ fn component_contract_literals_are_pinned() {
     );
 
     // filesystem endpoint 调用契约（wire 常量）：contract 身份 + 方法号 + 长度。
-    // 与 block 同一约定：ABI 指纹（"FILESYST"）标识 function table / 扁平编码的
+    // 与 block 同一约定：ABI 指纹（"FSNODERO"）标识 function table / 扁平编码的
     // 逐位布局，contract 身份（"VFSCONTR"）标识 endpoint 契约——**两个不同的值**。
     assert_eq!(
         generated_filesystem::KCOMP_FILESYSTEM_CONTRACT,
@@ -491,10 +491,18 @@ fn component_contract_literals_are_pinned() {
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_OPEN, 2);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_CLOSE, 3);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_READ, 4);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_ROOT, 5);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_LOOKUP, 6);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_NODE_INFO, 7);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_HANDLE_LEN, 8);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_FLAGS_LEN, 4);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_READ_HEADER_LEN, 8);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_PATH_MAX, 256);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN, 12);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NAME_MAX, 255);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_ENCODING_BYTES, 1);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NODE_FILE, 1);
+    assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NODE_DIRECTORY, 2);
 
     // InterfaceKind 编码（Core 侧真实类型，来自 component.toml 生成物）：
     // ABI 编码 0/1/2，与 docs/architecture/component-model.md §2 一致。

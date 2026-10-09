@@ -52,7 +52,10 @@ CoreTest 验证公开组件接口的集成契约，ArchTest 验证实际硬件�
 和 littlefs 并验证内容、错误路径与旧句柄；这仍不是 VFS 或应用运行期文件访问。
 `tests/build/test_filesystem_provider.py` 编译生产 C provider 与上游 FS 库，在宿主
 块介质 fake 内强制停住读 I/O，验证并发 close/mount 返回 EBUSY；同时验证旧句柄、
-零长度读、句柄耗尽以及 C SDK 普通数据缓冲前端。它证明库/状态串行纪律，不声称
+零长度读、句柄耗尽以及 C SDK 普通数据缓冲前端。FatFs 的节点场景经 C SDK
+Direct / Gate 调用真实 backend / FatFs 库，覆盖嵌套目录、大小写 token 复用、
+缺失与非法名字、非目录/过期 parent、节点表耗尽和重新挂载失效；SDK host
+测试另验证 Rust adapter 与 wire 编码。它证明库/状态串行纪律，不声称
 硬件隔离或 DMA 撤销。源码推导和报告推演不得登记为 QEMU PASS。
 
 ## 4. 如何运行与观察

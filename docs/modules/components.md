@@ -17,7 +17,7 @@
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；每 CPU cursor 保存上次提议的 TaskId，按候选 id 后继轮转，避免列表排除 outgoing 时的下标饥饿；游标属于实例，只提议 TaskId |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | opaque compatible 粗匹配；create config 下发 device/结果端口，成功后 pull probe.result；完成全部候选；同驱动/设备去重，已 Match 设备不交后续候选 |
 | `virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | 每实例 claim 一个 VirtIO-MMIO 设备；sector 0 传输健康检查后发布 block.device/probe.result；不解释格式签名，RV32 LBA 溢出明确拒绝 |
-| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs + block.device diskio；实例级 try-lock 串行库状态/文件表；竞争 EBUSY、handle 单调不复用 |
+| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs + block.device diskio；root / 单段 lookup / node_info，ASCII 8.3；节点表含根共 8 槽，挂载期间驻留、卸载失效；实例级 try-lock 串行库状态/文件表/节点表，竞争 EBUSY、handle 与 node token 分别单调不复用；语义与 wire 见 [filesystem schema](../../abi/filesystem.toml) |
 | `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`，实例级 try-lock，handle 不复用）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
 | `vfs` | `os/components/filesystems/vfs/` | Rust `.kcomp` 骨架 | Namespace / File service 内部类型与操作占位；create 返回 `-ENOTSUP`，尚无服务 endpoint。现状与手写入口见 [`vfs.md`](vfs.md) |
 | `posix` | `os/components/personalities/posix/` | Rust `.kcomp` | RV64/MMU 普通用户进程族，fork/exec/wait、console 与只读 posix.process endpoint 已接；通用 VFS/fd 仍骨架，见 [`posix.md`](posix.md) |

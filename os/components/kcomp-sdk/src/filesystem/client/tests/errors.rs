@@ -49,6 +49,9 @@ fn direct_error_mapping_keeps_method_and_invalid_reply_apart() {
         open: direct_open,
         close: direct_close,
         read: direct_read,
+        root: direct_root,
+        lookup: direct_lookup,
+        node_info: direct_node_info,
     };
     static BOGUS_TABLE: FileSystemApi = FileSystemApi {
         mount: bogus_mount,
@@ -56,6 +59,9 @@ fn direct_error_mapping_keeps_method_and_invalid_reply_apart() {
         open: direct_open,
         close: direct_close,
         read: direct_read,
+        root: direct_root,
+        lookup: direct_lookup,
+        node_info: direct_node_info,
     };
 
     test_support::reset_script();

@@ -87,4 +87,14 @@ struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_bin
                                                uint64_t handle, void *output, size_t output_len,
                                                size_t *out_read);
 
+/* 节点 token 与 open handle 分离；有效期见 abi/filesystem.toml。 */
+struct kcomp_call_result kcomp_filesystem_root(const struct kcomp_filesystem_binding *binding,
+                                               uint64_t *out_node);
+struct kcomp_call_result kcomp_filesystem_lookup(const struct kcomp_filesystem_binding *binding,
+                                                 uint64_t parent, const uint8_t *name,
+                                                 size_t name_len, uint32_t encoding,
+                                                 uint64_t *out_node);
+struct kcomp_call_result kcomp_filesystem_node_info(const struct kcomp_filesystem_binding *binding,
+                                                    uint64_t node, uint32_t *out_kind);
+
 #endif /* KCOMP_FILESYSTEM_H */

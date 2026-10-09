@@ -26,8 +26,10 @@ use crate::errno::Errno;
 use crate::filesystem::dispatch::{decode_handle, decode_read_len, encode_flags, encode_handle};
 use crate::filesystem::{FileSystem, FileSystemApi};
 use crate::generated::filesystem::{
-    KCOMP_FILESYSTEM_HANDLE_LEN, KCOMP_FILESYSTEM_METHOD_CLOSE, KCOMP_FILESYSTEM_METHOD_MOUNT,
-    KCOMP_FILESYSTEM_METHOD_OPEN, KCOMP_FILESYSTEM_METHOD_READ, KCOMP_FILESYSTEM_METHOD_UNMOUNT,
+    KCOMP_FILESYSTEM_HANDLE_LEN, KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN, KCOMP_FILESYSTEM_METHOD_CLOSE,
+    KCOMP_FILESYSTEM_METHOD_LOOKUP, KCOMP_FILESYSTEM_METHOD_MOUNT,
+    KCOMP_FILESYSTEM_METHOD_NODE_INFO, KCOMP_FILESYSTEM_METHOD_OPEN, KCOMP_FILESYSTEM_METHOD_READ,
+    KCOMP_FILESYSTEM_METHOD_ROOT, KCOMP_FILESYSTEM_METHOD_UNMOUNT,
     KCOMP_FILESYSTEM_READ_HEADER_LEN,
 };
 
@@ -188,6 +190,92 @@ pub(super) fn read(backend: &Backend, handle: u64, buf: &mut [u8]) -> Result<usi
                 &frame[KCOMP_FILESYSTEM_READ_HEADER_LEN..KCOMP_FILESYSTEM_READ_HEADER_LEN + actual],
             );
             Ok(actual)
+        }
+    }
+}
+
+pub(super) fn root(backend: &Backend) -> Result<u64, InvokeError> {
+    let node = match backend {
+        Backend::Direct { api, ctx } => {
+            let mut node = 0;
+            // SAFETY: table 来自 Core bind；out 在调用期间可写。
+            map_status(unsafe { (table(*api).root)(*ctx, &mut node) })?;
+            node
+        }
+        Backend::Gate { endpoint } => {
+            let mut reply = [0; KCOMP_FILESYSTEM_HANDLE_LEN];
+            invoke_gate(
+                *endpoint,
+                KCOMP_FILESYSTEM_METHOD_ROOT,
+                &[],
+                &[],
+                &mut reply,
+            )?;
+            u64::from_le_bytes(reply)
+        }
+    };
+    if node == 0 {
+        Err(InvokeError::InvalidReply)
+    } else {
+        Ok(node)
+    }
+}
+
+pub(super) fn lookup(
+    backend: &Backend,
+    parent: u64,
+    name: &[u8],
+    encoding: u32,
+) -> Result<u64, InvokeError> {
+    let node = match backend {
+        Backend::Direct { api, ctx } => {
+            let mut node = 0;
+            // SAFETY: table 来自 Core bind；name 与 out 在调用期间有效。
+            map_status(unsafe {
+                (table(*api).lookup)(*ctx, parent, name.as_ptr(), name.len(), encoding, &mut node)
+            })?;
+            node
+        }
+        Backend::Gate { endpoint } => {
+            let mut args = [0; KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN];
+            args[..8].copy_from_slice(&parent.to_le_bytes());
+            args[8..].copy_from_slice(&encoding.to_le_bytes());
+            let mut reply = [0; KCOMP_FILESYSTEM_HANDLE_LEN];
+            invoke_gate(
+                *endpoint,
+                KCOMP_FILESYSTEM_METHOD_LOOKUP,
+                &args,
+                name,
+                &mut reply,
+            )?;
+            u64::from_le_bytes(reply)
+        }
+    };
+    if node == 0 {
+        Err(InvokeError::InvalidReply)
+    } else {
+        Ok(node)
+    }
+}
+
+pub(super) fn node_info(backend: &Backend, node: u64) -> Result<u32, InvokeError> {
+    match backend {
+        Backend::Direct { api, ctx } => {
+            let mut kind = 0;
+            // SAFETY: table 来自 Core bind；out 在调用期间可写。
+            map_status(unsafe { (table(*api).node_info)(*ctx, node, &mut kind) })?;
+            Ok(kind)
+        }
+        Backend::Gate { endpoint } => {
+            let mut reply = [0; 4];
+            invoke_gate(
+                *endpoint,
+                KCOMP_FILESYSTEM_METHOD_NODE_INFO,
+                &node.to_le_bytes(),
+                &[],
+                &mut reply,
+            )?;
+            Ok(u32::from_le_bytes(reply))
         }
     }
 }

@@ -143,6 +143,50 @@ static int32_t dispatch_read(struct fatfs_state *state, const struct kcomp_call_
     return 0;
 }
 
+static int32_t dispatch_root(struct fatfs_state *state, const struct kcomp_call_frame *frame)
+{
+    if (frame->args_len != 0 || frame->input_len != 0 || frame->output == NULL ||
+        frame->output_len != KCOMP_FILESYSTEM_HANDLE_LEN)
+        return -EINVAL;
+    uint64_t node = 0;
+    int32_t result = fatfs_root(state, &node);
+    if (result == 0)
+        write_le64(frame->output, node);
+    return result;
+}
+
+static int32_t dispatch_lookup(struct fatfs_state *state, const struct kcomp_call_frame *frame)
+{
+    if (frame->args == NULL || frame->args_len != KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN ||
+        frame->input == NULL || frame->input_len == 0 ||
+        frame->input_len > KCOMP_FILESYSTEM_NAME_MAX || frame->output == NULL ||
+        frame->output_len != KCOMP_FILESYSTEM_HANDLE_LEN)
+        return -EINVAL;
+    uint8_t name[KCOMP_FILESYSTEM_NAME_MAX];
+    memcpy(name, frame->input, frame->input_len);
+    uint64_t node = 0;
+    int32_t result = fatfs_lookup(state, read_le64(frame->args), name, frame->input_len,
+                                  read_le32(frame->args + KCOMP_FILESYSTEM_HANDLE_LEN), &node);
+    if (result == 0)
+        write_le64(frame->output, node);
+    return result;
+}
+
+static int32_t dispatch_node_info(struct fatfs_state *state, const struct kcomp_call_frame *frame)
+{
+    if (frame->args == NULL || frame->args_len != KCOMP_FILESYSTEM_HANDLE_LEN ||
+        frame->input_len != 0 || frame->output == NULL ||
+        frame->output_len != KCOMP_FILESYSTEM_FLAGS_LEN)
+        return -EINVAL;
+    uint32_t kind = 0;
+    int32_t result = fatfs_node_info(state, read_le64(frame->args), &kind);
+    if (result == 0) {
+        for (size_t i = 0; i < KCOMP_FILESYSTEM_FLAGS_LEN; ++i)
+            frame->output[i] = KCOMP_FILESYSTEM_U32_BYTE(kind, i);
+    }
+    return result;
+}
+
 int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t method,
                                const struct kcomp_call_frame *frame)
 {
@@ -176,6 +220,15 @@ int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t met
 
     case KCOMP_FILESYSTEM_METHOD_READ:
         return dispatch_read(state, frame);
+
+    case KCOMP_FILESYSTEM_METHOD_ROOT:
+        return dispatch_root(state, frame);
+
+    case KCOMP_FILESYSTEM_METHOD_LOOKUP:
+        return dispatch_lookup(state, frame);
+
+    case KCOMP_FILESYSTEM_METHOD_NODE_INFO:
+        return dispatch_node_info(state, frame);
 
     default:
         /* 能力缺失（不是畸形帧）：与 Core 对"没有 dispatcher"的档位一致。 */

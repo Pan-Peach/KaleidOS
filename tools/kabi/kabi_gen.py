@@ -2229,18 +2229,21 @@ doc = "I/O error"
     assert block_consts["KCOMP_BLOCK_METHOD_WRITE"] == 2
     assert block_consts["KCOMP_BLOCK_LBA_LEN"] == 8
     assert block_consts["KCOMP_BLOCK_CAPACITY_LEN"] == 8
-    assert len(filesystem.structs) == 1 and filesystem.structs[0].size_ptrs == 5
+    assert len(filesystem.structs) == 1 and filesystem.structs[0].size_ptrs == 8
     assert [field.name for field in filesystem.structs[0].fields] == [
         "mount",
         "unmount",
         "open",
         "close",
         "read",
+        "root",
+        "lookup",
+        "node_info",
     ]
     filesystem_abi = [
         const for const in filesystem.constants if const.name == "KCOMP_FILESYSTEM_ABI"
     ][0]
-    assert filesystem_abi.value == 0x4649_4C45_5359_5354
+    assert filesystem_abi.value == 0x4653_4E4F_4445_524F
     filesystem_consts = {const.name: const.value for const in filesystem.constants}
     assert filesystem_consts["KCOMP_FILESYSTEM_CONTRACT"] == 0x5646_5343_4F4E_5452
     assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_MOUNT"] == 0

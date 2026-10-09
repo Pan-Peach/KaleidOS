@@ -7,6 +7,7 @@
 #include "kcomp.h"
 #include "fatfs_internal.h"
 #include <errno.h>
+#include <string.h>
 
 static int32_t fatfs_result(FRESULT result)
 {
@@ -87,12 +88,19 @@ static int32_t fatfs_mount_locked(void *ctx)
         return 0; /* Already mounted */
     }
 
+    if (state->last_node == UINT64_MAX)
+        return -EOVERFLOW;
+
     FRESULT result = f_mount(&state->filesystem, "0:", 1);
     if (result != FR_OK)
     {
         return fatfs_result(result);
     }
 
+    memset(state->nodes, 0, sizeof(state->nodes));
+    state->nodes[0].id = ++state->last_node;
+    state->nodes[0].kind = KCOMP_FILESYSTEM_NODE_DIRECTORY;
+    strcpy(state->nodes[0].path, "0:");
     state->mounted = 1;
     FATFS_LOG_LINE("[fatfs] mount");
     return 0;
@@ -127,6 +135,7 @@ static int32_t fatfs_unmount_locked(void *ctx)
     }
 
     state->mounted = 0;
+    memset(state->nodes, 0, sizeof(state->nodes));
     FATFS_LOG_LINE("[fatfs] unmount");
     return 0;
 }
@@ -305,6 +314,154 @@ int32_t fatfs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t 
     if (!fatfs_enter(state))
         return -EBUSY;
     int32_t result = fatfs_read_locked(ctx, handle, buf, len, out_read);
+    fatfs_leave(state);
+    return result;
+}
+
+static struct fatfs_node *fatfs_find_node(struct fatfs_state *state, uint64_t id)
+{
+    for (size_t i = 0; id != 0 && i < FATFS_MAX_NODES; ++i) {
+        if (state->nodes[i].id == id)
+            return &state->nodes[i];
+    }
+    return NULL;
+}
+
+/* 当前 FF_USE_LFN=0：只接受可精确表示的 ASCII 8.3 名字，避免 FatFs 截断、
+ * 忽略尾点或空格后查到另一个名字。大小写匹配仍由 FatFs 完成。 */
+static int32_t fatfs_check_name(const uint8_t *name, size_t len, uint32_t encoding)
+{
+    if (encoding != KCOMP_FILESYSTEM_ENCODING_BYTES)
+        return -ENOTSUP;
+    if (len == 0 || len > 12)
+        return -EINVAL;
+    size_t dot = len;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t ch = name[i];
+        if (ch >= 0x80)
+            return -ENOTSUP;
+        if (ch <= 0x20 || ch == 0x7f || strchr("\"*+,/:;<=>?[\\]|", ch) != NULL)
+            return -EINVAL;
+        if (ch == '.') {
+            if (dot != len)
+                return -EINVAL;
+            dot = i;
+        }
+    }
+    if (dot == 0 || dot > 8 || (dot != len && (dot + 1 == len || len - dot - 1 > 3)))
+        return -EINVAL;
+    return 0;
+}
+
+static int32_t fatfs_lookup_locked(struct fatfs_state *state, uint64_t parent,
+                                  const uint8_t *name, size_t name_len,
+                                  uint32_t encoding, uint64_t *out_node)
+{
+    if (!state->alive || !state->mounted)
+        return -ENODEV;
+    struct fatfs_node *directory = fatfs_find_node(state, parent);
+    if (directory == NULL)
+        return -EBADF;
+    if (directory->kind != KCOMP_FILESYSTEM_NODE_DIRECTORY)
+        return -ENOTDIR;
+    int32_t result = fatfs_check_name(name, name_len, encoding);
+    if (result != 0)
+        return result;
+
+    char path[KCOMP_FILESYSTEM_PATH_MAX];
+    size_t prefix = strlen(directory->path);
+    if (prefix + 1 + name_len + 1 > sizeof(path))
+        return -ENAMETOOLONG;
+    memcpy(path, directory->path, prefix);
+    path[prefix++] = '/';
+    memcpy(path + prefix, name, name_len);
+    path[prefix + name_len] = '\0';
+
+    FILINFO info;
+    FRESULT status = f_stat(path, &info);
+    if (status != FR_OK)
+        return fatfs_result(status);
+
+    /* f_stat 的 fname 是磁盘目录项的原生名字，大小写别名共享同一 token。 */
+    size_t canonical_len = strlen(info.fname);
+    if (prefix + canonical_len + 1 > sizeof(path))
+        return -ENAMETOOLONG;
+    memcpy(path + prefix, info.fname, canonical_len + 1);
+    struct fatfs_node *free_node = NULL;
+    for (size_t i = 0; i < FATFS_MAX_NODES; ++i) {
+        struct fatfs_node *node = &state->nodes[i];
+        if (node->id != 0 && node->parent == parent &&
+            strlen(node->path) == prefix + canonical_len &&
+            memcmp(node->path, path, prefix + canonical_len) == 0) {
+            *out_node = node->id;
+            return 0;
+        }
+        if (node->id == 0 && free_node == NULL)
+            free_node = node;
+    }
+    if (free_node == NULL)
+        return -ENOSPC;
+    if (state->last_node == UINT64_MAX)
+        return -EOVERFLOW;
+    strcpy(free_node->path, path);
+    free_node->parent = parent;
+    free_node->kind = (info.fattrib & AM_DIR) ? KCOMP_FILESYSTEM_NODE_DIRECTORY
+                                             : KCOMP_FILESYSTEM_NODE_FILE;
+    free_node->id = ++state->last_node;
+    *out_node = free_node->id;
+    return 0;
+}
+
+int32_t fatfs_root(void *ctx, uint64_t *out_node)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL || out_node == NULL)
+        return -EINVAL;
+    *out_node = 0;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = (!state->alive || !state->mounted) ? -ENODEV : 0;
+    if (result == 0) {
+        *out_node = state->nodes[0].id;
+        FATFS_LOG_LINE("[fatfs] root");
+    }
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_lookup(void *ctx, uint64_t parent, const uint8_t *name,
+                     size_t name_len, uint32_t encoding, uint64_t *out_node)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL || name == NULL || out_node == NULL)
+        return -EINVAL;
+    *out_node = 0;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_lookup_locked(state, parent, name, name_len, encoding, out_node);
+    if (result == 0)
+        FATFS_LOG_LINE("[fatfs] lookup");
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_node_info(void *ctx, uint64_t id, uint32_t *out_kind)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL || out_kind == NULL)
+        return -EINVAL;
+    *out_kind = 0;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = -ENODEV;
+    if (state->alive && state->mounted) {
+        struct fatfs_node *node = fatfs_find_node(state, id);
+        result = node == NULL ? -EBADF : 0;
+        if (node != NULL)
+            *out_kind = node->kind;
+    }
+    if (result == 0)
+        FATFS_LOG_LINE("[fatfs] node_info");
     fatfs_leave(state);
     return result;
 }
