@@ -137,8 +137,8 @@ fn dispatch_callback(handler: IrqHandler, ctx: *mut (), owner: ComponentId) {
 
 /// 把一条中断号路由成组件投递目标：`(owner, handler, ctx)`。
 ///
-/// Core 真相：只认 IRQ 表上 live route——组件 release/失败后不会再有回调进入
-/// 它的代码。**锁内只取一份拷贝，实际回调在锁外执行**（trap 可能重入 spin 锁）。
+/// Core 真相：撤销 route 阻止后续准入；已复制并准入的 callback 仍可完成，
+/// 由 component inflight 保活。**锁内只取拷贝，回调在锁外执行**。
 pub fn route(number: u32) -> Option<(ComponentId, IrqHandler, *mut ())> {
     crate::resource::irq::get_table().lock().route_of(number)
 }

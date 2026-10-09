@@ -8,6 +8,7 @@ pub const PASSIVE: u32 = 0;
 pub const ACTIVE: u32 = 1;
 pub const HYBRID: u32 = 2;
 pub const GATE_ONLY: u32 = 3;
+pub const LIFECYCLE_PROBE: u32 = 4;
 
 /// phase: 0 empty, 1 producer reserved, 2 request, 3 reply.
 /// All shared words are accessed through AtomicU32::from_ptr, on both sides.

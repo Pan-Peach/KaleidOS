@@ -56,6 +56,7 @@ CHOOSE_NEXT 的 args 为 `current TaskId + CpuId`，各 u32 LE；input 是本 CP
 - unpark 校验 caller 是 owner。Blocked → Runnable 提交后通知固定 CPU；尚未 Blocked 时记 permit。等待条件与循环重查属于组件。
 - start、远端 wake、安装策略触发 Reschedule IPI；handler 只应答和标记 pending，调度在 Core 安全点进行。
 - AP 在空闲循环运行本 CPU 候选；BSP 在 monitor / console 安全点服务本地工作。monitor 读串口前先服务 Runnable 任务，避免在组件 console 任务 yield 回锚点后抢读其输入；未配置策略时保留 monitor 初始组合入口。检查工作与休眠在本地关 IRQ 下衔接，保留 pending 门铃，避免丢失唤醒。忙任务仍需主动 yield / park / exit。
+- Init / Exit 临时栈及其嵌套边界拒绝 yield / park / exit；Init 创建、启动 Worker 与启动锚点 sched_run 保留。边界规则见 [组件生命周期 §7](component-lifecycle.md#7-资源归属-identity-规则重要陷阱)。
 - task table 与 registry 的共享锁在获取前关闭本地 IRQ，释放后恢复。组件创建与停止以同一 registry → task 顺序完成 admission，停止不能漏掉并发创建的任务。
 
 ## 6. 失败边界与当前范围

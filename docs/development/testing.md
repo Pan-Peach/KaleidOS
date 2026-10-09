@@ -144,7 +144,7 @@ provider panic、失败状态、新实例与过期绑定。测试控制属于 te
 
 ArchTest 的 isolated 用例保留私有 AS、实际 backing、satp 恢复、访问权限、
 销毁故障与回收现场的证据。当前公开 create 固定 KernelNative，load 只支持默认配置，
-且没有 stop ABI；需要指定 Isolated config 或检查销毁现场的用例仍由 ArchTest 承担。
+已有 `kcore_component_stop`；需要指定 Isolated config 或检查私有域销毁现场的用例仍由 ArchTest 承担。
 这些约束不能靠测试后门绕过。
 
 ## Component 形态与 Stop 准入实验
@@ -160,6 +160,10 @@ RV32 单 CPU 协作运行。Consumer 错误 unpark provider-owned task 必须 EA
 内执行 Gate，CPU0 Stop 返回 EBUSY 且仍 Ready；返回后 Stop 成功，旧 endpoint 拒绝，
 重新创建获得新身份。host 的 128 轮 begin_call/begin_stop 竞争只证明锁和状态机，
 QEMU 场景才证明真实双 CPU 在途调用。命令为 `make test-qemu`。
+
+同一 fixture 的 LifecycleProbe 模式由 consumer Task 创建并停止。Init / Exit 调用公开
+`task_yield`、`task_park`、`task_exit` 均返回 EINVAL；随后 endpoint 发布与销毁成功，
+验证真实临时栈返回后 principal 仍正确。该模式无 Worker、无 Direct 表。
 
 Worker 使用已有 yield，错误路径有有限超时；没有跨 owner 的 wake、通用取消、Task
 join 或私有域 Worker 能力。这不是生产 RPC runtime。Direct 发布后 ctx 保留，停止

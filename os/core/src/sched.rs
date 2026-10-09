@@ -697,7 +697,9 @@ pub(crate) fn service_local() -> bool {
 
 /// 当前任务主动让出 CPU：Running → Runnable，切换走。再次被选中时返回。
 pub fn yield_current() -> Result<(), SchedError> {
-    deny_scheduling_forbidden()?;
+    if containment::task_switch_forbidden() {
+        return Err(SchedError::InvalidTransition);
+    }
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Runnable), None)
 }
@@ -705,7 +707,9 @@ pub fn yield_current() -> Result<(), SchedError> {
 /// 当前任务退出：Running → Exited，切换走。**本任务从此不再恢复**——
 /// 若还有 Runnable 任务则它们接管；全部退出后控制权回到锚点。
 pub fn exit_current() -> Result<(), SchedError> {
-    deny_scheduling_forbidden()?;
+    if containment::task_switch_forbidden() {
+        return Err(SchedError::InvalidTransition);
+    }
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     schedule_next(Some(current), Some(TaskState::Exited), None)
 }
@@ -717,7 +721,9 @@ pub fn exit_current() -> Result<(), SchedError> {
 /// 覆盖策略执行期间的远端 unpark。IRQ guard 转交保存值给 outgoing execution，
 /// 切换不携带 guard；在 incoming 栈上恢复该执行流自己的 IRQ 状态。
 pub fn park_current() -> Result<(), SchedError> {
-    deny_scheduling_forbidden()?;
+    if containment::task_switch_forbidden() {
+        return Err(SchedError::InvalidTransition);
+    }
     let guard = IrqSaveGuard::new();
     let current = cpu().lock().current.ok_or(SchedError::NoCurrent)?;
     let has_permit = {

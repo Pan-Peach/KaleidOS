@@ -89,6 +89,10 @@ pub enum DmaError {
     NotFound,
     /// `ptr + len` 溢出或 `len == 0`。
     BadRange,
+    /// caller 或设备 owner 已不可获取新 authority。
+    OwnerNotReady,
+    /// mapping identity 空间耗尽；永不回绕或复用。
+    IdExhausted,
 }
 
 /// 一次 device 可见地址的映射结果。
@@ -178,12 +182,13 @@ impl DmaTable {
         device: DeviceId,
         ptr: usize,
         _len: usize,
-    ) -> DmaMapping {
+    ) -> Result<DmaMapping, DmaError> {
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let next = id.checked_add(1).ok_or(DmaError::IdExhausted)?;
+        self.next_id = next;
         let device_addr = ptr; // No-IOMMU identity；IOMMU 时改为 IOVA。
         self.mappings.push(Mapping { id, owner, device });
-        DmaMapping { device_addr, id }
+        Ok(DmaMapping { device_addr, id })
     }
 
     /// 撤销一条映射（按 id 唯一定位）。
@@ -269,6 +274,10 @@ pub fn alloc(owner: ComponentId, size: usize) -> Result<DmaBuffer, DmaError> {
         MemoryError::Exhausted => DmaError::Exhausted,
         MemoryError::InvalidSize | MemoryError::DoubleFree => DmaError::InvalidSize,
     })?;
+    let registry = crate::component::registry::get_registry().lock();
+    if !registry.may_run(owner) {
+        return Err(DmaError::OwnerNotReady); // unpublished lease drops normally
+    }
     Ok(get_table().lock().insert_allocation(owner, lease))
 }
 
@@ -293,7 +302,7 @@ pub fn map(
     len: usize,
     direction: DmaDirection,
 ) -> Result<DmaMapping, DmaError> {
-    let _ = (ctx, direction); // ctx 仅为 ABI 一致性；方向对 No-IOMMU identity 无影响。
+    let _ = direction; // No-IOMMU identity does not depend on direction.
     if ptr.is_null() || len == 0 || (ptr as usize).checked_add(len).is_none() {
         return Err(DmaError::BadRange);
     }
@@ -305,14 +314,21 @@ pub fn map(
     }
 
     let _guard = IrqSaveGuard::new();
-    // 锁序 device → dma（device 表是最外层）。
+    // registry → device → dma; validate both caller and intrinsic owner.
+    let registry = crate::component::registry::get_registry().lock();
+    if !registry.may_run(ctx.component) {
+        return Err(DmaError::OwnerNotReady);
+    }
     let device_table = super::device::get_table().lock();
     let Some(owner) = device_table.owner(device) else {
         return Err(DmaError::NotOwner);
     };
+    if !registry.may_run(owner) {
+        return Err(DmaError::OwnerNotReady);
+    }
     let mapping = get_table()
         .lock()
-        .insert_mapping(owner, device, ptr as usize, len);
+        .insert_mapping(owner, device, ptr as usize, len)?;
     // device release checks child mappings under this same device lock.
     // Keep ownership stable until the new child is visible.
     drop(device_table);
@@ -354,6 +370,91 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_failure_cannot_leave_a_late_allocation() {
+        use std::sync::{Arc, Barrier};
+        let _heap = test_support::GUARD.lock();
+        test_support::ensure_init();
+        super::init();
+        crate::component::endpoint::init();
+        crate::resource::device::init();
+        crate::resource::irq::init();
+        for _ in 0..64 {
+            let owner = crate::component::registry::test_support::ready(b"dma-failure-race");
+            let barrier = Arc::new(Barrier::new(2));
+            let remote = barrier.clone();
+            let grant = std::thread::spawn(move || {
+                remote.wait();
+                super::alloc(owner, 4096).map(|buffer| buffer.ptr as usize)
+            });
+            barrier.wait();
+            crate::component::fail_component(
+                owner,
+                crate::component::load::ComponentLoadError::TaskPanicked(
+                    crate::task::TaskId::from_raw(1),
+                ),
+            );
+            let result = grant.join().unwrap();
+            assert!(result.is_ok() || matches!(result, Err(DmaError::OwnerNotReady)));
+            assert!(
+                !super::get_table()
+                    .lock()
+                    .allocations
+                    .iter()
+                    .any(|a| a.owner == owner)
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_mapping_ids_never_reuse_a_stale_identity() {
+        let mut table = DmaTable::new();
+        table.next_id = u64::MAX - 1;
+        let mapping = table
+            .insert_mapping(cid(1), DeviceId::from_raw(0), 0x1000, 16)
+            .unwrap();
+        table.remove_mapping(mapping.id).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                table.insert_mapping(cid(1), DeviceId::from_raw(0), 0x2000, 16),
+                Err(DmaError::IdExhausted)
+            ));
+            assert_eq!(table.remove_mapping(mapping.id), Err(DmaError::NotFound));
+            assert!(table.mappings.is_empty());
+            assert_eq!(table.next_id, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn allocation_rechecks_failed_owner_and_drops_unpublished_backing() {
+        let _heap = test_support::GUARD.lock();
+        test_support::ensure_init();
+        super::init();
+        let owner = crate::component::registry::test_support::ready(b"dma-stale-admission");
+        assert!(
+            crate::component::registry::get_registry()
+                .lock()
+                .may_run(owner)
+        );
+        crate::component::registry::get_registry()
+            .lock()
+            .mark_failed(owner)
+            .unwrap();
+        let before = crate::memory::free_block_counts();
+        assert!(matches!(
+            super::alloc(owner, 4096),
+            Err(DmaError::OwnerNotReady)
+        ));
+        assert_eq!(crate::memory::free_block_counts(), before);
+        assert!(
+            !super::get_table()
+                .lock()
+                .allocations
+                .iter()
+                .any(|a| a.owner == owner)
+        );
+    }
+
+    #[test]
     fn direction_encoding_roundtrips() {
         for direction in [
             DmaDirection::ToDevice,
@@ -370,8 +471,8 @@ mod tests {
         let owner = cid(1);
         let device = DeviceId::from_raw(0);
         let mut table = DmaTable::new();
-        let first = table.insert_mapping(owner, device, 0x1000, 16);
-        let second = table.insert_mapping(owner, device, 0x2000, 16);
+        let first = table.insert_mapping(owner, device, 0x1000, 16).unwrap();
+        let second = table.insert_mapping(owner, device, 0x2000, 16).unwrap();
         assert_ne!(first.id, second.id, "mapping id 单调唯一");
         assert_eq!(first.device_addr, 0x1000, "No-IOMMU identity");
 
@@ -389,7 +490,7 @@ mod tests {
         let owner = cid(1);
         let far = DeviceId::from_raw(260);
         let mut table = DmaTable::new();
-        let mapping = table.insert_mapping(owner, far, 0x1000, 16);
+        let mapping = table.insert_mapping(owner, far, 0x1000, 16).unwrap();
         assert!(table.has_mapping_for_device(far));
         assert!(!table.has_mapping_for_device(DeviceId::from_raw(0)));
         assert_eq!(table.remove_mapping(mapping.id), Ok(owner));
@@ -399,7 +500,9 @@ mod tests {
     #[test]
     fn unmap_unknown_id_is_not_found() {
         let mut table = DmaTable::new();
-        let mapping = table.insert_mapping(cid(1), DeviceId::from_raw(0), 0x1000, 16);
+        let mapping = table
+            .insert_mapping(cid(1), DeviceId::from_raw(0), 0x1000, 16)
+            .unwrap();
         assert_eq!(
             table.remove_mapping(mapping.id + 1),
             Err(DmaError::NotFound)
@@ -414,7 +517,7 @@ mod tests {
         test_support::ensure_init();
         super::init();
 
-        let owner = cid(50);
+        let owner = crate::component::registry::test_support::ready(b"dma-free");
         let buffer = super::alloc(owner, 4096).expect("alloc");
         assert!(!buffer.ptr.is_null());
         assert!(buffer.len >= 4096);
@@ -437,7 +540,7 @@ mod tests {
         // 非 owner 不能释放别人的 allocation。
         let other_buffer = super::alloc(owner, 4096).expect("alloc 2");
         assert_eq!(
-            super::free(cid(51), other_buffer.ptr),
+            super::free(cid(u32::MAX), other_buffer.ptr),
             Err(DmaError::NotOwner)
         );
     }
@@ -448,14 +551,17 @@ mod tests {
         test_support::ensure_init();
         super::init();
 
-        let owner = cid(52);
+        let owner = crate::component::registry::test_support::ready(b"dma-revoke");
         let buffer = super::alloc(owner, 8192).expect("alloc");
-        super::get_table().lock().insert_mapping(
-            owner,
-            DeviceId::from_raw(3),
-            buffer.ptr as usize,
-            buffer.len,
-        );
+        super::get_table()
+            .lock()
+            .insert_mapping(
+                owner,
+                DeviceId::from_raw(3),
+                buffer.ptr as usize,
+                buffer.len,
+            )
+            .unwrap();
 
         let before_quarantine = super::quarantine_len();
         let before_free = crate::memory::free_block_counts();

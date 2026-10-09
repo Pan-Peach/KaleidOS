@@ -220,14 +220,11 @@ mod imp {
         let create_entry = placed.create();
 
         // (2) 声明组件：它 1:1 拥有这次加载结果（lease 随 loaded 常驻）。
-        let id = registry::get_registry()
-            .lock()
-            .declare(
-                name,
-                placed.into_loaded_component(),
-                ExecutionDomain::IsolatedNative,
-            )
-            .map_err(|_| ComponentLoadError::DeclareFailed)?;
+        let id = crate::component::load::declare_instance(
+            name,
+            placed.into_loaded_component(),
+            ExecutionDomain::IsolatedNative,
+        )?;
 
         // (3) 私有 AS：还没有 AS 就没有可清理的，直接 Failed。
         let handle = match address_space::create_isolated_address_space_for(id) {

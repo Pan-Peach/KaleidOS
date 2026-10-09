@@ -58,6 +58,8 @@ pub enum DeviceClaimError {
     DeviceNotFound,
     /// 该设备的**主窗口**（`spaces[0]`）不是 MMIO（PIO / 无窗口；当前不支持）。
     NotMmio,
+    /// owner 未知或不在 Starting / Ready，拒绝新 authority。
+    OwnerNotReady,
     /// 该设备已被认领，或已被失败 quarantine 标记。
     DeviceBusy,
 }
@@ -245,7 +247,11 @@ pub fn claim(ctx: &RequestContext, device: DeviceId) -> Result<DeviceMapping, De
         return Err(DeviceClaimError::NotMmio);
     };
 
-    let _guard = IrqSaveGuard::new();
+    // registry → device: failure cannot commit between admission and insertion.
+    let registry = crate::component::registry::get_registry().lock();
+    if !registry.may_run(ctx.component) {
+        return Err(DeviceClaimError::OwnerNotReady);
+    }
     get_table().lock().claim(ctx.component, device)?;
     emit(TraceEvent::ResourceGrant {
         component: ctx.component,
@@ -517,7 +523,7 @@ mod tests {
         super::install_for_test(300);
 
         let ctx = crate::resource::RequestContext {
-            component: owner(60),
+            component: crate::component::registry::test_support::ready(b"device-window"),
             task: None,
         };
         // 越界 → DeviceNotFound。

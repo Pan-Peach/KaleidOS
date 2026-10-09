@@ -600,6 +600,19 @@ pub(crate) fn scheduling_forbidden() -> bool {
     })
 }
 
+/// A lifecycle entry has a temporary stack above the scheduler's current task.
+/// It cannot suspend or exit that task: the scheduler saves only Task boundaries.
+/// Anchor init may still run/start workers through the ordinary scheduling gate.
+pub(crate) fn task_switch_forbidden() -> bool {
+    scheduling_forbidden()
+        || chain_any(|guard| {
+            matches!(
+                guard.kind,
+                EscapeKind::Init { .. } | EscapeKind::Exit { .. }
+            )
+        })
+}
+
 /// Whether **any** boundary in the active chain is a policy call
 /// ([`EscapeKind::PolicyCall`]) — including one hidden beneath nested lifecycle
 /// boundaries.

@@ -119,6 +119,10 @@ mod implementation {
 
     impl UserDomain {
         fn new(owner: ComponentId) -> Result<Self> {
+            let registry = crate::component::registry::get_registry().lock();
+            if !registry.may_run(owner) {
+                return Err(Errno::EPERM);
+            }
             let space =
                 spaces::create_isolated_address_space_for(owner).map_err(|_| Errno::ENOMEM)?;
             Ok(Self {
@@ -243,14 +247,34 @@ mod implementation {
         Ok(())
     }
 
-    pub fn create(owner: ComponentId, entry: usize, arg: *mut ()) -> Result<u32> {
-        let domain = Box::new(UserDomain::new(owner)?);
+    // The task identity is not published to the caller until its user domain
+    // is attached. Failure between the two commits rolls back the new task.
+    fn create_with_domain(
+        owner: ComponentId,
+        entry: usize,
+        arg: *mut (),
+        domain: Box<UserDomain>,
+    ) -> Result<u32> {
         let id = task::create_task(owner, entry, arg).map_err(Errno::from)?;
-        task::get_task_table().lock().get_mut(id).unwrap().user = Some(domain);
+        let registry = crate::component::registry::get_registry().lock();
+        let mut table = task::get_task_table().lock();
+        if !registry.may_run(owner) {
+            table.remove(id).map_err(Errno::from)?;
+            return Err(Errno::EPERM);
+        }
+        table.get_mut(id).unwrap().user = Some(domain);
         Ok(id.raw())
     }
 
+    pub fn create(owner: ComponentId, entry: usize, arg: *mut ()) -> Result<u32> {
+        create_with_domain(owner, entry, arg, Box::new(UserDomain::new(owner)?))
+    }
+
     pub fn map(owner: ComponentId, raw: u32, base: usize, len: usize, flags: u32) -> Result<()> {
+        let registry = crate::component::registry::get_registry().lock();
+        if !registry.may_run(owner) {
+            return Err(Errno::EPERM);
+        }
         let id = TaskId::from_raw(raw);
         let current = sched::current_task();
         let mut table = task::get_task_table().lock();
@@ -276,6 +300,10 @@ mod implementation {
         len: usize,
         direction: u32,
     ) -> Result<()> {
+        let registry = crate::component::registry::get_registry().lock();
+        if !registry.may_run(owner) {
+            return Err(Errno::EPERM);
+        }
         let id = TaskId::from_raw(raw);
         let current = sched::current_task();
         let mut table = task::get_task_table().lock();
@@ -308,6 +336,10 @@ mod implementation {
     }
 
     pub fn prepare(owner: ComponentId, raw: u32, pc: usize, sp: usize) -> Result<()> {
+        let registry = crate::component::registry::get_registry().lock();
+        if !registry.may_run(owner) {
+            return Err(Errno::EPERM);
+        }
         let mut table = task::get_task_table().lock();
         let record = table.get_mut(TaskId::from_raw(raw)).ok_or(Errno::ESRCH)?;
         if record.owner() != owner || record.state() != TaskState::Created {
@@ -323,6 +355,10 @@ mod implementation {
         len: usize,
         flags: u32,
     ) -> Result<()> {
+        let registry = crate::component::registry::get_registry().lock();
+        if !registry.may_run(owner) {
+            return Err(Errno::EPERM);
+        }
         let id = TaskId::from_raw(raw);
         let current = sched::current_task();
         let mut table = task::get_task_table().lock();
@@ -435,6 +471,10 @@ mod implementation {
         let source = sched::current_task().ok_or(Errno::EPERM)?;
         let mut domain = Box::new(UserDomain::new(owner)?);
         {
+            let registry = crate::component::registry::get_registry().lock();
+            if !registry.may_run(owner) {
+                return Err(Errno::EPERM);
+            }
             let table = task::get_task_table().lock();
             let record = table.get(source).ok_or(Errno::ESRCH)?;
             if record.owner() != owner {
@@ -463,12 +503,14 @@ mod implementation {
             domain.prepared = true;
             domain.reply = true;
         }
-        let id = task::create_task(owner, entry, arg).map_err(Errno::from)?;
-        task::get_task_table().lock().get_mut(id).unwrap().user = Some(domain);
-        Ok(id.raw())
+        create_with_domain(owner, entry, arg, domain)
     }
 
     pub fn replace(owner: ComponentId, raw: u32) -> Result<()> {
+        let registry = crate::component::registry::get_registry().lock();
+        if !registry.may_run(owner) {
+            return Err(Errno::EPERM);
+        }
         let current = sched::current_task().ok_or(Errno::EPERM)?;
         let staged = TaskId::from_raw(raw);
         if current == staged {

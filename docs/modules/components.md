@@ -64,7 +64,7 @@
   store（cpio newc 解析）→ loader（段放置 + 重定位 + 入口校验）→ registry（生命周期，`ComponentRecord` 直接持有 loaded）
 ```
 
-- **导出白名单**：`abi/core.toml` 声明 **44** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。Isolated 另有更窄的 import 支持面（诊断 / 只读查询 + `kcore_panic_escape`），装载前拒绝其余符号。
+- **导出白名单**：`abi/core.toml` 声明 **61** 项 `kcore_*`；实现与解析在 `os/core/src/component/export.rs`、`export/{query,user}.rs` + 生成的 `component/generated/exports.rs`。打包时按前缀校验（`UNDEF` 必须以 `kcore_` 开头），加载时精确名解析；未导出符号 → `UnresolvedSymbol`，整次加载失败。Isolated 另有更窄的 import 支持面（19 项，包含诊断、只读查询、memory 和 endpoint 操作；精确名单见 [部署契约](../architecture/deployment.md)），装载前拒绝其余符号。
 - **构建列表真相**：[mk/components.mk](../../mk/components.mk) 维护生产、guest test 与 host fixture 库存；`CONFIG_TEST_COMPONENTS` 决定是否加入测试组件。完整列表见该文件，`.kcomp` 名取目录 basename（`load <basename>`）。SandboxedNative 是 Core 执行域，不是构建列表中的组件。
 
 ## 测试 / smoke vs 真实组件

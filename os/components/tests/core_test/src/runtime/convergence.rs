@@ -142,6 +142,14 @@ fn exercise(state: &State) -> Option<u32> {
     if worker != u32::MAX && unsafe { abi::kcore_task_unpark(worker) } == Errno::EACCES.code() {
         result |= 16;
     }
+    // A real consumer Task enters B's Init and Exit stacks. Each forbidden
+    // switch must leave B's publication/lifecycle identity intact.
+    if let Some(provider) = create(LIFECYCLE_PROBE)
+        && lookup(provider).is_some()
+        && unsafe { abi::kcore_component_stop(provider) } == 0
+    {
+        result |= 32;
+    }
     Some(result)
 }
 
@@ -296,6 +304,7 @@ pub fn group(checks: &mut Checks, state: *mut State) {
         ("active-runtime-reply", 4),
         ("hybrid-direct-worker", 8),
         ("worker-owner", 16),
+        ("nested-lifecycle-switch-denied", 32),
     ] {
         checks.check(name, result & mask != 0);
     }

@@ -206,6 +206,17 @@ int32_t kcore_task_create(KcompTaskEntry entry, void *arg, uint32_t *out_task);
 
 在 IRQ 回调作用域内，调度类 Core 操作在 Core 机制层被拒绝并返回 `-EINVAL`（`SchedError::InvalidTransition` / `TaskError::InvalidTransition`，`os/core/src/errno.rs:68,55`）：`sched::run` / `yield_current` / `exit_current`（`os/core/src/sched.rs:343-360`，祖先感知门禁 `:77-83`）与 `task::create_task` / `start_task`（`os/core/src/task/mod.rs:61,102`）；只读入口与资源访问不受影响。IRQ 回调内的 panic **不**被收敛，保持**致命**：`panic_escape()` 恢复被中断的 guard 后拒绝逃逸，因为 IRQ 回调没有 Core 拥有的上下文可恢复（`os/core/src/component/containment.rs:849-873`），这与 init / task / service-call 边界不同。
 
+### Init / Exit 的临时栈与创建准入
+
+Init / Exit 使用 Core 临时栈，祖先链上存在这两种边界时，`task_yield`、`task_park`、
+`task_exit` 返回 `-EINVAL`，避免在 caller Task 上切栈并丢失 lifecycle principal。
+Init 仍可创建、启动所属 Worker；启动锚点内的 `sched_run` 保留。进入真正 Task 时建立
+独立 Task 边界，不把启动锚点的 Init 当作该 Task 的祖先。
+
+create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient caller 时，
+必须处于 Starting / Ready，否则 `-EPERM`。完成装载后、登记新实例时，在 registry
+锁内再次复验 caller，防止失败后的迟到登记。Core 内部无 ambient 的启动调用仍可创建。
+
 ### 窄定义的调用边界：`kcore_endpoint_call` 的 service call
 
 `kcore_endpoint_call`（Contract/Endpoint 模型的调用面，`os/core/src/component/call.rs`）就是上面所说的**窄定义的调用边界**：provider 的 `kcomp_service_dispatch` 跑在 Core 拥有的 **per-call service stack** 上（`containment::call_component_service`），principal 是 **provider 自己**——caller 的 task 只作为执行来源（provenance）传递，不构成对该任务的授权；`ambient_init()` 在边界内为 `None`（service call 不得发布）。

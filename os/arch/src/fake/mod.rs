@@ -360,6 +360,25 @@ impl Timer for Fake {
     }
 }
 
+// Host-only hook for checking Core's controller transaction ordering. It runs
+// synchronously at the hardware commit point; it never delivers an IRQ.
+type InterruptTestHook = std::boxed::Box<dyn FnMut(u32, bool)>;
+std::thread_local! {
+    static INTERRUPT_TEST_HOOK: RefCell<Option<InterruptTestHook>> = const { RefCell::new(None) };
+}
+
+pub fn set_interrupt_hook_for_test(hook: Option<InterruptTestHook>) {
+    INTERRUPT_TEST_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn interrupt_commit_for_test(line: u32, enabled: bool) {
+    INTERRUPT_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(line, enabled);
+        }
+    });
+}
+
 // host 无中断硬件：控制器是 no-op（不 claim、不 EOI）。外部中断由
 // `deliver_external_for_test` 显式驱动：它调用这里注册的 Core 回调，让
 // `on_irq` 的生产路径在 host 可测（控制器本身不投递）。
@@ -374,8 +393,12 @@ impl InterruptController for Fake {
         Ok(())
     }
 
-    fn enable(_line: u32) {}
-    fn disable(_line: u32) {}
+    fn enable(line: u32) {
+        interrupt_commit_for_test(line, true);
+    }
+    fn disable(line: u32) {
+        interrupt_commit_for_test(line, false);
+    }
 
     fn register_external_handler(handler: ExternalIrqHandler) {
         EXTERNAL_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);

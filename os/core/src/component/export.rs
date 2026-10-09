@@ -1242,7 +1242,7 @@ extern "C" fn kcore_irq_disable(device_id: u32, resource_index: u32) -> i32 {
     })
 }
 
-/// 释放该设备的 IRQ route：撤销 route（此后不再投递给已死 owner）并关断控制器线。
+/// 撤销该设备的 IRQ route 并关断控制器线；已准入 callback 仍可完成，Stop 由 inflight 保护。
 /// 返回 0 / `-Errno`。
 extern "C" fn kcore_irq_release(device_id: u32, resource_index: u32) -> i32 {
     with_core_critical(|| {
@@ -1310,13 +1310,13 @@ extern "C" fn kcore_dma_free(ptr: *mut u8) -> i32 {
 /// 把一个 buffer 映射给某台设备，返回**设备可见地址** + mapping identity。
 ///
 /// No-IOMMU：device address == buffer 地址（identity）；IOMMU 只需在 Core
-/// 内部把 buffer PA → IOVA（或经 bounce buffer），driver 不变。只有设备 owner 能
-/// 把自己的 buffer 映射给该设备。
+/// 内部把 buffer PA → IOVA（或经 bounce buffer），driver 不变。受信 Native 的
+/// caller 可以借入 buffer；mapping 归已认领设备的 owner，双方生命周期在提交时复验。
 ///
 /// 成功 = 0，`*out_device_addr`（`u64`）与 `*out_mapping`（`u64`）写入；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EINVAL` direction 非法或范围非法 /
 /// `EPERM` 无法解析 caller 或已 Failed / `ENOTSUP` caller 不在 KernelNative 域 /
-/// `ENODEV` 设备不存在 / `EACCES` 非 owner）。
+/// `ENODEV` 设备不存在 / `EACCES` 设备未认领 / `EOVERFLOW` mapping id 耗尽）。
 extern "C" fn kcore_dma_map(
     device_id: u32,
     ptr: *mut u8,
@@ -1381,6 +1381,61 @@ pub fn resolve(name: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::{containment, load::ComponentLoadError};
+
+    #[test]
+    fn lifecycle_entries_reject_task_switches_without_losing_principal() {
+        let _boundary = containment::test_boundary_lock();
+        crate::task::init();
+        crate::sched::init();
+        let caller = registry::test_support::ready(b"lifecycle-caller");
+        let provider = registry::test_support::ready(b"lifecycle-provider");
+        containment::enter_task(crate::task::TaskId::from_raw(u32::MAX), caller);
+        let check = || {
+            assert_eq!(kcore_task_yield(), Errno::EINVAL.code());
+            assert_eq!(kcore_task_park(), Errno::EINVAL.code());
+            assert_eq!(kcore_task_exit(), Errno::EINVAL.code());
+            assert_eq!(RequestContext::ambient().unwrap().component, provider);
+        };
+        containment::with_test_init_boundary(Some(provider), check);
+        containment::with_test_exit_boundary(provider, check);
+        assert_eq!(RequestContext::ambient().unwrap().component, caller);
+        containment::enter_anchor();
+    }
+
+    #[test]
+    fn failed_or_irq_callers_cannot_create_components() {
+        let _boundary = containment::test_boundary_lock();
+        let caller = registry::test_support::ready(b"create-caller");
+        containment::with_test_init_boundary(Some(caller), || {
+            containment::with_irq_scope(caller, || {
+                assert_eq!(
+                    kcore_component_load(b"missing".as_ptr(), 7, 0),
+                    Errno::EINVAL.code()
+                );
+            });
+            registry::get_registry().lock().mark_failed(caller).unwrap();
+            let mut id = u32::MAX;
+            assert_eq!(
+                kcore_component_create(b"missing".as_ptr(), 7, &KcompCreateArgs::empty(), &mut id),
+                Errno::EPERM.code()
+            );
+            assert_eq!(
+                kcore_component_load(b"missing".as_ptr(), 7, 0),
+                Errno::EPERM.code()
+            );
+            assert_eq!(id, u32::MAX);
+            // Exercise the final commit with an already prepared image, too.
+            assert_eq!(
+                crate::component::load::declare_instance(
+                    b"prepared-child",
+                    registry::test_support::test_loaded(0, None),
+                    ExecutionDomain::KernelNative
+                ),
+                Err(ComponentLoadError::CallerNotReady)
+            );
+        });
+    }
 
     #[test]
     fn runtime_backend_delivers_shared_heap_only_to_kernel_native() {

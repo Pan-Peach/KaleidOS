@@ -46,4 +46,7 @@
 用户执行从同一 TaskRecord 的 KernelNative personality 入口进入，trap 恢复该任务的
 内核栈 / kernel satp，再允许 yield / park。复制和权限编辑只允许 owner 操作未启动
 任务或当前任务，不把原始页表 / 用户 backing 交付组件。成功替换与终态 backing 保持
-驻留；staging discard 仅针对 never-started 用户任务。ABI 以 `abi/core.toml` 为准。
+驻留；staging discard 仅针对 never-started 用户任务。新建 AS 与 map / copy / prepare /
+protect / clone / replace 在 registry 锁内复验 owner 为 Starting / Ready，并保持到相应
+Task / AS 提交完成，锁序为 registry → task → mapping plan / AS；discard 保留拆除语义。
+ABI 以 `abi/core.toml` 为准。

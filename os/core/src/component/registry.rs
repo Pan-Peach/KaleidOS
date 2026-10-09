@@ -233,8 +233,8 @@ impl Registry {
     /// `id` 是否为 `Failed`（逻辑死亡）实例。
     ///
     /// Core 真相门禁：失败实例不得获取新 authority 或创建新 work，但仍需
-    /// teardown（`release` / `revoke`、释放已持有的 handle）。（`Stopping` /
-    /// `Stopped` 落地后并入本判定：它们同样不是可运行状态。）
+    /// teardown（`release` / `revoke`、释放已持有的 handle）。新 authority 的
+    /// 提交须持有 registry 锁并使用 `may_run`；不能只依赖此前的 Failed 查询。
     pub fn is_failed(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| r.state == ComponentState::Failed)
@@ -387,6 +387,18 @@ pub fn get_registry() -> &'static RegistryLock {
 pub(crate) mod test_support {
     use super::*;
     use crate::component::containment::KCOMP_ABI;
+
+    pub(crate) fn ready(name: &[u8]) -> ComponentId {
+        init();
+        let mut reg = get_registry().lock();
+        let id = reg
+            .declare(name, test_loaded(0, None), ExecutionDomain::KernelNative)
+            .unwrap();
+        reg.resolve(id).unwrap();
+        reg.begin_start(id).unwrap();
+        reg.finish_start(id).unwrap();
+        id
+    }
 
     /// 一份伪造的 loaded component（`.text` 段 64 字节；入口 = base + 8）。
     pub(crate) fn test_loaded(destroy: usize, service_dispatch: Option<usize>) -> LoadedComponent {

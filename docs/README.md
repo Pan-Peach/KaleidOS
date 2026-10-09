@@ -62,6 +62,7 @@ docs/
 | 运行测试、决定用例归属 | [测试指南](development/testing.md) |
 | 了解配置/测试 cleanup 调研与待实施清单 | [cleanup](development/cleanup.md)（建议，非架构契约） |
 | Core 收敛职责审计、变更与验证证据 | [Core convergence](development/core-convergence.md)（审计记录，非契约） |
+| 执行身份、资源归属与 Direct/Gate/Worker 语义审计 | [Execution & ownership review](development/execution-ownership-review.md)（审计记录与建议，非契约） |
 | 理解项目与寻找源码 | [核心哲学](philosophy/core-philosophy.md)、[架构总览](architecture/overview.md)、[模块地图](modules/README.md) |
 | 理解 scheduler 与 SMP | [调度契约](architecture/scheduling.md)、[sched 模块](modules/core/sched.md) |
 | 写驱动、认领设备 | [驱动契约](architecture/driver-model.md)、[组件地图](modules/components.md) |

@@ -72,6 +72,14 @@ extern "C" fn worker(ctx: *mut ()) {
     }
 }
 
+fn lifecycle_switches_denied() -> bool {
+    unsafe {
+        abi::kcore_task_yield() == Errno::EINVAL.code()
+            && abi::kcore_task_park() == Errno::EINVAL.code()
+            && abi::kcore_task_exit() == Errno::EINVAL.code()
+    }
+}
+
 kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     let args = unsafe { &*args };
     if args.config_abi != CONFIG_ABI || args.config_len != 8 || args.config.is_null() {
@@ -80,7 +88,7 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     let words = args.config.cast::<u32>();
     let mode = unsafe { words.read_unaligned() };
     let cpu = unsafe { words.add(1).read_unaligned() };
-    if mode > GATE_ONLY {
+    if mode > LIFECYCLE_PROBE {
         return Errno::EINVAL.code();
     }
     let region = match mem::mem_alloc(
@@ -107,6 +115,9 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
         });
         *out_state = state.cast();
     }
+    if mode == LIFECYCLE_PROBE && !lifecycle_switches_denied() {
+        return Errno::EIO.code();
+    }
     if mode == ACTIVE || mode == HYBRID {
         let mut task = 0;
         let code = unsafe { abi::kcore_task_create(worker, state.cast(), &mut task) };
@@ -129,7 +140,7 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
             1,
             ABI,
             0,
-            if mode == GATE_ONLY {
+            if mode == GATE_ONLY || mode == LIFECYCLE_PROBE {
                 core::ptr::null()
             } else {
                 core::ptr::from_ref(&API).cast()
@@ -145,6 +156,10 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
 });
 
 kcomp_sdk::kcomp_instance_destroy!(|state| {
+    // Exercise an Exit boundary nested over the caller Task, too.
+    if unsafe { (*state.cast::<State>()).mode } == LIFECYCLE_PROBE && !lifecycle_switches_denied() {
+        return Errno::EIO.code();
+    }
     // Direct instances never reach destroy; Gate-only instances have no worker.
     match mem::mem_release(unsafe { (*state.cast::<State>()).region }) {
         Ok(()) => 0,

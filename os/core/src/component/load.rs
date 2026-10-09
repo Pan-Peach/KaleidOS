@@ -69,6 +69,10 @@ pub enum ComponentLoadError {
     /// 在 **policy 回调**（`PolicyCall` 边界，含其下的嵌套边界）内请求创建组件：
     /// 策略回调有界（不得阻塞 / 不得分配 / 不得创建组件），Core 拒绝 → `-EINVAL`。
     InPolicyContext,
+    /// IRQ callbacks cannot enter the allocating/loading lifecycle path.
+    InIrqContext,
+    /// Failed / stopped / unknown caller cannot create new work.
+    CallerNotReady,
     /// 请求 `IsolatedNative` 部署，但当前平台 / profile **没有私有地址空间能力**
     /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
     /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
@@ -171,6 +175,14 @@ pub fn create_component(
         return Err(ComponentLoadError::InPolicyContext);
     }
 
+    if containment::irq_in_chain() {
+        return Err(ComponentLoadError::InIrqContext);
+    }
+    let caller = crate::resource::RequestContext::ambient().map(|ctx| ctx.component);
+    if caller.is_some_and(|id| !registry::get_registry().lock().may_run(id)) {
+        return Err(ComponentLoadError::CallerNotReady);
+    }
+
     // 按执行域分派：每个域一个创建入口——接入新域 = 新增一个臂，而不是"放开一道
     // guard"（guard 会让"未实现域"与"已实现域"共用同一条装载路径，混淆真相）。
     match kind {
@@ -181,6 +193,22 @@ pub fn create_component(
         // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
         ExecutionDomain::SandboxedNative => create_sandboxed_native(name, args),
     }
+}
+
+/// Revalidate the creator and publish the new instance under one registry lock.
+/// Loading/placement occurs before this point; component code runs after unlock.
+pub(crate) fn declare_instance(
+    name: &[u8],
+    loaded: loader::LoadedComponent,
+    domain: ExecutionDomain,
+) -> Result<ComponentId, ComponentLoadError> {
+    let caller = crate::resource::RequestContext::ambient().map(|ctx| ctx.component);
+    let mut reg = registry::get_registry().lock();
+    if caller.is_some_and(|id| !reg.may_run(id)) {
+        return Err(ComponentLoadError::CallerNotReady);
+    }
+    reg.declare(name, loaded, domain)
+        .map_err(|_| ComponentLoadError::DeclareFailed)
 }
 
 /// `KernelNative` 的创建路径。
@@ -201,10 +229,8 @@ fn create_kernel_native(
     let runtime_entry = loaded.runtime_init;
 
     let id = {
+        let id = declare_instance(name, loaded, ExecutionDomain::KernelNative)?;
         let mut reg = registry::get_registry().lock();
-        let id = reg
-            .declare(name, loaded, ExecutionDomain::KernelNative)
-            .map_err(|_| ComponentLoadError::DeclareFailed)?;
         reg.resolve(id)
             .map_err(|_| ComponentLoadError::ResolveFailed)?;
         // Resolved → Starting：`kcomp_instance_create` 执行期间 publish 只记录 pending。

@@ -170,7 +170,7 @@ mod tests {
 
         // quarantine 后普通认领 -EBUSY。
         let claimant = RequestContext {
-            component: ComponentId::from_raw(999),
+            component: registry::test_support::ready(b"quarantine-claimant"),
             task: None,
         };
         assert_eq!(

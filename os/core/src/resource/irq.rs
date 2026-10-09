@@ -40,7 +40,7 @@
 //!
 //! # 锁序
 //!
-//! device → irq：**route 的插入 / 移除都在 device 锁内完成**——owner 校验通过
+//! registry → device → irq：新授权复验生命周期；**route 的插入 / 移除都在 device 锁内完成**——owner 校验通过
 //! 与 route 生效之间不允许插入"设备被并发 release"的窗口。
 
 use super::{RequestContext, ResourceKind};
@@ -79,6 +79,8 @@ pub enum IrqError {
     NoIrq,
     /// caller 不是该设备 owner（IRQ 只能由设备 owner 注册）。
     NotOwner,
+    /// owner 未知或不在 Starting / Ready。
+    OwnerNotReady,
     /// 尚未注册 handler 就 enable / 释放一个不存在的 route。
     NoHandler,
     /// 该逻辑 IRQ 号已挂在**另一个** `(device, resource_index)` key 下：
@@ -319,6 +321,10 @@ pub fn register(
 ) -> Result<(), IrqError> {
     let number = resolve(device, resource_index)?;
     let _guard = IrqSaveGuard::new();
+    let registry = crate::component::registry::get_registry().lock();
+    if !registry.may_run(ctx.component) {
+        return Err(IrqError::OwnerNotReady);
+    }
     let device_table = super::device::get_table().lock();
     if device_table.owner(device) != Some(ctx.component) {
         return Err(IrqError::NotOwner);
@@ -340,52 +346,50 @@ pub fn register(
     Ok(())
 }
 
-/// 使能该设备某条中断资源：先验证已注册 route，再配置中断控制器。
-///
-/// 表锁只覆盖验证；PLIC 寄存器与 CPU 使能位在**锁外**写（MMIO 慢，trap 可重入）。
+/// Enable one registered line. Admission and hardware commit share registry →
+/// device → IRQ locks; local IRQs stay masked until every lock is released.
 pub fn enable(ctx: &RequestContext, device: DeviceId, resource_index: u32) -> Result<(), IrqError> {
     resolve(device, resource_index)?;
-    let number = {
-        let device_table = super::device::get_table().lock();
-        if device_table.owner(device) != Some(ctx.component) {
-            return Err(IrqError::NotOwner);
-        }
-        let table = get_table().lock();
-        table
-            .number_for(device, resource_index)
-            .ok_or(IrqError::NoHandler)?
-    };
-    // 只开控制器上的**这条线**。本 CPU 的外部中断投递源与全局闸门在
-    // `irq::init`（`InterruptController::init_cpu`）与 boot 的 `enable_irq` 里
-    // 处理——`enable(line)` 不得在**任意调用者 CPU** 上开本地投递。
+    let registry = crate::component::registry::get_registry().lock();
+    if !registry.may_run(ctx.component) {
+        return Err(IrqError::OwnerNotReady);
+    }
+    let device_table = super::device::get_table().lock();
+    if device_table.owner(device) != Some(ctx.component) {
+        return Err(IrqError::NotOwner);
+    }
+    let table = get_table().lock();
+    let number = table
+        .number_for(device, resource_index)
+        .ok_or(IrqError::NoHandler)?;
+    // Only this controller line; never enable caller CPU delivery/global IRQs.
     arch::InterruptImpl::enable(number);
     Ok(())
 }
 
-/// 关断该设备某条中断资源（控制器层）。
+/// Disable a line under device → IRQ locks, with local IRQs masked. Teardown
+/// remains allowed after failure. No component callback runs under these locks.
 pub fn disable(
     ctx: &RequestContext,
     device: DeviceId,
     resource_index: u32,
 ) -> Result<(), IrqError> {
     resolve(device, resource_index)?;
-    let number = {
-        let device_table = super::device::get_table().lock();
-        if device_table.owner(device) != Some(ctx.component) {
-            return Err(IrqError::NotOwner);
-        }
-        let table = get_table().lock();
-        table
-            .number_for(device, resource_index)
-            .ok_or(IrqError::NoHandler)?
-    };
-    // 锁外关线：trap 可重入、控制器写慢。
+    let _guard = IrqSaveGuard::new();
+    let device_table = super::device::get_table().lock();
+    if device_table.owner(device) != Some(ctx.component) {
+        return Err(IrqError::NotOwner);
+    }
+    let table = get_table().lock();
+    let number = table
+        .number_for(device, resource_index)
+        .ok_or(IrqError::NoHandler)?;
     arch::InterruptImpl::disable(number);
     Ok(())
 }
 
-/// 释放该设备某条中断资源的 route：先撤销 route（此后不再投递给已死 owner），
-/// 再在锁外关断控制器上的线。route 移除在 device 锁内完成（锁序 device → irq）。
+/// Remove the route and disable its line in one device → IRQ transaction.
+/// Already admitted callbacks may finish; their component inflight pins Stop.
 pub fn release(
     ctx: &RequestContext,
     device: DeviceId,
@@ -393,24 +397,21 @@ pub fn release(
 ) -> Result<(), IrqError> {
     resolve(device, resource_index)?;
     let _guard = IrqSaveGuard::new();
-    let number = {
-        let device_table = super::device::get_table().lock();
-        if device_table.owner(device) != Some(ctx.component) {
-            return Err(IrqError::NotOwner);
-        }
-        let mut table = get_table().lock();
-        let number = table
-            .number_for(device, resource_index)
-            .ok_or(IrqError::NoHandler)?;
-        table.release(ctx.component, device, resource_index)?;
-        number
-    };
+    let device_table = super::device::get_table().lock();
+    if device_table.owner(device) != Some(ctx.component) {
+        return Err(IrqError::NotOwner);
+    }
+    let mut table = get_table().lock();
+    let number = table
+        .number_for(device, resource_index)
+        .ok_or(IrqError::NoHandler)?;
+    table.release(ctx.component, device, resource_index)?;
+    arch::InterruptImpl::disable(number);
     emit(TraceEvent::ResourceRevoke {
         component: ctx.component,
         kind: ResourceKind::Irq,
         id: trace_id(device, resource_index),
     });
-    arch::InterruptImpl::disable(number);
     Ok(())
 }
 
@@ -434,6 +435,174 @@ mod tests {
 
     fn owner(raw: u32) -> ComponentId {
         ComponentId::from_raw(raw)
+    }
+
+    #[test]
+    fn controller_commits_mask_irqs_and_keep_route_transaction_locked() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _machine = test_support::GUARD.lock();
+        let device = install_fixture();
+        let ctx = RequestContext {
+            component: crate::component::registry::test_support::ready(b"irq-commit"),
+            task: None,
+        };
+        crate::resource::device::claim(&ctx, device).unwrap();
+        super::register(&ctx, device, 1, handler, core::ptr::null_mut()).unwrap();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed = commits.clone();
+        arch::fake::set_interrupt_hook_for_test(Some(Box::new(move |line, _enabled| {
+            assert_eq!(line, 42);
+            assert!(!arch::fake::irq_enabled_for_test());
+            assert!(crate::resource::device::get_table().try_lock().is_none());
+            assert!(super::get_table().try_lock().is_none());
+            observed.fetch_add(1, Ordering::Relaxed);
+        })));
+        super::enable(&ctx, device, 1).unwrap();
+        super::disable(&ctx, device, 1).unwrap();
+        super::release(&ctx, device, 1).unwrap();
+        arch::fake::set_interrupt_hook_for_test(None);
+        assert_eq!(commits.load(Ordering::Relaxed), 3);
+        assert!(arch::fake::irq_enabled_for_test());
+    }
+
+    #[test]
+    fn old_release_cannot_disable_a_newly_enabled_route() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let _machine = test_support::GUARD.lock();
+        let device = install_fixture();
+        let owner = crate::component::registry::test_support::ready(b"irq-release-race");
+        let ctx = RequestContext {
+            component: owner,
+            task: None,
+        };
+        crate::resource::device::claim(&ctx, device).unwrap();
+        super::register(&ctx, device, 1, handler, core::ptr::null_mut()).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (reached, proceed, hardware) = (entered.clone(), resume.clone(), enabled.clone());
+        let old = std::thread::spawn(move || {
+            arch::fake::set_interrupt_hook_for_test(Some(Box::new(move |_, value| {
+                assert!(!value);
+                reached.wait();
+                proceed.wait();
+                hardware.store(false, Ordering::SeqCst);
+            })));
+            let result = super::release(
+                &RequestContext {
+                    component: owner,
+                    task: None,
+                },
+                device,
+                1,
+            );
+            arch::fake::set_interrupt_hook_for_test(None);
+            result
+        });
+        entered.wait();
+        let started = Arc::new(Barrier::new(2));
+        let remote_started = started.clone();
+        let hardware = enabled.clone();
+        let (tx, rx) = mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            arch::fake::set_interrupt_hook_for_test(Some(Box::new(move |_, value| {
+                hardware.store(value, Ordering::SeqCst);
+            })));
+            remote_started.wait();
+            let ctx = RequestContext {
+                component: owner,
+                task: None,
+            };
+            let result = super::register(&ctx, device, 1, other_handler, core::ptr::null_mut())
+                .and_then(|_| super::enable(&ctx, device, 1));
+            tx.send(result).unwrap();
+            arch::fake::set_interrupt_hook_for_test(None);
+        });
+        started.wait();
+        let premature = rx.recv_timeout(std::time::Duration::from_millis(30));
+        // Always release the paused worker before asserting, including failure.
+        resume.wait();
+        assert_eq!(old.join().unwrap(), Ok(()));
+        replacement.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        assert!(enabled.load(Ordering::SeqCst));
+        let (_, callback, _) = super::get_table().lock().route_of(42).unwrap();
+        assert_eq!(callback as usize, other_handler as *const () as usize);
+    }
+
+    #[test]
+    fn resource_grants_recheck_both_caller_and_device_owner() {
+        let _machine = test_support::GUARD.lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::resource::dma::init();
+        let device = install_fixture();
+        let provider = RequestContext {
+            component: crate::component::registry::test_support::ready(b"grant-provider"),
+            task: None,
+        };
+        let consumer = RequestContext {
+            component: crate::component::registry::test_support::ready(b"grant-consumer"),
+            task: None,
+        };
+        crate::resource::device::claim(&provider, device).unwrap();
+        let mapping = crate::resource::dma::map(
+            &consumer,
+            device,
+            0x8000 as *mut u8,
+            16,
+            crate::resource::dma::DmaDirection::ToDevice,
+        )
+        .unwrap();
+        crate::resource::dma::unmap(mapping.id).unwrap();
+        // Failure has committed, but the device sweep has not run yet.
+        crate::component::registry::get_registry()
+            .lock()
+            .mark_failed(provider.component)
+            .unwrap();
+        assert!(matches!(
+            crate::resource::dma::map(
+                &consumer,
+                device,
+                0x8000 as *mut u8,
+                16,
+                crate::resource::dma::DmaDirection::ToDevice
+            ),
+            Err(crate::resource::dma::DmaError::OwnerNotReady)
+        ));
+        assert_eq!(
+            super::register(&provider, device, 1, handler, core::ptr::null_mut()),
+            Err(IrqError::OwnerNotReady)
+        );
+        assert_eq!(
+            super::enable(&provider, device, 1),
+            Err(IrqError::OwnerNotReady)
+        );
+        crate::resource::device::release(&provider, device).unwrap();
+        assert!(matches!(
+            crate::resource::device::claim(&provider, device),
+            Err(crate::resource::device::DeviceClaimError::OwnerNotReady)
+        ));
+        // The healthy consumer can claim, but a failed caller cannot map it.
+        crate::resource::device::claim(&consumer, device).unwrap();
+        assert!(matches!(
+            crate::resource::dma::map(
+                &provider,
+                device,
+                0x8000 as *mut u8,
+                16,
+                crate::resource::dma::DmaDirection::ToDevice
+            ),
+            Err(crate::resource::dma::DmaError::OwnerNotReady)
+        ));
     }
 
     #[test]
@@ -754,11 +923,11 @@ mod tests {
 
         let device = install_fixture();
         let a = RequestContext {
-            component: owner(1),
+            component: crate::component::registry::test_support::ready(b"irq-a"),
             task: None,
         };
         let b = RequestContext {
-            component: owner(2),
+            component: crate::component::registry::test_support::ready(b"irq-b"),
             task: None,
         };
         crate::resource::device::get_table()

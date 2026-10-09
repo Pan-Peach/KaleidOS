@@ -18,6 +18,18 @@
 - `irq`：`IrqTable`、`IrqError`、`IrqHandler`；`register` / `enable` / `disable` / `release` / `revoke_owner`，全部以 `(DeviceId, resource_index)` 为锚点。
 - `dma`：`DmaTable`、`DmaDirection`、`DmaError`、`DmaMapping`、`DmaBuffer`；`alloc` / `free` / `map` / `unmap` / `revoke_owner` + 私有 `QUARANTINE`。
 
+## 授权提交与锁序
+
+新 claim、IRQ register / enable、DMA alloc / map 在 registry 锁内复验 owner 为
+Starting / Ready，并保持到资源登记完成；map 同时复验 caller 和设备 owner，二者可不同。
+实际锁序为 registry → device → IRQ / DMA；device release 与 mapping / route 插入共享
+设备锁。失败先在 registry 提交逻辑死亡，再扫资源，因此不能在撤销之后补入新授权。
+
+IRQ enable / disable / release 关闭本地 IRQ，持 device → IRQ 锁直到 arch 控制器写入完成。
+arch 操作为有界寄存器操作；组件 callback 始终在锁外执行。release 阻止后续准入，
+已经准入的 callback 可以完成，其 inflight 保护 Stop。拆除 API 不要求 owner 仍 Ready。
+mapping id 耗尽拒绝新 map，返回 EOVERFLOW，不回绕或复用。
+
 ## 明确不做
 
 - **不做 per-access 鉴权**：`kcore_device_claim` 之后 driver 直接拿裸 MMIO 指针，稳态不再进 Core（KernelNative 就是可信代码，见 `docs/architecture/driver-model.md` §1.1）。

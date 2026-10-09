@@ -176,7 +176,8 @@ impl From<ComponentLoadError> for Errno {
             ComponentLoadError::PolicyPanicked => Errno::EIO,
             ComponentLoadError::PolicyRejected => Errno::EIO,
             // 上下文种类拒绝：policy 回调内不得创建组件（与调度拒绝同档）。
-            ComponentLoadError::InPolicyContext => Errno::EINVAL,
+            ComponentLoadError::InPolicyContext | ComponentLoadError::InIrqContext => Errno::EINVAL,
+            ComponentLoadError::CallerNotReady => Errno::EPERM,
             // 部署能力不足 / Isolated import 白名单外符号：能力缺失（不是 I/O
             // 错误）。都必须在 ABI 边界区分于 EIO，调用方才不会误判为可重试的
             // I/O。
@@ -225,6 +226,7 @@ impl From<device::DeviceClaimError> for Errno {
         match error {
             device::DeviceClaimError::DeviceNotFound => Errno::ENODEV,
             device::DeviceClaimError::NotMmio => Errno::ENOTSUP,
+            device::DeviceClaimError::OwnerNotReady => Errno::EPERM,
             device::DeviceClaimError::DeviceBusy => Errno::EBUSY,
         }
     }
@@ -245,6 +247,8 @@ impl From<dma::DmaError> for Errno {
         match error {
             dma::DmaError::InvalidSize | dma::DmaError::BadRange => Errno::EINVAL,
             dma::DmaError::Exhausted => Errno::ENOMEM,
+            dma::DmaError::OwnerNotReady => Errno::EPERM,
+            dma::DmaError::IdExhausted => Errno::EOVERFLOW,
             dma::DmaError::DeviceNotFound => Errno::ENODEV,
             dma::DmaError::NotOwner => Errno::EACCES,
             dma::DmaError::NotFound => Errno::ENOENT,
@@ -257,6 +261,7 @@ impl From<irq::IrqError> for Errno {
         match error {
             irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
             irq::IrqError::NotOwner => Errno::EACCES,
+            irq::IrqError::OwnerNotReady => Errno::EPERM,
             irq::IrqError::NoHandler => Errno::EINVAL,
             irq::IrqError::LineBusy => Errno::EBUSY,
         }
@@ -542,6 +547,8 @@ mod tests {
             ComponentLoadError::PolicyPanicked,
             ComponentLoadError::PolicyRejected,
             ComponentLoadError::InPolicyContext,
+            ComponentLoadError::InIrqContext,
+            ComponentLoadError::CallerNotReady,
             ComponentLoadError::IsolationUnsupported,
             ComponentLoadError::SandboxUnsupported,
             ComponentLoadError::IsolatedImportUnsupported,
@@ -571,7 +578,10 @@ mod tests {
                 ComponentLoadError::ServicePanicked => Errno::EIO,
                 ComponentLoadError::PolicyPanicked => Errno::EIO,
                 ComponentLoadError::PolicyRejected => Errno::EIO,
-                ComponentLoadError::InPolicyContext => Errno::EINVAL,
+                ComponentLoadError::InPolicyContext | ComponentLoadError::InIrqContext => {
+                    Errno::EINVAL
+                }
+                ComponentLoadError::CallerNotReady => Errno::EPERM,
                 ComponentLoadError::IsolationUnsupported
                 | ComponentLoadError::SandboxUnsupported
                 | ComponentLoadError::IsolatedImportUnsupported => Errno::ENOTSUP,
@@ -671,11 +681,13 @@ mod tests {
         for error in [
             device::DeviceClaimError::DeviceNotFound,
             device::DeviceClaimError::NotMmio,
+            device::DeviceClaimError::OwnerNotReady,
             device::DeviceClaimError::DeviceBusy,
         ] {
             let expected = match error {
                 device::DeviceClaimError::DeviceNotFound => Errno::ENODEV,
                 device::DeviceClaimError::NotMmio => Errno::ENOTSUP,
+                device::DeviceClaimError::OwnerNotReady => Errno::EPERM,
                 device::DeviceClaimError::DeviceBusy => Errno::EBUSY,
             };
             assert_eq!(Errno::from(error), expected, "DeviceClaimError {error:?}");
@@ -703,6 +715,8 @@ mod tests {
         for error in [
             dma::DmaError::InvalidSize,
             dma::DmaError::Exhausted,
+            dma::DmaError::OwnerNotReady,
+            dma::DmaError::IdExhausted,
             dma::DmaError::DeviceNotFound,
             dma::DmaError::NotOwner,
             dma::DmaError::NotFound,
@@ -711,6 +725,8 @@ mod tests {
             let expected = match error {
                 dma::DmaError::InvalidSize | dma::DmaError::BadRange => Errno::EINVAL,
                 dma::DmaError::Exhausted => Errno::ENOMEM,
+                dma::DmaError::OwnerNotReady => Errno::EPERM,
+                dma::DmaError::IdExhausted => Errno::EOVERFLOW,
                 dma::DmaError::DeviceNotFound => Errno::ENODEV,
                 dma::DmaError::NotOwner => Errno::EACCES,
                 dma::DmaError::NotFound => Errno::ENOENT,
@@ -725,12 +741,14 @@ mod tests {
             irq::IrqError::DeviceNotFound,
             irq::IrqError::NoIrq,
             irq::IrqError::NotOwner,
+            irq::IrqError::OwnerNotReady,
             irq::IrqError::NoHandler,
             irq::IrqError::LineBusy,
         ] {
             let expected = match error {
                 irq::IrqError::DeviceNotFound | irq::IrqError::NoIrq => Errno::ENODEV,
                 irq::IrqError::NotOwner => Errno::EACCES,
+                irq::IrqError::OwnerNotReady => Errno::EPERM,
                 irq::IrqError::NoHandler => Errno::EINVAL,
                 irq::IrqError::LineBusy => Errno::EBUSY,
             };
