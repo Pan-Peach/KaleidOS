@@ -194,8 +194,9 @@ Worker 不代表销毁实例；完整证据与未通过路径见 [收敛审计](
 profile与失败，CoreTest分组通过不等于整套通过，旧PASS不覆盖当前失败。
 
 `python3 -m unittest discover -s tests/build -p test_ipc_codec.py -v` 编译实际C/Rust
-SDK envelope，验证独立LE golden、长度与错误层次；一个Rust decoder上界差异明确标为
-expectedFailure，不能计通过，生产修补后去掉标记。它已纳入test-tools，不证明AS隔离。
+SDK envelope，验证独立LE golden、长度与错误层次；Rust decoder 上界已修补，4项全部通过。
+`test_kabi_methods.py` 验证生成 client/dispatch，5项通过（C启用UBSan）；均纳入test-tools，
+不证明AS隔离。现行语法见 [方法生成](kabi-methods.md)。
 SDK test-only IPC链接替身返回ENOTSUP，只恢复旧前端单测，不模拟Core收发。
 
 I域普通Gate对照在真实Task/IPC/copy替代通过前保留；先核对工件UNDEF，不能因为源代码

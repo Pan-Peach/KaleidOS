@@ -68,6 +68,10 @@ pub struct State {
     pub blk_mask: u32,
     /// 第一台块设备的 ordinal（`u32::MAX` = 没有块设备候选）。
     pub first_blk: u32,
+    pub dispatch_ok: bool,
+    pub attach_ok: bool,
+    pub no_match_ok: bool,
+    pub multi_ok: bool,
 }
 
 const NO_ORDINAL: u32 = u32::MAX;
@@ -184,7 +188,7 @@ fn create_driver(device_id: u32, result_name: &[u8], out_instance: &mut u32) -> 
 }
 
 /// attached 驱动实例的 `block.device` endpoint 真的能读盘：
-/// bind（Direct）→ capacity > 0 → 读任意内容的 sector 0；
+/// bind → IPC capacity > 0 → 读任意内容的 sector 0；
 /// 再用边界读校验**报告的容量确实等于设备的可寻址范围**
 /// （`capacity - 1` 可读、`capacity` 越界拒绝）——比硬编码 runner 的磁盘大小更强。
 fn attach_serves(endpoint: Endpoint<BlockDevice>) -> bool {
@@ -401,7 +405,7 @@ fn no_block_ownership(state: &State) -> bool {
 /// 拓扑分支：`first_blk == NO_ORDINAL` = 候选里没有块设备（runner 的 no-block
 /// 机器）；否则至少有一台块设备（default 机器）。两个分支都要求 prober 完整
 /// 走完自己的有限流程 + 所有出生实例达到 `Ready`。
-pub fn report(checks: &mut Checks, state: &State) {
+fn run(state: &mut State) {
     let mut declared = [0u32; MAX_DECLARED];
     let declared_len = trace::declared_components(state.cursor, &mut declared);
     let no_block = state.first_blk == NO_ORDINAL;
@@ -410,21 +414,15 @@ pub fn report(checks: &mut Checks, state: &State) {
     let lifecycles_ok = declared[..declared_len]
         .iter()
         .all(|&id| trace::component_lifecycle(state.cursor, id as i32));
-    checks.check(
-        "driver-prober-dispatch",
-        state.prober_id >= 0
-            && state.candidate_count > 0
-            && declared_len as u32 == 1 + attempts
-            && lifecycles_ok,
-    );
+    state.dispatch_ok = state.prober_id >= 0
+        && state.candidate_count > 0
+        && declared_len as u32 == 1 + attempts
+        && lifecycles_ok;
 
     if no_block {
-        checks.check(
-            "driver-attach",
-            no_match_evidence(state, &declared[..declared_len]),
-        );
-        checks.check("driver-no-match", check_no_match());
-        checks.check("driver-multi-device", no_block_ownership(state));
+        state.attach_ok = no_match_evidence(state, &declared[..declared_len]);
+        state.no_match_ok = check_no_match();
+        state.multi_ok = no_block_ownership(state);
         return;
     }
 
@@ -433,12 +431,37 @@ pub fn report(checks: &mut Checks, state: &State) {
     let attach_ok = ownership_ok
         && endpoint_count == state.blk_mask.count_ones()
         && attached_endpoint.is_some_and(attach_serves);
-    checks.check("driver-attach", attach_ok);
-
-    checks.check("driver-no-match", check_no_match());
+    state.attach_ok = attach_ok;
+    state.no_match_ok = check_no_match();
 
     let multi_ok = check_multi_device(state, attached_device);
     // 被拒绝的第二次 attachment 不得复位已 attach 的设备：它仍能读盘。
     let still_serves = attached_endpoint.is_some_and(attach_serves);
-    checks.check("driver-multi-device", multi_ok && still_serves);
+    state.multi_ok = multi_ok && still_serves;
+}
+
+extern "C" fn task(arg: *mut ()) {
+    // SAFETY: create owns stable State backing; this Task alone writes the
+    // driver results. The anchor reads them only after scheduling returns.
+    run(unsafe { &mut *arg.cast::<State>() });
+    unsafe { abi::kcore_task_exit() };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Blocking Request/Reply requires a real caller Task, not the create anchor.
+pub fn spawn(state: *mut State) {
+    let mut id = 0;
+    let status = unsafe { abi::kcore_task_create(task, state.cast(), &mut id) };
+    if status != 0 || unsafe { abi::kcore_task_start(id) } != 0 {
+        klog!("[core-test] driver scenario task could not start");
+    }
+}
+
+pub fn report(checks: &mut Checks, state: &State) {
+    checks.check("driver-prober-dispatch", state.dispatch_ok);
+    checks.check("driver-attach", state.attach_ok);
+    checks.check("driver-no-match", state.no_match_ok);
+    checks.check("driver-multi-device", state.multi_ok);
 }

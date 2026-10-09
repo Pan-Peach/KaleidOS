@@ -46,17 +46,14 @@ pub const KCOMP_BLOCK_DEVICE_SECTOR: usize = 512;
 /// 数值 = 8 字节 ASCII tag `b"BLKCONTR"` 的大端读数（与 ABI 指纹同一约定）。
 pub const KCOMP_BLOCK_DEVICE_CONTRACT: u64 = 0x424C_4B43_4F4E_5452;
 
-/// `capacity` 的方法号：args 空 / input 空 / output = 8 字节 LE `u64`。
-pub const KCOMP_BLOCK_METHOD_CAPACITY: u32 = 0;
-
-/// `read` 的方法号：args = 8 字节 LE `u64` lba / input 空 / output 非零且 512 整数倍。
-pub const KCOMP_BLOCK_METHOD_READ: u32 = 1;
-
-/// `write` 的方法号：args = 8 字节 LE `u64` lba / input 非零且 512 整数倍 / output 空。
-pub const KCOMP_BLOCK_METHOD_WRITE: u32 = 2;
-
 /// `read` / `write` 的 `args` 区长度：一个 LE `u64` lba（没有其它编码）。
 pub const KCOMP_BLOCK_LBA_LEN: usize = 8;
 
 /// `capacity` 的 `output` 区长度：一个 LE `u64`（sector 数）。
 pub const KCOMP_BLOCK_CAPACITY_LEN: usize = 8;
+
+pub const KCOMP_BLOCK_METHOD_CAPACITY: u32 = 0;
+
+pub const KCOMP_BLOCK_METHOD_READ: u32 = 1;
+
+pub const KCOMP_BLOCK_METHOD_WRITE: u32 = 2;

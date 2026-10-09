@@ -82,7 +82,7 @@ extern "C" fn client(arg: *mut ()) {
     if ipc::call(ep, &[SELF_CALL], &mut []) == Ok(0) {
         result |= 8;
     }
-    if ipc::service::invoke(ep, SERVICE_ECHO, &[], &input[..64], &mut output[..64]) == Ok(0)
+    if kcomp_sdk::generated::echo_wire::echo(ep, &input[..64], &mut output[..64]) == Ok(())
         && output[..64] == input[..64]
     {
         result |= 256;

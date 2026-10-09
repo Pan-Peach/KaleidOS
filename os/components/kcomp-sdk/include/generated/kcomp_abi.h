@@ -592,20 +592,17 @@ _Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kco
  * 数值 = 8 字节 ASCII tag `b"BLKCONTR"` 的大端读数（与 ABI 指纹同一约定）。 */
 #define KCOMP_BLOCK_DEVICE_CONTRACT UINT64_C(0x424C4B434F4E5452)
 
-/* `capacity` 的方法号：args 空 / input 空 / output = 8 字节 LE `u64`。 */
-#define KCOMP_BLOCK_METHOD_CAPACITY UINT32_C(0)
-
-/* `read` 的方法号：args = 8 字节 LE `u64` lba / input 空 / output 非零且 512 整数倍。 */
-#define KCOMP_BLOCK_METHOD_READ UINT32_C(1)
-
-/* `write` 的方法号：args = 8 字节 LE `u64` lba / input 非零且 512 整数倍 / output 空。 */
-#define KCOMP_BLOCK_METHOD_WRITE UINT32_C(2)
-
 /* `read` / `write` 的 `args` 区长度：一个 LE `u64` lba（没有其它编码）。 */
 #define KCOMP_BLOCK_LBA_LEN 8
 
 /* `capacity` 的 `output` 区长度：一个 LE `u64`（sector 数）。 */
 #define KCOMP_BLOCK_CAPACITY_LEN 8
+
+#define KCOMP_BLOCK_METHOD_CAPACITY UINT32_C(0)
+
+#define KCOMP_BLOCK_METHOD_READ UINT32_C(1)
+
+#define KCOMP_BLOCK_METHOD_WRITE UINT32_C(2)
 
 /* `filesystem` provider/consumer function table（**Direct** transport 的共享布局）。
  * 

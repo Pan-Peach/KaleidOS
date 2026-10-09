@@ -90,24 +90,36 @@ doc = """
 数值 = 8 字节 ASCII tag `b"BLKCONTR"` 的大端读数（与 ABI 指纹同一约定）。
 """
 
-[[const]]
-name = "KCOMP_BLOCK_METHOD_CAPACITY"
-type = "u32"
-value = "0"
-targets = "c,sdk-rust"
-doc = "`capacity` 的方法号：args 空 / input 空 / output = 8 字节 LE `u64`。"
-[[const]]
-name = "KCOMP_BLOCK_METHOD_READ"
-type = "u32"
-value = "1"
-targets = "c,sdk-rust"
-doc = "`read` 的方法号：args = 8 字节 LE `u64` lba / input 空 / output 非零且 512 整数倍。"
-[[const]]
-name = "KCOMP_BLOCK_METHOD_WRITE"
-type = "u32"
-value = "2"
-targets = "c,sdk-rust"
-doc = "`write` 的方法号：args = 8 字节 LE `u64` lba / input 非零且 512 整数倍 / output 空。"
+[[method]]
+name = "capacity_sectors"
+id = 0
+symbol = "KCOMP_BLOCK_METHOD_CAPACITY"
+infallible = true
+[[method.reply]]
+name = "sectors"
+type = "u64"
+
+[[method]]
+name = "read"
+id = 1
+symbol = "KCOMP_BLOCK_METHOD_READ"
+[[method.args]]
+name = "lba"
+type = "u64"
+[method.output]
+min = 512
+max = 512
+
+[[method]]
+name = "write"
+id = 2
+symbol = "KCOMP_BLOCK_METHOD_WRITE"
+[[method.args]]
+name = "lba"
+type = "u64"
+[method.input]
+min = 512
+max = 512
 
 [[const]]
 name = "KCOMP_BLOCK_LBA_LEN"

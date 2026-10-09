@@ -7,4 +7,4 @@ pub const PANIC: u8 = 0xfd;
 pub const EXIT: u8 = 0xfc;
 pub const SELF_CALL: u8 = 0xf9;
 pub const FOREIGN_GRANT: u8 = 0xf8;
-pub const SERVICE_ECHO: u32 = 0xf7;
+pub const SERVICE_ECHO: u32 = kcomp_sdk::generated::echo::KCOMP_ECHO_METHOD_ECHO;

@@ -1,5 +1,5 @@
-//! Owned Block Server Task; the existing business decoder also serves IPC.
-use crate::{Errno, Result, block::BlockDeviceProvider, frame::Call, ipc};
+//! Owned Block Server Task; the schema generates its business decoder.
+use crate::{Errno, Result, block::BlockDeviceProvider, generated::block_wire, ipc};
 pub fn serve<P: BlockDeviceProvider>(provider: &P, endpoint: u64) -> Result<()> {
     ipc::listen(endpoint)?;
     let mut bytes = [0; ipc::MESSAGE_MAX];
@@ -21,20 +21,7 @@ pub fn serve<P: BlockDeviceProvider>(provider: &P, endpoint: u64) -> Result<()> 
         };
         let mut reply = [0; ipc::MESSAGE_MAX];
         let output = &mut reply[4..4 + request.output];
-        // One sector per wire operation. SDK clients split larger transfers.
-        let status = if request.input.len() > 512 || request.output > 512 {
-            Errno::EMSGSIZE.code()
-        } else {
-            super::dispatch::dispatch(
-                provider,
-                request.method,
-                Call {
-                    args: request.args,
-                    input: request.input,
-                    output,
-                },
-            )
-        };
+        let status = block_wire::dispatch(provider, &request, output);
         // Cancellation does not undo a write already executed by the device.
         let _ = ipc::service::reply(receipt, status, &mut reply[..4 + request.output]);
     }

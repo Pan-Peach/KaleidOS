@@ -1,6 +1,8 @@
 //! The same provider/consumer artifact exercises SDK bindings in K and I.
 #![no_std]
 extern crate alloc;
+mod legacy;
+use legacy::LegacyBind;
 
 use alloc::{boxed::Box, vec};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -29,7 +31,7 @@ impl BlockDeviceProvider for Device {
         let relay = RELAY.load(Ordering::Relaxed);
         if relay != 0 {
             let binding = Endpoint::<BlockDevice>::lookup(relay, BLOCK_DEVICE_NAME)?
-                .bind()
+                .legacy_bind()
                 .map_err(errno)?;
             return binding.read(lba, output).map_err(errno);
         }
@@ -46,7 +48,7 @@ impl BlockDeviceProvider for Device {
             let mode = words(2);
             for provider in [words(0), words(1)] {
                 let binding = Endpoint::<BlockDevice>::lookup(provider, BLOCK_DEVICE_NAME)?
-                    .bind()
+                    .legacy_bind()
                     .map_err(errno)?;
                 let mut output = [0xceu8; 512];
                 match mode {
@@ -155,7 +157,7 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
             Ok(endpoint) => endpoint,
             Err(error) => return error.code(),
         };
-        let binding = match endpoint.bind() {
+        let binding = match endpoint.legacy_bind() {
             Ok(binding) => binding,
             Err(error) => return errno(error).code(),
         };

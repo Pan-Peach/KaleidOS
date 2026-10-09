@@ -4,7 +4,15 @@
 mod contract;
 use contract::*;
 use core::sync::atomic::{AtomicU32, Ordering};
+use kcomp_sdk::generated::echo_wire;
 use kcomp_sdk::{Errno, abi, ipc, management};
+struct Echo;
+impl echo_wire::Provider for Echo {
+    fn echo(&self, input: &[u8], output: &mut [u8]) -> kcomp_sdk::Result<()> {
+        output.copy_from_slice(input);
+        Ok(())
+    }
+}
 static CONSUMER: AtomicU32 = AtomicU32::new(0);
 extern "C" fn server(_arg: *mut ()) {
     let owner = management::current_component().unwrap();
@@ -53,12 +61,11 @@ extern "C" fn server(_arg: *mut ()) {
                     && bytes[..4] == SERVICE_ECHO.to_le_bytes() =>
             {
                 let frame = ipc::service::Request::decode(bytes).unwrap();
-                assert!(frame.args.is_empty());
-                assert_eq!(frame.output, frame.input.len());
                 let mut reply = [0; ipc::MESSAGE_MAX];
                 let len = ipc::service::REPLY_HEADER + frame.output;
-                reply[ipc::service::REPLY_HEADER..len].copy_from_slice(frame.input);
-                ipc::service::reply(request, 0, &mut reply[..len]).unwrap();
+                let status =
+                    echo_wire::dispatch(&Echo, &frame, &mut reply[ipc::service::REPLY_HEADER..len]);
+                ipc::service::reply(request, status, &mut reply[..len]).unwrap();
             }
             _ => {
                 let result = ipc::reply(request, &bytes[..len]);

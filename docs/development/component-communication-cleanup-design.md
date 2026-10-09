@@ -1,7 +1,8 @@
 # KABI 协议方法生成：可手写的小模块方案
 
-> 2026-10-09，设计待实施。基线 `2e10304c389f` 的生成器没有 method 生成能力。
-> 本轮授权范围为审计、文档和测试，不修改生产生成器/schema/Core。
+> 2026-10-09，用户进一步授权直接实现。基线 `2e10304c389f` 没有 method 生成能力；
+> 当前 Echo/Block 的 scalar/bounded-buffer client/dispatch 已实现，语法与限制见
+> [现行方法生成](kabi-methods.md)。此页仍保留后续 FS/VFS/执行域的小模块方案。
 > 维护点与真实失败见 [专项审计](component-communication-audit.md)；门禁见
 > [迁移清单](component-communication-migration.md)。此页是建议，不是现行 ABI。
 
@@ -44,7 +45,7 @@ request/receipt 终态与真实 Task 等待。Provider 私有对象状态和生�
 复用 `load_schemas` / `_build_schema` / `_reject_unknown` / `_table_list` / emitters / Output。
 Wire 类型与既有 ABI type AST 分开：后者允许指针/usize/fn，wire 一律拒绝这些类型。
 
-建议 schema（下面 **不是当前可被生成器接受的语法**）：
+现行 scalar/bounded-buffer schema 示例：
 
 ```toml
 [[method]]

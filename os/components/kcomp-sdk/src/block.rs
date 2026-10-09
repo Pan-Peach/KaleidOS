@@ -93,19 +93,7 @@ const SECTOR_SIZE: usize = crate::generated::block::KCOMP_BLOCK_DEVICE_SECTOR;
 ///
 /// 实现者仍受 [`BlockDeviceApi`] 契约约束：阻塞到本次传输完成、只在 task 上下文
 /// 调用、`buf` 指向 Core 可见 RAM（v1 无 IOMMU：物理地址 == 虚拟地址）。
-pub trait BlockDeviceProvider {
-    /// 设备容量（单位：512 字节 sector）。
-    fn capacity_sectors(&self) -> u64;
-
-    /// 从 `lba` 读 `buf.len()` 字节到 `buf`。
-    ///
-    /// adapter 已保证 `buf.len() > 0` 且是 512 的整数倍；不满足时调用方拿到
-    /// `-EINVAL`，本方法**不会被调用**。
-    fn read(&self, lba: u64, buf: &mut [u8]) -> Result<()>;
-
-    /// 从 `buf` 写 `buf.len()` 字节到 `lba`（入参保证同 [`BlockDeviceProvider::read`]）。
-    fn write(&self, lba: u64, buf: &[u8]) -> Result<()>;
-}
+pub use crate::generated::block_wire::Provider as BlockDeviceProvider;
 
 /// provider 实现与生成的 `#[repr(C)]` table 的配对；放进 `static` 后
 /// [`publish`](Self::publish)。

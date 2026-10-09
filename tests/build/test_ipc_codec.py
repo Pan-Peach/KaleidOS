@@ -65,10 +65,7 @@ class IpcCodec(unittest.TestCase):
                 if index:
                     self.assertEqual(result[0], "error=-22")
 
-    @unittest.expectedFailure
-    def test_known_rust_decoder_gap_rejects_message_larger_than_core_limit(self):
-        # HEAD 2e10304: C rejects >1024; Rust Request::decode accepts this.
-        # Core submit already enforces the bound. Remove xfail with decoder fix.
+    def test_decoders_reject_message_larger_than_core_limit(self):
         frame = struct.pack("<IIII", 1, 0, 0, 1009) + bytes(1009)
         self.assertEqual(self.run_both("decode", frame.hex()), ["error=-22", "error=-22"])
 

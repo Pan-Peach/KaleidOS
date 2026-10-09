@@ -96,6 +96,10 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         (*state).driver.candidate_count = 0;
         (*state).driver.blk_mask = 0;
         (*state).driver.first_blk = u32::MAX;
+        (*state).driver.dispatch_ok = false;
+        (*state).driver.attach_ok = false;
+        (*state).driver.no_match_ok = false;
+        (*state).driver.multi_ok = false;
         (*state).region = region;
     }
     // SAFETY: out_state 由 Core 保证可写；Core 只存/传该指针，不解释、不释放。
@@ -123,7 +127,9 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     let driver_state = unsafe { &mut *core::ptr::addr_of_mut!((*state).driver) };
     driver::prepare(&mut checks, driver_state);
     schedule();
-    // SAFETY: 调度已返回，prober 的 dispatch 任务退出；此后只读。
+    driver::spawn(unsafe { core::ptr::addr_of_mut!((*state).driver) });
+    schedule();
+    // SAFETY: prober 和场景任务均已退出，结果自此只读。
     let driver_state = unsafe { &*core::ptr::addr_of!((*state).driver) };
     driver::report(&mut checks, driver_state);
     filesystem::spawn_physical(driver_state.cursor, unsafe {

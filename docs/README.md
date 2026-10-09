@@ -49,6 +49,7 @@ docs/
 | 网络服务、wire 与等待 | [网络](interfaces/network.md) + [abi/network.toml](../abi/network.toml) | 调用方代理与 provider 状态分开 |
 | 模块真实行为与代码位置 | [模块地图](modules/README.md) | 查源码与模块页，不从目标推断能力 |
 | 测试职责与运行方法 | [测试指南](development/testing.md) | 构建步骤见 [building](development/building.md) |
+| KABI 方法 schema 与生成 SDK | [方法生成](development/kabi-methods.md) | 当前 Echo/Block IPC 语法、边界及验证 |
 | 性能验证 | [benchmark](development/benchmark.md) | 基准与回归策略 |
 | 现状、里程碑与路线图 | [STATUS.md](../STATUS.md) | 进度的单一入口；事实以代码和验证证据为准 |
 | 参考系统与论文 | [参考资料](philosophy/references.md) | 阅读清单 |

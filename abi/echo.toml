@@ -1,0 +1,13 @@
+# Test service: ordinary typed Echo uses the same generated protocol as Block.
+# Raw control messages remain test-only lifecycle and Exchange probes.
+[[method]]
+name = "echo"
+id = 247
+symbol = "KCOMP_ECHO_METHOD_ECHO"
+[method.input]
+min = 0
+max = 1008
+[method.output]
+min = 0
+max = 1008
+matches = "input"

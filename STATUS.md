@@ -1,10 +1,10 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-09。已核对develop `2e10304c389f`：KernelNative IPC、混合Local/Remote
-Fat VFS、virtio Block IPC-only及ksh/ELF主链已有。此次专项Cleanup完成审计、文档与
-测试补充，method生成和旧通信体系退出未完成；本轮完整门禁有明确失败，见§3.29。
-此前里程碑的PASS/计数是历史记录，不覆盖本轮回归。Isolated新IPC、Sandbox、通用
-VFS文件fd/libc startup和完整物理回收仍未实现；K链不证明私有域能力。
+更新：2026-10-09。基线 develop `2e10304c389f` 已有 KernelNative IPC、混合
+Local/Remote Fat VFS、virtio Block IPC-only 与 ksh/ELF 主链。用户授权后已实现
+Echo/Block scalar/buffer 方法生成并接入真实服务，修复已审计回归；完整 check/host/
+QEMU/Arch 门禁通过。普通旧通道安全退出仍未完成，见§3.29。Isolated新IPC、Sandbox、
+通用VFS文件fd/libc startup和完整物理回收未实现，K链不证明私有域能力。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -401,23 +401,23 @@ wake/退出/取消；Local+Remote FatFs、VFS runtime/SDK、ksh cat/ELF；virtio
 实际链路是 VFS → Fat Server → Block Server，设备由 driver 自己的 Task 身份操作。
 Node 是 borrowed mount-lifetime 身份，open 才 owning；不是早期每-node lease 草案。
 
-本轮门禁：abi/fmt通过；SDK test-only 链接替身修补后94 tests、VFS6 tests通过；
-init RV64五场景/RV32四场景及SMP3通过。CoreTest default RV64 101/104、RV32 88/90，
-NoMMU default 88/90；混合VFS/IPC分组通过，driver检查因锚点调用IPC失败。
-RV64 no-block 隔离服务检查失败，RV32 no-block 90/90+shell通过。Core host一个policy
-错误优先级失败，make check有两处clippy失败；Arch RV64/RV32各42/43，domain fixture
-因新增IPC imports被I白名单拒绝。本轮不能称完整门禁通过。
-新增C/Rust envelope字节测试3通过、1个1025字节Rust decoder已知差异expectedFailure；
-已知失败不计通过，修补生产decoder后必须去掉标记。详见审计，不以旧PASS覆盖。
+最新实施门禁：make abi-gen/abi-check（21生成文件）、make check（含test-host）通过；
+make test-qemu：RV64 default/no-block各112 checks、RV32各90 checks与shell通过；
+init RV64五场景/RV32四场景全部通过。make test-arch：RV64/RV32各43/43、SMP3/3通过。
+4项C/Rust envelope测试及5项generated方法测试通过，无expectedFailure。
+NoMMU的88/90是修补前历史结果，本次尚未重跑，不能推导通过。
+生产修补包括policy拒绝优先级与decoder容量校验；测试修补把driver I/O放真实Task，
+独立legacy fixture adapter解除未支持的IPC import依赖；没有扩展I白名单。
 
-收敛状态：Phase A专项审计完成；B仅方案/字节证据，method generator未实现；
-C仍有Block三Backend、FS双入口、RAM/little/probe旧通道；D私有Task/import/copy尚缺；
-E旧普通业务Direct/Gate未删。F文档/测试同步已做，不等于整体Cleanup完成。
-Core新增账本/锁本轮为零，没有Channel/Connection Registry。
+收敛状态：Phase A专项审计完成；B已实现Echo/Block method AST、整数LE、bounded buffer、
+C/Rust client/validator/dispatch并接入真实VirtIO Server；命名结构、FS/VFS待做。
+详见 [方法生成](docs/development/kabi-methods.md)。C仍有Block三Backend、FS双入口、
+RAM/little/probe旧通道；D私有Task/import/copy尚缺；E普通业务Direct/Gate未删。
+F文档/测试随实施更新，不等于整体Cleanup完成。Core新增账本/锁为零。
 
 限制：KernelNative同特权可信；Isolated新IPC/持久Task/跨AS copy、Sandbox、deadline/
 强制终止/通知与物理回收未实现。旧Gate必须保留到真实I替代门禁满足。
-下一步：先基线回归，再Echo+Block生成客户端/分发，逐组迁移普通服务，最后删重复通道。
+下一步：FS/VFS生成client/dispatch，逐组迁移普通服务，补私有域IPC后删除旧通道。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 

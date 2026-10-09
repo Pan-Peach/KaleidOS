@@ -10,7 +10,7 @@ pub struct Request<'a> {
 }
 impl<'a> Request<'a> {
     pub fn decode(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() < REQUEST_HEADER {
+        if bytes.len() < REQUEST_HEADER || bytes.len() > ipc::MESSAGE_MAX {
             return Err(Errno::EINVAL);
         }
         let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());

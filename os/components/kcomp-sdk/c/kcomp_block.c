@@ -13,6 +13,7 @@
 #include "kcomp.h"
 #include "kcomp_block.h"
 #include "kcomp_ipc.h"
+#include "generated/block_wire.h"
 #include <errno.h>
 
 /* 不透明绑定的内部表示。header 的 `opaque[4]` 至少这么大、对齐至少这么强
@@ -135,10 +136,9 @@ struct kcomp_call_result kcomp_block_read(const struct kcomp_block_binding *bind
         uint64_t sectors = output_len / 512;
         if (lba > UINT64_MAX - (sectors - 1)) return (struct kcomp_call_result){0, -EOVERFLOW};
         for (size_t i = 0; i < sectors; ++i) {
-            uint8_t args[8]; kcomp_ipc_put64(args, lba + i);
             struct kcomp_call_result result = {0, 0};
-            result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_READ,
-                args, sizeof(args), NULL, 0, (uint8_t *)output + i * 512, 512, &result.method);
+            result.transport = kcomp_block_wire_read(b->endpoint, lba + i,
+                (uint8_t *)output + i * 512, 512, &result.method);
             if (result.transport || result.method) return result;
         }
         return (struct kcomp_call_result){0, 0};
@@ -185,10 +185,9 @@ struct kcomp_call_result kcomp_block_write(const struct kcomp_block_binding *bin
         uint64_t sectors = input_len / 512;
         if (lba > UINT64_MAX - (sectors - 1)) return (struct kcomp_call_result){0, -EOVERFLOW};
         for (size_t i = 0; i < sectors; ++i) {
-            uint8_t args[8]; kcomp_ipc_put64(args, lba + i);
             struct kcomp_call_result result = {0, 0};
-            result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_WRITE,
-                args, sizeof(args), (const uint8_t *)input + i * 512, 512, NULL, 0, &result.method);
+            result.transport = kcomp_block_wire_write(b->endpoint, lba + i,
+                (const uint8_t *)input + i * 512, 512, &result.method);
             if (result.transport || result.method) return result;
         }
         return (struct kcomp_call_result){0, 0};
@@ -205,10 +204,10 @@ struct kcomp_call_result kcomp_block_capacity(const struct kcomp_block_binding *
     }
     const struct kcomp_block_binding_internal *b = binding_ref(binding);
     if (b->mechanism == KCORE_ENDPOINT_MECHANISM_IPC) {
-        uint8_t reply[8]; struct kcomp_call_result result = {0, 0};
-        result.transport = kcomp_ipc_invoke(b->endpoint, KCOMP_BLOCK_METHOD_CAPACITY,
-            NULL, 0, NULL, 0, reply, sizeof(reply), &result.method);
-        if (!result.transport && !result.method) *out_sectors = kcomp_ipc_u64(reply);
+        struct kcomp_block_wire_capacity_sectors_reply reply;
+        struct kcomp_call_result result = {0, 0};
+        result.transport = kcomp_block_wire_capacity_sectors(b->endpoint, &reply, &result.method);
+        if (!result.transport && !result.method) *out_sectors = reply.sectors;
         return result;
     }
 
