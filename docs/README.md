@@ -53,7 +53,7 @@ docs/
 | 现状、里程碑与路线图 | [STATUS.md](../STATUS.md) | 进度的单一入口；事实以代码和验证证据为准 |
 | 参考系统与论文 | [参考资料](philosophy/references.md) | 阅读清单 |
 | 成熟内核调查方法、版本与可借鉴范围 | [参考系统](development/reference-systems.md) | 研究入口，不替代架构契约 |
-| 统一 IPC / 混合 VFS 重构 | [源码审计](development/component-communication-audit.md)、[IPC ADR](development/ipc-request-reply-adr.md)、[VFS ADR](development/hybrid-vfs-adr.md)、[迁移计划](development/component-communication-migration.md) | 历史审计、阶段实现与后续提议；现行 architecture/interfaces 为契约 |
+| 统一 IPC / 混合 VFS 重构 | [源码审计](development/component-communication-audit.md)、[KABI Cleanup设计](development/component-communication-cleanup-design.md)、[IPC ADR](development/ipc-request-reply-adr.md)、[VFS ADR](development/hybrid-vfs-adr.md)、[迁移计划](development/component-communication-migration.md) | 历史审计、阶段实现与后续提议；现行 architecture/interfaces 为契约 |
 
 `notes/` 不参与权威判定。旧 resource-model-review 中的 Handle/Slot/authority 模型
 已被替代；需要现行资源与生命周期契约时查 architecture。

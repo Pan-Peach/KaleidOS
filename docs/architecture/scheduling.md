@@ -13,7 +13,7 @@
 | 本 CPU 的合法候选集合 | Core | 只读快照：Runnable、CPU 匹配、owner 存活 |
 | RR 游标、优先级、公平性、私有队列 | Scheduler Component | 从快照提议 TaskId；私有队列不成为存在性或状态真相 |
 | 创建多少任务、初始放在哪颗 CPU | 任务所属组件 / 上层组合策略 | 提出请求；Core 校验 owner、状态与目标 Online |
-| 等待条件、等待队列、通知语义 | 使用任务的组件 | Core 只提供 park/unpark 与一份 pending permit |
+| 普通业务等待条件、队列、通知语义 | 使用任务的组件 | Core提供park/unpark与pending permit；Endpoint IPC的transport谓词/等待者另由[Exchange](ipc.md)拥有 |
 | 策略 endpoint 的发现与选择 | 组合方 | 显式选择 Ready provider；调度路径不按名字自动发现 |
 
 Core 的候选扫描是机制。RR、负载均衡、work stealing、公平性规则属于策略。

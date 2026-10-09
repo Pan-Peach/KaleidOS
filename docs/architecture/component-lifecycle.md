@@ -52,7 +52,7 @@ ComponentId          ← 唯一的运行时身份：一个完整的运行组件
 ```
 
 实例声明时，Core 另记录实际创建请求的 ComponentId（启动 Core 锚点可为 None），
-其后不可经公开 API 改写。它只提供 [IPC grant](ipc.md) 的显式组合授权，不继承
+其后不可经公开 API 改写。它及不可改写的真实创建祖先链只提供 [IPC grant](ipc.md) 的显式组合授权，不继承
 child 的设备、内存、Task 或其他资源所有权；父实例重启不会接管旧 child 的创建者身份。
 
 **关键点**：`ComponentId` 就是唯一的一等运行时身份，承载一个**完整的运行组件**——它自己的已加载程序、常驻 backing、资源、任务、endpoint。**没有** `ComponentImageId` / `ComponentImage` / `ImageTable` 二级身份：`LoadedComponent`（base / create / destroy / service_dispatch / text_size / MemoryLease）由 `ComponentRecord` **1:1 直接拥有**，不存在 instance → image 的二级查找。

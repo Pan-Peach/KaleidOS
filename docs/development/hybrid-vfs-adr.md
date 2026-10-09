@@ -1,6 +1,6 @@
 # ADR：一个 VFS 的 Local / Remote 后端
 
-> 状态：**KernelNative 混合 VFS 已实现**。LocalFs、Remote FatFs、独立 VFS Server Task、SDK 与 ksh/exec 已接线；Block 与 littlefs 的统一 IPC、私有域 IPC 尚未实现。现行权威是 [filesystem](../interfaces/filesystem.md)、[VFS wire](../interfaces/vfs.md)、[模块现状](../modules/vfs.md)；本 ADR 记录决策，验证见 STATUS。前置依据见 [参考系统](reference-systems.md)、[源码审计](component-communication-audit.md) 与 [IPC ADR](ipc-request-reply-adr.md)。
+> 状态：**KernelNative 混合 VFS 已实现**。LocalFs、Remote FatFs、独立 VFS Server Task、SDK 与 ksh/exec 已接线；virtio Block 已 IPC-only；Block SDK/RAM/littlefs 尚未统一，私有域 IPC 未实现。现行权威是 [filesystem](../interfaces/filesystem.md)、[VFS wire](../interfaces/vfs.md)、[模块现状](../modules/vfs.md)；本 ADR 记录决策，验证见 STATUS。前置依据见 [参考系统](reference-systems.md)、[源码审计](component-communication-audit.md) 与 [IPC ADR](ipc-request-reply-adr.md)。
 
 ## 1. 决策
 
@@ -125,7 +125,7 @@ FF_VOLUMES=1、private image globals、diskio active_block：多个 `.kcomp` 实
 
 littlefs 当前节点接口 ENOTSUP，迁移属于 Phase 4；不能把 legacy absolute-path open 留作永久 VFS 后门。ksh `cat` 和 ELF 文件读取已一起迁至 VFS，不再消费旧 FS table。
 
-Block 需要先具备 Server Task 端点，保证 `VFS → Fat → Block` 都能 park；可以在过渡期从 Fat Server Task 调用旧同步 Block，须标注轮询占 CPU、不代表链路新 IPC 已完成。新的 transport buffer 复制不是 DMA buffer 转移，virtio 仍需 Core DMA allocation/mapping/backing 静默机制。
+virtio Block 已具备 Server Task，正常启动 `VFS → Fat → Block` 均能 park；RAM fixtures仍使用旧绑定。IPC驱动后端仍同步轮询，不能称IRQ完成。新的 transport buffer 复制不是 DMA buffer 转移，virtio 仍需 Core DMA allocation/mapping/backing 静默机制。
 
 ## 7. 当前实现、缺口与验收
 
@@ -133,4 +133,4 @@ Block 需要先具备 Server Task 端点，保证 `VFS → Fat → Block` 都能
 
 当前只支持 Bytes、只读文件/目录；没有 symlink、命名流、目录列举、权限/share/delete 或 namespace 运行期并发修改。Weak cache 保持活跃路径位置一致，不证明 rename/传播/bind mount 语义。
 
-CoreTest 真 C FatFs + 两个独立 Block 实例验证混合挂载、verified Task 权限、取消 open 回滚、退出回收、Provider 失效/重启与 IPC-only stop。init runner 用 virtio FAT 镜像验证 Local/Remote 路径与 ksh/exec。证据与阶段限制见 [STATUS §3.29](../../STATUS.md#329-endpoint-requestreply-与混合-vfs--experimental)。Block 仍为同步轮询旧绑定，littlefs 和新 IPC 私有域尚待迁移，不能宣称全通信重构完成。
+CoreTest 真 C FatFs + 两个独立 Block 实例验证混合挂载、verified Task 权限、取消 open 回滚、退出回收、Provider 失效/重启与 IPC-only stop。init runner 用 virtio FAT 镜像验证 Local/Remote 路径与 ksh/exec。证据与阶段限制见 [STATUS §3.29](../../STATUS.md#329-endpoint-requestreply-与混合-vfs--experimental)。virtio Block 为IPC+同步轮询，SDK三Backend、RAM/littlefs和新IPC私有域尚待收敛；本轮整套门禁失败见专项审计，不能宣称全通信重构完成。

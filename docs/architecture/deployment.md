@@ -3,10 +3,12 @@
 > 本文件是**"部署（deployment）决定调用机制"**的设计契约：谁提议部署、Core 验证什么、`(caller domain, callee domain)` 如何选出调用机制、binding 携带什么、不支持的组合如何拒绝。
 > 它是**设计契约，不是进度快照**。**KernelNative 与受限的 IsolatedNative 两种部署真实存在**：K/I 双向 Gate 已真正派发（§10）；Sandbox transport 仍**未实现**（§10 是实现状态表，§7 是逐条缺口）。
 
-新增的 KernelNative Task Request/Reply 使用独立窄入口，契约见 [IPC](ipc.md)。它沿用
-Endpoint identity、exact ABI 校验与部署准入，但不经过下述 legacy bind 机制选择。
-Core 每次复验双方域与 grant，SDK 不旁路或回退。本文的 Direct/Gate 矩阵继续描述旧
-服务；syscall-IPC 与持久私有域 Server Task 仍未实现。
+KernelNative Task Request/Reply 的窄契约见 [IPC](ipc.md)。IPC-only 发布由
+`port=0, api=NULL, ctx=NULL` 表示，bind 在 exact/live 校验后只允许 K/K，返回 Ipc=2
+与零 api/ctx；涉及 Isolated/Sandboxed 显式拒绝。原始 IPC 入口不自动 legacy bind，
+submit 每次复验域和 grant。下文 Direct/Gate 矩阵继续描述历史发布，不能覆盖这个例外；
+持久私有域 Task 与新跨 AS IPC 尚未实现，不能退回裸指针隐藏缺口。
+
 > 与 `docs/architecture/component-lifecycle.md` 在"同一份组件代码能否跨执行域原样运行"上冲突时，**以本文件为准**：`component-lifecycle.md` §9"代码页去重是未来的 loader / MM 优化，不是 ABI / 生命周期承诺"的结论**由本文件补充**（见 §6、§8）。本文件不否认它的现状描述，而是把目标写清楚，并把缺口显式登记。
 
 ---
@@ -22,7 +24,7 @@ Server Task；部署决定合法调用窗口，不代替 provider 的并发、�
 
 | 概念 | 回答什么 | 身份 / 载体 | 代码锚点 |
 |---|---|---|---|
-| **Contract** | 这个服务**语义**是什么 | 接口名 + exact ABI fingerprint + typed `#[repr(C)]` function table | `abi/block.toml`、`os/components/kcomp-sdk/src/block.rs:68-75` |
+| **Contract** | 这个服务**语义**是什么 | 接口名 + exact ABI fingerprint + 方法/wire；历史发布另有 typed function table | `abi/block.toml`、`os/components/kcomp-sdk/src/block.rs:68-75` |
 | **Artifact** | 一个**组件程序字节**（不是运行实例） | `.kcomp`（ET_REL）；artifact 名 | `tools/kcomp-link.sh`、`os/core/src/component/loader.rs` |
 | **Component** | **一个完整运行组件**：instantiate 后拥有自己的已加载程序 | `ComponentId`；`loaded`（`base` + `create` / `destroy` / `service_dispatch`）+ 资源归属（device / irq / dma / task / publication） | `os/core/src/component/registry.rs`、`os/core/src/component/load.rs` |
 | **Endpoint** | provider **发布的服务点** | `EndpointId`（provider ComponentId + port_name + contract） | `os/core/src/component/endpoint.rs` |
@@ -31,7 +33,7 @@ Server Task；部署决定合法调用窗口，不代替 provider 的并发、�
 
 **核心判断（不可违背）：**
 
-- **Core owns the execution-domain truth。** 组合器（composer / profile）**提议**部署（哪个组件跑在哪个执行域），Core **验证并提交**。Core **不硬编码信任级策略**（不写"所有组件都必须走同一套重型机制"）。
+- **Core owns the execution-domain truth。** 组合器（composer / profile）**提议**部署（哪个组件跑在哪个执行域），Core **验证并提交**。Core **不硬编码信任级策略**。统一业务 wire 不等于扩大某个域的执行能力。
 - **尽量复用业务实现与契约。** SDK adapter 承担可支持的部署差异；不承诺任意 `.kcomp` 跨 ISA、特权级或 import 面原样运行。
 - **Binding 以调用者的执行域为作用域，不能跨调用域转交。** 合法机制取决于**两端**（caller domain **且** callee domain），**绝不**只看 provider 的部署标签。
 - **Core 在 bind 时一次性选定机制**，运行期**不按调用重新决策**。SDK **实现**每种机制，但**不得选择**机制；否则组件可能悄悄降级到 native，这是**禁止**的。不支持的部署 / 绑定必须**显式拒绝**。

@@ -11,8 +11,9 @@ contract 与 exact fingerprint；typed consumer 应先通过 `Endpoint<C>::from_
 验证契约。IPC 不自动调用 legacy bind，也不自动降级到 Direct/Gate。
 
 `listen` 将当前真实 KernelNative Task 注册为 owner 端口的唯一 Server Task。
-`grant` 只允许端口 owner 或 Core 在实例声明时记录的创建者授权一个存活 consumer
-Component。创建者来自实际 Core 请求上下文，不来自配置 payload；不会随父实例重启
+`grant` 只允许端口 owner 或 Core 在实例声明时记录的真实创建祖先授权一个存活 consumer
+Component。创建链来自实际 Core 请求上下文，不来自配置 payload；Registry::created_by 沿不可改写链
+校验祖先，资源 owner 不因此改变，send 权限仍须显式 grant；不会随父实例重启
 重绑。grant 允许启动锚点编排，拒绝 Gate/IRQ/policy。普通 ID 查询不授予任何权限。
 consumer 停止/失败移除其 grant，端口关闭永久失效。当前没有通用 rights transfer/revoke。
 
@@ -64,7 +65,8 @@ Server Task 退出会关闭其端口；Provider 停止/失败关闭所有端口�
 
 ## 执行域与内存边界
 
-当前只支持 KernelNative Tasks：RV64 MMU 与 RV32 NoMMU 运行期测试分别验证。
+当前只支持 KernelNative Tasks：RV64/Sv39、RV32/Sv32 默认profile与RV32 S-mode NoMMU
+私有profile有IPC分组运行证据；本轮整套回归的失败以STATUS为准。
 私有域 import 白名单没有 IPC；Isolated/Sandboxed Server Task、范围检查与跨 AS copy
 尚未实现。现有 Gate 的私有 AS 测试不能充当新 IPC 隔离证据。
 

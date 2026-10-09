@@ -19,17 +19,16 @@
    默认策略选择第 0 个，枚举顺序属于本启动 profile；增加第二张盘不使根选择歧义。
    可用 config ABI `0x494E_4954_524F_4F54` + 4 字节 native-endian u32 指定序号，
    不要求字节对齐。指定非零序号不存在返回 ENODEV；默认无盘进入纯 console 会话。
-4. 把选中的 opaque EndpointId 用 FatFs 的扁平 create config 传给 `fatfs`。
-   FatFs 用 memcpy 解码到本地结构，不要求字节负载具有 u64 对齐。
-   创建 init 自己的有限任务，在任务上下文 bind / mount filesystem，结果写回实例私有原子。
-   FAT 挂载不格式化磁盘；保留 transport / method 分类的错误诊断。
-5. 挂载成功后经 create config 把确切 FS EndpointId 交给 `ksh`。init 的 create 返回 0，Core 提交 Ready；monitor 的调度安全点
-   随后运行 shell 任务。没有块盘也可正常进入 ksh，此时 cat 报缺少 filesystem provider。
+4. 创建FatFs：LE config为block EndpointId u64、control ComponentId u32、flags=1 u32。
+   flags=1仅发布IPC；init作为真实创建祖先显式grant Block给Fat。运行任务让listener就绪。
+5. 创建VFS：control u32、mount count u32、FS EndpointId列表u64；grant Fat给VFS。
+   VFS在自己的Server Task中mount/root，把Remote Fat挂到`/fat`，Local始终存在。
+6. init的有限Task通过VfsBinding取root/release确认bootstrap结果，写回原子状态。
+   成功后ksh config为VFS Endpoint LE u64加选定根路径`/fat`（无盘为`/`），grant VFS给ksh。
 
-这是 provider root 挂载，没有 VFS namespace 或 `/` 路由；shell 使用 `0:/HELLO.TXT`。
-init 不导出新服务。`component_create` 现与 load 一样接受 domain，可同时传配置；
-Core 仍裁决实例、端口、任务与设备所有权。多个 FS 的命名空间仍由 VFS 后续实现，
-本启动 profile 只挂 FAT 根，不自动格式化另一张盘。
+shell使用同一namespace，`0:/HELLO.TXT`映射选定根，绝对`/fat`/`/local`由VFS解析。
+没有块盘也可cat `/local/README.TXT`；缺失文件明确报错。init不导出新服务，也不自动
+格式化FAT或另一张盘。Core只裁决实例/Task/Endpoint/设备/grant，不知道mount语义。
 
 ## 失败与生命周期
 
@@ -38,7 +37,7 @@ load / config / mount 失败使 create 返回 errno，Core 留下 Failed 的 ini
 没有整张图的事务回滚。缺失的启动 artifact 同样回到 monitor。
 
 init 完成后保持 Ready，没有常驻管理任务；退出 ksh 回到 monitor，不自动重启会话。
-卸载 init 不级联卸载它组合出的独立组件。当前没有 reaper、watchdog、依赖解析、热插拔或
+卸载 init 不级联卸载它组合出的独立组件。init没有常驻reaper、watchdog、依赖解析、热插拔或
 自动恢复；从 shell 任务再 load init 会在改变图之前返回 EINVAL（需要 boot/monitor 锚点）。
 
 `sched_run` 返回只代表控制回到锚点，不是 join。当前策略依赖 prober dispatch 和挂载任务
@@ -64,7 +63,7 @@ core>
 
 实现位于 `os/components/init/src/{runtime,root}.rs`，boot 入口位于
 `os/boot/riscv/src/composition.rs`。host 用例检查显式序号选择与生命周期 / 指纹过滤。
-`make test-init` 的 RV64/RV32 各跑 FAT、dual-fat（FAT 根 + 无签名 raw 盘）、no-block、bad-fat 四条真实串口流程，包括读取文件、
+`make test-init` 在RV64跑FAT、dual-fat、OOM、no-block、bad-fat五条，RV32除OOM外四条，包含Local/Remote路径、读取文件与RV64 ELF exec、
 init 状态、拒绝 task-context 重入、坏盘后的 monitor 恢复、shell exit 与 shutdown。
 它同时纳入 `make test-qemu`；原 CoreTest 流程使用 `configs/monitor.fragment` 自行组合图。
 CoreTest 的 block-chain 额外把 FatFs 配置放在对齐缓冲的偏移 1 字节处，验证非对齐负载。

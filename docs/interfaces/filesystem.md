@@ -130,7 +130,7 @@ read(已打开的 obj) →  File service  →  FS provider
 具体失败模式：把 permission-denied、share-conflict、delete-pending 三种情况塌缩成一个 `EACCES`，会让 NT 行为**无法恢复**，因为上层再也分不出是哪一种。这条一旦塌缩就不可逆，所以必须先决定再实现相关接口。
 
 VFS 第一阶段声明的局部选择见 `docs/interfaces/vfs.md` / `abi/vfs.toml`：保留负 errno，
-在回复头补 domain-status 区分共享冲突、delete-pending 等。适配器尚未实现；既有 FS 契约
+在回复头补 domain-status 区分共享冲突、delete-pending 等。Rust VFS SDK/服务已传递此头，当前业务只用domain=0；完整share/delete分类尚未实现；既有 FS 契约
 不变，通用原生权限模型与完整 POSIX / NT 映射仍未决。
 
 ## 7. Namespace：两个必须写下的细节
@@ -209,20 +209,22 @@ FsInstance + FsNode + 同一份 storage
 
 这是目标形态，不是现状。要让一个底层实例同时被多个 personality 通过不同"入口"访问，需要 namespace 把多条路径映射到同一个实例/节点身份，而不是复制实例。
 
-**诚实的依赖**：endpoint 模型已落地——endpoint 身份 = `(provider, port_name, contract)`，端口名只在 provider 实例内唯一，因此"多个同类型 FS 实例各自发布、各自被 bind"**已经可以做到**（组合方显式 `kcore_endpoint_lookup(provider, port_name)` 发现，`bind` 由 Core 选定机制）。namespace / 多 personality 路由仍属目标形态，未实现。
+**诚实的依赖**：endpoint 模型已落地——endpoint 身份 = `(provider, port_name, contract)`，端口名只在 provider 实例内唯一，因此"多个同类型 FS 实例各自发布、各自被 bind"**已经可以做到**（组合方显式 `kcore_endpoint_lookup(provider, port_name)` 发现，`bind` 由 Core 选定机制）。只读Local+Remote Fat namespace已接；多personality路由仍为目标。
 
 ## 11. 现状 vs 目标
 
-**现状**（务必按此描述，不要拔高）：
+**现状**（运行期门禁以 STATUS 为准）：
 
-- `block.device` 设备接口已落地：块设备驱动认领设备后向上发布，单位、阻塞、`0/-errno` 等契约已在 SDK 中写清；
-- 一个最小 `filesystem` 服务契约已存在：只读、`mount/unmount/open/close/read`、不透明 u64 handle、singleton 端点名；**两个** provider 已落地并绑 `block.device`：FatFs（只读 FAT，自带最小 selftest）与 littlefs（v2.9.3，`mount` 内 format + 自检，真实走 prog/erase）；CoreTest（`littlefs-multi-instance` / `littlefs-isolation`）已端到端证明**两个同类型 FS 实例各自发布并各自被 bind**、存储互不相干（QEMU，rv64 + rv32）；
-- 节点操作 `root / lookup(parent, name, encoding) / node_info` 已在 FatFs 与 C/Rust SDK
-  的 Direct / Gate 路径接通；生命周期、名字与错误编码见
-  [`abi/filesystem.toml`](../../abi/filesystem.toml)。littlefs 尚不支持节点操作。
-  本次新增行为由真实 FatFs 库 + FAT 镜像的 host 测试验证，尚无新增 QEMU 行为证据；
-- `os/components/filesystems/vfs/` 已有组件骨架（见 `docs/modules/vfs.md`）；**没有**可用的 namespace 服务、File service 或独立的 generic FS 接口层；
-- **没有**稳定的 VFS / Page Cache 路径（与 `docs/development/benchmark.md` 一致）。
+- virtio `block.device` 已 IPC-only，Rust/C Block SDK 仍保留 Direct/Gate/IPC；RAM测试设备仍旧通道。
+- FatFs 默认启动是IPC-only，legacy测试仍有八项表/Gate；littlefs仍旧通道，mount失败才format。
+- FatFs已支持root/lookup/node_info/node_details/open_node/read_at；64个mount-lifetime borrowed Node、
+  8个owned FIL open。权限与取消/失活清理由Provider按verified Component/Task处理。
+- 单个VFS已含Namespace/File service、Local+Remote Fat、SDK和ksh cat/ELF文件读取，
+  多实例/身份/游标/EOF/失效回归有真实CoreTest证据；littlefs节点/Remote仍未接。
+- 写、目录枚举、Page Cache、完整share/delete/ACL、通用POSIX文件fd未实现。
+
+wire布局/编号以 [filesystem schema](../../abi/filesystem.toml) 为准；架构不要求Core
+识别文件对象。method生成与旧业务表退出仍未实现，见[收敛审计](../development/component-communication-audit.md)。
 
 **目标**（本契约要长成的样子）：
 
@@ -253,7 +255,7 @@ FsInstance + FsNode + 同一份 storage
 - ACL 互译（POSIX ACL ↔ NT Security Descriptor 的对应规则）；
 - 两级缓存（文件数据缓存 + 块缓存同时上）；
 - partition 组件（接口不排除它，但本阶段不实现）；
-- 热插拔 / 多实例 FS 的真正落地（依赖 §10 的 endpoint / instance 模型）。
+- 热插拔/完整物理回收；多实例FS已落地，不与热插拔混为一谈。
 
 ### 未决问题（记录，等人类定稿）
 
@@ -262,7 +264,7 @@ FsInstance + FsNode + 同一份 storage
 | 1 | 是否定义 KaleidOS 原生权限模型 | 影响 provider 保留什么语义、personality 如何映射 |
 | 2 | 是否引入新错误分类法 / domain-status 通道 | permission-denied / share-conflict / delete-pending 塌缩进 `EACCES` 后不可逆 |
 | 3 | Namespace / File service 何时从 `vfs.kcomp` 内部模块提升为独立组件与 binding | 职责分离马上有价值，但拆 binding 需要实例模型与真实需求 |
-| 4 | endpoint / instance 模型的具体形状 | 决定多实例、多 mount 是否可用 |
+| 4 | 运行期mount/卸载和热替换协议 | Endpoint/实例与只读多mount已有；动态变更另定 |
 | 5 | 缓存的最终归属（File service 侧还是 FS provider 侧） | 先读 FatFs 验证接口，缓存留后 |
 
 ## 14. 与其他文档的关系

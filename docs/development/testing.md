@@ -186,3 +186,17 @@ QEMU 场景才证明真实双 CPU 在途调用。命令为 `make test-qemu`。
 Worker 使用已有 yield，错误路径有有限超时；没有跨 owner 的 wake、通用取消、Task
 join 或私有域 Worker 能力。这不是生产 RPC runtime。Direct 发布后 ctx 保留，停止
 Worker 不代表销毁实例；完整证据与未通过路径见 [收敛审计](core-convergence.md)。
+
+## 通信 Cleanup 门禁（2026-10-09）
+
+现有Echo/混合VFS/真实Fat/virtio主链不要重复实现；每次迁移按
+[专项审计](component-communication-audit.md#6-本轮真实门禁与已定位回归)记录准确HEAD、
+profile与失败，CoreTest分组通过不等于整套通过，旧PASS不覆盖当前失败。
+
+`python3 -m unittest discover -s tests/build -p test_ipc_codec.py -v` 编译实际C/Rust
+SDK envelope，验证独立LE golden、长度与错误层次；一个Rust decoder上界差异明确标为
+expectedFailure，不能计通过，生产修补后去掉标记。它已纳入test-tools，不证明AS隔离。
+SDK test-only IPC链接替身返回ENOTSUP，只恢复旧前端单测，不模拟Core收发。
+
+I域普通Gate对照在真实Task/IPC/copy替代通过前保留；先核对工件UNDEF，不能因为源代码
+未执行IPC分支就认为没有IPC import。NoMMU、MMU与Sandbox分别报告；Block吞吐目前未测。

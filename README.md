@@ -24,7 +24,8 @@ KaleidOS 探索的是：用一个提供基础机制的小型 Core，支撑可组
   适用于受信组件；IsolatedNative 使用私有地址空间。驱动向 Core 认领设备后，
   在本执行域的访问窗口内操作硬件。访问边界取决于真实执行域及硬件能力。
 - **服务语义与调用机制分开。** 组件通过 Endpoint 发布和绑定服务；接口描述
-  “提供什么”，Core 在绑定时按双方部署域选择 Direct 或 Gate。
+  “提供什么”；新普通服务使用 Endpoint Request/Reply，Core 复验授权与执行域。
+  历史 Direct/Gate 尚有消费者，收敛状态见 STATUS §3.29。
   同一份组件业务代码与服务契约可以用于不同部署组合。
 - **组件是独立程序，也有独立实例。** `.kcomp` 使用窄 C ABI，支持 Rust 与
   freestanding C 前端；加载同一工件两次得到两个组件，各自拥有可写镜像状态、
@@ -74,7 +75,7 @@ bootstrap 与 Core 职责分离，链接成一个内核镜像；组件独立构�
 | 普通用户程序 | RV64 静态 ELF 的 U-mode 执行，最小 POSIX fork/exec/wait，以及 FAT → ksh exec 流程 |
 
 IsolatedNative 当前仍是受限、协作式的执行边界；KernelNative panic containment
-只保证相应逻辑失效。SandboxedNative 组件后端、通用 VFS/libc 启动与完整物理回收
+只保证相应逻辑失效。SandboxedNative 组件后端、通用 VFS 文件 fd/libc 启动与完整物理回收
 仍待接通。各 ISA 的能力见 [Arch 模块](docs/modules/arch.md) 与
 [boot 模块](docs/modules/boot.md)。
 

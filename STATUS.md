@@ -1,6 +1,10 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-09。本次增加 KernelNative Endpoint Request/Reply 与生产只读 Local VFS 对象模块（§3.29）；Remote FatFs、VFS 服务与消费者迁移尚未接线。本次补齐 ksh 行编辑、历史、命令补全、引号解析与设备描述 / owner 显示；host 与 RV64/RV32 QEMU 验证见 §3.27。服务执行/组合研究与近期依赖链仍按现行契约推进。既有 RV64 用户 task / AS / trap、POSIX fork / exec / wait 与 FAT→ksh exec 证据保留；glibc guest startup 仍未通过。K/I 双向 Gate 的合成服务矩阵不代表真实驱动/FS 任意跨域可用。
+更新：2026-10-09。已核对develop `2e10304c389f`：KernelNative IPC、混合Local/Remote
+Fat VFS、virtio Block IPC-only及ksh/ELF主链已有。此次专项Cleanup完成审计、文档与
+测试补充，method生成和旧通信体系退出未完成；本轮完整门禁有明确失败，见§3.29。
+此前里程碑的PASS/计数是历史记录，不覆盖本轮回归。Isolated新IPC、Sandbox、通用
+VFS文件fd/libc startup和完整物理回收仍未实现；K链不证明私有域能力。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -10,7 +14,7 @@ RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固
 
 ## 0. 一句话
 
-KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS / libc startup、组件 SandboxedNative 后端和物理回收仍是主要缺口。
+KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS 文件 fd / libc startup、组件 SandboxedNative 后端和物理回收仍是主要缺口。
 
 底座侧 RISC-V 的 CPU 身份、启动、IPI 与 per-CPU 执行现场已接通组件调度。第二 ISA 的现状见模块文档，本轮不扩展它的实现或测试范围。
 
@@ -78,7 +82,7 @@ Hardware                                    目前只有 QEMU virt
 
 现状：每任务一份 pending permit、owner 校验、Blocked → Runnable 已接入真实任务调度。最终 permit 检查与 block commit 共用一个 task table 事务，覆盖跨 CPU 在策略执行期间 unpark 的竞争。wake 提交后通知目标 CPU。host 确定性测试与 property 测试覆盖状态模型；RV64 SMP 真实组件跑 128 轮远端 park/unpark。
 
-缺口：没有 task join、task-stop、Core event / waitqueue，也没有独立 TaskBlock / TaskWake trace。等待条件与等待者集合属于组件。
+缺口：没有 task join、task-stop、Core event / waitqueue，也没有独立 TaskBlock / TaskWake trace。普通业务等待条件属于组件；Endpoint IPC等待者和完成谓词由Core Exchange管理（§3.29）。
 
 #### 3.5 调度机制 `▰▰▰▰▱` IMPLEMENTED（协作式 SMP）
 
@@ -206,35 +210,31 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 下一步：定稿 `NetDevice` 契约与网卡 provider，手写 netstack adapter / 原语；事件驱动先补跨组件 unpark 与显式 timer 登记 / 取消，普通 park 不新增隐式 deadline。USB 走 TinyUSB，前提是同步原语。TLS 走 Mbed TLS，前提是 RNG/Clock/Socket。真机 bring-up 时补 SD/eMMC 与以太网，顺序见第 7 节。
 
-#### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED
+#### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED（只读；通信收敛未完成）
 
-现状：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3，mount 内 format 加自检）两个 C `.kcomp`，都绑 `block.device`；共用只读 filesystem 契约的 mount/unmount/open/close/read（不透明 handle）。CoreTest `block-chain`、`block-chain-direct`、`littlefs-multi-instance`、`littlefs-isolation`、`littlefs-direct` 在 RV64/RV32 端到端验证，多实例存储互不影响。
+FatFs、littlefs 是两个独立 C `.kcomp`，显式消费 Block。littlefs mount 失败才 format，
+随后自检；legacy open/read/close 与双实例介质隔离回归保留，节点接口仍 ENOTSUP。
+FatFs 已有 root/lookup/node_info/node_details/open_node/read_at；64 个挂载期 borrowed
+Node、8 个独立 FIL open；默认 init 使用 IPC-only FatFs，legacy 测试仍保留表/Gate。
+Provider 状态已有 try-enter 串行纪律，不能继续称 files 表无同步。
 
-节点操作：FatFs 已实现 `root / lookup(parent, name, encoding) / node_info`，
-C/Rust SDK 的 Direct / Gate 路径已接线；littlefs 显式返回 ENOTSUP。
-名字限制与 token 有效期见 [filesystem schema](abi/filesystem.toml)。真实 FAT 镜像
-host 测试、SDK 93 项 host 测试、ABI 校验与两个 C provider 的 RV64/RV32 `.kcomp`
-构建通过；新增节点行为尚未经过 QEMU，VFS provider 适配仍未接线。
+VFS create、Rust SDK、LocalFs/RemoteFs、统一 Namespace/Path/OpenFile 与 owned Server
+Task 已接线；ksh cat 和 ELF 文件读取都走 VFS。CoreTest 真两个 C FatFs+RAM Block
+验证身份、独立游标/EOF、wrong Task、取消/退出回收、失效/重启不重绑与 drain/stop。
+init 真实 virtio FAT/双盘/Local/Remote 路径及 RV64 exec 本轮通过。
+模块事实见 [VFS](docs/modules/vfs.md)，完整当前门禁与剩余迁移见 §3.29。
 
-VFS：生产只读 LocalFs / FsNode / FsOpen / Namespace / Path / OpenFile 已实现，有直接验证生产模块的 host 测试；两个 Local 实例、目录项别名、挂载位置/保活和独立游标可用。组件 create、SDK VFS binding 仍 ENOTSUP，无外部服务句柄表或 RemoteFat 接线。对象模块 IMPLEMENTED，VFS 服务 NOT IMPLEMENTED。见 [模块页](docs/modules/vfs.md)、[ADR](docs/development/hybrid-vfs-adr.md) 与 §3.29。
-
-骨架验证（构建层）：VFS / POSIX 的 RV64 / RV32 `.kcomp` 构建与 packer 检查通过，RV64 clippy（`-D warnings`）与 fmt 通过；当前 RV64 `make init.kpkg` 已包含两者。C ABI 的 RV32 / RV64 布局断言与 `make abi-check` 通过，SDK 现有 82 项 host 测试通过。尚无新增服务行为或用户态运行期验证。
-
-缺口：只读；namespace/OpenFile 已有 Local 对象实现，但没有可用 VFS 服务与 Remote FS；没有两级缓存；`lwext4` 还是候选，GPLv2 许可策略要先定。
-
-本次源码核对：FatFs REENTRANT=0，实例 files 表无同步；同实例双 CPU Direct/KernelNative
-Gate 并发的风险为 INFERRED，未实际复现。集成前须先明确并实施 provider 同步纪律，
-Gate 不自动串行业务状态。证据位置见 [服务研究 §3](docs/development/service-runtime-study.md#3-源码问题矩阵)。
-
-下一步：先 provider 节点 / 引用 / 枚举 / read_at，再只读 VFS 与 SDK adapter；写支持另定原子操作。用户态方向见 `docs/development/userspace.md`；`lwext4` 许可先行。
+缺口：littlefs Remote Node、目录枚举/写/share/delete/ACL、两级缓存与通用 POSIX fd；
+C/Rust FS legacy frontend 仍两 Backend，Block 三 Backend，method codec 尚未生成。
+下一步先恢复基线失败与 KABI/SDK 收敛，不重复实现已接通 VFS。lwext4 仍候选，许可另审。
 
 ### SDK、测试与观测
 
 #### 3.20 SDK / C ABI / Rust ABI `▰▰▰▰▱` IMPLEMENTED
 
-现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；61 个 `kcore_*` 导出（本轮仅新增已有 Stop 机制的窄导出）；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
+现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；72 个 `kcore_*` 导出（含九项 IPC 与 current principal 查询）；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
 
-缺口：没有 ABI 版本兼容，靠 exact fingerprint 加原地替换；组件外链只允许 `kcore_*`；SDK 刻意不朝 libc 或共享 runtime 扩张。
+缺口：没有 ABI 版本兼容，靠 exact fingerprint 加协调替换；KABI 尚不生成业务 method codec/client/dispatch，C/Rust 仍需人工同步。组件外链只允许 `kcore_*`；SDK 不朝 libc 或共享 runtime 扩张。
 
 下一步：为 embedded 系列提供 `kcomp-embedded-*` 伴生 crate 或 SDK feature；把 `porting.md` §8 的 host 接口（Net/RNG/Clock/Log/Thread/Sync）逐个成文并落到 SDK。
 
@@ -327,6 +327,8 @@ PID / Linux syscall 语义在组件；Core 只管理实际执行真相。create 
 
 #### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 交互 shell）
 
+当前cat和ELF文件读取走VFS；以下早期交互阶段计数/fingerprint/PASS保留为历史记录，最新门禁见§3.29。
+
 现状：独立 `ksh.kcomp`，普通 profile 由 init 自动启动；monitor 也可 `load scheduler_rr` → `load ksh` 启动普通任务。
 支持 help [command] / history / echo / clear / components / endpoints / devices / load native 或 isolated /
 inspect 已加载实例 / cat / exec 静态 ELF / exit。业务代码只走 SDK。shell 的 Core 观察导出包括 console read 与
@@ -374,51 +376,48 @@ session 仲裁、通用 VFS / execve 路径、文件 fd、管道或 Win32。`exe
 
 #### 3.28 init `▰▰▰▰▱` IMPLEMENTED（最小启动编排）
 
-现状：普通 KernelNative `init.kcomp`，create 选择 scheduler_rr → 运行 driver_prober →
-把唯一 Live block EndpointId 作为 FatFs config → 任务上下文挂载 FAT → 启动 ksh。
-无块盘进入纯 console 会话；挂载失败使 init Failed 并回到 monitor，部分组件图保留可诊断。
-`CONFIG_BOOT_COMPONENT` 由 Kconfig 选择启动 artifact，普通 RISC-V profile 默认 init；
-空串直接 monitor，SELFTEST 绕过组件启动链。没有新增 Core 导出或改变 ABI 指纹。
-实现、使用与失败边界见 `docs/modules/init.md`。
+现状：普通KernelNative init选择RR并运行driver_prober，明确选择IPC-only Block，
+创建FatFs（LE config、control、flags=1）和VFS，显式安装Block→Fat→VFS→ksh grants。
+真实Task检查根挂载，ksh消费VFS Endpoint及选定根路径。无块盘仍有Local namespace；
+坏FAT使init Failed回monitor。没有全图回滚/级联卸载；实现见docs/modules/init.md。
 
-验证：`make check` 通过；Core host 536 PASS / 6 ignored、SDK 82、init 2、ksh 8，
-Kconfig 胶水 12/12，ABI 16 个生成物一致。`make test-qemu` 全通过：RV64/RV32 各两条
-原 CoreTest / ksh 流程与各三条 FAT、no-block、bad-fat 自动 init 流程。真实 FAT 文件读回、
-init Ready/Failed、task-context 重入拒绝、坏盘 monitor 恢复与 shutdown 均有串口证据。
-FatFs 改为 memcpy 解码不透明 config 字节；CoreTest 的 block-chain 使用偏移 1 字节的
-非对齐配置，双架构 PASS。日志见 `tests/qemu/logs/*20261003-230*.log`。
-另用私有 `qemu_rv32_nommu` profile 验证自动 FAT 挂载、文件读回、exit / unload /
-shutdown；`init-rv32-fat-20261003-230518.log` PASS。用户 `.config` 未改动。
+本轮make test-init覆盖RV64五/RV32四场景并通过，含cat/Local/Remote绝对路径、
+双盘选择、坏盘/无盘与RV64 OOM/ELF exec。早期FS直连验证不作为当前链路证据。
 
-缺口：无 VFS namespace、常驻 supervisor / reaper / watchdog、依赖解析或热插拔。
+缺口：无常驻 supervisor / watchdog、依赖解析或热插拔；已有只读混合 VFS namespace 与请求驱动对象 reaper（§3.29）。
 当前 prober / mount 是有限任务；`sched_run` 不提供 join，异步启动需要组件侧完成契约。
 
-#### 3.29 Endpoint Request/Reply 与 Local VFS `▰▰▰▱▱` EXPERIMENTAL
+#### 3.29 Endpoint Request/Reply 与混合 VFS `▰▰▰▱▱` EXPERIMENTAL
 
-授权范围：用户明确授权 Agent 直接实现本任务，采用逐阶段迁移。Phase 0 审计/官方参考/
-ADRs 与文件计划已补；Phase 1 的 KernelNative 真 IPC、Phase 2 的 Local 对象模块已落地。
-通信权威见 [IPC 契约](docs/architecture/ipc.md)，设计与迁移见
-[审计](docs/development/component-communication-audit.md)、[IPC ADR](docs/development/ipc-request-reply-adr.md)、
-[VFS ADR](docs/development/hybrid-vfs-adr.md)、[迁移计划](docs/development/component-communication-migration.md)。
+2026-10-09 Cleanup 核对：起始 HEAD 与 fetch 后 origin/develop 均为
+`2e10304c389fb6ab1b5815a97575199b62aa0c4b`，起始工作树干净。
+现行传输见 [IPC](docs/architecture/ipc.md)；事实/维护点/性能/门禁见
+[专项审计](docs/development/component-communication-audit.md)，待实施小 patch 见
+[KABI 设计](docs/development/component-communication-cleanup-design.md) 与
+[文件级迁移](docs/development/component-communication-migration.md)。
 
-Core 新增 listen/grant/submit/receive/reply/collect/wait/cancel/close 和当前 principal 查询。
-请求槽、listener/grant 与 wake storage 有界预留；不保存 caller 指针，只有 opaque bytes，
-不理解 FS 对象。创建者授权不改变资源 owner。等待登记和首个终态共用锁；Core 内部 wake
-沿真实 Task owner 执行。Task 退出、端口 close 和组件失败接到真实清理路径。Task 栈固定
-16 KiB，以容纳 SDK 请求/回复和 Core wait/switch 帧；新增存储换来独立可 park 的 Server Task，
-不是旧 Gate 改名，也未因新 IPC 删除旧同步 Gate。
+已实现：有界 Exchange、verified Component/Task、grant、独立 Echo Server、真实 wait/
+wake/退出/取消；Local+Remote FatFs、VFS runtime/SDK、ksh cat/ELF；virtio Block IPC-only。
+实际链路是 VFS → Fat Server → Block Server，设备由 driver 自己的 Task 身份操作。
+Node 是 borrowed mount-lifetime 身份，open 才 owning；不是早期每-node lease 草案。
 
-验证层次：生产 Exchange host 测试覆盖副本、逆序回复、权限、容量、取消/回复/close 六种
-终态顺序、caller/server exit、等待谓词与环；Local VFS 五项 host 测试覆盖只读对象、两个
-挂载与引用释放。CoreTest 用独立 `kcomp_echo.kcomp`、真实公开 API 验证 KernelNative
-RV64 跨 CPU / RV32 同 CPU IPC、两个 caller、满队列恢复、caller 退出、Provider panic、
-Server exit、关闭/停止、非法参数和 SDK envelope。完整验证结果在审计的后续实现记录。
+本轮门禁：abi/fmt通过；SDK test-only 链接替身修补后94 tests、VFS6 tests通过；
+init RV64五场景/RV32四场景及SMP3通过。CoreTest default RV64 101/104、RV32 88/90，
+NoMMU default 88/90；混合VFS/IPC分组通过，driver检查因锚点调用IPC失败。
+RV64 no-block 隔离服务检查失败，RV32 no-block 90/90+shell通过。Core host一个policy
+错误优先级失败，make check有两处clippy失败；Arch RV64/RV32各42/43，domain fixture
+因新增IPC imports被I白名单拒绝。本轮不能称完整门禁通过。
+新增C/Rust envelope字节测试3通过、1个1025字节Rust decoder已知差异expectedFailure；
+已知失败不计通过，修补生产decoder后必须去掉标记。详见审计，不以旧PASS覆盖。
 
-限制：新 IPC 的私有域进口、持久 Isolated Task、跨 AS copy、任意坏 VA containment、
-timer deadline/强制终止、通知和通用 capability 均未实现。Local host 不是混合 VFS 整机证据；
-Remote FatFs owning lease、创建取消 orphan、非阻塞 release、VFS runtime/SDK、ksh/exec
-和 Block/littlefs 迁移属于后续 Phase 3..4。现有 FAT/双盘/exec 仍走旧路径。Phase 5 删除旧
-Direct/Gate 的门禁尚未满足，不能宣称整个重构完成。
+收敛状态：Phase A专项审计完成；B仅方案/字节证据，method generator未实现；
+C仍有Block三Backend、FS双入口、RAM/little/probe旧通道；D私有Task/import/copy尚缺；
+E旧普通业务Direct/Gate未删。F文档/测试同步已做，不等于整体Cleanup完成。
+Core新增账本/锁本轮为零，没有Channel/Connection Registry。
+
+限制：KernelNative同特权可信；Isolated新IPC/持久Task/跨AS copy、Sandbox、deadline/
+强制终止/通知与物理回收未实现。旧Gate必须保留到真实I替代门禁满足。
+下一步：先基线回归，再Echo+Block生成客户端/分发，逐组迁移普通服务，最后删重复通道。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
@@ -477,13 +476,15 @@ P4 执行域/隔离（C10）                                        —— 部�
 |---|---|---|---|
 | 0：架构基线 | Service / Binding / Transport / Execution / Session / Recovery 分开；问题矩阵带证据等级 | 现行契约、代码事实和提案分别登记 | 文档已整理；未新增硬件验证 |
 | 1：双设备与显式组合 | raw block 可 attach，prober 遍历全部设备并关联实例；组合方显式选择两条 Block→FS 连接；init 配置根序号和 shell FS endpoint | 真实两盘/两驱动有效读写；错指纹、过期选择、创建失败；不以改 Core ABI 为起点 | DONE：raw attach、全枚举/去重、显式选择；真实两盘双 FS 直连通过，见下文 |
-| 2：只读 VFS | 补 provider 节点/lookup/read_at 所需语义、同步纪律与 SDK 数据缓冲前端；/fat、/little 并存 | FS ABI 演进与 adapter 前置；两个 FS 的路径、独立 open 与共享引用分别验证；ksh 消费选定 VFS | provider 串行纪律、旧句柄拒绝与 SDK 数据前端已实现；FatFs 节点与 SDK 已接线，littlefs 节点/read_at/VFS 适配仍待实现 |
+| 2：只读 VFS | 补 provider 节点/lookup/read_at 所需语义、同步纪律与 SDK 数据缓冲前端；/fat、/little 并存 | FS ABI 演进与 adapter 前置；两个 FS 的路径、独立 open 与共享引用分别验证；ksh 消费选定 VFS | Local+Remote Fat、VFS服务、ksh/ELF已接；littlefs节点/read_at/Remote仍待迁移，当前失败与证据见§3.29 |
 | 3：POSIX 文件 I/O | fd 引用 VFS 打开对象，用户内存 copy 与 openat/read/close 接通 | 普通 ELF 运行期访问两个挂载；坏指针、短读、fork/close 引用语义 | BLOCKED：阶段 2，通用 fd 表未接 |
-| 4：动态逻辑故障 | 依赖失效、旧对象错误、新实例显式重新挂载 | 一项 FS 失败不误伤另一项；旧 handle 不改指向；不要求现有 Direct FS 热卸载 | BLOCKED：对象/失效协议；无新增恢复实验 |
+| 4：动态逻辑故障 | 依赖失效、旧对象错误、新实例显式重新挂载 | 一项 FS 失败不误伤另一项；旧 handle 不改指向；不要求现有 Direct FS 热卸载 | 部分已验证：混合VFS测试覆盖Fat失效、旧句柄、新实例不重绑及另一挂载可用；完整回收仍缺 |
 | 5：Queued 实验 | Runtime 队列/Worker 原型；有需求再设计最小授权通知 | 先证提交/取消，最终阻塞完成无忙轮询；完成早于等待与失败收尾；不放宽 unpark owner | PLANNED：跨 owner notification 未实现 |
 | 6：部署/保护评估 | 固定业务负载比较实际可行 K/I 组合 | 先验证 import/等待/同步能力，再测性能；硬件保护另由 ArchTest/QEMU 证明 | PLANNED：真实驱动/FS 支持面受限 |
 
-### 6.2 本次实施与验收（2026-10-09）
+### 6.2 历史 FS 前置实施与验收（2026-10-09，混合 VFS 接线前）
+
+以下保留旧阶段记录；其“没有 VFS”和 PASS 是当时事实，当前实现/失败以 §3.29 为准。
 
 本次明确授权下完成阶段 1，以及阶段 2 的同步/SDK 前置；没有实现 VFS 草案、POSIX
 通用文件 fd、Queued 通知或 Native Direct release。初审问题编号见服务研究矩阵。
@@ -564,7 +565,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 
 | 能力 | KaleidOS 现状 | 计划复用 | 前置 |
 |---|---|---|---|
-| 存储 / 文件系统 | 部分 IMPLEMENTED（只读）：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3）两个 C `.kcomp`，只读契约，无 VFS / namespace / 写支持 | C 路线：lwext4（ext2/3/4，许可待定）；Rust 路线：Hadris（MIT，FAT/exFAT）、ext4-view（MIT/Apache，只读 ext4）。写支持与 VFS 自研（`docs/interfaces/filesystem.md`） | lwext4 的 GPLv2 许可策略先定；FS 契约定稿；块设备路径已就绪 |
+| 存储 / 文件系统 | 部分 IMPLEMENTED（只读）：`fatfs`（只读 FAT）与 `littlefs`（v2.9.3）两个 C `.kcomp`，已有只读 Local+Remote Fat VFS/namespace；little Remote 与写支持未有 | C 路线：lwext4（ext2/3/4，许可待定）；Rust 路线：Hadris（MIT，FAT/exFAT）、ext4-view（MIT/Apache，只读 ext4）。写支持与 VFS 自研（`docs/interfaces/filesystem.md`） | lwext4 的 GPLv2 许可策略先定；FS 契约定稿；块设备路径已就绪 |
 | 网络（TCP/IP） | SKELETON：服务 ABI / SDK 代理 / 用例与私有 smoltcp 后端占位；bind / create 拒绝，无运行服务 / 网卡驱动 / NetDevice ABI | smoltcp（0BSD，已引入）；lwIP（Modified BSD，后备） | `NetDevice` + 网卡驱动、原语 / 同步 / 服务 adapters、跨组件通知 / 显式 timer；lwIP 还需 Thread/Sync |
 | WiFi | NOT IMPLEMENTED | 按芯片：ESP32 系列 → esp-radio；Pico W → cyw43；参考 supplicant：wpa_supplicant/hostapd（BSD-3，Zephyr 移植）。多数芯片固件自带 802.11/WPA，主机侧只需驱动 + HCI/帧交换 | 对应硬件；SDIO/SPI 总线；固件加载机制（WiFi blob） |
 | 蓝牙 | NOT IMPLEMENTED | TrouBLE（trouble-host，MIT/Apache）+ bt-hci（Controller 缝）；C 后备 NimBLE（Apache-2.0） | HCI 传输（UART/USB/SDIO）+ 同步原语；本期不做 BR/EDR |
@@ -973,7 +974,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 |---|---|---|---|
 | A | Driver：真设备 → claim → MMIO/IRQ/DMA → driver component → Endpoint，最好在真 SoC 上 | PARTIAL | 机制齐全，`virtio_blk` 加 `driver_prober` 在 QEMU 跑通；无真 SoC；IRQ 单线；无 PCIe/USB/NVMe |
 | B | 多实例：一个 artifact 到实例 A/B，各自 state/resources/endpoints/tasks，无串扰 | PARTIAL | 已证：host `same_artifact_loads_produce_independent_components`、CoreTest `driver-multi-device`、ArchTest `isolated-restart`（并发同 artifact）、`ram_blk_rw` 每实例 buffer；endpoint/task 全维度无串扰与卸载后语义未系统证明 |
-| C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；无 VFS、namespace、File service、两级缓存 |
+| C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；只读混合VFS/namespace/OpenFile已接，通用POSIX fd与两级缓存未有，通信收敛见§3.29 |
 | D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit、host 调度集成与 RV64 远端 wake 已通过；RR 三常驻任务的下标饥饿已修复；preemption（`on_timer_tick` 是 `todo!()` 且未接线）仍缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | PARTIAL | RV64 普通用户 task/AS/trap、fork/exec/wait 与 console 已接；通用 VFS fd、线程/signal 与文件完成协议仍缺 |
 | F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的真实 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
@@ -993,7 +994,7 @@ RV64 普通用户 task 与 AS 已关联，不能继续当作零实现缺口。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
 - 内存物理回收与 instance 退役回收：不承诺，逻辑死亡、物理驻留。NOT IMPLEMENTED。
-- NoMMU 启动验证：profile 存在但从未 boot。PLANNED / 未验证。
+- NoMMU：RV32 S-mode私有profile已实际boot；本轮IPC/hybrid分组通过但整套driver失败，默认CI仍未纳入。M-mode不由此推导通过。
 - M-mode（`PRIVILEGE_MACHINE`）启动：Kconfig 可选、代码可编译，但没有 defconfig、没有 boot harness、不在任何测试或 CI 里构建。PLANNED / 未验证。
 - AArch64 / x86_64 / LoongArch：`os/arch/src/<isa>` 与 `os/boot/<isa>` 同形骨架已落地（`encoding`/`elf`/`console`/`cpu`/`smp`/`trap`/`context`/`mmu`，实现体 `todo!()`），能编译、未启动、未验证。NOT IMPLEMENTED（骨架）。
 - 真机支持（VisionFive 2、ESP32-C3 等）：零代码与配置，纯路线图。PLANNED。
@@ -1001,7 +1002,7 @@ RV64 普通用户 task 与 AS 已关联，不能继续当作零实现缺口。
 
 ## 12. 与文档的已发现漂移
 
-只登记，不改写。
+历史登记保留；本轮通信漂移已同步，清单与当前证据见专项审计§9。
 
 - `docs/architecture/deployment.md` §7.4/§11 的消费路径 ABI 陈旧描述已修正：裸 lookup 只发现 id，SDK 随后 validate，bind 再核对 exact ABI 与存活。
 - `docs/modules/components.md` 漏登记两个已在 `KCOMP_SRCS` 里的 fixture：`tests/kcomp_isolated_direct`、`tests/kcomp_isolated_unsupported`，全 `docs/` 没有引用。

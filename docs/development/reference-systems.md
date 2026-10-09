@@ -30,3 +30,11 @@
 - FS：Linux 区分 inode/dentry/path/file，DragonOS 证明 Rust 内部 Arc 对象可用；MINIX 提供远程批量路径解析的边界机制，Windows 提醒 open/cleanup/outstanding I/O 不能混成 Node 生命周期。选择单个 VFS + Local/Remote 统一对象接口，批量 pathwalk 延后，见 [VFS ADR](hybrid-vfs-adr.md)。
 
 这些选择适用于当前工作负载与部署能力。性能、NoMMU、防护与硬件生效仍需本项目自身证据，不能由参考系统代证。
+
+## 4. 业务协议生成补充（Cleanup）
+
+2026-10-09另核对[Fuchsia generated bindings](https://fuchsia.dev/fuchsia-src/reference/fidl/bindings/cpp-bindings)
+与[Wayland Code Generation](https://wayland.freedesktop.org/docs/book/Protocol.html)：
+比较结构化wire/client/dispatch生成与薄stub路径，采用范围和明确不照搬的复杂度见
+[KABI小模块设计](component-communication-cleanup-design.md#2-两个参考方案与采用范围)。
+这是在线文档核对，不是固定commit源码审计，无外部代码复制。

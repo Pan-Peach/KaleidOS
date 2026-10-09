@@ -60,7 +60,7 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
 | Gate + Inline | Core 管理的同步服务栈执行 dispatcher，同步返回 | 已有；不是独立 Server Task 的 receive/reply |
 | Direct + Queued | 本地入口提交，owned Worker 处理 | 组件侧候选；唤醒 Worker 的 owner 条件必须满足 |
 | Gate + Queued | 同步入口由 Runtime 入队，owned Worker 处理 | 业务完成协议仍为候选 |
-| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative 已接线；私有域 Task IPC 未实现 |
+| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative Echo/virtio Block/Fat/VFS 已接线；私有域 Task IPC 未实现 |
 
 Inline 表示执行者没有被移交，**不自动表示可阻塞或线程安全**。当前 Gate 栈不可
 yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可能使用 caller 的调度

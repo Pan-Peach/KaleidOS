@@ -4,7 +4,7 @@
 
 ## 1. 决策与适用范围
 
-普通独立 `.kcomp` 服务推荐统一到 **Endpoint + Core 拥有的有界消息副本 + Provider Server Task + 一次性回复凭据**。Rust/C SDK 在其上封装同步 call；Provider 只实现一个请求处理入口，不同时发布业务 Direct table 和 Gate dispatcher。单镜像内部保持普通函数、trait、Arc。第一步以 Echo 证明真实阻塞与唤醒，之后迁移 FS/Block。
+普通独立 `.kcomp` 服务推荐统一到 **Endpoint + Core 拥有的有界消息副本 + Provider Server Task + 一次性回复凭据**。Rust/C SDK 在其上封装同步 call；Provider 只实现一个请求处理入口，不同时发布业务 Direct table 和 Gate dispatcher。单镜像内部保持普通函数、trait、Arc。Echo、默认Fat/VFS与virtio Block的K链已接；本轮method生成/旧通道退出仍待实施，见[专项设计](component-communication-cleanup-design.md)。
 
 Core 只负责 Endpoint 活性、发送权限、消息长度/归属、Request 生命周期、Task 等待和一次完成；不认识 Session、inode、FILE_OBJECT、block lba。初版不做通用 handle table、CSpace、共享内存、零拷贝、notification、多 server 调度框架。内部的 request/reply 记录不是 provider 对象注册表。
 
@@ -90,7 +90,7 @@ accepted receipt --reply/discard/fail--> receipt retired
 
 ## 7. 执行域接线与验收门槛
 
-KernelNative Task create/start/park 已有，能作为第一轮真实 Echo 基础。Gate 服务栈、IRQ、policy/create/destroy 同步边界不能接收同步 IPC call。需要从 Task 入口进行，禁止在 Gate 中 park。
+KernelNative Task create/start/park 与真实 Echo 已有；本轮回归结果见[专项审计](component-communication-audit.md#6-本轮真实门禁与已定位回归)。Gate 服务栈、IRQ、policy/create/destroy 同步边界不能接收同步 IPC call。需要从 Task 入口进行，禁止在 Gate 中 park。
 
 IsolatedNative 现有同步 Gate 有私有 AS/trampoline/copy，但 import whitelist 没有 task/park/receive，单 invocation 活动限制与临时栈不等于持久 server Task。必须先实现：域关联 Task、持久私有栈、切换 satp/寄存器、受检 IPC imports、请求双向 copy、panic/exit 与 wait 回收；再测 K→I、I→K、I→I。RV64 Sv39 和 RV32 Sv32 分开验证。RV32 S-mode NoMMU 只验可信同域 transport，不承诺 private-AS；M-mode 启动与 Sandbox 另列缺口。
 

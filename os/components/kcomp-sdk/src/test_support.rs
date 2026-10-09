@@ -15,6 +15,33 @@
 use std::sync::Mutex;
 use std::vec::Vec;
 
+// Legacy SDK tests link the new Block backend even when they exercise only
+// Direct/Gate. Unsupported IPC fails explicitly; these stubs do not simulate
+// Exchange, scheduling, or isolation. Real envelope compatibility is tested in
+// tests/build/test_ipc_codec.py and transport behavior in CoreTest.
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_ipc_submit(_: u64, _: *const u8, _: usize, _: *mut u64) -> i32 {
+    crate::Errno::ENOTSUP.code()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_ipc_collect(
+    _: u64,
+    _: *mut u8,
+    _: usize,
+    _: *mut usize,
+    _: *mut i32,
+) -> i32 {
+    crate::Errno::ENOTSUP.code()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_ipc_wait(_: u64, _: u64) -> i32 {
+    crate::Errno::ENOTSUP.code()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kcore_ipc_cancel(_: u64) -> i32 {
+    crate::Errno::ENOTSUP.code()
+}
+
 static CALL_SCRIPT: Mutex<(i32, i32)> = Mutex::new((0, 0));
 /// 下一次 `kcore_endpoint_call` 成功时要写进 output 的脚本回复（消费一次）。
 static CALL_REPLY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
