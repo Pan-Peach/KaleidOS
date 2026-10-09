@@ -26,8 +26,8 @@ jobs:
           workspaces: |
             . -> target
             os/boot/riscv -> ../../../build
-      - name: Install exec fixture compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-unknown-elf clang llvm
+      - name: Install host test and fixture tools
+        run: sudo apt-get update && sudo apt-get install -y dosfstools mtools gcc-riscv64-unknown-elf clang llvm
       - name: Make check
         run: make check
 
@@ -46,6 +46,8 @@ jobs:
           rustup target add riscv32imac-unknown-none-elf
       - name: Install QEMU and FAT image tools
         run: sudo apt-get update && sudo apt-get install -y qemu-system-misc dosfstools mtools gcc-riscv64-unknown-elf clang llvm
+      - name: Install RV32 OpenSBI firmware
+        run: sudo bash scripts/ci/install-rv32-firmware.sh /usr/share/qemu
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -76,6 +78,8 @@ jobs:
           rustup target add riscv32imac-unknown-none-elf
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-unknown-elf clang llvm
+      - name: Install RV32 OpenSBI firmware
+        run: sudo bash scripts/ci/install-rv32-firmware.sh /usr/share/qemu
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

@@ -17,6 +17,13 @@
 | qemu-system-riscv64 / qemu-system-riscv32 | 启动与硬件测试 |
 | mkfs.vfat、mcopy（dosfstools / mtools） | FAT 根盘与 init 流程 |
 
+文件系统 provider 的 host 测试同样需要 `dosfstools` / `mtools`。
+RV32 的 `-bios default` 需要 QEMU 固件目录中的
+`opensbi-riscv32-generic-fw_dynamic.bin`。Ubuntu 的 QEMU 包可能缺少它；
+CI 使用 `scripts/ci/install-rv32-firmware.sh` 下载 QEMU v8.2.2 随附的
+OpenSBI 镜像并校验 SHA-256。本地 Ubuntu 缺少该固件时，可在仓库根目录运行
+`sudo bash scripts/ci/install-rv32-firmware.sh /usr/share/qemu`。
+
 ```sh
 git submodule update --init --recursive
 rustup target add riscv64gc-unknown-none-elf riscv32imac-unknown-none-elf
