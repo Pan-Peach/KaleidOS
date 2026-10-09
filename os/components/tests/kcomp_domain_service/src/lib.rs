@@ -135,9 +135,14 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     // An empty config is the public load() fixture: a plain provider.
     let defaults = [0, 0, 0x41, 0];
     let config = if args.config_len == 0 {
-        &defaults[..]
+        defaults
     } else {
-        unsafe { core::slice::from_raw_parts(args.config.cast::<u32>(), 4) }
+        let mut values = [0; 4];
+        for (index, value) in values.iter_mut().enumerate() {
+            // SAFETY: create borrows 16 valid bytes; config has no alignment promise.
+            *value = unsafe { core::ptr::read_unaligned(args.config.cast::<u32>().add(index)) };
+        }
+        values
     };
     let (provider, mode, seed, relay) = (config[0], config[1], config[2], config[3]);
     SEED.store(seed, Ordering::Relaxed);

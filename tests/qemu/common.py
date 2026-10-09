@@ -40,9 +40,11 @@ def qemu_command(args, disks=(), memory=None, probe=True):
     return command
 
 
-def make_disk(path):
+def make_disk(path, marker=0, signature=True):
     image = bytearray(1024 * 1024)
-    image[510:512] = b"\x55\xaa"
+    image[0] = marker
+    if signature:
+        image[510:512] = b"\x55\xaa"
     Path(path).write_bytes(image)
 
 

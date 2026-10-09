@@ -11,6 +11,10 @@
 组件实例、执行域、接口契约与交互机制分别描述身份、部署环境、语义与双方关系。
 Artifact 是程序字节，Endpoint 是一次发布；它们不另建组件生命周期。
 
+Service、Transport、Inline/Queued 与业务 Session 的职责分离以
+[服务执行契约](service-execution.md) 为准。这里的 Gate 是同步调用边界，不代表独立
+Server Task；部署决定合法调用窗口，不代替 provider 的并发、等待与对象失效语义。
+
 | 概念 | 回答什么 | 身份 / 载体 | 代码锚点 |
 |---|---|---|---|
 | **Contract** | 这个服务**语义**是什么 | 接口名 + exact ABI fingerprint + typed `#[repr(C)]` function table | `abi/block.toml`、`os/components/kcomp-sdk/src/block.rs:68-75` |
@@ -100,6 +104,12 @@ Artifact 是程序字节，Endpoint 是一次发布；它们不另建组件生�
 > `lookup` 比较 contract + 存活；SDK 的 `Endpoint<C>::from_id` 经 `kcore_endpoint_validate` 补齐 exact ABI 校验，`bind` 再验证契约与存活。
 
 **SDK 在 bind 后沿已选机制调用。** Direct 直接执行表，不逐次进入 Core；Gate 每次进入 Core，重新检查 caller / provider 身份、存活、域与重入条件。SDK 不自行重新协商或降级机制。
+
+provider selection 属于组合策略，Core 不从候选中猜 root/default 服务。
+**候选，未实现**：组合方在真实需求下可提出 transport preference，Core 仅交付验证后
+的机制。当前 bind ABI 无 preference/fallback 字段，仍遵循 §3；显式 K/K endpoint_call
+也不等于普通 SDK bind 支持选择 Gate。EndpointId 是发布身份，不是完整 per-consumer
+grant capability，不能把可发现当作不可信组件的访问授权。
 
 ---
 
@@ -320,9 +330,9 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 | 项 | 已有 | 目标 | 缺口 / 证据 |
 |---|---|---|---|
 | 私有地址空间 | **已接线**：按域放段、共享 Core 映射、私有 backing 别名排除、跨 AS trampoline、生命周期与 K/I 双向 Gate；异常由普通 trap 路径归因 | ASID / U-mode / Sandboxed 执行器、任务与 DMA teardown 仍未实现 | `memory/{address_space,kernel_mappings}.rs`；`component/{isolated,isolated_call,isolated_lifecycle}.rs`；`arch/src/riscv/trampoline/` |
-| 上下文切换 | 只存 `ra/sp/s0-s11` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs:24-28`（`RiscvContext` 字段，**不含 satp / sstatus.SIE**）；跨 AS 进入走独立的最小 trampoline（`arch/riscv/trampoline/`，每次调用独立 `Context`：调用者 `satp` + ABI 现场按需保存 / 恢复，`satp` 只在目标与调用者不同时切换 + 全量 `sfence.vma`）；普通任务切换仍用 `__switch`（`RiscvContext`） |
+| 上下文切换 | 普通 Task 保存 `ra/sp/s0-s11/tp` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs` 的 `RiscvContext`（不含 satp，IRQ 使能由 Core 执行流状态另存）；跨 AS 进入走独立的最小 trampoline（`arch/riscv/trampoline/`，每次调用独立 `Context`：调用者 `satp` + ABI 现场按需保存 / 恢复，`satp` 只在目标与调用者不同时切换 + 全量 `sfence.vma`）；普通任务切换仍用 `__switch`（`RiscvContext`） |
 | `activate()` | 写 satp + sfence，**运行期无人调用**（boot 的 runtime root 除外） | 按域激活 | `os/arch/src/riscv/mmu/mod.rs`；boot 的 runtime root 在 `kernel::init` 后 activate；Isolated 切换由 `trampoline` 直接消费 `PreparedActivation` 的预打包 satp，ASID 恒 0 |
-| U-mode / MPP | **无**（`mstatus` 只设 MIE） | U 域 | `UserEnvCall` 已解码（`os/arch/src/riscv/trap/mod.rs:66,97`）但 **panic**（`os/arch/src/riscv/trap/supervisor.rs`） |
+| U-mode 组件后端 | **SandboxedNative 组件未实现**；RV64 普通用户 Task 的 U-mode / trap 已接线 | U-mode 组件 import、heap、生命周期与服务授权 | 普通用户路径 `os/core/src/task/user.rs`，personality 见 [POSIX 模块](../modules/posix.md)；不能从它推导 `.kcomp` Sandbox 可用 |
 
 ### 7.2 重新放段与入口
 

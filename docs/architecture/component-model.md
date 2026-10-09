@@ -1,5 +1,9 @@
 # 组件模型（component-model.md）
 
+> 概念页。身份/生命周期以 [组件生命周期](component-lifecycle.md) 为准，部署/binding
+> 以 [部署契约](deployment.md) 为准，服务执行/组合以 [服务执行](service-execution.md)
+> 为准。目标组合/恢复结构不表示当前已实现。
+
 ## 1. Component 是什么
 
 Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而是 **lifecycle 与 ownership 的同一单位（unit of lifecycle AND ownership）**：一个组件实例代表它的 code、execution、资源归属、interfaces、lifetime 与 failure state。因此它是一个完整的可管理单元：
@@ -11,7 +15,7 @@ Component 是 KaleidOS 的基本构建单元。它不只是"一个模块"，而�
 - 可以包含子 Component（Composite，见 §7）；
 - 可以被替换 / 重启 / 恢复。
 
-一个实例因此可以拥有：tasks、stacks、claimed 设备、IRQ routes、DMA allocations/mappings、memory mappings、interfaces；失败时 Core 能按实例（per-instance）拆除它们（见 §3.3 与 §4.9）。
+一个实例因此可以拥有：tasks、stacks、claimed 设备、IRQ routes、DMA allocations/mappings、memory mappings、interfaces；失败时 Core 撤销可见资源归属并禁止后续调度，已发布 backing 保留驻留。逻辑失效不等于完整拆除（见 §3.3 与 §4.9）。
 
 **组件 ≠ crate**：第一阶段里，一个只有几十行的小模块就是普通 Rust module，不需要为架构图强行建 crate。组件是概念边界，crate 是实现选择。
 
@@ -41,8 +45,9 @@ requires:  FileSystem providers, PageCache
 provides:  FileSystemService
 ```
 
-> Interface 是语义，传输是绑定策略。第一阶段用 Rust trait + direct call；
-> 未来可换 IPC stub / Wasm host call。接口文档里写"契约"（方法、语义、错误），不写"怎么调用"。
+> Interface 是语义，传输是绑定机制。组件边界使用窄 C ABI；SDK 的 Rust trait 是组件内部前端。
+> 接口定义方法、完成/等待、并发、借用与失效语义；Direct/Gate 窗口服从部署契约。
+> Server/Worker 是独立执行模型，见 [服务执行](service-execution.md)。
 
 ### 2.1 绑定机制定案：Endpoint Registry（唯一绑定真相）
 
@@ -57,12 +62,13 @@ Component → Component     = Endpoint binding（endpoint.rs）——禁止 flat
   不是"永不变更的 provider ELF 符号地址"。`bind` 时 Core 按两端执行域一次性选定
   机制：同域 Direct 交付 provider 的 `api` / `ctx`（`#[repr(C)]` function table +
   opaque state），跨域 Gate 只给 call-gate handle。endpoint **永不重定向**：
-  provider 停止 / 失败 → 它的全部 endpoint 永久失效，**不需要 ELF reload**。
+  provider 停止 / 失败 → 它的全部 endpoint 永久失效；新实例发布新 endpoint。
+  已交付 Direct 表不能追回，publication 失效不等于所有业务会话已清理。
 - **exact ABI fingerprint（`InterfaceAbi`，`#[repr(transparent)] u64`）取代
   version**：它没有版本兼容语义，只回答"provider 与 consumer 是否由完全相同的
   Service ABI contract 编译"。不一致必须拒绝 publish / validate / bind，绝不能把布局
-  不同的 function table 交给 consumer。自动 ABI hash 生成器 / compatible range /
-  ABI-changing coordinated update 属下一阶段（只留 seam）。
+  不同的 function table 交给 consumer。指纹由 `abi/*.toml` 生成并协调替换，
+  不提供 compatible range 或陈旧 ABI 兼容别名。
 - Core 真相：`EndpointRegistry` 记录 谁在哪个端口发布了哪个契约（ContractId /
   EndpointId / kind / abi / provider / port / api / ctx）；`publish` 在
   `kcomp_instance_create()` 期间只记录 pending（**staged**），create 成功后 Core
@@ -177,7 +183,7 @@ struct Mapping {               // DMA mapping（device-related）
 
 > **ResourceDomain 不记受管内存**：Core 不做内存记账（无 region owner 记录），只记录设备所有权 / IRQ route / DMA mapping，用于 revoke / teardown / quarantine；堆是 runtime / deployment 策略，不是 ResourceDomain 资源。契约见 `docs/architecture/memory-and-heap.md`。`ComponentId` 与 `DeviceId` 都是 identity（不是权限），所有权记录只存在于各资源表。
 
-> **DMA 归属模型**：allocation 与 mapping 的归属 / 权限边界以 [驱动契约](driver-model.md#63-dma-模型allocation-与-mapping-分离) 为准；当前受信 Native mapping 锚在 device owner，不检查 ambient caller。DeviceId 是身份，不能把记账推导为跨隔离域权限。
+> **DMA 归属模型**：allocation 与 mapping 的归属 / 权限边界以 [驱动契约](driver-model.md#63-dma-模型allocation-与-mapping-分离) 为准；当前受信 Native mapping 锚在 device owner，caller 可与设备 owner 不同；提交仍复验双方生命周期。DeviceId 是身份，不能把记账推导为跨隔离域权限。
 
 ### 3.1 归属表可以非常普通
 
@@ -209,252 +215,76 @@ fn release(caller: ComponentId, device_index: u8) -> Result<(), DeviceReleaseErr
 
 **这些归属检查是"谁拥有 / 谁能拆"的记账，不是 per-access 鉴权**：`kcore_device_claim` 之后，driver 直接拿到裸 MMIO 指针，Core 不再参与每次寄存器读写（KernelNative 就是可信代码，见 `driver-model.md` §1.1）。
 
-### 3.2 回收：revoke_owner
+### 3.2 撤销归属
 
-```rust
-fn revoke_component_resources(id: ComponentId) {
-    device::revoke_owner(id);   // 失败路径：设备进 quarantine（保持到 reboot）
-    irq::revoke_owner(id);
-    dma::revoke_owner(id);      // backing 进 QUARANTINE（不 free）
-}
-```
+`revoke_owner` 按各资源表的 owner 处理可见记录，不要求外置 ResourceDomain 容器。
+真实兜底汇合点是 `failure::revoke_authority_and_unbind`；顺序与 quarantine 规则只在
+[驱动契约](driver-model.md#7-生命周期与-teardown-安全) 和 [生命周期](component-lifecycle.md)
+维护。概念上的「撤销一组资源」不等于裸指针不可访问或物理资源已释放。
 
-每张表内部：
+### 3.3 组件停止与失败：逻辑失效先于物理回收
 
-```rust
-fn revoke_owner(owner: ComponentId) {
-    for record in TABLE.iter_mut() {
-        if record.owner == owner {
-            revoke(record);
-        }
-    }
-}
-```
+| 路径 | 概念边界 | 权威细节 |
+|---|---|---|
+| Graceful stop | 先通过停止准入，组件 destroy 协作收尾，Core 兜底后提交 Stopped | [生命周期](component-lifecycle.md)、[驱动 teardown](driver-model.md#7-生命周期与-teardown-安全) |
+| Failure | 先提交 Failed，不调用 destroy；撤销 Core 可见归属并 quarantine | 同上；不保证立即停止远端执行流 |
+| Physical reclamation（未来） | 另证引用/执行者静止、页表/TLB 与设备 DMA 安全 | [内存与堆](memory-and-heap.md)、[服务执行 §6](service-execution.md#6-生命周期保证分别论证) |
 
-> 第一反应可能是"扫表性能是不是不好？"——但这条路径是 **component unload / failure / restart，不是 fast path**，O(全部 IRQ + MMIO + DMA handle) 完全可接受。第一版不做 `ComponentId -> Vec<ResourceRef>` 反向索引；等真发现资源量大再维护。
+设备自身 quiesce/reset 的顺序属于驱动；Core 已实现的兜底顺序属于生命周期机制。
+KernelNative 的裸指针、挂死、恶意写内存、带锁失败不能由归属撤销强制隔离。
+panic=abort 的 containment 没有 Rust Drop/unwinding 清理保证；失败不是 free(state)。
+仍可能被 CPU 或设备访问的 backing 不得重新分配，CPU 静止也不证明 DMA 静止。
 
-### 3.3 组件停止时的回收 —— 两条路径，不预设 universal revoke order
+## 4. ExecutionDomain —— 部署属性与 Core 资源
 
-> Core 的保证是 **eventual revocation / containment**：组件生命周期结束后，Core 最终必须收回其 ResourceDomain。
-> 具体顺序**不写死** —— 不同设备要求不同：有的要先停 DMA、reset 设备再 mask IRQ；有的要先 unmap。
-> 落地原语统一收敛为上面的 `revoke_component_resources(id)`。
+执行域概念与能力以 [部署契约](deployment.md) / [驱动契约](driver-model.md) 为准。
+KernelNative 共享 Core 地址空间；受限 IsolatedNative 使用私有 AS；SandboxedNative
+组件创建仍显式 ENOTSUP。Native/Wasm 后端与 Inline/Queued 请求执行分别是正交维度。
 
-#### Graceful shutdown（正常关闭）
+### 4.1 实例记录与地址空间
 
-```text
-quiesce                        —— 停止接受新请求
-  ↓
-component-specific shutdown    —— 设备相关收尾（停 DMA / reset / mask IRQ ...，顺序由设备定）
-  ↓
-stop
-  ↓
-revoke_component_resources(id) —— Core 兜底，撤销剩余归属（device 进 quarantine / DMA backing 停车）
-  ↓
-ResourceDomain becomes empty
-```
+`ComponentRecord` 直接拥有自己的 LoadedComponent、instance state、生命周期与部署属性，
+AddressSpace 的存在/映射真相由 Core 内存模块维护。加载同一 artifact 两次就是两个
+ComponentId 和独立可写 image；不再建 ComponentRuntime/ImageTable 复制 loaded 归属。
+记录的精确字段见 [component 模块](../modules/core/component.md)，唯一身份契约见
+[生命周期 §2](component-lifecycle.md#2-身份模型)。
 
-> 现状（§5.2 的第一版实现）：quiesce = `begin_stop`（`Ready → Stopping`，任务
-> run 门禁 + publish 拒绝）、component-specific shutdown = 组件退出钩子
-> `kcomp_instance_destroy`（monitor `unload` 触发）、stop = `finish_stop`；Core 兜底与失败
-> 路径共用 `failure::revoke_authority_and_unbind`（剩余 device claim 进
-> quarantine，DMA backing 停车）。有未退出任务的实例在第一步就被拒绝（drain variant 未实现）。
+### 4.2 loader / registry 与组合 Runtime
 
-#### Forced containment（强制隔离）
+Core load 编排装载、登记、create、pending publication 提交与 Ready。
+Resolved 是生命周期步骤，不证明已有通用 requires 解析器或运行时依赖图。
+`init` / profile 负责选择、连接与初始化顺序；provider 的服务 Runtime 负责队列/Worker/
+Session，均复用现有 ComponentId。library helper 与可独立部署的组件按实际需要区分，
+不为了 ComponentManager 图再造第二套运行时 Registry。
 
-组件 crashed / hung / 恶意行为时：
+### 4.3 KernelNative
 
-```text
-Component Failed
-  ↓
-Core containment               —— 阻止它继续访问资源
-  ↓
-reset / isolate device（尽可能）
-  ↓
-force revoke ownership
-  ↓
-revoke_component_resources(id) —— 撤销归属记录（device / irq / dma）并做 quarantine
-```
+create / destroy / Gate 通过 Core 管理的执行边界调用入口；Direct 数据面是已绑定的
+C function table。后者不切 principal，也不建立单独的 panic containment，不能把函数
+所属镜像当作资源请求的 owner。实例堆/状态仍保持自己的有效期，细节见生命周期 §7。
 
-> 强制隔离撤销的是**归属记录**（device / IRQ route / DMA mapping），并对可能仍被设备访问的 DMA backing 做 quarantine。堆内存的清理走正常 Drop 路径；完整的内存回收属于 ExecutionDomain 的职责（见 §4）——phase 1 的 KernelNative 组件不承诺内存回收。
+### 4.4 私有 AddressSpace 与执行域
 
-#### Teardown 是资源生命周期问题，不是 "free(stack) + done"
+Core 保存 AS 语义真相并提交映射，Arch 维护页表硬件投影。共享 Core 映射、import 面、
+跨 AS trampoline 与条件性故障归因决定 Isolated 实际支持范围；S-mode 私有 AS 不是
+不可信代码边界。普通 U-mode 用户 Task 已有，不等于 SandboxedNative 组件已可装载。
+AS 退役、CPU/TLB 静止和物理 backing 释放分别论证，见 [内存与堆](memory-and-heap.md)。
 
-正确的拆除顺序以**资源生命周期**为中心：
+### 4.8 按域装载
 
-```text
-stop new work
-  → quiesce / reset / detach device
-  → mask IRQ
-  → resolve outstanding interrupt claims
-  → stop tasks
-  → remove interfaces
-  → unmap memory
-  → wait / quarantine outstanding DMA
-  → release resources
-  → revoke ownership records
-  → mark Failed / Destroyed
-```
+当前 KernelNative 使用 `loader.rs`；Isolated 使用 `isolated_load.rs` 按域放段/重定位并
+由 `isolated_lifecycle.rs` 关联私有 AS 与执行入口。通用 ELF/白名单重定位复用既有逻辑。
+不以一份 ET_REL 可解析就推断所有部署域的 import、设备访问和等待能力均可用。
+源码入口与支持矩阵见 [component 模块](../modules/core/component.md) 和 deployment §10。
 
-> 两条硬原则：
-> 1. **任何仍可能被 CPU 或设备访问的物理内存，都不得重新分配**（否则就是 UAF / 数据破坏）。
-> 2. **CPU 隔离 ≠ DMA 隔离**：即使 CPU 侧已停止访问、任务已停，设备 DMA 仍可能写入该内存——必须先 quiesce / wait / quarantine outstanding DMA，才能回收。
+### 4.9 失败与退出的代码入口
 
-**意义**：restart、replace、fault recovery 全部建立在"Core 最终能收回 ResourceDomain"这一保证上。
-
-## 4. ExecutionDomain —— 这里才真的有 enum
-
-- **ResourceDomain** 回答"它拥有什么"；
-- **ExecutionDomain** 回答"它在哪里运行"。
-
-**两个 Domain 的形态故意不对称**：ResourceDomain 无 struct（§3，一个视图）；ExecutionDomain 是真正 owning 的 enum —— 它代表需要建立、切换、最终销毁的运行环境：
-
-```rust
-pub enum ExecutionDomain {
-    KernelNative,
-    IsolatedNative(AddressSpaceId),   // 可选实验（S + 私有 AS），非里程碑
-    // future: SandboxedNative(AddressSpaceId)  —— U + 私有 AS，未来的硬件强制边界
-}
-```
-
-> **执行模型 / ISA / runtime（native machine code vs Wasm）是正交维度，不属于本枚举。** `KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime，`SandboxedNative` 也都可以是 native code；把 Wasm 放进 `ExecutionDomain` 是把两个正交维度揉到一起。Wasm 作为未来 Component 的执行后端需要**单独的维度**（见 `deployment.md` §3），不要加回本枚举。
-
-> **契约不能 ABI 锁定**：Interface 和 device claim / IRQ / DMA 机制必须与"传输方式"解耦，否则未来无法把组件挪进独立域。
-
-### 4.1 不塞进 ComponentRecord
-
-组件记录（`registry::ComponentRecord`，见 `docs/architecture/component-lifecycle.md`）本质是 Registry / monitor / inspection 用的 metadata；`AddressSpace` 是 heavyweight runtime 对象。两者不混：
-
-```rust
-pub struct ComponentRecord {
-    pub id: ComponentId,          // 唯一的一等运行时身份
-    pub name: Vec<u8>,            // artifact 名
-    pub loaded: LoadedComponent,  // 本组件自己的已加载程序 + 常驻 MemoryLease
-    pub state: ComponentState,
-    pub execution_domain: ExecutionDomain, // 部署域（创建入口验证后写入；今天 KernelNative 与受限 IsolatedNative 可执行）
-    pub instance_state: *mut (),  // 组件私有的实例状态（create 返回）
-}
-
-// 执行域只在记录上放这个轻量种类字段（**不放** AddressSpace runtime 对象）；今天
-// KernelNative 与受限 IsolatedNative 都有真实执行器；SandboxedNative 在创建入口是
-// `todo!()` 占位（按域分派，绝不静默降级）。
-// 执行模型 / runtime（native machine code vs Wasm）是正交维度，**不进本记录**（见 §4 顶部）。
-```
-
-组件记录**直接拥有** `LoadedComponent`（`base` / `create` / `destroy` / `service_dispatch` / `text_size` / MemoryLease）——代码 / 入口 / 常驻 backing 全属于这个 `ComponentId`，**没有** instance → image 的二级查找。加载同一 `.kcomp` 两次就是两个 `ComponentId`，各自独立放段 / 重定位，可写 image state（`.data` / `.bss`）互不共享；`ImageTable` / `ComponentImageId` 二级身份已删除。
-
-真正 runtime：
-
-```rust
-pub struct ComponentRuntime {
-  pub id: ComponentId,
-  pub loaded: LoadedComponent,
-  pub execution: ExecutionDomain,
-}
-```
-
-分工：
-
-```text
-Registry —— "系统里有哪些 Component，是什么状态"（metadata）
-Runtime  —— "这个 Component 现在实际占着什么运行环境"（runtime）
-```
-
-### 4.2 ComponentManager（未来把 loader / registry / execution 串起来）
-
-```rust
-pub struct ComponentManager {
-  registry: Registry,
-  runtimes: Vec<ComponentRuntime>,
-}
-
-impl ComponentManager {
-  pub fn load(&mut self, name: &[u8], blob: &[u8], kind: ExecutionKind)
-    -> Result<ComponentId, ComponentError>;
-  pub fn start(&mut self, id: ComponentId) -> Result<(), ComponentError>;
-  pub fn stop(&mut self, id: ComponentId) -> Result<(), ComponentError>;
-  pub fn fail(&mut self, id: ComponentId, reason: ComponentError);
-}
-```
-
-（概念代码；落地时按现有 Registry 状态机接轨。当前 load 链是
-`Declared → resolve → Resolved → begin_start → Starting → call kcomp_instance_create →
-{ failure → Failed | success → 提交 pending endpoints → finish_start → Ready }`：
-`resolve()` 已落地（语义 = requires 全部绑定成功）；`Starting` 已接线为
-`kcomp_instance_create()` 执行期（此期间 `kcore_endpoint_publish` 只记录 pending，不创建
-endpoint）。停止链已落地（§5.2：`Ready → Stopping → Stopped`，monitor
-`unload` 驱动）；`Stopped` 记录保留、段内存不回收（phase 1）。）
-
-> **Component Runtime ≠ Component**：Component Runtime 是负责 load / instantiate / 连接 registry / 管理 execution 与 lifecycle 的**基础设施**——可以是围绕 Core 的一组 library / manager（§4.1 的 `ComponentRuntime` struct 只是它持有的 per-component 运行时数据），但它本身**不是 Component**。同理，一个只为驱动组件提供共享机制的 "Driver Runtime"，首先也是 library / framework，不是 Component。
->
-> 规则：不要因为有了组件模型就把一切都组件化。Component 对应真正具备 lifecycle / identity / ownership / execution / service-role 的实体（见 §1）。
-
-### 4.3 KernelNative 具体是什么
-
-`KernelNative` 只需要保存已加载程序和执行种类，调用方式与现在一致：
-
-```rust
-let ret = containment::call_component_create(runtime.loaded.create, args, &mut out_state);
-```
-
-### 4.4 私有 AddressSpace 与执行域（C10）
-
-M0.5 的静态启动页表不是这里的 AddressSpace。真正的运行期地址空间只在需要**私有地址空间**时引入（`IsolatedNative` / `SandboxedNative` 等执行域，或可执行回收），由 Core 的 AddressSpaceManager 统一管理：`ExecutionDomain` 只保存 `AddressSpaceId`，Core 保存语义真相，PTE 只是 backend 的硬件投影。map / unmap 是 Core 内部提交点（不导出给组件）；映射与销毁是 Core 控制的显式事务（进入 `Dying` 后拒绝新操作、确认无 CPU 使用、backend 销毁、Core 按 ownership 回收并递增 generation）。实现 C10 前不把 Core 绑定到 `Sv39` / `Pte` / `satp` 或具体 backend。定位见 `driver-model.md`，现状见 `docs/modules/core/memory.md`。
-
-### 4.8 Loader 自然分叉
-
-现状 `load_component(blob)` 由 Core 侧 loader 编排：通用 ELF 对象解析在
-`component/elf.rs`，段存储由 Core allocator 提供，架构/ABI 重定位由
-`arch/riscv/elf.rs` 的 `RiscvRelocator` 实现（该实现可在 host 编译，测试直接驱动
-生产代码）；loader 返回 `LoadedComponent { base, entry, text_size }`。
-当前拿 PA 当 VA 拷贝。未来（按 ExecutionDomain 分叉）：
-
-```rust
-fn load_component(blob: &[u8], target: &mut dyn LoadTarget)
-    -> Result<LoadedComponent, LoaderError>
-```
-
-- KernelNative target：alloc memory region → identity / kernel VA → copy；
-- IsolatedNative target：向 Core 请求 memory region → Core 提交 range mapping → copy。
-
-loader 不需要知道 satp / Sv39 / KernelNative / IsolatedNative，它只知道"给我一块能放 section 的 memory"——保持 arch / mechanism 分层。
-
-### 4.9 失败与退出的实际代码流
-
-```rust
-pub fn fail_component(&mut self, id: ComponentId, reason: ComponentError) {
-    self.registry.mark_failed(id).unwrap();
-    self.stop_component_tasks(id);
-    revoke_component_resources(id);
-    self.drop_runtime(id);   // KernelNative: drop Rust state 结束；
-                 // IsolatedNative: Core 显式销毁 AddressSpace
-}
-```
-
-正常退出：
-
-```rust
-match run_component(id) {
-    Ok(()) => {}
-    Err(err) => shutdown(id),
-}
-```
-
-graceful path：
-
-```text
-Component 返回 Err
-  ↓
-Quiesce
-  ↓
-Component shutdown()
-  ↓
-Rust Drop
-  ↓
-绝大部分资源由组件自己释放
-  ↓
-revoke_owner(id)   ← 只是保险："还有没释放的归属？有就 Core 扫掉（quarantine）。"
-```
-
+真实入口是 [failure.rs](../../os/core/src/component/failure.rs) 的 `fail_component`
+与 [exit.rs](../../os/core/src/component/exit.rs) 的 `stop_component`。
+前者先 mark_failed 再兜底，后者在通过停止门禁后调用 destroy；二者都不承诺完整物理回收。
+停止自己的 Task、解除客户端连接、排空业务请求与恢复策略分别由所属组件处理，
+不能把一个示意 drop_runtime 当成实际可用的卸载原语。现状入口见
+[component 模块](../modules/core/component.md)，规范见生命周期契约。
 
 ## 5. 生命周期
 
@@ -466,30 +296,39 @@ revoke_owner(id)   ← 只是保险："还有没释放的归属？有就 Core �
 Declared → Resolved → Starting → Ready → (Stopping → Stopped) | Failed
 ```
 
-`ComponentId` 永不复用；`Stopped` / `Failed` 记录留 tombstone，段内存不回收（phase 1）。**过期访问边界（勿高估）**：`bind` / `claim` / IRQ 投递 / 调度都查生命周期，但 consumer 已缓存的裸 function table 指针在 provider `Stopped` / `Failed` 后**仍会调用成功**（段内存未释放）——这是"物理驻留 + KernelNative 无隔离"的直接后果，不是 bug。意外退出 / abort 当前统一由 `Failed` 覆盖（hook 点见 `ComponentState::Failed` 的 `TODO(unexpected-exit)`）。
+`ComponentId` 永不复用；`Stopped` / `Failed` 记录留 tombstone，段内存不回收。
+Core 可检查的入口拒绝过期身份；已缓存 Direct 表仍指向驻留代码，调用是否成功由
+业务状态决定，Core 不保证撤回或逐次阻止。发布非空 Direct 表的 KernelNative 实例
+保守拒绝 Stop；failure 仍会逻辑失效，不能据此释放 ctx。
 
 ### 5.1 失败谱系：Result 失败 vs panic
 
 | 类别 | 表达 | 语义 |
 |---|---|---|
-| 普通失败 | `Result` / status code（`kcomp_instance_create` / `destroy` 返回 `0 / -errno`） | 可恢复的组件失败，走正常 teardown / restart |
-| 意外 panic | `panic!`（`panic=abort`） | 进程级 abort，不能凭空转成组件 recovery boundary |
+| 普通方法失败 | `Result` / `-errno` | 向 caller 报错，不自动把 provider 标 Failed |
+| 生命周期入口失败 | create / destroy 非零 | 按生命周期契约提交失败与兜底 |
+| panic | `panic!`（`panic=abort`） | 仅已有 Core 管理边界可协作式收敛；不凭函数边界推导 recovery |
 
-phase 1 已有 init / task 边界的**协作式 containment**（Core-owned 独立栈 + stack-switch 回 Core，标记 `Failed`，不做 Rust unwinding；内存回收仍 deferred）。**panic recovery ≠ fault isolation**：KernelNative 组件仍可能破坏 Core 内存 / UB / 带锁死亡，真正的 memory-fault containment 属 IsolatedNative / U-mode。
+已有 Init / Task / Gate 边界的协作式 containment；Direct 与 IRQ 不自动获得同样的恢复边界。
+不做 Rust unwinding，内存回收 deferred。panic recovery 不等于 fault isolation：
+KernelNative 仍可能破坏 Core 内存 / UB / 带锁死亡；Isolated 的条件性故障归因也不等于
+未来 U-mode 的不可信代码边界。细节见生命周期与部署契约。
 
 ### 5.2 退出语义
 
-`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 = `component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>`。顺序：
+`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 = `component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>` 与 `kcore_component_stop`。顺序：
 
 ```text
-1. 拒绝门（提交之前；拒绝不改 Core 真相）：有未退出任务 → EBUSY；非 Ready → NotReady / EINVAL
+1. 拒绝门（提交之前；拒绝不改 Core 真相）：非 Ready；Native Direct publication；未退出任务；Core-managed inflight
 2. begin_stop             Ready → Stopping：任务 run 门禁 + publish 拒绝
 3. kcomp_instance_destroy Core-owned 隔离栈；ambient identity = 被停止实例
 4. Core 兜底              撤销归属（device quarantine / DMA 停车）+ 失效 provider endpoint
 5. finish_stop            Stopping → Stopped（记录保留）
 ```
 
-失败路径**刻意不调用** `kcomp_instance_destroy`（崩溃的模块不值得信任），`Failed` 只走 `fail_component`（mark + 兜底）。**仍开放**：drain variant（等任务清空）、非零退出 / 退出 panic 的最终分类、`UnexpectedExit` 是否独立终态、Sandbox 停止、实例退役、退出期间的资源认领门禁、退出钩子阻塞 / 超时 / 看门狗。细节见冻结契约。
+失败路径刻意不调用 destroy；destroy 非零、panic 或栈分配失败均进入 Failed，不重试。
+drain、Direct release、Sandbox 停止、实例回收、退出超时/看门狗仍未实现。
+细节见冻结契约；不在概念页另维护一套门禁或终态规则。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 
@@ -498,6 +337,9 @@ phase 1 已有 init / task 边界的**协作式 containment**（Core-owned 独�
 ### Ownership Tree（生命周期归属）
 
 描述"谁创建谁、谁负责谁的生命周期"：
+
+下面是目标关系图，不表示 Core 已实现 parent/child 级联停止。当前 init 创建的组件
+各自有独立生命周期；停止 init 不自动停止其消费者或所创建实例。
 
 ```text
 VFS
@@ -546,6 +388,9 @@ VFS
 
 ## 8. 替换与恢复（Recovery / Replace Policy）
 
+> 以下是目标分类与候选协议，不是现有 manifest 类型或热替换能力。新实例获得新
+> ComponentId 与 endpoint；旧打开对象不自动转向新实例。职责见 [服务执行](service-execution.md)。
+
 不同组件可以有不同恢复能力：
 
 | 类别 | 含义 | 例子 |
@@ -560,16 +405,18 @@ VFS
 > - TCP stack restart → 服务能重新起来，但旧 connections 可能全部死亡 —— 仍然是 Restartable；
 > - Ext4 restart → 从 block device + journal 重建，可恢复大量 semantic state。
 >
-> 定义：组件能够重新进入 Ready 状态；是否保留旧的 semantic state 由该组件自己的 recovery contract 决定。
+> 定义：重新实例化后的新 ComponentId 能进入 Ready；旧 Failed/Stopped 身份不复活。
+> 是否重建业务状态与服务可用性由 recovery contract 决定。
 
-### 第一阶段替换流程（不做热迁移）
+### 候选替换流程（未实现，不做热迁移）
 
 ```text
 quiesce → stop → unbind → reset → replace → bind → start
 ```
 
-允许**短暂中断**。这一流程的价值已经足够：替换一个调度器/分配器/驱动时，系统不需要重启。
-复杂 live state migration 明确留到以后。
+目标允许短暂中断；各环节要先证明静止、解绑与资源复用条件。物理帧分配器是
+不可热卸载的 Core 内部机制，不属于此图。当前无 Direct release 或通用 drain，
+失败设备仍 quarantine；不能宣称已有无重启驱动替换。live state migration 后置。
 
 ### 为什么策略组件可以安全 reset
 

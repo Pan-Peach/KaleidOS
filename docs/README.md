@@ -38,6 +38,7 @@ docs/
 | 设备认领、IRQ/DMA、执行域与 teardown | [驱动契约](architecture/driver-model.md) | 相关细节优先于 overview |
 | Memory/Heap、region 归属、访问窗口与回收 | [内存与堆](architecture/memory-and-heap.md) | 内存/堆最终契约；与 device claim 同形 |
 | 部署、binding 作用域与调用机制 | [部署契约](architecture/deployment.md) | 补充 lifecycle §9 的代码共享目标，不取代生命周期承诺 |
+| 服务执行模型、组合策略与业务会话归属 | [服务执行](architecture/service-execution.md) | 不替代部署、生命周期或文件对象契约；候选机制明确标注 |
 | 分层与 ResourceDomain/ExecutionDomain 概念 | [架构总览](architecture/overview.md) / [组件模型](architecture/component-model.md) | 细节服从上述主题契约 |
 | 调度、CPU 归属与 SMP 提交 | [调度契约](architecture/scheduling.md) | Core 与策略分工 |
 | 构建配置 | [Kconfig 契约](architecture/kconfig.md) | resolved .config 是本次构建真相 |
@@ -63,10 +64,12 @@ docs/
 | 了解配置/测试 cleanup 调研与待实施清单 | [cleanup](development/cleanup.md)（建议，非架构契约） |
 | Core 收敛职责审计、变更与验证证据 | [Core convergence](development/core-convergence.md)（审计记录，非契约） |
 | 执行身份、资源归属与 Direct/Gate/Worker 语义审计 | [Execution & ownership review](development/execution-ownership-review.md)（审计记录与建议，非契约） |
+| 研究吸收、双盘/双 FS 纵向负载与源码问题矩阵 | [服务研究](development/service-runtime-study.md)（研究与审计，非契约） |
 | 理解项目与寻找源码 | [核心哲学](philosophy/core-philosophy.md)、[架构总览](architecture/overview.md)、[模块地图](modules/README.md) |
 | 理解 scheduler 与 SMP | [调度契约](architecture/scheduling.md)、[sched 模块](modules/core/sched.md) |
 | 写驱动、认领设备 | [驱动契约](architecture/driver-model.md)、[组件地图](modules/components.md) |
 | 获取内存、选择部署与调用机制 | [内存与堆](architecture/memory-and-heap.md)、[部署契约](architecture/deployment.md) |
+| 设计 Inline / Worker 服务、显式连接与失效传播 | [服务执行](architecture/service-execution.md) |
 | 装载/停止组件 | [组件生命周期](architecture/component-lifecycle.md)、[component 模块](modules/core/component.md) |
 | 组合启动与操作 shell | [init](modules/init.md)、[ksh](modules/ksh.md) |
 | 接第三方库 | [移植契约](architecture/porting.md) |

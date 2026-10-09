@@ -131,10 +131,13 @@ int32_t kcomp_instance_destroy(void *opaque_state)
     if (state == NULL)
         return 0;
 
+    if (!littlefs_enter(state))
+        return -EBUSY;
     state->alive = 0;
 
     /* endpoint / binding 的 ctx 可能仍被消费者缓存，open 文件与 lfs_t 都在 state
      * 里；只逻辑停止，不回收 state。 */
+    littlefs_leave(state);
     LITTLEFS_LOG_LINE("[littlefs] destroy");
     return 0;
 }

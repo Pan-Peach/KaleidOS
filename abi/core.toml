@@ -531,6 +531,10 @@ type = "*const u8"
 name = "image_name_len"
 type = "usize"
 [[function.param]]
+name = "domain"
+type = "u32"
+doc = "执行域编码；与 config 正交，不支持的组合明确拒绝。"
+[[function.param]]
 name = "args"
 type = "*const KcompCreateArgs"
 [[function.param]]

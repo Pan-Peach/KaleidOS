@@ -26,7 +26,13 @@ fn create(mode: u32) -> Option<u32> {
     let mut config = [0; 8];
     config[..4].copy_from_slice(&mode.to_le_bytes());
     config[4..].copy_from_slice(&cpu.to_le_bytes());
-    management::create(b"kcomp_checksum", CONFIG_ABI, &config).ok()
+    management::create(
+        b"kcomp_checksum",
+        management::ExecutionDomain::KernelNative,
+        CONFIG_ABI,
+        &config,
+    )
+    .ok()
 }
 
 fn lookup(provider: u32) -> Option<u64> {

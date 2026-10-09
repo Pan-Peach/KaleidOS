@@ -64,6 +64,14 @@ impl AssignmentCursor {
     /// 追加一台候选设备；attempt = `下标 + 1`。表满返回 `false`（调用方记日志，
     /// 不覆盖已有项）。
     pub fn push(&mut self, driver: &'static [u8], device_id: u32) -> bool {
+        // 同一设备可能匹配该驱动的多个 compatible；只尝试一次。
+        if self.entries[..self.count].iter().any(|entry| {
+            entry.device_id == device_id
+                && (entry.driver == driver
+                    || (entry.reported && entry.outcome == kcomp_sdk::probe::ProbeReply::MATCH))
+        }) {
+            return true;
+        }
         if self.count >= MAX_ASSIGNMENTS {
             return false;
         }

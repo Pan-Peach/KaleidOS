@@ -86,7 +86,18 @@ static int32_t littlefs_selftest(struct littlefs_state *state)
     return 0;
 }
 
-int32_t littlefs_mount(void *ctx)
+static struct littlefs_file_slot *littlefs_find(struct littlefs_state *state, uint64_t handle)
+{
+    if (handle != 0) {
+        for (size_t i = 0; i < LITTLEFS_MAX_OPEN_FILES; i++) {
+            if (state->files[i].handle == handle)
+                return &state->files[i];
+        }
+    }
+    return NULL;
+}
+
+static int32_t littlefs_mount_locked(void *ctx)
 {
     struct littlefs_state *state = ctx;
 
@@ -145,7 +156,7 @@ int32_t littlefs_mount(void *ctx)
     return 0;
 }
 
-int32_t littlefs_unmount(void *ctx)
+static int32_t littlefs_unmount_locked(void *ctx)
 {
     struct littlefs_state *state = ctx;
 
@@ -161,7 +172,7 @@ int32_t littlefs_unmount(void *ctx)
 
     for (size_t i = 0; i < LITTLEFS_MAX_OPEN_FILES; ++i)
     {
-        if (state->files[i].used)
+        if (state->files[i].handle)
         {
             return -EBUSY;
         }
@@ -178,7 +189,7 @@ int32_t littlefs_unmount(void *ctx)
     return 0;
 }
 
-int32_t littlefs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
+static int32_t littlefs_open_locked(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
 {
     struct littlefs_state *state = ctx;
 
@@ -201,10 +212,13 @@ int32_t littlefs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out
     }
 
     // Find an available file slot
+    if (state->last_handle == UINT64_MAX)
+        return -EOVERFLOW;
+
     int slot_index = -1;
     for (int i = 0; i < LITTLEFS_MAX_OPEN_FILES; i++)
     {
-        if (!state->files[i].used)
+        if (!state->files[i].handle)
         {
             slot_index = i;
             break;
@@ -229,14 +243,14 @@ int32_t littlefs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out
         return littlefs_result(err);
     }
 
-    slot->used = 1;
-    *out_handle = (uint64_t)slot_index + 1;
+    *out_handle = ++state->last_handle;
+    slot->handle = *out_handle;
     LITTLEFS_LOG_LINE("[littlefs] open");
 
     return 0;
 }
 
-int32_t littlefs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read)
+static int32_t littlefs_read_locked(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read)
 {
     struct littlefs_state *state = ctx;
 
@@ -252,21 +266,12 @@ int32_t littlefs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size
         return -ENODEV;
     }
 
+    struct littlefs_file_slot *slot = littlefs_find(state, handle);
+    if (slot == NULL)
+        return -EBADF;
+
     if (len == 0)
-    {
         return 0;
-    }
-
-    if (handle == 0 || handle > LITTLEFS_MAX_OPEN_FILES)
-    {
-        return -EBADF;
-    }
-
-    struct littlefs_file_slot *slot = &state->files[handle - 1];
-    if (!slot->used)
-    {
-        return -EBADF;
-    }
 
     /* lfs_size_t 是 u32：单次请求按上限截断（littlefs 语义允许短读）。 */
     lfs_size_t request = len > (size_t)(lfs_size_t)-1 ? (lfs_size_t)-1 : (lfs_size_t)len;
@@ -282,11 +287,11 @@ int32_t littlefs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size
     return 0;
 }
 
-int32_t littlefs_close(void *ctx, uint64_t handle)
+static int32_t littlefs_close_locked(void *ctx, uint64_t handle)
 {
     struct littlefs_state *state = ctx;
 
-    if (state == NULL || handle == 0 || handle > LITTLEFS_MAX_OPEN_FILES)
+    if (state == NULL)
     {
         return -EBADF;
     }
@@ -296,8 +301,8 @@ int32_t littlefs_close(void *ctx, uint64_t handle)
         return -ENODEV;
     }
 
-    struct littlefs_file_slot *slot = &state->files[handle - 1];
-    if (!slot->used)
+    struct littlefs_file_slot *slot = littlefs_find(state, handle);
+    if (slot == NULL)
     {
         return -EBADF;
     }
@@ -308,7 +313,67 @@ int32_t littlefs_close(void *ctx, uint64_t handle)
         return littlefs_result(err);
     }
 
-    slot->used = 0;
+    slot->handle = 0;
     LITTLEFS_LOG_LINE("[littlefs] close");
     return 0;
+}
+
+int32_t littlefs_mount(void *ctx)
+{
+    struct littlefs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!littlefs_enter(state))
+        return -EBUSY;
+    int32_t result = littlefs_mount_locked(ctx);
+    littlefs_leave(state);
+    return result;
+}
+
+int32_t littlefs_unmount(void *ctx)
+{
+    struct littlefs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!littlefs_enter(state))
+        return -EBUSY;
+    int32_t result = littlefs_unmount_locked(ctx);
+    littlefs_leave(state);
+    return result;
+}
+
+int32_t littlefs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
+{
+    struct littlefs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!littlefs_enter(state))
+        return -EBUSY;
+    int32_t result = littlefs_open_locked(ctx, path, flags, out_handle);
+    littlefs_leave(state);
+    return result;
+}
+
+int32_t littlefs_close(void *ctx, uint64_t handle)
+{
+    struct littlefs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!littlefs_enter(state))
+        return -EBUSY;
+    int32_t result = littlefs_close_locked(ctx, handle);
+    littlefs_leave(state);
+    return result;
+}
+
+int32_t littlefs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read)
+{
+    struct littlefs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!littlefs_enter(state))
+        return -EBUSY;
+    int32_t result = littlefs_read_locked(ctx, handle, buf, len, out_read);
+    littlefs_leave(state);
+    return result;
 }

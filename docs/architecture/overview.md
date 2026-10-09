@@ -1,4 +1,4 @@
-# KaleidOS 架构总览（architecture.md）
+# KaleidOS 架构总览（overview.md）
 
 ## 1. 项目定位
 
@@ -47,12 +47,29 @@ KaleidOS 最重要的边界不是"模块"，而是一组概念分离：
 ```text
 Identity         ≠  Ownership           —— 名字 ≠ 所有权（DeviceId 不是权限）
 Interface        ≠  Transport           —— 契约 ≠ 调用方式
+Transport        ≠  Execution Model     —— Direct/Gate ≠ Inline/Worker
+Publication      ≠  Session             —— 发布点 ≠ 打开/连接对象
 ResourceDomain   ≠  ExecutionDomain     —— 拥有什么 ≠ 在哪里运行
 Ownership Tree   ≠  Dependency DAG      —— 生命周期 ≠ 依赖关系
 Machine Description ≠ FDT specifically  —— 机器发现 ≠ 某种具体机制
 ```
 
 其中 Core owns Resource Truth（含跨组件安全真相）；Component 拥有 Semantic / Derived / Ephemeral State、Policy、Protocol、Semantics（状态四级分类见 `core-philosophy.md` §2）。
+
+### 服务组合的职责落点
+
+| 职责 | 最小落点 | 不承担的职责 |
+|---|---|---|
+| 实例、发布、部署与执行准入 | Core loader / registry / endpoint | root 磁盘、FS 路由和业务 Session |
+| provider 选择、显式连接、初始化顺序与恢复策略 | init / profile；后续组件 Runtime | 复制 Core 存活/owner 真相或参与每次数据请求 |
+| 请求并发、队列、Worker、业务会话 | provider adapter / Runtime | 修改其他 owner 的 Task 状态 |
+| 路径、mount、打开引用与共享访问协调 | VFS 的 Namespace / File 模块（目标） | POSIX fd、进程 cwd 或 Core endpoint 生命周期 |
+| PID、fd/HANDLE、syscall 与用户内存翻译 | personality | 全局枚举猜测 FS provider |
+
+控制路径建立确切连接，数据路径沿 binding 使用服务；Server 不要求每项服务独立 Task。
+职责契约见 [服务执行](service-execution.md)，研究证据见
+[纵向负载研究](../development/service-runtime-study.md)。表中的 VFS/动态组合是目标，
+当前能力必须查模块页与 STATUS。
 
 ## 3. Arch 与 Machine Discovery
 
@@ -211,7 +228,7 @@ Core 是整个系统的**机制与所有权真相核心（mechanism & ownership 
 
 - Task 与 CPU 执行状态（Task 身份、状态、运行在哪个 CPU、上下文）
 - 物理内存（Physical Memory）：帧真相 + **canonical 帧分配器作为 Core 机制**（静态帧池，不热卸载）
-- Core 对象堆（仅 Core 内部；组件不共享）与 **region 粒度**的 backing / mapping（Core **不**做内存记账：不记 region owner，无隔离域不记归属，Isolated / Sandboxed 由该实例的 AS / 页表承载；见 `docs/architecture/memory-and-heap.md`）
+- Core 对象堆（KernelNative 可经两个窄 ABI 符号共享；私有域拒绝这两个 import）与 **region 粒度**的 backing / mapping（Core **不**做内存记账：不记 region owner，无隔离域不记归属，Isolated / Sandboxed 由该实例的 AS / 页表承载；见 `docs/architecture/memory-and-heap.md`）
 - AddressSpace
 - IRQ / Timer / MMIO / DMA
 - 内核对象（Kernel Object）
@@ -279,7 +296,7 @@ Core 的内存模型不等于某一种页表格式，保持三层分离：Physic
 | Policy（策略） | SchedulerPolicy、PageReplacementPolicy（未来：MemoryPolicy） |
 
 > **Interface 是语义，传输（transport）是绑定策略。**
-> 第一阶段用 Rust trait + direct call；未来可以换成 IPC stub 或 Wasm host call。
+> 组件边界用窄 C ABI；SDK 的 Rust trait 是组件内部前端。Direct / Gate 由合法部署绑定确定，未来可扩展 IPC stub 或 Wasm host call。
 > 因此接口描述**永远不要**绑定 native Rust ABI 细节。
 
 **Rust ABI 不得成为 Component ABI。** 边界处禁止出现：Rust mangled symbol、
@@ -298,7 +315,7 @@ Component → Component     = Endpoint binding（endpoint.rs：publish/lookup/di
                             function table 或 Core call gate，禁止 flat ELF symbol 互链）
 ```
 
-Core Export ABI 不导出**未经 Core 提交的裸 mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动都是 Core 内部提交点——组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。Endpoint Registry 是 Core 的组件依赖真相；两者是独立概念，互不替代。
+Core Export ABI 不导出**未经 Core 提交的裸 mutation**：物理帧分配的最终提交、地址空间变更、裸任务表改动都是 Core 内部提交点——组件只能 request，验证 + commit + 记录（owner / trace）由 Core 完成。Endpoint Registry 是 Core 的接口发布真相；上层依赖和路由由组合方保存，两者互不替代。
 
 ### Core ABI 错误约定与宽度
 

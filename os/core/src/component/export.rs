@@ -519,6 +519,16 @@ fn kind_from_u32(kind: u32) -> Option<InterfaceKind> {
     }
 }
 
+fn decode_domain(domain: u32) -> Option<ExecutionDomain> {
+    use crate::generated::abi::ExecutionDomain as WireDomain;
+    match domain {
+        n if n == WireDomain::KernelNative as u32 => Some(ExecutionDomain::KernelNative),
+        n if n == WireDomain::IsolatedNative as u32 => Some(ExecutionDomain::IsolatedNative),
+        n if n == WireDomain::SandboxedNative as u32 => Some(ExecutionDomain::SandboxedNative),
+        _ => None,
+    }
+}
+
 /// 请求 Core 用**默认配置**创建组件实例（store → loader 放段/重定位 → registry →
 /// `kcomp_instance_create` 全链，与 monitor `load` 同源）。
 ///
@@ -531,12 +541,8 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize, domain:
         let Some(name) = checked_name(name_ptr, name_len) else {
             return Errno::EINVAL.code();
         };
-        use crate::generated::abi::ExecutionDomain as WireDomain;
-        let kind = match domain {
-            n if n == WireDomain::KernelNative as u32 => ExecutionDomain::KernelNative,
-            n if n == WireDomain::IsolatedNative as u32 => ExecutionDomain::IsolatedNative,
-            n if n == WireDomain::SandboxedNative as u32 => ExecutionDomain::SandboxedNative,
-            _ => return Errno::EINVAL.code(),
+        let Some(kind) = decode_domain(domain) else {
+            return Errno::EINVAL.code();
         };
         match crate::component::load::load_and_start(name, kind) {
             Ok(id) => id.raw() as i32,
@@ -558,6 +564,7 @@ extern "C" fn kcore_component_load(name_ptr: *const u8, name_len: usize, domain:
 extern "C" fn kcore_component_create(
     image_name: *const u8,
     image_name_len: usize,
+    domain: u32,
     args: *const KcompCreateArgs,
     out_instance: *mut u32,
 ) -> i32 {
@@ -571,8 +578,10 @@ extern "C" fn kcore_component_create(
         // SAFETY: 调用方保证 args 指向调用期间有效的 KcompCreateArgs（C ABI 契约）；
         // Core 只在本次调用内借用它。
         let args = unsafe { &*args };
-        // create 带组件配置；未携带部署域，默认 KernelNative。
-        match crate::component::load::create_component(name, args, ExecutionDomain::KernelNative) {
+        let Some(kind) = decode_domain(domain) else {
+            return Errno::EINVAL.code();
+        };
+        match crate::component::load::create_component(name, args, kind) {
             Ok(id) => {
                 // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
                 unsafe { core::ptr::write_unaligned(out_instance, id.raw()) };
@@ -1417,7 +1426,13 @@ mod tests {
             registry::get_registry().lock().mark_failed(caller).unwrap();
             let mut id = u32::MAX;
             assert_eq!(
-                kcore_component_create(b"missing".as_ptr(), 7, &KcompCreateArgs::empty(), &mut id),
+                kcore_component_create(
+                    b"missing".as_ptr(),
+                    7,
+                    0,
+                    &KcompCreateArgs::empty(),
+                    &mut id
+                ),
                 Errno::EPERM.code()
             );
             assert_eq!(
@@ -1574,6 +1589,19 @@ mod tests {
 
     #[test]
     fn observation_outputs_and_deployment_reject_invalid_inputs() {
+        let mut id = 0;
+        assert_eq!(
+            kcore_component_create(
+                b"x".as_ptr(),
+                1,
+                u32::MAX,
+                &KcompCreateArgs::empty(),
+                &mut id
+            ),
+            Errno::EINVAL.code()
+        );
+        assert_eq!(id, 0);
+
         assert_eq!(
             kcore_component_nth(0, core::ptr::null_mut(), core::ptr::null_mut(), 0),
             Errno::EFAULT.code()

@@ -189,9 +189,9 @@ fn panic_case(state: *mut State, failed_cpu: usize) -> bool {
     };
     let mut failed = u32::MAX;
     let from = trace::cursor();
-    let loaded =
-        unsafe { abi::kcore_component_create(b"kcomp_smp".as_ptr(), 9, &create_args, &mut failed) }
-            == 0;
+    let loaded = unsafe {
+        abi::kcore_component_create(b"kcomp_smp".as_ptr(), 9, 0, &create_args, &mut failed)
+    } == 0;
     loaded
         && await_exited(state, &[6, 7])
         && trace::component_failed(from, failed)

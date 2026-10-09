@@ -15,12 +15,12 @@
 | `init` | `os/components/init/` | Rust `.kcomp` | 普通 profile 启动编排：scheduler / prober / FAT root / ksh；见 [`init.md`](init.md) |
 | `ksh` | `os/components/ksh/` | Rust `.kcomp` | KernelNative 交互会话与文件读取；见 [`ksh.md`](ksh.md) |
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；每 CPU cursor 保存上次提议的 TaskId，按候选 id 后继轮转，避免列表排除 outgoing 时的下标饥饿；游标属于实例，只提议 TaskId |
-| `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | 协议无关设备 prober（总线角色）：opaque compatible 粗匹配；逐台以扁平 create config 下发 `(device_id, 结果端口名)`，create 返回后 pull 驱动的 `probe.result`，本地更新 cursor（**无环**，driver 不回调） |
-| `kcomp_virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | VirtIO-MMIO 块驱动；从 create config 读 assignment、claim 设备、细匹配；发布 `block.device` 与 `probe.result`（单设备限制见其模块文档） |
-| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs 文件系统服务（`kcomp_filesystem_api`），包 third_party `ff.c` + `block.device` diskio |
-| `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
+| `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | opaque compatible 粗匹配；create config 下发 device/结果端口，成功后 pull probe.result；完成全部候选；同驱动/设备去重，已 Match 设备不交后续候选 |
+| `virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | 每实例 claim 一个 VirtIO-MMIO 设备；sector 0 传输健康检查后发布 block.device/probe.result；不解释格式签名，RV32 LBA 溢出明确拒绝 |
+| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs + block.device diskio；实例级 try-lock 串行库状态/文件表；竞争 EBUSY、handle 单调不复用 |
+| `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`，实例级 try-lock，handle 不复用）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
 | `vfs` | `os/components/filesystems/vfs/` | Rust `.kcomp` 骨架 | Namespace / File service 内部类型与操作占位；create 返回 `-ENOTSUP`，尚无服务 endpoint。现状与手写入口见 [`vfs.md`](vfs.md) |
-| `posix` | `os/components/personalities/posix/` | Rust `.kcomp` 骨架 | VFS 消费者与进程 / fd / syscall 语义接缝；仅 create 配置，无 service endpoint，create 返回 `-ENOTSUP`。见 [`posix.md`](posix.md) |
+| `posix` | `os/components/personalities/posix/` | Rust `.kcomp` | RV64/MMU 普通用户进程族，fork/exec/wait、console 与只读 posix.process endpoint 已接；通用 VFS/fd 仍骨架，见 [`posix.md`](posix.md) |
 | `netstack` | `os/components/network/netstack/` | Rust `.kcomp` 骨架 | TCP / UDP 服务契约与 SDK 代理、私有 smoltcp / 帧 adapter / worker 占位；操作为 `todo!()`，bind / create 拒绝。见 [`netstack.md`](netstack.md) |
 | `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |

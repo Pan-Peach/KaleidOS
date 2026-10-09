@@ -29,7 +29,7 @@
 //!
 //! 本组件 create 期间**不发布** endpoint；它创建一个**有限** dispatch 任务：
 //! monitor 在 load 提交后 `sched::run()` 运行它——枚举候选 → 逐台 create + pull，
-//! 直到首个 `Match`（成功 attach）后停止；全部 NoMatch / 创建失败则自然结束（无
+//! 逐台完成全部分配；全部 NoMatch / 创建失败也自然结束（无
 //! 后台循环）。实例状态（候选集 + cursor）由 create 显式分配，经 `out_state` /
 //! task arg 传递，不是可变全局；枚举只在 dispatch 时做一次。
 
@@ -144,6 +144,35 @@ mod tests {
             "未知 attempt 必须拒绝"
         );
         assert!(cursor.all_reported());
+    }
+
+    #[test]
+    fn overlapping_compatible_keys_and_matched_devices_are_not_reassigned() {
+        let mut cursor = AssignmentCursor::new();
+        assert!(cursor.push(b"a", 3));
+        assert!(cursor.push(b"a", 3));
+        assert_eq!(cursor.next(b"a"), Some((1, 3)));
+        assert_eq!(
+            cursor.report(1, kcomp_sdk::probe::ProbeReply::MATCH, 0),
+            Ok(())
+        );
+        assert!(cursor.push(b"b", 3));
+        assert_eq!(cursor.next(b"b"), None);
+        assert!(cursor.push(b"a", 5));
+        assert_eq!(cursor.next(b"a"), Some((2, 5)));
+    }
+
+    #[test]
+    fn no_match_leaves_device_for_another_candidate() {
+        let mut cursor = AssignmentCursor::new();
+        assert!(cursor.push(b"a", 3));
+        assert_eq!(cursor.next(b"a"), Some((1, 3)));
+        assert_eq!(
+            cursor.report(1, kcomp_sdk::probe::ProbeReply::NO_MATCH, 0),
+            Ok(())
+        );
+        assert!(cursor.push(b"b", 3));
+        assert_eq!(cursor.next(b"b"), Some((2, 3)));
     }
 
     /// 内置目录：`compatible` → `virtio_blk`（opaque 键；prober 不解释它）。

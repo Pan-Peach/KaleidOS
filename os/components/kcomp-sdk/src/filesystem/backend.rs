@@ -4,18 +4,12 @@
 //! - **Direct**（同域 KernelNative）：直接调 provider 的 `#[repr(C)]` function
 //!   table（`api` + `ctx`）——稳态零 Core 介入、零分配、零打包；
 //! - **Gate**（跨域 / 需 containment）：经 `kcore_endpoint_call` 的 Core call gate，
-//!   线格式与 Direct 完全一致（[`crate::filesystem::dispatch`] 的扁平编码）。
+//!   业务语义与 Direct 一致（[`crate::filesystem::dispatch`] 的扁平编码）。
 //!
 //! 两条路都在本模块收口，consumer 只看到 [`crate::filesystem::client::FileSystemBinding`]
 //! 的 typed 方法——调用点与机制无关（`fs.open(path, flags)`）。
 //!
-//! # `read` 的缓冲区布局（两条机制一致）
-//!
-//! typed 前端的 `buf` **就是**扁平 frame 的 `output` 区：前
-//! [`KCOMP_FILESYSTEM_READ_HEADER_LEN`] 字节是 LE `u64` 实际长度头，数据从 offset 8
-//! 开始；`buf.len()` 含头（数据容量 = `buf.len() - 8`）。Direct 分支因此也把 provider
-//! 写出的数据留在 offset 8 并回填同一份头——两条机制对 consumer 呈现的缓冲区字节
-//! **完全一致**，consumer 不做机制分支。
+//! Gate 的协议头只存在 SDK scratch 中；Direct 直接写入业务缓冲区。
 //!
 //! # 为什么 `api` / `ctx` 是 `unsafe` 的边界
 //!
@@ -29,9 +23,7 @@ use crate::abi;
 use crate::call;
 use crate::endpoint::{Contract, InvokeError};
 use crate::errno::Errno;
-use crate::filesystem::dispatch::{
-    decode_handle, decode_read_len, encode_flags, encode_handle, encode_read_len,
-};
+use crate::filesystem::dispatch::{decode_handle, decode_read_len, encode_flags, encode_handle};
 use crate::filesystem::{FileSystem, FileSystemApi};
 use crate::generated::filesystem::{
     KCOMP_FILESYSTEM_HANDLE_LEN, KCOMP_FILESYSTEM_METHOD_CLOSE, KCOMP_FILESYSTEM_METHOD_MOUNT,
@@ -162,40 +154,39 @@ pub(super) fn close(backend: &Backend, handle: u64) -> Result<(), InvokeError> {
     }
 }
 
-/// 从 `handle` 当前位置读 `buf.len() - 8` 字节到 `buf` 的数据区；返回实际读取长度。
-///
-/// `buf` 的布局见模块文档（前 8 字节是长度头）；typed 前端保证 `buf.len() >= 8`。
+/// 单次读取；短读是正常结果，不隐藏多次服务调用。
 pub(super) fn read(backend: &Backend, handle: u64, buf: &mut [u8]) -> Result<usize, InvokeError> {
     match backend {
         Backend::Direct { api, ctx } => {
             let table = table(*api);
-            let (header, data) = buf.split_at_mut(KCOMP_FILESYSTEM_READ_HEADER_LEN);
             let mut actual = 0usize;
-            // SAFETY: 同 mount；`data` 是本帧内的有效可写切片，契约要求它位于 Core
-            // 可见 RAM（v1 无 IOMMU：设备地址 == 物理地址 == 虚拟地址）。
-            let status =
-                unsafe { (table.read)(*ctx, handle, data.as_mut_ptr(), data.len(), &mut actual) };
-            map_status(status)?;
-            if actual > data.len() {
-                // provider 返回超过 buffer 的长度 = 契约违约（不截断、不 UB 兜底）。
+            // SAFETY: table 来自 Core bind；buf 在调用期间可写，provider 不保留它。
+            map_status(unsafe {
+                (table.read)(*ctx, handle, buf.as_mut_ptr(), buf.len(), &mut actual)
+            })?;
+            if actual > buf.len() {
                 return Err(InvokeError::InvalidReply);
             }
-            header.copy_from_slice(&encode_read_len(actual));
             Ok(actual)
         }
         Backend::Gate { endpoint } => {
+            let mut frame = [0u8; KCOMP_FILESYSTEM_READ_HEADER_LEN + 512];
+            let capacity = buf.len().min(512);
             invoke_gate(
                 *endpoint,
                 KCOMP_FILESYSTEM_METHOD_READ,
                 &encode_handle(handle),
                 &[],
-                buf,
+                &mut frame[..KCOMP_FILESYSTEM_READ_HEADER_LEN + capacity],
             )?;
-            let actual = decode_read_len(&buf[..KCOMP_FILESYSTEM_READ_HEADER_LEN])
+            let actual = decode_read_len(&frame[..KCOMP_FILESYSTEM_READ_HEADER_LEN])
                 .ok_or(InvokeError::InvalidReply)?;
-            if actual > buf.len() - KCOMP_FILESYSTEM_READ_HEADER_LEN {
+            if actual > capacity {
                 return Err(InvokeError::InvalidReply);
             }
+            buf[..actual].copy_from_slice(
+                &frame[KCOMP_FILESYSTEM_READ_HEADER_LEN..KCOMP_FILESYSTEM_READ_HEADER_LEN + actual],
+            );
             Ok(actual)
         }
     }

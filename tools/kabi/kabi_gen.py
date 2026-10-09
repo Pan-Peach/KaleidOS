@@ -2206,7 +2206,7 @@ doc = "I/O error"
     assert component.objects[0].name == "kcomp_abi" and component.objects[0].is_const
     assert component.enums[0].c_name == "KcompInterfaceKind"
     kcomp_abi = [const for const in component.constants if const.name == "KCOMP_ABI"][0]
-    assert kcomp_abi.value == 0xB136_5C28_A47D_E092
+    assert kcomp_abi.value == 0x71A9_CE34_8D62_F0B5
     kinds = [const for const in core.constants if const.name.startswith("KIND_")]
     assert [const.value for const in kinds] == list(range(1, 12))
     absent = [const for const in core.constants if const.name == "ABSENT"][0]

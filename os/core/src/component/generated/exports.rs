@@ -133,6 +133,7 @@ pub(super) static EXPORTS: [Export; 61] = [
             let implementation: extern "C" fn(
                 *const u8,
                 usize,
+                u32,
                 *const KcompCreateArgs,
                 *mut u32,
             ) -> i32 = super::kcore_component_create;

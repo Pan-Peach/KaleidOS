@@ -61,7 +61,10 @@ pub(super) fn state(id: u32) -> Option<u32> {
 fn services(checks: &mut Checks) -> Option<()> {
     use ExecutionDomain::{IsolatedNative as I, KernelNative as K};
     let native = management::load(b"kcomp_domain_service", K).ok()?;
-    let private = management::load(b"kcomp_domain_service", I).ok()?;
+    let mut config = [0; 16];
+    // Fixture config: plain provider, mode 0, seed 0x41, no relay.
+    config[8..12].copy_from_slice(&0x41u32.to_ne_bytes());
+    let private = management::create(b"kcomp_domain_service", I, 0, &config).ok()?;
     let caller = management::load(b"kcomp_domain_service", I).ok()?;
     checks.check("service-native-caller", healthy(native) && healthy(private));
     checks.check(

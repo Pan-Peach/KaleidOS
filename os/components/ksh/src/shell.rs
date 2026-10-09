@@ -217,36 +217,45 @@ fn endpoints() {
     }
 }
 
-fn cat(path: &[u8]) {
-    let mut out = Console;
-    // Minimal composition policy: use the sole live matching filesystem endpoint.
-    // Never silently choose between multiple volumes; namespace/selection is deferred.
+fn filesystem_endpoint() -> kcomp_sdk::Result<Option<u64>> {
+    let configured = crate::runtime::filesystem();
+    if configured != 0 {
+        return Ok(Some(configured));
+    }
+    // Monitor-created standalone shell retains a deliberately conservative fallback.
     let mut selected = None;
-    let mut name = [0u8; 256];
+    let mut name = [0; 256];
     for ordinal in 0..u32::MAX {
-        match management::endpoint_nth(ordinal, &mut name) {
-            Ok(Some(info))
-                if info.state == abi::EndpointState::Live as u32
-                    && info.contract == FileSystem::ID
-                    && info.abi == FileSystem::ABI =>
-            {
-                if selected.is_some() {
-                    let _ = writeln!(
-                        out,
-                        "cat: multiple filesystem providers; selection is unavailable"
-                    );
-                    return;
-                }
-                selected = Some(info.id);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(error) => {
-                let _ = writeln!(out, "cat: {error}");
-                return;
-            }
+        let Some(info) = management::endpoint_nth(ordinal, &mut name)? else {
+            break;
+        };
+        if info.state == abi::EndpointState::Live as u32
+            && info.contract == FileSystem::ID
+            && info.abi == FileSystem::ABI
+            && selected.replace(info.id).is_some()
+        {
+            return Err(kcomp_sdk::Errno::EBUSY);
         }
     }
+    Ok(selected)
+}
+
+fn cat(path: &[u8]) {
+    let mut out = Console;
+    let selected = match filesystem_endpoint() {
+        Ok(id) => id,
+        Err(error) => {
+            if error == kcomp_sdk::Errno::EBUSY {
+                let _ = writeln!(
+                    out,
+                    "cat: multiple filesystem providers; selection is unavailable"
+                );
+            } else {
+                let _ = writeln!(out, "cat: {error}");
+            }
+            return;
+        }
+    };
     let Some(id) = selected else {
         let _ = writeln!(out, "cat: no filesystem provider");
         return;
@@ -290,7 +299,7 @@ fn cat(path: &[u8]) {
     loop {
         match binding.read(handle, &mut buffer) {
             Ok(0) => break,
-            Ok(len) => Console::write(&buffer[8..8 + len]),
+            Ok(len) => Console::write(&buffer[..len]),
             Err(error) => {
                 let _ = writeln!(out, "cat: read failed: {error:?}");
                 break;
@@ -312,20 +321,7 @@ fn cat(path: &[u8]) {
 fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
     use alloc::vec::Vec;
     use kcomp_sdk::{Errno, posix};
-    let mut selected = None;
-    let mut name = [0u8; 256];
-    for ordinal in 0..u32::MAX {
-        let Some(info) = management::endpoint_nth(ordinal, &mut name)? else {
-            break;
-        };
-        if info.state == abi::EndpointState::Live as u32
-            && info.contract == FileSystem::ID
-            && info.abi == FileSystem::ABI
-            && selected.replace(info.id).is_some()
-        {
-            return Err(Errno::EBUSY);
-        }
-    }
+    let selected = filesystem_endpoint()?;
     let binding = Endpoint::<FileSystem>::from_id(selected.ok_or(Errno::ENODEV)?)?
         .bind()
         .map_err(fs_error)?;
@@ -349,7 +345,7 @@ fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
             if image.len() + len > 1024 * 1024 {
                 return Err(Errno::E2BIG);
             }
-            image.extend_from_slice(&buffer[8..8 + len]);
+            image.extend_from_slice(&buffer[..len]);
             management::yield_task()?;
         }
     })();
@@ -357,7 +353,12 @@ fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
     let image = loaded?;
     closed?;
     let config = posix::encode(&[(b"/main", &image)], argv, &[])?;
-    let id = management::create(b"posix", posix::KCOMP_POSIX_CREATE_CONFIG_ABI, &config)?;
+    let id = management::create(
+        b"posix",
+        management::ExecutionDomain::KernelNative,
+        posix::KCOMP_POSIX_CREATE_CONFIG_ABI,
+        &config,
+    )?;
     let process =
         Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?.bind()?;
     loop {

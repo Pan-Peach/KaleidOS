@@ -21,7 +21,12 @@ const TIMER: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/ti
 
 fn family(images: &[(&[u8], &[u8])], argv: &[&[u8]]) -> kcomp_sdk::Result<posix::ProcessBinding> {
     let config = posix::encode(images, argv, &[])?;
-    let id = management::create(b"posix", posix::KCOMP_POSIX_CREATE_CONFIG_ABI, &config)?;
+    let id = management::create(
+        b"posix",
+        management::ExecutionDomain::KernelNative,
+        posix::KCOMP_POSIX_CREATE_CONFIG_ABI,
+        &config,
+    )?;
     Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?.bind()
 }
 fn wait(binding: &posix::ProcessBinding) -> u32 {

@@ -16,7 +16,7 @@
 | SPIN | 论文（经典） | 语言级安全的内核扩展 | 类型安全组件运行在内核地址空间 |
 | Singularity | 研究 OS（微软） | 软件隔离、契约式通信 | 不依赖硬件地址空间的组件隔离 |
 | Inferno | 研究 OS（Bell Labs） | Dis 虚拟 ISA、可移植程序 | Wasm 作为组件执行后端的先例 |
-| RedLeaf | 研究 OS（Rust） | 语言级隔离、驱动故障恢复 | 驱动组件化、ResourceDomain 回收 |
+| RedLeaf | 研究 OS（Rust） | 语言级隔离、域间所有权与驱动恢复 | 跨组件借用/状态归属研究；不直接等同 ResourceDomain 回收 |
 | Theseus | 研究 OS（Rust） | 细粒度组件、状态管理、在线演化 | 组件生命周期、替换/恢复模型 |
 | WebAssembly | 标准/运行时 | 虚拟 ISA、沙箱、导入导出 | 未来的组件执行后端（v0 不实现） |
 | Wasm Component Model | 标准 | WIT、Interface Types、Canonical ABI | 未来 Interface 跨 ABI 参考 |
@@ -25,7 +25,12 @@
 | FSCQ | 论文 | 文件系统验证、崩溃一致性 | 未来对 Component contract 的强验证 |
 | Kani / Loom / Miri / Verus | 工具链 | 模型检查 / 并发探索 / UB 检查 / 演绎验证 | 未来 Developer-First 测试工具链 |
 | Zephyr | 开源 RTOS | arch / SoC / board / device model 的硬件边界 | `Machine Discovery`、设备描述、驱动 Component |
-| Linux 内核模块（`rmmod` / livepatch） | 内核机制（Linux） | 卸载的引用计数与静默、原地替换 | 组件 stop/unload、热替换、过期访问收口（见第 17 条） |
+| Linux 内核模块（`rmmod` / livepatch） | 内核机制（Linux） | 引用保活与 callback 排空 | 停止与物理回收分别论证（§17） |
+| CAmkES | seL4 组件框架 | 同址 Direct 与隔离 RPC connector | Contract / Transport / 部署分离（§18） |
+| Genode | 组件化 OS 框架 | 父级路由、服务 Session 与通信 | 建连控制路径与数据路径分离（§19） |
+| Fuchsia DFv2 | 驱动框架 | node / 匹配 / host / 实例 / dispatcher | 多设备组合与服务并发纪律（§20） |
+| MINIX 3 | 微内核 OS | 静止点、状态迁移、回滚 | Restart / Recovery / Live Update 分离（§21） |
+| FlexOS | ASPLOS 2022 论文 | 可选择隔离布局与负载实验 | 同一负载跨部署的保护/性能比较（§22） |
 
 ---
 
@@ -39,7 +44,7 @@
 - 用 Safe Rust 约束 TCB 规模：Core 越小，可证明/可审查的部分越少。
 
 **怎么映射**：
-- 我们的 SchedulerPolicy / FrameAllocatorPolicy 组件 ≈ Asterinas 的策略注入；
+- 我们的 SchedulerPolicy 组件对应策略注入；物理帧分配器是 canonical Core 内部机制，无 FrameAllocatorPolicy 组件；
 - 我们的 Core 校验路径（任务是否存在、是否 Runnable、是否在别的 CPU）≈ 它的 policy output validation。
 
 **不照搬**：Linux ABI 兼容目标；OSTD 那样庞大的内核基础库 —— 我们第一阶段 Core 词汇表保持最小。
@@ -134,39 +139,25 @@
 
 ## 7. RedLeaf（论文）
 
-> *RedLeaf: Isolation and Communication in a Safe Operating System*（加州大学尔湾分校 UCI / VMware Research, OSDI 2020, Anton Burtsev 团队）
+[RedLeaf: Isolation and Communication in a Safe Operating System](https://www.usenix.org/conference/osdi20/presentation/narayanan-vikram)，OSDI 2020。
+论文以 Rust 类型/内存安全、域边界与跨域所有权支撑语言级隔离、零拷贝和驱动恢复。
 
-**是什么**：用 Rust 写的研究 OS。核心思想是**语言级隔离（language-based isolation）**：OS 域（domain）不是硬件地址空间，而是 Rust 所有权/借用检查保证的隔离单元；域内分配器、域间通信都由类型系统约束。支持驱动故障恢复。
-
-**借鉴什么**：
-- Rust 所有权模型可以充当隔离机制 —— 我们的 ResourceDomain 概念与它同源：**谁拥有什么资源，由类型系统 + Core 记录保证，而不是靠地址空间边界**；
-- 驱动故障恢复路径（域崩溃 → 回收资源 → 重建）≈ 我们的 ResourceDomain revoke → replace → restart。
-
-**怎么映射**：
-- 每个 Component 的 ResourceDomain = 一个轻量"域"：它拥有的设备 / IRQ route / DMA mapping 归属由 Core 记录；
-- 驱动（如 VirtIO block）作为 Component 实现并支持替换，直接参考 RedLeaf 的驱动恢复。
-
-**不照搬**：它的域间通信语言设施（语言内 channel 等）；我们第一阶段组件间只是 Rust direct call，不引入新通信机制。
+借鉴跨组件借用/转移的有效期与故障收尾；不把 Rust 编写、HeapState 分离或 Core
+归属记录等同于论文的隔离机制。KaleidOS 的 C/FFI、裸指针与 MMIO 不受安全 Rust
+类型系统自动约束，ResourceDomain 只是 owner 视图。暂不添加语言隔离执行域，
+也不引入共享 Rust runtime。相关研究判断见 [服务研究](../development/service-runtime-study.md)。
 
 ---
 
 ## 8. Theseus（论文）
 
-> *Theseus: an Experiment in Operating System Structure and State Management*（Rice University + Yale University, OSDI 2020）
+[Theseus: an Experiment in Operating System Structure and State Management](https://www.usenix.org/conference/osdi20/presentation/boos)，OSDI 2020。
+论文通过明确运行时组件边界、减少组件为彼此持有的状态，支持 live evolution 与故障恢复。
 
-**是什么**：用 Rust 写的 OS，把内核拆成**细粒度组件**（cell），每个组件明确声明自己管理哪些状态（state management）。支持**在线演化（live evolution）**：运行中替换组件、更新系统，无需重启。单地址空间（single address space），组件间通过所有权转移传递状态、降低锁依赖。
-
-**借鉴什么**：
-- **细粒度组件 + 明确的状态归属**："哪个组件拥有哪份状态"必须在结构上清晰 —— 我们 Core/Component 状态清单（谁存 Task 真相、谁存 runqueue）就是这种思想的静态化；
-- 组件生命周期与替换流程的建模（quiesce → 替换 → 恢复）—— 我们 Phase-1 替换模型的灵感来源之一；
-- **组件失败恢复不靠 unwinding**：组件出错 → 状态标记 Failed → 丢弃/重启该组件上下文，其它组件不受影响（single address space 下的 fault containment 思路）—— 这正是我们组件 panic 场景的正确姿势（对照：Rust panic unwinding 是栈展开清理，不适合跨组件展开）。
-
-**怎么映射**：
-- 我们的"Core 存真相、Scheduler 存 runqueue、Buddy 存 free list"边界划分 = Theseus 的状态归属原则；
-- 未来做热替换时，Theseus 的 live evolution 是主要参考；
-- 组件失败恢复协议（`kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`） / Failed 状态 / 后续重启）参考它的 cell 失败模型。
-
-**不照搬**：在线演化本身（第一阶段明确不做）；单地址空间无锁消息传递模型（我们现在也不需要）。
+借鉴对 state spill 的审查：FS 失败后，Core 管 publication，VFS 管 mount/open 对象，
+personality 管 fd 错误与进程策略；不让 Core 操作这些业务表。现有窄 C ABI、驻留
+backing 与裸 Direct 表没有因此获得动态演化能力。在线替换需要另外证明引用、静止点
+与状态转换，不照搬其 Rust 装载/链接模型或推断所有 panic 都可安全恢复。
 
 ---
 
@@ -408,50 +399,90 @@ KaleidOS 不照搬：
 
 ---
 
-## 17. Linux 内核模块：卸载、引用计数与原地替换
+## 17. Linux 内核模块：引用保活与回调排空
 
-**是什么**：Linux 的模块生命周期（`init_module`/`finit_module` → `MODULE_STATE_COMING`
-→ `do_init_module` → `LIVE` → `delete_module` → `try_stop_module` → `GOING` →
-`free_module`），以及"使用中不许卸"的引用计数机制（`module_refcount` /
-`try_module_get` / `module_put`）。**模块不是线程**：`module_init` 返回后模块只是
-代码 + 数据 + 状态，只在被调用时执行；要长期运行就自己建 kthread/workqueue。
+[Driver Basics](https://www.kernel.org/doc/html/latest/driver-api/basics.html) 规定：
+`try_module_get` 在移除期间拒绝新引用，`module_put` 归还引用；获取引用前还须有
+保证模块仍存活的保护，不能先使用悬挂指针再增加计数。
+[RCU and Unloadable Modules](https://docs.kernel.org/RCU/rcubarrier.html) 说明
+`synchronize_rcu` 等待 grace period 不等于异步 callback 完成；卸载前须停止新 callback
+并以对应 barrier 排空。
 
-**借鉴什么（逐条对应我们的开放项）**：
+| 需要分别证明的条件 | KaleidOS 的判断 |
+|---|---|
+| 不再接受新引用 | Stopping 的准入；当前无 Direct acquire/release 协议 |
+| 长期引用已归还 | 已交付 api/ctx 不可追回；Native 非空 Direct publication 保守拒绝 Stop |
+| 执行已结束 | Core-managed inflight 仅覆盖 Core 可见调用；另查 Task 与 callback |
+| 设备不再访问 backing | IRQ 撤销不代表 DMA 静默；失败 backing/device quarantine |
+| 可物理释放 | 前述条件不能只用 refcount=0 替代；当前不承诺完整回收 |
 
-| Linux 机制 | 它回答的问题 | 我们的对应 |
-|---|---|---|
-| `module_refcount` + `try_module_get`/`module_put` | "使用中不许卸"怎么做到 | 今天只有"名下有未结束任务就拒绝"这一条粗粒度门；**接口绑定是否也该计入**是开放项 |
-| `MODULE_STATE_GOING` | 先封新用，再执行退出 | 我们的 `Stopping`（封新 work） |
-| `free_module` | 真卸载 = 释放模块内存 + **让名字可复用** | **我们缺这一半**：段内存不回收、名字槽不还、同名 stop 后不能再 `load` |
-| `kthread_stop` + `kthread_should_stop` | 合作式"请求停止 + 等待" | `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）要能等自己的 worker（drain variant 的先例） |
-| `synchronize_rcu` / `stop_machine` | **如何证明"没人还在引用"** | "真回收"的前置条件；见 `component-model.md` §5 的过期访问边界 |
-| 卸载序（先停 kthread/workqueue/timer，再注销设备） | 退出钩子该按什么顺序干什么 | `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`）的语义参考 |
-| init 失败不调 `exit` | 谁负责擦屁股 | 我们失败路径**刻意不调** `kcomp_exit`（**已删除**，现为 `kcomp_instance_destroy`），同一个理由 |
-| built-in 永不调 `exit` | 什么时候没有退出这回事 | `kcomp_exit`（**已删除**）；现为**必需**入口 `kcomp_instance_destroy`（缺失即加载失败，无"可选跳过"） |
-| `__init` 段 + `free_initmem` | "一次性组件"的回收 | 不是卸载模块，而是 init 后回收 init-only 内存；我们 phase 1 不做 |
-| `rmmod -f`（`CONFIG_MODULE_FORCE_UNLOAD`） | 不合作时怎么办 | 存在但被标注**危险**，且**不真正回收** —— 对应"不合作的组件只能标记死亡，不能回收" |
-| **`livepatch`（ftrace 函数重定向）** | **"动态替换"到底怎么做** | Linux 的答案**不是 unload + reload**，而是**原地重定向行为**；这是"热插拔"最值得先读的一条 |
+Linux module 不必是线程；服务选择 Inline 或 Worker，与代码装载分别考虑。
+可以研究可选长期 binding 引用协议，保留 Direct 稳态零 Core 边界；不立即引入全局 Arc、
+每次调用计数、RCU 框架或强制卸载。KaleidOS 同名 artifact 已可多实例，新实例有新
+ComponentId；没有「先回收名字槽才能重启」这一前置。
+[livepatch](https://docs.kernel.org/livepatch/livepatch.html) 是另一个行为切换课题，
+不能等同于卸载/重装；本项目不因此采用 text patching。
+现行停止与回收边界以 [组件生命周期](../architecture/component-lifecycle.md) 为准。
 
-**怎么映射**：
-- 我们 phase 1 的 `unload` = `rmmod` 的**前半段**（状态 + 资源），缺 `free_module` 那一半；
-- "热插拔"要成立，最短路径是先补"**名字槽 + 新 `ComponentId` + 退休记录**"（让同名重载
-  成立、旧 id 作废），再谈"何时可以安全 free"（需要一种 `synchronize_rcu` 的对应物）；
-- 如果目标只是"运行中换掉已绑定组件的**行为**"，先看 livepatch 的思路，而不是强行 unload。
+---
 
-**不照搬**：`insmod`/`rmmod` 的用户态 syscall 面；模块依赖解析与 `modules.dep`；
-`rmmod -f` 的强制语义；livepatch 的 ftrace 打补丁实现（我们**不做 text patching**，
-见 trace 的运行时开关决策）；以及"重启策略在用户态"之外的部分 —— 我们对应的是
-"Core 记事实、policy 决定要不要重启"。
+## 18. CAmkES：接口与连接方式
 
-**阅读入口**：`kernel/module/main.c`（`load_module` / `do_init_module` /
-`delete_module` / `free_module`）、`include/linux/module.h`（`MODULE_STATE_*` /
-`try_module_get`）、`kernel/kthread.c`（`kthread_stop`）、`Documentation/livepatch/`。
+[CAmkES Manual](https://docs.sel4.systems/projects/camkes/manual.html) 的 assembly/connector
+把组件实例与连接分别描述；seL4DirectCall 只用于 colocated 实例，否则报错。Direct
+返回指针的堆归属也可能与隔离 RPC 不同。
+[seL4 IPC tutorial](https://docs.sel4.systems/Tutorials/ipc.html) 则描述线程间 Call/Reply。
+
+借鉴 Contract 与 Transport 的分离、组合者对通信需求的选择。KaleidOS Gate 是当前
+同步服务栈调用，不能等同于独立 Server Thread receive/reply。不照搬静态 ADL，
+transport preference 仍需真实消费者论证，Core 的合法性验证不能交给 SDK 绕过。
+
+## 19. Genode：路由与 Session
+
+[Recursive System Structure](https://genode.org/documentation/genode-foundations/25.05/architecture/Recursive_system_structure.html)
+说明父级对 session 请求选择/拒绝/转发；
+[Inter-component Communication](https://genode.org/documentation/genode-foundations/25.05/architecture/Inter-component_communication.html)
+区分 RPC、通知与共享内存，服务端 RPC session 与客户端 connection 分别承载状态。
+
+借鉴建连时路由、高频调用使用已建立服务引用；业务 open/socket/stream 状态由服务
+保存，不要求每个对象成为 Core endpoint。不复制其 quota、capability 图或第二套服务
+注册中心；KaleidOS 的 EndpointId 不自动具有 Genode session capability 的权限语义。
+
+## 20. Fuchsia：设备、实例与执行环境
+
+[DFv2](https://fuchsia.dev/fuchsia-src/concepts/drivers/driver_framework) 区分 node、Driver Index、
+Driver Manager、Driver Host 和 driver instance；多个驱动可同 host 共址。
+[Dispatcher and threads](https://fuchsia.dev/fuchsia-src/concepts/drivers/driver-dispatcher-and-threads)
+说明 dispatcher 的异步工作与线程纪律由 driver runtime 实施。
+
+借鉴发现→匹配→实例关联→部署的分步职责，以及 transport 不等于并发策略。
+先用组件侧 DeviceId→实例/endpoint 记录检验双盘，不建立完整 Driver Manager 或共享
+host 执行域。现有 ComponentRecord 与私有 AS 的实现不因此改变。
+
+## 21. MINIX 3：更新需要静止、迁移和回滚
+
+[Live update](https://wiki.minix3.org/doku.php?id=developersguide:liveupdate) 记录 RS 先使旧服务
+到已知静止点，新实例转移/调整状态，成功切换、失败回滚；该机制有编译与运行时支持。
+
+借鉴 Restart、Recovery、Live Update 的分离。KaleidOS instantiate 不迁移 socket、
+打开引用或设备状态；故障驱动 quarantine 不可由新实例清除。暂不搬 RS、状态迁移工具链
+或宣称透明恢复；先验证旧对象失败与显式建立新连接。
+
+## 22. FlexOS：用真实负载比较部署
+
+[FlexOS: Towards Flexible OS Isolation](https://arxiv.org/abs/2112.06566)，ASPLOS 2022，
+以模块化 LibOS 在编译/部署时选择隔离和数据共享配置，使用 Redis/Nginx/SQLite 评估
+设计空间。它的 compartment 配置不等同于 KaleidOS 的动态实例生命周期。
+
+借鉴实验方法：固定业务语义与负载，改变合法部署/调用组合，同时报告延迟、吞吐、
+数据搬运/栈成本及实际保护条件。不因 K/K、K/I、I/K、I/I 合成服务矩阵通过，就宣称
+真实 FS/驱动可任意跨域部署。实验入口见 [服务研究 §4](../development/service-runtime-study.md#4-真实纵向负载与前置)。
 
 ---
 
 ## 使用建议
 
-1. **动手写之前**：读一遍 `core-philosophy.md` 和 `architecture.md`，对照本表的"对应设计点"列。
+1. **动手写之前**：读一遍 `docs/philosophy/core-philosophy.md` 和 `docs/architecture/overview.md`，对照本表的"对应设计点"列。
 2. **设计某个具体机制时**（如 device claim、生命周期、替换流程）：先看对应条目的"借鉴什么/不照搬"，避免重复发明或过度设计。
 3. **第一阶段**：主要看 Asterinas（策略验证）、seL4（typed capability / 资源真相）、Exokernel（保护/管理分离）、Theseus（状态归属）；涉及硬件边界和第一个驱动时，优先补看 Zephyr，其余条目留作未来参考。
 4. 本文件是活文档：每深入一个方向（如 Wasm、IPC、验证），就把对应的参考条目写详细。

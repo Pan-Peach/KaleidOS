@@ -1,20 +1,23 @@
 use kcomp_sdk::abi::{EndpointInfo, EndpointState};
 use kcomp_sdk::block::BlockDevice;
 use kcomp_sdk::endpoint::Contract;
-use kcomp_sdk::{Errno, Result};
 
-/// This profile accepts one live block provider; multiple candidates need policy.
-pub fn observe(selected: Option<u64>, row: &EndpointInfo) -> Result<Option<u64>> {
-    if row.state != EndpointState::Live as u32
+/// Explicit profile policy: select the requested ordinal among live exact block endpoints.
+/// Enumeration order is part of this boot profile, not a global uniqueness constraint.
+pub fn observe(wanted: &mut u32, selected: Option<u64>, row: &EndpointInfo) -> Option<u64> {
+    if selected.is_some()
+        || row.state != EndpointState::Live as u32
         || row.contract != BlockDevice::ID
         || row.abi != BlockDevice::ABI
     {
-        return Ok(selected);
+        return selected;
     }
-    if selected.is_some() {
-        return Err(Errno::EBUSY);
+    if *wanted == 0 {
+        Some(row.id)
+    } else {
+        *wanted -= 1;
+        None
     }
-    Ok(Some(row.id))
 }
 
 #[cfg(test)]
@@ -34,10 +37,13 @@ mod tests {
     }
 
     #[test]
-    fn root_requires_an_unambiguous_provider() {
-        let selected = observe(None, &block(7)).unwrap();
-        assert_eq!(selected, Some(7));
-        assert_eq!(observe(selected, &block(8)), Err(Errno::EBUSY));
+    fn explicit_root_ordinal_accepts_multiple_providers() {
+        let mut ordinal = 1;
+        let selected = observe(&mut ordinal, None, &block(7));
+        assert_eq!(selected, None);
+        let selected = observe(&mut ordinal, selected, &block(8));
+        assert_eq!(selected, Some(8));
+        assert_eq!(observe(&mut ordinal, selected, &block(9)), Some(8));
     }
 
     #[test]
@@ -47,7 +53,9 @@ mod tests {
                 state: state as u32,
                 ..block(7)
             };
-            assert_eq!(observe(None, &row), Ok(None));
+            let mut wanted = 1;
+            assert_eq!(observe(&mut wanted, None, &row), None);
+            assert_eq!(wanted, 1);
         }
         let wrong_contract = EndpointInfo {
             contract: BlockDevice::ID ^ 1,
@@ -57,7 +65,7 @@ mod tests {
             abi: BlockDevice::ABI ^ 1,
             ..block(7)
         };
-        assert_eq!(observe(Some(8), &wrong_contract), Ok(Some(8)));
-        assert_eq!(observe(Some(8), &wrong_abi), Ok(Some(8)));
+        assert_eq!(observe(&mut 0, Some(8), &wrong_contract), Some(8));
+        assert_eq!(observe(&mut 0, Some(8), &wrong_abi), Some(8));
     }
 }

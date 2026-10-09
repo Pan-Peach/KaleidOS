@@ -14,19 +14,22 @@
 
 1. 加载 `scheduler_rr`，查找并选择它的 `scheduler.policy` endpoint。
 2. 加载 `driver_prober`，经既有 `kcore_sched_run` 跑完当前有限、不 yield 的 dispatch 任务。
-   prober 创建 `virtio_blk`，由驱动自己认领设备，遇到首个 Match 停止。
-3. 从 Core 值查询中选择唯一 Live、exact ABI 匹配的 `block.device` endpoint。
-   没有块端口则启动纯 console 会话；多个候选返回 EBUSY。
+   prober 创建 `virtio_blk`，由驱动自己认领设备，完成所有候选；每台 Match 设备有独立驱动实例。
+3. 从 Core 值查询中按 profile 指定序号选择 Live、exact ABI 匹配的 `block.device`。
+   默认策略选择第 0 个，枚举顺序属于本启动 profile；增加第二张盘不使根选择歧义。
+   可用 config ABI `0x494E_4954_524F_4F54` + 4 字节 native-endian u32 指定序号，
+   不要求字节对齐。指定非零序号不存在返回 ENODEV；默认无盘进入纯 console 会话。
 4. 把选中的 opaque EndpointId 用 FatFs 的扁平 create config 传给 `fatfs`。
    FatFs 用 memcpy 解码到本地结构，不要求字节负载具有 u64 对齐。
    创建 init 自己的有限任务，在任务上下文 bind / mount filesystem，结果写回实例私有原子。
    FAT 挂载不格式化磁盘；保留 transport / method 分类的错误诊断。
-5. 挂载成功后加载 `ksh`。init 的 create 返回 0，Core 提交 Ready；monitor 的调度安全点
+5. 挂载成功后经 create config 把确切 FS EndpointId 交给 `ksh`。init 的 create 返回 0，Core 提交 Ready；monitor 的调度安全点
    随后运行 shell 任务。没有块盘也可正常进入 ksh，此时 cat 报缺少 filesystem provider。
 
 这是 provider root 挂载，没有 VFS namespace 或 `/` 路由；shell 使用 `0:/HELLO.TXT`。
-init 不导出新服务，也没有新增 Core ABI。SDK 只增加既有 `component_create` 和 `sched_run`
-的安全包装；Core 仍裁决实例、端口、任务与设备所有权。
+init 不导出新服务。`component_create` 现与 load 一样接受 domain，可同时传配置；
+Core 仍裁决实例、端口、任务与设备所有权。多个 FS 的命名空间仍由 VFS 后续实现，
+本启动 profile 只挂 FAT 根，不自动格式化另一张盘。
 
 ## 失败与生命周期
 
@@ -60,8 +63,8 @@ core>
 `make core` 的空仓库会使配置选中的 init 缺失，仍可回到 monitor。
 
 实现位于 `os/components/init/src/{runtime,root}.rs`，boot 入口位于
-`os/boot/riscv/src/composition.rs`。host 用例检查根端口歧义与生命周期 / 指纹过滤。
-`make test-init` 的 RV64/RV32 各跑 FAT、no-block、bad-fat 三条真实串口流程，包括读取文件、
+`os/boot/riscv/src/composition.rs`。host 用例检查显式序号选择与生命周期 / 指纹过滤。
+`make test-init` 的 RV64/RV32 各跑 FAT、dual-fat（FAT 根 + 无签名 raw 盘）、no-block、bad-fat 四条真实串口流程，包括读取文件、
 init 状态、拒绝 task-context 重入、坏盘后的 monitor 恢复、shell exit 与 shutdown。
 它同时纳入 `make test-qemu`；原 CoreTest 流程使用 `configs/monitor.fragment` 自行组合图。
 CoreTest 的 block-chain 额外把 FatFs 配置放在对齐缓冲的偏移 1 字节处，验证非对齐负载。

@@ -11,12 +11,12 @@
 //!    它的 dispatch 任务在 create 里创建 / 启动，由 `runtime.rs` 统一
 //!    `kcore_sched_run`（monitor `load` 的语义相同）。prober 逐台 create
 //!    `virtio_blk`（assignment 经 create config，结果经 `probe.result` 拉取），
-//!    首个 Match 后停止；没有 Match 时试完全部候选后干净结束。
+//!    试完全部候选后干净结束。
 //!
 //! 断言全部来自 Core 真相，且分支在**机器拓扑事实**（参考真值）上，CoreTest 不
 //! 接收"场景"参数：有块设备 → 出生事件数与尝试数吻合、attached 设备被驱动持有
 //! （再次 claim `-EBUSY`）、只有 attached 实例有可读的 `block.device` endpoint、
-//! 同一 artifact 的第二台块设备可再 instantiate 一个独立组件（独立镜像状态）；
+//! 同一 artifact 为所有块设备自动 instantiate 独立组件（独立镜像状态）；
 //! 无块设备 → 每个候选
 //! 得到 report-only 实例（`probe.result` `outcome=1`、无 `block.device`）、设备无
 //! 残留持有；两种拓扑共有 stale NoMatch 路径（非 virtio-blk 设备作为候选）。
@@ -52,9 +52,8 @@ const MAX_CANDIDATES: u32 = 8;
 /// trace 窗口内出生事件上限：prober + 每个候选一个实例。
 const MAX_DECLARED: usize = 12;
 
-/// block 传输单位与 MBR 签名偏移（与 runner 的 1 MiB 磁盘约定一致）。
+/// block 传输单位（与 runner 的 1 MiB 磁盘约定一致）。
 const SECTOR: usize = 512;
-const MBR_SIG_OFFSET: usize = 510;
 
 /// 本场景组的结果与窗口（`prepare` 写、调度返回后 `report` 读）。
 #[repr(C)]
@@ -149,7 +148,7 @@ pub fn prepare(checks: &mut Checks, state: &mut State) {
     state.cursor = trace::cursor();
     let mut prober = 0u32;
     let rc = unsafe {
-        abi::kcore_component_create(PROBER.as_ptr(), PROBER.len(), &empty_args(), &mut prober)
+        abi::kcore_component_create(PROBER.as_ptr(), PROBER.len(), 0, &empty_args(), &mut prober)
     };
     if rc == 0 {
         state.prober_id = prober as i32;
@@ -174,12 +173,18 @@ fn create_driver(device_id: u32, result_name: &[u8], out_instance: &mut u32) -> 
         config_len,
     };
     unsafe {
-        abi::kcore_component_create(VIRTIO_BLK.as_ptr(), VIRTIO_BLK.len(), &args, out_instance)
+        abi::kcore_component_create(
+            VIRTIO_BLK.as_ptr(),
+            VIRTIO_BLK.len(),
+            0,
+            &args,
+            out_instance,
+        )
     }
 }
 
 /// attached 驱动实例的 `block.device` endpoint 真的能读盘：
-/// bind（Direct）→ capacity > 0 → 读 sector 0 → MBR 签名 0xAA55；
+/// bind（Direct）→ capacity > 0 → 读任意内容的 sector 0；
 /// 再用边界读校验**报告的容量确实等于设备的可寻址范围**
 /// （`capacity - 1` 可读、`capacity` 越界拒绝）——比硬编码 runner 的磁盘大小更强。
 fn attach_serves(endpoint: Endpoint<BlockDevice>) -> bool {
@@ -194,10 +199,10 @@ fn attach_serves(endpoint: Endpoint<BlockDevice>) -> bool {
     }
     let mut sector = [0u8; SECTOR];
     binding.read(0, &mut sector).is_ok()
-        && sector[MBR_SIG_OFFSET] == 0x55
-        && sector[MBR_SIG_OFFSET + 1] == 0xAA
         && binding.read(capacity - 1, &mut sector).is_ok()
         && binding.read(capacity, &mut sector).is_err()
+        && binding.read(1u64 << 32, &mut sector).is_err()
+        && binding.write(1u64 << 32, &sector).is_err()
 }
 
 /// 设备归属：attached 的设备被 driver 持有（claim → `-EBUSY`），其余候选已释放
@@ -214,8 +219,10 @@ fn check_ownership(state: &State) -> (bool, u32) {
         };
         let (mut base, mut len) = (core::ptr::null_mut(), 0usize);
         let rc = unsafe { abi::kcore_device_claim(device, &mut base, &mut len) };
-        if ordinal == state.first_blk {
-            attached = device;
+        if state.blk_mask & (1u32 << ordinal) != 0 {
+            if ordinal == state.first_blk {
+                attached = device;
+            }
             ok &= rc == Errno::EBUSY.code();
         } else {
             ok &= rc == 0;
@@ -227,7 +234,7 @@ fn check_ownership(state: &State) -> (bool, u32) {
     (ok, attached)
 }
 
-/// 从 trace 窗口发现 attached 驱动实例（出生 id 里唯一有 `block.device` 的那个）。
+/// 从 trace 窗口发现 attached 驱动实例（出生 id 里有 `block.device` 的实例）。
 fn find_attached(state: &State) -> (u32, Option<Endpoint<BlockDevice>>) {
     let mut declared = [0u32; MAX_DECLARED];
     let declared_len = trace::declared_components(state.cursor, &mut declared);
@@ -293,40 +300,40 @@ fn nth_stale() -> Result<u32, i32> {
     if rc == 0 { Ok(device) } else { Err(rc) }
 }
 
-/// 多设备行为（新模型）：同一 `virtio_blk` artifact 为**第二台**块设备再
-/// instantiate 一个组件——每次 instantiate 得到独立的 writable image（独立的
-/// `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK`），因此第二个 attachment 被接受
-/// （旧模型下被 image-global `BLK` 拒绝成 `-EBUSY`）。
-///
-/// 只有一台块设备时退化为对 attached 设备本身再 create：新组件 claim 已归属的
-/// 设备 → `-EBUSY`（归属检查，不是共享 static）。
-///
-/// 诚实边界：prober 当前在首个 Match 后停止，不会主动 provision 第二台设备；
-/// 这里验证的是**模型**允许同 artifact 的第二个驱动组件（独立镜像状态），而不是
-/// "系统已完成多设备编排"。
+/// 全部块设备由 prober 自动创建；重复 attach 拒绝且原服务仍可用。
+/// runner 的两张盘有不同的 sector 0 内容，其中一张没有格式签名。
 fn check_multi_device(state: &State, attached: u32) -> bool {
-    let mut device = attached;
-    for ordinal in 0..state.candidate_count {
-        if ordinal == state.first_blk || state.blk_mask & (1u32 << ordinal) == 0 {
-            continue;
-        }
-        if let Ok(candidate) = nth(ordinal) {
-            device = candidate;
-            break;
-        }
-    }
-    let different = device != attached;
-    let mut name_buf = [0u8; probe::RESULT_PORT_NAME_MAX];
-    let Ok(name_len) = probe::result_port_name(2, &mut name_buf) else {
+    let mut instance = 0;
+    if create_driver(attached, b"probe.duplicate", &mut instance) != Errno::EBUSY.code() {
         return false;
-    };
-    let mut instance = 0u32;
-    let rc = create_driver(device, &name_buf[..name_len], &mut instance);
-    if different {
-        rc == 0
-    } else {
-        rc == Errno::EBUSY.code()
     }
+    let mut declared = [0; MAX_DECLARED];
+    let len = trace::declared_components(state.cursor, &mut declared);
+    let mut first = None;
+    let mut count = 0;
+    let mut raw = false;
+    for id in &declared[..len] {
+        let Ok(endpoint) = Endpoint::<BlockDevice>::lookup(*id, BLOCK_DEVICE_NAME) else {
+            continue;
+        };
+        if !attach_serves(endpoint) {
+            return false;
+        }
+        let Ok(binding) = endpoint.bind() else {
+            return false;
+        };
+        let mut data = [0; SECTOR];
+        if binding.read(0, &mut data).is_err() {
+            return false;
+        }
+        if first == Some(data[0]) {
+            return false;
+        }
+        first = Some(data[0]);
+        raw |= data[510..512] != [0x55, 0xaa];
+        count += 1;
+    }
+    count == state.blk_mask.count_ones() && (count < 2 || raw)
 }
 
 /// 该实例是否发布了 `probe.result` 且 pull 到 `NO_MATCH`（按 attempt 命名查找；
@@ -393,15 +400,7 @@ pub fn report(checks: &mut Checks, state: &State) {
     let declared_len = trace::declared_components(state.cursor, &mut declared);
     let no_block = state.first_blk == NO_ORDINAL;
 
-    // prober 在首个 Match 后停止（有块设备：出生事件 = 1 + 第一台块设备的
-    // ordinal + 1），没有 Match 时试完全部候选（出生事件 = 1 + 候选数）。
-    // 每个出生实例还必须走完整生命周期（`Ready`）——旧 runner 的 `components`
-    // `state=Ready` 断言的机器可读版本。
-    let attempts = if no_block {
-        state.candidate_count
-    } else {
-        state.first_blk + 1
-    };
+    let attempts = state.candidate_count;
     let lifecycles_ok = declared[..declared_len]
         .iter()
         .all(|&id| trace::component_lifecycle(state.cursor, id as i32));
@@ -425,8 +424,9 @@ pub fn report(checks: &mut Checks, state: &State) {
 
     let (ownership_ok, attached_device) = check_ownership(state);
     let (endpoint_count, attached_endpoint) = find_attached(state);
-    let attach_ok =
-        ownership_ok && endpoint_count == 1 && attached_endpoint.is_some_and(attach_serves);
+    let attach_ok = ownership_ok
+        && endpoint_count == state.blk_mask.count_ones()
+        && attached_endpoint.is_some_and(attach_serves);
     checks.check("driver-attach", attach_ok);
 
     checks.check("driver-no-match", check_no_match());

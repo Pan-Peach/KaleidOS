@@ -101,20 +101,18 @@ fn oversized_path_is_rejected_without_a_call() {
     );
 }
 
-/// `read` 的缓冲区放不下 8 字节头 → 调用前挡下（两条机制一致）。
+/// 小缓冲区和空缓冲区也必须调用 provider，保留句柄验证。
 #[test]
-fn undersized_read_buffer_is_rejected_without_a_call() {
+fn small_and_empty_reads_keep_provider_validation() {
     let _guard = test_support::lock();
-    test_support::reset_script();
-    test_support::script_call(0, 0);
-    let binding = gate_binding();
-
-    assert_eq!(
-        binding.read(1, &mut [0u8; 7]),
-        Err(InvokeError::Method(Errno::EINVAL))
-    );
-    assert!(
-        test_support::last_call().is_none(),
-        "畸形 read 缓冲区不得触发 kcore_endpoint_call"
-    );
+    for len in [0, 1, 7] {
+        test_support::reset_script();
+        test_support::script_call(0, Errno::EBADF.code());
+        let mut buf = [0; 7];
+        assert_eq!(
+            gate_binding().read(99, &mut buf[..len]),
+            Err(InvokeError::Method(Errno::EBADF))
+        );
+        assert_eq!(test_support::last_call().unwrap().output_len, len + 8);
+    }
 }

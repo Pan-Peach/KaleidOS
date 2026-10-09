@@ -9,9 +9,7 @@
  *
  * 组件代码只看到 `struct kcomp_filesystem_binding` 与统一调用，**看不到机制**。
  *
- * read 的缓冲区布局两条路径一致：output 的前 8 字节是 LE u64 实际长度头，数据从
- * offset 8 开始（见 kcomp_filesystem.h）。DIRECT 分支把 provider 写出的数据留在
- * offset 8 并回填同一份头。
+ * read 接受普通数据缓冲区；Gate 的长度头和最多 512 字节 scratch 留在 SDK。
  */
 #include "kcomp.h"
 #include "kcomp_filesystem.h"
@@ -258,12 +256,8 @@ struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_bin
     }
     *out_read = 0;
 
-    /* output 必须放得下 8 字节长度头（数据容量可以为 0）。 */
-    if (output_len < KCOMP_FILESYSTEM_READ_HEADER_LEN) {
-        return error_result(-EINVAL);
-    }
-    size_t capacity = output_len - KCOMP_FILESYSTEM_READ_HEADER_LEN;
-    uint8_t *data = (uint8_t *)output + KCOMP_FILESYSTEM_READ_HEADER_LEN;
+    size_t capacity = output_len;
+    uint8_t *data = output;
 
     const struct kcomp_filesystem_binding_internal *b = binding_ref(binding);
     struct kcomp_call_result result;
@@ -281,7 +275,6 @@ struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_bin
                 /* provider 返回超过 buffer 的长度 = 契约违约（不截断）。 */
                 return error_result(-EPROTO);
             }
-            write_le64((uint8_t *)output, (uint64_t)actual);
             *out_read = actual;
         }
         return result;
@@ -289,18 +282,20 @@ struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_bin
 
     if (b->mechanism == KCORE_ENDPOINT_MECHANISM_GATE) {
         uint8_t args[KCOMP_FILESYSTEM_HANDLE_LEN];
-
+        uint8_t frame[KCOMP_FILESYSTEM_READ_HEADER_LEN + 512] = {0};
+        capacity = capacity > 512 ? 512 : capacity;
         write_le64(args, handle);
         result.method = 0;
         result.transport = kcore_endpoint_call(b->endpoint, KCOMP_FILESYSTEM_METHOD_READ, args,
-                                               sizeof(args), NULL, 0, (uint8_t *)output, output_len,
+                                               sizeof(args), NULL, 0, frame,
+                                               KCOMP_FILESYSTEM_READ_HEADER_LEN + capacity,
                                                &result.method);
         if (result.transport == 0 && result.method == 0) {
-            uint64_t actual = read_le64((const uint8_t *)output);
+            uint64_t actual = read_le64(frame);
             if (actual > capacity) {
-                /* 回复头声称的长度超过数据容量 = 回复违约（不猜测、不截断）。 */
                 return error_result(-EPROTO);
             }
+            memcpy(data, frame + KCOMP_FILESYSTEM_READ_HEADER_LEN, (size_t)actual);
             *out_read = (size_t)actual;
         }
         return result;

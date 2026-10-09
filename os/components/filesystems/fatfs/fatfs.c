@@ -134,11 +134,14 @@ int32_t kcomp_instance_destroy(void *opaque_state)
     if (state == NULL)
         return 0;
 
+    if (!fatfs_enter(state))
+        return -EBUSY;
     state->alive = 0;
 
     fatfs_disk_detach();
 
     /* endpoint / binding 的 ctx 可能仍被消费者缓存；只逻辑停止，不回收 state。 */
+    fatfs_leave(state);
     FATFS_LOG_LINE("[fatfs] destroy");
     return 0;
 }

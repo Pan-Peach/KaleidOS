@@ -14,7 +14,7 @@
 //!       → kcore_component_create(driver, config)
 //!       → create 返回 0 后 lookup + pull `probe.result`（经 Core call gate）
 //!       → cursor.report(attempt, outcome, detail)   ← 普通本地调用
-//!   → Match 即停止（首个成功 block attach；cursor 更新是本地函数调用）
+//!   → 完成全部设备分配（cursor 更新是本地函数调用）
 //! ```
 //!
 //! **驱动绝不回调 prober**：它只读 create config、claim `DeviceId`、发布自己的
@@ -118,7 +118,7 @@ extern "C" fn dispatch_task(arg: *mut ()) {
     // SAFETY: arg 是 create 写入的本实例 state；本任务独占它（组件不发布
     // endpoint、不暴露 ctx），地址在实例存活期内稳定。
     let state = unsafe { &mut *state_ptr(arg) };
-    let mut stopped = false;
+    let mut matched = 0usize;
 
     for index in 0..state.set.len() {
         let driver = state.set.driver(index);
@@ -163,7 +163,7 @@ extern "C" fn dispatch_task(arg: *mut ()) {
             let mut instance = 0u32;
             // SAFETY: driver / args 均在本帧有效；create 只在调用期间借用 config。
             let status = unsafe {
-                abi::kcore_component_create(driver.as_ptr(), driver.len(), &args, &mut instance)
+                abi::kcore_component_create(driver.as_ptr(), driver.len(), 0, &args, &mut instance)
             };
             if status != 0 {
                 // construction failure：与 NoMatch 分开记录（outcome = create errno）。
@@ -221,21 +221,11 @@ extern "C" fn dispatch_task(arg: *mut ()) {
             );
             record(state, attempt, reply);
             if reply.is_match() {
-                kcomp_sdk::klog!(
-                    "driver_prober: attempt={} Match; stopping after first attachment",
-                    attempt
-                );
-                stopped = true;
-                break;
+                matched += 1;
             }
         }
-        if stopped {
-            break;
-        }
     }
-    if !stopped {
-        kcomp_sdk::klog!("driver_prober: no supported device; dispatch done");
-    }
+    kcomp_sdk::klog!("driver_prober: dispatch done; matched={}", matched);
 
     let _ = unsafe { abi::kcore_task_exit() };
     loop {

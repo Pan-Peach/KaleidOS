@@ -43,8 +43,17 @@ CoreTest 验证公开组件接口的集成契约，ArchTest 验证实际硬件�
 - **对抗性测试与功能测试同等重要**：Core 的"拒绝错误提案"行为必须显式测试。
   - 目标类别：double free / wrong owner / stale 资源身份 / invalid task transition / duplicate claim / illegal map / invalid scheduler proposal；
   - 已落地子集：重复 `device_claim` → `-EBUSY`、quarantine 后再 claim → `-EBUSY`、仍有 live IRQ route / DMA mapping 时 `device_release` → `-EBUSY`、非 owner `irq_register` → `-EACCES`、顺序错误 → `-EINVAL`、ordinal 越界 → `-ENOENT`、stale mapping id → `-ENOENT`。
-- **同一 artifact 多组件的独立 backing（关键不变量）**：host `same_artifact_loads_produce_independent_components`（同名 artifact 连续 load 两次 → 两个 `ComponentId`、独立常驻 backing、镜像区间不重叠、`.data` / `.bss` 不共享）；CoreTest `driver-multi-device`（第二个同 artifact `virtio_blk` 组件独立 attach 第二台设备，RV64+RV32）；ArchTest `isolated-restart`（同 artifact 的并发 Isolated 组件各自独立私有 AS / backing）。
+- **同一 artifact 多组件的独立 backing（关键不变量）**：host `same_artifact_loads_produce_independent_components`（同名 artifact 连续 load 两次 → 两个 `ComponentId`、独立常驻 backing、镜像区间不重叠、`.data` / `.bss` 不共享）；CoreTest `driver-multi-device`（prober 自动为所有块设备创建独立 `virtio_blk`；含无签名盘、重复认领拒绝与 RV32 LBA 溢出，RV64+RV32）；ArchTest `isolated-restart`（同 artifact 的并发 Isolated 组件各自独立私有 AS / backing）。
 - Core 的 API 每多一个，就多一份必须验证的承诺——这反过来约束 Core 词汇表保持最小。
+
+双盘→双 FS→VFS→POSIX 纵向负载、已验收部分与剩余前置见
+[服务研究 §4](service-runtime-study.md#4-真实纵向负载与前置)，推进状态见
+[STATUS §6](../../STATUS.md#6-近期依赖链)。driver-multi-device 现验证自动全枚举，storage-real-chain 把真实两盘分别交给 FatFs
+和 littlefs 并验证内容、错误路径与旧句柄；这仍不是 VFS 或应用运行期文件访问。
+`tests/build/test_filesystem_provider.py` 编译生产 C provider 与上游 FS 库，在宿主
+块介质 fake 内强制停住读 I/O，验证并发 close/mount 返回 EBUSY；同时验证旧句柄、
+零长度读、句柄耗尽以及 C SDK 普通数据缓冲前端。它证明库/状态串行纪律，不声称
+硬件隔离或 DMA 撤销。源码推导和报告推演不得登记为 QEMU PASS。
 
 ## 4. 如何运行与观察
 
@@ -52,7 +61,7 @@ CoreTest 验证公开组件接口的集成契约，ArchTest 验证实际硬件�
 make check        质量快车道：fmt + clippy -D warnings + host 单测 + RV64 构建 + RV32 check
 make test-host    宿主单测
 make test-qemu    CoreTest + ksh 串口流程 + init 启动流程 + shutdown
-make test-init    RV64/RV32：默认 FAT 挂载、无盘会话、坏盘 monitor 回退
+make test-init    RV64/RV32：FAT、双盘 FAT 根、无盘会话、坏盘 monitor 回退
 make test-arch-smp-rv64  RV64：CPU 启动 / IPI / per-CPU（组件调度由 test-qemu 中的 CoreTest 验证）
 make test-arch    ArchTest 白盒 selftest（每 case 独立 QEMU，精确 scause 判定）
 ```

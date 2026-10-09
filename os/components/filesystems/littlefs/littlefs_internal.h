@@ -4,7 +4,7 @@
 #include "kcomp.h"
 #include "lfs.h"
 
-/* 同时在线的 open 文件上限（handle = slot + 1，0 永久保留为无效值）。 */
+/* 同时在线的 open 文件上限（handle 单调增长、不复用，0 永久保留为无效值）。 */
 #define LITTLEFS_MAX_OPEN_FILES 8
 
 /* provider 定义的端口 token（**Gate** 路径经 kcomp_service_dispatch 用它选中本
@@ -31,7 +31,7 @@
 #define LITTLEFS_LOG_LINE(text) kcore_log_line((const uint8_t *)(text), sizeof(text) - 1)
 
 struct littlefs_file_slot {
-    int used;
+    uint64_t handle;
     lfs_file_t file;
     /* `LFS_NO_MALLOC`：per-file cache buffer 必须显式提供，且 config 在文件打开
      * 期间保持存活（lfs_file_opencfg 的契约）——两者都放在本槽位里。 */
@@ -55,6 +55,8 @@ struct littlefs_state {
      * 非整 sector 的 read/prog 经这个 bounce buffer 转一手。 */
     uint8_t sector[KCOMP_BLOCK_DEVICE_SECTOR];
 
+    uint32_t busy;
+    uint64_t last_handle;
     int mounted;
     int alive;
 
@@ -65,6 +67,17 @@ struct littlefs_state {
     struct lfs_file_config selftest_config;
     uint8_t selftest_buffer[LITTLEFS_CACHE_SIZE];
 };
+
+/* 不等待：同 CPU 的重入不能自旋；竞争返回 EBUSY，调用方决定重试。 */
+static inline int littlefs_enter(struct littlefs_state *state)
+{
+    return state != NULL && !__atomic_exchange_n(&state->busy, 1, __ATOMIC_ACQUIRE);
+}
+
+static inline void littlefs_leave(struct littlefs_state *state)
+{
+    __atomic_store_n(&state->busy, 0, __ATOMIC_RELEASE);
+}
 
 /* 业务后端：Direct 的 `#[repr(C)]` function table 与 Gate 的扁平 method switch
  * （littlefs_service.c）调用**同一份**实现；业务代码不感知部署。 */

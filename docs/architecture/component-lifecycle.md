@@ -157,14 +157,15 @@ struct kcomp_driver_create_config {
 
 ```c
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len,
-                               const struct KcompCreateArgs *args,
+                               uint32_t domain, const struct KcompCreateArgs *args,
                                uint32_t *out_instance);
 ```
 
 `kcore_component_load(name, len, domain)` 是“默认配置启动”的便利操作，返回组件 id / -errno。
 `domain` 使用 schema 的整数编码（KernelNative=0 / IsolatedNative=1 / SandboxedNative=2）；
 Core 验证支持面，不隐式回退，SandboxedNative 当前返回 ENOTSUP。带自定义 config 的
-`kcore_component_create` 仍为 KernelNative 入口，不扩充完整 image 管理 API。
+`kcore_component_create` 使用同一 domain 编码，配置与部署正交；Core 把不透明 config
+送到所选域的真实 create 边界，不扩充完整 image 管理 API。
 `kcore_component_stop(id)` 复用同一个 Stop 操作，供受信 KernelNative 组合方使用；
 IRQ / Gate / policy 上下文拒绝，没有父子权限表。Stop 拒绝不改状态，销毁入口在锁外运行。
 
@@ -242,6 +243,12 @@ create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient
 
 ## 8. 失败、destroy 与隔离
 
+生命周期保证分层：**Logical death**（拒绝新工作/身份失效）、**Execution quiescence**
+（Task、调用、已准入 callback 静止）、**Physical reclamation**（代码/状态/backing
+可释放）分别证明。`Failed` 或 `inflight == 0` 不代表后两项成立；Direct 引用与 DMA
+设备静默不能从一个调用计数推导。业务 Recovery 属于组合与服务 Runtime，见
+[服务执行 §5–§6](service-execution.md#5-连接会话与失效)。
+
 - 沿用现状：failure **不调用** exit/destroy（`failure.rs`），MMIO 设备与 DMA backing 被**隔离（quarantine）**。
 - **设备隔离持续到重启**。创建新实例**不得**清除隔离。
 - destroy 的命名**不得**暗示 Core 能安全回收全部状态。Native 实例发布非空 Direct 表后，Core **拒绝 Stop/destroy（EBUSY）**；即使 endpoint 已失效，也不能证明表已归还。不新增 Direct 引用计数，不追踪每次调用。failure 不调用 destroy，已暴露的 state 必须驻留。本轮**保留已暴露的 state 存储**——尤其通过 `'static` SDK 引用交出去的。现有 consumer 可能持有拷贝过的 binding；释放其 ctx 会把今天的"stale 逻辑访问"变成 use-after-free。
@@ -256,6 +263,9 @@ create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient
   > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单不变（`tp` 是普通架构 / 任务执行状态，由 Core 在任务切换 / trap 时透明保存 / 恢复，全新上下文起点为 0，不再是组件运行时指针）。见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
 - **重启 ≠ 设备恢复**（隔离到重启，见 §8）。
+- **重启 ≠ 业务恢复或 Live Update**：新实例不继承旧 endpoint、open handle 或连接身份。
+  上层可显式建立新路由；旧对象不静默指向新实例。状态重建/重放、静止点、迁移与回滚
+  分别需要服务契约和证据，不由 instantiate 自动提供。
 
 ### 关于 text 共享
 

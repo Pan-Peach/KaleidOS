@@ -82,7 +82,8 @@ mkdir -p "$(dirname "$output")"
 
 # ---- 契约校验：load 前失败，别把坏镜像带进 kpkg ----
 
-if ! "$readelf" -h "$output" | grep -q 'REL (Relocatable file)'; then
+# Consume the complete pipe: grep -q can give readelf SIGPIPE under pipefail.
+if ! "$readelf" -h "$output" | grep 'REL (Relocatable file)' >/dev/null; then
     echo "kcomp-link: $output is not ET_REL" >&2
     exit 1
 fi
@@ -120,7 +121,7 @@ fi
 # 只允许 loader 已支持的 RISC-V 重定位类型；特别禁止 R_RISCV_ALIGN。
 #   Allow: 0 NONE, 1/2 32/64, 18/19 CALL/CALL_PLT, 20 32_PCREL,
 #          23/24/25 PCREL_HI20/LO12_I/LO12_S, 26/27/28 HI20/LO12_I/LO12_S, 51 RELAX.
-if "$readelf" -r "$output" | grep -q 'R_RISCV_ALIGN'; then
+if "$readelf" -r "$output" | grep 'R_RISCV_ALIGN' >/dev/null; then
     echo "kcomp-link: R_RISCV_ALIGN present (loader 不支持) in $output" >&2
     exit 1
 fi

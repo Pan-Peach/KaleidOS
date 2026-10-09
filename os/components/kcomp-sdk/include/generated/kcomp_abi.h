@@ -88,7 +88,7 @@ extern const uint64_t kcomp_abi;
 /* 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
  * 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
  * `kcomp_abi` 符号由入口宏发出。 */
-#define KCOMP_ABI UINT64_C(0xB1365C28A47DE092)
+#define KCOMP_ABI UINT64_C(0x71A9CE348D62F0B5)
 
 /* 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
  * 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
@@ -335,7 +335,7 @@ uint32_t kcore_task_count(void);
 uint32_t kcore_component_count(void);
 /* -- Component lifecycle -- */
 /* Core 侧的最小创建操作：按 artifact 名创建新实例（同一 artifact 允许多实例）。 */
-int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, const struct KcompCreateArgs *args, uint32_t *out_instance);
+int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, uint32_t domain, const struct KcompCreateArgs *args, uint32_t *out_instance);
 /* 请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。 */
 int32_t kcore_component_load(const uint8_t *name, size_t len, uint32_t domain);
 /* 请求优雅停止实例，复用 monitor 的 Stop 编排；只支持 KernelNative caller。

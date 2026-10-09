@@ -15,7 +15,7 @@ pub fn load(name: &[u8], domain: ExecutionDomain) -> Result<u32> {
 }
 
 /// Flat create config borrowed only until the provider's create returns.
-pub fn create(name: &[u8], config_abi: u64, config: &[u8]) -> Result<u32> {
+pub fn create(name: &[u8], domain: ExecutionDomain, config_abi: u64, config: &[u8]) -> Result<u32> {
     let args = abi::KcompCreateArgs {
         config_abi,
         config: config.as_ptr().cast(),
@@ -23,7 +23,9 @@ pub fn create(name: &[u8], config_abi: u64, config: &[u8]) -> Result<u32> {
     };
     let mut id = 0;
     // SAFETY: name/config/args remain valid for this synchronous call.
-    let code = unsafe { abi::kcore_component_create(name.as_ptr(), name.len(), &args, &mut id) };
+    let code = unsafe {
+        abi::kcore_component_create(name.as_ptr(), name.len(), domain as u32, &args, &mut id)
+    };
     if code == 0 {
         Ok(id)
     } else {

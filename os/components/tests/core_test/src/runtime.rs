@@ -80,6 +80,9 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     unsafe {
         (*state).sched.a_count = 0;
         (*state).sched.b_count = 0;
+        (*state).filesystem.physical_count = 0;
+        (*state).filesystem.physical_blocks = [0; 2];
+        (*state).filesystem.physical_chain = false;
         (*state).filesystem.block_chain = false;
         (*state).filesystem.block_chain_direct = false;
         (*state).filesystem.littlefs_multi = false;
@@ -121,6 +124,13 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     // SAFETY: 调度已返回，prober 的 dispatch 任务退出；此后只读。
     let driver_state = unsafe { &*core::ptr::addr_of!((*state).driver) };
     driver::report(&mut checks, driver_state);
+    filesystem::spawn_physical(driver_state.cursor, unsafe {
+        core::ptr::addr_of_mut!((*state).filesystem)
+    });
+    schedule();
+    checks.check("storage-real-chain", unsafe {
+        (*state).filesystem.physical_chain
+    });
 
     c_frontend::run(&mut checks);
     convergence::group(&mut checks, unsafe {

@@ -2,6 +2,8 @@
 """Boot a test profile, validate CoreTest, then exercise the serial console."""
 import argparse
 import sys
+import subprocess
+from pathlib import Path
 import ksh
 from common import (BOOT_MARKERS, FATAL_MARKERS, MONITOR_BANNER, RunFailure,
                     Session, add_arguments, make_disk, qemu_command)
@@ -22,7 +24,13 @@ def main():
             if args.scenario == "default":
                 for index in range(2):
                     disk = session.directory / f"block-{index}.img"
-                    make_disk(disk)
+                    make_disk(disk, marker=index + 1, signature=index == 0)
+                    if index == 0:
+                        subprocess.run(["mkfs.fat", "-F", "12", str(disk)], check=True,
+                                       capture_output=True)
+                        hello = Path(__file__).resolve().parents[1] / "fixtures/rootfs/HELLO.TXT"
+                        subprocess.run(["mcopy", "-i", str(disk), str(hello), "::/HELLO.TXT"],
+                                       check=True)
                     disks.append(disk)
             proc = session.start(qemu_command(args, disks))
 
@@ -43,7 +51,7 @@ def main():
             ksh.run(proc, session.collect, session.send, RunFailure, FATAL_MARKERS)
             session.send(proc, "shutdown\n")
             session.shutdown()
-    except (RunFailure, OSError) as error:
+    except (RunFailure, OSError, subprocess.CalledProcessError) as error:
         print(f"FAIL coretest {args.arch}/{args.scenario}: {error}")
         return 1
     print(f"[coretest-{args.arch}/{args.scenario}] ALL PASS")

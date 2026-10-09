@@ -117,7 +117,7 @@ pub type KcompServiceDispatch = extern "C" fn(
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0xB136_5C28_A47D_E092;
+pub const KCOMP_ABI: u64 = 0x71A9_CE34_8D62_F0B5;
 
 /// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
 #[repr(u32)]
@@ -462,6 +462,7 @@ unsafe extern "C" {
     pub fn kcore_component_create(
         image_name: *const u8,
         image_name_len: usize,
+        domain: u32,
         args: *const KcompCreateArgs,
         out_instance: *mut u32,
     ) -> i32;

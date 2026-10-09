@@ -6,19 +6,14 @@
 //! 不选择：`Direct` 绑定直接调 provider function table（无 Core 介入、无分配、无
 //! 打包），`Gate` 绑定走 `kcore_endpoint_call`——**调用点完全相同**。
 //!
-//! # `read` 的缓冲区布局
-//!
-//! `buf` **就是**扁平 frame 的 `output` 区：前
-//! [`KCOMP_FILESYSTEM_READ_HEADER_LEN`](crate::generated::filesystem::KCOMP_FILESYSTEM_READ_HEADER_LEN)
-//! （8）字节是 LE `u64` 实际长度头，数据从 offset 8 开始；成功返回实际长度，
-//! 数据在 `&buf[8..8 + actual]`。`buf.len()` 含头，因此单次读的数据容量是
-//! `buf.len() - 8`。Direct / Gate 两条机制对 consumer 呈现**同一份**缓冲区布局。
+//! `read` 接受普通数据缓冲区。Direct 直接写入；Gate 在 SDK 内使用最多
+//! 512 字节数据的临时 frame，校验长度后复制；允许短读和零长度缓冲区。
 //!
 //! # 错误分类（三类必须可区分）
 //!
 //! - [`InvokeError::Transport`]：Core 传输失败（Gate 绑定才有），provider **未被调用**；
 //! - [`InvokeError::Method`]：provider 被调用并返回 `-errno`（或请求按契约无效，
-//!   前端直接挡下：超长路径 / `read` 缓冲区放不下 8 字节头）；
+//!   前端直接挡下：超长路径）；
 //! - [`InvokeError::InvalidReply`]：传输成功但 provider / Core 的回复不是契约形状。
 
 use core::ffi::CStr;
@@ -27,7 +22,6 @@ use crate::endpoint::{Endpoint, InvokeError};
 use crate::errno::Errno;
 use crate::filesystem::FileSystem;
 use crate::filesystem::backend::{self, Backend};
-use crate::filesystem::dispatch::is_read_output_len;
 use crate::generated::filesystem::KCOMP_FILESYSTEM_PATH_MAX;
 
 /// `filesystem` 的**调用绑定**（consumer 侧句柄）。
@@ -78,14 +72,8 @@ impl FileSystemBinding {
         backend::close(&self.backend, handle)
     }
 
-    /// 从 `handle` 当前位置读数据到 `buf` 的数据区（布局见模块文档）。
-    ///
-    /// 成功返回实际读到的字节数（数据在 `&buf[8..8 + actual]`）。`buf` 必须至少
-    /// 放得下 8 字节长度头；不足时在调用前挡下（不浪费一次传输，两条机制一致）。
+    /// 从当前位置读到普通数据缓冲区，返回实际长度；Gate 单次最多读 512 字节。
     pub fn read(&self, handle: u64, buf: &mut [u8]) -> Result<usize, InvokeError> {
-        if !is_read_output_len(buf.len()) {
-            return Err(InvokeError::Method(Errno::EINVAL));
-        }
         backend::read(&self.backend, handle, buf)
     }
 }

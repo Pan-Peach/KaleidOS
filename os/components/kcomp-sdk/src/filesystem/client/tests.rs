@@ -112,7 +112,7 @@ pub(super) fn gate_binding() -> FileSystemBinding {
     endpoint().bind().expect("stub bind returns GATE")
 }
 
-/// Direct：五个方法直调 function table（数据留在 offset 8），**绝不**经过
+/// Direct：五个方法直调 function table（数据写入业务缓冲区），**绝不**经过
 /// `kcore_endpoint_call`（稳态零 Core 介入、零打包）。
 #[test]
 fn direct_binding_calls_the_function_table_without_core_involvement() {
@@ -130,12 +130,7 @@ fn direct_binding_calls_the_function_table_without_core_involvement() {
     let mut region = [0u8; 8 + 32];
     let actual = binding.read(handle, &mut region).unwrap();
     assert_eq!(actual, DIRECT_DATA.len());
-    assert_eq!(&region[8..8 + actual], DIRECT_DATA, "数据从 offset 8 开始");
-    assert_eq!(
-        crate::filesystem::dispatch::decode_read_len(&region[..8]),
-        Some(DIRECT_DATA.len()),
-        "Direct 分支回填与 Gate 同一份 8 字节长度头"
-    );
+    assert_eq!(&region[..actual], DIRECT_DATA);
 
     binding.close(handle).unwrap();
     binding.unmount().unwrap();

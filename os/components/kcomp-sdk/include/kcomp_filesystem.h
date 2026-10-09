@@ -15,10 +15,8 @@
  *   close(3)：args = 8 字节 LE `u64` handle
  *   read(4)：args = 8 字节 LE `u64` handle；output = 8 字节 LE 实际长度 + 数据
  *
- * `read` 的缓冲区布局（**两条机制一致**）：`output` 就是扁平 frame 的 output 区，
- * 前 `KCOMP_FILESYSTEM_READ_HEADER_LEN` (8) 字节是 LE `u64` 实际长度头，数据从
- * offset 8 开始；`output_len` 含头，因此单次读的数据上限 = `output_len` - 8。
- * 成功时 `*out_read` = 实际字节数，数据在 `(uint8_t *)output + 8` 起。
+ * `read` 接受普通数据缓冲区（不含协议头）；成功时数据从 output 起，
+ * *out_read 为实际长度。Gate 单次最多读 512 字节，允许正常短读。
  *
  * 实现（不透明绑定的内部表示）在 `kcomp-sdk/c/kcomp_filesystem.c`，随每个 C 组件
  * 私有携带；本头文件只暴露声明。
@@ -84,8 +82,7 @@ struct kcomp_call_result kcomp_filesystem_open(const struct kcomp_filesystem_bin
 struct kcomp_call_result kcomp_filesystem_close(const struct kcomp_filesystem_binding *binding,
                                                 uint64_t handle);
 
-/* 从 handle 当前位置读数据到 `output` 的数据区（布局见文件头；`output_len` 含
- * 8 字节头）。成功（transport == 0 且 method == 0）时 `*out_read` 有效。 */
+/* 从当前位置读到普通数据缓冲区；成功时 *out_read 有效。 */
 struct kcomp_call_result kcomp_filesystem_read(const struct kcomp_filesystem_binding *binding,
                                                uint64_t handle, void *output, size_t output_len,
                                                size_t *out_read);

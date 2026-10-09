@@ -53,8 +53,7 @@
 //!   attach 两台设备），不再阻止另一个组件 attach 另一台设备。
 //! - `CoreHal` 的回调仍是**无上下文的**（`Hal` 不接收 per-instance ctx）；因为
 //!   每个组件只 attach 一台设备，全局 `DEVICE_ID` 在组件内是唯一的，DMA 归属正确。
-//! - **系统编排仍未做**：prober 在首个 Match 后停止，不会主动为第二台设备
-//!   instantiate 第二个驱动组件——这是编排缺口，不是模型限制。
+//! - prober 完成全部候选，为每台匹配设备创建独立驱动组件。
 
 #![no_std]
 
@@ -119,15 +118,17 @@ impl BlockDeviceProvider for VirtioBlkProvider {
     }
 
     fn read(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
+        let lba = usize::try_from(lba).map_err(|_| Errno::EOVERFLOW)?;
         match BLK.lock().as_mut() {
-            Some(blk) => blk.read_blocks(lba as usize, buf).map_err(|_| Errno::EIO),
+            Some(blk) => blk.read_blocks(lba, buf).map_err(|_| Errno::EIO),
             None => Err(Errno::ENODEV),
         }
     }
 
     fn write(&self, lba: u64, buf: &[u8]) -> Result<()> {
+        let lba = usize::try_from(lba).map_err(|_| Errno::EOVERFLOW)?;
         match BLK.lock().as_mut() {
-            Some(blk) => blk.write_blocks(lba as usize, buf).map_err(|_| Errno::EIO),
+            Some(blk) => blk.write_blocks(lba, buf).map_err(|_| Errno::EIO),
             None => Err(Errno::ENODEV),
         }
     }
@@ -299,15 +300,7 @@ kcomp_instance_create!(|args, out_state| {
         unsafe { free_state(state) };
         return Errno::EIO.code();
     }
-    let sig = u16::from_le_bytes([buf[510], buf[511]]);
-    klog!("mbr sig={:04x}", sig);
-    if sig != 0xAA55 {
-        klog!("virtio_blk test failed");
-        drop(blk);
-        rollback_attachment(device_id);
-        unsafe { free_state(state) };
-        return Errno::EIO.code();
-    }
+    // 磁盘内容由上层 FS/分区组件解释；raw disk 也是合法块设备。
 
     // (7) Match **只在 attach + publication 都成功之后**成立：结果先写进本实例
     //     state，两个 endpoint 都 staged publish；任一失败都回滚（create 非 0 =

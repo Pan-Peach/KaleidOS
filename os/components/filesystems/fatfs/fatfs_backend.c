@@ -62,7 +62,18 @@ static int32_t fatfs_result(FRESULT result)
     }
 }
 
-int32_t fatfs_mount(void *ctx)
+static struct fatfs_file_slot *fatfs_find(struct fatfs_state *state, uint64_t handle)
+{
+    if (handle != 0) {
+        for (size_t i = 0; i < FATFS_MAX_OPEN_FILES; i++) {
+            if (state->files[i].handle == handle)
+                return &state->files[i];
+        }
+    }
+    return NULL;
+}
+
+static int32_t fatfs_mount_locked(void *ctx)
 {
     struct fatfs_state *state = ctx;
 
@@ -87,7 +98,7 @@ int32_t fatfs_mount(void *ctx)
     return 0;
 }
 
-int32_t fatfs_unmount(void *ctx)
+static int32_t fatfs_unmount_locked(void *ctx)
 {
     struct fatfs_state *state = ctx;
 
@@ -103,7 +114,7 @@ int32_t fatfs_unmount(void *ctx)
 
     for (size_t i = 0; i < FATFS_MAX_OPEN_FILES; ++i)
     {
-        if (state->files[i].used)
+        if (state->files[i].handle)
         {
             return -EBUSY;
         }
@@ -120,7 +131,7 @@ int32_t fatfs_unmount(void *ctx)
     return 0;
 }
 
-int32_t fatfs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
+static int32_t fatfs_open_locked(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
 {
     struct fatfs_state *state = ctx;
 
@@ -144,11 +155,14 @@ int32_t fatfs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_ha
         return -EROFS;
     }
 
+    if (state->last_handle == UINT64_MAX)
+        return -EOVERFLOW;
+
     // Find an available file slot
     int slot_index = -1;
     for (int i = 0; i < FATFS_MAX_OPEN_FILES; i++)
     {
-        if (!state->files[i].used)
+        if (!state->files[i].handle)
         {
             slot_index = i;
             break;
@@ -167,14 +181,14 @@ int32_t fatfs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_ha
         return fatfs_result(result);
     }
 
-    state->files[slot_index].used = 1;
-    *out_handle = (uint64_t)slot_index + 1;
+    *out_handle = ++state->last_handle;
+    state->files[slot_index].handle = *out_handle;
     FATFS_LOG_LINE("[fatfs] open");
 
     return 0;
 }
 
-int32_t fatfs_read(
+static int32_t fatfs_read_locked(
     void *ctx,
     uint64_t handle,
     uint8_t *buf,
@@ -191,15 +205,12 @@ int32_t fatfs_read(
     if (!state->alive || !state->mounted)
         return -ENODEV;
 
+    struct fatfs_file_slot *slot = fatfs_find(state, handle);
+    if (slot == NULL)
+        return -EBADF;
+
     if (len == 0)
         return 0;
-
-    if (handle == 0 || handle > FATFS_MAX_OPEN_FILES)
-        return -EBADF;
-
-    struct fatfs_file_slot *slot = &state->files[handle - 1];
-    if (!slot->used)
-        return -EBADF;
 
     UINT request = len > (size_t)(UINT)-1
                        ? (UINT)-1
@@ -215,25 +226,85 @@ int32_t fatfs_read(
     return 0;
 }
 
-int32_t fatfs_close(void *ctx, uint64_t handle)
+static int32_t fatfs_close_locked(void *ctx, uint64_t handle)
 {
     struct fatfs_state *state = ctx;
 
-    if (state == NULL || handle == 0 || handle > FATFS_MAX_OPEN_FILES)
+    if (state == NULL)
         return -EBADF;
 
     if (!state->alive || !state->mounted)
         return -ENODEV;
 
-    struct fatfs_file_slot *slot = &state->files[handle - 1];
-    if (!slot->used)
+    struct fatfs_file_slot *slot = fatfs_find(state, handle);
+    if (slot == NULL)
         return -EBADF;
 
     FRESULT result = f_close(&slot->file);
     if (result != FR_OK)
         return fatfs_result(result);
 
-    slot->used = 0;
+    slot->handle = 0;
     FATFS_LOG_LINE("[fatfs] close");
     return 0;
+}
+
+int32_t fatfs_mount(void *ctx)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_mount_locked(ctx);
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_unmount(void *ctx)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_unmount_locked(ctx);
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_open(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_open_locked(ctx, path, flags, out_handle);
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_close(void *ctx, uint64_t handle)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_close_locked(ctx, handle);
+    fatfs_leave(state);
+    return result;
+}
+
+int32_t fatfs_read(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read)
+{
+    struct fatfs_state *state = ctx;
+    if (state == NULL)
+        return -EINVAL;
+    if (!fatfs_enter(state))
+        return -EBUSY;
+    int32_t result = fatfs_read_locked(ctx, handle, buf, len, out_read);
+    fatfs_leave(state);
+    return result;
 }

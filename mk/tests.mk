@@ -50,6 +50,7 @@ _test-init-rv32:
 
 _test-init-one: kernel rootfs $(if $(filter rv64,$(KCFG_ARCH)),exec-fixtures,)
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --rootfs $(ROOTFS) --exec-fixtures $(BUILD_DIR)/exec-fixtures --scenario fat
+	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --rootfs $(ROOTFS) --exec-fixtures $(BUILD_DIR)/exec-fixtures --scenario dual-fat
 	@if [ "$(KCFG_ARCH)" = rv64 ]; then python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --rootfs $(ROOTFS) --exec-fixtures $(BUILD_DIR)/exec-fixtures --scenario oom; fi
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --rootfs $(ROOTFS) --exec-fixtures $(BUILD_DIR)/exec-fixtures --scenario no-block
 	@python3 tests/qemu/init_runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --rootfs $(ROOTFS) --exec-fixtures $(BUILD_DIR)/exec-fixtures --scenario bad-fat

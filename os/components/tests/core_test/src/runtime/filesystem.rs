@@ -30,9 +30,7 @@ use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::filesystem::client::FileSystemBinding;
 use kcomp_sdk::filesystem::{FILESYSTEM_NAME, FILESYSTEM_OPEN_READ, FileSystem};
 use kcomp_sdk::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
-use kcomp_sdk::generated::filesystem::{
-    KCOMP_FILESYSTEM_METHOD_MOUNT, KCOMP_FILESYSTEM_READ_HEADER_LEN,
-};
+use kcomp_sdk::generated::filesystem::KCOMP_FILESYSTEM_METHOD_MOUNT;
 use kcomp_sdk::klog;
 
 use super::report::Checks;
@@ -73,6 +71,9 @@ const SECTOR: usize = 512;
 /// 本场景组的结果（task 写、create 报告；未跑到 = false）。
 #[repr(C)]
 pub struct State {
+    pub physical_blocks: [u64; 2],
+    pub physical_count: usize,
+    pub physical_chain: bool,
     /// block chain 全链成功（含精确内容）。
     pub block_chain: bool,
     /// block chain 的业务绑定机制是 Direct（block + filesystem）。
@@ -100,7 +101,7 @@ const fn empty_args() -> KcompCreateArgs {
 fn create(image: &[u8]) -> Option<u32> {
     let mut instance = 0u32;
     (unsafe {
-        abi::kcore_component_create(image.as_ptr(), image.len(), &empty_args(), &mut instance)
+        abi::kcore_component_create(image.as_ptr(), image.len(), 0, &empty_args(), &mut instance)
     } == 0)
         .then_some(instance)
 }
@@ -123,14 +124,14 @@ fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<
         config_len: core::mem::size_of::<EndpointCreateConfig>(),
     };
     let mut instance = 0u32;
-    (unsafe { abi::kcore_component_create(image.as_ptr(), image.len(), &args, &mut instance) } == 0)
+    (unsafe { abi::kcore_component_create(image.as_ptr(), image.len(), 0, &args, &mut instance) }
+        == 0)
         .then_some(instance)
 }
 
-/// 经 filesystem 绑定读一个文件并逐字节比对期望内容。`read` 的缓冲前 8 字节是
-/// LE 长度头，数据从 offset 8 开始（SDK client 的契约布局）。
+/// 经 filesystem 绑定精确读回内容，同时检查关闭后的旧句柄不会复活。
 fn read_exact(binding: &FileSystemBinding, path: &CStr, expected: &[u8]) -> bool {
-    let mut frame = [0u8; KCOMP_FILESYSTEM_READ_HEADER_LEN + 64];
+    let mut frame = [0u8; 64];
     if expected.len() > 64 {
         return false;
     }
@@ -140,15 +141,26 @@ fn read_exact(binding: &FileSystemBinding, path: &CStr, expected: &[u8]) -> bool
     let read = binding.read(handle, &mut frame);
     let closed = binding.close(handle).is_ok();
     let content_ok = match read {
-        Ok(actual) => {
-            actual == expected.len()
-                && frame
-                    [KCOMP_FILESYSTEM_READ_HEADER_LEN..KCOMP_FILESYSTEM_READ_HEADER_LEN + actual]
-                    == *expected
-        }
+        Ok(actual) => actual == expected.len() && frame[..actual] == *expected,
         Err(_) => false,
     };
-    content_ok && closed
+    let Ok(fresh) = binding.open(path, FILESYSTEM_OPEN_READ) else {
+        return false;
+    };
+    let stale = fresh != handle
+        && binding.read(handle, &mut [])
+            == Err(kcomp_sdk::endpoint::InvokeError::Method(
+                kcomp_sdk::Errno::EBADF,
+            ))
+        && binding.close(handle)
+            == Err(kcomp_sdk::endpoint::InvokeError::Method(
+                kcomp_sdk::Errno::EBADF,
+            ));
+    let small = binding.read(fresh, &mut frame[..1]);
+    let first_byte = expected.is_empty() && small == Ok(0)
+        || !expected.is_empty() && small == Ok(1) && frame[0] == expected[0];
+    let fresh_closed = binding.close(fresh).is_ok();
+    content_ok && closed && stale && first_byte && fresh_closed
 }
 
 /// block 级多实例直证：两个同源 `ram_blk_rw` 实例对同一扇区的读写互不可见。
@@ -428,6 +440,76 @@ extern "C" fn task(arg: *mut ()) {
     // task_exit 永不返回本任务；防御性驻留（不可达）。
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Physical disk fixture: QEMU discovers FAT disk A before raw disk B.
+/// Selection is explicit composition data; providers do not search globally.
+extern "C" fn physical_task(arg: *mut ()) {
+    // SAFETY: CoreTest owns this state and waits for this finite task to exit.
+    let state = unsafe { &mut *arg.cast::<State>() };
+    state.physical_chain = (|| {
+        if state.physical_count == 0 {
+            return true;
+        }
+        if state.physical_count != 2 {
+            return false;
+        }
+        let Some(fat) =
+            create_with_endpoint(FATFS, FATFS_CREATE_CONFIG_ABI, state.physical_blocks[0])
+        else {
+            return false;
+        };
+        let Some(little) = create_with_endpoint(
+            LITTLEFS,
+            LITTLEFS_CREATE_CONFIG_ABI,
+            state.physical_blocks[1],
+        ) else {
+            return false;
+        };
+        let (Ok(fat), Ok(little)) = (
+            Endpoint::<FileSystem>::lookup(fat, FILESYSTEM_NAME)
+                .and_then(|ep| ep.bind().map_err(|_| kcomp_sdk::Errno::EIO)),
+            Endpoint::<FileSystem>::lookup(little, FILESYSTEM_NAME)
+                .and_then(|ep| ep.bind().map_err(|_| kcomp_sdk::Errno::EIO)),
+        ) else {
+            return false;
+        };
+        let fat_content = b"HELLO FROM KALEIDOS FAT ROOTFS\n";
+        let ok = fat.mount().is_ok()
+            && little.mount().is_ok()
+            && read_exact(&fat, HELLO_PATH, fat_content)
+            && read_exact(&little, SELFTEST_PATH, SELFTEST_CONTENT)
+            && fat.open(SELFTEST_PATH, FILESYSTEM_OPEN_READ).is_err()
+            && little.open(c"HELLO.TXT", FILESYSTEM_OPEN_READ).is_err()
+            && read_exact(&fat, HELLO_PATH, fat_content)
+            && read_exact(&little, SELFTEST_PATH, SELFTEST_CONTENT);
+        let cleanup = fat.unmount().is_ok() && little.unmount().is_ok();
+        ok && cleanup
+    })();
+    let _ = unsafe { abi::kcore_task_exit() };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+pub fn spawn_physical(cursor: u64, state: *mut State) {
+    let mut instances = [0; 12];
+    let len = trace::declared_components(cursor, &mut instances);
+    // SAFETY: called from CoreTest anchor after prober exit, before this task starts.
+    let result = unsafe { &mut *state };
+    result.physical_count = 0;
+    for instance in &instances[..len] {
+        if let Ok(endpoint) = Endpoint::<BlockDevice>::lookup(*instance, BLOCK_DEVICE_NAME) {
+            if result.physical_count < 2 {
+                result.physical_blocks[result.physical_count] = endpoint.id();
+            }
+            result.physical_count += 1;
+        }
+    }
+    let mut task = 0;
+    if unsafe { abi::kcore_task_create(physical_task, state.cast(), &mut task) } == 0 {
+        let _ = unsafe { abi::kcore_task_start(task) };
     }
 }
 

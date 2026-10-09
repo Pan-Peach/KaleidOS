@@ -37,17 +37,23 @@ monitor 不抢读它的下一条命令。未安装调度策略时 monitor 仍可
 | `devices` | 纯发现得到的 DeviceId；不认领设备，不为显示名称扩充 ABI |
 | `load <artifact> [native\|isolated]` | 默认 native；可省略 `.kcomp`；Core 验证请求，失败打印 errno；不隐式回退域 |
 | `inspect <loaded-artifact>` | 复用组件查询，显示该 artifact 的所有已加载实例、KCOMP 格式、域与状态 |
-| `cat <provider-relative-path>` | 查找唯一 Live、exact ABI 匹配的 filesystem endpoint，bind / mount / open / read / close |
-| `exec <provider-relative-path> [args...]` | 经唯一 FS 读静态 ELF，创建 POSIX 镜像快照进程族，等待退出并显示 exit / signal |
+| `cat <provider-relative-path>` | 使用 init 指定的 filesystem endpoint；无配置时查找唯一 Live、exact ABI 匹配端口，bind / mount / open / read / close |
+| `exec <provider-relative-path> [args...]` | 经选定 FS 读静态 ELF，创建 POSIX 镜像快照进程族，等待退出并显示 exit / signal |
 | `ls` / `cd` / `pwd` | 明确报告 unsupported：现有 FS 没有目录枚举或工作目录 / namespace 契约 |
 
 `inspect` 当前不读取未加载 artifact 或任意路径的字节，也不解析 ELF / PE / WASM。
 这需要外置的只读文件 / artifact inspection helper；Core 不新增格式识别 API。
 
-`cat` 不替用户选择多个 provider，也不自动组合 driver / filesystem。多个 Live FS 返回
-歧义错误，无匹配端口返回缺失错误。路径解释交给 provider；FAT 示例为 `0:/HELLO.TXT`，
-littlefs 使用其自身路径。mount 幂等；退出 shell 不 unmount 共享 provider。传输与方法错误
-分别保留，打开的文件在正常完成或 read 错误后都 close。
+init 经 config ABI `0x4B53_4846_5343_4647` + 8 字节 native-endian u64 交付 FS
+EndpointId；0 表示无预设（空 config 也表示无预设），非零 ID 在 create 时校验 exact
+contract/ABI/liveness。config 无对齐要求，两个 32 位原子仅在 create 写入、任务启动后
+只读，保持完整 ID 并支持 RV32。`cat` / `exec` 复用同一选择，不再每次全局重选。
+
+monitor 无配置加载 shell 时仍只接受唯一 provider，多个 Live FS 明确报歧义。
+路径解释交给 provider；FAT 示例为 `0:/HELLO.TXT`，littlefs 使用其自身路径。
+mount 幂等；退出 shell 不 unmount 共享 provider。传输与方法错误分别保留，打开的
+文件在正常完成或 read 错误后都 close。SDK read 接受普通数据缓冲区，不向 shell
+暴露 Gate 的长度头；Direct 直接写入，Gate 单次最多 512 字节数据、校验后复制。
 
 输入最多 128 字节、17 个词（含命令）。无引号 / 展开 / 管道 / 脚本语法；支持退格、CRLF、
 Ctrl-C 取消。超长行整行丢弃到换行，下一行恢复，绝不执行截断后的命令。
@@ -65,7 +71,7 @@ Ctrl-C 取消。超长行整行丢弃到换行，下一行恢复，绝不执行�
 查询每次返回一行的快照，名称缓冲不足返回 ENOBUFS，不截断；不承诺整张表原子快照。
 既有 `kcore_device_nth` 接受空 compatible 字节串以枚举全部设备；既有
 `kcore_component_load` 增加 domain 请求参数，沿用 id / -errno 返回编码。后者改变 import
-签名，所以 `KCOMP_ABI` 原地协调替换为 `0xB136_5C28_A47D_E092`；旧组件明确不兼容。
+签名；后续 create 同步增加 domain，`KCOMP_ABI` 原地协调替换为 `0x71A9_CE34_8D62_F0B5`；旧组件明确不兼容。
 SDK / C provider / test fixture 的指纹与既有 load 调用同步更新，生成的声明与导出表由
 `make abi-gen` 更新、`make abi-check` 检查。
 
@@ -97,7 +103,7 @@ QEMU smoke 验证真实串口、组件查询、native / isolated load、失败�
 
 ## 应用执行范围
 
-`exec 0:/APP.ELF [args...]` 已能从真实 FAT 文件运行静态 RV64 ELF。当前需要唯一
+`exec 0:/APP.ELF [args...]` 已能从真实 FAT 文件运行静态 RV64 ELF。当前使用配置选定或无配置下唯一的
 filesystem provider，读取上限 1MiB；stdin 为 EOF、stdout/stderr 为 SDK console。
 进程故障或非法 ELF 不结束 shell。POSIX profile 的镜像 key 固定为 `/main`，通用
 execve 路径、cwd、动态链接、文件 fd、重定向 / pipe 和 Win32 未实现；不支持 `./hello`

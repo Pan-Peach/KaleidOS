@@ -4,7 +4,7 @@
 #include "kcomp.h"
 #include "ff.h"
 
-/* 同时在线的 open 文件上限（handle = slot + 1，0 永久保留为无效值）。 */
+/* 同时在线的 open 文件上限（handle 单调增长、不复用，0 永久保留为无效值）。 */
 #define FATFS_MAX_OPEN_FILES 8
 
 /* provider 定义的端口 token（**Gate** 路径经 kcomp_service_dispatch 用它选中本
@@ -17,7 +17,7 @@
 #define FATFS_LOG_LINE(text) kcore_log_line((const uint8_t *)(text), sizeof(text) - 1)
 
 struct fatfs_file_slot {
-    int used;
+    uint64_t handle;
     FIL file;
 };
 
@@ -27,11 +27,24 @@ struct fatfs_state {
     /* Core 在 create 里选定的块调用绑定（机制藏在绑定内部）。 */
     struct kcomp_block_binding block_binding;
 
+    uint32_t busy;
+    uint64_t last_handle;
     int mounted;
     int alive;
 
     struct fatfs_file_slot files[FATFS_MAX_OPEN_FILES];
 };
+
+/* 不等待：同 CPU 的重入不能自旋；竞争返回 EBUSY，调用方决定重试。 */
+static inline int fatfs_enter(struct fatfs_state *state)
+{
+    return state != NULL && !__atomic_exchange_n(&state->busy, 1, __ATOMIC_ACQUIRE);
+}
+
+static inline void fatfs_leave(struct fatfs_state *state)
+{
+    __atomic_store_n(&state->busy, 0, __ATOMIC_RELEASE);
+}
 
 /* 业务后端：Direct 的 `#[repr(C)]` function table 与 Gate 的扁平 method switch
  * （fatfs_service.c）调用**同一份**实现；业务代码不感知部署。 */
