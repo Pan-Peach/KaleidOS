@@ -468,10 +468,11 @@ int32_t fatfs_node_info(void *ctx, uint64_t id, uint32_t *out_kind)
     return result;
 }
 
-int32_t fatfs_node_details(void *ctx, uint64_t id, uint8_t out[28])
+int32_t kcomp_filesystem_wire_handle_node_details(void *ctx, uint64_t id,
+    uint8_t *out, size_t output_len, struct kcomp_filesystem_wire_node_details_reply *reply)
 {
     struct fatfs_state *state = ctx;
-    if (!state || !out) return -EINVAL;
+    if (!state || !out || output_len != 12 || !reply) return -EINVAL;
     if (!fatfs_enter(state)) return -EBUSY;
     struct fatfs_node *node = fatfs_find_node(state, id);
     int32_t result = (!state->alive || !state->mounted) ? -ENODEV : (node ? 0 : -EBADF);
@@ -481,11 +482,11 @@ int32_t fatfs_node_details(void *ctx, uint64_t id, uint8_t out[28])
         size_t len = node->parent ? strlen(name) : 0;
         if (len > 12) result = -EIO;
         else {
-            memset(out, 0, 28);
-            for (size_t i = 0; i < 4; ++i) out[i] = KCOMP_FILESYSTEM_U32_BYTE(node->kind, i);
-            out[4] = (uint8_t)len;
-            for (size_t i = 0; i < 8; ++i) out[8 + i] = KCOMP_FILESYSTEM_U64_BYTE(node->size, i);
-            memcpy(out + 16, name, len);
+            reply->kind = node->kind;
+            reply->name_length = (uint32_t)len;
+            reply->size = node->size;
+            memset(out, 0, output_len);
+            memcpy(out, name, len);
         }
     }
     fatfs_leave(state);

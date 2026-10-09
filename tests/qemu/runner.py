@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", required=True, choices=sorted(BOOT_MARKERS))
     parser.add_argument("--scenario", choices=("default", "no-block"), default="default")
+    parser.add_argument("--no-mmu", action="store_true", help="expect private execution domains to be unavailable")
     add_arguments(parser)
     args = parser.parse_args()
     if not args.kernel.is_file():
@@ -48,7 +49,7 @@ def main():
             report = expect(["load core_test: OK", "[core-test] all: PASS"], 60)
             cases = core_test_report(report)
             print(f"[coretest-{args.arch}/{args.scenario}] {len(cases)} checks PASS")
-            ksh.run(proc, session.collect, session.send, RunFailure, FATAL_MARKERS)
+            ksh.run(proc, session.collect, session.send, RunFailure, FATAL_MARKERS, isolated=not args.no_mmu)
             session.send(proc, "shutdown\n")
             session.shutdown()
     except (RunFailure, OSError, subprocess.CalledProcessError) as error:

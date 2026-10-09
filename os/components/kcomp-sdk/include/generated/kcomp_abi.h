@@ -649,21 +649,6 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
  * endpoint 契约"，后者标识"function table / 扁平编码的逐位布局"。 */
 #define KCOMP_FILESYSTEM_CONTRACT UINT64_C(0x564653434F4E5452)
 
-/* `mount` 的方法号：args 空 / input 空 / output 空。 */
-#define KCOMP_FILESYSTEM_METHOD_MOUNT UINT32_C(0)
-
-/* `unmount` 的方法号：args 空 / input 空 / output 空。 */
-#define KCOMP_FILESYSTEM_METHOD_UNMOUNT UINT32_C(1)
-
-/* `open` 的方法号：args = 4 字节 LE `u32` flags / input = NUL 结尾路径（含结尾 NUL）/ output = 8 字节 LE `u64` handle。 */
-#define KCOMP_FILESYSTEM_METHOD_OPEN UINT32_C(2)
-
-/* `close` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output 空。 */
-#define KCOMP_FILESYSTEM_METHOD_CLOSE UINT32_C(3)
-
-/* `read` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output ≥ 8 字节（8 字节 LE 实际长度头 + 数据）。 */
-#define KCOMP_FILESYSTEM_METHOD_READ UINT32_C(4)
-
 /* `read` / `close` 的 `args` 区与 `open` 的 `output` 区长度：一个 LE `u64` handle（没有其它编码）。 */
 #define KCOMP_FILESYSTEM_HANDLE_LEN 8
 
@@ -680,12 +665,6 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 
 #define KCOMP_FILESYSTEM_NODE_DIRECTORY UINT32_C(2)
 
-#define KCOMP_FILESYSTEM_METHOD_ROOT UINT32_C(5)
-
-#define KCOMP_FILESYSTEM_METHOD_LOOKUP UINT32_C(6)
-
-#define KCOMP_FILESYSTEM_METHOD_NODE_INFO UINT32_C(7)
-
 #define KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN 12
 
 #define KCOMP_FILESYSTEM_NAME_MAX 255
@@ -693,19 +672,31 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 /* 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。 */
 #define KCOMP_FILESYSTEM_ENCODING_BYTES UINT32_C(1)
 
-/* IPC: args node u64; reply kind u32, canonical name length u32, size u64, canonical ASCII name[12] (28 bytes). */
-#define KCOMP_FILESYSTEM_METHOD_NODE_DETAILS UINT32_C(8)
-
-/* IPC: args node u64; reply open handle u64. Owner is verified consumer Task. */
-#define KCOMP_FILESYSTEM_METHOD_OPEN_NODE UINT32_C(9)
-
-/* IPC: args handle u64 + offset u64; reply actual u64 + bytes. No exposed cursor change. */
-#define KCOMP_FILESYSTEM_METHOD_READ_AT UINT32_C(10)
-
 /* LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC. */
 #define KCOMP_FATFS_CREATE_CONFIG_ABI UINT64_C(0x45D2189ACF0673BE)
 
-/* IPC control consumer only: args/input/output empty; close files, unmount, invalidate endpoint and exit server. */
+#define KCOMP_FILESYSTEM_METHOD_MOUNT UINT32_C(0)
+
+#define KCOMP_FILESYSTEM_METHOD_UNMOUNT UINT32_C(1)
+
+#define KCOMP_FILESYSTEM_METHOD_OPEN UINT32_C(2)
+
+#define KCOMP_FILESYSTEM_METHOD_CLOSE UINT32_C(3)
+
+#define KCOMP_FILESYSTEM_METHOD_READ UINT32_C(4)
+
+#define KCOMP_FILESYSTEM_METHOD_ROOT UINT32_C(5)
+
+#define KCOMP_FILESYSTEM_METHOD_LOOKUP UINT32_C(6)
+
+#define KCOMP_FILESYSTEM_METHOD_NODE_INFO UINT32_C(7)
+
+#define KCOMP_FILESYSTEM_METHOD_NODE_DETAILS UINT32_C(8)
+
+#define KCOMP_FILESYSTEM_METHOD_OPEN_NODE UINT32_C(9)
+
+#define KCOMP_FILESYSTEM_METHOD_READ_AT UINT32_C(10)
+
 #define KCOMP_FILESYSTEM_METHOD_SHUTDOWN UINT32_C(11)
 
 /* 每次正常回复均有效；domain 0 = 无额外分类，非零值见 STATUS 常量；reserved 必须为 0。成功时 domain 必须为 0。 */

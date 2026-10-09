@@ -1,4 +1,4 @@
-/* One owned Server Task. Legacy dispatch is shared only during staged migration. */
+/* One owned Server Task. Generated business dispatch; owner/rollback stay here. */
 #include "fatfs_internal.h"
 #include "kcomp_ipc.h"
 #include <errno.h>
@@ -50,9 +50,9 @@ void fatfs_server(void *arg) {
         uint64_t created = 0;
         int shutdown = 0;
         if (!rc) {
-            if (message.method == KCOMP_FILESYSTEM_METHOD_SHUTDOWN) {
+            rc = kcomp_filesystem_wire_validate(&message);
+            if (!rc && message.method == KCOMP_FILESYSTEM_METHOD_SHUTDOWN) {
                 if (consumer != state->control) rc = -EACCES;
-                else if (message.args_len || message.input_len || message.output_len) rc = -EINVAL;
                 else {
                     for (size_t i = 0; i < FATFS_MAX_OPEN_FILES; ++i)
                         if (state->files[i].handle) fatfs_close(state, state->files[i].handle);
@@ -61,21 +61,16 @@ void fatfs_server(void *arg) {
                 }
             }
             /* The proxy opens Nodes; IPC never accepts a VFS absolute path. */
-            else if (message.method == KCOMP_FILESYSTEM_METHOD_OPEN) rc = -ENOTSUP;
-            else if (message.method == KCOMP_FILESYSTEM_METHOD_CLOSE ||
+            else if (!rc && message.method == KCOMP_FILESYSTEM_METHOD_OPEN) rc = -ENOTSUP;
+            else if (!rc && (message.method == KCOMP_FILESYSTEM_METHOD_CLOSE ||
                      message.method == KCOMP_FILESYSTEM_METHOD_READ ||
-                     message.method == KCOMP_FILESYSTEM_METHOD_READ_AT) {
-                if (message.args_len < 8) rc = -EINVAL;
-                else {
-                    struct fatfs_file_slot *file = find_file(state, kcomp_ipc_u64(message.args));
-                    if (!file) rc = -EBADF;
-                    else if (file->consumer != consumer || file->consumer_task != task) rc = -EACCES;
-                }
+                     message.method == KCOMP_FILESYSTEM_METHOD_READ_AT)) {
+                struct fatfs_file_slot *file = find_file(state, kcomp_ipc_u64(message.args));
+                if (!file) rc = -EBADF;
+                else if (file->consumer != consumer || file->consumer_task != task) rc = -EACCES;
             }
             if (!rc && !shutdown) {
-                struct kcomp_call_frame frame = {message.args, message.args_len,
-                    message.input, message.input_len, reply + KCOMP_REPLY_HEADER_LEN, output_len};
-                rc = fatfs_dispatch(state, message.method, &frame);
+                rc = kcomp_filesystem_wire_dispatch(state, &message, reply + KCOMP_REPLY_HEADER_LEN, output_len);
                 if (!rc && message.method == KCOMP_FILESYSTEM_METHOD_OPEN_NODE) {
                     created = kcomp_ipc_u64(reply + KCOMP_REPLY_HEADER_LEN);
                     struct fatfs_file_slot *file = find_file(state, created);

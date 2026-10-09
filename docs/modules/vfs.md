@@ -24,7 +24,7 @@ Local 文件 `/local/README.TXT` 总可用，远程卷依次挂在 `/fat` 与 `/
 | `src/name.rs` | 名字表示、单段 Bytes 校验；当前后端只支持 Bytes |
 | `src/namespace.rs` | 强父/弱子 Dentry 缓存、Path=(Mount,Dentry)、挂载保活、root/beneath/no-cross |
 | `src/file.rs` | OpenFile 持 Path/backend；独立游标、read_at、一次 close |
-| `src/remote.rs` | 固定连接与借用 NodeId；owned OpenLease；预留槽的非阻塞 drop/close drain |
+| `src/remote.rs` | generated filesystem client；固定连接与借用 NodeId；owned OpenLease；预留槽的非阻塞 drop/close drain |
 | `src/service.rs` | 32 个 Path 与 32 个 Open 槽，verified Component/Task 归属；wire 解码、引用与回滚 |
 | `src/runtime.rs` | 生命周期、混合挂载、owned Server Task、请求驱动 reaper、控制 shutdown |
 | `src/tests.rs` | 六项生产 host 测试，对象语义及服务错误/回滚；不冒充 IPC 隔离 |

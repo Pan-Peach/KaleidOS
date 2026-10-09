@@ -14,15 +14,23 @@ impl echo_wire::Provider for Echo {
     }
 }
 static CONSUMER: AtomicU32 = AtomicU32::new(0);
+static STARTED: AtomicU32 = AtomicU32::new(0);
 extern "C" fn server(_arg: *mut ()) {
+    STARTED.store(1, Ordering::Release);
     let owner = management::current_component().unwrap();
     let mut endpoint = 0;
-    assert_eq!(
-        unsafe {
+    // start_on publishes work immediately; the remote Task can enter while
+    // create still owns staged endpoints. Yield until their atomic commit.
+    loop {
+        let status = unsafe {
             abi::kcore_endpoint_lookup(owner, NAME.as_ptr(), NAME.len(), CONTRACT, &mut endpoint)
-        },
-        0
-    );
+        };
+        if status == 0 {
+            break;
+        }
+        assert_eq!(status, Errno::ENOENT.code());
+        management::yield_task().unwrap();
+    }
     ipc::listen(endpoint).unwrap();
     ipc::grant(endpoint, CONSUMER.load(Ordering::Relaxed)).unwrap();
     // Owner can propose a self-call; Core rejects the wait cycle, not grants.
@@ -107,6 +115,21 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     if status != 0 {
         return status;
     }
-    unsafe { abi::kcore_task_start_on(task, cpu) }
+    let status = unsafe { abi::kcore_task_start_on(task, cpu) };
+    if status != 0 {
+        return status;
+    }
+    // Force the real SMP startup ordering in this fixture, instead of hoping
+    // QEMU happens to schedule the remote Task before create returns.
+    if unsafe { abi::kcore_cpu_current() } != cpu {
+        let deadline = unsafe { abi::kcore_now() + abi::kcore_timebase_hz() * 10 };
+        while STARTED.load(Ordering::Acquire) == 0 {
+            if unsafe { abi::kcore_now() } >= deadline {
+                return Errno::EIO.code();
+            }
+            core::hint::spin_loop();
+        }
+    }
+    0
 });
 kcomp_sdk::kcomp_instance_destroy!(|_state| { 0 });

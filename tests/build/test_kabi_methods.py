@@ -73,6 +73,13 @@ class KabiMethods(unittest.TestCase):
                  ("block", "write", 512, 2, struct.pack("<Q", 7), bytes([0x81])*512, b""),
                  ("numbers", "", 30, 9, integers, b"", integers),
                  ("flush", "", 0, 3, b"", b"", b"")]
+        cases += [("filesystem", "root", 8, 5, b"", b"", struct.pack("<Q",42)),
+                  ("filesystem", "lookup", 8, 6, struct.pack("<QI",42,1), b"HELLO.TXT", struct.pack("<Q",42)),
+                  ("filesystem", "details", 12, 8, struct.pack("<Q",42), b"", struct.pack("<IIQ",1,9,23)+b"HELLO.TXT"+bytes(3)),
+                  ("filesystem", "open", 8, 9, struct.pack("<Q",42), b"", struct.pack("<Q",42)),
+                  ("filesystem", "read_at", 7, 10, struct.pack("<QQ",42,7), b"", struct.pack("<Q",3)+b"abc"+bytes(4)),
+                  ("filesystem", "read_at", 0, 10, struct.pack("<QQ",42,7), b"", bytes(8)),
+                  ("filesystem", "close", 0, 3, struct.pack("<Q",42), b"", b"")]
         for contract, arg, capacity, method, args, input_, output in cases:
             with self.subTest(contract=contract, arg=arg):
                 request = struct.pack("<IIII", method, len(output), len(args), len(input_))+args+input_
@@ -93,6 +100,10 @@ class KabiMethods(unittest.TestCase):
                   ("echo", frame(247, 1009, input_=bytes(1009)), 1009, -22),
                   ("echo", frame(247, 1, input_=b"x")+b"x", 1, -22),
                   ("flush", frame(10, 0), 0, -38)]
+        frames += [("filesystem", frame(8, 27, bytes(8)), 27, -22),
+                   ("filesystem", frame(10, 7, bytes(16)), 7, -22),
+                   ("filesystem", frame(10, 521, bytes(16)), 521, -22),
+                   ("filesystem", frame(6, 8, bytes(12)), 8, -22)]
         for contract, request, capacity, status in frames:
             with self.subTest(contract=contract, request=request[:16]):
                 expected = f'status={status} calls=0 output={bytes(capacity).hex()}'

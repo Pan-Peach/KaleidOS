@@ -219,30 +219,60 @@ int32_t fatfs_dispatch(struct fatfs_state *state, uint32_t method,
     case KCOMP_FILESYSTEM_METHOD_NODE_INFO:
         return dispatch_node_info(state, frame);
 
-    case KCOMP_FILESYSTEM_METHOD_NODE_DETAILS:
-        return frame->args_len == 8 && frame->input_len == 0 && frame->output_len == 28 ?
-            fatfs_node_details(state, read_le64(frame->args), frame->output) : -EINVAL;
+    default: {
+        struct kcomp_ipc_request request = {method, frame->args, frame->args_len,
+            frame->input, frame->input_len, frame->output_len};
+        return kcomp_filesystem_wire_dispatch(state, &request, frame->output, frame->output_len);
+    }
+    }
+}
 
-    case KCOMP_FILESYSTEM_METHOD_OPEN_NODE: {
-        if (frame->args_len != 8 || frame->input_len || frame->output_len != 8) return -EINVAL;
-        uint64_t handle = 0;
-        int32_t result = fatfs_open_node(state, read_le64(frame->args), &handle);
-        if (!result) write_le64(frame->output, handle);
-        return result;
-    }
-    case KCOMP_FILESYSTEM_METHOD_READ_AT: {
-        if (frame->args_len != 16 || frame->input_len || frame->output_len < 8) return -EINVAL;
-        size_t actual = 0;
-        int32_t result = fatfs_read_at(state, read_le64(frame->args), read_le64(frame->args + 8),
-            frame->output + 8, frame->output_len - 8, &actual);
-        if (!result) write_le64(frame->output, (uint64_t)actual);
-        return result;
-    }
-
-    default:
-        /* 能力缺失（不是畸形帧）：与 Core 对"没有 dispatcher"的档位一致。 */
-        return -ENOSYS;
-    }
+/* Transitional adapters preserve the existing backend and legacy table ABI.
+ * The generated dispatcher alone owns the IPC shapes and LE conversion. */
+int32_t kcomp_filesystem_wire_handle_mount(void *ctx) { return fatfs_mount(ctx); }
+int32_t kcomp_filesystem_wire_handle_unmount(void *ctx) { return fatfs_unmount(ctx); }
+int32_t kcomp_filesystem_wire_handle_close(void *ctx, uint64_t handle) { return fatfs_close(ctx, handle); }
+int32_t kcomp_filesystem_wire_handle_root(void *ctx, struct kcomp_filesystem_wire_root_reply *reply) {
+    return fatfs_root(ctx, &reply->node);
+}
+int32_t kcomp_filesystem_wire_handle_lookup(void *ctx, uint64_t parent, uint32_t encoding,
+    const uint8_t *name, size_t name_len, struct kcomp_filesystem_wire_lookup_reply *reply) {
+    return fatfs_lookup(ctx, parent, name, name_len, encoding, &reply->node);
+}
+int32_t kcomp_filesystem_wire_handle_node_info(void *ctx, uint64_t node, struct kcomp_filesystem_wire_node_info_reply *reply) {
+    return fatfs_node_info(ctx, node, &reply->kind);
+}
+int32_t kcomp_filesystem_wire_handle_open_node(void *ctx, uint64_t node, struct kcomp_filesystem_wire_open_node_reply *reply) {
+    return fatfs_open_node(ctx, node, &reply->handle);
+}
+int32_t kcomp_filesystem_wire_handle_open(void *ctx, uint32_t flags, const uint8_t *input, size_t input_len,
+    struct kcomp_filesystem_wire_open_reply *reply) {
+    if (!input_len || input_len > KCOMP_FILESYSTEM_PATH_MAX || input[input_len - 1]) return -EINVAL;
+    for (size_t i = 0; i + 1 < input_len; ++i) if (!input[i]) return -EINVAL;
+    char path[KCOMP_FILESYSTEM_PATH_MAX];
+    memcpy(path, input, input_len);
+    return fatfs_open(ctx, path, flags, &reply->handle);
+}
+int32_t kcomp_filesystem_wire_handle_read(void *ctx, uint64_t handle, uint8_t *output, size_t len,
+    struct kcomp_filesystem_wire_read_reply *reply) {
+    size_t actual = 0;
+    int32_t rc = fatfs_read(ctx, handle, output, len, &actual);
+    if (!rc && actual > len) return -EIO;
+    reply->actual = actual;
+    return rc;
+}
+int32_t kcomp_filesystem_wire_handle_read_at(void *ctx, uint64_t handle, uint64_t offset,
+    uint8_t *output, size_t len, struct kcomp_filesystem_wire_read_at_reply *reply) {
+    size_t actual = 0;
+    int32_t rc = fatfs_read_at(ctx, handle, offset, output, len, &actual);
+    if (!rc && actual > len) return -EIO;
+    reply->actual = actual;
+    return rc;
+}
+int32_t kcomp_filesystem_wire_handle_shutdown(void *ctx) {
+    (void)ctx;
+    /* Only the Server's verified control-consumer branch may shut down. */
+    return -EACCES;
 }
 
 int32_t kcomp_service_dispatch(void *state, uint32_t port, uint32_t method,

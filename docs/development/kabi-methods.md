@@ -1,6 +1,6 @@
 # KABI Request/Reply 方法生成
 
-`abi/block.toml` 与 `abi/echo.toml` 的 `[[method]]` 是当前 IPC 方法结构的权威。
+`abi/block.toml`、`abi/echo.toml`、`abi/filesystem.toml` 的 `[[method]]` 是当前 IPC 方法结构的权威。
 既有 `tools/kabi/kabi_gen.py` 生成 C/Rust 方法编号、typed client、Provider 接口、
 LE 编解码、长度 validator 和 dispatcher。生成物是提交物，普通构建不运行生成器。
 Core 不读取业务 schema；使用现有 Endpoint、Exchange 和 SDK envelope。
@@ -42,7 +42,11 @@ Echo、真实 Block 形状、畸形帧拒绝及错误层次；C 启用 UBSan。
 synthetic flush 仅添加 schema 和业务 handler/test，无生产 Block flush，也不改 emitter。
 这是 host codec 证据；跨 CPU/地址空间事实由真实系统测试分别证明。
 
-当前停点：Echo/Block IPC 的机械协议胶水已经生成。旧 Block Direct/Gate 仍有真实
-私有域和回归消费者，FS/VFS 尚未生成；命名固定结构尚不支持。新增普通 IPC 方法的
+FatFs Server 的 IPC validator/dispatch 与 RemoteFs 的 client 已生成。FatFs 节点详情
+业务返回 typed 字段，由生成 dispatcher 编码；FIL owner、shutdown 与 canceled-open
+rollback 保持在 Server。旧 C backend 签名仍有本地薄 adapter，legacy table/Gate 未删。
+
+当前停点：Echo/Block/Filesystem IPC 的机械协议胶水已经生成。旧 Block Direct/Gate 仍有真实
+私有域和回归消费者，VFS 自身尚未生成；命名固定结构尚不支持。新增普通 IPC 方法的
 生成物无需手改，但旧通道退出前，整个 Block SDK 仍未达到最终的一套业务机制验收。
 后续实施范围见 [迁移清单](component-communication-migration.md)。

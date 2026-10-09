@@ -97,10 +97,11 @@ static void test_lookup(void)
         assert(file != root && file == alias);
         expect_method(kcomp_filesystem_node_info(&binding, file, &kind), 0);
         assert(kind == KCOMP_FILESYSTEM_NODE_FILE);
-        uint8_t details[28];
-        assert(fatfs_node_details(&state, file, details) == 0);
-        assert(details[0] == KCOMP_FILESYSTEM_NODE_FILE && details[4] == 9);
-        assert(memcmp(details + 16, "HELLO.TXT", 9) == 0);
+        uint8_t name[12];
+        struct kcomp_filesystem_wire_node_details_reply details;
+        assert(kcomp_filesystem_wire_handle_node_details(&state, file, name, sizeof(name), &details) == 0);
+        assert(details.kind == KCOMP_FILESYSTEM_NODE_FILE && details.name_length == 9);
+        assert(memcmp(name, "HELLO.TXT", 9) == 0);
         uint64_t opened = 0;
         assert(fatfs_open_node(&state, root, &opened) == -EISDIR && opened == 0);
         assert(fatfs_open_node(&state, file, &opened) == 0 && opened != 0);

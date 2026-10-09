@@ -2,6 +2,7 @@
 #define KALEIDOS_FATFS_INTERNAL_H
 
 #include "kcomp.h"
+#include "generated/filesystem_wire.h"
 #include "ff.h"
 
 /* 同时在线的 open 文件上限（handle 单调增长、不复用，0 永久保留为无效值）。 */
@@ -77,7 +78,6 @@ int32_t fatfs_root(void *ctx, uint64_t *out_node);
 int32_t fatfs_lookup(void *ctx, uint64_t parent, const uint8_t *name,
                      size_t name_len, uint32_t encoding, uint64_t *out_node);
 int32_t fatfs_node_info(void *ctx, uint64_t node, uint32_t *out_kind);
-int32_t fatfs_node_details(void *ctx, uint64_t node, uint8_t out[28]);
 int32_t fatfs_open_node(void *ctx, uint64_t node, uint64_t *out_handle);
 int32_t fatfs_read_at(void *ctx, uint64_t handle, uint64_t offset,
                        uint8_t *buf, size_t len, size_t *out_read);

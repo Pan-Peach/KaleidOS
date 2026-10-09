@@ -33,8 +33,8 @@ _test-qemu-rv32:
 	@$(MAKE) O=build/tests/qemu-rv32 _test-qemu-one
 
 _test-qemu-one: kernel
-	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --scenario default
-	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) --scenario no-block
+	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) $(if $(filter y,$(CONFIG_VM_NOMMU)),--no-mmu,) --scenario default
+	@python3 tests/qemu/runner.py --arch $(KCFG_ARCH) --kernel $(OUTPUT) $(QEMU_TEST_ARGS) $(if $(filter y,$(CONFIG_VM_NOMMU)),--no-mmu,) --scenario no-block
 
 # 自动 init：实际 FAT 盘、无盘、坏 FAT 盘（挂载失败回 monitor）。
 .PHONY: test-init _test-init-rv64 _test-init-rv32 _test-init-one

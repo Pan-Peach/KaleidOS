@@ -2,6 +2,7 @@
 #include "kcomp.h"
 #include "generated/block_wire.h"
 #include "generated/echo_wire.h"
+#include "generated/filesystem_wire.h"
 #include "methods_wire.h"
 #include <assert.h>
 #include <stdio.h>
@@ -15,6 +16,28 @@ static size_t unhex(const char *text, uint8_t *bytes) {
     size_t n=strlen(text)/2; assert(n<=2048);
     for(size_t i=0;i<n;++i) { unsigned b; assert(sscanf(text+2*i,"%2x",&b)==1); bytes[i]=(uint8_t)b; } return n;
 }
+int32_t kcomp_filesystem_wire_handle_mount(void *ctx) { (void)ctx; ++calls; return 0; }
+int32_t kcomp_filesystem_wire_handle_unmount(void *ctx) { (void)ctx; ++calls; return 0; }
+int32_t kcomp_filesystem_wire_handle_open(void *ctx, uint32_t flags, const uint8_t *input, size_t len,
+    struct kcomp_filesystem_wire_open_reply *reply) { (void)ctx; (void)flags; (void)input; (void)len; ++calls; reply->handle=42; return 0; }
+int32_t kcomp_filesystem_wire_handle_close(void *ctx, uint64_t handle) { (void)ctx; (void)handle; ++calls; return 0; }
+int32_t kcomp_filesystem_wire_handle_read(void *ctx, uint64_t handle, uint8_t *output, size_t len,
+    struct kcomp_filesystem_wire_read_reply *reply) { (void)ctx; (void)handle; (void)output; (void)len; ++calls; reply->actual=0; return 0; }
+int32_t kcomp_filesystem_wire_handle_root(void *ctx, struct kcomp_filesystem_wire_root_reply *reply) { (void)ctx; ++calls; reply->node=42; return 0; }
+int32_t kcomp_filesystem_wire_handle_lookup(void *ctx, uint64_t parent, uint32_t encoding, const uint8_t *input, size_t len,
+    struct kcomp_filesystem_wire_lookup_reply *reply) { (void)ctx; (void)parent; (void)encoding; (void)input; (void)len; ++calls; reply->node=42; return 0; }
+int32_t kcomp_filesystem_wire_handle_node_info(void *ctx, uint64_t node,
+    struct kcomp_filesystem_wire_node_info_reply *reply) { (void)ctx; (void)node; ++calls; reply->kind=1; return 0; }
+int32_t kcomp_filesystem_wire_handle_node_details(void *ctx, uint64_t node, uint8_t *output, size_t len,
+    struct kcomp_filesystem_wire_node_details_reply *reply) { (void)ctx; (void)node; ++calls;
+    memset(output,0,len); memcpy(output,"HELLO.TXT",9); *reply=(struct kcomp_filesystem_wire_node_details_reply){1,9,23}; return 0; }
+int32_t kcomp_filesystem_wire_handle_open_node(void *ctx, uint64_t node,
+    struct kcomp_filesystem_wire_open_node_reply *reply) { (void)ctx; (void)node; ++calls; reply->handle=42; return 0; }
+int32_t kcomp_filesystem_wire_handle_read_at(void *ctx, uint64_t handle, uint64_t offset, uint8_t *output, size_t len,
+    struct kcomp_filesystem_wire_read_at_reply *reply) { (void)ctx; (void)handle; ++calls;
+    if(offset==UINT64_MAX) return -EOVERFLOW;
+    size_t actual=len<3?len:3; memcpy(output,"abc",actual); reply->actual=actual; return 0; }
+int32_t kcomp_filesystem_wire_handle_shutdown(void *ctx) { (void)ctx; ++calls; return 0; }
 int32_t kcomp_block_wire_handle_capacity_sectors(void *ctx, struct kcomp_block_wire_capacity_sectors_reply *reply) {
     (void)ctx; ++calls; reply->sectors=UINT64_C(0x0102030405060708); return 0;
 }
@@ -37,6 +60,7 @@ static int32_t dispatch(const uint8_t *bytes, size_t n, uint8_t *output, size_t 
     struct kcomp_ipc_request r; int32_t status=kcomp_ipc_decode(bytes,n,&r); if(status) return status;
     if(!strcmp(contract,"block")) return kcomp_block_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"echo")) return kcomp_echo_wire_dispatch(NULL,&r,output,len);
+    if(!strcmp(contract,"filesystem")) return kcomp_filesystem_wire_dispatch(NULL,&r,output,len);
     return kcomp_methods_wire_dispatch(NULL,&r,output,len);
 }
 int32_t kcore_ipc_submit(uint64_t endpoint, const uint8_t *bytes, size_t len, uint64_t *id) {
@@ -59,7 +83,16 @@ int main(int argc,char **argv) {
         printf("status=%d calls=%zu output=",status,calls); hex(output,n); puts(""); return 0;
     }
     int32_t status=0,transport;
-    if(!strcmp(contract,"echo")) transport=kcomp_echo_wire_echo(7,input,unhex(argv[3],input),output,n,&status);
+    if(!strcmp(contract,"filesystem")) {
+        if(!strcmp(argv[3],"root")) { struct kcomp_filesystem_wire_root_reply r; transport=kcomp_filesystem_wire_root(7,&r,&status); }
+        else if(!strcmp(argv[3],"lookup")) { struct kcomp_filesystem_wire_lookup_reply r;
+            transport=kcomp_filesystem_wire_lookup(7,42,1,(const uint8_t *)"HELLO.TXT",9,&r,&status); }
+        else if(!strcmp(argv[3],"details")) { struct kcomp_filesystem_wire_node_details_reply r; transport=kcomp_filesystem_wire_node_details(7,42,output,n,&r,&status); }
+        else if(!strcmp(argv[3],"open")) { struct kcomp_filesystem_wire_open_node_reply r; transport=kcomp_filesystem_wire_open_node(7,42,&r,&status); }
+        else if(!strcmp(argv[3],"close")) transport=kcomp_filesystem_wire_close(7,42,&status);
+        else { struct kcomp_filesystem_wire_read_at_reply r; transport=kcomp_filesystem_wire_read_at(7,42,7,output,n,&r,&status); }
+    }
+    else if(!strcmp(contract,"echo")) transport=kcomp_echo_wire_echo(7,input,unhex(argv[3],input),output,n,&status);
     else if(!strcmp(contract,"block")) {
         if(!strcmp(argv[3],"capacity")) {
             struct kcomp_block_wire_capacity_sectors_reply r;

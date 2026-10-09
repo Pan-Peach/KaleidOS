@@ -68,21 +68,6 @@ pub const KCOMP_FILESYSTEM_OPEN_READ: u32 = 0x00000001;
 /// endpoint 契约"，后者标识"function table / 扁平编码的逐位布局"。
 pub const KCOMP_FILESYSTEM_CONTRACT: u64 = 0x5646_5343_4F4E_5452;
 
-/// `mount` 的方法号：args 空 / input 空 / output 空。
-pub const KCOMP_FILESYSTEM_METHOD_MOUNT: u32 = 0;
-
-/// `unmount` 的方法号：args 空 / input 空 / output 空。
-pub const KCOMP_FILESYSTEM_METHOD_UNMOUNT: u32 = 1;
-
-/// `open` 的方法号：args = 4 字节 LE `u32` flags / input = NUL 结尾路径（含结尾 NUL）/ output = 8 字节 LE `u64` handle。
-pub const KCOMP_FILESYSTEM_METHOD_OPEN: u32 = 2;
-
-/// `close` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output 空。
-pub const KCOMP_FILESYSTEM_METHOD_CLOSE: u32 = 3;
-
-/// `read` 的方法号：args = 8 字节 LE `u64` handle / input 空 / output ≥ 8 字节（8 字节 LE 实际长度头 + 数据）。
-pub const KCOMP_FILESYSTEM_METHOD_READ: u32 = 4;
-
 /// `read` / `close` 的 `args` 区与 `open` 的 `output` 区长度：一个 LE `u64` handle（没有其它编码）。
 pub const KCOMP_FILESYSTEM_HANDLE_LEN: usize = 8;
 
@@ -99,12 +84,6 @@ pub const KCOMP_FILESYSTEM_NODE_FILE: u32 = 1;
 
 pub const KCOMP_FILESYSTEM_NODE_DIRECTORY: u32 = 2;
 
-pub const KCOMP_FILESYSTEM_METHOD_ROOT: u32 = 5;
-
-pub const KCOMP_FILESYSTEM_METHOD_LOOKUP: u32 = 6;
-
-pub const KCOMP_FILESYSTEM_METHOD_NODE_INFO: u32 = 7;
-
 pub const KCOMP_FILESYSTEM_LOOKUP_ARGS_LEN: usize = 12;
 
 pub const KCOMP_FILESYSTEM_NAME_MAX: usize = 255;
@@ -112,17 +91,29 @@ pub const KCOMP_FILESYSTEM_NAME_MAX: usize = 255;
 /// 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。
 pub const KCOMP_FILESYSTEM_ENCODING_BYTES: u32 = 1;
 
-/// IPC: args node u64; reply kind u32, canonical name length u32, size u64, canonical ASCII name[12] (28 bytes).
-pub const KCOMP_FILESYSTEM_METHOD_NODE_DETAILS: u32 = 8;
-
-/// IPC: args node u64; reply open handle u64. Owner is verified consumer Task.
-pub const KCOMP_FILESYSTEM_METHOD_OPEN_NODE: u32 = 9;
-
-/// IPC: args handle u64 + offset u64; reply actual u64 + bytes. No exposed cursor change.
-pub const KCOMP_FILESYSTEM_METHOD_READ_AT: u32 = 10;
-
 /// LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC.
 pub const KCOMP_FATFS_CREATE_CONFIG_ABI: u64 = 0x45D2_189A_CF06_73BE;
 
-/// IPC control consumer only: args/input/output empty; close files, unmount, invalidate endpoint and exit server.
+pub const KCOMP_FILESYSTEM_METHOD_MOUNT: u32 = 0;
+
+pub const KCOMP_FILESYSTEM_METHOD_UNMOUNT: u32 = 1;
+
+pub const KCOMP_FILESYSTEM_METHOD_OPEN: u32 = 2;
+
+pub const KCOMP_FILESYSTEM_METHOD_CLOSE: u32 = 3;
+
+pub const KCOMP_FILESYSTEM_METHOD_READ: u32 = 4;
+
+pub const KCOMP_FILESYSTEM_METHOD_ROOT: u32 = 5;
+
+pub const KCOMP_FILESYSTEM_METHOD_LOOKUP: u32 = 6;
+
+pub const KCOMP_FILESYSTEM_METHOD_NODE_INFO: u32 = 7;
+
+pub const KCOMP_FILESYSTEM_METHOD_NODE_DETAILS: u32 = 8;
+
+pub const KCOMP_FILESYSTEM_METHOD_OPEN_NODE: u32 = 9;
+
+pub const KCOMP_FILESYSTEM_METHOD_READ_AT: u32 = 10;
+
 pub const KCOMP_FILESYSTEM_METHOD_SHUTDOWN: u32 = 11;

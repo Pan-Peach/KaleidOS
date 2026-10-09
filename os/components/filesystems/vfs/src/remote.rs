@@ -3,7 +3,11 @@
 use crate::{Error, Result, name::NameRef, provider::*};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use kcomp_sdk::generated::filesystem::*;
-use kcomp_sdk::{endpoint::Endpoint, filesystem::FileSystem as Contract, ipc};
+use kcomp_sdk::{
+    endpoint::{Endpoint, InvokeError},
+    filesystem::FileSystem as Contract,
+    generated::filesystem_wire as wire,
+};
 use spin::Mutex;
 const OPEN_LIMIT: usize = 8;
 #[derive(Clone, Copy)]
@@ -32,14 +36,6 @@ struct RemoteOpen {
     closed: bool,
 }
 impl Connection {
-    fn invoke(&self, method: u32, args: &[u8], input: &[u8], output: &mut [u8]) -> Result<()> {
-        let code = ipc::service::invoke(self.endpoint, method, args, input, output)?;
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(Error::from_code(code))
-        }
-    }
     fn reserve(&self) -> Result<usize> {
         self.drain()?;
         let mut slots = self.release.lock();
@@ -69,12 +65,7 @@ impl Connection {
             let Some((index, handle)) = pending else {
                 return Ok(());
             };
-            let result = self.invoke(
-                KCOMP_FILESYSTEM_METHOD_CLOSE,
-                &handle.to_le_bytes(),
-                &[],
-                &mut [],
-            );
+            let result = wire::close(self.endpoint, handle).map_err(error);
             // Transport backpressure has not submitted a close; keep ownership.
             // Method/endpoint failure consumes or invalidates the provider lease.
             let retry = matches!(result, Err(Error::ENOBUFS | Error::EBUSY | Error::EAGAIN));
@@ -96,10 +87,8 @@ impl RemoteFs {
             endpoint,
             release: Mutex::new([Release::Free; OPEN_LIMIT]),
         });
-        connection.invoke(KCOMP_FILESYSTEM_METHOD_MOUNT, &[], &[], &mut [])?;
-        let mut bytes = [0; 8];
-        connection.invoke(KCOMP_FILESYSTEM_METHOD_ROOT, &[], &[], &mut bytes)?;
-        let id = u64::from_le_bytes(bytes);
+        wire::mount(endpoint).map_err(error)?;
+        let id = wire::root(endpoint).map_err(error)?;
         if id == 0 {
             return Err(Error::EPROTO);
         }
@@ -122,28 +111,24 @@ impl FileSystem for RemoteFs {
 }
 impl RemoteNode {
     fn details(&self) -> Result<(Metadata, Vec<u8>)> {
-        let mut bytes = [0; 28];
-        self.connection.invoke(
-            KCOMP_FILESYSTEM_METHOD_NODE_DETAILS,
-            &self.id.to_le_bytes(),
-            &[],
-            &mut bytes,
-        )?;
-        let kind = match u32::from_le_bytes(bytes[..4].try_into().unwrap()) {
+        let mut name = [0; 12];
+        let details =
+            wire::node_details(self.connection.endpoint, self.id, &mut name).map_err(error)?;
+        let kind = match details.kind {
             KCOMP_FILESYSTEM_NODE_FILE => NodeKind::File,
             KCOMP_FILESYSTEM_NODE_DIRECTORY => NodeKind::Directory,
             _ => return Err(Error::EPROTO),
         };
-        let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let len = details.name_length as usize;
         if len > 12 {
             return Err(Error::EPROTO);
         }
         Ok((
             Metadata {
                 kind,
-                size: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                size: details.size,
             },
-            bytes[16..16 + len].to_vec(),
+            name[..len].to_vec(),
         ))
     }
 }
@@ -165,13 +150,13 @@ impl FsNode for RemoteNode {
             return Err(Error::ENOTSUP);
         };
         crate::name::check_component(name)?;
-        let mut args = [0; 12];
-        args[..8].copy_from_slice(&self.id.to_le_bytes());
-        args[8..].copy_from_slice(&KCOMP_FILESYSTEM_ENCODING_BYTES.to_le_bytes());
-        let mut bytes = [0; 8];
-        self.connection
-            .invoke(KCOMP_FILESYSTEM_METHOD_LOOKUP, &args, name, &mut bytes)?;
-        let id = u64::from_le_bytes(bytes);
+        let id = wire::lookup(
+            self.connection.endpoint,
+            self.id,
+            KCOMP_FILESYSTEM_ENCODING_BYTES,
+            name,
+        )
+        .map_err(error)?;
         if id == 0 {
             return Err(Error::EPROTO);
         }
@@ -188,18 +173,13 @@ impl FsNode for RemoteNode {
     }
     fn open(&self) -> Result<Box<dyn FsOpen>> {
         let index = self.connection.reserve()?;
-        let mut bytes = [0; 8];
-        let result = self.connection.invoke(
-            KCOMP_FILESYSTEM_METHOD_OPEN_NODE,
-            &self.id.to_le_bytes(),
-            &[],
-            &mut bytes,
-        );
-        if let Err(error) = result {
-            self.connection.release.lock()[index] = Release::Free;
-            return Err(error);
-        }
-        let handle = u64::from_le_bytes(bytes);
+        let handle = match wire::open_node(self.connection.endpoint, self.id).map_err(error) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.connection.release.lock()[index] = Release::Free;
+                return Err(error);
+            }
+        };
         if handle == 0 {
             self.connection.release.lock()[index] = Release::Free;
             return Err(Error::EPROTO);
@@ -218,22 +198,19 @@ impl FsOpen for RemoteOpen {
             return Err(Error::EBADF);
         }
         let count = out.len().min(512);
-        let mut args = [0; 16];
-        args[..8].copy_from_slice(&self.handle.to_le_bytes());
-        args[8..].copy_from_slice(&offset.to_le_bytes());
-        let mut bytes = [0; 520];
-        self.connection.invoke(
-            KCOMP_FILESYSTEM_METHOD_READ_AT,
-            &args,
-            &[],
-            &mut bytes[..8 + count],
-        )?;
-        let actual = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let mut bytes = [0; 512];
+        let actual = wire::read_at(
+            self.connection.endpoint,
+            self.handle,
+            offset,
+            &mut bytes[..count],
+        )
+        .map_err(error)?;
         if actual > count as u64 {
             return Err(Error::EPROTO);
         }
         let actual = actual as usize;
-        out[..actual].copy_from_slice(&bytes[8..8 + actual]);
+        out[..actual].copy_from_slice(&bytes[..actual]);
         Ok(actual)
     }
     fn close(&mut self) -> Result<()> {
@@ -250,5 +227,12 @@ impl Drop for RemoteOpen {
         if !self.closed {
             self.connection.defer(self.slot, self.handle);
         }
+    }
+}
+
+fn error(error: InvokeError) -> Error {
+    match error {
+        InvokeError::Method(errno) | InvokeError::Transport(errno) => errno,
+        InvokeError::InvalidReply => Error::EPROTO,
     }
 }

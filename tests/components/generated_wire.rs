@@ -1,5 +1,5 @@
 //! Actual generated clients/dispatchers and SDK envelope; only Core transport is fake.
-use kcomp_sdk::generated::{block_wire, echo_wire};
+use kcomp_sdk::generated::{block_wire, echo_wire, filesystem_wire as fs};
 pub use kcomp_sdk::{Errno, Result, endpoint, ipc};
 use std::sync::{
     Mutex,
@@ -12,6 +12,67 @@ mod methods {
 static REQUEST: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 struct Handler;
+impl fs::Provider for Handler {
+    fn mount(&self) -> Result<()> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn unmount(&self) -> Result<()> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn open(&self, _: u32, _: &[u8]) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(42)
+    }
+    fn close(&self, _: u64) -> Result<()> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn read(&self, _: u64, _: &mut [u8]) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    }
+    fn root(&self) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(42)
+    }
+    fn lookup(&self, _: u64, _: u32, _: &[u8]) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(42)
+    }
+    fn node_info(&self, _: u64) -> Result<u32> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(1)
+    }
+    fn node_details(&self, _: u64, output: &mut [u8]) -> Result<fs::NodeDetailsReply> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        output.fill(0);
+        output[..9].copy_from_slice(b"HELLO.TXT");
+        Ok(fs::NodeDetailsReply {
+            kind: 1,
+            name_length: 9,
+            size: 23,
+        })
+    }
+    fn open_node(&self, _: u64) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(42)
+    }
+    fn read_at(&self, _: u64, offset: u64, output: &mut [u8]) -> Result<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        if offset == u64::MAX {
+            return Err(Errno::EOVERFLOW);
+        }
+        let actual = output.len().min(3);
+        output[..actual].copy_from_slice(&b"abc"[..actual]);
+        Ok(actual as u64)
+    }
+    fn shutdown(&self) -> Result<()> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
 impl block_wire::Provider for Handler {
     fn capacity_sectors(&self) -> u64 {
         CALLS.fetch_add(1, Ordering::Relaxed);
@@ -86,6 +147,7 @@ fn dispatch(bytes: &[u8], output: &mut [u8]) -> i32 {
     match std::env::args().nth(2).unwrap().as_str() {
         "block" => block_wire::dispatch(&Handler, &request, output),
         "echo" => echo_wire::dispatch(&Handler, &request, output),
+        "filesystem" => fs::dispatch(&Handler, &request, output),
         _ => methods::dispatch(&Handler, &request, output),
     }
 }
@@ -154,6 +216,15 @@ fn main() {
         return;
     }
     let result = match args[2].as_str() {
+        "filesystem" => match args[3].as_str() {
+            "root" => fs::root(7).map(|v| assert_eq!(v, 42)),
+            "lookup" => fs::lookup(7, 42, 1, b"HELLO.TXT").map(|v| assert_eq!(v, 42)),
+            "details" => fs::node_details(7, 42, &mut vec![0; args[4].parse().unwrap()])
+                .map(|r| assert_eq!(r.size, 23)),
+            "open" => fs::open_node(7, 42).map(|v| assert_eq!(v, 42)),
+            "close" => fs::close(7, 42),
+            _ => fs::read_at(7, 42, 7, &mut vec![0; args[4].parse().unwrap()]).map(|_| ()),
+        },
         "echo" => {
             let input = unhex(&args[3]);
             let mut output = vec![0; args[4].parse().unwrap()];

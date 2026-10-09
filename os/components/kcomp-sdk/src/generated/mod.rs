@@ -7,6 +7,7 @@ pub mod echo;
 pub mod echo_wire;
 pub mod errno;
 pub mod filesystem;
+pub mod filesystem_wire;
 pub mod network;
 pub mod posix;
 pub mod probe;

@@ -3,7 +3,7 @@
 import time
 
 
-def run(proc, collect, send, failure, fatal_markers):
+def run(proc, collect, send, failure, fatal_markers, isolated=True):
     output = []
 
     def command(line, expected):
@@ -40,12 +40,18 @@ def run(proc, collect, send, failure, fatal_markers):
     command("devices", ["DEVICE (PRIMARY COMPATIBLE)", "OWNER", "virtio,mmio", "ns16550a", "primary MMIO:", "IRQ[0]:", "Unclaimed", "Claimed", "core_test#", "device record(s)"])
     command("inspect ksh.kcomp", ["Format:   KCOMP (loaded component)", "Domain:   KernelNative", "State:    Ready"])
     command("load kcomp_c_smoke native", ["load kcomp_c_smoke: OK"])
-    command("load kcomp_isolated_life isolated", ["load kcomp_isolated_life: OK"])
-    command("inspect kcomp_isolated_life", ["Domain:   IsolatedNative", "State:    Ready"])
+    if isolated:
+        command("load kcomp_isolated_life isolated", ["load kcomp_isolated_life: OK"])
+        command("inspect kcomp_isolated_life", ["Domain:   IsolatedNative", "State:    Ready"])
+    else:
+        command("load kcomp_isolated_life isolated", ["load kcomp_isolated_life: ENOTSUP"])
     # This raw ArchTest image requires a harness page unavailable to ordinary
     # lifecycle loading. Its create fault must leave only the callee Failed.
-    command("load kcomp_isolated isolated", ["load kcomp_isolated: EIO"])
-    command("inspect kcomp_isolated", ["Domain:   IsolatedNative", "State:    Failed"])
+    if isolated:
+        command("load kcomp_isolated isolated", ["load kcomp_isolated: EIO"])
+        command("inspect kcomp_isolated", ["Domain:   IsolatedNative", "State:    Failed"])
+    else:
+        command("load kcomp_isolated isolated", ["load kcomp_isolated: ENOTSUP"])
     command("load kcomp_panic native", ["load kcomp_panic: EIO"])
     command("inspect ksh", ["State:    Ready"])
     command("echo KSH_AFTER_LOAD_ERROR", ["\nKSH_AFTER_LOAD_ERROR"])
@@ -62,6 +68,7 @@ def run(proc, collect, send, failure, fatal_markers):
     command("echo " + "x" * 512, ["input rejected: line too long"])
     command("echo KSH_RECOVERED", ["\nKSH_RECOVERED"])
     command("exit", ["ksh: exit"])
-    command("unload kcomp_isolated_life", ["unload kcomp_isolated_life: OK"])
+    if isolated:
+        command("unload kcomp_isolated_life", ["unload kcomp_isolated_life: OK"])
     command("unload ksh", ["unload ksh: OK"])
     return "\n".join(output)
