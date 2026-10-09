@@ -1,38 +1,83 @@
 use crate::input::{Event, Input};
+use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcomp_sdk::console::Console;
 use kcomp_sdk::{Errno, management};
 // Written only during create, before the sole session task is published.
 // Two 32-bit words preserve full EndpointId on RV32 without requiring AtomicU64.
 static FILESYSTEM: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+// The sole session task owns this instance's writable image. Keep bounded
+// history off the one-granule task stack, especially on RV32; no heap needed.
+static mut INPUT: Input = Input::new();
+static mut DECODED: [u8; crate::parser::LINE_MAX] = [0; crate::parser::LINE_MAX];
 
 pub fn filesystem() -> u64 {
     u64::from(FILESYSTEM[0].load(Ordering::Acquire))
         | (u64::from(FILESYSTEM[1].load(Ordering::Acquire)) << 32)
 }
 
+fn refresh(input: &Input) {
+    let (visible, back) = input.view();
+    Console::write(b"\r\x1b[2Kksh> ");
+    Console::write(visible);
+    if back != 0 {
+        let _ = write!(Console, "\x1b[{back}D");
+    }
+}
+
 extern "C" fn session(_arg: *mut ()) {
-    Console::write(b"KaleidOS ksh\ntype 'help' for commands\nksh> ");
-    let mut input = Input::new();
+    Console::write(
+        b"KaleidOS ksh\ntype 'help' for commands; Up/Down: history, Tab: completion\nksh> ",
+    );
+    // SAFETY: create publishes exactly one session task per component instance;
+    // no other entry accesses INPUT. Each loaded instance has its own image.
+    let input = unsafe { &mut *core::ptr::addr_of_mut!(INPUT) };
+    // SAFETY: like INPUT, only the sole task uses this separate parsing buffer.
+    let decoded = unsafe { &mut *core::ptr::addr_of_mut!(DECODED) };
     loop {
         match Console::read_byte() {
             Ok(Some(byte)) => match input.feed(byte) {
                 Event::None => {}
                 Event::Echo(byte) => Console::write(&[byte]),
-                Event::Erase => Console::write(b"\x08 \x08"),
+                Event::Refresh => refresh(input),
+                Event::Complete => {
+                    let (names, count) = input.complete();
+                    if count > 1 {
+                        Console::write(b"\n");
+                        for name in &names[..count] {
+                            Console::write(name);
+                            Console::write(b"  ");
+                        }
+                        Console::write(b"\n");
+                    } else if count == 0 {
+                        Console::write(b"\x07");
+                    }
+                    refresh(input);
+                }
+                Event::Clear => {
+                    Console::write(b"\x1b[2J\x1b[H");
+                    refresh(input);
+                }
                 Event::Submit => {
                     Console::write(b"\n");
-                    if crate::shell::execute(input.line()) {
+                    input.remember();
+                    if crate::shell::execute(input.line(), input, decoded) {
                         break;
                     }
                     Console::write(b"ksh> ");
                 }
                 Event::Overflow => {
-                    Console::write(b"\ninput rejected: line too long (max 128 bytes)\nksh> ")
+                    let _ = write!(
+                        Console,
+                        "\ninput rejected: line too long (max {} bytes)\nksh> ",
+                        crate::parser::LINE_MAX
+                    );
                 }
+                Event::Invalid => Console::write(b"\ninput rejected: ASCII input only\nksh> "),
                 Event::Cancel => Console::write(b"^C\nksh> "),
                 Event::Exit => {
-                    crate::shell::execute(b"exit");
+                    Console::write(b"\n");
+                    crate::shell::execute(b"exit", input, decoded);
                     break;
                 }
             },

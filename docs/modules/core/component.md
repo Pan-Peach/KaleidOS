@@ -25,7 +25,7 @@
 - `containment.rs`：panic containment（`CallOutcome`、`EscapeKind`、`EscapeInfo`、`call_component_create` / `call_component_destroy` / `call_component_service`、`enter_task` / `enter_anchor`、`panic_escape`、`with_irq_scope`、祖先遍历的 `scheduling_forbidden` / `irq_in_chain` / `provider_in_active_chain`）。
 - `endpoint.rs`：Contract / Endpoint 真相（`ContractId`、`EndpointId`、`EndpointState`、`EndpointRecord`、`EndpointRegistry`）；`stage_publish` / `commit_pending` / `discard_pending` / `resolve` / `lookup` / `discover` / `invalidate_provider`。
 - `call.rs`：`kcore_endpoint_call` 的 Core 实现（`CallError`）：**按 provider 执行域路由**（KernelNative → service-call 执行边界 `call_component_service`；Isolated → `isolated_lifecycle::dispatch_service` 的 caller 帧直接交付 + 跨 AS trampoline 路径；Sandboxed → 显式拒绝）、re-entry 门禁、IRQ 祖先门禁、`complete_call` / `handle_provider_panic` 收尾。
-- `export/query.rs`：console 输入与 component / endpoint 只读值投影；名称完整拷贝，不交付私有指针。
+- `export/query.rs`：console 输入与 component / endpoint / device 只读值投影；名称完整拷贝，设备描述及 owner / quarantine 只复制值，不交付私有指针。
 - `export.rs`：`kcore_*` 导出 ABI 实现（清单以 `abi/core.toml` 为准）与 `resolve(name) -> Option<usize>`。
 - `failure.rs`：`fail_component`、`revoke_authority_and_unbind`。
 - `exit.rs`：`stop_component`、`ComponentStopError`。

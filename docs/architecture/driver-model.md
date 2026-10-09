@@ -451,6 +451,7 @@ runtime:
 原模型里设备认领只做"第一台 compatible 匹配且未被认领"，QEMU 上 `virtio,mmio` 有 8 台同 compatible 设备，组件无法**精确选择**。现定案：
 
 - `kcore_device_nth(compatible, len, ordinal, out_device_id)` 纯发现（不分配、不触碰设备、包含已认领设备、order 稳定；`ordinal >= 匹配数` → `-ENOENT` 是唯一终止信号），产出 `DeviceId`（identity，非 handle）；
+- `kcore_device_info(device_id, out, compatible, capacity)` 是只读观察：复制主 compatible、主窗口与首个 IRQ，并带各类资源总数及 owner / quarantine 状态。布局、缓冲及错误码以 `abi/core.toml` 为准。真实消费者是 ksh 的 `devices`；仅有发现 ID 与组件枚举无法取得设备描述和 ownership，二者的唯一真相都在 Core。地址是固件窗口数值，不是 Core 私有 VA 或访问授权；不新增名字、协议探测或 MMIO 读。owner 与 quarantine 在同一次 DeviceTable 锁下取值；查询不改 ownership，不跨组件持锁，也不承诺整个设备表的原子快照；
 - `kcore_device_claim(device_id, ...)` 认领**那台确切设备**，独占锚在 device index；
 - `kcore_irq_register(device_id, resource_index, ...)` 与 `kcore_dma_map(device_id, ...)` 都以 `DeviceId` 为锚点（IRQ 通过 `DeviceDescriptor.interrupts[resource_index].line` 解析逻辑线号），不存在"MMIO 给 A、IRQ 给 B"的跨设备错配；
 - `kcore_device_release` 在仍有 live IRQ route / DMA mapping 时 `-EBUSY`；`kcore_irq_release` 撤销 route 并关断控制器线；

@@ -230,7 +230,7 @@ value = 2
 [[const]]
 name = "KCOMP_ABI"
 type = "u64"
-value = "0x71A9_CE34_8D62_F0B5"
+value = "0xD58F_B296_4E73_A10C"
 doc = """
 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的

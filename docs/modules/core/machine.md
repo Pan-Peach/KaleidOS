@@ -17,6 +17,7 @@
 - 类型：`MachineInfo`、`FirmwareInfo`、`CpuId`、`CpuInfo`、`MemoryRegion`、`DeviceDescriptor`（`spaces: Box<[IoSpace]>` 全部窗口、固件顺序、`spaces[0]` = 主窗口；`interrupts: Box<[InterruptResource]>` 完整中断资源；`compatibles: Box<[Box<str>]>` 完整 compatible，数量与长度都不截断）、`IoSpace`（Mmio / Pio）、`DeviceId`、`DeviceLookupError`、`InterruptResource` / `InterruptSpecifier`（设备的完整中断资源：固件 specifier + 可投递的逻辑 `line: Option<u32>`）。
 - `commit(info)` / `committed()`。
 - `nth_compatible(compatible, ordinal)`：纯设备枚举（含已认领设备，顺序跨 claim/release 稳定；`ordinal` 越界 → `DeviceLookupError`）。
+- `component/export/query.rs` 的 `kcore_device_info` 把已有设备描述与 DeviceTable 的 owner / quarantine 投影为只读值；发现本身不变，不新增节点命名或另一套 ownership 账本。ABI 布局以 `abi/core.toml` 为准，语义见 [驱动契约](../../architecture/driver-model.md#121-已决设备选择原-q1)。
 
 ## 明确不做
 

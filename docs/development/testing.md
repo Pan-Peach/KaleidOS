@@ -101,15 +101,21 @@ CoreTest 使用带 `[core-test] ` 前缀的 KTAP：header、连续编号与稳�
 - CoreTest 只走真实 Core API；host fake 上下文后端不算跨域证明。
 
 `tests/qemu/ksh.py` 在 CoreTest 完成后提交真实串口命令，检查输入 / 输出、加载失败后的
-会话存活、cat 与 exit 回到 monitor。这是 shell 用户流程 smoke；driver / FS / scheduler
+会话存活、引号 / 转义、行编辑 / 历史 / 补全、cat 与 exit 回到 monitor。这是 shell 用户流程 smoke；driver / FS / scheduler
 的细粒度集成编排仍由 CoreTest 负责。两种硬件 topology 都走这条流程。
+
+设备观察分层验证：Core host 覆盖主 PIO / 多资源计数、合法零 ID / 零 IRQ、未映射 IRQ、
+认领 / 释放 / quarantine 的值投影及错误时输出不变；SDK host 检查复制值是否合法。
+CoreTest 从公开 API 验证认领后同一设备的窗口 / owner、释放后状态、短缓冲和不存在 ID；
+串口 smoke 检查 compatible / IRQ / owner 的可读显示，普通 init 流程另验证 `virtio_blk` 认领者。
 
 CoreTest 的私有 profile 叠加 `configs/coretest.fragment`，避免默认 init 提前认领设备。
 `tests/qemu/init_runner.py` 另用普通 board profile 检查 boot → init → FAT root → ksh
-的用户流程，以及无盘 / 坏盘分支；使用独立磁盘副本，未把断言塞入生产 init。
+的用户流程，以及无盘 / 坏盘分支；含真实 FAT 路径的引号 / 转义读取和引号 exec
+参数。使用独立磁盘副本，未把断言塞入生产 init。
 RV64 另在全新 128 MiB guest 中运行 `exec_probe/oom.S`：耗尽 `brk` backing 后，
 `mprotect` 必须返回 `ENOMEM`、保留原有可写映射；程序正常退出后，再次装载组件
-须返回 `ENOMEM`，shell 继续响应。
+须返回 `ENOMEM`，shell 的引号 echo、历史回忆 / 查询、设备表与退出继续响应。
 该探针不进入普通 exec corpus 或 Linux 参考测试，避免把硬件内存压力带入其它用例。
 
 - 同一事实只在一个层次证明，避免三层重复断言。

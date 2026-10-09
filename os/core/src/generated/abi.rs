@@ -82,7 +82,23 @@ const _: () = {
 /// 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
 /// 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
 /// `kcomp_abi` 符号由入口宏发出。
-pub const KCOMP_ABI: u64 = 0x71A9_CE34_8D62_F0B5;
+pub const KCOMP_ABI: u64 = 0xD58F_B296_4E73_A10C;
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClaimState {
+    Unclaimed = 0,
+    Claimed = 1,
+    Quarantined = 2,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSpaceKind {
+    None = 0,
+    Mmio = 1,
+    Pio = 2,
+}
 
 /// Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。
 #[repr(u32)]
@@ -114,6 +130,50 @@ pub enum EndpointState {
     Live = 1,
     Invalid = 2,
 }
+
+/// 只读设备观察：primary compatible 的完整字节另由调用方缓冲区接收，无 NUL。
+/// base / size 是固件主窗口的数值，非 Core VA 或授权；kind 为 DeviceSpaceKind。
+/// irq_line 仅在 irq_known=1 时有效，表示第一条中断资源的已绑定逻辑 IRQ；
+/// interrupt_count>0 且 irq_known=0 表示该资源未绑定，不能当成没有中断。
+/// 各 count 保留完整数量；不是全部 compatible / 窗口 / IRQ 的枚举接口。
+/// owner 仅在 Claimed 有效，其他状态为 0；Quarantined 与 Unclaimed 明确区分。
+/// 存在性来自不可变 MachineInfo，owner/state 在同一设备锁下取快照；不读寄存器。
+/// reserved 恒为 0。观察不授予访问权限，也不承诺跨查询的表级原子快照。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub state: u32,
+    pub owner: u64,
+    pub compatible_len: u32,
+    pub compatible_count: u32,
+    pub space_count: u32,
+    pub interrupt_count: u32,
+    pub space_kind: u32,
+    pub irq_known: u32,
+    pub base: u64,
+    pub size: u64,
+    pub irq_line: u32,
+    pub reserved: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<DeviceInfo>() == 64);
+    assert!(core::mem::align_of::<DeviceInfo>() == 8);
+    assert!(core::mem::offset_of!(DeviceInfo, id) == 0);
+    assert!(core::mem::offset_of!(DeviceInfo, state) == 4);
+    assert!(core::mem::offset_of!(DeviceInfo, owner) == 8);
+    assert!(core::mem::offset_of!(DeviceInfo, compatible_len) == 16);
+    assert!(core::mem::offset_of!(DeviceInfo, compatible_count) == 20);
+    assert!(core::mem::offset_of!(DeviceInfo, space_count) == 24);
+    assert!(core::mem::offset_of!(DeviceInfo, interrupt_count) == 28);
+    assert!(core::mem::offset_of!(DeviceInfo, space_kind) == 32);
+    assert!(core::mem::offset_of!(DeviceInfo, irq_known) == 36);
+    assert!(core::mem::offset_of!(DeviceInfo, base) == 40);
+    assert!(core::mem::offset_of!(DeviceInfo, size) == 48);
+    assert!(core::mem::offset_of!(DeviceInfo, irq_line) == 56);
+    assert!(core::mem::offset_of!(DeviceInfo, reserved) == 60);
+};
 
 /// 一条 trace 记录的**稳定编码**（Core `trace::abi::TraceRecordAbi`）。
 /// `kind` 决定 `a` / `b` / `c` 的含义，缺省字段写成 `ABSENT`（**不是** 0）。

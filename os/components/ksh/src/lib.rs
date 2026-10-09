@@ -1,4 +1,4 @@
-//! 最小系统 shell；Core / ComponentManager 拥有生命周期与资源真相。
+//! 有界交互 shell；Core / ComponentManager 拥有生命周期与资源真相。
 #![no_std]
 extern crate alloc;
 

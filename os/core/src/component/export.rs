@@ -1535,6 +1535,7 @@ mod tests {
             &b"kcore_sched_run"[..],
             &b"kcore_sched_set_policy"[..],
             &b"kcore_device_nth"[..],
+            &b"kcore_device_info"[..],
             &b"kcore_device_claim"[..],
             &b"kcore_device_release"[..],
             &b"kcore_irq_register"[..],

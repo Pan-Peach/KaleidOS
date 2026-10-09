@@ -88,7 +88,7 @@ extern const uint64_t kcomp_abi;
 /* 精确契约指纹（手工维护，非版本号）：Core 在调用组件代码前校验其 ELF 定义、
  * 边界与值。指纹包含当前 Core import 契约；签名变动须协调替换并重建全部组件。组件里的
  * `kcomp_abi` 符号由入口宏发出。 */
-#define KCOMP_ABI UINT64_C(0x71A9CE348D62F0B5)
+#define KCOMP_ABI UINT64_C(0xD58FB2964E73A10C)
 
 /* 可选的 SDK 运行时入口；Core 在业务 create 前以实例身份调用一次。
  * 返回 0 / -errno；失败按 create 失败处理，不进入业务 create。
@@ -113,6 +113,45 @@ int32_t kcomp_instance_destroy(void *state);
  * `0 / -errno` —— 它**不是** Core 的传输状态（见 `kcore_endpoint_call`）。
  * 缺失该符号 = 组件不提供任何 endpoint 服务：加载不失败，调用返回 `-ENOSYS`。 */
 int32_t kcomp_service_dispatch(void *instance_state, uint32_t port, uint32_t method, const struct kcomp_call_frame *frame);
+
+/* 只读设备观察：primary compatible 的完整字节另由调用方缓冲区接收，无 NUL。
+ * base / size 是固件主窗口的数值，非 Core VA 或授权；kind 为 DeviceSpaceKind。
+ * irq_line 仅在 irq_known=1 时有效，表示第一条中断资源的已绑定逻辑 IRQ；
+ * interrupt_count>0 且 irq_known=0 表示该资源未绑定，不能当成没有中断。
+ * 各 count 保留完整数量；不是全部 compatible / 窗口 / IRQ 的枚举接口。
+ * owner 仅在 Claimed 有效，其他状态为 0；Quarantined 与 Unclaimed 明确区分。
+ * 存在性来自不可变 MachineInfo，owner/state 在同一设备锁下取快照；不读寄存器。
+ * reserved 恒为 0。观察不授予访问权限，也不承诺跨查询的表级原子快照。 */
+struct KcoreDeviceInfo {
+    uint32_t id;
+    uint32_t state;
+    uint64_t owner;
+    uint32_t compatible_len;
+    uint32_t compatible_count;
+    uint32_t space_count;
+    uint32_t interrupt_count;
+    uint32_t space_kind;
+    uint32_t irq_known;
+    uint64_t base;
+    uint64_t size;
+    uint32_t irq_line;
+    uint32_t reserved;
+};
+_Static_assert(sizeof(struct KcoreDeviceInfo) == 64, "KcoreDeviceInfo layout drift");
+_Static_assert(_Alignof(struct KcoreDeviceInfo) == 8, "KcoreDeviceInfo alignment drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, id) == 0, "KcoreDeviceInfo.id offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, state) == 4, "KcoreDeviceInfo.state offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, owner) == 8, "KcoreDeviceInfo.owner offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, compatible_len) == 16, "KcoreDeviceInfo.compatible_len offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, compatible_count) == 20, "KcoreDeviceInfo.compatible_count offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, space_count) == 24, "KcoreDeviceInfo.space_count offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, interrupt_count) == 28, "KcoreDeviceInfo.interrupt_count offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, space_kind) == 32, "KcoreDeviceInfo.space_kind offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, irq_known) == 36, "KcoreDeviceInfo.irq_known offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, base) == 40, "KcoreDeviceInfo.base offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, size) == 48, "KcoreDeviceInfo.size offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, irq_line) == 56, "KcoreDeviceInfo.irq_line offset drift");
+_Static_assert(offsetof(struct KcoreDeviceInfo, reserved) == 60, "KcoreDeviceInfo.reserved offset drift");
 
 /* 一条 trace 记录的**稳定编码**（Core `trace::abi::TraceRecordAbi`）。
  * `kind` 决定 `a` / `b` / `c` 的含义，缺省字段写成 `ABSENT`（**不是** 0）。 */
@@ -252,6 +291,18 @@ _Static_assert(offsetof(struct kcore_user_trap, arg5) == 80, "kcore_user_trap.ar
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
 
+enum DeviceClaimState {
+    KCORE_DEVICE_UNCLAIMED = 0,
+    KCORE_DEVICE_CLAIMED = 1,
+    KCORE_DEVICE_QUARANTINED = 2,
+};
+
+enum DeviceSpaceKind {
+    KCORE_DEVICE_SPACE_NONE = 0,
+    KCORE_DEVICE_SPACE_MMIO = 1,
+    KCORE_DEVICE_SPACE_PIO = 2,
+};
+
 /* Core 查询 / 部署的稳定 wire 编码；不依赖 Rust enum layout。 */
 enum KcoreExecutionDomain {
     KCORE_EXECUTIONDOMAIN_KERNEL_NATIVE = 0,
@@ -385,6 +436,12 @@ int32_t kcore_sched_set_policy(uint64_t endpoint);
 /* -- Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针） -- */
 /* 纯发现：compatible 为空（非 NULL 指针，len = 0）时枚举全部设备；否则按 compatible 过滤。只返回 DeviceId，非权限。 */
 int32_t kcore_device_nth(const uint8_t *compatible, size_t len, uint32_t ordinal, uint32_t *out_device_id);
+/* 按 DeviceId 复制 DeviceInfo 与 primary compatible（完整、不截断、无 NUL）。
+ * 调用方提供互不重叠的可写 out 和 compatible 缓冲区，out 无对齐要求。
+ * 成功 0；不存在设备 -ENOENT、机器尚未提交 -ENODEV、空指针 -EFAULT、
+ * 容量不足 -ENOBUFS、计数无法表示 -EOVERFLOW。失败不写任何输出。
+ * DeviceId 0 合法；只读观察不 claim / release，不触碰 MMIO / IRQ / DMA。 */
+int32_t kcore_device_info(uint32_t device_id, struct KcoreDeviceInfo *out, uint8_t *compatible, size_t capacity);
 /* 认领确切设备：Core 记 owner，返回本执行域下的 MMIO 指针 + 长度。 */
 int32_t kcore_device_claim(uint32_t device_id, uint8_t **out_mmio, size_t *out_len);
 int32_t kcore_device_release(uint32_t device_id);

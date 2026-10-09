@@ -11,6 +11,123 @@
 # 手写部分（facade / umbrella / Core 实现 / 语义转换）不在本文件范围内。
 # 结构布局断言是编译器背书的：C `_Static_assert` + Rust `const _: () = assert!(...)`。
 
+[[enum]]
+name = "DeviceClaimState"
+c_name = "DeviceClaimState"
+repr = "u32"
+c_style = "enum"
+[[enum.variant]]
+name = "Unclaimed"
+c_name = "KCORE_DEVICE_UNCLAIMED"
+value = 0
+[[enum.variant]]
+name = "Claimed"
+c_name = "KCORE_DEVICE_CLAIMED"
+value = 1
+[[enum.variant]]
+name = "Quarantined"
+c_name = "KCORE_DEVICE_QUARANTINED"
+value = 2
+
+[[enum]]
+name = "DeviceSpaceKind"
+c_name = "DeviceSpaceKind"
+repr = "u32"
+c_style = "enum"
+[[enum.variant]]
+name = "None"
+c_name = "KCORE_DEVICE_SPACE_NONE"
+value = 0
+[[enum.variant]]
+name = "Mmio"
+c_name = "KCORE_DEVICE_SPACE_MMIO"
+value = 1
+[[enum.variant]]
+name = "Pio"
+c_name = "KCORE_DEVICE_SPACE_PIO"
+value = 2
+
+[[struct]]
+name = "DeviceInfo"
+c_name = "KcoreDeviceInfo"
+size = 64
+align = 8
+doc = """
+只读设备观察：primary compatible 的完整字节另由调用方缓冲区接收，无 NUL。
+base / size 是固件主窗口的数值，非 Core VA 或授权；kind 为 DeviceSpaceKind。
+irq_line 仅在 irq_known=1 时有效，表示第一条中断资源的已绑定逻辑 IRQ；
+interrupt_count>0 且 irq_known=0 表示该资源未绑定，不能当成没有中断。
+各 count 保留完整数量；不是全部 compatible / 窗口 / IRQ 的枚举接口。
+owner 仅在 Claimed 有效，其他状态为 0；Quarantined 与 Unclaimed 明确区分。
+存在性来自不可变 MachineInfo，owner/state 在同一设备锁下取快照；不读寄存器。
+reserved 恒为 0。观察不授予访问权限，也不承诺跨查询的表级原子快照。
+"""
+
+[[struct.field]]
+name = "id"
+type = "u32"
+offset = 0
+
+[[struct.field]]
+name = "state"
+type = "u32"
+offset = 4
+
+[[struct.field]]
+name = "owner"
+type = "u64"
+offset = 8
+
+[[struct.field]]
+name = "compatible_len"
+type = "u32"
+offset = 16
+
+[[struct.field]]
+name = "compatible_count"
+type = "u32"
+offset = 20
+
+[[struct.field]]
+name = "space_count"
+type = "u32"
+offset = 24
+
+[[struct.field]]
+name = "interrupt_count"
+type = "u32"
+offset = 28
+
+[[struct.field]]
+name = "space_kind"
+type = "u32"
+offset = 32
+
+[[struct.field]]
+name = "irq_known"
+type = "u32"
+offset = 36
+
+[[struct.field]]
+name = "base"
+type = "u64"
+offset = 40
+
+[[struct.field]]
+name = "size"
+type = "u64"
+offset = 48
+
+[[struct.field]]
+name = "irq_line"
+type = "u32"
+offset = 56
+
+[[struct.field]]
+name = "reserved"
+type = "u32"
+offset = 60
+
 [[struct]]
 name = "TraceRecordAbi"
 c_name = "kcore_trace_record"
@@ -746,6 +863,31 @@ type = "u32"
 [[function.param]]
 name = "out_device_id"
 type = "*mut u32"
+
+[[function]]
+name = "kcore_device_info"
+ret = "i32"
+category = "Device ownership（mechanism-first）"
+c_category = "Device ownership / MMIO（mechanism-first：claim 后直接拿 MMIO 指针）"
+doc = """
+按 DeviceId 复制 DeviceInfo 与 primary compatible（完整、不截断、无 NUL）。
+调用方提供互不重叠的可写 out 和 compatible 缓冲区，out 无对齐要求。
+成功 0；不存在设备 -ENOENT、机器尚未提交 -ENODEV、空指针 -EFAULT、
+容量不足 -ENOBUFS、计数无法表示 -EOVERFLOW。失败不写任何输出。
+DeviceId 0 合法；只读观察不 claim / release，不触碰 MMIO / IRQ / DMA。
+"""
+[[function.param]]
+name = "device_id"
+type = "u32"
+[[function.param]]
+name = "out"
+type = "*mut DeviceInfo"
+[[function.param]]
+name = "compatible"
+type = "*mut u8"
+[[function.param]]
+name = "capacity"
+type = "usize"
 
 [[function]]
 name = "kcore_device_claim"

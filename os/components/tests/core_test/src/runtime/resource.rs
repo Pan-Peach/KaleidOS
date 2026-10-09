@@ -18,6 +18,7 @@ use kcomp_sdk::abi::{
     kcore_irq_release,
 };
 use kcomp_sdk::errno::Errno;
+use kcomp_sdk::management::{self, DeviceClaimState, DeviceSpaceKind};
 
 use super::report::Checks;
 use super::trace;
@@ -82,6 +83,43 @@ pub fn group(checks: &mut Checks) -> Outcome {
         "device-window-len",
         claimed && mmio_len == VIRTIO_MMIO_WINDOW,
     );
+    // Observation uses the same public claim identity/window. This checks the
+    // SDK/Core boundary, not another assertion about QEMU register layout.
+    let mut compatible = [0; 32];
+    let observed = management::device_info(virtio_device, &mut compatible);
+    let mut owner_name = [0; 64];
+    let owner_matches = observed.as_ref().is_ok_and(|info| {
+        (0..u32::MAX).find_map(|ordinal| {
+            match management::component_nth(ordinal, &mut owner_name) {
+                Ok(Some(owner)) if u64::from(owner.id) == info.owner => {
+                    Some(&owner_name[..owner.name_len as usize] == b"core_test")
+                }
+                Ok(Some(_)) => None,
+                _ => Some(false),
+            }
+        }) == Some(true)
+    });
+    checks.check(
+        "device-observation",
+        claimed
+            && owner_matches
+            && observed.is_ok_and(|info| {
+                info.id == virtio_device
+                    && info.state == DeviceClaimState::Claimed as u32
+                    && info.space_kind == DeviceSpaceKind::Mmio as u32
+                    && info.base == mmio as usize as u64
+                    && info.size == mmio_len as u64
+                    && &compatible[..info.compatible_len as usize] == b"virtio,mmio"
+            }),
+    );
+    let mut short = [0xaa; 1];
+    checks.check(
+        "device-observation-errors",
+        claimed
+            && management::device_info(virtio_device, &mut short) == Err(Errno::ENOBUFS)
+            && short == [0xaa]
+            && management::device_info(u32::MAX, &mut compatible) == Err(Errno::ENOENT),
+    );
 
     // 拒绝路径：独占锚在**设备**上 —— 同一 DeviceId 重复认领 → -EBUSY。
     let (mut dup, mut dup_len) = (core::ptr::null_mut(), 0usize);
@@ -130,6 +168,13 @@ pub fn group(checks: &mut Checks) -> Outcome {
 
     // --- Device release：释放后同一设备可被再次认领（无 quarantine）。 ---
     let uart_released = uart_claimed && unsafe { kcore_device_release(uart_device) } == 0;
+    checks.check(
+        "device-observation-release",
+        uart_released
+            && management::device_info(uart_device, &mut compatible).is_ok_and(|info| {
+                info.state == DeviceClaimState::Unclaimed as u32 && info.owner == 0
+            }),
+    );
     let (mut uart2, mut uart2_len) = (core::ptr::null_mut(), 0usize);
     let uart_reclaimed = uart_released
         && unsafe { kcore_device_claim(uart_device, &mut uart2, &mut uart2_len) } == 0;

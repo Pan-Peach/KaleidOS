@@ -1,6 +1,6 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-09。本次吸收服务执行/组合研究、复核 `d60afb9` 源码并调整近期依赖链，只有文档改动，无新增 OS 测试结果。既有 RV64 用户 task / AS / trap、POSIX fork / exec / wait 与 FAT→ksh exec 证据保留；glibc guest startup 仍未通过。K/I 双向 Gate 的合成服务矩阵不代表真实驱动/FS 任意跨域可用。
+更新：2026-10-09。本次补齐 ksh 行编辑、历史、命令补全、引号解析与设备描述 / owner 显示；host 与 RV64/RV32 QEMU 验证见 §3.27。服务执行/组合研究与近期依赖链仍按现行契约推进。既有 RV64 用户 task / AS / trap、POSIX fork / exec / wait 与 FAT→ksh exec 证据保留；glibc guest startup 仍未通过。K/I 双向 Gate 的合成服务矩阵不代表真实驱动/FS 任意跨域可用。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -319,15 +319,38 @@ PID / Linux syscall 语义在组件；Core 只管理实际执行真相。create 
 下一步：先接只读 VFS / fd，验证普通应用运行期文件 I/O；libc startup 按实际二进制缺口独立推进，不能替代纵向文件链路验收。
 现有 FAT/littlefs/block provider 可复用；Core 不收 POSIX 或文件系统语义。
 
-#### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 最小 shell）
+#### 3.27 ksh `▰▰▰▰▱` IMPLEMENTED（KernelNative 交互 shell）
 
 现状：独立 `ksh.kcomp`，普通 profile 由 init 自动启动；monitor 也可 `load scheduler_rr` → `load ksh` 启动普通任务。
-支持 help / echo / clear / components / endpoints / devices / load native 或 isolated /
-inspect 已加载实例 / cat / exec 静态 ELF / exit。业务代码只走 SDK。新增 Core 导出仅 console read 与
-component / endpoint 的值枚举；设备观察复用 `device_nth`，装载在既有 `component_load`
+支持 help [command] / history / echo / clear / components / endpoints / devices / load native 或 isolated /
+inspect 已加载实例 / cat / exec 静态 ELF / exit。业务代码只走 SDK。shell 的 Core 观察导出包括 console read 与
+component / endpoint 的值枚举；设备发现复用 `device_nth`，`device_info` 复制已有描述与 owner / quarantine，装载在既有 `component_load`
 上增加 domain 请求，协调替换 exact ABI fingerprint。命令与文件组合边界见 `docs/modules/ksh.md`。
 
-验证：ksh 8 个 host 用例、SDK 82 个、Core 536 个通过（Core 6 个既有 ignored）；
+本次交互改进：512 字节有界行、引号 / 转义 / 空参数 / 注释、历史与草稿恢复、光标插入 / 删除、
+编辑控制键、命令名补全与单命令帮助。基础解析和历史不分配堆；会话 / 解码缓冲驻留各实例
+自己的可写 image，参数使用有界短偏移，避免在单 granule 任务栈上存放大数组。
+未支持的管道 / 重定向 / 命令列表、超长或非 ASCII 输入整行拒绝，不执行截断前缀。
+
+交互改进阶段验证：ksh 14 个 host 用例 PASS；host tests 与 RV64/RV32 的 ksh Clippy `-D warnings`、
+`make fmt-check` PASS；`make test-qemu` 的 13 条流程 PASS：四条 CoreTest→ksh 串口链
+（当前 RV64 81 项、RV32 59 项 CoreTest）以及 RV64 五条、RV32 四条 init 流程。
+串口覆盖引号 echo、编辑 / 补全 / 历史、取消、错参与语法拒绝、超长恢复；init 覆盖真实
+FAT 路径的引号 / 转义读取和 RV64 引号 exec 参数。RV64 OOM 后引号 echo、历史查询 / 回忆、
+退出继续响应。该阶段没有变更 Core / SDK ABI，也没有重跑 ArchTest。
+
+设备显示阶段：显示主 compatible、MMIO / PIO 窗口、首个 IRQ、资源总数与认领者
+`artifact#id`；空 virtio transport 仍按固件记录显示，不探测协议、不认领设备。
+新增只读 `kcore_device_info`，exact ABI 原地协调为 `0xD58F_B296_4E73_A10C`，全部组件重建。
+验证：`make check` PASS（Core host 564 PASS、6 ignored；SDK 88 PASS；ksh 14 PASS；
+fmt / Clippy / Kconfig 12 项 / 16 个 ABI 生成物一致性 / RV64 构建 / RV32 check）。
+`make test-qemu` 13 条流程全部 PASS：RV64 CoreTest 84 项、RV32 62 项，四条 CoreTest→ksh
+链及九条普通 init 流程覆盖真实设备表、块驱动 owner、双盘与 RV64 OOM 后继续查询。
+CoreTest 新增认领后值查询、短缓冲 / 不存在设备、释放后状态三个检查；host 另覆盖
+quarantine、未映射 IRQ、多资源、零 ID / 零 IRQ 与失败时不写输出。
+未重跑 ArchTest。串口证据在 `build/tests/{coretest,init}-rv{64,32}/logs/`。
+
+此前验证：ksh 8 个 host 用例、SDK 82 个、Core 536 个通过（Core 6 个既有 ignored）；
 `make check` 包括 fmt / Clippy / Kconfig / ABI 生成一致性 / 全部 host / RV64 构建 / RV32 check。
 RV64 与 RV32、default 与 no-block 四条 QEMU 串口链均 PASS：CoreTest → ksh 输入与查询 →
 native / isolated 装载 → 故障或 panic 加载返回 EIO 且 shell 存活 → cat → 超长行恢复 →

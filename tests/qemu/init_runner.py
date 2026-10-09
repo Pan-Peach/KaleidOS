@@ -84,16 +84,20 @@ def run(args, session):
         if args.scenario == "dual-fat" and "dispatch done; matched=2" not in session.output:
             raise RunFailure("both block devices must be attached automatically")
         command("inspect init", ["Domain:   KernelNative", "State:    Ready"])
+        command("devices", ["DEVICE (PRIMARY COMPATIBLE)", "ns16550a", "virtio,mmio", "primary MMIO:", "device record(s)"] +
+                (["Claimed", "virtio_blk#"] if args.scenario in ("fat", "dual-fat", "oom") else ["Unclaimed"]))
         if args.scenario == "oom":
             command("exec 0:/OOM.ELF", ["OOM_RECOVERED", "exec: exit=0"])
         elif args.scenario in ("fat", "dual-fat"):
             command("cat 0:/HELLO.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
+            command('cat "0:/HELLO.TXT"', ["HELLO FROM KALEIDOS FAT ROOTFS"])
+            command("cat 0:/HELLO\\.TXT", ["HELLO FROM KALEIDOS FAT ROOTFS"])
             command("cat 0:/DOCS/ABOUT.TXT", ["KaleidOS test fixture:"])
             if args.arch == "rv64":
                 for filename, expected in [("EXIT0.ELF", "exec: exit=0"),
                                            ("EXIT7.ELF", "exec: exit=7"),
                                            ("WRITE.ELF", "exec: exit=0"),
-                                           ("STACK.ELF probe", "exec: exit=0"),
+                                           ('STACK.ELF "probe"', "exec: exit=0"),
                                            ("PRIV.ELF", "exec: signal=4"),
                                            ("TEXT.ELF", "exec: signal=11"),
                                            ("PROTECT.ELF", "exec: signal=11")]:
@@ -108,6 +112,11 @@ def run(args, session):
         # init is a boot-anchor composer, not an application launched by ksh.
         command("load init", ["load init: ENOMEM" if args.scenario == "oom" else "load init: EINVAL"])
     command("echo INIT_SERIAL_OK", ["\nINIT_SERIAL_OK"])
+    if args.scenario == "oom":
+        command("\x1b[A", ["\nINIT_SERIAL_OK"])
+        command('echo "OOM  SHELL_OK"', ["\nOOM  SHELL_OK"])
+        command("history", ["  echo INIT_SERIAL_OK"])
+        command("devices", ["virtio_blk#", "device record(s)"])
     command("exit", ["ksh: exit"])
     if args.scenario == "oom":
         # Exhaustion need not consume every allocatable order. A changed image
