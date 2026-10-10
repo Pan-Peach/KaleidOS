@@ -201,3 +201,23 @@ SDK test-only IPC链接替身返回ENOTSUP，只恢复旧前端单测，不模�
 
 I域普通Gate对照在真实Task/IPC/copy替代通过前保留；先核对工件UNDEF，不能因为源代码
 未执行IPC分支就认为没有IPC import。NoMMU、MMU与Sandbox分别报告；Block吞吐目前未测。
+
+## Runtime 生命周期与回收验证
+
+场景矩阵、K/I/U通信格、逐层职责和本轮真实命令结果见
+[Runtime 第一轮交付 §4–§5](component-runtime-consolidation.md#4-lifecycle-test-matrix)。
+`exchange/tests.rs` 新增server exit后的成功回复保留、caller/server/reply六种顺序中另一
+实例不受影响，以及1000轮Endpoint/receipt槽位退役。它们只证明host传输真相，
+不执行component入口、不证明私有AS、CPU强制停止或物理页回收。
+
+真回收必须使用CPU-only组件：热身后基线→load→真实Task/IPC→stop/fault→CPU离场
+确认→destroy/force→AS/backing teardown→物理基线。逐项记录Task/Endpoint逻辑数量、
+image/stack/heap extent、页表页与可用物理页、预期tombstone/缓存和Quarantine原因。
+先100轮，再数百与1000轮；现实现不满足条件时列为待验收，不能让host槽位压力替代。
+
+已新增真实 private 生命周期压力：CoreTest RV64 I/U 交替合计1000轮，RV32 I1000轮，
+每轮真 Task/Endpoint/生成 IPC 后 stop/fault/force、显式 reclaim，比较 Task 数与
+物理页。U 无 yield 忙循环以及远端 CPU1 的 timer 停止另行验证。runner 的 report
+预算为300秒，场景 Task 参数使用持久 backing，超时不释放尚可能使用的参数。
+NoMMU 的 public load 能力前置拒绝表示 private 场景不适用，不计隔离PASS。
+最新结果、精确保留核算缺口见 [报告 §7](component-runtime-consolidation.md#7-授权后的生产实现与验证)。

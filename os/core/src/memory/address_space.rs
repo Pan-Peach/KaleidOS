@@ -404,6 +404,33 @@ impl<B: AddressSpaceBackend> KernelAddressSpace<B> {
         true
     }
 
+    pub fn private_range_has_permission(
+        &self,
+        range: VirtualRange,
+        permission: MappingPermission,
+    ) -> bool {
+        if self.state != AddressSpaceState::Ready {
+            return false;
+        }
+        let Some(end) = range.base.checked_add(range.size) else {
+            return false;
+        };
+        let mut cursor = range.base;
+        while cursor < end {
+            let Some(mapping) = self.mappings.iter().find(|m| {
+                cursor >= m.virtual_range.base
+                    && cursor < m.virtual_range.base + m.virtual_range.size
+            }) else {
+                return false;
+            };
+            if !mapping.permission.contains(permission) {
+                return false;
+            }
+            cursor = end.min(mapping.virtual_range.base + mapping.virtual_range.size);
+        }
+        true
+    }
+
     /// Find an aligned hole for a new region. This proposes a VA only; map
     /// revalidates it before committing, including concurrent proposals.
     pub fn find_free_range(
@@ -639,6 +666,25 @@ impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
             .find(|s| s.id == handle.id && s.generation == handle.generation)
     }
 
+    /// # Safety
+    /// Caller has excluded every current and future activation of this root.
+    pub unsafe fn reclaim(
+        &mut self,
+        handle: AddressSpaceHandle,
+        free: arch::vm::PageFree,
+    ) -> Result<alloc::vec::Vec<Mapping>, MapError> {
+        let index = self
+            .spaces
+            .iter()
+            .position(|s| s.id == handle.id && s.generation == handle.generation)
+            .ok_or(MapError::NoSuchSpace)?;
+        let space = self.spaces.remove(index);
+        unsafe {
+            space.backend.release_page_tables(free);
+        }
+        Ok(space.mappings)
+    }
+
     pub fn get_mut(&mut self, handle: AddressSpaceHandle) -> Option<&mut KernelAddressSpace<B>> {
         self.spaces
             .iter_mut()
@@ -861,20 +907,52 @@ mod active {
         if !isolation_capable() {
             return Err(MapError::Unsupported);
         }
-        let backend =
-            <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
-                .map_err(|_| MapError::BackendFailed)?;
         crate::memory::kernel_mappings::with_shared_mappings(|shared| {
             let mut spaces = SPACES.lock();
+            // Reserve identity/metadata before allocating any physical root.
+            // create/adopt cannot fail after this point while the lock is held.
+            spaces
+                .spaces
+                .try_reserve(1)
+                .map_err(|_| MapError::OutOfMemory)?;
+            if spaces.next_id == u32::MAX {
+                return Err(MapError::OutOfMemory);
+            }
+            let backend =
+                <AddressSpaceImpl as AddressSpaceBackend>::create(crate::memory::vm_page_alloc)
+                    .map_err(|_| MapError::BackendFailed)?;
             let handle = spaces.create(owner, backend)?;
             for mapping in shared {
                 if let Err(error) = spaces.add_shared(handle, mapping) {
-                    let _ = spaces.retire(handle);
+                    unsafe {
+                        let _ = spaces.reclaim(handle, crate::memory::vm_page_free);
+                    }
                     return Err(error);
                 }
             }
             Ok(handle)
         })
+    }
+
+    pub fn private_mappings(
+        handle: AddressSpaceHandle,
+    ) -> Result<alloc::vec::Vec<Mapping>, MapError> {
+        let spaces = SPACES.lock();
+        let space = spaces.get(handle).ok_or(MapError::NoSuchSpace)?;
+        let mut mappings = alloc::vec::Vec::new();
+        mappings
+            .try_reserve_exact(space.mappings.len())
+            .map_err(|_| MapError::OutOfMemory)?;
+        mappings.extend_from_slice(&space.mappings);
+        Ok(mappings)
+    }
+
+    /// # Safety
+    /// Component teardown has drained all CPUs and blocked future activations.
+    pub unsafe fn reclaim(
+        handle: AddressSpaceHandle,
+    ) -> Result<alloc::vec::Vec<Mapping>, MapError> {
+        unsafe { SPACES.lock().reclaim(handle, crate::memory::vm_page_free) }
     }
 
     /// 在已建立的地址空间上落一段映射（Core 验证 → 后端写 PTE → Core 记录真相）。
@@ -904,6 +982,105 @@ mod active {
             .lock()
             .get(handle)
             .is_some_and(|space| space.range_has_permission(range, permission))
+    }
+
+    pub fn private_range_has_permission(
+        handle: AddressSpaceHandle,
+        range: VirtualRange,
+        permission: super::MappingPermission,
+    ) -> bool {
+        SPACES
+            .lock()
+            .get(handle)
+            .is_some_and(|space| space.private_range_has_permission(range, permission))
+    }
+
+    /// Pins mapping metadata/PTEs across IPC validation, Exchange commit and
+    /// copy-out. Lock order: registry -> endpoint -> AS -> Exchange -> Task.
+    pub struct Access {
+        spaces: spin::MutexGuard<'static, ActiveSpaces>,
+        handle: AddressSpaceHandle,
+    }
+    pub fn access(handle: AddressSpaceHandle) -> Result<Access, MapError> {
+        let spaces = SPACES.lock();
+        if spaces.get(handle).is_none() {
+            return Err(MapError::NoSuchSpace);
+        }
+        Ok(Access { spaces, handle })
+    }
+    impl Access {
+        pub fn valid(
+            &self,
+            address: usize,
+            len: usize,
+            permission: super::MappingPermission,
+        ) -> bool {
+            self.spaces
+                .get(self.handle)
+                .unwrap()
+                .private_range_has_permission(
+                    VirtualRange {
+                        base: address,
+                        size: len,
+                    },
+                    permission,
+                )
+        }
+        pub fn copy(
+            &mut self,
+            address: usize,
+            bytes: &mut [u8],
+            write: bool,
+            user: bool,
+        ) -> Result<(), MapError> {
+            let permission = super::MappingPermission::READ
+                | if write {
+                    super::MappingPermission::WRITE
+                } else {
+                    super::MappingPermission::empty()
+                }
+                | if user {
+                    super::MappingPermission::USER
+                } else {
+                    super::MappingPermission::empty()
+                };
+            if !self.valid(address, bytes.len(), permission) {
+                return Err(MapError::Unsupported);
+            }
+            let space = self.spaces.get(self.handle).unwrap();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let va = address + offset;
+                let pa = space.translate(va).ok_or(MapError::Unsupported)?;
+                let count = (bytes.len() - offset).min(4096 - va % 4096);
+                unsafe {
+                    if write {
+                        core::ptr::copy_nonoverlapping(
+                            bytes.as_ptr().add(offset),
+                            pa as *mut u8,
+                            count,
+                        );
+                    } else {
+                        core::ptr::copy_nonoverlapping(
+                            pa as *const u8,
+                            bytes.as_mut_ptr().add(offset),
+                            count,
+                        );
+                    }
+                }
+                offset += count;
+            }
+            Ok(())
+        }
+    }
+    pub fn copy_bytes(
+        handle: AddressSpaceHandle,
+        address: usize,
+        bytes: &mut [u8],
+        write: bool,
+        user: bool,
+    ) -> Result<(), MapError> {
+        access(handle)?.copy(address, bytes, write, user)
     }
 
     /// Reinstall a released extent's shared identity alias before physical reuse.
@@ -998,9 +1175,10 @@ mod active {
     )
 ))]
 pub use active::{
-    ActiveActivation, AddressSpaceImpl, create_isolated_address_space_for,
-    exclude_identity_alias_from_live_spaces, find_free_range, isolation_capable, map,
-    mapping_exact, prepare_activation, prepare_transition, range_has_permission,
+    Access, ActiveActivation, AddressSpaceImpl, access, copy_bytes,
+    create_isolated_address_space_for, exclude_identity_alias_from_live_spaces, find_free_range,
+    isolation_capable, map, mapping_exact, prepare_activation, prepare_transition,
+    private_mappings, private_range_has_permission, range_has_permission, reclaim,
     restore_identity_alias_to_live_spaces, retire, shared_executable_at, translate, unmap,
 };
 
@@ -1108,6 +1286,31 @@ pub fn find_free_range(
 )))]
 pub fn restore_identity_alias_to_live_spaces(_mapping: Mapping) -> Result<(), MapError> {
     Ok(())
+}
+
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn range_has_permission(_: AddressSpaceHandle, _: VirtualRange, _: MappingPermission) -> bool {
+    false
+}
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn private_range_has_permission(
+    _: AddressSpaceHandle,
+    _: VirtualRange,
+    _: MappingPermission,
+) -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -145,6 +145,8 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         core::ptr::addr_of_mut!((*state).convergence)
     });
     ipc::group(&mut checks);
+    ipc::domain_group(&mut checks);
+    ipc::lifecycle_group(&mut checks);
     hybrid_vfs::group(&mut checks);
     #[cfg(target_arch = "riscv64")]
     deployment::group(&mut checks);

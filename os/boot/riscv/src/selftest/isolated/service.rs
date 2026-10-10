@@ -363,7 +363,6 @@ pub(crate) fn isolated_service() -> ! {
 pub(crate) fn isolated_service_fault() -> ! {
     use kernel::component::call::{self, CallError};
     use kernel::component::endpoint::{EndpointError, ExecutionDomain};
-    use kernel::component::isolated_lifecycle;
     use kernel::component::load;
     use kernel::component::registry;
     use kernel::component::ComponentState;
@@ -468,17 +467,12 @@ pub(crate) fn isolated_service_fault() -> ! {
         Err(kernel::memory::address_space::MapError::Retired) => {}
         _ => fail("isolated-service-fault: address space was not retired"),
     }
-    for range in [
-        isolated_lifecycle::stack_range(),
-        isolated_lifecycle::window_range(),
-    ] {
-        if !matches!(
-            address_space::mapping_exact(provider.handle, &range),
-            Ok(None)
-        ) {
-            fail("isolated-service-fault: a Core-prepared window leaked");
-        }
-    }
+    super::lifecycle::assert_failure_released(
+        "isolated-service-fault",
+        provider.id,
+        provider.handle,
+    );
+
     {
         let reg = registry::get_registry().lock();
         let dead = kernel::component::endpoint::get_endpoints()

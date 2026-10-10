@@ -390,7 +390,7 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
 
-/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback.
+/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). K/I/U Task consumers on supported deployments; no Direct/Gate fallback.
 pub const KCORE_ENDPOINT_MECHANISM_IPC: u32 = 2;
 
 /// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。

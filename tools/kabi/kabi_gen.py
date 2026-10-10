@@ -2672,7 +2672,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 72
+    assert len(core.functions) == 74
     core_exports = {func.name for func in core.functions}
     assert {"kcore_component_current"} | {
         "kcore_ipc_" + name for name in

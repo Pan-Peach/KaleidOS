@@ -50,7 +50,7 @@
 //!   **保留内存**（state 存储不回收），Core containment 兜底；
 //! - panic → 由 Destroy 边界容纳（`CallOutcome::Panicked`）→ 同上；
 //! - **绝不自动重试析构**；`Failed` 是终态，tombstone 保留。`Stopped` 记录同样
-//!   保留（逻辑死亡、物理驻留），registry 不删除记录、image 不 unload。
+//!   保留；私有域后续可显式 reclaim，K image 保持驻留。
 
 use crate::component::containment::{self, CallOutcome};
 use crate::component::endpoint::ExecutionDomain;
@@ -122,7 +122,12 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
                 _ => ComponentStopError::NotReady,
             });
         }
+        registry
+            .pin_lifecycle(id)
+            .map_err(|_| ComponentStopError::StateRejected)?;
     }
+
+    let _execution = crate::component::load::LifecycleExecution(id);
 
     // 步骤 2：必需销毁入口。参数 = 实例在 create 时记录的 opaque state
     // （可为 NULL，无状态组件合法）。身份 = 被停止实例：KernelNative 走
@@ -143,8 +148,10 @@ pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
             containment::call_component_destroy(destroy, instance_state, id)
         }
         ExecutionDomain::IsolatedNative => isolated_lifecycle::destroy(id, destroy, instance_state),
-        // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
-        ExecutionDomain::SandboxedNative => todo!("Sandbox 执行器未实现"),
+        // U destroy 共用私有生命周期，由 sandbox runner 执行。
+        ExecutionDomain::SandboxedNative => {
+            isolated_lifecycle::destroy(id, destroy, instance_state)
+        }
     };
 
     // 步骤 3 的结果分类 + 步骤 4/5：兜底 → `Stopped`。
@@ -329,6 +336,15 @@ mod tests {
             ComponentState::Ready
         );
         assert_eq!(state, 7);
+        assert_eq!(
+            crate::component::reclaim::force_stop(id),
+            Err(crate::errno::Errno::ENOTSUP)
+        );
+        assert_eq!(
+            registry::get_registry().lock().get(id).unwrap().state,
+            ComponentState::Failed
+        );
+        assert_eq!(state, 7, "force cannot destroy a copied native context");
     }
 
     #[test]

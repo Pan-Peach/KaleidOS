@@ -64,8 +64,9 @@ pub struct ComponentRecord {
     /// service_dispatch / text_size / abi / MemoryLease）。
     pub loaded: LoadedComponent,
     pub instance_state: *mut (),
-    /// 未返回的 Gate / policy / IRQ 执行；Direct 不经 Core，不计入。
+    /// 未返回的 lifecycle / Gate / policy / IRQ 执行；Direct 不经 Core，不计入。
     pub inflight: u32,
+    pub(crate) reclaimed: bool,
 }
 
 // `instance_state` 是组件 opaque 指针：Registry 只存取、永不解引用。
@@ -128,6 +129,7 @@ impl Registry {
             loaded,
             instance_state: core::ptr::null_mut(),
             inflight: 0,
+            reclaimed: false,
         });
         // 出生也入 trace：否则"只声明未 resolve"的实例在事件流里不可见，
         // 而"失败组件是否被回收"这类断言需要看到它从哪来。
@@ -306,6 +308,9 @@ impl Registry {
         Self::count_execution(record)
     }
 
+    pub(crate) fn pin_lifecycle(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        Self::count_execution(self.record_mut(id)?)
+    }
     fn count_execution(record: &mut ComponentRecord) -> Result<(), RegistryError> {
         record.inflight = record
             .inflight
@@ -327,6 +332,39 @@ impl Registry {
     /// 该实例当前在飞行的调用数；未知实例为 0。
     pub fn active_calls(&self, id: ComponentId) -> u32 {
         self.get(id).map_or(0, |record| record.inflight)
+    }
+
+    #[cfg(all(
+        feature = "vm-mmu",
+        feature = "supervisor",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    ))]
+    pub(crate) fn retain_image(
+        &mut self,
+        id: ComponentId,
+    ) -> crate::memory::address_space::PhysicalRange {
+        let lease = self
+            .record_mut(id)
+            .expect("declared image")
+            .loaded
+            .memory
+            .as_mut()
+            .expect("owned image");
+        lease.retain_on_drop();
+        lease.region()
+    }
+
+    #[cfg(all(
+        feature = "vm-mmu",
+        feature = "supervisor",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    ))]
+    pub(crate) fn finish_reclaim(&mut self, id: ComponentId) {
+        let record = self.record_mut(id).expect("reclaim admitted instance");
+        record.address_space = None;
+        record.instance_state = core::ptr::null_mut();
+        record.loaded.memory.take(); // resident lease; physical release was explicit
+        record.reclaimed = true;
     }
 
     pub fn get(&self, id: ComponentId) -> Option<&ComponentRecord> {

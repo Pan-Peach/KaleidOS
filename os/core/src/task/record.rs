@@ -33,6 +33,11 @@ pub struct TaskRecord {
     pub(crate) irq_flags: Option<<arch::CpuImpl as arch::CpuArch>::IrqFlags>,
     pub kstack: Kernelstack,
     pub(crate) memory: Option<MemoryLease>,
+    /// Private component stack mapping; backing remains resident until AS drain.
+    pub(crate) private_stack: Option<crate::memory::address_space::VirtualRange>,
+    pub(crate) exit_requested: bool,
+    pub(crate) execution_retired: bool,
+    pub(crate) api_stack: Option<MemoryLease>,
     #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
     pub(crate) user: Option<Box<super::user::UserDomain>>,
     #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
@@ -64,6 +69,10 @@ impl TaskRecord {
             irq_flags: None,
             kstack,
             memory: Some(memory),
+            private_stack: None,
+            exit_requested: false,
+            execution_retired: true,
+            api_stack: None,
             #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
             user: None,
             #[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]

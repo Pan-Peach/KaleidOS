@@ -3,7 +3,7 @@
 use super::{Export, ExportAddress};
 use crate::generated::abi::*;
 
-pub(super) static EXPORTS: [Export; 72] = [
+pub(super) static EXPORTS: [Export; 74] = [
     // Category 0：Trace / 时钟（只读观察面）
     Export {
         name: b"kcore_trace_read",
@@ -153,6 +153,20 @@ pub(super) static EXPORTS: [Export; 72] = [
         name: b"kcore_component_stop",
         address: ExportAddress({
             let implementation: extern "C" fn(u32) -> i32 = super::kcore_component_stop;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_component_force_stop",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_component_force_stop;
+            implementation as *const ()
+        }),
+    },
+    Export {
+        name: b"kcore_component_reclaim",
+        address: ExportAddress({
+            let implementation: extern "C" fn(u32) -> i32 = super::kcore_component_reclaim;
             implementation as *const ()
         }),
     },

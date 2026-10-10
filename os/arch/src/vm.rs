@@ -36,6 +36,7 @@ bitflags! {
 /// 因为 `os/arch` 不能依赖 `os/core`，Core 在初始化时把这个函数地址塞进
 /// 当前 RISC-V 页表 backend。v1 identity 阶段返回的物理地址可直接当虚拟地址解引用。
 pub type PageAlloc = fn() -> Result<usize, ()>;
+pub type PageFree = fn(usize);
 
 /// Contract `KernelAddressSpace` drives. Methods take raw ranges/permissions;
 /// Core validates & commits around the call. The active architecture backend
@@ -84,4 +85,13 @@ pub trait AddressSpaceBackend {
     /// 真正的寄存器写入仍在 `activate()`（切换汇编消费本返回值，见
     /// `arch::riscv::trampoline`）。
     fn prepare_activation(&self) -> Self::Activation;
+
+    /// # Safety
+    /// No CPU may activate or retain execution in this root. All translations
+    /// must be drained before returning its exclusively owned page-table pages.
+    unsafe fn release_page_tables(self, _free: PageFree)
+    where
+        Self: Sized,
+    {
+    }
 }

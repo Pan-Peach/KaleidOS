@@ -8,6 +8,7 @@ pub enum TaskError {
     NotFound,
     /// 内存不足。
     NoMemory,
+    InvalidOutput,
     /// 状态机非法转换（如 Runnable 再 start、Exited 终态再推进）。
     InvalidTransition,
     /// 请求创建任务的组件不存在（requester 未声明）。

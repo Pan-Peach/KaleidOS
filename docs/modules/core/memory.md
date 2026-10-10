@@ -22,11 +22,16 @@
 
 ## 明确不做
 
+Runtime回收：retire 仅改状态；显式 reclaim 在证明 root/Task/inflight 静止后移除
+AS 并归还 Sv39/Sv32 自有页表 frames。PageFree 不释放叶子 backing；私有独占 extents
+由 component/reclaim 单独归还。unmap 不等于 free，K/DMA 与普通用户已发布 backing
+不从此接口推导可回收。见[回收矩阵](../../architecture/memory-and-heap.md#9-runtime-回收矩阵目标与基线)。
+
 - **不把帧 / 区域分配暴露给组件**：`alloc_region` / `vm_page_alloc` 不在导出白名单——物理分配是 Core 内部机制（`AGENTS.md`）。
 - 不做内存记账：无 region owner 记录、无 region id、无 Retired 表，也不做 per-instance 字节计费 / 配额（`D1` 已修订；见 `docs/architecture/memory-and-heap.md`）。堆由 runtime / deployment 策略决定，不是 Core 记账。
 - `alloc_region` **不负责清零**。
 - `ALLOC_GRANULE` 与 `AddressSpaceBackend::GRANULE` 语义解耦（数值同为 4 KiB 只是巧合）。
-- `AddressSpaceManager` 由 Core 的 Isolated 生命周期与 backing ABI 使用（`component/isolated_lifecycle.rs` 为实例建私有 AS、落按域镜像与 Core 预置窗口；`kcore_address_space_map` 刻意不在导出白名单）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`prepare_transition` + 最小跨 AS trampoline 与 `component/isolated_load.rs` 的按域放段 / 逐段映射由 `isolated_lifecycle.rs` 生产消费（create / destroy / service dispatch，含 Core 预置窗口 backing）；ArchTest 另直接驱动机制用例（`isolated-transition*` / `isolated-image*` / `isolated-lifecycle*` / `isolated-service*`）。失败 / 重启矩阵（`isolated-load-reject` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-stale-access` / `isolated-ready-fault` / `isolated-restart`）把窗口生命周期钉成两条路径：create / service 故障归还 backing，destroy 路径只退役 AS（窗口驻留）。
+- `AddressSpaceManager` 由 Core 的 Isolated 生命周期与 backing ABI 使用（`component/isolated_lifecycle.rs` 为实例建私有 AS、落按域镜像与 Core 预置窗口；`kcore_address_space_map` 刻意不在导出白名单）；boot 的长期 root 仍由 boot 的 `RuntimeVm` 持有（`adopt` hook 未接线）。`prepare_transition` + 最小跨 AS trampoline 与 `component/isolated_load.rs` 的按域放段 / 逐段映射由 `isolated_lifecycle.rs` 生产消费（create / destroy / service dispatch，含 Core 预置窗口 backing）；ArchTest 另直接驱动机制用例（`isolated-transition*` / `isolated-image*` / `isolated-lifecycle*` / `isolated-service*`）。失败 / 重启矩阵（`isolated-load-reject` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-stale-access` / `isolated-ready-fault` / `isolated-restart`）把窗口生命周期钉成两条路径：create / service / destroy 失败先保留窗口，直到同一显式 reclaim 证明成立。
 
 ## 代码在哪
 
@@ -38,4 +43,4 @@
 | `os/core/src/memory/slab.rs` | 小对象 slab 分配器 |
 | `os/core/src/memory/test_support.rs` | host 测试初始化 / guard |
 
-Isolated 动态 backing：`component/backing.rs` 在实例 AS 内选择空闲 VA、映射并排除共享 identity 别名；精确 release 撤映射并恢复共享别名后才归还物理 extent。root 创建与 backing 发布/释放共用 PLAN→SPACES 锁序。`isolated-heap` 验证同工件 K/I 堆后端、增长、release 与多实例隔离；停止后的堆 backing 仍驻留。
+Isolated 动态 backing：`component/backing.rs` 在实例 AS 内选择空闲 VA、映射并排除共享 identity 别名；精确 release 先恢复共享别名再撤 owning mapping，完成后才归还物理 extent。root 创建与 backing 发布/释放共用 PLAN→SPACES 锁序。`isolated-heap` 验证同工件 K/I 堆后端、增长、release 与多实例隔离；停止后的堆 backing 先驻留，CPU-only 私有域显式 reclaim 后归还。

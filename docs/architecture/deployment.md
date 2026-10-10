@@ -1,16 +1,16 @@
 # 部署与绑定：执行域约束交互机制（deployment.md）
 
-> 本文件是**"部署（deployment）决定调用机制"**的设计契约：谁提议部署、Core 验证什么、`(caller domain, callee domain)` 如何选出调用机制、binding 携带什么、不支持的组合如何拒绝。
-> 它是**设计契约，不是进度快照**。**KernelNative 与受限的 IsolatedNative 两种部署真实存在**：K/I 双向 Gate 已真正派发（§10）；Sandbox transport 仍**未实现**（§10 是实现状态表，§7 是逐条缺口）。
+> 本文件规定部署能力、Core 验证与绑定边界；支持范围以 §10 与源码为准。
 
-KernelNative Task Request/Reply 的窄契约见 [IPC](ipc.md)。IPC-only 发布由
-`port=0, api=NULL, ctx=NULL` 表示，bind 在 exact/live 校验后只允许 K/K，返回 Ipc=2
-与零 api/ctx；涉及 Isolated/Sandboxed 显式拒绝。原始 IPC 入口不自动 legacy bind，
-submit 每次复验域和 grant。当前全部普通业务服务使用上述 IPC-only 发布。下文 Direct/Gate 矩阵描述保留的同步策略/诊断发布，
-普通 Block/Filesystem SDK 不接受这些历史 binding；
-持久私有域 Task 与新跨 AS IPC 尚未实现，不能退回裸指针隐藏缺口。
+普通业务使用 Endpoint Request/Reply：K 经 Core C ABI，I 经 Core 栈/root 桥接，
+U 经私有 syscall thunk/ecall。IPC-only 发布 `port=0, api=NULL, ctx=NULL`，bind
+验证 exact/live 后返回 Ipc=2 与零 api/ctx；原始 IPC 仍须显式 grant。
+RV64 S/MMU 支持 K/I/U 九格，RV32 S/MMU 支持 K/I 四格；RV32 U 与无 MMU
+私有域显式拒绝。Provider 在自己的 Task/AS 下处理 Core 副本。详见 [IPC](ipc.md)。
 
-> 与 `docs/architecture/component-lifecycle.md` 在"同一份组件代码能否跨执行域原样运行"上冲突时，**以本文件为准**：`component-lifecycle.md` §9"代码页去重是未来的 loader / MM 优化，不是 ABI / 生命周期承诺"的结论**由本文件补充**（见 §6、§8）。本文件不否认它的现状描述，而是把目标写清楚，并把缺口显式登记。
+下面的 Direct/Gate 矩阵只描述保留的同步策略/诊断，不允许普通业务新增这些路径。
+Contract/Handler 可复用；不同 ISA、特权级、import 面不保证二进制天然兼容。
+身份和入口 ABI 以 [生命周期](component-lifecycle.md) 为准。
 
 ---
 
@@ -95,7 +95,7 @@ Server Task；部署决定合法调用窗口，不代替 provider 的并发、�
 
 ③ Core 选定 mechanism（一次性，bind 时）
      输入：(caller domain, callee domain)
-     输出：Direct | Gate | rejected（syscall-IPC 未实现）
+     输出：IPC-only 发布返回 Ipc；同步诊断按 Direct | Gate | rejected
      规则见 §3 模式矩阵
 
 ④ Core 交付 binding 并记录 trace（没有单独的 binding registry）
@@ -127,7 +127,7 @@ grant capability，不能把可发现当作不可信组件的访问授权。
 
 行 = caller 的执行域，列 = callee 的执行域。单元格 = **合法机制**。`rejected` 表示该组合**必须被 Core 显式拒绝**。
 
-> **实现状态**：K/K Direct（及显式 Gate）、K→I、I→K、I→I Gate 均已接线；Sandbox 参与的调用仍显式拒绝。ArchTest `isolated-domain-service` 在 RV64/RV32 以同一工件、专用 test-only `domain.test` 同步前端验证四种组合、嵌套、panic、stale 与循环重入。
+> **实现状态**：K/K Direct（及显式 Gate）、K→I、I→K、I→I Gate 均已接线；Sandbox 参与的同步 Gate 调用仍显式拒绝；普通 IPC 支持表见 §10。ArchTest `isolated-domain-service` 在 RV64/RV32 以同一工件、专用 test-only `domain.test` 同步前端验证四种组合、嵌套、panic、stale 与循环重入。
 
 | caller ↓ \ callee → | KernelNative | IsolatedNative | SandboxedNative |
 |---|---|---|---|
@@ -135,14 +135,13 @@ grant capability，不能把可发现当作不可信组件的访问授权。
 | **IsolatedNative** | **Gate** | **Gate** | **rejected** |
 | **SandboxedNative** | **rejected** | **rejected** | **rejected** |
 
-这是当前支持矩阵。每个 Isolated 实例有自己的 AS，I/I 不交付裸指针。Sandbox
-部署和参与的 binding 都返回 ENOTSUP；没有隐式 KernelNative fallback。
-未来跨特权交互需要真实 U-mode 进入、ecall 与访问检查，不能从现有 Gate 推导。
+这是同步诊断矩阵。I/I 不交付裸指针；U 不支持 Gate/Direct。
+普通 IPC 不使用此表：RV64 的真实 U runner/ecall 已接线，无 native fallback。
 
 同一个实例可以零 Task、多个 Task、Direct 与 Worker 共存；Worker 请求编码、
 队列、reply、取消和业务同步属于组件 / Runtime。Gate 的同步调用栈不可 yield，
 不能把它与可阻塞的 Task Request/Reply 当成同一执行上下文。Wasm 是未来执行后端，
-不是第四个 ExecutionDomain。没有通用 Core RPC 子系统。
+不是第四个 ExecutionDomain。已有有界Endpoint Exchange；Core不管理通用业务RPC语义。
 
 **为什么 native binding 绝不能跨域传递：**
 
@@ -165,7 +164,7 @@ Direct binding 携带的是 `(api, ctx)` 两个**裸指针**，只在 provider �
 - Direct 下 provider 与 caller 同特权、同地址空间：**没有** Core 拥有的边界来切换 owner，也**没有**可恢复的上下文来收敛 provider 的 panic。B panic = 进程级 abort 的一部分，Direct **不**承诺 caller 存活。
 - Gate 下 provider 跑在 Core 拥有的 per-call service stack 上，principal = provider 自己，provider panic 被 Core 收敛（标 `Failed`、撤销 authority、永久失效其 endpoint），**caller 存活且不变**。
 
-**`inflight` 计 Core 管理的 Gate、policy 与 IRQ 执行。** Core 的 endpoint `inflight` 计数在**经 Core 边界** 的执行上递增；Direct 绑定**完全绕过 Core**，Core 看不到。因此：
+**`inflight` 计 Core 管理的 lifecycle、Gate、policy 与 IRQ 执行。** Core 的 endpoint `inflight` 计数在**经 Core 边界** 的执行上递增；Direct 绑定**完全绕过 Core**，Core 看不到。因此：
 
 > **"inflight == 0 → 可以 stop（否则 -EBUSY）"永远不能证明"所有调用都已结束"。** 它只证明"没有正在进行的 Core-managed 调用 / 回调"。若存在 Direct 绑定，consumer 手里那张 function table 的调用对 Core 不可见——这正是 KernelNative 无隔离 + 物理驻留的直接后果。teardown 的正确性不能仅建立在 `inflight` 上。当前 Native 实例发布非空 Direct 表即保守拒绝 Stop/destroy（EBUSY），旧表、ctx 保持驻留；没有 Direct release 协议。
 
@@ -242,20 +241,19 @@ VirtIO/RAM 的 Server 复用 SDK `block::server::serve`。DLL式函数表、业�
 
 ### 6.1 `kcore_*` import 在三种部署下如何解析（目标）
 
-```text
-Native    ：直接符号地址（现状：loader 重定位到 export 白名单解析出的函数地址）
-            → loader.rs:337-341（export::resolve）
-Isolated  ：支持面 import 解析到共享 Core 低别名 → 普通 C-ABI 直接调用（satp 不变）
-            → 已实现（isolated_load.rs::SUPPORTED_IMPORTS）；更宽的 import 面未实现
-Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
-            → 未实现（wire ABI 设计见 driver-model.md §6.4）
-```
+已实现支持面：K 链接普通 Core C ABI；I 白名单由 `isolated_load::SUPPORTED_IMPORTS`
+限定，Task/IPC 经 `isolated_api::on_core` 切到真实 Core root/栈；U 白名单由
+`sandbox::IMPORTS` 限定，loader 将符号解析到 USER RX thunk。
+U thunk 使用 t0 放调用编号，保留 a0..a7，因此覆盖现有七/八参数 C ABI，
+不新增业务 wire 或传输描述符。`export/sandbox.rs` 调用已有 Core API。
+I/U 拒绝共享 Core heap、设备/DMA/IRQ 与组件创建 import；U 也拒绝 Gate。
+私有 heap 使用各实例 image 中的 HeapState 与本域 backing。
 
 ### 6.2 text / data / bss / instance-state 的 VA 与重定位
 
 - 现状（KernelNative）：**每次 instantiate 都重新放段 + 重新应用重定位**（`loader.rs`，返回 `LoadedComponent`，存进本组件的 `ComponentRecord`）；段放置只提供段内对齐、**没有页级权限分离**；import 对每次放置各解析一次；`create` / `destroy` / `service_dispatch` 是绝对 `usize`，运行时被 transmute 成函数指针（`os/core/src/component/containment.rs:906,913`）。`.text` / `.rodata` 物理去重尚未做（未来 loader / MM 优化）。
-- **Isolated 生命周期 + 跨域 service Gate + 失败/重启矩阵已接线**：`os/core/src/component/isolated_load.rs` 按域重新放段——每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），并按域 base 重新应用重定位（复用 `loader.rs` 的私有 ELF API，绝不复用 KernelNative 放段结果）；`os/core/src/component/isolated_lifecycle.rs` 创建私有 AS、落镜像、预置**组件栈 + 实例内存窗口**，经 跨 AS trampoline 执行 `kcomp_instance_create` / `kcomp_instance_destroy` 与 `kcomp_service_dispatch`（KernelNative caller → Isolated provider），任一步失败即退役 AS + 归还预置窗口 + `Failed`。由 ArchTest 在 RV64 + RV32 QEMU 端到端证明（`isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-service` / `isolated-service-fault`）：组件在私有 AS 里跑过、ABI 交窗口（args / config / out_state，串行布局见下）正确、新上下文以 `tp == 0` 进入（`tp` 是普通架构 / 任务执行状态，不是组件运行时指针）、窗口只在该实例 AS 里可达、destroy 入口真的执行、Core AS 每次切换后恢复；跨域调用的扁平帧**直接**交付（caller 是 KernelNative，共享 Core 映射让 `frame` / args / input / output 在 provider 的 AS 里 same VA → same PA 直接有效——无拷贝、无中间页）、provider 原地读写 caller 缓冲、provider 故障被 普通 Core trap 路径收敛（caller 拿到类型化错误、实例 `Failed` + AS 退役）。
-- **失败 / 重启矩阵**：每个阶段的失败都有可观察终态与清理——放段失败 / import 白名单外符号在**声明实例之前**拒绝（`isolated-load-reject`）；config 超窗口固定区在 create 入口执行前拒绝（`isolated-config-reject`）；create 入口返回非零 / trap（`isolated-lifecycle-fail` / `isolated-lifecycle-fault`）与 service dispatch 故障（`isolated-service-fault`）都走"Core 中止实例"：退役 AS + **解映射并归还**预置窗口（栈 / 窗口）+ `Failed` + endpoint 永久失效；destroy 入口 trap 走"实例生命尽头"路径（`isolated-destroy-fault`）：`DestroyPanicked` + `Failed` + 退役 AS，**窗口按 phase 1 契约保持驻留**（AS 退役后不可进入），且**绝不重试析构**；`isolated-prepare-reject` 钉住 `isolated::prepare` 的窄拒绝（入口不可执行 / 栈不可写 / AS 已退役 → 类型化错误，且不改变实例真相）；`isolated-stale-access` 证明已解析但已死的 endpoint 在 Core 边界被拒（provider 从未再次执行）；`isolated-ready-fault` 证明"已经服务过调用"的实例故障后仍被完整收敛；**重启 = 重新 instantiate**（`isolated-restart`）：前一个组件 `Failed` / `Stopped` 之后，同名 artifact 创建**全新组件**——全新按域放置、全新私有 backing、全新 AS / 全新预置窗口；同一 artifact 的**多个并发组件合法**（各自独立 backing + AS）。**支持面 import 解析已实现**（诊断 / 只读、panic、私有 backing 与 endpoint API，解析到共享 Core 低别名、普通 C-ABI 直接调用、`satp` 不变）；更宽的 import 面（共享堆、调度入口、组件创建、设备 / DMA / IRQ）仍显式拒绝，Isolated provider 可自行 staged publish，K/I caller 均可通过 SDK 发起调用。
+- **Isolated 生命周期 + 跨域 service Gate + 失败/重启矩阵已接线**：`os/core/src/component/isolated_load.rs` 按域重新放段——每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），并按域 base 重新应用重定位（复用 `loader.rs` 的私有 ELF API，绝不复用 KernelNative 放段结果）；`os/core/src/component/isolated_lifecycle.rs` 创建私有 AS、落镜像、预置**组件栈 + 实例内存窗口**，经 跨 AS trampoline 执行 `kcomp_instance_create` / `kcomp_instance_destroy` 与 `kcomp_service_dispatch`（KernelNative caller → Isolated provider），已声明后的失败退役 AS + 保留预置窗口至显式 reclaim + `Failed`。由 ArchTest 在 RV64 + RV32 QEMU 端到端证明（`isolated-lifecycle` / `isolated-lifecycle-fail` / `isolated-service` / `isolated-service-fault`）：组件在私有 AS 里跑过、ABI 交窗口（args / config / out_state，串行布局见下）正确、新上下文以 `tp == 0` 进入（`tp` 是普通架构 / 任务执行状态，不是组件运行时指针）、窗口只在该实例 AS 里可达、destroy 入口真的执行、Core AS 每次切换后恢复；跨域调用的扁平帧**直接**交付（caller 是 KernelNative，共享 Core 映射让 `frame` / args / input / output 在 provider 的 AS 里 same VA → same PA 直接有效——无拷贝、无中间页）、provider 原地读写 caller 缓冲、provider 故障被 普通 Core trap 路径收敛（caller 拿到类型化错误、实例 `Failed` + AS 退役）。
+- **失败 / 重启矩阵**：失败后 Failed、AS 退役、Endpoint 永久失效；已发布窗口与 image 保留至显式 reclaim。destroy 故障不重试。ArchTest 验证失败窗口先留驻、reclaim 后旧 AS handle 不再存在。重启获得全新 ComponentId/AS/backing；Task/IPC import 已接，设备/DMA/IRQ 与共享 heap 继续拒绝。
 - **Isolated 的内存路径（Core 预置窗口，窄 import 面）**：Core 为每个实例预置一块**实例内存窗口**（Core backing、零初始化、只映射在该实例的私有 AS），以固定串行布局交付 create args / `out_state` / config——`+0` `KcompCreateArgs`、`+32` `out_state`(`usize`)、`+64` config payload（`WINDOW_CONFIG_MAX = 256`）、`+320` 域 `MemoryView`（24 B）、`+352` runtime 部署描述符（RV64 24 B / RV32 16 B），窗口大小 4096。旧 `+64` 的 64 字节 "runtime context block" **已删除**；全新同步进入的 Isolated 上下文观察到 `tp == 0`（`tp` 只是架构 / 任务执行状态，见 `docs/modules/arch.md`）。Core 以 **`kcore_memory_view` 编码**（`kind = LOCAL_VA`、`base/len` = 本窗口）把该域视图预交付给实例。表示是**实例内 VA**（`view.base/len` 只在那个 AS 里有意义，归属由该实例的页表承载；绝不出现物理地址 / Core 私有 VA），ArchTest `isolated-lifecycle` 断言编码与「窗口只在该实例 AS 里可达」。`kcore_memory_acquire/release` 已加入 Isolated import 面：按调用身份取得实例 AS，动态 backing 放在 `0x23000000..0x2f000000`，release 只接受该窗口内的精确 acquire 映射。SDK runtime 在业务 create 前初始化，使同一个工件的分配自动选择 K 共享堆或 I 私有堆（见 `memory-and-heap.md` §6.1）。Isolated 仍是 S-mode 普通直接调用；ecall 属于后置的 SandboxedNative。
 - **跨域 service 传输**：K caller 保留共享 Core 映射下的直接帧/缓冲交付。I caller 经 `isolated_call` 检查范围权限、搬运 args/input/output、切到独立 Core 栈与挂起的 Core root，再按 provider 域分派；返回后恢复 caller root，传输成功时写回 output/status。payload 是不透明字节，嵌套指针由 SDK adapter 编码；provider 不得保留本次借用。没有固定长度上限，资源不足返回 ENOMEM。
 - **同一 artifact 能否按域重定位？** 可以，但**必须按域重新放段 + 重新解析 import**（新 `base`、新 import 目标）。Isolated 侧已具备"按域重新放段 + 重定位 + **支持面 import 解析**"（支持面 = 诊断 / 只读查询、panic、私有 backing 与 endpoint API，解析到共享的低别名，运行时是普通 C-ABI 调用、`satp` 不变）；KernelNative 侧每次 instantiate 重新放段 / 重定位、完整导出面。
@@ -266,16 +264,9 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 ### 6.3 依赖排序的缺口清单
 
-按依赖顺序，前者不成立后者无从谈起：
-
-1. **执行域字段 + 私有 AS 运行时**：`ComponentRecord::execution_domain`（已落地）、私有地址空间、`satp` 切换、ASID、U-mode、`ecall` 处理。
-   （**私有 AS 切换机制已落地**：最小跨 AS trampoline（共享 Core 映射） + Core 侧准备 + 窄故障分派；**组件生命周期已接入**（create / destroy 都经跨 AS trampoline），**K/I 双向 service 已接入**（I 出站经 Core 栈/root 桥接，I provider 经跨 AS trampoline 执行 dispatcher），**失败 / 重启矩阵已逐条证明**（含 destroy 故障、stale 阻断与重新 instantiate（重启），见 §10）；**ASID / U-mode / `ecall` 仍未实现**。）
-2. **loader 按域放段 / 按域 import 解析**：每次 instantiate 都按域重新放段 + 重定位（`component/isolated_load.rs` / `isolated_lifecycle.rs`）；`kcomp_service_dispatch` 已按域解析成实例域 VA；**没有 same-image backing 复用**——同一 artifact 的多个组件（含并发 Isolated）各自全新 backing / AS。按域 **import** 解析的**支持面已实现**（诊断 / 只读查询、panic、私有 backing 与 endpoint API，解析到共享 Core 低别名、普通 C-ABI 直接调用、`satp` 不变）；更宽的 import 面未实现。KernelNative 侧同样是每次 instantiate 重新放段。
-3. **per-domain 本地入口 / adapter**：Gate 的 image 级入口 `kcomp_service_dispatch` 已按域调用（KernelNative = 共享 AS 内 Core 栈、Isolated = 私有 AS 内经跨 AS trampoline）；Direct 的按域 function table 与其它 transport 仍未接线。
-4. **组件支持范围元数据**：manifest **没有**任何字段声明组件支持哪些部署（`os/core/src/component/store.rs` 只解析 `manifest` 文本 + 组件条目）。
-5. **平台能力声明 + 拒绝语义**：MMU / IOMMU / 特权级 / 私有 AS 是否具备，以及"不具备就拒绝"的路径（`driver-model.md` §11 的能力诚实表）。
-
----
+已接通 load → private Task → Core IPC adapter → own Server Task → stop/force →
+显式 CPU-only reclaim。剩余先补一般 Graceful 通知/drain、OOM/竞态矩阵与精确保留
+核算，再考虑 remote TLB shootdown、RV32 U 和设备部署；路由仅设计，不是前置。
 
 ## 7. 已有 / 目标 / 缺口（逐条，带 `file:line`）
 
@@ -283,12 +274,13 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 ### 7.1 执行域与隔离
 
-| 项 | 已有 | 目标 | 缺口 / 证据 |
-|---|---|---|---|
-| 私有地址空间 | **已接线**：按域放段、共享 Core 映射、私有 backing 别名排除、跨 AS trampoline、生命周期与 K/I 双向 Gate；异常由普通 trap 路径归因 | ASID / U-mode / Sandboxed 执行器、任务与 DMA teardown 仍未实现 | `memory/{address_space,kernel_mappings}.rs`；`component/{isolated,isolated_call,isolated_lifecycle}.rs`；`arch/src/riscv/trampoline/` |
-| 上下文切换 | 普通 Task 保存 `ra/sp/s0-s11/tp` | 含 `satp` 切换 | `os/arch/src/riscv/cpu.rs` 的 `RiscvContext`（不含 satp，IRQ 使能由 Core 执行流状态另存）；跨 AS 进入走独立的最小 trampoline（`arch/riscv/trampoline/`，每次调用独立 `Context`：调用者 `satp` + ABI 现场按需保存 / 恢复，`satp` 只在目标与调用者不同时切换 + 全量 `sfence.vma`）；普通任务切换仍用 `__switch`（`RiscvContext`） |
-| `activate()` | 写 satp + sfence，**运行期无人调用**（boot 的 runtime root 除外） | 按域激活 | `os/arch/src/riscv/mmu/mod.rs`；boot 的 runtime root 在 `kernel::init` 后 activate；Isolated 切换由 `trampoline` 直接消费 `PreparedActivation` 的预打包 satp，ASID 恒 0 |
-| U-mode 组件后端 | **SandboxedNative 组件未实现**；RV64 普通用户 Task 的 U-mode / trap 已接线 | U-mode 组件 import、heap、生命周期与服务授权 | 普通用户路径 `os/core/src/task/user.rs`，personality 见 [POSIX 模块](../modules/posix.md)；不能从它推导 `.kcomp` Sandbox 可用 |
+| 项 | 已有 | 剩余边界 / 源码 |
+|---|---|---|
+| 私有 AS | I: RV64/RV32；U: RV64；独立 image/heap/stack、页权限、AS teardown | `isolated_load.rs`、`isolated_lifecycle.rs`、`memory/address_space.rs`；I 是可信 S-mode |
+| Task 调度 | 每 Task Core 栈和私有业务栈；AS 从唯一 ComponentRecord 查询 | `task/mod.rs`、`isolated_api.rs`；RiscvContext 不存 satp，yield/park 先回 Core root |
+| U-mode | 复用普通 arch UserContext/trap；ecall adapter、10ms timer 返回 Core | `sandbox.rs`、`export/sandbox.rs`；RV32 U 仍 ENOTSUP |
+| TLB | ASID=0；每次跨域进入/返回全量 sfence | 无远端 shootdown；reclaim 要求全局私有域安全点，否则 EBUSY |
+| 物理回收 | 私有 CPU-only backing/页表/Task 栈显式归还 | `reclaim.rs`；K backing、DMA、不可追踪裸引用不承诺 |
 
 ### 7.2 重新放段与入口
 
@@ -298,9 +290,9 @@ Sandbox   ：syscall stub（自有稳定 wire ABI，ecall 进 Core）
 
 ### 7.3 部署 / 模式字段
 
-| 项 | 已有 | 目标 | 缺口 / 证据 |
-|---|---|---|---|
-| 部署字段 | **已实现** | 组件实例 / 部署域记录 | `ComponentRecord::execution_domain` 落地 + 创建入口按域分派（见 §10）；`KernelNative` / `IsolatedNative` 两域可执行，`SandboxedNative` 是 Core `sandbox.rs` 骨架（create 装载前 `-ENOTSUP`，U-mode / destroy 未实现） |
+`ComponentRecord.execution_domain/address_space` 仍是唯一部署真相。
+K/I/U 共用 ComponentId、LoadedComponent 和 staged publication；无 Image/Instance 二级表。
+请求超出平台/白名单能力返回 ENOTSUP，不退化到 KernelNative。
 
 ### 7.4 consumer ABI 校验
 
@@ -370,17 +362,16 @@ transport、AS 并发回收与 DMA 静默条件。每项先有消费者与验证
 ### 9.2 Native（QEMU，RV64 + RV32）
 
 - **真实 C / Rust 链**：consumer 经 typed 前端调 provider 的**真实**实现。
-- **稳态 direct call**：typed 前端直接走 function table，**不经 `kcore_endpoint_call`**，**不分配 service stack**（用 trace / 计数器证明）。
+- **稳态 IPC**：普通typed前端使用生成client/dispatcher，在真实owner Server Task处理；不退回function table。保留同步诊断单独验证Direct/Gate。
 - **RV32 / RV64 布局与宽度一致**：`KcompCallFrame` `size_ptrs = 6`（32/64 同布局）；kcore ABI 宽度规则（`overview.md` §5）。
 
 ### 9.3 执行域验证
 
-- Isolated 的真实 satp / 栈切换、参数可达性、权限、panic、重入与重启由 QEMU
-  ArchTest 的 `isolated-*` 验证；CoreTest 通过公开 ABI 验证 K/I 业务调用组合。
-- host fake 不执行组件入口，只证明协议和状态记账；不作为硬件隔离证据。
-- Native containment 的寄存器 / 栈切换不是 AS 切换；Isolated 经专用跨 AS trampoline。
-- SandboxedNative 尚未实现。U-mode 普通用户程序的测试不等于 Sandbox 组件实现。
-- RV64 Gate/Stop 的双 CPU 在途执行验证由 CoreTest 编排，不用私有表模拟并行。
+CoreTest 使用同一 Echo artifact/生成 Contract/Handler，RV64 覆盖九格、RV32 覆盖
+四格真实 IPC。另有 private bad-buffer、fault、1000 次 load/IPC/stop/reclaim/stale、
+U 非协作忙循环与远端 CPU 停止测试。ArchTest 保留原 K/I Gate、RX/NX、fault/restart
+等硬件回归，并检查失败窗口保留到显式 reclaim。host 不作为隔离证据。
+完整失败/OOM、所有 IPC 退出竞争、跨 CPU copy/unmap、精确常驻 metadata 核算仍待补齐。
 
 ### 9.4 性能
 
@@ -393,53 +384,37 @@ transport、AS 并发回收与 DMA 静默条件。每项先有消费者与验证
 | **AS-switch cost** | 跨域切换地址空间 / 特权级的开销（Gate / syscall 才有） |
 | **data-transfer cost** | 参数 / 负载搬运（frame 打包、跨域拷贝） |
 
-**Native 基线 = 裸 function table 直接调用**（无 Core 通用分派、无栈分配、无消息打包）。任何 Gate / syscall 的数字都必须对照这条基线报告。
+普通业务报告当前Native IPC基线；旧裸function table/Gate数字只作为历史对照，不能
+因它更快重新增加普通业务Direct。私有域性能分离AS切换与copy，当前尚无新I/U IPC数据。
 
 ---
 
 ## 10. 实现状态
 
-> **这张表是防止把目标当成现状的唯一防线。**
-
-| 能力 | 状态 | 证据 |
+| 能力 | 当前支持 | 边界 / 文件 |
 |---|---|---|
-| Contract（名字 + exact ABI + repr(C) table） | **已实现** | `abi/block.toml`、`block.rs:68-75` |
-| Artifact → Component（一次 instantiate = 一个完整组件，各自独立可写 image） | **已实现** | `registry.rs`（`ComponentRecord.loaded`）、`load.rs`、`loader.rs` |
-| Endpoint 真相（publish / discover / invalidate） | **已实现** | `endpoint.rs` |
-| Gate 调用边界（per-call stack + principal + panic containment） | **已实现** | `call.rs`、`containment.rs` |
-| SchedulerPolicy 专用路径（选择 = `kcore_sched_set_policy`；`PolicyCall` 边界；通用调用拒绝保留契约；vtable + 名字绑定已删） | **已实现** | `sched.rs`、`component/call.rs`、`containment.rs`、`abi/scheduler.toml` |
-| `kcore_endpoint_call` 文档与代码一致 | **已做（KernelNative 执行边界）**：abi doc 写"执行边界已落地"并指向 `component/call.rs`；跨域（Isolated provider）语义在同一模块文档与 §3/§10 | `abi/core.toml`（`kcore_endpoint_call` doc）、`component/call.rs` |
-| consumer exact ABI 校验 | **已实现** | SDK lookup 后 validate，bind 再做 exact contract + abi + 存活校验；裸 lookup 只发现 id |
-| 部署字段（`ComponentRecord::execution_domain`） | **两域可执行**：K 与 I 的生命周期、堆与通用服务均接线；I 自行 staged publish，K/I 双向 Gate 真实切 root/栈。任务、设备/DMA/IRQ 与 Sandbox 仍未实现 | `registry.rs`、`load.rs`、`isolated_lifecycle.rs`、`isolated_call.rs`、`export.rs`、`call.rs` |
-| 执行模型 / ISA / runtime 维度（native machine code vs Wasm） | **未开始**，且**不属于 `ExecutionDomain`**——与执行域正交，需**单独维度**表达 | 本文件 §3 |
-| 按 `(caller, callee)` 域选机制 | **K/I 矩阵已接线**：K/K Direct；K→I、I→K、I→I Gate。I 的扁平调用帧由 Core 搬运，不交付 provider 裸入口 | `endpoint.rs`、`call.rs`、`isolated_call.rs`、ArchTest `isolated-domain-service` |
-| Direct / Gate 作为**绑定机制**分离 | **部分实现**：Direct（KernelNative 同域）与 Gate（跨域 + 调度策略）都在跑；Gate 的 binding 只携带 opaque `EndpointId` + `port`（绝不交付 provider 域内裸入口） | `endpoint.rs::bind`、`component/call.rs` |
-| "inflight 只计 Gate" 的契约约束 | **设计完成** | 本文件 §3 |
-| Isolated 失败 / 重启矩阵 | **已证明**：逐条覆盖放段失败 / import 白名单外符号 / config 超限 / prepare 拒绝 / create 返回非零 / create 故障 / destroy 故障 / service 故障 / 超容量帧 / Ready 期故障 / stale 访问阻断 / 重新 instantiate（重启）。每个失败断言：文档化终态（`Failed` / `Stopped` / 无组件）、AS 退役或释放、Core 预置窗口归还或（destroy 路径）驻留、endpoint 永久失效、caller 类型化错误、Core 存活、KernelNative 不受影响。**未证明**：生产 create 路径内的 prepare 失败（组件不可注入，只能来自 Core 不变式破坏——机制层拒绝已证明） | ArchTest `isolated-load-reject` / `isolated-config-reject` / `isolated-prepare-reject` / `isolated-destroy-fault` / `isolated-stale-access` / `isolated-ready-fault` / `isolated-restart` + `isolated-lifecycle-{fail,fault}` / `isolated-service-{limits,fault}`（RV64+RV32） |
-| 私有地址空间 / `satp` 切换 / ASID | **部分实现（机制落地 + 生命周期 + 跨域 service 已接线；ASID / U-mode 未实现）**：映射生命周期 / 精确查询 / 退役状态 / 激活描述符（`prepare_activation`）**加上最小跨 AS trampoline（共享 Core 映射）**（Core 侧 `prepare` + arch 汇编进入 / trap 往返 / 恢复 / 放弃、窄 Core 故障分派钩子）已落地；ArchTest 在 **RV64 + RV32 QEMU** 证明「Core → 私有 AS → Core 往返」「私有 AS 内时钟中断在 Core AS / Core trap 栈处理后恢复」「组件页故障可恢复 / 可放弃」。**按域放段**已落地（`isolated_load.rs`：页级权限分离、按域重定位、显式拒绝），ArchTest 证明真实 `.kcomp` 在私有 AS 里执行、段数据可读、页表按段权限强制（写 R+X text → scause 15 / 取指 R+W data → scause 12）、别的实例的私有映射不可达（共享 Core 映射本身可达）。**组件生命周期已接线**（`isolated_lifecycle.rs`：Isolated 的 create / destroy 经跨 AS trampoline 在私有 AS 里执行，失败即退役 AS + 归还预置窗口）；**跨域 service Gate** 让 KernelNative caller 经 Core call gate 调用 Isolated provider 的 `kcomp_service_dispatch`（扁平帧经共享 Core 映射直接交付，provider 原地读写 caller 缓冲；故障由普通 Core trap 路径收敛成 `Failed` + AS 退役）。`activate()` 仍无生产调用方，**ASID 恒 0 + 全量 `sfence.vma`**（不实现 / 不声称 ASID 分配复用）；这是**协作式**边界（S-mode 可直接改 satp），不是对抗隔离 | `memory/address_space.rs`、`component/isolated.rs`、`component/isolated_load.rs`、`component/isolated_lifecycle.rs`、`arch/src/riscv/trampoline/`、`arch/src/vm.rs`、`riscv/mmu`、ArchTest `isolated-*` / `isolated-lifecycle*` / `isolated-service*` |
-| U-mode / `ecall` | **未开始** | `supervisor.rs:63-66`（`UserEnvCall` panic） |
-| 每次 instantiate 重新按域放段 | **已实现并接线**：`component/isolated_load.rs` 按域放段 + 重定位 + 页级权限分离（create / destroy / 可选 `kcomp_service_dispatch` 解析成实例域 VA），`isolated_lifecycle.rs` 每次 instantiate 全新放置到全新私有 backing + 全新私有 AS；同一 artifact 可并发多个 Isolated 组件（各自独立 backing / AS）。ArchTest `isolated-image` / `isolated-perm-*` / `isolated-lifecycle` / `isolated-service` / `isolated-restart` / `isolated-ready-fault` 在 RV64+RV32 证明。**按域 import 解析的支持面已实现**（诊断 / 只读、panic、私有 backing 与 endpoint API），更宽的 import 面未实现 | `isolated_load.rs`、`isolated_lifecycle.rs`、`load.rs::validate_isolated_load` |
-| `kcore_*` import 的 Isolated / Sandbox 解析 | **I 支持面**：诊断、只读、panic、私有 backing acquire/release、endpoint publish/lookup/validate/bind/call；共享 heap、任务、设备/DMA/IRQ、组件创建仍装载前拒绝。Sandbox 无 native 导出面 | `isolated_load.rs::SUPPORTED_IMPORTS`、`isolated_call.rs` |
-| 组件支持范围元数据 | **未开始** | manifest 无字段 |
-| 重入嵌套深度上限 | **未开始** | 只有链成员门禁 |
+| K | 可信共享 S/AS，普通 Task/IPC | KernelNative backing 不批量回收 |
+| I | RV64/RV32 S/MMU `.kcomp` create/destroy、持久 Task、私有 heap、IPC | `isolated_lifecycle.rs`、`isolated_api.rs`；不隔离特权，不能强杀不让出的 S Task |
+| U | RV64 S/MMU `.kcomp` relocation、USER 段/栈/thunk、create/destroy、Task/IPC | `sandbox.rs`、`export/sandbox.rs`；timer 返回 Core；设备/DMA/IRQ/Gate 不支持 |
+| IPC | RV64 K/I/U 九格、RV32 K/I 四格 | `export/ipc.rs`、`access.rs`；验证输出并 pin AS 后提交与 copy |
+| Graceful | live Task/inflight/Direct 时 EBUSY；无 live Task 才执行一次 destroy | 目前 Echo 由业务 STOP 先退 Server；一般 Core 通知/drain 尚缺 |
+| Force | 逻辑撤销、skip destroy、cancel saved Task；实际运行未离场 EBUSY | `reclaim.rs`；U timer 有真实 SMP 回归；K/I 无有限时间强杀保证 |
+| Reclaim | 私有 CPU-only 已证明静止时撤 root、表页、独占 extents、Task 栈 | 全局私有域安全点；重试幂等；保留 Component/Endpoint tombstone |
+| DMA/Device | 保持已有 Quarantine | 本轮不新增设备静默/reset/IOMMU 能力 |
 
-> **IsolatedNative 的诚实边界（本阶段，不放大）**：
-> - **协作式、非对抗**：S-mode 组件与 Core 同特权级，可直接改写 `satp` / `stvec` / 自己的映射；共享 Core 映射意味着组件也能到达 Core 内存。真正的强制边界是未来的 U-mode（SandboxedNative），**未实现**。
-> - **ASID 恒 0 + 全量 `sfence.vma`**：不实现 / 不声称 ASID 分配复用；`satp` 只在目标 AS 与调用者不同时切换。
-> - **import 支持面**：诊断 / 只读查询、`kcore_panic_escape` 与私有 backing acquire/release；共享堆、调度入口、组件创建、设备 / DMA / IRQ 获取仍显式拒绝（`-ENOTSUP`）。
-> - **出站通用 dispatch 已接线**：I→K / I→I 经 Core 栈/root 桥接。当前是同步、不可 yield 的调用；循环重入被拒绝，尚无 Isolated 任务调度、跨 CPU 服务调度或远端 TLB shootdown。
-> - **回收边界**：create / service 故障归还 Core 预置窗口 backing；destroy 路径（含 destroy 故障）只退役 AS，窗口 backing 驻留（AS 退役后不可再进入，无页表 teardown）；KernelNative 失败只保证逻辑失效 / 物理驻留。同一 artifact 的多个组件各自独立 `.data` / `.bss`（每次 instantiate 独立放段）。
+I import 不授予对抗隔离：它仍可改 Core、satp、stvec。U 私有页权限是真实硬件边界，
+但本轮不宣称完成恶意组件安全审计。ASID 与远端 TLB shootdown 尚未实现。
+失败的已发布 private image/窗口统一保留到同一 reclaim 证明，不再故障时提前 free。
+已完成 IPC 副本可在 provider backing 释放后由存活 caller collect；旧 Endpoint 永久失效。
 
-今天真实可执行的是 KernelNative 与协作式 IsolatedNative；共享/私有堆和 K/I 通用服务均可用同一 SDK 业务代码与工件。Sandbox、Isolated 任务/设备、自动物理回收与 ASID 仍是缺口。
-
----
+| caller → provider（普通 IPC） | K | I | U |
+|---|---|---|---|
+| K | RV64/RV32 | RV64/RV32 MMU | RV64 MMU |
+| I | RV64/RV32 MMU | RV64/RV32 MMU | RV64 MMU |
+| U | RV64 MMU | RV64 MMU | RV64 MMU |
 
 ## 11. 相关文档
 
-- `docs/architecture/overview.md`：分层、ResourceDomain / ExecutionDomain 概念、三个信任域；
-- `docs/architecture/component-lifecycle.md`：组件生命周期与组件契约（本文件补充其 §9 的目标方向）；
-- `docs/architecture/component-model.md`：Interface / ResourceDomain / 依赖图；
-- `docs/architecture/driver-model.md`：执行域模型、能力诚实表、未来 syscall wire ABI；
-- `docs/architecture/kconfig.md`：backend 能力来自 Kconfig；部署要求来自组合配置，Core 验证并提交；
-- `docs/development/testing.md`：host / CoreTest / QEMU 验证策略；
-- `docs/development/benchmark.md`：性能分段与基线。
+已执行补丁、实际门禁与剩余任务见 [Runtime 交付](../development/component-runtime-consolidation.md#7-授权后的生产实现与验证)。
+生命周期语义见 [component-lifecycle](component-lifecycle.md)，回收证明见
+[memory-and-heap](memory-and-heap.md)，控制面仅设计见 [路由 ADR](../development/ipc-routing-service-discovery-adr.md)。

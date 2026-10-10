@@ -343,7 +343,7 @@ enum KcoreEndpointState {
  * `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。 */
 #define KCORE_ENDPOINT_MECHANISM_GATE UINT32_C(1)
 
-/* Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback. */
+/* Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). K/I/U Task consumers on supported deployments; no Direct/Gate fallback. */
 #define KCORE_ENDPOINT_MECHANISM_IPC UINT32_C(2)
 
 /* `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。 */
@@ -371,7 +371,7 @@ uint64_t kcore_timebase_hz(void);
 /* 取一段内存 backing，返回本执行域访问窗口（kind = KCORE_MEMORY_VIEW_LOCAL_VA）：
  * min_len > 0、min_align 为非零 2 的幂；成功时 view.len >= min_len，首次交付零初始化。
  * 无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。
- * KernelNative 给共享 AS 的 VA；Isolated 给实例私有 VA；Sandboxed 直调返回 ENOTSUP。 */
+ * KernelNative 给共享 AS 的 VA；Isolated 给实例私有 VA；Sandboxed 经 ecall 给 USER 私有 VA，原生直调拒绝。 */
 int32_t kcore_memory_acquire(uint64_t min_len, uint64_t min_align, struct kcore_memory_view *out_view);
 /* 交回一个 kcore_memory_acquire 交付的 view，把 backing 归还分配器。
  * KernelNative 受信操作；(base, len) 必须与 acquire 一致。
@@ -408,6 +408,10 @@ int32_t kcore_component_load(const uint8_t *name, size_t len, uint32_t domain);
  * 失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
  * KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。 */
 int32_t kcore_component_stop(uint32_t component);
+/* 逻辑撤销后跳过 destroy。真实 Task 离场未确认时返回 EBUSY，保留所有 backing；U-mode timer 返回，S-mode 不承诺抢占。KernelNative 已发布 Direct 表时逻辑失效后返回 ENOTSUP，裸引用保持驻留。只允许活 KernelNative 管理上下文。 */
+int32_t kcore_component_force_stop(uint32_t component);
+/* 显式回收 CPU-only 私有域。必须 Stopped/Failed、所有 Task 实际离场、无在途执行、全局私有域安全点；否则 EBUSY/ENOTSUP 并保留 backing。成功幂等，身份 tombstone 保留。KernelNative 自动 backing 回收不支持。 */
+int32_t kcore_component_reclaim(uint32_t component);
 /* -- Task control -- */
 /* 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
  * （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入
@@ -496,7 +500,7 @@ int32_t kcore_endpoint_bind(uint64_t endpoint, uint64_t contract, uint64_t abi, 
 /* 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
  * *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
  * 执行（provider 域内栈 / principal / re-entry 与 IRQ 门禁 / panic containment）。
- * K/I caller 均支持；I 出站经 Core 栈/root 桥接与扁平缓冲搬运。Sandbox 未实现。 */
+ * K/I caller 均支持；I 出站经 Core 栈/root 桥接与扁平缓冲搬运。Sandbox 不提供此同步 Gate 入口；普通业务走 Task IPC。 */
 int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args, size_t args_len, const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len, int32_t *out_status);
 /* -- Console / observation -- */
 /* 轮询诊断 console。字节 0..255；无输入 -EAGAIN。无输入时做一次有界 idle 等待，caller 可 yield 后重试。 */
@@ -529,23 +533,23 @@ int32_t kcore_user_replace(uint32_t prepared_task);
 /* Destroy a never-started task and retire its AS; rollback only. RV64 supervisor/MMU only; other profiles return ENOTSUP. */
 int32_t kcore_user_discard(uint32_t task);
 /* -- Endpoint Request/Reply -- */
-/* 将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* 将当前真实 Component Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_listen(uint64_t endpoint);
 /* Endpoint owner 或 Core 记录的不可变实例创建者明确允许 consumer Component 发送；允许启动锚点编排，拒绝 Gate/IRQ/policy；ID 不是 capability。仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
 int32_t kcore_ipc_grant(uint64_t endpoint, uint32_t consumer);
-/* 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_submit(uint64_t endpoint, const uint8_t *bytes, size_t len, uint64_t *request);
-/* 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_receive(uint64_t endpoint, uint8_t *bytes, size_t capacity, uint64_t *request, uint32_t *consumer, uint32_t *consumer_task, size_t *length);
-/* Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_reply(uint64_t request, const uint8_t *bytes, size_t len);
-/* caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_collect(uint64_t request, uint8_t *bytes, size_t capacity, size_t *length, int32_t *completion);
-/* 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_wait(uint64_t endpoint, uint64_t request);
-/* caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_cancel(uint64_t request);
-/* owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。 */
+/* owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。 */
 int32_t kcore_ipc_close(uint64_t endpoint);
 /* -- Component identity -- */
 /* 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。 */

@@ -135,6 +135,14 @@ pub struct Sv32PageTable {
 }
 
 impl Sv32PageTable {
+    /// Core has drained all activations; frames contains only this root's
+    /// independently allocated table pages, never mapped data backing.
+    pub(crate) unsafe fn release(self, free: crate::vm::PageFree) {
+        for page in self.frames {
+            free(page);
+        }
+    }
+
     pub fn new(alloc_page: PageAlloc) -> Result<Self, MapError> {
         let mut frames = Vec::new();
         frames.try_reserve(1).map_err(|_| MapError::Exhausted)?;
@@ -340,6 +348,42 @@ mod tests {
     }
 
     // -- PTE 编码（32 位宽）----------------------------------------------------
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn teardown_returns_only_owned_table_pages_after_unmap() {
+        use std::sync::Mutex;
+        static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        fn free(page: usize) {
+            FREED.lock().unwrap().push(page);
+        }
+        let _guard = super::super::test_pool::guard();
+        super::super::test_pool::init_low();
+        let mut table = Sv32PageTable::new(super::super::test_pool::alloc).unwrap();
+        let range = VirtualRange {
+            base: 0x2000_0000,
+            size: VM_PAGE_SIZE,
+        };
+        let data = PhysicalRange {
+            base: 0x6000_0000,
+            size: VM_PAGE_SIZE,
+        };
+        table
+            .map_range(
+                range,
+                data,
+                MappingPermission::READ | MappingPermission::WRITE,
+            )
+            .unwrap();
+        table.unmap_range(range).unwrap();
+        let owned = table.frames.clone();
+        FREED.lock().unwrap().clear();
+        unsafe {
+            table.release(free);
+        } // never activated on host
+        assert_eq!(*FREED.lock().unwrap(), owned);
+        assert!(!FREED.lock().unwrap().contains(&data.base));
+    }
 
     #[test]
     fn pte_invalid_is_not_valid_not_leaf() {

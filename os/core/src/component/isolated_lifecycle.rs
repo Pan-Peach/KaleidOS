@@ -23,7 +23,7 @@
 //!   └─ dispatch_service(...)：结构 sanity（长度非零时指针不得为空）→
 //!      `with_isolated_service_boundary` 包住 `enter` → caller 帧（共享 Core
 //!      映射，same VA → same PA）**直接**交给 provider，原地读写；Faulted 时
-//!      fail_provider（Failed + AS 退役 + 窗口归还）→ EIO
+//!      fail_provider（Failed + AS 退役 + 窗口保留至显式 reclaim）→ EIO
 //! ```
 //!
 //! # Core 验证 vs 组件提议
@@ -66,29 +66,24 @@
 //! | 阶段 | 终态 | AS | Core 预置窗口 | caller 得到 |
 //! |---|---|---|---|---|
 //! | 放段 / 门禁失败（声明之前） | 无实例 | 未创建 | 未创建 | 类型化装载错误 |
-//! | create 入口返回非零 / config 拒绝 | `Failed` | 退役 | 归还 backing | `CreateFailed` / `IsolatedConfigRejected` |
-//! | create 入口故障（trap） | `Failed` | 退役 | 归还 backing | `CreateFaulted` |
-//! | service dispatch 故障 | `Failed` | 退役 | 归还 backing | `CallError::ProviderFailed`（EIO） |
+//! | create 入口返回非零 / config 拒绝 | `Failed` | 退役 | 保留至显式 reclaim | `CreateFailed` / `IsolatedConfigRejected` |
+//! | create 入口故障（trap） | `Failed` | 退役 | 保留至显式 reclaim | `CreateFaulted` |
+//! | service dispatch 故障 | `Failed` | 退役 | 保留至显式 reclaim | `CallError::ProviderFailed`（EIO） |
 //! | destroy 入口故障 | `Failed` | 退役 | **保持驻留** | `DestroyPanicked`（EIO） |
 //! | 优雅 destroy 成功 | `Stopped` | 退役 | **保持驻留** | `Ok` |
 //!
-//! 读法：**create / service 故障 = Core 中止实例**（预置机制一并归还，半成品不留）；
-//! **destroy 路径 = 实例已走到生命尽头**（无论入口成功或故障都只退役 AS，窗口
-//! backing 驻留——AS 退役后不可再进入，页表页无 teardown 接口）。任何终态之后：
-//! endpoint 永久失效（`failure` 兜底），stale 调用在 Core 边界被 `resolve` 拒绝
-//! （先于任何进入），同一 artifact 可**重新 instantiate**（全新组件）。
+//! 所有已发布 private backing 都先保留，失败/停止不得依据状态提前 free。
+//! reclaim 模块确认全部 Task 实际离场、生命周期 inflight 排空以及全局私有域
+//! 安全点后，恢复别名、拆 root/页表并归还独占 backing。
 //!
-//! # 明确不做（当前边界）
+//! 持久 I Task/IPC 与 RV64 U create/destroy 已接线；I 仍为协作式 S-mode。
+//! 不开放设备/DMA/IRQ，不实现 ASID/远端 TLB shootdown。同步诊断 Gate 保留。
 //!
-//! Isolated 任务、设备 / DMA / IRQ 与 Sandboxed 执行器仍未接线。destroy 后
-//! 不做物理回收；ASID 恒 0 + 全量 `sfence.vma`，没有 U-mode / `ecall`。
-//! Isolated panic 通过活动跨 AS 现场交回 Core；出站桥接期间挂起 caller 的
-//! 逃逸现场，确保 native provider panic 由它自己的 service guard 收敛。
-//!
+
 //! # 诚实边界
 //!
 //! - **协作式、非对抗**：S-mode 组件与 Core 同特权级，可以直接改 `satp` / 自己的
-//!   映射；本模块不声称对抗隔离（那是 U-mode / SandboxedNative，未实现）。
+//!   映射；本模块不声称对抗隔离（RV64 U-mode / SandboxedNative 在 sandbox 模块实现）。
 //! - **CPU isolation ≠ DMA isolation**：Isolated 实例 AS = 共享 Core 映射
 //!   （same VA → same PA）+ 该实例自己的镜像 / 栈 / 窗口；**不含**别的实例的
 //!   私有映射（页表保证 A 看不到 B 的 backing）。Core 拥有的 DMA backing 是否
@@ -196,7 +191,7 @@ pub fn window_range() -> VirtualRange {
 mod imp {
     use super::*;
     use crate::component::endpoint::{self, ExecutionDomain};
-    use crate::component::isolated::{self, IsolatedPrepareError, Outcome};
+    use crate::component::isolated::{self, Outcome};
     use crate::component::isolated_load::IsolatedLoadError;
     use crate::component::load;
     use crate::component::{containment, failure, registry};
@@ -207,24 +202,49 @@ mod imp {
     /// 创建并启动一个 Isolated 组件（`load.rs::create_isolated_native` 的实现）。
     ///
     /// 每次 instantiate 都从 artifact **重新按域放段 + 重定位**，得到这个组件
-    /// 自己私有的 backing（不再有同域 image 复用）。任何一步失败都走"半成品不留"：
-    /// 退役 AS + 归还 Core 预置窗口 backing + `Failed`（组件一旦声明就一定有终态）。
+    /// 自己私有的 backing（不再有同域 image 复用）。失败后退役 AS、保留已发布
+    /// backing 至显式 reclaim，提交 `Failed`（声明后一定有逻辑终态）。
     pub(crate) fn create(
         name: &[u8],
         blob: &[u8],
         args: &KcompCreateArgs,
     ) -> Result<ComponentId, ComponentLoadError> {
+        create_domain(name, blob, args, ExecutionDomain::IsolatedNative)
+    }
+    pub(crate) fn create_sandboxed(
+        name: &[u8],
+        blob: &[u8],
+        args: &KcompCreateArgs,
+    ) -> Result<ComponentId, ComponentLoadError> {
+        create_domain(name, blob, args, ExecutionDomain::SandboxedNative)
+    }
+    fn create_domain(
+        name: &[u8],
+        blob: &[u8],
+        args: &KcompCreateArgs,
+        domain: ExecutionDomain,
+    ) -> Result<ComponentId, ComponentLoadError> {
         // (1) 按域放段：段 / 权限 / 入口 / kcomp_abi 全部 Core 验证。
-        let placed = isolated_load::place(blob).map_err(map_placement_error)?;
+        let placed =
+            isolated_load::place_for_lifecycle(blob, domain == ExecutionDomain::SandboxedNative)
+                .map_err(map_placement_error)?;
         let mappings = placed.mappings();
         let create_entry = placed.create();
 
         // (2) 声明组件：它 1:1 拥有这次加载结果（lease 随 loaded 常驻）。
-        let id = crate::component::load::declare_instance(
-            name,
-            placed.into_loaded_component(),
-            ExecutionDomain::IsolatedNative,
-        )?;
+        let id =
+            crate::component::load::declare_instance(name, placed.into_loaded_component(), domain)?;
+
+        let _execution = load::LifecycleExecution(id);
+
+        // A failed alias publication now has an existing, observable owner.
+        // Even a root-creation failure can reclaim this image after departure.
+        let image = registry::get_registry().lock().retain_image(id);
+        if let Err(error) = crate::memory::kernel_mappings::publish_private_backing(image) {
+            let error = map_space_error(error);
+            failure::fail_component(id, error);
+            return Err(error);
+        }
 
         // (3) 私有 AS：还没有 AS 就没有可清理的，直接 Failed。
         let handle = match address_space::create_isolated_address_space_for(id) {
@@ -248,8 +268,18 @@ mod imp {
         if let Err(error) = isolated_load::map_mappings(handle, &mappings) {
             return Err(fail_with_as(id, handle, map_placement_error(error)));
         }
-        if let Err(error) = map_instance_windows(handle) {
+        if let Err(error) = map_instance_windows(handle, domain) {
             return Err(fail_with_as(id, handle, error));
+        }
+
+        if domain == ExecutionDomain::SandboxedNative {
+            if let Err(error) = super::super::sandbox::map_stubs(handle) {
+                return Err(fail_with_as(
+                    id,
+                    handle,
+                    ComponentLoadError::CreateFailed(error.code()),
+                ));
+            }
         }
 
         // (5) Declared → Resolved → Starting（create 执行期）。
@@ -280,24 +310,22 @@ mod imp {
             .loaded
             .runtime_init;
         if let Some(entry) = runtime_entry {
-            let runtime =
-                crate::component::export::runtime_backend(ExecutionDomain::IsolatedNative);
+            let runtime = crate::component::export::runtime_backend(domain);
             // SAFETY: the descriptor fits in the Core-owned ABI window.
             unsafe {
                 ((window_backing + WINDOW_RUNTIME_OFF) as *mut crate::generated::abi::KcompRuntime)
                     .write(runtime);
             }
             isolated::install();
-            let prepared = isolated::prepare(
-                handle,
-                entry,
-                stack_range(),
-                true,
-                isolated::EntryArgs::pair(window.base + WINDOW_RUNTIME_OFF, 0),
-            )
-            .map_err(|error| fail_with_as(id, handle, map_prepare_error(error)))?;
             let outcome = load::with_current(id, || {
-                containment::with_isolated_create_boundary(id, || isolated::enter(prepared))
+                containment::with_isolated_create_boundary(id, || {
+                    run_entry(
+                        domain,
+                        handle,
+                        entry,
+                        isolated::EntryArgs::pair(window.base + WINDOW_RUNTIME_OFF, 0),
+                    )
+                })
             });
             match outcome {
                 Outcome::Returned(0) => {}
@@ -319,24 +347,18 @@ mod imp {
         //     不是可恢复的证明），create 里的故障因此收敛成 `Outcome::Faulted`
         //     → `Failed`，而不是把 Core 打 panic。
         isolated::install();
-        let transition = match isolated::prepare(
-            handle,
-            create_entry,
-            stack_range(),
-            true,
-            isolated::EntryArgs::pair(
-                window.base + WINDOW_ARGS_OFF,
-                window.base + WINDOW_OUT_STATE_OFF,
-            ),
-        ) {
-            Ok(transition) => transition,
-            Err(error) => return Err(fail_with_as(id, handle, map_prepare_error(error))),
-        };
-
-        // (8) 进入：组件在私有 AS 里执行 `kcomp_instance_create(args, out_state)`。
-        //     期间 CURRENT = 本实例（与 KernelNative create 同一身份纪律）。
         match load::with_current(id, || {
-            containment::with_isolated_create_boundary(id, || isolated::enter(transition))
+            containment::with_isolated_create_boundary(id, || {
+                run_entry(
+                    domain,
+                    handle,
+                    create_entry,
+                    isolated::EntryArgs::pair(
+                        window.base + WINDOW_ARGS_OFF,
+                        window.base + WINDOW_OUT_STATE_OFF,
+                    ),
+                )
+            })
         }) {
             Outcome::Returned(0) => {
                 // Core 从**自己的视图**读回组件写下的 opaque state（绝不把实例内
@@ -403,27 +425,20 @@ mod imp {
         };
         // 与 create 同一纪律：组件故障交给 Core 的窄分派（无策略 = Abandon）。
         isolated::install();
-        let transition = match isolated::prepare(
-            handle,
-            entry,
-            stack_range(),
-            true,
-            isolated::EntryArgs::pair(state as usize, 0),
-        ) {
-            Ok(transition) => transition,
-            Err(error) => {
-                crate::log!(
-                    "component",
-                    "isolated destroy: prepare failed for instance {}: {:?}",
-                    id.raw(),
-                    error
-                );
-                let _ = address_space::retire(handle);
-                return CallOutcome::Returned(Errno::EIO.code());
-            }
-        };
+        let domain = registry::get_registry()
+            .lock()
+            .get(id)
+            .unwrap()
+            .execution_domain;
         let outcome = match load::with_current(id, || {
-            containment::with_isolated_destroy_boundary(id, || isolated::enter(transition))
+            containment::with_isolated_destroy_boundary(id, || {
+                run_entry(
+                    domain,
+                    handle,
+                    entry,
+                    isolated::EntryArgs::pair(state as usize, 0),
+                )
+            })
         }) {
             Outcome::Returned(0) => CallOutcome::Returned(0),
             Outcome::Returned(code) => CallOutcome::Returned(code as u32 as i32),
@@ -433,6 +448,26 @@ mod imp {
         // 实例已被请求停止：AS 不再可能被进入（复用 = 新建空间），一律退役。
         let _ = address_space::retire(handle);
         outcome
+    }
+
+    fn run_entry(
+        domain: ExecutionDomain,
+        handle: AddressSpaceHandle,
+        entry: usize,
+        args: isolated::EntryArgs,
+    ) -> Outcome {
+        if domain == ExecutionDomain::SandboxedNative {
+            super::super::sandbox::invoke(
+                handle,
+                entry,
+                stack_range(),
+                [args.a0, args.a1, args.a2, args.a3],
+            )
+        } else {
+            isolated::prepare(handle, entry, stack_range(), true, args)
+                .map(isolated::enter)
+                .unwrap_or(Outcome::Faulted)
+        }
     }
 
     /// 在 provider 私有 AS 中运行 dispatcher。frame / buffers 此时均位于
@@ -506,10 +541,9 @@ mod imp {
     }
 
     /// provider 在 service 边界内故障 / Core 无法准备切换：逻辑死亡 + AS 退役 +
-    /// Core 预置窗口归还（与 create 失败同一套清理），归还 inflight。
+    /// Core 预置窗口保留到同一显式 reclaim，归还 inflight。
     fn fail_provider(provider: ComponentId, handle: Option<AddressSpaceHandle>) -> CallError {
         if let Some(handle) = handle {
-            release_instance_windows(handle);
             let _ = address_space::retire(handle);
         }
         crate::component::fail_component(provider, ComponentLoadError::ServiceFaulted);
@@ -521,6 +555,7 @@ mod imp {
     fn map_window(
         handle: AddressSpaceHandle,
         range: VirtualRange,
+        user: bool,
     ) -> Result<(), ComponentLoadError> {
         let lease =
             memory::alloc_region(range.size).map_err(|_| ComponentLoadError::StartFailed)?;
@@ -537,17 +572,22 @@ mod imp {
         let mapping = Mapping {
             virtual_range: range,
             physical_range: PhysicalRange { base, size },
-            permission: MappingPermission::READ | MappingPermission::WRITE,
+            permission: MappingPermission::READ
+                | MappingPermission::WRITE
+                | if user {
+                    MappingPermission::USER
+                } else {
+                    MappingPermission::empty()
+                },
         };
         match address_space::map(handle, mapping) {
             Ok(()) => {
                 // Map first, publish second. A failed map has no exclusion to
                 // undo. A failed publication may already have removed aliases;
-                // unmap the private window and conservatively retain its pages.
+                // keep its exact owning mapping for explicit reclaim.
                 if let Err(error) =
                     crate::memory::kernel_mappings::publish_private_backing(mapping.physical_range)
                 {
-                    let _ = address_space::unmap(handle, &range);
                     core::mem::forget(lease);
                     return Err(map_space_error(error));
                 }
@@ -560,9 +600,13 @@ mod imp {
         }
     }
 
-    fn map_instance_windows(handle: AddressSpaceHandle) -> Result<(), ComponentLoadError> {
-        map_window(handle, stack_range())?;
-        map_window(handle, window_range())
+    fn map_instance_windows(
+        handle: AddressSpaceHandle,
+        domain: ExecutionDomain,
+    ) -> Result<(), ComponentLoadError> {
+        let user = domain == ExecutionDomain::SandboxedNative;
+        map_window(handle, stack_range(), user)?;
+        map_window(handle, window_range(), user)
     }
 
     /// 把 create args / config 负载 / out_state / 域视图写进窗口 backing。
@@ -627,25 +671,9 @@ mod imp {
         handle: AddressSpaceHandle,
         error: ComponentLoadError,
     ) -> ComponentLoadError {
-        release_instance_windows(handle);
         let _ = address_space::retire(handle);
         failure::fail_component(id, error);
         error
-    }
-
-    /// 解映射并归还 Core 预置窗口（best effort：状态提交不因回收失败而回滚）。
-    fn release_instance_windows(handle: AddressSpaceHandle) {
-        for range in [stack_range(), window_range()] {
-            if let Ok(Some(mapping)) = address_space::mapping_exact(handle, &range)
-                && address_space::unmap(handle, &range).is_ok()
-                && memory::kernel_mappings::release_private_backing(mapping.physical_range).is_ok()
-            {
-                let _ = memory::free_region_raw(
-                    mapping.physical_range.base,
-                    mapping.physical_range.size,
-                );
-            }
-        }
     }
 
     fn map_placement_error(error: IsolatedLoadError) -> ComponentLoadError {
@@ -661,13 +689,6 @@ mod imp {
     fn map_space_error(error: MapError) -> ComponentLoadError {
         match error {
             MapError::Unsupported => ComponentLoadError::IsolationUnsupported,
-            _ => ComponentLoadError::StartFailed,
-        }
-    }
-
-    fn map_prepare_error(error: IsolatedPrepareError) -> ComponentLoadError {
-        match error {
-            IsolatedPrepareError::Unsupported => ComponentLoadError::IsolationUnsupported,
             _ => ComponentLoadError::StartFailed,
         }
     }
@@ -690,6 +711,14 @@ mod imp {
         _args: &KcompCreateArgs,
     ) -> Result<ComponentId, ComponentLoadError> {
         Err(ComponentLoadError::IsolationUnsupported)
+    }
+
+    pub(crate) fn create_sandboxed(
+        _: &[u8],
+        _: &[u8],
+        _: &KcompCreateArgs,
+    ) -> Result<ComponentId, ComponentLoadError> {
+        Err(ComponentLoadError::SandboxUnsupported)
     }
 
     pub(crate) fn destroy(_id: ComponentId, _entry: usize, _state: *mut ()) -> CallOutcome {
@@ -726,7 +755,7 @@ mod imp {
     }
 }
 
-pub(crate) use imp::{create, destroy, dispatch_service};
+pub(crate) use imp::{create, create_sandboxed, destroy, dispatch_service};
 
 /// 帧结构 sanity（两条实现共用，唯一判据）：长度非零时对应指针不得为空。
 ///

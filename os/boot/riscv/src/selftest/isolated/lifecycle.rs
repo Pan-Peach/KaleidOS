@@ -270,13 +270,24 @@ pub(crate) fn assert_failure_released(case: &str, id: ComponentId, handle: Addre
         Err(MapError::Retired) => {}
         _ => fail_case(case, "address space was not retired"),
     }
+    // Failure retains published windows until the same teardown proof as a
+    // normal stop. This fixture has no Task/DMA/external execution references.
     for range in [
         isolated_lifecycle::stack_range(),
         isolated_lifecycle::window_range(),
     ] {
-        if !matches!(address_space::mapping_exact(handle, &range), Ok(None)) {
-            fail_case(case, "a Core-prepared window leaked");
+        if !matches!(address_space::mapping_exact(handle, &range), Ok(Some(_))) {
+            fail_case(case, "failure released an unconfirmed Core-prepared window");
         }
+    }
+    if kernel::component::reclaim::reclaim(id).is_err() {
+        fail_case(case, "CPU-only failure could not reclaim");
+    }
+    if !matches!(
+        address_space::prepare_activation(handle),
+        Err(MapError::NoSuchSpace)
+    ) {
+        fail_case(case, "reclaimed root retained an activation identity");
     }
 }
 

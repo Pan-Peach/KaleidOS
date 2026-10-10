@@ -10,14 +10,14 @@ Endpoint 是不可复用的端口身份，不是 capability。发布沿用 stage
 contract 与 exact fingerprint；typed consumer 应先通过 `Endpoint<C>::from_id/lookup`
 验证契约。IPC 不自动调用 legacy bind，也不自动降级到 Direct/Gate。
 
-`listen` 将当前真实 KernelNative Task 注册为 owner 端口的唯一 Server Task。
+`listen` 将当前真实 Component Task 注册为 owner 端口的唯一 Server Task。
 `grant` 只允许端口 owner 或 Core 在实例声明时记录的真实创建祖先授权一个存活 consumer
 Component。创建链来自实际 Core 请求上下文，不来自配置 payload；Registry::created_by 沿不可改写链
 校验祖先，资源 owner 不因此改变，send 权限仍须显式 grant；不会随父实例重启
 重绑。grant 允许启动锚点编排，拒绝 Gate/IRQ/policy。普通 ID 查询不授予任何权限。
 consumer 停止/失败移除其 grant，端口关闭永久失效。当前没有通用 rights transfer/revoke。
 
-其余 IPC 操作只允许真实 KernelNative Task，Core 同时核对 ambient principal、
+其余 IPC 操作只允许支持域中的真实 Component Task，Core 同时核对 ambient principal、
 current Task、Task owner 和 Running CPU。提交复验双方存活与 consumer grant；
 receive/reply 仅属于指定 Server Task。receipt 不能靠猜中数字由另一 Task 使用。
 业务收到 Core 验证过的 consumer ComponentId 与 TaskId，不能信任消息中的自报身份。
@@ -49,7 +49,7 @@ reply、cancel、端口 close/Provider failure 在同一锁下竞争首个终态
 结果，不重复交付或唤醒。cancel 不承诺撤销已执行的业务；已 receive 的 receipt 仍占槽，
 直到 server reply 或端口失效。晚 reply 丢弃数据、退役 receipt 并返回 ECANCELED，
 让业务服务回滚未交付的拥有引用；该错误不允许重试旧 receipt。SDK call 的短输出路径会 drain Core 结果；
-raw submit 的调用者必须 collect 或退出。当前没有 timer deadline 或强制终止服务。
+raw submit 的调用者必须 collect 或退出。IPC 没有请求 timer deadline；Component Force 单独撤销服务并等待真实执行离场。
 
 caller Task 退出丢弃其结果，queued 请求立即退役，accepted receipt 保留至 server 归还。
 Server Task 退出会关闭其端口；Provider 停止/失败关闭所有端口并以 ENOTCONN 完成尚无
@@ -60,15 +60,13 @@ Server Task 退出会关闭其端口；Provider 停止/失败关闭所有端口�
 
 提交检查 caller→Server Task 的未完成等待图，自调用或形成环返回 EDEADLK。
 它不能发现业务锁的任意循环；服务必须禁止跨 IPC 持有对方需要的锁。一个 server 永不
-返回 Core 时，协作式调度不能保证有限时间完成。全局 IPC 锁按 registry→endpoints→exchange
-→Task table 顺序取得；Task exit hooks 在调度真相提交、其他锁释放后执行，wake 在解锁后执行。
+返回 Core 时，协作式调度不能保证有限时间完成。IPC 先按 registry→endpoints→Task table 复验身份并释放 Task 锁，再持 AS pin→exchange 完成 copy/提交；不在 AS 锁内反取 Task 锁；Task exit hooks 在调度真相提交、其他锁释放后执行，wake 在解锁后执行。
 
 ## 执行域与内存边界
 
-当前只支持 KernelNative Tasks：RV64/Sv39、RV32/Sv32 默认profile与RV32 S-mode NoMMU
-私有profile的完整 CoreTest 与 shell 通过；具体计数以STATUS为准。
-私有域 import 白名单没有 IPC；Isolated/Sandboxed Server Task、范围检查与跨 AS copy
-尚未实现。现有 Gate 的私有 AS 测试不能充当新 IPC 隔离证据。
+当前 RV64 S/MMU 支持 K/I/U 九格，RV32 S/MMU 支持 K/I 四格真实 Task IPC。
+I 白名单与 U thunk 均接线；private buffer 通过 AS ledger 逐页检查并经 PA 复制。
+无 MMU 时仅 K 路径；RV32 U 明确拒绝。Gate 硬件诊断仍单独保留。
 
 Core 检查 null、长度、标量对齐及地址加法溢出。KernelNative 同特权同地址空间，指针
 必须遵守可信 C ABI 借用约定；这不是任意坏 VA 的 fault containment，也不是安全隔离。
@@ -83,3 +81,36 @@ u32）和 4 字节方法状态回复头（LE i32）；其余字节由契约决�
 CoreTest 编排：[runtime/ipc.rs](../../os/components/tests/core_test/src/runtime/ipc.rs)。
 QEMU 覆盖 RV64 跨 CPU 往返及 RV32 同 CPU，比较旧 Direct/Gate 的 trace-on 基线。
 结果、阶段缺口与回归统一记录在 [STATUS](../../STATUS.md)。
+
+## 私有执行域接通
+
+Task/import/runner/copy 已实现，一般 Graceful cleanup/drain 与完整竞态矩阵仍缺。
+`access::Pinned` 持 AS 表锁覆盖完整检查、copy 与 Exchange 提交；所有输出验证先于消费。
+
+业务 Contract/Handler 与现有 Wire 不变：K 经窄 C ABI，I 经 Core 栈/root 桥接，
+U 经 syscall stub/ecall；provider 始终由自己的 Server Task/AS 执行。生成器继续只管
+codec/client/dispatcher，不把 domain 分支、资源或 Session 语义放进 schema。
+Task 当前 owner、Running CPU、实例域与 AS 来自 Core，不接受消息内自报身份。
+
+I/U copy 必须逐页验证完整范围和读/写权限，U 要求 USER；不准 provider 解引用
+caller 私有 VA，不依赖 SUM。除 payload 外，request id、consumer、length、completion
+等所有标量输出与输入结构同样 marshal。先验证所有输出、保证 backing 在 copy 期间
+稳定，再提交 receive/collect 等消费动作；copy-out 失败不能丢掉唯一结果或留下
+无法收取的 submit。锁/借用顺序需与 Task/AS teardown 一起设计，不能只有一次
+validate 后锁外使用可能被 unmap/free 的 PA。消息仍只存 Core-owned 副本。
+
+停止初期沿用 close 的首终态/cancel-and-drain：成功 reply 保留供活 caller collect；
+其余请求终结 ENOTCONN；关闭 receipt 不表示 provider 已停止处理自己的副本。
+Task/callback 离场仍由[生命周期](component-lifecycle.md#11-runtime-完整化当前与目标)确认。
+Graceful 已有 Task 的 cleanup 允许 cancel/collect/释放等拆除操作，拒绝新 submit/listen/
+grant；目前 transaction 的 may_run 门禁不能支持此目标。
+
+raw IPC 每次复验 endpoint 活性和 grant；exact ABI 当前在 typed validate/bind，
+submit ABI 本身不携带 contract/fingerprint，Core 不解析业务 envelope。私有域使用
+同一 typed 路径；不得宣称 raw submit 自身做 exact 校验。若将来要求不可信 raw caller
+必须证明 expected ABI，应先明确最小 ABI 缺口，再协调 schema；不新增业务 Wire。
+
+当前真实 IPC 往返已覆盖上述九格（RV32 四格）。bad buffer、I/U fault、stale 与
+重复回收另由压力场景验证；不宣称各格已经穷尽 caller/server 退出和取消竞争。
+逻辑寻址与连接编排的取舍见 [路由 ADR](../development/ipc-routing-service-discovery-adr.md)，
+仅设计，不是私有域 Task/IPC 的前置框架。

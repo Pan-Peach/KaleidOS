@@ -18,7 +18,7 @@
 - `registry.rs`：`Registry`、`ComponentRecord`（`name: Vec<u8>` + `loaded: LoadedComponent`）、`RegistryError`；`declare` / `resolve` / `begin_start` / `finish_start` / `begin_stop` / `finish_stop` / `mark_failed` / `record_instance_state`；全局 `get_registry`。
 - `abi.rs`：`InterfaceAbi`（exact fingerprint）、`InterfaceKind`（生成物 re-export）。
 - `load.rs`：`ComponentLoadError`、`current_component()` / `with_current()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：分派到 `create_kernel_native` / `create_isolated_native` / `create_sandboxed_native`（前两者分别走 `loader.rs` / `isolated_lifecycle.rs`；Sandbox 装载前返回 `-ENOTSUP`）。**每次调用都重新 instantiate**（独立放段 / 重定位），同名 artifact 可并存多个组件；能力不足 / 支持面之外的 import → 装载前显式拒绝。见 `deployment.md` §6.2/§7.1/§10。
-- `sandbox.rs`：SandboxedNative 执行域机制骨架；prepare_task / U-mode enter / 用户范围 copy 均显式拒绝，trap 路由与销毁未实现。创建入口在 `load.rs`。不是组件，不包含 POSIX 或 Linux syscall 语义。阶段顺序见 `docs/development/userspace.md`。
+- `sandbox.rs`：RV64 `.kcomp` U runner、USER thunk 与 trap/timer 路由；`export/sandbox.rs` 将白名单 C ABI 分派到已有 Core API。无 personality/POSIX 语义；其他目标显式拒绝。
 - `loader.rs`：`load_component()`、`LoadedComponent`、`LoaderError`；解析 ELF、放置段、应用重定位、解析 `kcomp_instance_create` / `kcomp_instance_destroy` / `kcomp_abi`。
 - `elf.rs`：架构中立 ELF ET_REL 解析（`ElfObject`、`ElfError`、`ElfClass`、`Section`、`Symbol`、`Relocation`）。
 - `store.rs`：内嵌 `.initpkg` cpio store（`CpioEntry`、`EmbeddedStore`、`parse_entries`、`init`、`get_component_store`）。
@@ -31,7 +31,7 @@
 - `exit.rs`：`stop_component`、`ComponentStopError`。
 - `isolated.rs`：私有 AS 进入的 Core 侧准备（`PreparedTransition`、`EntryArgs`、`prepare`、`enter`、`ComponentFault`、`FaultPolicy`、`install` / `register_fault_policy`）+ **普通 trap 路径的异常钩子**（`on_exception`：按活动跨 AS 现场归因、默认拒绝恢复、放弃经 trampoline 交回 Core 延续）；进入参数（组件入口 `a0..a3`）由 Core 解释、arch 只搬运。**生产调用方 = `isolated_lifecycle.rs`**（Isolated 的 create / destroy / service dispatch 都经这里）；`prepare` 在锁内校验并取出 `Copy` 描述符，`enter` 在锁外组装 **per-invocation** trampoline 记录（CrossAsContext LIFO 链）。
 - `isolated_load.rs`：**按域装载**：`PlacedImage` / `PlacedSegment` / `IsolatedLoadError`、`place(blob)` / `place_artifact(name)` / `map_into(handle, image)` / `map_mappings(handle, &mappings)`，以及组件登记用的 `PlacedImage::mappings()` / `into_loaded_component()`。每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），import 白名单（诊断 / 只读、panic、私有 backing 与 endpoint API）解析到共享 Core 低别名，显式拒绝出窗 / 重叠 / 不可表达权限 / 非 2 的幂对齐 / 白名单外 import；**可选 `kcomp_service_dispatch` 解析成实例域 VA**（必须落在 R+X 段内）；重定位复用 `loader.rs` 的私有 ELF API（按域 base 重算，绝不复用 KernelNative 放段结果）。ArchTest 在 RV64/RV32 QEMU 直接驱动机制用例，生产消费方是 `isolated_lifecycle.rs`。
-- `isolated_lifecycle.rs`：**Isolated 实例生命周期 + 跨域 service dispatch**：`create(name, blob, args)` / `destroy(id, entry, state)` / `dispatch_service(...)` + VA 布局（组件栈 `ISOLATED_STACK_BASE` / **实例内存窗口** `ISOLATED_WINDOW_BASE` 与窗口偏移）。create = 每次按域放段（`isolated_load::place`）+ 登记（全新私有 backing，**无** same-image 复用）→ 声明 → 私有 AS → 落镜像 + 预置窗口（`+0` args / `+32` `out_state` / `+64` config / `+320` 域 `MemoryView`）→ Starting → 写 args / out_state → `prepare` + `enter` 跑 `kcomp_instance_create` → `Ready`；destroy = `prepare` + `enter` 跑 `kcomp_instance_destroy` → 退役 AS（`exit.rs` 按 `execution_domain` 分派；窗口按 phase 1 契约保持驻留）；dispatch_service = 帧结构 sanity → `prepare` + `enter` 跑 `kcomp_service_dispatch`（frame/buffers 在共享 Core 映射内；K caller 直接交付，I caller 由 `isolated_call` 搬运）→ 方法状态写 `*out_status`。**失败清理**（create / service 故障 = Core 中止实例）：退役 AS + 解映射并归还预置窗口 + `Failed`（半成品不留）；**destroy 路径**（成功或入口故障）：只退役 AS，窗口驻留（AS 退役后不可进入）。无私有 AS backend 的构建显式拒绝。内存 / 传输路径选择：**Core 预置窗口、窄 import 面**（支持面 import 是普通 C-ABI 直接调用，`satp` 不变；跨 AS trampoline 只用于 create / destroy / service dispatch 的域切换）。
+- `isolated_lifecycle.rs`：I/U 共用私有实例生命周期；先声明 image owner 再发布 backing，I 经 trampoline、U 经 sandbox runner 跑 create/destroy。所有已发布失败窗口保留到显式 reclaim；旧同步 Gate dispatch 仅供诊断。
 - `isolated_call.rs`：I 出站 Gate 检查 caller AS 访问权限、搬运三个扁平字节缓冲，在独立 Core 栈与挂起的 Core root 分派；返回后恢复 I root 并写回输出。桥接期间挂起 caller 的跨 AS panic 现场；循环重入在 provider 进入前拒绝。
 - 重导出：`panic_escape`、`ComponentStopError`、`stop_component`、`fail_component`。
 
@@ -45,6 +45,10 @@
 - **panic recovery ≠ fault isolation**：KernelNative 组件仍可能写坏 Core 内存 / UB / 持锁死亡，这是协作式 containment，不是对抗隔离。
 
 ## 代码在哪
+
+本轮[Runtime审计](../../development/component-runtime-consolidation.md)补全停止/回收缺口与
+逐文件任务；[生命周期§11](../../architecture/component-lifecycle.md#11-runtime-完整化当前与目标)
+是未实现目标，不能将其Graceful drain/Force/Reclaimed语义当作当前模块能力。
 
 | 文件 | 内容 |
 |---|---|
@@ -64,3 +68,8 @@
 | `os/core/src/component/isolated_load.rs` | 按域装载：页级权限分离的段放置 + 逐段映射 + 可选服务入口解析 |
 | `os/core/src/component/isolated_lifecycle.rs` | Isolated 组件生命周期 + 跨域 service dispatch：私有 AS + 每次按域放段（全新私有 backing，无 same-image 复用）+ Core 预置窗口，经跨 AS trampoline 跑 create / destroy / `kcomp_service_dispatch`（trampoline 对全新同步 Isolated 入口显式清零 `tp`）；失败清理 / destroy 退役语义 |
 | `os/core/src/component/generated/exports.rs` | schema 生成的 `EXPORTS` 表 |
+
+当前新增模块：`isolated_api.rs` 在真实 Core 栈/root 执行可 park 的 I Core API；
+`access.rs` pin AS 校验并逐页复制 private C buffer；`reclaim.rs` 实施 CPU-only Force /
+显式 reclaim。所有已发布 I/U 失败 backing 先保留至实际 Task 离场与全局私有域安全点，
+不再 create/service 故障时提前释放窗口。生产源码/验证见 Runtime 报告 §7。

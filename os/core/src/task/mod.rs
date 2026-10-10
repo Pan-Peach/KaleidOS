@@ -123,6 +123,22 @@ pub fn create_task(
     entry: usize,
     arg: *mut (),
 ) -> Result<TaskId, TaskError> {
+    create_task_inner(requester, entry, arg, None)
+}
+pub(crate) fn create_task_with_output(
+    requester: ComponentId,
+    entry: usize,
+    arg: *mut (),
+    output: *mut u32,
+) -> Result<TaskId, TaskError> {
+    create_task_inner(requester, entry, arg, Some(output))
+}
+fn create_task_inner(
+    requester: ComponentId,
+    entry: usize,
+    arg: *mut (),
+    output: Option<*mut u32>,
+) -> Result<TaskId, TaskError> {
     // 上下文种类门禁：IRQ 回调（同步、不可 yield 的顶半部）与 service call
     //（provider 跑在 Core 拥有的 service stack 上，没有调度可见的任务）内不得
     // 创建 work（创建任务会分配内核栈 / 新执行流）。门禁沿边界链**祖先遍历**：
@@ -146,12 +162,90 @@ pub fn create_task(
         ) {
             return Err(TaskError::RequesterNotReady);
         }
+        let user =
+            record.execution_domain == crate::component::endpoint::ExecutionDomain::SandboxedNative;
+        if let Some(output) = output {
+            let buffers = crate::component::access::Pinned::new(record.address_space, user)
+                .map_err(|_| TaskError::InvalidOutput)?;
+            buffers
+                .validate(output as usize, 4, true)
+                .map_err(|_| TaskError::InvalidOutput)?;
+        }
         let base = record.loaded.base;
         let end = base + record.loaded.text_size;
         if entry < base || entry >= end {
             return Err(TaskError::EntryOutOfImage);
         }
-        get_task_table().lock().create(requester, entry, arg)
+        let id = if let Some(space) = record.address_space {
+            use crate::memory::address_space::{
+                self as spaces, MappingPermission as P, VirtualRange,
+            };
+            if !spaces::range_has_permission(
+                space,
+                VirtualRange {
+                    base: entry,
+                    size: 2,
+                },
+                P::READ | P::EXECUTE,
+            ) {
+                return Err(TaskError::EntryOutOfImage);
+            }
+            let stack = crate::memory::alloc_region(table::TASK_STACK_BYTES)
+                .map_err(|_| TaskError::NoMemory)?;
+            // Private stacks become readable by their component (USER for U).
+            // Never expose contents left by a previous physical allocation.
+            unsafe {
+                core::ptr::write_bytes(stack.base() as *mut u8, 0, stack.size());
+            }
+            let range = spaces::find_free_range(
+                space,
+                VirtualRange {
+                    base: 0x3000_0000,
+                    size: 0x0800_0000,
+                },
+                stack.size(),
+                4096,
+            )
+            .map_err(|_| TaskError::NoMemory)?;
+            let mapping = spaces::Mapping {
+                virtual_range: range,
+                physical_range: stack.region(),
+                permission: P::READ
+                    | P::WRITE
+                    | if record.execution_domain
+                        == crate::component::endpoint::ExecutionDomain::SandboxedNative
+                    {
+                        P::USER
+                    } else {
+                        P::empty()
+                    },
+            };
+            spaces::map(space, mapping).map_err(|_| TaskError::NoMemory)?;
+            if crate::memory::kernel_mappings::publish_private_backing(stack.region()).is_err() {
+                // Keep the exact owning mapping even if alias exclusion partly
+                // failed. Later private reclaim must still find this extent.
+                core::mem::forget(stack);
+                return Err(TaskError::NoMemory);
+            }
+            // Exact AS mappings own Core-created stack extents, as for the ABI window.
+            core::mem::forget(stack);
+            let mut table = get_task_table().lock();
+            let id = table.create(requester, entry, arg)?;
+            table.get_mut(id).unwrap().private_stack = Some(range);
+            Ok(id)
+        } else {
+            get_task_table().lock().create(requester, entry, arg)
+        }?;
+        if let Some(output) = output {
+            // The registry admission lock serializes region teardown through
+            // publication. No guessed TaskId can start before this copy commits.
+            let mut buffers = crate::component::access::Pinned::new(record.address_space, user)
+                .map_err(|_| TaskError::InvalidOutput)?;
+            buffers
+                .put(output, id.raw())
+                .map_err(|_| TaskError::InvalidOutput)?;
+        }
+        Ok(id)
     }
 }
 
@@ -218,18 +312,79 @@ extern "C" fn task_entry_trampoline() -> ! {
     let Some(id) = crate::sched::current_task() else {
         halt()
     };
-    let (entry, arg) = {
+    let (owner, entry, arg, private_stack) = {
         let table = get_task_table().lock();
         match table.get(id) {
-            Some(record) => (record.entry(), record.arg()),
+            Some(record) => (
+                record.owner(),
+                record.entry(),
+                record.arg(),
+                record.private_stack,
+            ),
             // 不变式：被调度运行的任务必然在表里。
             None => halt(),
         }
     };
     // SAFETY: `entry` 由 `kcore_task_create` 提供并已通过"落在 owner 镜像内"
     // 验证；签名契约 = SDK 侧 `KcompTaskEntry`（`extern "C" fn(*mut ())`）。
-    let task_entry: extern "C" fn(*mut ()) = unsafe { core::mem::transmute(entry) };
-    task_entry(arg);
+    if let Some(stack) = private_stack {
+        #[cfg(all(
+            feature = "vm-mmu",
+            feature = "supervisor",
+            any(target_arch = "riscv32", target_arch = "riscv64")
+        ))]
+        {
+            use crate::component::isolated;
+            let space = crate::component::registry::get_registry()
+                .lock()
+                .get(owner)
+                .and_then(|r| r.address_space)
+                .unwrap();
+            isolated::install();
+            let domain = crate::component::registry::get_registry()
+                .lock()
+                .get(owner)
+                .unwrap()
+                .execution_domain;
+            let outcome = if domain == crate::component::endpoint::ExecutionDomain::SandboxedNative
+            {
+                Ok(crate::component::sandbox::invoke(
+                    space,
+                    entry,
+                    stack,
+                    [arg as usize, 0, 0, 0],
+                ))
+            } else {
+                let prepared = isolated::prepare(
+                    space,
+                    entry,
+                    stack,
+                    true,
+                    isolated::EntryArgs::pair(arg as usize, 0),
+                );
+                prepared.map(isolated::enter)
+            };
+            if !matches!(outcome, Ok(isolated::Outcome::Returned(_)))
+                && !get_task_table().lock().get(id).unwrap().exit_requested
+            {
+                crate::component::fail_component(
+                    owner,
+                    crate::component::load::ComponentLoadError::TaskPanicked(id),
+                );
+            }
+        }
+        #[cfg(not(all(
+            feature = "vm-mmu",
+            feature = "supervisor",
+            any(target_arch = "riscv32", target_arch = "riscv64")
+        )))]
+        {
+            let _ = (owner, stack);
+        }
+    } else {
+        let task_entry: extern "C" fn(*mut ()) = unsafe { core::mem::transmute(entry) };
+        task_entry(arg);
+    }
     // 契约要求任务必须经 `kcore_task_exit` 退出；返回视为 Core 兜底退出。
     let _ = crate::sched::exit_current();
     halt()

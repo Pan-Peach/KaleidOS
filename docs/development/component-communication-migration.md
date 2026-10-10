@@ -12,12 +12,12 @@
 | A 最新源码审计 | 完成：远端/HEAD/clean tree、调用/依赖/维护矩阵、真实门禁、漂移、性能样本 | 提交文档与 test-only 补充；没有生产功能回退 |
 | B KABI/SDK | 已实现 scalar/buffer/固定嵌套结构；六个 Contract 的 C/Rust client/codec/dispatch 同源 | 普通旧消费者已迁；结构生成不替代 owner/取消/业务语义 |
 | C 普通服务统一 | 完成：VirtIO/两个 RAM Block、Fat/little、VFS、Posix、Echo、probe.result 统一 IPC；Block/FS C/Rust SDK 无旧 Backend | 真实双架构/NoMMU 多实例、设备、FS、ksh/exec 门禁通过；保留现有业务语义 |
-| D 执行域/生命周期 | K IPC 真 Task 已有，I 持久 Task/IPC imports/copy 未有，legacy I 回归已修复并通过真实 QEMU | 保持旧 Gate 对照；实现 K/I/I/K/I/I 真域 Task，无 Sandbox 凭空实现 |
+| D 执行域/生命周期 | I RV64/RV32 S/MMU、U RV64 S/MMU 持久 Task/import/copy/IPC 已接通，CPU-only Force/reclaim 与1000轮真实回归通过 | 一般 Graceful drain、OOM/并发与精确回收核算仍缺；保持旧 Gate 硬件对照，见 [Runtime报告 §7](component-runtime-consolidation.md#7-授权后的生产实现与验证) |
 | E 删除旧机制 | 普通 Block/FS 的表、SDK Backend、Provider Gate 已删除；Core 同步机制未删 | I 替代通过后审计 Core api/ctx 与同步入口；policy 留窄，隔离/生命周期诊断暂保留 |
 | F 文档/测试 | 本轮同步状态、契约描述、ADR与历史标签；新 C/Rust codec 与 SDK test-only 链接修补 | 不把文档完成等同 B–E 完成；旧对照测试到替代完成前保留 |
 
 旧阶段对应：Phase 1 K IPC、Phase 2 Local、Phase 3 Remote/Fat/VFS/ksh 已有；
-Phase 4 Block/FS/RAM/little/probe 普通业务与 SDK 已收敛；旧 Phase 1c 私有域与 Phase 5 删除仍未完成。
+Phase 4 Block/FS/RAM/little/probe 普通业务与 SDK 已收敛；旧 Phase 1c 私有域已接CPU-only IPC，Phase 5同步诊断删除仍未完成。
 不能重复实现现有 VFS 或把 virtio 回退到 Direct。
 
 ## 2. 历史基线门禁修复（迁移前快照）
@@ -68,7 +68,7 @@ Core 同步测试入口不作为普通 Block/Filesystem 的兼容 Backend。
 4. Fat/little/VFS：真实FAT、Local+Remote、多个Fat、little原有format/独立介质、Node身份、
    EOF/短读/独立游标、取消新open/晚reply、Task exit reaper、Provider失败与旧endpoint/handle不重绑、cat/ELF。
 5. I域：RV64/Sv39、RV32/Sv32分别验证持久Task+AS、IPC import、copy坏范围、Caller/Server退出、
-   Failed/Stopped/SMP wake；NoMMU仅K可信，Sandbox单列未实现。
+   Failed/Stopped/SMP wake；NoMMU仅K可信，Sandbox RV64支持见 Runtime 报告§7，RV32 U未实现。
 6. 整套 make check/test-host/test-qemu/test-arch通过且普通旧consumer清单为空后，才删旧业务机制；
    `rg` 零命中只是辅助证据，不能代替语义/硬件门禁。
 
@@ -80,6 +80,8 @@ write，endpoint close不替FS回收对象；业务rollback/reaper责任不能�
 
 普通业务方法生成、Block/Filesystem SDK 和全部现有普通 Provider 的 IPC 迁移已完成。
 下一步实现私有Task/IPC，再删除失去必要诊断消费者的 Core 旧机制；性能优化后置。
+私有域与停止回收的最新源码基线、依赖和验收拆分见
+[Runtime第一轮审计](component-runtime-consolidation.md#3-文件级实施任务)，不另造迁移清单。
 当前没有透明local dispatch、shared memory、零拷贝、通用capability transfer、额外channel/
 connection registry或动态RPC路由需求；若模板开始包办对象语义，停止扩大并重新审查。
 

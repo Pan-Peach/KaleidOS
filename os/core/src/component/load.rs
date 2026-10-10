@@ -77,7 +77,7 @@ pub enum ComponentLoadError {
     /// （NoMMU 恒等 backend，或没有真实 backend）：`AddressSpaceBackend` 可用
     /// **不等于**有隔离能力 → `-ENOTSUP`，绝不把恒等映射当私有 AS 用。
     IsolationUnsupported,
-    /// SandboxedNative 的 U-mode / task-AS / syscall 机制尚未实现：装载前 ENOTSUP。
+    /// SandboxedNative 在此平台缺少 RV64 S/MMU 执行能力：装载前 ENOTSUP。
     SandboxUnsupported,
     /// `IsolatedNative` 装载发现**不在支持白名单里的 `kcore_*` import**：
     /// 支持诊断 / 只读、panic、私有 backing 与 endpoint API
@@ -96,7 +96,7 @@ pub enum ComponentLoadError {
     CreateFaulted,
     /// Isolated provider 在**跨 AS service dispatch** 期间故障，由 Core 的
     /// 故障分派判为不可恢复（`Outcome::Faulted`）：provider 逻辑死亡 + AS 退役 +
-    /// Core 预置窗口归还，caller 存活。
+    /// Core 预置窗口保留至显式 reclaim，caller 存活。
     ServiceFaulted,
 }
 
@@ -157,8 +157,8 @@ pub fn load_and_start(
 /// `kind` 是**部署请求**（Policy proposes）：本函数**按执行域分派**创建路径——
 /// `KernelNative` 走 [`create_kernel_native`]（现有完整创建链）；`IsolatedNative`
 /// 走 [`create_isolated_native`] 的门禁（能力 / import 白名单任一不满足即显式拒绝）
-/// 后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 走 [`create_sandboxed_native`] 占位，
-/// 装载前返回 ENOTSUP。任何域都**绝不静默降级成 native 跑**
+/// 后交 `isolated_lifecycle` 真正创建；`SandboxedNative` 在 RV64 S/MMU 经
+/// [`create_sandboxed_native`] 私有装载与 U runner 创建，其他平台返回 ENOTSUP。任何域都**绝不静默降级成 native 跑**
 /// （`docs/architecture/deployment.md` §2 ⑤/§10）。
 ///
 /// 锁纪律：registry / endpoint 锁只覆盖各自的查询与提交；`kcomp_instance_create`
@@ -190,8 +190,18 @@ pub fn create_component(
         // Isolated 有真实执行器：`create_isolated_native` 建私有 AS、放置镜像，
         // 再经跨 AS trampoline 跑 `kcomp_instance_create`（见 `isolated_lifecycle`）。
         ExecutionDomain::IsolatedNative => create_isolated_native(name, args),
-        // Sandbox 执行器未实现（U-mode + 私有 AS + ecall）。
+        // RV64 S/MMU Sandbox；不支持的平台显式拒绝。
         ExecutionDomain::SandboxedNative => create_sandboxed_native(name, args),
+    }
+}
+
+/// Pins the existing image execution count across the entire published loader
+/// or destroy operation, including setup and failure cleanup. Force cannot
+/// reclaim a create/destroy frame merely by replacing its lifecycle state.
+pub(crate) struct LifecycleExecution(pub(crate) ComponentId);
+impl Drop for LifecycleExecution {
+    fn drop(&mut self) {
+        registry::get_registry().lock().finish_call(self.0);
     }
 }
 
@@ -211,6 +221,8 @@ pub(crate) fn declare_instance(
         .declare(name, loaded, domain)
         .map_err(|_| ComponentLoadError::DeclareFailed)?;
     reg.record_creator(id, caller)
+        .map_err(|_| ComponentLoadError::DeclareFailed)?;
+    reg.pin_lifecycle(id)
         .map_err(|_| ComponentLoadError::DeclareFailed)?;
     Ok(id)
 }
@@ -242,6 +254,7 @@ fn create_kernel_native(
             .map_err(|_| ComponentLoadError::StartFailed)?;
         id
     };
+    let _execution = LifecycleExecution(id);
 
     // 入口调用：期间本 CPU 的 creating = 本实例（publish / task_create 的身份来源）。
     // Core 先把 out_state 置 NULL（无状态组件可成功写回 NULL）。
@@ -352,14 +365,22 @@ fn create_isolated_native(
     isolated_lifecycle::create(name, &blob, args)
 }
 
-/// `SandboxedNative` 的创建入口；执行器尚未实现，装载前返回 ENOTSUP。
+/// RV64 S/MMU Sandboxed 创建；白名单 thunk、USER 段与真实 U runner。
 /// TODO: 平台能力 / import 门禁与实例生命周期编排；底层 U-mode 机制位于 `sandbox`。
 /// 当前不读 artifact、不声明实例，不降级成 KernelNative。
 fn create_sandboxed_native(
-    _name: &[u8],
-    _args: &KcompCreateArgs,
+    name: &[u8],
+    args: &KcompCreateArgs,
 ) -> Result<ComponentId, ComponentLoadError> {
-    Err(ComponentLoadError::SandboxUnsupported)
+    if !cfg!(all(
+        target_arch = "riscv64",
+        feature = "supervisor",
+        feature = "vm-mmu"
+    )) {
+        return Err(ComponentLoadError::SandboxUnsupported);
+    }
+    let blob = read_artifact(name)?;
+    isolated_lifecycle::create_sandboxed(name, &blob, args)
 }
 
 /// Isolated 装载的**前置门禁**（能力门禁之后、任何装载之前）。返回 artifact
@@ -544,7 +565,7 @@ mod tests {
         assert_eq!(current_component(), before, "最外层返回后恢复进入前的值");
     }
 
-    /// Sandbox 执行器未实现，装载前返回能力缺失，不静默降级成 native。
+    /// Host 没有 RV64 S/MMU Sandbox 能力，装载前拒绝且不降级。
     ///
     /// 独立于 store：分派发生在装载之前，因此本用例不需要挂载仓库。仍取
     /// LOAD_TEST_LOCK 与上面的全局真相用例串行。

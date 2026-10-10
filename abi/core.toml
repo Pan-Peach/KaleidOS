@@ -383,7 +383,7 @@ targets = "c,sdk-rust,core-rust"
 name = "KCORE_ENDPOINT_MECHANISM_IPC"
 type = "u32"
 value = "2"
-doc = "Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback."
+doc = "Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). K/I/U Task consumers on supported deployments; no Direct/Gate fallback."
 targets = "c,sdk-rust,core-rust"
 
 [[const]]
@@ -471,7 +471,7 @@ backing 粒度由 Core 决定，今天最小 4 KiB）。首次交付**零初始�
 **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
 （`base` / `len`）就是身份；释放凭同一个 view 走 `kcore_memory_release`。
 KernelNative 返回共享 AS 的 VA；Isolated 映射进调用实例的私有 AS，归属由映射
-承载，不另立账本。Sandboxed 的原生直调入口返回 ENOTSUP（ecall 后端尚未接线）。
+承载，不另立账本。Sandboxed 经 ecall adapter 交付 USER 窗口；原生直调入口仍拒绝。
 成功 = `0`（view 写入 `*out_view`）；失败 = `-Errno`（`EFAULT` out 为空 /
 `EINVAL` size/align 非法 / `EOVERFLOW` `min_len` 超出本域指针宽 /
 `ENOMEM` 物理内存耗尽）。
@@ -480,7 +480,7 @@ c_doc = """
 取一段内存 backing，返回本执行域访问窗口（kind = KCORE_MEMORY_VIEW_LOCAL_VA）：
 min_len > 0、min_align 为非零 2 的幂；成功时 view.len >= min_len，首次交付零初始化。
 无账本：不发 id、不记 owner，view 自身就是身份（释放凭同一 view 走 kcore_memory_release）。
-KernelNative 给共享 AS 的 VA；Isolated 给实例私有 VA；Sandboxed 直调返回 ENOTSUP。
+KernelNative 给共享 AS 的 VA；Isolated 给实例私有 VA；Sandboxed 经 ecall 给 USER 私有 VA，原生直调拒绝。
 """
 [[function.param]]
 name = "min_len"
@@ -502,7 +502,7 @@ doc = """
 
 KernelNative 是**受信操作**（不校验归属、无账本），`(base, len)` 必须与 acquire
 交付的 view 完全一致。成功 = `0`；
-Isolated 只接受动态 backing 窗口内的精确映射；先 unmap、恢复共享 identity 别名，
+Isolated 只接受动态 backing 窗口内的精确映射；先恢复共享 identity 别名，再 unmap，
 再归还 physical extent。调用方保证无任务、回调或 DMA 继续借用；不接受 image/stack。
 失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法、`reserved` 非 0，
 或 `(base, len)` 不是一次 acquire 产物的形状）。
@@ -693,6 +693,24 @@ Gate / policy / IRQ 在途执行，或 Native 已发布 Direct 表时返回 EBUS
 失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
 KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。
 """
+[[function.param]]
+name = "component"
+type = "u32"
+
+[[function]]
+name = "kcore_component_force_stop"
+ret = "i32"
+category = "Component lifecycle"
+doc = "逻辑撤销后跳过 destroy。真实 Task 离场未确认时返回 EBUSY，保留所有 backing；U-mode timer 返回，S-mode 不承诺抢占。KernelNative 已发布 Direct 表时逻辑失效后返回 ENOTSUP，裸引用保持驻留。只允许活 KernelNative 管理上下文。"
+[[function.param]]
+name = "component"
+type = "u32"
+
+[[function]]
+name = "kcore_component_reclaim"
+ret = "i32"
+category = "Component lifecycle"
+doc = "显式回收 CPU-only 私有域。必须 Stopped/Failed、所有 Task 实际离场、无在途执行、全局私有域安全点；否则 EBUSY/ENOTSUP 并保留 backing。成功幂等，身份 tombstone 保留。KernelNative 自动 backing 回收不支持。"
 [[function.param]]
 name = "component"
 type = "u32"
@@ -1207,7 +1225,7 @@ endpoint `Live`、owner 存在且 `Ready`），再按 `(caller 执行域, provid
 - **Gate**：`*out_api` / `*out_ctx` **不写**（保持调用方原值）；调用方改用
   `kcore_endpoint_call`（同一 `endpoint` id 即 call-gate handle）。
 
-不支持的组合（跨特权 / 无法证明同 AS 且 syscall-IPC 未实现）→ `-ENOTSUP`；
+不支持的同步组合（U 不提供 Direct/Gate）→ `-ENOTSUP`；
 **绝不静默降级成 Direct**。调用方不在任何组件执行边界内 → `-EPERM`；caller 已
 `Failed` → `-EPERM`。Direct 选中但 provider 未交付 function table（`api` 为空）→
 `-ENOTSUP`。成功 = `0`；失败 = `-Errno`（`EFAULT` 任一 out 为空 /
@@ -1274,7 +1292,7 @@ c_doc = """
 调用 endpoint。返回 Core 传输状态（0 / -Errno）；provider 自己的 i32 返回写入
 *out_status（仅传输返回 0 时有意义）。dispatcher 在 Core 控制的 service 边界内
 执行（provider 域内栈 / principal / re-entry 与 IRQ 门禁 / panic containment）。
-K/I caller 均支持；I 出站经 Core 栈/root 桥接与扁平缓冲搬运。Sandbox 未实现。
+K/I caller 均支持；I 出站经 Core 栈/root 桥接与扁平缓冲搬运。Sandbox 不提供此同步 Gate 入口；普通业务走 Task IPC。
 """
 [[function.param]]
 name = "endpoint"
@@ -1815,7 +1833,7 @@ name = "kcore_ipc_listen"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "将当前真实 Component Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "endpoint"
 type = "u64"
@@ -1838,7 +1856,7 @@ name = "kcore_ipc_submit"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "endpoint"
 type = "u64"
@@ -1857,7 +1875,7 @@ name = "kcore_ipc_receive"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "endpoint"
 type = "u64"
@@ -1885,7 +1903,7 @@ name = "kcore_ipc_reply"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "request"
 type = "u64"
@@ -1901,7 +1919,7 @@ name = "kcore_ipc_collect"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "request"
 type = "u64"
@@ -1923,7 +1941,7 @@ name = "kcore_ipc_wait"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "endpoint"
 type = "u64"
@@ -1936,7 +1954,7 @@ name = "kcore_ipc_cancel"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "request"
 type = "u64"
@@ -1946,7 +1964,7 @@ name = "kcore_ipc_close"
 ret = "i32"
 category = "Endpoint Request/Reply"
 c_category = "Endpoint Request/Reply"
-doc = "owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。"
+doc = "owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。"
 [[function.param]]
 name = "endpoint"
 type = "u64"

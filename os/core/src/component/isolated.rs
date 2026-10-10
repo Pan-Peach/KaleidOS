@@ -25,7 +25,7 @@
 //!
 //! S-mode 组件与 Core 同特权级：它可以直接改 `satp` / `stvec` / 自己的映射。
 //! 本模块证明的是**机制**（真页表、真 trap 往返、真恢复 / 放弃路径），不是对抗
-//! 隔离；真正的强制边界是 U-mode（SandboxedNative，未实现）。ASID 恒 0 + 全量
+//! 隔离；RV64 U-mode Sandboxed 的强制边界由 sandbox 模块提供。ASID 恒 0 + 全量
 //! `sfence.vma`。
 
 use crate::component::containment::{self, cross_as::CrossAsContext};
@@ -214,6 +214,10 @@ pub fn install() {
 /// 通过后：策略缺失 = `Abandon`；`Resume` = 按（可能被修改的）帧恢复组件；
 /// `Abandon` = 经 [`CrossAsContext::abandon`] 交回进入前的 Core 调用者。
 fn on_exception(frame: *mut TrapFrame, cause: usize, stval: usize) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    if unsafe { super::sandbox::on_trap(frame, cause, stval) } {
+        return true;
+    }
     #[cfg(target_arch = "riscv64")]
     if unsafe { crate::task::user::on_trap(frame, cause, stval) } {
         return true;

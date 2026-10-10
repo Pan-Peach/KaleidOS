@@ -2,8 +2,8 @@
 
 > **状态：已冻结。** 本文件是组件身份、生命周期与入口 ABI 的**唯一依据**；与 `docs/architecture/component-model.md` 冲突时以本文件为准。
 
-本文件只解决一件事：**让组件 ABI 走"实例化"**——每次 instantiate 从一个 `.kcomp` artifact 得到一个完整、独立、拥有自己可写镜像状态的 `ComponentId`。
-它**不是**执行域（ExecutionDomain）里程碑，**不是**热更新/卸载里程碑。
+身份与入口 ABI 已冻结：每次 instantiate 从一个 `.kcomp` artifact 得到一个完整、独立、拥有自己可写镜像状态的 `ComponentId`。
+§1–§10 描述当前契约；§11 保留完整化目标与剩余缺口。已实现 I/U CPU-only Force 与显式 reclaim 的范围见 §11.1，不能推导一般 Graceful drain 或 S-mode 抢占已完成。
 
 ---
 
@@ -11,7 +11,7 @@
 
 ### 现在做（本契约覆盖）
 
-- 每次 instantiate 从一个 `.kcomp` artifact 得到一个**完整组件**（`ComponentId`），拥有**自己的可写镜像状态**（独立放段 / 重定位的 `.text` / `.rodata` / `.data` / `.bss`）+ 常驻 MemoryLease；加载同一 artifact 两次 = 两个互不共享 `.data` / `.bss` 的组件。
+- 每次 instantiate 从一个 `.kcomp` artifact 得到一个**完整组件**（`ComponentId`），拥有**自己的可写镜像状态**（独立放段 / 重定位的 `.text` / `.rodata` / `.data` / `.bss`）+ 由 LoadedComponent 持有的 MemoryLease；加载同一 artifact 两次 = 两个互不共享 `.data` / `.bss` 的组件。
 - 组件入口从 `kcomp_init`/`kcomp_exit` 协调替换为 `kcomp_instance_create`/`kcomp_instance_destroy` + 精确 ABI 指纹。
 - 每个组件拥有**自己的状态**、资源归属（device / IRQ route / DMA mapping）、任务、接口发布。
 - task entry 支持 opaque 参数。
@@ -21,18 +21,16 @@
 
 | 拒绝项 | 原因 |
 |---|---|
-| syscall 传输、IPC thunk、ASID、通用 ExecutionDomain manager | 仍未实现；执行域是进行中的里程碑（`STATUS.md`），私有 AS / 域切换的受限版本见下表后的更新 |
-| 物理 unload、refcount→回收、回调排空框架、看门狗、强制终止任务 | 活跃实例计数**不是**代码存活证明（旧表/回调/task context/返回地址都可能仍指向镜像） |
+| ASID、通用 ExecutionDomain manager | 本轮不引入；I/U 窄 adapter 复用既有机制 |
+| 通用物理 unload、refcount→回收、回调排空框架、K/I 强杀 | 私有 CPU-only reclaim 单独证明静止；活跃计数不是裸引用存活证明 |
 | 通用资源转移/授予图、ResourceDomain 容器、per-instance 字节计费/配额、Core 侧内存账本（region owner / region id / Retired 表） | 违反 `AGENTS.md`；所有权转移是推迟项；Core 不做内存记账，见 `docs/architecture/memory-and-heap.md` |
 | 跨域 text 去重、PIC/GOT 改造、共享 Rust runtime | 每次 instantiate 已独立放段 / 重定位自己的 `.data` / `.bss`；text 去重是**未来 loader / MM 优化**，不是组件语义（见 §9），本轮不为此改造 |
 | 驱动注册框架、热插拔策略、依赖解析器、自动 ABI 兼容协商 | 无当下需求 |
 | `module_init`（image 级初始化钩子） | 不可变表/元数据不需要初始化钩子；一个会声明资源/发布服务的 module_init 会立刻重造"这些归哪个实例"的问题。**7 个组件里没有一个需要它** |
 
-> **更新（取代上表"私有地址空间、域切换"的拒绝项）**：受限的 `IsolatedNative`
-> （S + 私有 AS）已落地——`KernelAddressSpace` 生命周期 + 最小跨 AS trampoline（共享 Core 映射） + 按域放段 +
-> Core 预置窗口 + K/I 双向 service Gate + 失败 / 重启矩阵（RV64+RV32 QEMU
-> 证明）；**ASID / U-mode / `ecall` / Isolated 任务与设备 import 面仍未实现**（支持面 import 已落地），边界是
-> 协作式（非对抗隔离）。见 `docs/architecture/deployment.md` §10。
+> 当前支持：I 的持久 Task/IPC 和私有 heap 已在 RV64/RV32 S/MMU 接线，
+> U `.kcomp`/ecall/Task/heap/IPC 在 RV64 S/MMU 接线。复用相同实例身份，
+> 无设备/DMA/IRQ import；I 仍为可信协作式 S-mode。详见 [部署 §10](deployment.md#10-实现状态)。
 
 ---
 
@@ -262,8 +260,8 @@ create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient
 
 ## 9. 重启与 text 共享
 
-- **不实现 `instances == 0 → unload` / 物理回收。** 组件 backing 保持 pinned-until-reboot；`Stopped` / `Failed` 的记录留作 tombstone，其 backing 仍归**旧组件**所有。
-- **重启 = 从同一 artifact 重新 instantiate**：得到**全新 `ComponentId`**、**全新可写 image state**（`.data` / `.bss` 回到 artifact 初始值）、**全新资源归属 / endpoint**。旧组件的 `Stopped` / `Failed` 记录与 backing 驻留（phase 1 不回收）。
+- 不按 `instances == 0` 推断可回收。K backing 保留驻留；I/U CPU-only 在执行离场及全局私有域安全点证明后显式 reclaim。`Stopped`/`Failed` 身份 tombstone 永久保留。
+- **重启 = 从同一 artifact 重新 instantiate**：得到**全新 `ComponentId`**、**全新可写 image state**（`.data` / `.bss` 回到 artifact 初始值）、**全新资源归属 / endpoint**。旧组件记录保留，私有 backing 是否释放由 reclaim 的独立证明决定。
   > Isolated 域：**每次 instantiate 都做全新的按域放置**（`isolated_load::place`）到**全新私有 backing + 全新私有 AS**——**没有** same-image backing 复用。同一 artifact 可以有多个**并发** Isolated 组件（各自私有 AS + backing）。trampoline / 共享 Core 映射 / trap 故障收敛 / import 白名单不变（`tp` 是普通架构 / 任务执行状态，由 Core 在任务切换 / trap 时透明保存 / 恢复，全新上下文起点为 0，不再是组件运行时指针）。见 `architecture/deployment.md` §10。
 - 可为观察目的派生一个计数，但**不需要原子 refcount 或回收语义**。
 - **重启 ≠ 设备恢复**（隔离到重启，见 §8）。
@@ -282,6 +280,101 @@ create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient
 
 `virtio_blk` 的 `DEVICE_ID` / `MMIO_BASE` / `DMA_MAP` / `BLK` 现在是**组件私有 static**——每次 instantiate 都得到独立的可写 image state，因此第二个 `virtio_blk` 组件可以独立接管第二台设备（各自私有 static，互不覆盖）。CoreTest `driver-multi-device` 已在 RV64 + RV32 上验证第二个同 artifact 驱动组件独立 attach。
 
-**剩余的是编排缺口，不是模型限制**：prober 在第一个 `Match` 后停止，不为第二台设备 provision 第二个驱动组件。**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖编排问题。
+prober 当前已逐台编排，事实见 [STATUS](../../STATUS.md) §3.29。**不要**在 Core 里造通用的 "current device" 设施，或 fork 第三方驱动框架来掩盖编排问题。
 
 > 旧的 scoped HAL context gate 已随 image 私有化消失：每个组件有自己的 static，"同一份共享 static 被多实例争用"的补救不再需要。通用迁移模式（不可变表保持共享；带可变生命周期的状态移入地址稳定的显式分配；回调经 ctx 访问该状态）的其余部分属于实现进度，不入本契约；C 生命周期 smoke 已落地。
+
+## 11. Runtime 完整化当前与目标
+
+### 11.1 终止与回收分别报告
+
+当前管理入口 `kcore_component_force_stop` 与 `kcore_component_reclaim` 只开放给
+活 KernelNative 管理上下文。Force 立即逻辑失效并跳过 destroy；尚未实际离场返回
+EBUSY，可有限重试。K 仍有复制过的 Direct 表时，Force 完成逻辑撤销后返回
+ENOTSUP，不声称裸调用已排空。Reclaim 对 K 返回 ENOTSUP；I/U 必须 Failed/Stopped、无 inflight、
+所属 Task 均 Exited 且 execution_retired、其他私有域无 Running Task 或生命周期执行。
+成功清除实体 backing/AS/Task，保留身份并设置内部 reclaimed 标记，重复 reclaim 成功。
+不需要新 ComponentState。页表/别名恢复失败保守保留；调用者不能从 force 返回值推导
+物理回收。当前没有完整的逐资源 retained reason 结构化 API。
+U 每 10ms timer 返回 Core 复验状态；K/I 不保证非协作执行可强杀。一般 Graceful
+通知/cleanup Task/drain 协议仍是下述目标；Echo 测试先以业务 STOP 退出 Server。
+
+Component 是资源生命周期的基本归属单位；复用 `ComponentRecord.loaded`、AS、
+Task owner、Endpoint owner 和现有设备表，不增加 Image/Instance Registry。
+`Stopped` 表示正常逻辑终止，`Failed` 表示异常逻辑终止；两者均禁止新业务。
+执行是否排空、哪些物理资源已回收必须另行报告，不能仅由状态推断。
+
+完整目标的内部结果应包含 logical state、execution drained、reclaimed extents/pages 与
+retained reason；`Reclaimed` / `Quarantined` 是回收结果，不增加公开 ComponentState。
+允许部分资源回收、部分保留；至少区分 ActiveCpu、ActiveCallback、NativeRawReference、
+UnknownDma、AliasRestoreFailed、PageTableTeardownMissing 与 DestroyFailure。
+诊断按现有 ComponentId / 资源身份定位，不新建通用资源图。当前没有这份完整结果 API。
+停止编排初期仍由受信KernelNative组合方发起；U不因知道ComponentId就可停止别的
+实例。U自退出只操作自己的Core Task/实例身份，不从payload取得管理权限。
+若停止请求来自目标自己的Task，只提交停止请求并返回/退出；不能同步等待自身排空
+再destroy/free正在使用的栈。后续在Core安全上下文推进已认领的停止。
+
+### 11.2 Graceful Stop
+
+现有 Stop 仍是无等待操作：live Task / inflight / Native Direct 发布即 EBUSY，
+重复 Stop 返回 EINVAL。目标按以下依赖推进，顺序允许组件清理需求的局部调整：
+
+1. registry 准入事务认领一次 Stop，提交 Ready → Stopping；同时拒绝新 Task、
+   publish、grant、submit 与 backing/device/DMA 获取。已认领 Stop 不再次运行 destroy。
+2. 通知已有 Task 停止。最小候选是 Core 停止谓词 + owner 内 wake，组件在自己的
+   Server/Worker 循环清理并退出；不引入 Unix signal 或通用事件框架。
+   **必须同时修改调度准入**：现有 `may_run(Stopping)==false` 无法让这些 Task 收尾。
+   仅 Graceful 的已有 Task 可在清理期间恢复；不能让 Stopping 重新获取普通授权。
+3. 初期采用 cancel-and-drain：关闭所有服务 Endpoint，已有成功 reply 保留首个结果，
+   其余请求完成 ENOTCONN；accepted receipt 的业务执行仍须排空。consumer 的未结请求
+   取消/放弃，移除 send grant。close 只终结 transport，不回滚已执行的业务。
+   以后若有真实需求，再支持“拒绝新 submit、保留 accepted reply”的独立排空模式。
+4. 从 Task kernel stack 返回到 Core；等待所有 owner Task、同步 Gate/policy/IRQ、
+   copy 与 AS 进入引用退出。`Exited` 提交在切栈前，必须有 incoming-stack 完成确认，
+   不能此时删除 TaskRecord。回收确认前，旧 context / return address 保活。
+5. 执行排空后在实例域运行一次 destroy；生命周期入口不属于普通 RPC。保留私有
+   lifecycle 栈与 ABI 窗口直至入口返回 Core；destroy 不能 yield/park/exit。
+6. 撤销残余 IRQ/DMA/device/Endpoint，满足[内存回收条件](memory-and-heap.md#9-runtime-回收矩阵目标与基线)后释放独占资源，最后提交 Stopped。
+
+Stop 不在 Core 锁内等待、执行 destroy 或调用业务；并发 Task 创建、IPC submit 与
+资源获取均须持 registry 锁复验，再在各自表提交。维持现有局部锁序，不能在 AS/PLAN
+锁内反向获取 registry/task。destroy 成功与 finish_stop 竞争 Failed 时，Failed 优先，
+不能重新变为 Stopped，也不能再次析构。
+
+初期 Stop 使用非阻塞推进/查询与调用方有限 deadline，不在 Core 加 timer waiter 队列。
+deadline 到期返回 Pending/TimedOut 和阻塞原因，实例留 Stopping；默认不自动升级 Force。
+在没有可调度 lifecycle Task 或安全抢占之前，K/I destroy 挂死无法保证调用返回：
+有界 destroy 是可信组件前提，deadline **不能**中断同步入口。U destroy 可在完成真实
+U trap/deadline 后受控中止。当前 Stop ABI 只有 i32，新增结果需 schema/fingerprint 协调替换。
+
+### 11.3 Forced Stop 与失败
+
+Force 先关闭业务和资源准入，异常终态使用 Failed；跳过 destroy，终结 IPC，撤销
+未来 callback 准入，向正在运行的 CPU 请求离场。Created/Runnable/Blocked Task 可以
+在证明没有正在保存/恢复 context 后由 Core 终结；Running Task 的终结必须由本 CPU
+从 Core 安全上下文提交。不能由远端删记录或直接把 Running 改成 Exited 并 free。
+
+K/I 当前协作式 S-mode 不具备不 yield 任务的有限时间停止能力；IPI 只有门铃/安全点，
+timer 未接内核抢占。即使 S-mode 抢占接通，禁中断、破坏 Core 或持锁挂死仍无通用恢复
+保证。遇到这类任务报告 execution pending，代码、栈、AS 和关联 backing 保留。
+U-mode 则需真实 timer/IPI trap 回 Core task stack、stop 检查及“禁止再次 sret”才能
+强制停止忙循环；不能在 per-CPU trap 栈运行 Scheduler。跨 CPU 确认见[调度契约](scheduling.md#7-runtime-停止与私有-as)。
+
+### 11.4 竞争与失败处理
+
+| 情况 | 目标结果 / 保留条件 |
+|---|---|
+| Pending IPC | 使用 Exchange 首终态规则；取消不承诺业务回滚，关闭不代替 CPU 排空 |
+| Server 已退出 | 复用 task_exited 关闭端口；无 Server 不成为 Stop 永久等待条件 |
+| Task 不退出 | deadline 后 Pending/TimedOut；K/I 不声称已强杀，保留被访问 backing |
+| destroy 返回错误 / panic | Failed；不重试、不继续业务；只回收独立证明安全的 Core 资源，裸状态保留 |
+| 两 CPU Stop | registry 内一次认领；第二请求观察同一结果/进行中，不第二次 destroy |
+| 重复 Stop | 现行 EINVAL 保持；目标查询/推进复用结果，不引入第二生命周期 |
+| Stop 与 Failed | Failed 不回滚；Force 优先关闭准入；若 destroy 已开始，不能从远端释放其栈/镜像 |
+| Stop 与 Exit / Reply | Exchange 锁串行首终态；Task 状态与切栈完成分别确认；不重复 wake/collect/free |
+| Create 失败 / commit 失败 | 未构造不 destroy；已启动 Task 也要排空，不能因 create 失败直接释放镜像 |
+| OOM | 未发布 lease 可 Drop；已发布资源保留原因，拆除不依赖临时的大额分配 |
+
+只把停止所需的小标志/确认放入已有记录与 per-CPU state；具体字段由实现任务决定。
+不加通用 ResourceManager、POSIX process 语义或路由前置。源码审计、逐文件实施任务和
+测试证据见 [Runtime 第一轮交付](../development/component-runtime-consolidation.md)。

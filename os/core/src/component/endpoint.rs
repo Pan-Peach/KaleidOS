@@ -532,11 +532,6 @@ impl EndpointRegistry {
         // (2) 机制选择：两端执行域缺一不可。
         let provider_domain = instance_domain(components, record.owner);
         let mechanism = if record.is_ipc_only() {
-            if caller_domain != ExecutionDomain::KernelNative
-                || provider_domain != ExecutionDomain::KernelNative
-            {
-                return Err(BindError::UnsupportedMechanism);
-            }
             Mechanism::Ipc
         } else {
             select_mechanism(caller_domain, provider_domain)?
@@ -1270,7 +1265,7 @@ mod tests {
         assert_eq!(bound.record.owner, ids[0]);
     }
     #[test]
-    fn ipc_only_binding_rejects_private_domains_and_never_hands_out_pointers() {
+    fn ipc_only_binding_crosses_domains_without_handing_out_pointers() {
         let (reg, ids) = ready_world();
         let mut er = EndpointRegistry::new();
         let id = publish_ready_with_table(
@@ -1291,10 +1286,9 @@ mod tests {
             ExecutionDomain::IsolatedNative,
             ExecutionDomain::SandboxedNative,
         ] {
-            assert!(matches!(
-                er.bind(&reg, id, CONTRACT, ABI_A, domain),
-                Err(BindError::UnsupportedMechanism)
-            ));
+            let bound = er.bind(&reg, id, CONTRACT, ABI_A, domain).unwrap();
+            assert_eq!(bound.mechanism, Mechanism::Ipc);
+            assert!(bound.record.api.is_null() && bound.record.ctx.is_null());
         }
         er.invalidate(id);
         assert!(

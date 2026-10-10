@@ -50,6 +50,7 @@ impl From<TaskError> for Errno {
         match error {
             TaskError::AlreadyExists => Errno::EEXIST,
             TaskError::NotFound => Errno::ESRCH,
+            TaskError::InvalidOutput => Errno::EFAULT,
             TaskError::NoMemory => Errno::ENOMEM,
             TaskError::InvalidTransition => Errno::EINVAL,
             TaskError::RequesterNotFound => Errno::ESRCH,
@@ -364,6 +365,7 @@ mod tests {
             let expected = match &error {
                 TaskError::AlreadyExists => Errno::EEXIST,
                 TaskError::NotFound => Errno::ESRCH,
+                TaskError::InvalidOutput => Errno::EFAULT,
                 TaskError::NoMemory => Errno::ENOMEM,
                 TaskError::InvalidTransition => Errno::EINVAL,
                 TaskError::RequesterNotFound => Errno::ESRCH,

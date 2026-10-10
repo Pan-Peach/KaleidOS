@@ -3,10 +3,14 @@
 更新：2026-10-10。基线 develop `2e10304c389f` 已有 KernelNative IPC、混合
 Local/Remote Fat VFS、virtio Block IPC-only 与 ksh/ELF 主链。用户授权后已实现
 Echo/Block/Filesystem/VFS/Posix/Probe scalar/buffer/固定结构方法生成并接入真实服务，修复已审计回归；完整 check/host/
-QEMU/Arch 门禁通过。普通业务 SDK/Provider 已统一 IPC；Core 同步隔离诊断与策略入口仍保留，见§3.29。Isolated新IPC、Sandbox、
-通用VFS文件fd/libc startup和完整物理回收未实现，K链不证明私有域能力。
+QEMU/Arch 门禁通过。普通业务 SDK/Provider 已统一 IPC；Core 同步隔离诊断与策略入口仍保留，见§3.29。
+通用VFS文件fd/libc startup、一般Graceful drain与完整回收核算仍缺；新增I/U CPU-only Task/IPC/Force/reclaim及1000轮真实回归见§3.30。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
+
+下一阶段主线调整为 Component Runtime 的 Load/Run/IPC/Stop/Unload/Reclaim，先纯内存
+组件与 I 持久 Task/IPC，再 U 组件；上层功能扩展暂后置。第一轮审计、目标契约与
+授权后的 CPU-only I/U 实现已完成，剩余任务见 §3.30；路由只形成 ADR，不作为 Runtime 前置框架。
 
 本文是审计快照加计划，不是设计文档。事实以代码、测试、构建配置为准。README 和设计文档里写了但代码没有的，按未实现记。
 
@@ -14,7 +18,7 @@ RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固
 
 ## 0. 一句话
 
-KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS 文件 fd / libc startup、组件 SandboxedNative 后端和物理回收仍是主要缺口。
+KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS 文件 fd / libc startup、一般 Graceful drain、精确保留核算与 DMA 物理回收仍是主要缺口（I/U CPU-only 已接，§3.30）。
 
 底座侧 RISC-V 的 CPU 身份、启动、IPI 与 per-CPU 执行现场已接通组件调度。第二 ISA 的现状见模块文档，本轮不扩展它的实现或测试范围。
 
@@ -74,9 +78,9 @@ Hardware                                    目前只有 QEMU virt
 
 现状：`TaskId`、`TaskTable`、owner、kernel stack、状态机（`Created`/`Runnable`/`Running(CpuId)`/`Blocked`/`Exited`，合法边 6 条）。host 覆盖非法迁移、owner、`EntryOutOfImage`、property `random_transition_sequence_preserves_task_truth`；QEMU 有 `task-create`/`task-switch`/`task-exit`，ArchTest 有 `task-panic`。
 
-缺口：`TaskRecord` 与 `AddressSpaceId` 没有绑定，`Running(CpuId)` 没有 AS 概念。
+当前私有组件 Task 已从唯一 ComponentRecord 关联 AS，并以 Core 栈调度；普通用户 Task 使用既有 UserDomain。更多失败/并发回收验收见§3.30。
 
-下一步：task 与 AS 的绑定语义（当前调度只承诺 KernelNative 固定 CPU）。
+下一步：补齐私有任务的失败/并发回收与原生浮点现场验证；当前 Task 固定 CPU。
 
 #### 3.4 park/unpark 原语 `▰▰▰▰▱` IMPLEMENTED
 
@@ -90,9 +94,9 @@ Hardware                                    目前只有 QEMU virt
 
 策略回调串行占用 Core policy 栈，忙时替换返回 EBUSY；错误提议 / panic 退役并使用已有确定性回退。host 并发测试覆盖同栈占用和每 CPU 身份；RV64 ArchTest 覆盖启动 / IPI / per-CPU；CoreTest 新增七项检查，覆盖真实组件并行、远端 wake、本地 RR、任务退出与 CPU0 / CPU1 双向 panic containment。职责契约见 `docs/architecture/scheduling.md`。
 
-缺口：无抢占、迁移、work stealing、hotplug、私有 AS 任务调度；没有真机证明。其它 ISA 的调度不在本轮范围。
+缺口：无 S-mode 抢占、迁移、work stealing、hotplug；I/U 私有任务支持见§3.30；没有真机证明。其它 ISA 的调度不在本轮范围。
 
-下一步：用真实驱动 / 服务的组件等待队列检验协作式 SMP；私有 AS 任务绑定与抢占单独定契约。
+下一步：用真实驱动 / 服务的组件等待队列检验协作式 SMP；S-mode 抢占与远端 TLB 同步单独验收。
 
 #### 3.6 时钟 / 抢占 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -180,7 +184,7 @@ Stop 在 registry 准入锁内检查 live Task 与 Gate/policy/IRQ 在途执行�
 
 ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 abi，只比 contract 与存活，交付 opaque capability。exact contract 加 abi 加存活的校验在 `kcore_endpoint_validate`（对已持有的 id，C ABI 可达，SDK `Endpoint<C>::from_id` 已接）和 `kcore_endpoint_bind`（第一步就走同一个 `EndpointRegistry::lookup`）。`deployment.md` §7.4/§11 已同步这一落点，裸 lookup 只发现 id。
 
-现有 K/I 矩阵均已派发：K/K Direct、K→I / I→K / I→I Gate。专用 test-only `domain.test` 工件验证同步跨域调用；普通 Block SDK 已仅支持 IPC。Sandbox 仍显式拒绝。
+现有 K/I 矩阵均已派发：K/K Direct、K→I / I→K / I→I Gate。专用 test-only `domain.test` 工件验证同步跨域调用；普通业务仅支持 IPC；RV64 Sandbox IPC已接，同步Gate/Direct仍拒绝。
 
 下一步：新接口（NetDevice、Clock、RNG 等）继续走同一条 bind 路径；补齐各接口的扁平 wire adapter。
 
@@ -188,17 +192,11 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 现状：`ExecutionDomain` 三个变体。KernelNative 完整并验证。IsolatedNative（S 加私有 AS）有真实的 create/destroy/service：私有 AS、共享 Core 映射（same VA→PA）、最小跨 AS trampoline（per-invocation context、satp 切换、全量 `sfence.vma`）、按域放段（页级权限）、Core 预置窗口、K/I 双向 service Gate、失败与重启清理；SDK 在 create 前选择 K 共享堆 / I 私有堆，同一 `kcomp_heap.kcomp` 验证 Rust/C 分配、增长、精确 release、多实例与重启。按验证层看是 PARTIALLY VALIDATED，能力止于 QEMU RV64+RV32 的 29 个 ArchTest case，不能再往上抬。
 
-缺口：无 ASID（恒 0 加全量 flush）；无 U-mode/`ecall`，是协作式 S-mode 边界，不是对抗隔离；import 面支持诊断、只读查询、panic、私有 backing 与 endpoint 发布/发现/校验/绑定/调用；不能 claim 设备、注册 IRQ/DMA、建任务；没有压力或对抗测试；私有堆 backing 停止后驻留，自动回收仍需 drain / DMA 静默与 AS teardown。
+当前更新：I 持久 Task/IPC 与 CPU-only 回收已接；I 仍是协作式 S-mode。设备/IRQ/DMA、ASID与远端 shootdown不支持，详见§3.30。
 
-下一步：两条路选一条。继续补 ASID、U-mode、任务/设备 import 面；或者明确冻结成教学实验，把资源投到 SandboxedNative 与真机。
+#### 3.17 SandboxedNative `▰▰▰▱▱` EXPERIMENTAL
 
-#### 3.17 SandboxedNative（U-mode + syscall 边界） `▱▱▱▱▱` NOT IMPLEMENTED
-
-现状：Core `component/sandbox.rs` 已有 prepare_task / enter / 用户范围 copy 的声明与 Unsupported 占位，尚无执行机制。`load.rs` 的创建分派装载前返回 `SandboxUnsupported`（ABI `-ENOTSUP`），不创建实例、不回退 native；销毁入口仍未实现。没有 sandbox.kcomp。普通用户 task 已有单独的 kcore_user_* C ABI / U-mode 路径，不等于组件部署后端已实现。
-
-缺口：组件按域装载 / import、Core mechanism ecall SDK 与 destroy；私有 allocator / runtime 选择可复用 Isolated 后端，但未接通 Sandbox 执行路径；普通程序的低特权执行 / trap / U 页表访问已有独立路径。
-
-下一步：复用已接通的普通用户 task / AS / trap / copy 机制，补组件按域装载与 Core ecall SDK。阶段依赖与验收见 `docs/development/userspace.md`。
+RV64 S/MMU 已有 `.kcomp` 装载/USER thunk/ecall、create/destroy、私有 Task/heap/IPC、timer Force 和显式 reclaim；RV32 U 与设备/DMA/IRQ仍拒绝。复用普通arch U现场，组件身份不混入personality。真实九格Echo与1000轮回收见§3.30。
 
 #### 3.18 驱动组件 `▰▰▰▱▱` EXPERIMENTAL
 
@@ -320,7 +318,7 @@ PID / Linux syscall 语义在组件；Core 只管理实际执行真相。create 
 
 缺口：一般 VFS / 文件 fd、mmap、signal delivery / handler、线程、vfork、pipe / terminal、
 动态链接、静态 PIE；上游 glibc startup 尚未通过。fork 深拷贝，无 COW；wait 与成功 exec
-旧 backing 尚无物理回收。SandboxedNative 组件部署仍未实现。
+旧 backing 尚无物理回收。SandboxedNative 组件部署已在 §3.30 接线，普通 POSIX 用户 backing 回收不由此推导。
 
 下一步：先接只读 VFS / fd，验证普通应用运行期文件 I/O；libc startup 按实际二进制缺口独立推进，不能替代纵向文件链路验收。
 现有 FAT/littlefs/block provider 可复用；Core 不收 POSIX 或文件系统语义。
@@ -416,25 +414,51 @@ Block/FS C/Rust SDK 不再有 Direct/Gate Backend，旧 BlockDeviceApi/FileSyste
 新 little/Fat create config 为16字节 LE：Block EndpointId、control ComponentId、reserved=0；
 exact fingerprint 协调替换，不接受旧 config 或业务函数表。Probe result/shutdown 也由 schema 生成。
 未发布服务的 network 骨架删除旧函数表/分发占位，仍 ENOTSUP。
-D私有Task/import/copy尚缺；E剩余 Core Direct/Gate 只服务策略/诊断/生命周期回归，不能提前删除。
+D私有Task/import/copy已在§3.30接通；E剩余 Core Direct/Gate 只服务策略/诊断/生命周期回归，不能提前删除。
 F同步文档与测试；详见 [方法生成](docs/development/kabi-methods.md) 与 [专项审计 §11](docs/development/component-communication-audit.md#11-普通业务-ipc-only-cleanup)。
 Core新增账本/锁为零。RAM、littlefs、probe.result 每实例增加真实 Server Task；probe shutdown 后退出，
 已匹配设备的 Block Task 继续服务；普通 stop 仍拒绝 live Task。Native backing 仍驻留，OOM 下 destroy 栈分配的既有限制不变。
 
-限制：KernelNative同特权可信；Isolated新IPC/持久Task/跨AS copy、Sandbox、deadline/
-强制终止/通知与物理回收未实现。旧Gate必须保留到真实I替代门禁满足。
+限制：KernelNative同特权可信；一般deadline/Graceful通知仍缺。I/U的Task/IPC/Force/CPU-only回收见§3.30；旧Gate硬件诊断仍保留。
 Echo fixture确定性验证远端Task先于create完成的启动窗口，等待Endpoint提交后listen。
-下一步：接通并真实验证私有域 IPC，再审计 Core 同步调用和保活状态的删除；性能优化后置。
+下一步：补齐Graceful drain、失败/并发回归和回收保留核算，再按消费者审计同步诊断；性能优化后置。
+
+#### 3.30 Component Runtime 完整化（I/U CPU-only 实现与回收）
+
+基线 develop `7e3a3ed1da2e503d0acb74892dea50c977957b73`，用户授权生产实现。
+[报告 §7](docs/development/component-runtime-consolidation.md#7-授权后的生产实现与验证)
+记录审计、逐文件改动、维护点、实际门禁与剩余缺口。身份仍为 ComponentId →
+ComponentRecord → LoadedComponent；无新实例/资源账本或路由框架。
+
+已实现：RV64/RV32 S/MMU I 持久 Task、逐 Task 私有栈、Core 栈/root IPC 桥接；
+RV64 S/MMU U `.kcomp` 装载/重定位、USER thunk/ecall、生命周期/heap/Server Task。
+Core 用真实 Task/owner/CPU 鉴权并 pin AS 覆盖 payload/标量校验、copy 和 Exchange
+提交。RV64 九格、RV32 四格 IPC 使用同一 Echo 业务 Contract/Handler。
+
+新增 Force 管理入口：先逻辑失效、跳过 destroy、取消已保存执行；未实际离场
+EBUSY 并保留 backing。U 每 10ms timer 回 Core；远端 CPU 忙循环停止有真实证据。
+Scheduler 在 incoming stack 确认 departing Task 保存完成；现有 inflight 保护
+create/destroy 执行。显式 reclaim 只在所属 Task 已离场、无 inflight、全局私有域
+安全点时归还独占 image/heap/stack、Task Core/API 栈和页表页；成功幂等、身份保留。
+
+测试：真实 1000 轮 load/IPC/graceful 或受控 fault/force/reclaim/stale，每轮 Task
+数量恢复且物理页增加。常驻净增包含 tombstone/allocator metadata，但精确分项尚缺，
+本轮不宣称零不明泄漏认证。门禁与具体计数以报告 §7 为准。
+
+仍缺：一般 Graceful 通知/drain/有限推进、请求 deadline、结构化逐资源 retained reason、
+远端 TLB shootdown、全面 OOM/stop-reply/copy-unmap 竞争、RV32 U、设备域部署、K/I 原生浮点现场保存/验证。
+K/I 非协作 S-mode 强杀无保证；K image/shared heap 不批量回收。DMA 继续 Quarantine。
+[路由 ADR](docs/development/ipc-routing-service-discovery-adr.md)仅设计。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
 1. block/wake 已接通固定 CPU 的协作式 SMP；组件持有条件与等待者集合，Core 只提供 permit / park / unpark。继续检验真实驱动与服务负载。
-2. task 与地址空间没有绑定。`TaskRecord` 和 `AddressSpaceId` 之间没有关系，`Running(CpuId)` 没有 AS 概念。将来一个 POSIX 进程等于一个 AS 加 N 个 task，这个语义必须由 Core 先提供，否则进程语义会漏进 Core。
-3. 抢占没接线。`timer::on_trap` 不调用 `sched::on_timer_tick`，后者是 `todo!()`。纯协作模型下，不协作或死循环的执行域拿不回控制权。
-4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。unload 是 tombstone，backing 驻留到 reboot，没有 drain。发布 Direct 的 Native provider 不能进入 Stopped/destroy；Failure 后旧表仍可能调用，必须保留 ctx，代码页驻留本身不能保证其安全。Gate 的 stop/admission 竞争已由 host 与 RV64 双 CPU CoreTest 验证，完整 DMA/drain 回收仍未证明。
+2. 私有组件 Task 已关联唯一 ComponentRecord 的 AS；普通 personality 用户 Task 使用既有 UserDomain。多线程与进程语义仍属于 personality，见 §3.30。
+3. S-mode 抢占没接线。`timer::on_trap` 不调用 `sched::on_timer_tick`，后者是 `todo!()`。K/I 非协作或禁 IRQ 执行不能保证拿回控制权；RV64 U runner 已有 timer 返回 Core 的边界，见 §3.30。
+4. 组件多实例与生命周期的完整矩阵。多实例在加载、状态、设备、FS 维度已经证明，但 endpoint、task、crosstalk、卸载后的语义没有逐个证明。K unload 保留 tombstone 与 backing，一般 drain 仍缺；I/U 显式 CPU-only reclaim 见§3.30。发布 Direct 的 Native provider 不能进入 Stopped/destroy；Failure 后旧表仍可能调用，必须保留 ctx，代码页驻留本身不能保证其安全。Gate 的 stop/admission 竞争已由 host 与 RV64 双 CPU CoreTest 验证，完整 DMA/drain 回收仍未证明。
 5. IsolatedNative 的缺口。机制真实，覆盖很窄，详见 3.16。
 6. 真机验证缺失。设备、中断、DMA、timer 都只在 QEMU virt 证明过。
-7. 组件模型仍在演进。`ExecutionDomain` 与生命周期接口是 ACTIVE DESIGN，SandboxedNative 参与的所有组合都被 `todo!()` 或显式拒绝。
+7. 组件模型仍在演进；I/U CPU-only 支持见 §3.30，通用 Graceful drain、设备域部署与完整故障压力矩阵仍缺。
 
 ## 5. 验证矩阵（哪些组合真的跑过）
 
@@ -449,7 +473,7 @@ Echo fixture确定性验证远端Task先于create完成的启动窗口，等待E
 | ArchTest / SMP | 是 | `make test-arch-smp-rv64`：启动 / IPI / per-CPU；组件调度、远端 wake、双向 panic 在 CoreTest 的 `make test-qemu` 中验证 |
 | KernelNative（执行域） | 是 | CoreTest 全链加 ArchTest `panic-*` |
 | IsolatedNative（S 加私有 AS） | 是，仅 QEMU | ArchTest `isolated-*`（29 case，RV64+RV32） |
-| SandboxedNative（U-mode） | 否 | Core 骨架；create `-ENOTSUP`，U-mode / destroy 未实现，调用组合显式拒绝 |
+| SandboxedNative（U-mode） | RV64 S/MMU | `.kcomp`、ecall、私有 Task/heap/IPC、timer force 与 CPU-only reclaim；RV32 U 不支持 |
 | RV32 / NoMMU | S-mode 私有 profile 实跑 | 本轮 QEMU CoreTest 通过；默认 `_test-build` / CI 未覆盖。M-mode 编译成功、启动失败，证据见 [审计](docs/development/core-convergence.md) |
 | RV32 / M-mode（`PRIVILEGE_MACHINE`） | 编译通过，启动失败 | 本轮 NoMMU 私有 profile 通过 Cargo 构建；默认 BIOS 与裸启动分别尝试，均未到 monitor，见收敛审计 |
 | 真机（任何板卡） | 否 | 仓库没有任何真机代码或配置；`os/`、`configs/` 无 VisionFive/JH7110/ESP32 之类 |
@@ -469,11 +493,16 @@ Echo fixture确定性验证远端Task先于create完成的启动窗口，等待E
 P0 地基（启动地址去硬编码、Sv39/Sv32 启动）                 —— 已完成
 P1 任务系统（context switch、调度执行链）                    —— 已完成
 P2 中断/驱动（timer 抢占 C5、设备·IRQ·DMA C6、第一个 driver）—— 部分：driver 已落地，抢占未接线
-P3 组件化进阶（区域分配 C7、域视图交付 C8、任务化组件 C9）    —— 部分：身份与生命周期已落地，普通 owned Task 可实现 Passive / Active / Hybrid；缺私有域任务与回收协议
-P4 执行域/隔离（C10）                                        —— 部分：受限 IsolatedNative 已落地，ASID / U-mode / ecall / Isolated 任务与设备 / SandboxedNative 未完成
+P3 组件化进阶（区域分配、域视图、任务化组件） —— 私有 Task 与 CPU-only 回收已接；一般 drain/设备回收仍缺
+P4 执行域/隔离 —— RV64 K/I/U、RV32 K/I IPC 已验证；ASID、RV32 U、设备域与远端 shootdown 仍缺
 ```
 
-### 6.1 主线：由真实文件负载验证组件组合
+### 6.1 已有文件负载与后置上层任务
+
+近期主线为[Runtime实施任务](docs/development/component-runtime-consolidation.md#3-文件级实施任务)：
+已完成I/U持久Task/IPC/CPU-only回收与1000轮场景；下一步补一般Graceful drain、
+精确保留核算与并发/OOM矩阵。DMA恢复后续；路由仅文档。
+下面保留文件负载依赖事实，上层新功能不优先于Runtime完整化。
 
 职责见 [服务执行](docs/architecture/service-execution.md)，源码问题与实验条件见
 [服务研究](docs/development/service-runtime-study.md)。本次经用户明确授权修改生产实现，
@@ -530,13 +559,14 @@ P4 执行域/隔离（C10）                                        —— 部�
 
 ### 6.2 独立底座工作与已完成机制
 
-- RV64 普通用户 Task↔AS 与 trap 路径已接线，不再列为未开始的 POSIX 前置；私有域组件
+- RV64 普通用户 Task↔AS 与 trap 路径已接线，不再列为未开始的 POSIX 前置；私有域组件已接线（§3.30）；
   Worker/Sandbox 是另一项未完成能力。CPU/调度事实见 §3.3–§3.5、§3.26。
 - park/unpark permit 与远端 CPU 唤醒已有；事件 trace、跨 owner 通知仍后置，等待者/条件
   留在组件。已修资源 grant/IRQ/Init-Exit 门禁见 [归属审计 §12](docs/development/execution-ownership-review.md#12-授权后的修复与验证2026-10-08)。
 - Timer 抢占另行接线并证明 IRQ 状态保存，不作为同步双盘/VFS 主线的硬前置。
 - drain、Direct 引用释放、私有域 Task 与完整回收按真实消费者分别论证，不为双盘实验
-  提前承诺热卸载。Isolated 继续受限教学实验，不靠补 ASID 推导不可信代码隔离。
+  提前承诺热卸载。Isolated是近期CPU-only Runtime重点，仍受限S-mode条件性恢复，
+  不靠补ASID推导不可信代码隔离。
 - `validate`/`bind` exact ABI 与 liveness、SDK 消费路径已有；lookup 保持 contract-only。
 - RV64 协作式 SMP 已接真实组件 Task；迁移/work stealing/抢占与第二 ISA 后置。
 
@@ -581,7 +611,7 @@ P4 执行域/隔离（C10）                                        —— 部�
 | 音频 | NOT IMPLEMENTED | 无单一栈，需组合：embedded-i2s（传输）+ wm8960/es7210（codec/ADC）+ biquad/dasp（DSP）+ lc3-codec/opuscule（编解码）；流水线参考 daisy-embassy | I2S + DMA 搬运 + 同步原语；音频契约自定 |
 | 加密 / TLS | NOT IMPLEMENTED：Core 无 crypto，SDK 不携带 TLS | embedded-tls（Apache-2.0，无分配器）或 Mbed TLS（取 Apache-2.0 分支，C FFI）+ RustCrypto 原语（MIT/Apache） | RNG（熵源在 Arch/Core 侧）、Clock、Socket/传输 |
 | 电源管理 | NOT IMPLEMENTED：没有 cpufreq/cpuidle、runtime PM、suspend/resume | 本轮 4 份调研没有覆盖到可复用候选；需要单独调研或自研 | 先有设备模型与真机；QEMU-only 阶段不做 |
-| 安全 / 隔离 | IsolatedNative（S + 私有 AS）EXPERIMENTAL；SandboxedNative（U-mode + `ecall`）NOT IMPLEMENTED。这是 Core/Arch 机制，不是组件能力 | 组件侧能复用的是加密原语（RustCrypto）与 TLS 栈；隔离本体不靠第三方库 | ASID、U-mode/`ecall`、syscall wire ABI（见 3.16 / 3.17） |
+| 安全 / 隔离 | I 可信 S/private AS；U RV64 CPU-only 已实现，见 §3.30 | 私有 Task/IPC/heap 复用现有机制 | 一般 drain、ASID/远端 shootdown 与设备恢复仍缺 |
 
 ### 8.2 可复用组件目录
 
@@ -984,23 +1014,23 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；只读混合VFS/namespace/OpenFile已接，通用POSIX fd与两级缓存未有，通信收敛见§3.29 |
 | D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit、host 调度集成与 RV64 远端 wake 已通过；RR 三常驻任务的下标饥饿已修复；preemption（`on_timer_tick` 是 `todo!()` 且未接线）仍缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | PARTIAL | RV64 普通用户 task/AS/trap、fork/exec/wait 与 console 已接；通用 VFS fd、线程/signal 与文件完成协议仍缺 |
-| F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的专用 test-only `domain.test` 同步 provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
+| F | 执行域：同一业务 Contract/Handler 跨域 | PARTIAL | RV64 九格、RV32 四格真实 Echo Task/IPC；设备与完整错误矩阵仍缺，见 §3.30 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
 | H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | RV32 S-mode/NoMMU 私有 profile 已通过 CoreTest；M-mode 启动失败，无 MCU 真机 |
 
 结论：A/B/C/E/F 是 PARTIAL，D/G/H 未满足。Core 还没到 freeze-candidate。
-下一步缺口是组合/文件对象/完成语义、组件私有域任务，以及真机与异构机器验证；
+下一步缺口是一般Graceful、精确回收核算、组合/文件对象/完成语义，以及真机与异构机器验证；
 RV64 普通用户 task 与 AS 已关联，不能继续当作零实现缺口。
 
 ## 11. 明确未做
 
-- SandboxedNative（U-mode 加私有 AS 加 `ecall`）：Core `component/sandbox.rs` 骨架，组件 create `-ENOTSUP`；组件 import / Core ecall / destroy 未实现；私有 allocator / runtime 选择已有测试，尚未接到 Sandbox 执行路径。普通用户 task 的 U-mode / trap 单独已接通。NOT IMPLEMENTED / PLANNED。
+- SandboxedNative：RV64 S/MMU `.kcomp` loader、ecall、私有 Task/heap/IPC 与显式 reclaim 已实现；RV32 U、设备/DMA/IRQ 未支持，详见 §3.30。
 - 抢占：`sched::on_timer_tick` 是 `todo!()`，`timer::on_trap` 不调用它。NOT IMPLEMENTED。
 - block/wake：任务 permit、owner、最终检查与 commit 已落地；CoreTest 覆盖本地与跨 CPU 唤醒。独立 TaskBlock / TaskWake trace、event / waitqueue、join / stop 未做。
 - SMP 基础已落地（RV64）：AP 启动、BootGate、Online、IPI、per-CPU scheduler / timer / containment、固定 CPU 的真实组件调度、跨 CPU wake 与 panic containment。复杂 SMP 调度（迁移 / work stealing / 抢占 / hotplug）与私有 AS 任务调度未做。SMP 不是构建开关，无 `smp` Cargo feature。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
-- 内存物理回收与 instance 退役回收：不承诺，逻辑死亡、物理驻留。NOT IMPLEMENTED。
+- CPU-only I/U instance 退役物理回收已实现；K 共享 heap/image、DMA、普通 POSIX 用户 backing 与完整保留核算不承诺，见 §3.30。
 - NoMMU：RV32 S-mode私有profile已实际boot；本轮完整CoreTest default/no-block各90 checks和shell通过，默认CI仍未纳入。M-mode不由此推导通过。
 - M-mode（`PRIVILEGE_MACHINE`）启动：Kconfig 可选、代码可编译，但没有 defconfig、没有 boot harness、不在任何测试或 CI 里构建。PLANNED / 未验证。
 - AArch64 / x86_64 / LoongArch：`os/arch/src/<isa>` 与 `os/boot/<isa>` 同形骨架已落地（`encoding`/`elf`/`console`/`cpu`/`smp`/`trap`/`context`/`mmu`，实现体 `todo!()`），能编译、未启动、未验证。NOT IMPLEMENTED（骨架）。

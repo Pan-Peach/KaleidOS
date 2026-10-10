@@ -3,6 +3,7 @@
 //! KernelNative 已发布的代码 / ctx 保持驻留，设备静默由驱动负责。
 
 pub mod abi;
+pub(crate) mod access;
 pub(crate) mod backing;
 pub mod call;
 pub mod containment;
@@ -20,6 +21,7 @@ pub mod failure;
     any(target_arch = "riscv32", target_arch = "riscv64")
 ))]
 pub mod isolated;
+pub(crate) mod isolated_api;
 mod isolated_call;
 /// Isolated 域**实例生命周期**：私有 AS + 按域镜像 + Core 预置实例窗口，
 /// 经跨 AS trampoline 执行 `kcomp_instance_create` /
@@ -31,6 +33,7 @@ pub mod isolated_lifecycle;
 pub mod isolated_load;
 pub mod load;
 pub mod loader;
+pub mod reclaim;
 pub mod registry;
 pub mod sandbox;
 pub mod store;

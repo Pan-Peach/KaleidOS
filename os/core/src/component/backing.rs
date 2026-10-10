@@ -25,6 +25,22 @@ pub fn contains(range: VirtualRange) -> bool {
 }
 
 pub fn acquire(handle: AddressSpaceHandle, size: usize, align: usize) -> Result<MemoryView, Errno> {
+    acquire_mode(handle, size, align, false)
+}
+#[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+pub(crate) fn acquire_user(
+    handle: AddressSpaceHandle,
+    size: usize,
+    align: usize,
+) -> Result<MemoryView, Errno> {
+    acquire_mode(handle, size, align, true)
+}
+fn acquire_mode(
+    handle: AddressSpaceHandle,
+    size: usize,
+    align: usize,
+    user: bool,
+) -> Result<MemoryView, Errno> {
     if !address_space::isolation_capable() {
         return Err(Errno::ENOTSUP);
     }
@@ -50,7 +66,13 @@ pub fn acquire(handle: AddressSpaceHandle, size: usize, align: usize) -> Result<
         Mapping {
             virtual_range,
             physical_range: physical,
-            permission: MappingPermission::READ | MappingPermission::WRITE,
+            permission: MappingPermission::READ
+                | MappingPermission::WRITE
+                | if user {
+                    MappingPermission::USER
+                } else {
+                    MappingPermission::empty()
+                },
         },
     )
     .is_err()
@@ -60,7 +82,8 @@ pub fn acquire(handle: AddressSpaceHandle, size: usize, align: usize) -> Result<
     // Publish only after the private mapping is ready. On an exclusion failure
     // retain the backing: a partially changed set of roots must never see reuse.
     if memory::kernel_mappings::publish_private_backing(physical).is_err() {
-        let _ = address_space::unmap(handle, &virtual_range);
+        // No view is published, but the existing AS retains ownership so that
+        // explicit component reclaim can find the failed allocation.
         core::mem::forget(lease);
         return Err(Errno::ENOMEM);
     }
@@ -85,12 +108,11 @@ pub fn release(handle: AddressSpaceHandle, view: MemoryView) -> Result<(), Errno
     let mapping = address_space::mapping_exact(handle, &range)
         .map_err(|_| Errno::EPERM)?
         .ok_or(Errno::ENOENT)?;
-    address_space::unmap(handle, &range).map_err(|_| Errno::EIO)?;
-    flush();
-    // If restoration fails, the unmapped allocation stays resident. Explicit
+    // Keep the owning mapping until alias restoration succeeds. Explicit
     // release is a cooperative promise that no task, callback or DMA borrows it.
     memory::kernel_mappings::release_private_backing(mapping.physical_range)
         .map_err(|_| Errno::EIO)?;
+    address_space::unmap(handle, &range).map_err(|_| Errno::EIO)?;
     flush();
     memory::free_region_raw(mapping.physical_range.base, mapping.physical_range.size)
         .map_err(|_| Errno::EINVAL)

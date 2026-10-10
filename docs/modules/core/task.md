@@ -51,3 +51,11 @@
 protect / clone / replace 在 registry 锁内复验 owner 为 Starting / Ready，并保持到相应
 Task / AS 提交完成，锁序为 registry → task → mapping plan / AS；discard 保留拆除语义。
 ABI 以 `abi/core.toml` 为准。
+
+私有组件 Task 的 AS 从唯一 ComponentRecord 查询；每 Task 有私有业务栈与独立
+Core 栈。I 经 Core API 桥接，U 经 arch UserContext/ecall，yield/park 均在 Core root。
+Scheduler 的 departing 与 Task.execution_retired 在 incoming stack 确认实际切离；
+Force 只取消已保存且确认安全的执行，Running 保留至 CPU 离场。私有 reclaim 此后
+移除所属 TaskRecord，Drop 归还 Core/API 栈；K Task 正常退出仍保留记录。
+普通 U personality UserDomain 仍单独保留其已发布 backing，不因组件回收而改变。
+验证与剩余目标见 [Runtime交付 §7](../../development/component-runtime-consolidation.md#7-授权后的生产实现与验证)。

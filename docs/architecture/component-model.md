@@ -327,7 +327,7 @@ KernelNative 仍可能破坏 Core 内存 / UB / 带锁死亡；Isolated 的条�
 ```
 
 失败路径刻意不调用 destroy；destroy 非零、panic 或栈分配失败均进入 Failed，不重试。
-drain、Direct release、Sandbox 停止、实例回收、退出超时/看门狗仍未实现。
+一般 drain、Direct release、S-mode 退出超时/看门狗仍缺；RV64 Sandbox 停止与私有 CPU-only reclaim 已接，范围以生命周期/部署契约为准。
 细节见冻结契约；不在概念页另维护一套门禁或终态规则。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆

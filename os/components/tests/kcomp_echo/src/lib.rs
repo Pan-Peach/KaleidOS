@@ -14,6 +14,11 @@ impl echo_wire::Provider for Echo {
     }
 }
 static CONSUMER: AtomicU32 = AtomicU32::new(0);
+static TARGET: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+fn target() -> u64 {
+    (u64::from(TARGET[1].load(Ordering::Relaxed)) << 32)
+        | u64::from(TARGET[0].load(Ordering::Relaxed))
+}
 static STARTED: AtomicU32 = AtomicU32::new(0);
 extern "C" fn server(_arg: *mut ()) {
     STARTED.store(1, Ordering::Release);
@@ -46,8 +51,60 @@ extern "C" fn server(_arg: *mut ()) {
             Err(Errno::ENOENT) => management::exit_task(),
             Err(error) => panic!("echo receive: {:?}", error),
         };
-        assert_eq!(consumer, CONSUMER.load(Ordering::Relaxed));
+        let _ = consumer; // Core Grant, rather than message bytes, authorizes callers.
         match &bytes[..len] {
+            [FORWARD, payload @ ..] if payload.len() == 3 => {
+                let mut output = [0; ipc::MESSAGE_MAX];
+                let len = ipc::call(target(), payload, &mut output).unwrap();
+                ipc::reply(request, &output[..len]).unwrap();
+            }
+            [INVALID_BUFFER] => {
+                let mut probe = 0;
+                assert_eq!(
+                    unsafe { abi::kcore_ipc_submit(endpoint, core::ptr::null(), 1, &mut probe) },
+                    Errno::EFAULT.code()
+                );
+                assert_eq!(
+                    unsafe {
+                        abi::kcore_ipc_submit(
+                            endpoint,
+                            bytes.as_ptr(),
+                            1,
+                            0x8020_0000usize as *mut u64,
+                        )
+                    },
+                    Errno::EFAULT.code()
+                );
+                assert_eq!(
+                    unsafe {
+                        abi::kcore_task_create(
+                            server,
+                            core::ptr::null_mut(),
+                            0x8020_0000usize as *mut u32,
+                        )
+                    },
+                    Errno::EFAULT.code()
+                );
+                ipc::reply(request, &[]).unwrap();
+            }
+            [MEMORY_FAULT] => unsafe {
+                // RV64 U must take a real load page fault on a supervisor page.
+                // If it returns, the expected ENOTCONN assertion fails.
+                let _ = core::ptr::read_volatile(0x8020_0000usize as *const u8);
+                ipc::reply(request, &[]).unwrap();
+            },
+            [FAULT] => unsafe {
+                core::arch::asm!("unimp");
+            },
+            [BUSY_ACK] => {
+                ipc::reply(request, &[]).unwrap();
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            [BUSY] => loop {
+                core::hint::spin_loop();
+            },
             [STOP] => {
                 ipc::reply(request, &[]).unwrap();
                 ipc::close(endpoint).unwrap();
@@ -87,12 +144,18 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
         return Errno::EFAULT.code();
     }
     let args = unsafe { &*args };
-    if args.config_abi != CONFIG_ABI || args.config_len != 8 || args.config.is_null() {
+    if args.config_abi != CONFIG_ABI || !matches!(args.config_len, 8 | 16) || args.config.is_null()
+    {
         return Errno::EINVAL.code();
     }
-    let bytes = unsafe { core::slice::from_raw_parts(args.config.cast::<u8>(), 8) };
+    let bytes = unsafe { core::slice::from_raw_parts(args.config.cast::<u8>(), args.config_len) };
     let consumer = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    let cpu = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+    let cpu = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if bytes.len() == 16 {
+        let target = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        TARGET[0].store(target as u32, Ordering::Relaxed);
+        TARGET[1].store((target >> 32) as u32, Ordering::Relaxed);
+    }
     CONSUMER.store(consumer, Ordering::Relaxed);
     unsafe { out_state.write(core::ptr::null_mut()) };
     let mut task = 0;

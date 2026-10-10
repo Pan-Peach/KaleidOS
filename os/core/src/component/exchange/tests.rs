@@ -167,3 +167,117 @@ fn cyclic_waits_are_rejected_and_new_endpoint_never_redirects_old_request() {
     assert_eq!(s.collect(A, old, &mut []), Ok((Errno::ENOTCONN.code(), 0)));
     assert!(s.submit(CONSUMER, A, new, &[]).unwrap().0 > old);
 }
+
+#[test]
+fn successful_reply_survives_server_exit_and_repeated_close() {
+    let mut s = setup();
+    let id = s.submit(CONSUMER, A, EP, b"request").unwrap().0;
+    s.receive(SERVER, EP, &mut [0; 8]).unwrap();
+    s.reply(SERVER, id, b"reply").unwrap();
+    assert_eq!(s.exit(SERVER).0.into_iter().flatten().count(), 1);
+    assert!(s.close(EP).into_iter().flatten().next().is_none());
+    let mut output = [0; 8];
+    assert_eq!(s.collect(A, id, &mut output), Ok((0, 5)));
+    assert_eq!(&output[..5], b"reply");
+    assert_eq!(s.collect(A, id, &mut output), Err(Errno::ENOENT));
+}
+
+#[test]
+fn caller_and_server_exit_orders_preserve_another_instances_request() {
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut s = setup();
+        let other_owner = ComponentId::from_raw(21);
+        let other_server = TaskId::from_raw(201);
+        let other_ep = EndpointId::from_raw(2);
+        s.listen(other_owner, other_server, other_ep).unwrap();
+        s.grant(other_owner, other_ep, CONSUMER).unwrap();
+        let dying = s.submit(CONSUMER, A, EP, b"a").unwrap().0;
+        let healthy = s.submit(CONSUMER, B, other_ep, b"b").unwrap().0;
+        s.receive(SERVER, EP, &mut [0; 1]).unwrap();
+        s.receive(other_server, other_ep, &mut [0; 1]).unwrap();
+        s.wait(A, EP, dying).unwrap();
+        let mut wakes = 0;
+        for operation in order {
+            match operation {
+                0 => {
+                    let (_, notifications) = s.exit(A);
+                    assert!(notifications.into_iter().flatten().next().is_none());
+                }
+                1 => {
+                    let (closed, notifications) = s.exit(SERVER);
+                    assert_eq!(closed.into_iter().flatten().collect::<Vec<_>>(), [EP]);
+                    wakes += notifications
+                        .into_iter()
+                        .flatten()
+                        .filter(|t| *t == A)
+                        .count();
+                }
+                _ => match s.reply(SERVER, dying, b"late") {
+                    Ok(wake) => wakes += wake.into_iter().count(),
+                    Err(error) => assert!(matches!(
+                        error,
+                        Errno::ECANCELED | Errno::ENOENT | Errno::ENOTCONN
+                    )),
+                },
+            }
+        }
+        assert_eq!(wakes, usize::from(order[0] != 0));
+        assert_eq!(s.collect(A, dying, &mut [0; 4]), Err(Errno::ENOENT));
+        s.reply(other_server, healthy, b"alive").unwrap();
+        let mut output = [0; 5];
+        assert_eq!(s.collect(B, healthy, &mut output), Ok((0, 5)));
+        assert_eq!(&output, b"alive");
+        assert!(s.slots.iter().all(|slot| slot.id == 0));
+    }
+}
+
+/// Slot/listener reuse only: this host test does not load images or reclaim pages.
+#[test]
+fn thousand_endpoint_lifetimes_retire_receipts_without_redirecting() {
+    let mut s = Exchange::new();
+    let mut previous_endpoint = EndpointId::from_raw(0);
+    let mut previous_request = 0;
+    for round in 1..=1000 {
+        let endpoint = EndpointId::from_raw(round);
+        s.listen(OWNER, SERVER, endpoint).unwrap();
+        s.grant(OWNER, endpoint, CONSUMER).unwrap();
+        if round > 1 {
+            assert_eq!(
+                s.submit(CONSUMER, A, previous_endpoint, &[]),
+                Err(Errno::ENOTCONN)
+            );
+            assert_eq!(s.reply(SERVER, previous_request, &[]), Err(Errno::ENOENT));
+        }
+        let id = s.submit(CONSUMER, A, endpoint, &[]).unwrap().0;
+        assert!(id > previous_request);
+        s.receive(SERVER, endpoint, &mut []).unwrap();
+        match round % 3 {
+            0 => {
+                s.cancel(A, id).unwrap();
+                assert_eq!(s.collect(A, id, &mut []), Ok((Errno::ECANCELED.code(), 0)));
+                assert_eq!(s.reply(SERVER, id, &[]), Err(Errno::ECANCELED));
+                s.close(endpoint);
+            }
+            1 => {
+                s.reply(SERVER, id, &[]).unwrap();
+                s.exit(SERVER);
+                assert_eq!(s.collect(A, id, &mut []), Ok((0, 0)));
+            }
+            _ => {
+                s.exit(A);
+                s.exit(SERVER);
+            }
+        }
+        assert!(s.servers.is_empty());
+        assert!(s.slots.iter().all(|slot| slot.id == 0));
+        previous_endpoint = endpoint;
+        previous_request = id;
+    }
+}

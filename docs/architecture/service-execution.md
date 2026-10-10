@@ -14,7 +14,7 @@
 | Service / Contract | 提供什么能力、请求何时完成、失败如何表达 | 接口契约与 provider |
 | Endpoint | 哪个实例发布的哪个端口 | Core 发布真相 |
 | Binding | consumer 如何使用确切 endpoint、有效期到哪里 | Core 交付调用窗口，SDK 保存；无独立 binding registry |
-| Transport | 请求如何到达 provider | 普通业务为 KernelNative Request/Reply；同步策略/隔离诊断保留 Direct/Gate；私有域 IPC 是待实现路径 |
+| Transport | 请求如何到达 provider | 普通业务为 Endpoint Request/Reply；K/I/U 当前平台支持面见 [部署契约 §10](deployment.md#10-实现状态)；同步策略/隔离诊断保留 Direct/Gate |
 | Execution Model | 谁处理请求、是否排队、能否等待、怎样并发 | provider 的 adapter / Runtime |
 | ExecutionDomain | 特权级、地址空间、可用 import 与保护条件 | 组合方提议，Core 验证并提交 |
 | Session | 一次 open / connection / stream 的业务状态 | provider / 服务组件，不默认成为 Core endpoint |
@@ -62,7 +62,7 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
 | Gate + Inline | Core 管理的同步服务栈执行 dispatcher，同步返回 | 保留隔离/生命周期诊断与窄同步机制；普通业务已退出 |
 | Direct + Queued | 本地入口提交，owned Worker 处理 | 组件侧候选；唤醒 Worker 的 owner 条件必须满足 |
 | Gate + Queued | 同步入口由 Runtime 入队，owned Worker 处理 | 业务完成协议仍为候选 |
-| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative Echo/Block/Fat/little/VFS/Posix/Probe 已接线；私有域 Task IPC 未实现 |
+| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative Echo/Block/Fat/little/VFS/Posix/Probe 已接线；I/U CPU-only Echo 已有真实 Task IPC 与跨域回归，设备服务私有域部署未验证 |
 
 Inline 表示执行者没有被移交，**不自动表示可阻塞或线程安全**。当前 Gate 栈不可
 yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可能使用 caller 的调度
@@ -83,8 +83,8 @@ yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可
 Gate 中不得持有需要当前 CPU 上另一个 Task 才能释放的锁并无限等待。
 
 SDK 的 typed 前端应让业务看到数据缓冲与业务长度；wire 头、method 编号和搬运留在
-调用后端。当前 Rust/C filesystem read 前端已接受普通数据缓冲区；Gate 的 8 字节
-长度头与分块 scratch 留在 SDK，不交给业务调用者。
+调用后端。当前 Rust/C filesystem read 前端接受普通数据缓冲区；生成的 IPC codec
+与 SDK 分块处理传输细节，不交给业务调用者。
 
 ## 4. principal 与 Worker
 

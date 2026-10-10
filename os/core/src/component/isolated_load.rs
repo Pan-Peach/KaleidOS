@@ -331,6 +331,22 @@ pub const SUPPORTED_IMPORTS: &[&[u8]] = &[
     b"kcore_endpoint_validate",
     b"kcore_endpoint_bind",
     b"kcore_endpoint_call",
+    b"kcore_component_current",
+    b"kcore_cpu_current",
+    b"kcore_task_create",
+    b"kcore_task_start",
+    b"kcore_task_start_on",
+    b"kcore_task_yield",
+    b"kcore_task_exit",
+    b"kcore_ipc_listen",
+    b"kcore_ipc_grant",
+    b"kcore_ipc_submit",
+    b"kcore_ipc_receive",
+    b"kcore_ipc_reply",
+    b"kcore_ipc_collect",
+    b"kcore_ipc_wait",
+    b"kcore_ipc_cancel",
+    b"kcore_ipc_close",
 ];
 
 /// 该 UNDEF 符号是否是本阶段支持解析的 import（唯一判据）。
@@ -354,11 +370,57 @@ fn place_at(
     base: usize,
     window: VirtualRange,
 ) -> Result<PlacedImage, IsolatedLoadError> {
+    place_at_domain(blob, base, window, false, true)
+}
+
+#[cfg(any(
+    test,
+    all(
+        feature = "vm-mmu",
+        feature = "supervisor",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+))]
+pub(crate) fn place_for_lifecycle(
+    blob: &[u8],
+    sandboxed: bool,
+) -> Result<PlacedImage, IsolatedLoadError> {
+    // Production must register the image owner before a publication attempt
+    // can make Drop unsafe. Standalone ArchTest placement keeps its old path.
+    place_at_domain(
+        blob,
+        ISOLATED_IMAGE_BASE,
+        ISOLATED_IMAGE_WINDOW,
+        sandboxed,
+        false,
+    )
+}
+fn place_at_domain(
+    blob: &[u8],
+    base: usize,
+    window: VirtualRange,
+    sandboxed: bool,
+    publish: bool,
+) -> Result<PlacedImage, IsolatedLoadError> {
     let object = ElfObject::parse(blob).map_err(elf_error)?;
     if object.machine() != ComponentRelocationImpl::ELF_MACHINE {
         return Err(IsolatedLoadError::MachineMismatch);
     }
-    check_supported_imports(&object)?;
+    if sandboxed {
+        let table = object.symbol_table_index().map_err(elf_error)?;
+        for index in 0..object.symbol_count(table).map_err(elf_error)? {
+            let symbol = object.symbol(table, index).map_err(elf_error)?;
+            if symbol.shndx != 0 {
+                continue;
+            }
+            let name = object.symbol_name(table, symbol).map_err(elf_error)?;
+            if !name.is_empty() && super::sandbox::resolve_import(name).is_none() {
+                return Err(IsolatedLoadError::ImportsUnsupported);
+            }
+        }
+    } else {
+        check_supported_imports(&object)?;
+    }
 
     let symbol_table = object.symbol_table_index().map_err(elf_error)?;
     let service_dispatch =
@@ -421,7 +483,11 @@ fn place_at(
         image,
         &seg_place,
         &relocations,
-        resolve_import,
+        if sandboxed {
+            super::sandbox::resolve_import
+        } else {
+            resolve_import
+        },
     )
     .map_err(IsolatedLoadError::Loader)?;
 
@@ -456,9 +522,22 @@ fn place_at(
     // All image validation precedes publication: rejected images can be freed
     // without leaving alias exclusions. Published images remain resident even
     // if publication or a later lifecycle step fails (phase 1 contract).
-    region.retain_on_drop();
-    crate::memory::kernel_mappings::publish_private_backing(region.region())
-        .map_err(IsolatedLoadError::Map)?;
+    if publish {
+        region.retain_on_drop();
+        crate::memory::kernel_mappings::publish_private_backing(region.region())
+            .map_err(IsolatedLoadError::Map)?;
+    }
+    let segments = if sandboxed {
+        segments
+            .into_iter()
+            .map(|mut segment| {
+                segment.permission |= MappingPermission::USER;
+                segment
+            })
+            .collect()
+    } else {
+        segments
+    };
     Ok(PlacedImage {
         base,
         create,
@@ -793,6 +872,17 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_lifecycle_image_drop_returns_its_backing() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        let before = memory::free_block_counts();
+        let image = place_for_lifecycle(ISOLATED_KCOMP, false).unwrap();
+        assert_ne!(memory::free_block_counts(), before);
+        drop(image.into_loaded_component());
+        assert_eq!(memory::free_block_counts(), before);
+    }
+
+    #[test]
     fn published_image_remains_resident_after_owner_drop() {
         let _guard = test_support::GUARD.lock();
         test_support::ensure_init();
@@ -874,6 +964,22 @@ mod tests {
             b"kcore_endpoint_validate",
             b"kcore_endpoint_bind",
             b"kcore_endpoint_call",
+            b"kcore_component_current",
+            b"kcore_cpu_current",
+            b"kcore_task_create",
+            b"kcore_task_start",
+            b"kcore_task_start_on",
+            b"kcore_task_yield",
+            b"kcore_task_exit",
+            b"kcore_ipc_listen",
+            b"kcore_ipc_grant",
+            b"kcore_ipc_submit",
+            b"kcore_ipc_receive",
+            b"kcore_ipc_reply",
+            b"kcore_ipc_collect",
+            b"kcore_ipc_wait",
+            b"kcore_ipc_cancel",
+            b"kcore_ipc_close",
         ] {
             assert!(import_supported(name), "{name:?} must be supported");
         }

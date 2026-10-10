@@ -88,6 +88,7 @@ struct CpuState {
     current: Option<TaskId>,
     anchor_irq: Option<<CpuImpl as CpuArch>::IrqFlags>,
     incoming_irq: Option<<CpuImpl as CpuArch>::IrqFlags>,
+    departing: Option<TaskId>,
 }
 
 /// 每逻辑 CPU 一份调度真相，索引 = 逻辑 `CpuId`。**UP = 只有第 0 项的 SMP**，
@@ -120,6 +121,7 @@ pub fn init() {
                 current: None,
                 anchor_irq: None,
                 incoming_irq: None,
+                departing: None,
             })
         })
         .expect("sched per-cpu table allocation failed")
@@ -592,6 +594,7 @@ fn schedule_next_with_guard(
         let from_ptr = if let Some(id) = from {
             let record = table.get_mut(id).expect("validated outgoing task");
             record.irq_flags = Some(outgoing_irq);
+            record.execution_retired = false;
             record.context.as_mut() as *mut ContextImpl
         } else {
             cpu_guard.anchor_irq = Some(outgoing_irq);
@@ -603,6 +606,7 @@ fn schedule_next_with_guard(
         let (to_ptr, owner) = if let Some(id) = next {
             let record = table.get_mut(id).expect("validated incoming task");
             cpu_guard.incoming_irq = record.irq_flags.take();
+            record.execution_retired = false;
             (
                 record.context.as_mut() as *mut ContextImpl,
                 Some(record.owner()),
@@ -614,6 +618,7 @@ fn schedule_next_with_guard(
                 None,
             )
         };
+        cpu_guard.departing = from;
         cpu_guard.current = next;
         break (from_ptr, to_ptr, next, owner, retired);
     };
@@ -643,7 +648,15 @@ fn schedule_next_with_guard(
 /// Fresh tasks call it from task_entry_trampoline; suspended executions call it
 /// immediately after context_switch. IRQ flags belong to the incoming execution.
 pub(crate) fn finish_switch() {
-    let flags = cpu().lock().incoming_irq.take();
+    let (flags, departing) = {
+        let mut cpu = cpu().lock();
+        (cpu.incoming_irq.take(), cpu.departing.take())
+    };
+    if let Some(id) = departing
+        && let Some(record) = task::get_task_table().lock().get_mut(id)
+    {
+        record.execution_retired = true;
+    }
     match flags {
         Some(flags) => CpuImpl::restore_irq(flags),
         None => CpuImpl::enable_irq(),

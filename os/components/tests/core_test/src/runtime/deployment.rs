@@ -138,8 +138,13 @@ pub fn group(checks: &mut Checks) {
         heaps_ok && ids[0] != ids[1] && ids[1] != ids[2],
     );
     checks.check(
-        "sandboxed-deployment-rejected",
-        management::load(b"kcomp_heap", U) == Err(Errno::ENOTSUP),
+        "sandboxed-load-validation",
+        if cfg!(target_arch = "riscv64") {
+            management::load(b"kcomp_heap", U)
+                .is_ok_and(|id| unsafe { kcomp_sdk::abi::kcore_component_stop(id) } == 0)
+        } else {
+            management::load(b"kcomp_heap", U) == Err(Errno::ENOTSUP)
+        },
     );
     let completed = services(checks).is_some();
     checks.check("service-scenarios-completed", completed);

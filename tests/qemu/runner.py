@@ -46,7 +46,9 @@ def main():
                 session.send(proc, f"{verb} kcomp_c_smoke\n")
                 expect([f"{verb} kcomp_c_smoke: OK"])
             session.send(proc, "load core_test\n")
-            report = expect(["load core_test: OK", "[core-test] all: PASS"], 60)
+            # CoreTest includes 1000 real private-AS lifecycle cycles and timer
+            # forced-stop cases; use a bounded stress budget, independent of boot.
+            report = expect(["load core_test: OK", "[core-test] all: PASS"], 300)
             cases = core_test_report(report)
             print(f"[coretest-{args.arch}/{args.scenario}] {len(cases)} checks PASS")
             ksh.run(proc, session.collect, session.send, RunFailure, FATAL_MARKERS, isolated=not args.no_mmu)

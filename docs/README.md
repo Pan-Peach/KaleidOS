@@ -39,7 +39,7 @@ docs/
 | Memory/Heap、region 归属、访问窗口与回收 | [内存与堆](architecture/memory-and-heap.md) | 内存/堆最终契约；与 device claim 同形 |
 | 部署、binding 作用域与调用机制 | [部署契约](architecture/deployment.md) | 补充 lifecycle §9 的代码共享目标，不取代生命周期承诺 |
 | 服务执行模型、组合策略与业务会话归属 | [服务执行](architecture/service-execution.md) | 不替代部署、生命周期或文件对象契约；候选机制明确标注 |
-| Endpoint Request/Reply、授权、等待与退出 | [IPC](architecture/ipc.md) + [core ABI](../abi/core.toml) | 当前 KernelNative 窄传输契约；私有域 IPC 尚未接线 |
+| Endpoint Request/Reply、授权、等待与退出 | [IPC](architecture/ipc.md) + [core ABI](../abi/core.toml) | K/I/U Task 统一传输契约；具体平台支持见 deployment/STATUS |
 | 分层与 ResourceDomain/ExecutionDomain 概念 | [架构总览](architecture/overview.md) / [组件模型](architecture/component-model.md) | 细节服从上述主题契约 |
 | 调度、CPU 归属与 SMP 提交 | [调度契约](architecture/scheduling.md) | Core 与策略分工 |
 | 构建配置 | [Kconfig 契约](architecture/kconfig.md) | resolved .config 是本次构建真相 |
@@ -55,6 +55,7 @@ docs/
 | 参考系统与论文 | [参考资料](philosophy/references.md) | 阅读清单 |
 | 成熟内核调查方法、版本与可借鉴范围 | [参考系统](development/reference-systems.md) | 研究入口，不替代架构契约 |
 | 统一 IPC / 混合 VFS 重构 | [源码审计](development/component-communication-audit.md)、[KABI Cleanup设计](development/component-communication-cleanup-design.md)、[IPC ADR](development/ipc-request-reply-adr.md)、[VFS ADR](development/hybrid-vfs-adr.md)、[迁移计划](development/component-communication-migration.md) | 历史审计、阶段实现与后续提议；现行 architecture/interfaces 为契约 |
+| Component Runtime 完整化与 IPC 路由研究 | [Runtime 审计/实施任务](development/component-runtime-consolidation.md)、[Routing ADR](development/ipc-routing-service-discovery-adr.md) | 审计、实施建议与仅文档路由决定；停止/回收/调度/IPC 契约仍在对应 architecture 页 |
 
 `notes/` 不参与权威判定。旧 resource-model-review 中的 Handle/Slot/authority 模型
 已被替代；需要现行资源与生命周期契约时查 architecture。
@@ -77,6 +78,8 @@ docs/
 | 获取内存、选择部署与调用机制 | [内存与堆](architecture/memory-and-heap.md)、[部署契约](architecture/deployment.md) |
 | 设计 Inline / Worker 服务、显式连接与失效传播 | [服务执行](architecture/service-execution.md) |
 | 装载/停止组件 | [组件生命周期](architecture/component-lifecycle.md)、[component 模块](modules/core/component.md) |
+| 审计 I/U Task、Stop/Force 与物理回收 | [Runtime 第一轮交付](development/component-runtime-consolidation.md)、[资源回收矩阵](architecture/memory-and-heap.md#9-runtime-回收矩阵目标与基线) |
+| 研究服务发现与 IPC 连接编排 | [Routing ADR](development/ipc-routing-service-discovery-adr.md)（仅设计，无新框架） |
 | 组合启动与操作 shell | [init](modules/init.md)、[ksh](modules/ksh.md) |
 | 接第三方库 | [移植契约](architecture/porting.md) |
 | 写文件系统与 VFS | [文件系统接口](interfaces/filesystem.md)、[VFS 模块](modules/vfs.md) |

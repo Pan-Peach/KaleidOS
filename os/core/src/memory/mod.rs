@@ -287,6 +287,17 @@ fn release_region(region: PhysicalRange, order: usize) -> Result<(), MemoryError
 /// 否则新页表页会继承旧内存里的垃圾（被当成 PTE 就出大问题）。
 // The `()` error is part of arch::vm::PageAlloc's deliberately narrow
 // cross-crate callback contract; allocation diagnostics stay in Core.
+#[cfg(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+))]
+pub(crate) fn vm_page_free(page: usize) {
+    free_region_raw(page, ALLOC_GRANULE).expect("owned page-table frame");
+}
+
 #[allow(clippy::result_unit_err)]
 pub fn vm_page_alloc() -> Result<usize, ()> {
     let lease = alloc_region(ALLOC_GRANULE).map_err(|_| ())?;

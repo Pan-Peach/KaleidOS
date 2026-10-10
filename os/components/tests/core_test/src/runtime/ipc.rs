@@ -31,7 +31,10 @@ fn start(entry: abi::KcompTaskEntry, arg: *mut ()) -> Option<u32> {
     }
 }
 fn finish(task: u32) -> bool {
-    let end = deadline();
+    finish_with_budget(task, 10)
+}
+fn finish_with_budget(task: u32, seconds: u64) -> bool {
+    let end = unsafe { abi::kcore_now() + abi::kcore_timebase_hz() * seconds };
     while unsafe { abi::kcore_task_state(task) } != 4 {
         if unsafe { abi::kcore_now() } >= end || management::run_tasks().is_err() {
             return false;
@@ -391,6 +394,347 @@ pub fn group(checks: &mut Checks) {
         }
     });
     if client_done && first_done && second_done && held_done && abandon_done && done {
+        let _ = mem::mem_release(region);
+    }
+}
+
+struct DomainCall {
+    endpoint: u64,
+    forward: bool,
+    stop: bool,
+    result: AtomicU32,
+}
+extern "C" fn domain_client(arg: *mut ()) {
+    let state = unsafe { &*arg.cast::<DomainCall>() };
+    let mut output = [0; 8];
+    let payload = if state.stop {
+        &[STOP][..]
+    } else if state.forward {
+        &[FORWARD, 1, 2, 3][..]
+    } else {
+        &[1, 2, 3][..]
+    };
+    let passed = if state.stop {
+        ready_call(state.endpoint, payload, &mut output) == Ok(0)
+    } else {
+        ready_call(state.endpoint, payload, &mut output) == Ok(3) && output[..3] == [1, 2, 3]
+    };
+    state.result.store(u32::from(passed), Ordering::Release);
+    management::exit_task();
+}
+fn domain_provider(
+    domain: management::ExecutionDomain,
+    owner: u32,
+    target: u64,
+) -> Option<(u32, u64)> {
+    let mut config = [0; 16];
+    config[..4].copy_from_slice(&owner.to_le_bytes());
+    config[8..].copy_from_slice(&target.to_le_bytes());
+    let id = match management::create(b"kcomp_echo", domain, CONFIG_ABI, &config) {
+        Ok(id) => id,
+        Err(e) => {
+            kcomp_sdk::klog!("domain echo create {:?}: {:?}", domain, e);
+            return None;
+        }
+    };
+    let mut ep = 0;
+    if unsafe { abi::kcore_endpoint_lookup(id, NAME.as_ptr(), NAME.len(), CONTRACT, &mut ep) } != 0
+    {
+        return None;
+    }
+    Some((id, ep))
+}
+fn private_available(checks: &mut Checks) -> bool {
+    // The public load API checks platform capability before looking up an
+    // artifact. A missing name creates no instance and needs no CoreTest cfg
+    // mirror of the resolved platform configuration.
+    match management::load(
+        b"__runtime_capability_probe_missing",
+        management::ExecutionDomain::IsolatedNative,
+    ) {
+        Err(Errno::ENOENT) => true,
+        Err(Errno::ENOTSUP) => {
+            kcomp_sdk::klog!(
+                "private-domain tests not applicable: Core reports unsupported deployment"
+            );
+            false
+        }
+        _ => {
+            checks.check("private-domain-capability-probe", false);
+            false
+        }
+    }
+}
+pub fn domain_group(checks: &mut Checks) {
+    if !private_available(checks) {
+        return;
+    }
+    use management::ExecutionDomain::{
+        IsolatedNative as I, KernelNative as K, SandboxedNative as U,
+    };
+    let owner = management::current_component().unwrap();
+    let pairs = [
+        ("ipc-K-I-I-K", I, K),
+        ("ipc-K-I-I-I", I, I),
+        ("ipc-K-U-U-K", U, K),
+        ("ipc-K-U-U-I", U, I),
+        ("ipc-K-I-I-U", I, U),
+        ("ipc-K-U-U-U", U, U),
+    ];
+    for (name, relay_domain, target_domain) in pairs {
+        if !cfg!(target_arch = "riscv64") && (relay_domain == U || target_domain == U) {
+            continue;
+        }
+        let Some((target_id, target)) = domain_provider(target_domain, owner, 0) else {
+            checks.check(name, false);
+            continue;
+        };
+        let Some((relay_id, relay)) = domain_provider(relay_domain, owner, target) else {
+            checks.check(name, false);
+            continue;
+        };
+        let region = mem::mem_alloc(
+            core::mem::size_of::<DomainCall>() as u64,
+            core::mem::align_of::<DomainCall>() as u64,
+        )
+        .unwrap();
+        let pointer = region.base as *mut DomainCall;
+        unsafe {
+            pointer.write(DomainCall {
+                endpoint: target,
+                forward: false,
+                stop: false,
+                result: AtomicU32::new(0),
+            });
+        }
+        // Each argument remains owned until its actual Task exits. A timeout
+        // retains backing and must not mutate memory still borrowed remotely.
+        if !start(domain_client, pointer.cast()).is_some_and(finish) {
+            checks.check(name, false);
+            continue;
+        }
+        let ready = unsafe { (*pointer).result.load(Ordering::Acquire) } == 1;
+        let grant = unsafe { abi::kcore_ipc_grant(target, relay_id) } == 0;
+        unsafe {
+            (*pointer).endpoint = relay;
+            (*pointer).forward = true;
+            (*pointer).result.store(0, Ordering::Release);
+        }
+        let done = ready && grant && start(domain_client, pointer.cast()).is_some_and(finish);
+        kcomp_sdk::klog!(
+            "domain pair {} ready={} grant={} done={} result={}",
+            name,
+            ready,
+            grant,
+            done,
+            unsafe { (*pointer).result.load(Ordering::Acquire) }
+        );
+        checks.check(
+            name,
+            done && unsafe { (*pointer).result.load(Ordering::Acquire) } == 1,
+        );
+        if ready && grant && !done {
+            continue;
+        }
+        let mut cleanup_done = true;
+        for (id, ep) in [(relay_id, relay), (target_id, target)] {
+            unsafe {
+                (*pointer).endpoint = ep;
+                (*pointer).stop = true;
+            }
+            if !start(domain_client, pointer.cast()).is_some_and(finish) {
+                cleanup_done = false;
+                break;
+            }
+            let _ = unsafe { abi::kcore_component_stop(id) };
+            if target_domain != K || id == relay_id {
+                let _ = unsafe { abi::kcore_component_reclaim(id) };
+            }
+        }
+        if cleanup_done {
+            let _ = mem::mem_release(region);
+        }
+    }
+}
+
+struct LifecycleResult {
+    result: AtomicU32,
+}
+extern "C" fn lifecycle_client(arg: *mut ()) {
+    use management::ExecutionDomain::{IsolatedNative as I, SandboxedNative as U};
+    let result = unsafe { &*arg.cast::<LifecycleResult>() };
+    let owner = management::current_component().unwrap();
+    let mut passed = true;
+    let mut returned = 0u64;
+    let mut retained_peak = 0u32;
+    let initial = unsafe { abi::kcore_free_page_count() };
+    let task_count = unsafe { abi::kcore_task_count() };
+    for round in 0..1000 {
+        let domain = if cfg!(target_arch = "riscv64") && round % 2 == 1 {
+            U
+        } else {
+            I
+        };
+        let Some((id, ep)) = domain_provider(domain, owner, 0) else {
+            passed = false;
+            break;
+        };
+        let mut output = [0; 8];
+        let before_probe = unsafe { abi::kcore_task_count() };
+        if ready_call(ep, &[INVALID_BUFFER], &mut output) != Ok(0)
+            || unsafe { abi::kcore_task_count() } != before_probe
+        {
+            passed = false;
+            break;
+        }
+        let payload = [1, 2, 3, 4, 5, 6, 7, 8];
+        if kcomp_sdk::generated::echo_wire::echo(ep, &payload, &mut output) != Ok(())
+            || output != payload
+        {
+            passed = false;
+            break;
+        }
+        let before = unsafe { abi::kcore_free_page_count() };
+        if round % 10 == 1 || round % 10 == 2 {
+            // U attempts a supervisor-page load; I takes an illegal instruction.
+            // Both must return through the actual trap before task teardown.
+            let fault = if domain == U { MEMORY_FAULT } else { FAULT };
+            if ipc::call(ep, &[fault], &mut []) != Err(Errno::ENOTCONN) {
+                passed = false;
+                break;
+            }
+            let end = deadline();
+            loop {
+                let status = unsafe { abi::kcore_component_force_stop(id) };
+                if status == 0 {
+                    break;
+                }
+                if status != Errno::EBUSY.code()
+                    || unsafe { abi::kcore_now() } >= end
+                    || management::yield_task().is_err()
+                {
+                    passed = false;
+                    break;
+                }
+            }
+        } else if round % 10 == 3 && domain == U {
+            // An unyielding U loop must return through the hardware timer.
+            let Ok(request) = ipc::submit(ep, &[BUSY]) else {
+                passed = false;
+                break;
+            };
+            let _ = management::yield_task();
+            let stopped = unsafe { abi::kcore_component_force_stop(id) };
+            if stopped != 0 || ipc::collect(request, &mut []) != Err(Errno::ENOTCONN) {
+                passed = false;
+                break;
+            }
+        } else {
+            if ipc::call(ep, &[STOP], &mut []) != Ok(0) {
+                passed = false;
+                break;
+            }
+            let end = deadline();
+            loop {
+                let status = unsafe { abi::kcore_component_stop(id) };
+                if status == 0 {
+                    break;
+                }
+                if status != Errno::EBUSY.code()
+                    || unsafe { abi::kcore_now() } >= end
+                    || management::yield_task().is_err()
+                {
+                    passed = false;
+                    break;
+                }
+            }
+        }
+        let reclaimed = unsafe { abi::kcore_component_reclaim(id) };
+        let after = unsafe { abi::kcore_free_page_count() };
+        if reclaimed != 0
+            || unsafe { abi::kcore_component_reclaim(id) } != 0
+            || ipc::submit(ep, &[]) != Err(Errno::ENOENT)
+            || unsafe { abi::kcore_task_count() } != task_count
+            || after <= before
+        {
+            passed = false;
+            break;
+        }
+        returned += u64::from(after - before);
+        retained_peak = retained_peak.max(initial.saturating_sub(after));
+        if round % 100 == 99 {
+            kcomp_sdk::klog!(
+                "[runtime-stress] rounds={} tasks={} free={} returned_pages={} retained_peak={}",
+                round + 1,
+                task_count,
+                after,
+                returned,
+                retained_peak
+            );
+        }
+    }
+    if passed && cfg!(target_arch = "riscv64") {
+        let mut config = [0; 16];
+        config[..4].copy_from_slice(&owner.to_le_bytes());
+        config[4..8].copy_from_slice(&1u32.to_le_bytes());
+        passed = management::create(b"kcomp_echo", U, CONFIG_ABI, &config).is_ok_and(|id| {
+            let mut ep = 0;
+            if unsafe {
+                abi::kcore_endpoint_lookup(id, NAME.as_ptr(), NAME.len(), CONTRACT, &mut ep)
+            } != 0
+            {
+                return false;
+            }
+            if ready_call(ep, &[BUSY_ACK], &mut []) != Ok(0) {
+                return false;
+            }
+            let now = unsafe { abi::kcore_now() };
+            while unsafe { abi::kcore_now() } < now + unsafe { abi::kcore_timebase_hz() } / 1000 {
+                core::hint::spin_loop();
+            }
+            let end = deadline();
+            let first = unsafe { abi::kcore_component_force_stop(id) };
+            let mut stop = first;
+            while stop == Errno::EBUSY.code() && unsafe { abi::kcore_now() } < end {
+                stop = unsafe { abi::kcore_component_force_stop(id) };
+            }
+            let reclaimed = unsafe { abi::kcore_component_reclaim(id) };
+            kcomp_sdk::klog!(
+                "[runtime-smp] U busy AP first={} stop={} reclaim={}",
+                first,
+                stop,
+                reclaimed
+            );
+            stop == 0 && reclaimed == 0 && ipc::submit(ep, &[]) == Err(Errno::ENOENT)
+        });
+    }
+    result.result.store(u32::from(passed), Ordering::Release);
+    management::exit_task();
+}
+pub fn lifecycle_group(checks: &mut Checks) {
+    if !private_available(checks) {
+        return;
+    }
+    let region = mem::mem_alloc(
+        core::mem::size_of::<LifecycleResult>() as u64,
+        core::mem::align_of::<LifecycleResult>() as u64,
+    )
+    .unwrap();
+    let result = region.base as *mut LifecycleResult;
+    unsafe {
+        result.write(LifecycleResult {
+            result: AtomicU32::new(0),
+        });
+    }
+    let done =
+        start(lifecycle_client, result.cast()).is_some_and(|task| finish_with_budget(task, 240));
+    checks.check(
+        "component-private-reclaim-1000",
+        done && unsafe { (*result).result.load(Ordering::Acquire) } == 1,
+    );
+    // A timeout may leave execution pending on another CPU. Keep the argument
+    // backing until confirmed exit; never lend a short-lived create-stack local.
+    if done {
         let _ = mem::mem_release(region);
     }
 }

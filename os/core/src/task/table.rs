@@ -106,6 +106,16 @@ impl TaskTable {
             .any(|(_, record)| record.owner() == owner && record.state() != TaskState::Exited)
     }
 
+    /// Lifecycle cancellation of saved or never-started execution. A Running
+    /// Task remains live until its CPU actually returns and confirms departure.
+    pub(crate) fn stop_saved(&mut self, owner: ComponentId) {
+        for record in self.tasks.values_mut().filter(|r| r.owner() == owner) {
+            if !matches!(record.state(), TaskState::Running(_)) && record.execution_retired {
+                record.set_state(TaskState::Exited);
+            }
+        }
+    }
+
     fn insert(&mut self, id: TaskId, record: TaskRecord) -> Result<(), TaskError> {
         match self.tasks.entry(id) {
             Entry::Vacant(v) => {
@@ -296,6 +306,26 @@ mod tests {
     fn setup() -> test_support::Guard<'static> {
         test_support::ensure_init();
         test_support::GUARD.lock()
+    }
+
+    #[test]
+    fn lifecycle_cancel_requires_saved_execution_and_preserves_other_owner() {
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        let a = ComponentId::from_raw(91);
+        let b = ComponentId::from_raw(92);
+        let mut table = TaskTable::new();
+        let saved = table.create(a, 1, core::ptr::null_mut()).unwrap();
+        let departing = table.create(a, 1, core::ptr::null_mut()).unwrap();
+        let other = table.create(b, 1, core::ptr::null_mut()).unwrap();
+        table.get_mut(departing).unwrap().execution_retired = false;
+        table.stop_saved(a);
+        assert_eq!(table.get(saved).unwrap().state(), TaskState::Exited);
+        assert_eq!(table.get(departing).unwrap().state(), TaskState::Created);
+        assert_eq!(table.get(other).unwrap().state(), TaskState::Created);
+        table.get_mut(departing).unwrap().execution_retired = true;
+        table.stop_saved(a);
+        assert_eq!(table.get(departing).unwrap().state(), TaskState::Exited);
     }
 
     #[test]

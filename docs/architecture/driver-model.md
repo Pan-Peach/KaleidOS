@@ -40,20 +40,20 @@
 
 ### 1.4 内存模型澄清（D1 已修订）
 
-**Core 管 Memory，不管 Heap，也不做内存记账**：Core 对象堆只供 Core 内部使用；**堆是 runtime / deployment 策略，不是 Core 资源、不是组件一等资源**（KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器）。Core 只以 **region / address-space 粒度**提供 backing / mapping 并推进生命周期，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 的归属由该实例的地址空间 / 页表承载），**不**做 per-instance 字节计费或配额。region release / instance failure 只保证**逻辑失效**、不承诺物理回收：KernelNative 已发布 backing 保留驻留，且因为没有归属记录，实例死亡也没有可回收之物。地址空间隔离解决的是访问强制，不是内存计费——**不得以"地址空间隔离"为名把堆分离说成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
+**Core 管 Memory，不管 Heap，也不做内存记账**：Core 对象堆只供 Core 内部使用；**堆是 runtime / deployment 策略，不是 Core 资源、不是组件一等资源**（KernelNative 可共享 Core 内核堆，私有执行域可在自己的可写 `.data` / `.bss` 保留私有分配器）。Core 只以 **region / address-space 粒度**提供 backing / mapping 并推进生命周期，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 的归属由该实例的地址空间 / 页表承载），**不**做 per-instance 字节计费或配额。instance failure 先保证**逻辑失效**；私有 CPU-only 显式回收范围见内存契约，DMA 不承诺物理回收：KernelNative 已发布 backing 保留驻留，且因为没有归属记录，实例死亡也没有可回收之物。地址空间隔离解决的是访问强制，不是内存计费——**不得以"地址空间隔离"为名把堆分离说成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
 
 ## 2. 三个执行域模型
 
 | 模型 | 特权级 | 地址空间 | 目标 | 强制 |
 |---|---|---|---|---|
 | KernelNative | S | 共享内核 AS | 最高性能、常态 | 无硬件强制（可信代码） |
-| IsolatedNative（可选实验，非里程碑） | S | 私有 AS | 生命周期恢复 / 内存回收 | 仅条件性故障隔离（协作与偶然 bug；对恶意无效） |
+| IsolatedNative（近期 CPU-only Runtime 重点） | S | 私有 AS | 生命周期恢复 / 内存回收 | 仅条件性故障隔离（协作与偶然 bug；对恶意无效） |
 | SandboxedNative（未来） | U | 私有 AS | 对抗隔离 / 不可信代码 | 私有 AS + 页表 + 特权级 = 硬件强制 |
 
 要点：
 
-- **KernelNative 是正常、长期模式**：同域同特权级，调用即普通函数调用，零切换成本。Core 与驱动共享内核地址空间。
-- **IsolatedNative 只是可选的 S-mode 教学实验**，用来观察生命周期恢复与内存回收，**不是里程碑**；S 与 Core 同特权级，天然不是恶意代码边界。
+- **KernelNative 是正常、长期模式**：Core与驱动共享内核地址空间；组件内部普通函数调用，组件间普通业务统一IPC。
+- **IsolatedNative 是近期 CPU-only Runtime 完整化重点**；已有能力仍受限，S 与 Core 同特权级，天然不是恶意代码边界。阶段与真实支持面见 [Runtime 审计](../development/component-runtime-consolidation.md) 和 STATUS。
 - **SandboxedNative 才是未来的强制边界**：U 模式 + 私有 AS + 页表，由硬件完成强制。
 - **执行模型 / runtime（native machine code vs Wasm）是正交维度**：Wasm 只作为 Component 的**执行后端之一**（`AGENTS.md`），**不是第四个执行域**——`KernelNative` / `IsolatedNative` / `SandboxedNative` 都可以承载 Wasm runtime。见 `deployment.md` §3。
 
@@ -368,7 +368,8 @@ dma_unmap(mapping_id) → dma_free(ptr)      # 失败时 quarantine
 
 ### 跨组件 Interface
 
-同域直接 vtable；跨域走 domain-aware thunk。
+普通业务统一 Endpoint IPC；现行同步策略/隔离诊断的合法机制见 [部署](deployment.md)。
+组件内部仍可普通函数调用，不能把历史 vtable 作为新的业务通信路径。
 
 ## 9. 驱动兼容策略
 
@@ -461,8 +462,8 @@ runtime:
 
 ## 13. 已决
 
-- **D1（已修订）**：Core 管 Memory、不管 Heap，也不做内存记账；**堆是 runtime / deployment 策略，不是 Core 资源**（KernelNative 可共享 Core 内核堆，私有执行域可自带私有分配器）；Core 只以 region 粒度提供 backing / mapping，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 归属由该实例的 AS / 页表承载），**不**做 per-instance 字节计费；region release / instance failure 只保证逻辑失效、backing 保留驻留（不承诺物理回收，无归属记录时实例死亡亦无可回收之物）；**不得以"地址空间隔离"为名把堆分离当成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
-- **D2 = A**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是可选的**教学实验**、**不是里程碑**；SandboxedNative（U + 私有 AS）是未来的**强制边界**。执行模型 / runtime（native vs Wasm）是**正交维度**，Wasm 只是 Component 的执行后端之一，不是第四个执行域。
+- **D1（已修订）**：Core 管 Memory、不管 Heap，也不做内存记账；**堆是 runtime / deployment 策略，不是 Core 资源**（KernelNative 可共享 Core 内核堆，私有执行域可自带私有分配器）；Core 只以 region 粒度提供 backing / mapping，**不**记 owner（KernelNative 无账本；Isolated / Sandboxed 归属由该实例的 AS / 页表承载），**不**做 per-instance 字节计费；instance failure 先保证逻辑失效、DMA backing 保留驻留；私有 CPU-only reclaim 见内存契约，K无对象归属记录时不批量回收；**不得以"地址空间隔离"为名把堆分离当成安全隔离**。契约见 `docs/architecture/memory-and-heap.md`。
+- **D2（Runtime 方向更新）**：KernelNative 是正常、长期模式；IsolatedNative（S + 私有 AS）是近期 CPU-only 生命周期重点，仍只有条件性故障恢复；SandboxedNative（U + 私有 AS）建立非特权执行边界。执行模型 / runtime（native vs Wasm）是**正交维度**，Wasm 只是 Component 的执行后端之一，不是第四个执行域。
 - **设备访问模型**：`DeviceId`（identity）+ `kcore_device_claim` 返回本执行域窗口；KernelNative 拿裸寄存器基址，driver 自己 `volatile` 读写；不做 per-access 鉴权。旧的 `Handle → validate → Core MMIO read/write`、typed `MmioLease` / `DmaLease` 已删除。
 - **IRQ 模型**：锚点是已认领的 `(DeviceId, resource_index)`（设备的中断资源下标）；固件 specifier 与逻辑 IRQ 号分离（`InterruptResource`）；只支持 native callback；polled / count / mask / ack 已删除并推迟到真实 isolated / U-mode 执行模型。
 - **DMA 模型**：allocation（device-agnostic）与 mapping（device-related）分离；mapping id 单调递增 `u64` 从不复用；No-IOMMU identity，IOMMU / bounce buffer 在同一 seam。
@@ -472,7 +473,15 @@ runtime:
 
 ## 14. 相关文档
 
+Runtime 首批回收实验不授权设备/DMA，使用 Echo/纯内存服务。
+正常驱动退出由可信 driver 执行 quiesce/drain/reset；异常时 Core 关闭服务和权限，
+不再次调用业务 destroy，设备与有风险的 backing 保留隔离。
+**当前 dma_free 即使正常调用仍进入 Quarantine**；VirtIO 写 reset/drop 并不提供
+Core 可验证的设备静默确认。Device reset confirmation、恢复管理方、buffer pinning、
+Quarantine recovery、IOMMU/IOVA 和故障后重新认领均留后续阶段；本轮不实现。
+资源级回收依据以[内存矩阵](memory-and-heap.md#9-runtime-回收矩阵目标与基线)为准。
+
 - `architecture.md`：分层、Core 边界、ResourceDomain / ExecutionDomain 总览；
 - `component-model.md`：组件生命周期、ResourceDomain 视图、AddressSpaceManager；
-- `STATUS.md`（仓库根）：执行域/隔离的里程碑位置（C10 进行中；IsolatedNative 是可选实验、非承诺里程碑）；
+- `STATUS.md`（仓库根）：执行域/隔离的真实支持面与Runtime阶段；
 - `references.md`：seL4 typed capability、Theseus 状态归属等借鉴来源（注意 KaleidOS **不**实现 capability 系统，只借用"资源真相在 Core"的思想）。

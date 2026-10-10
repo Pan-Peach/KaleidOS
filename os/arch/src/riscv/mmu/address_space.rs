@@ -80,6 +80,11 @@ impl AddressSpaceBackend for Sv39AddressSpace {
             asid: self.asid,
         }
     }
+    unsafe fn release_page_tables(self, free: crate::vm::PageFree) {
+        unsafe {
+            self.table.release(free);
+        }
+    }
 }
 
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
@@ -150,6 +155,11 @@ impl AddressSpaceBackend for Sv32AddressSpace {
         super::SatpActivation {
             root_ppn: self.table.root_ppn(),
             asid: self.asid,
+        }
+    }
+    unsafe fn release_page_tables(self, free: crate::vm::PageFree) {
+        unsafe {
+            self.table.release(free);
         }
     }
 }

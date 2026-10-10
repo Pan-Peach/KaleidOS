@@ -431,7 +431,7 @@ pub const KCORE_ENDPOINT_MECHANISM_DIRECT: u32 = 0;
 /// `kcore_endpoint_call` 的 Core call gate，binding 只携带 opaque `EndpointId`）。
 pub const KCORE_ENDPOINT_MECHANISM_GATE: u32 = 1;
 
-/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). Currently KernelNative Task consumers only; no Direct/Gate fallback.
+/// Core-selected Request/Reply for an IPC-only publication (port=0, api=NULL, ctx=NULL). K/I/U Task consumers on supported deployments; no Direct/Gate fallback.
 pub const KCORE_ENDPOINT_MECHANISM_IPC: u32 = 2;
 
 /// `kcore_memory_view.kind`：**本执行域 VA**（KernelNative / IsolatedNative）。
@@ -469,7 +469,7 @@ unsafe extern "C" {
     /// **无账本**：Core 不为 region 建记录、不发 id、不记 owner——`view` 自身
     /// （`base` / `len`）就是身份；释放凭同一个 view 走 `kcore_memory_release`。
     /// KernelNative 返回共享 AS 的 VA；Isolated 映射进调用实例的私有 AS，归属由映射
-    /// 承载，不另立账本。Sandboxed 的原生直调入口返回 ENOTSUP（ecall 后端尚未接线）。
+    /// 承载，不另立账本。Sandboxed 经 ecall adapter 交付 USER 窗口；原生直调入口仍拒绝。
     /// 成功 = `0`（view 写入 `*out_view`）；失败 = `-Errno`（`EFAULT` out 为空 /
     /// `EINVAL` size/align 非法 / `EOVERFLOW` `min_len` 超出本域指针宽 /
     /// `ENOMEM` 物理内存耗尽）。
@@ -479,7 +479,7 @@ unsafe extern "C" {
     ///
     /// KernelNative 是**受信操作**（不校验归属、无账本），`(base, len)` 必须与 acquire
     /// 交付的 view 完全一致。成功 = `0`；
-    /// Isolated 只接受动态 backing 窗口内的精确映射；先 unmap、恢复共享 identity 别名，
+    /// Isolated 只接受动态 backing 窗口内的精确映射；先恢复共享 identity 别名，再 unmap，
     /// 再归还 physical extent。调用方保证无任务、回调或 DMA 继续借用；不接受 image/stack。
     /// 失败 = `-Errno`（`EFAULT` 空指针 / `EINVAL` kind 非法、`reserved` 非 0，
     /// 或 `(base, len)` 不是一次 acquire 产物的形状）。
@@ -549,6 +549,12 @@ unsafe extern "C" {
     /// KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。
     #[link_name = "kcore_component_stop"]
     pub fn kcore_component_stop(component: u32) -> i32;
+    /// 逻辑撤销后跳过 destroy。真实 Task 离场未确认时返回 EBUSY，保留所有 backing；U-mode timer 返回，S-mode 不承诺抢占。KernelNative 已发布 Direct 表时逻辑失效后返回 ENOTSUP，裸引用保持驻留。只允许活 KernelNative 管理上下文。
+    #[link_name = "kcore_component_force_stop"]
+    pub fn kcore_component_force_stop(component: u32) -> i32;
+    /// 显式回收 CPU-only 私有域。必须 Stopped/Failed、所有 Task 实际离场、无在途执行、全局私有域安全点；否则 EBUSY/ENOTSUP 并保留 backing。成功幂等，身份 tombstone 保留。KernelNative 自动 backing 回收不支持。
+    #[link_name = "kcore_component_reclaim"]
+    pub fn kcore_component_reclaim(component: u32) -> i32;
     // -- Task control --
     /// 创建任务：`entry` 必须落在 caller 组件镜像内；`arg` 原样传给 entry
     /// （归属仍来自 Core 执行边界，不是 `arg`）。成功 = `0` 且 TaskId 写入
@@ -740,7 +746,7 @@ unsafe extern "C" {
     /// - **Gate**：`*out_api` / `*out_ctx` **不写**（保持调用方原值）；调用方改用
     ///   `kcore_endpoint_call`（同一 `endpoint` id 即 call-gate handle）。
     ///
-    /// 不支持的组合（跨特权 / 无法证明同 AS 且 syscall-IPC 未实现）→ `-ENOTSUP`；
+    /// 不支持的同步组合（U 不提供 Direct/Gate）→ `-ENOTSUP`；
     /// **绝不静默降级成 Direct**。调用方不在任何组件执行边界内 → `-EPERM`；caller 已
     /// `Failed` → `-EPERM`。Direct 选中但 provider 未交付 function table（`api` 为空）→
     /// `-ENOTSUP`。成功 = `0`；失败 = `-Errno`（`EFAULT` 任一 out 为空 /
@@ -846,16 +852,16 @@ unsafe extern "C" {
     #[link_name = "kcore_user_discard"]
     pub fn kcore_user_discard(task: u32) -> i32;
     // -- Endpoint Request/Reply --
-    /// 将当前真实 KernelNative Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// 将当前真实 Component Task 注册为本组件 Endpoint 的唯一 Server Task；只接受 owner。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_listen"]
     pub fn kcore_ipc_listen(endpoint: u64) -> i32;
     /// Endpoint owner 或 Core 记录的不可变实例创建者明确允许 consumer Component 发送；允许启动锚点编排，拒绝 Gate/IRQ/policy；ID 不是 capability。仅可信 KernelNative，私有域暂拒绝；0 / -errno。
     #[link_name = "kcore_ipc_grant"]
     pub fn kcore_ipc_grant(endpoint: u64, consumer: u32) -> i32;
-    /// 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// 复制至有界请求槽；每 caller Task 最多一个未收取请求；1024 字节上限。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_submit"]
     pub fn kcore_ipc_submit(endpoint: u64, bytes: *const u8, len: usize, request: *mut u64) -> i32;
-    /// 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// 唯一 Server Task 收取 FIFO 请求及 Core 校验的 consumer 身份；空队列 EAGAIN。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_receive"]
     pub fn kcore_ipc_receive(
         endpoint: u64,
@@ -866,10 +872,10 @@ unsafe extern "C" {
         consumer_task: *mut u32,
         length: *mut usize,
     ) -> i32;
-    /// Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// Server Task 一次性回复；late canceled reply 丢弃并退休 receipt。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_reply"]
     pub fn kcore_ipc_reply(request: u64, bytes: *const u8, len: usize) -> i32;
-    /// caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// caller 一次收取终态；Pending 为 EAGAIN，短缓冲 EMSGSIZE 不消费；completion 为 transport status。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_collect"]
     pub fn kcore_ipc_collect(
         request: u64,
@@ -878,13 +884,13 @@ unsafe extern "C" {
         length: *mut usize,
         completion: *mut i32,
     ) -> i32;
-    /// 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// 真实 Task 上原子登记谓词等待后 park；request=0 等 receive，非零等自己请求；醒后复验。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_wait"]
     pub fn kcore_ipc_wait(endpoint: u64, request: u64) -> i32;
-    /// caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// caller 提交 ECANCELED 终态；不撤销已发生的业务副作用；完成后的请求 EALREADY。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_cancel"]
     pub fn kcore_ipc_cancel(request: u64) -> i32;
-    /// owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；仅可信 KernelNative，私有域暂拒绝；0 / -errno。
+    /// owner 永久失效 Endpoint，终结 pending并唤醒；旧 ID 不重定向。 缓冲只借用本次入口；I/U 完整私有范围检查并复制，U 要求 USER；0 / -errno。
     #[link_name = "kcore_ipc_close"]
     pub fn kcore_ipc_close(endpoint: u64) -> i32;
     // -- Component identity --

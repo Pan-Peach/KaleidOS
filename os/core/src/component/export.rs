@@ -116,6 +116,12 @@ use user::*;
 mod ipc;
 use ipc::*;
 
+#[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+#[path = "export/sandbox.rs"]
+mod sandbox;
+#[cfg(all(target_arch = "riscv64", feature = "supervisor", feature = "vm-mmu"))]
+pub(crate) use sandbox::dispatch as sandbox_dispatch;
+
 /// 单个导出条目：公开字节名 + 内核侧函数地址。
 /// 地址以裸函数指针存静态——rustc 生成普通数据重定位，最终链接器填入真实地址，
 /// 无需 build script / 运行时注册。
@@ -164,10 +170,11 @@ extern "C" fn kcore_memory_acquire(min_len: u64, min_align: u64, out_view: *mut 
             Ok(space) => space,
             Err(error) => return error.code(),
         };
+        let admission = registry::get_registry().lock();
         if let Some(id) = current_task_requester()
-            && let Some(error) = deny_if_failed(id)
+            && !admission.may_run(id)
         {
-            return error;
+            return Errno::EPERM.code();
         }
         if out_view.is_null() {
             return Errno::EFAULT.code();
@@ -235,6 +242,7 @@ extern "C" fn kcore_memory_release(view: *const MemoryView) -> i32 {
             Ok(space) => space,
             Err(error) => return error.code(),
         };
+        let _admission = registry::get_registry().lock();
         if view.is_null() {
             return Errno::EFAULT.code();
         }
@@ -502,6 +510,47 @@ extern "C" fn kcore_component_stop(component: u32) -> i32 {
     })
 }
 
+extern "C" fn kcore_component_force_stop(component: u32) -> i32 {
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if !crate::component::may_run(caller.component) {
+            return Errno::EPERM.code();
+        }
+        if let Some(denied) = deny_if_isolated(caller.component) {
+            return denied;
+        }
+        if crate::component::containment::scheduling_forbidden() {
+            return Errno::EINVAL.code();
+        }
+        status(crate::component::reclaim::force_stop(
+            ComponentId::from_raw(component),
+        ))
+    })
+}
+extern "C" fn kcore_component_reclaim(component: u32) -> i32 {
+    with_core_critical(|| {
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if !crate::component::may_run(caller.component) {
+            return Errno::EPERM.code();
+        }
+        if let Some(denied) = deny_if_isolated(caller.component) {
+            return denied;
+        }
+        if crate::component::containment::scheduling_forbidden() {
+            return Errno::EINVAL.code();
+        }
+        let result = crate::component::reclaim::reclaim(ComponentId::from_raw(component));
+        if let Err(reason) = result {
+            crate::log!("component", "reclaim {} retained: {:?}", component, reason);
+        }
+        status(result)
+    })
+}
+
 /// C ABI `(ptr, len)` → 短切片。长度上限防御野指针/超长输入（组件名受
 /// `MAX_NAME_LEN` 约束）。返回的切片只在调用期间有效。
 fn checked_name(ptr: *const u8, len: usize) -> Option<&'static [u8]> {
@@ -743,7 +792,7 @@ extern "C" fn kcore_endpoint_validate(endpoint: u64, contract: u64, abi: u64) ->
 ///
 /// caller 必须处在某个组件执行边界内（否则 `-EPERM`）——机制选择需要 caller 的
 /// 执行域；caller 已 `Failed` 同样 `-EPERM`（获取绑定 = 获取新能力）。
-/// 不支持的组合（跨特权 / 同 AS 无法证明且 syscall-IPC 未实现）→ `-ENOTSUP`，
+/// 不支持的同步组合（U 不提供 Direct/Gate）→ `-ENOTSUP`，
 /// **绝不静默降级成 Direct**；Direct 选中但 provider 未交付 function table →
 /// `-ENOTSUP`。
 ///
@@ -918,12 +967,21 @@ fn deny_if_isolated(component: crate::component::ComponentId) -> Option<i32> {
 ///
 /// 成功 = 0，TaskId（`u32`）写入 `*out_task`（调用方保证可写，任意对齐）；
 /// 失败 = `-Errno`（`EFAULT` out 为空 / `EPERM` 无法解析 caller /
-/// `ENOTSUP` caller 不在 KernelNative 域（Isolated 任务未实现）；
+/// `ENOTSUP` caller 不在 KernelNative 域（此设备管理入口不授权私有域）；
 /// 其余见 `Errno::from(TaskError)`）。
 extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) -> i32 {
+    if crate::component::isolated_api::active() {
+        return crate::component::isolated_api::on_core(move || {
+            kcore_task_create(entry, arg, out_task)
+        })
+        .unwrap_or_else(Errno::code);
+    }
     with_core_critical(|| {
         if out_task.is_null() {
             return Errno::EFAULT.code();
+        }
+        if let Err(e) = crate::component::access::validate(out_task as usize, 4, true) {
+            return e.code();
         }
         let Some(requester) = current_task_requester() else {
             return Errno::EPERM.code();
@@ -931,15 +989,8 @@ extern "C" fn kcore_task_create(entry: usize, arg: *mut (), out_task: *mut u32) 
         if let Some(denied) = deny_if_failed(requester) {
             return denied;
         }
-        if let Some(denied) = deny_if_isolated(requester) {
-            return denied;
-        }
-        match task::create_task(requester, entry, arg) {
-            Ok(id) => {
-                // SAFETY: out 指针可写性由调用方保证（C ABI 契约）；unaligned 写防未对齐 UB。
-                unsafe { core::ptr::write_unaligned(out_task, id.raw()) };
-                0
-            }
+        match task::create_task_with_output(requester, entry, arg, out_task) {
+            Ok(_) => 0,
             Err(error) => Errno::from(error).code(),
         }
     })
@@ -980,6 +1031,10 @@ extern "C" fn kcore_cpu_current() -> u32 {
 /// 注意：切换离开期间 Core ABI 深度由调度帧挂起/恢复（`sched::schedule_next`），
 /// 本包装的 +1/-1 在任务被重新调度、`yield_current` 返回后仍然平衡。
 extern "C" fn kcore_task_yield() -> i32 {
+    if crate::component::isolated_api::active() {
+        return crate::component::isolated_api::on_core(move || kcore_task_yield())
+            .unwrap_or_else(Errno::code);
+    }
     with_core_critical(|| status(sched::yield_current()))
 }
 
@@ -1019,6 +1074,24 @@ extern "C" fn kcore_task_unpark(id: u32) -> i32 {
 /// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
 /// 的上下文）。返回 0 / `-Errno`。
 extern "C" fn kcore_task_exit() -> i32 {
+    #[cfg(all(
+        feature = "vm-mmu",
+        feature = "supervisor",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    ))]
+    if let Some(cross) = crate::component::containment::cross_as::active_cross_as() {
+        if crate::component::containment::task_switch_forbidden() {
+            return Errno::EINVAL.code();
+        }
+        if let Some(id) = sched::current_task() {
+            task::get_task_table()
+                .lock()
+                .get_mut(id)
+                .unwrap()
+                .exit_requested = true;
+            unsafe { ((*cross).abandon)((*cross).context) }
+        }
+    }
     with_core_critical(|| status(sched::exit_current()))
 }
 
@@ -1590,12 +1663,15 @@ mod tests {
             .lines()
             .chain(query_half.lines())
             .chain(user_half.lines())
-            .chain(include_str!("export/ipc.rs").lines())
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("with_core_critical("))
             .count();
         assert_eq!(
-            wrapped,
+            wrapped
+                + include_str!("export/ipc.rs")
+                    .lines()
+                    .filter(|line| line.contains("core_call(move ||"))
+                    .count(),
             EXPORTS.len() - 1,
             "every export except the escape request must wrap its body"
         );
@@ -1898,7 +1974,7 @@ mod tests {
             );
             assert_eq!(
                 kcore_task_create(0x1000, core::ptr::null_mut(), &mut out_task),
-                Errno::ENOTSUP.code()
+                Errno::EPERM.code()
             );
             let mut out_status = 0i32;
             assert_eq!(
@@ -2135,6 +2211,11 @@ mod tests {
                 ExecutionDomain::KernelNative,
             )
             .unwrap();
+        {
+            let mut reg = registry::get_registry().lock();
+            reg.resolve(native).unwrap();
+            reg.begin_start(native).unwrap();
+        }
         containment::with_test_init_boundary(Some(native), || {
             let acquire = resolve(b"kcore_memory_acquire").unwrap();
             let acquire: extern "C" fn(u64, u64, *mut MemoryView) -> i32 =

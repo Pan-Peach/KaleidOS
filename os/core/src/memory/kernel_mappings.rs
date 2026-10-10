@@ -386,6 +386,12 @@ pub fn release_private_backing(
     use super::address_space::{self, MapError};
     let mut slot = PLAN.lock();
     if let Some(plan) = slot.as_mut() {
+        // A failed publication may never have installed an exclusion, or an
+        // earlier teardown attempt already restored it. Both retain ownership
+        // in the AS and can safely retry without inventing a second ledger.
+        if !plan.exclusions.contains(&extent) {
+            return Ok(());
+        }
         let mappings = plan.restoration(extent).map_err(|error| {
             if error == PlanError::OutOfMemory {
                 MapError::OutOfMemory
