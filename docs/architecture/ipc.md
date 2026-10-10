@@ -2,7 +2,7 @@
 
 > 当前窄 IPC 契约。ABI 以 [core.toml](../../abi/core.toml) 为准；设计取舍见
 > [IPC ADR](../development/ipc-request-reply-adr.md)。本页只规定传输，不规定 FS、Block
-> 或业务对象协议。旧 Direct/Gate 仍按 [部署](deployment.md) 工作。
+> 或业务对象协议。同步策略/隔离与生命周期诊断的 Direct/Gate 仍按 [部署](deployment.md) 工作；普通业务仅使用 IPC。
 
 ## 身份与授权
 
@@ -66,7 +66,7 @@ Server Task 退出会关闭其端口；Provider 停止/失败关闭所有端口�
 ## 执行域与内存边界
 
 当前只支持 KernelNative Tasks：RV64/Sv39、RV32/Sv32 默认profile与RV32 S-mode NoMMU
-私有profile有IPC分组运行证据；本轮整套回归的失败以STATUS为准。
+私有profile的完整 CoreTest 与 shell 通过；具体计数以STATUS为准。
 私有域 import 白名单没有 IPC；Isolated/Sandboxed Server Task、范围检查与跨 AS copy
 尚未实现。现有 Gate 的私有 AS 测试不能充当新 IPC 隔离证据。
 

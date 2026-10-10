@@ -41,6 +41,29 @@ const VIRTIO_BLK: &[u8] = b"virtio_blk";
 
 /// prober 的 coarse 路由键（不透明字节；prober 自己不解释它）。
 const COMPATIBLE: &[u8] = b"virtio,mmio";
+fn read_result(
+    endpoint: Endpoint<ProbeResult>,
+) -> core::result::Result<ProbeReply, kcomp_sdk::endpoint::InvokeError> {
+    use kcomp_sdk::endpoint::InvokeError;
+    let owner = kcomp_sdk::management::current_component().map_err(InvokeError::Transport)?;
+    let start = unsafe { abi::kcore_now() };
+    loop {
+        match kcomp_sdk::ipc::grant(endpoint.id(), owner) {
+            Err(Errno::ENOTCONN)
+                if unsafe { abi::kcore_now() }.wrapping_sub(start)
+                    < unsafe { abi::kcore_timebase_hz() } * 10 =>
+            {
+                let _ = kcomp_sdk::management::yield_task();
+            }
+            result => {
+                result.map_err(InvokeError::Transport)?;
+                break;
+            }
+        }
+    }
+    probe::pull_result(endpoint)
+}
+
 /// stale 候选用的非 virtio-blk MMIO 设备（NoMatch 路径）。
 const STALE_COMPATIBLE: &[u8] = b"google,goldfish-rtc";
 
@@ -236,11 +259,7 @@ fn measure_reads(endpoint: Endpoint<BlockDevice>) {
         }
         samples.sort_unstable();
         let median = samples[15];
-        let rate = if median == 0 {
-            0
-        } else {
-            hz * (bytes * 32) as u64 / median
-        };
+        let rate = (hz * (bytes * 32) as u64).checked_div(median).unwrap_or(0);
         klog!(
             "[block-read-sample] bytes={} hz={} batches=31 operations_per_batch=32 requests_per_operation={} median={} p95={} bytes_per_second={} trace=profile",
             bytes,
@@ -320,7 +339,12 @@ fn check_no_match() -> bool {
     }
     let outcome_ok = match Endpoint::<ProbeResult>::lookup(instance, result_name) {
         Ok(endpoint) => {
-            matches!(probe::pull_result(endpoint), Ok(reply) if reply.outcome == ProbeReply::NO_MATCH)
+            let replay = matches!(read_result(endpoint), Ok(reply) if reply.outcome == ProbeReply::NO_MATCH)
+                && matches!(probe::pull_result(endpoint), Ok(reply) if reply.outcome == ProbeReply::NO_MATCH);
+            let retired =
+                probe::shutdown(endpoint).is_ok() && probe::pull_result(endpoint).is_err();
+            let stopped = unsafe { abi::kcore_component_stop(instance) } == 0;
+            replay && retired && stopped
         }
         Err(_) => false,
     };
@@ -394,7 +418,7 @@ fn result_is_no_match(instance: u32) -> bool {
         };
         if let Ok(endpoint) = Endpoint::<ProbeResult>::lookup(instance, &name_buf[..name_len]) {
             return matches!(
-                probe::pull_result(endpoint),
+                read_result(endpoint),
                 Ok(reply) if reply.outcome == ProbeReply::NO_MATCH
             );
         }

@@ -1,14 +1,9 @@
 //! Real SDK provider and consumer, one artifact across the K/I deployment matrix.
 use super::*;
-// Contract semantics stay outside Core. This hardware test uses the SDK's
-// generated wire constants without linking a component runtime into the kernel.
+// Test-only synchronous AS/fault probe; ordinary BlockDevice is IPC-only.
+#[path = "../../../../../components/tests/domain_wire.rs"]
 #[allow(dead_code)]
-mod block {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../components/kcomp-sdk/src/generated/block.rs"
-    ));
-}
+mod wire;
 use kernel::component::{
     call,
     containment::KcompCreateArgs,
@@ -39,8 +34,8 @@ fn endpoint(id: ComponentId) -> endpoint::EndpointId {
         .discover(
             &reg,
             id,
-            b"block.device",
-            endpoint::ContractId::from_raw(block::KCOMP_BLOCK_DEVICE_CONTRACT),
+            wire::DOMAIN_NAME,
+            endpoint::ContractId::from_raw(wire::DOMAIN_CONTRACT),
         )
         .unwrap()
 }
@@ -153,7 +148,7 @@ pub(crate) fn isolated_domain_service() -> ! {
     assert_eq!(
         with_kernel_caller(native, 0x7b, || call::endpoint_call(
             endpoint(provider),
-            block::KCOMP_BLOCK_METHOD_WRITE,
+            wire::METHOD_WRITE,
             args.as_ptr(),
             args.len(),
             config.as_ptr(),

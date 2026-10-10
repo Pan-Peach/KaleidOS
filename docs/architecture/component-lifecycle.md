@@ -235,13 +235,13 @@ create / load 拒绝 IRQ 和 Policy 祖先上下文（`-EINVAL`）；有 ambient
 - 从普通 consumer 上下文**申请/释放 provider 拥有的资源**：可能撞 owner 检查。
 - provider panic：经 `kcore_endpoint_call` 的 service-call 边界**归因到 provider 并收敛**（见上）；绕过 Core 边界直接调用 provider 的函数表则不会。
 
-**不要**用"信任 `ctx` 里的 instance id"去绕过。资源获取与拆除保持在实例生命周期 / 被拥有的任务上下文里；若某服务确实需要 provider 归属的 Core 调用，走 `kcore_endpoint_call` 的 service-call 边界（见上）。
+**不要**用"信任 `ctx` 里的 instance id"去绕过。资源获取与拆除保持在实例生命周期 / 被拥有的任务上下文里；普通服务在 provider owned Server Task 中执行 Core 调用；保留的同步诊断可走 `kcore_endpoint_call` 的 service-call 边界（见上）。
 
 ### `ctx` 指什么
 
 - `ctx` 指向**组件私有实例状态**（或状态里一个稳定的 service 子对象），**不是** Core 的实例记录。
 - 同一实例的多个服务共用同一个 state 指针是可以的；**不强求相等**。
-- 现有设施已具备：`BlockDeviceService::ctx()` 指向自己的 provider 字段（`os/components/kcomp-sdk/src/block.rs:172-180`）。迁移主要是**去用它**，而不是留空 ctx + 全局状态。
+- 上述 ctx 规则适用于保留的同步策略/隔离与生命周期诊断。普通 Block/Filesystem 已删除函数表及 BlockDeviceService；IPC Server Task 持本镜像私有状态，endpoint 的 api/ctx 为零。
 
 ---
 

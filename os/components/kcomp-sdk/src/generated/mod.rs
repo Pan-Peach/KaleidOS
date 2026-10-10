@@ -12,6 +12,7 @@ pub mod network;
 pub mod posix;
 pub mod posix_wire;
 pub mod probe;
+pub mod probe_wire;
 pub mod scheduler;
 pub mod vfs;
 pub mod vfs_wire;

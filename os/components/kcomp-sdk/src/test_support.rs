@@ -42,13 +42,6 @@ pub extern "C" fn kcore_ipc_cancel(_: u64) -> i32 {
     crate::Errno::ENOTSUP.code()
 }
 
-static CALL_SCRIPT: Mutex<(i32, i32)> = Mutex::new((0, 0));
-/// 下一次 `kcore_endpoint_call` 成功时要写进 output 的脚本回复（消费一次）。
-static CALL_REPLY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-static LAST_CALL: Mutex<Option<CallRecord>> = Mutex::new(None);
-/// `kcore_endpoint_bind` 的脚本回复：`(status, mechanism, api, ctx)`。
-static BIND_SCRIPT: Mutex<(i32, u32, usize, usize)> = Mutex::new((0, 0, 0, 0));
-static LAST_BIND: Mutex<Option<BindRecord>> = Mutex::new(None);
 /// `kcore_endpoint_publish` 的脚本回复（status）与最近一次入参快照。
 static PUBLISH_SCRIPT: Mutex<i32> = Mutex::new(0);
 static LAST_PUBLISH: Mutex<Option<PublishRecord>> = Mutex::new(None);
@@ -79,24 +72,6 @@ pub(crate) struct HeapDeallocRecord {
     pub align: usize,
 }
 
-/// 最近一次 `kcore_endpoint_call` 的入参快照。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CallRecord {
-    pub endpoint: u64,
-    pub method: u32,
-    pub args: Vec<u8>,
-    pub input: Vec<u8>,
-    pub output_len: usize,
-}
-
-/// 最近一次 `kcore_endpoint_bind` 的入参快照。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BindRecord {
-    pub endpoint: u64,
-    pub contract: u64,
-    pub abi: u64,
-}
-
 /// 最近一次 `kcore_endpoint_publish` 的入参快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublishRecord {
@@ -119,11 +94,6 @@ pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
 /// 复位脚本：下一次调用返回 `(transport = 0, method = 0)`、bind 返回
 /// `(status = 0, mechanism = 0, api = 0, ctx = 0)`，并清空记录。
 pub(crate) fn reset_script() {
-    *CALL_SCRIPT.lock().unwrap() = (0, 0);
-    *CALL_REPLY.lock().unwrap() = None;
-    *LAST_CALL.lock().unwrap() = None;
-    *BIND_SCRIPT.lock().unwrap() = (0, 0, 0, 0);
-    *LAST_BIND.lock().unwrap() = None;
     *PUBLISH_SCRIPT.lock().unwrap() = 0;
     *LAST_PUBLISH.lock().unwrap() = None;
     *MEM_ACQUIRE_SCRIPT.lock().unwrap() = (0, 0, 0);
@@ -157,36 +127,6 @@ pub(crate) fn script_mem_acquire(status: i32, base: usize, len: usize) {
 /// 设置下一次 `kcore_memory_release` 的返回状态。
 pub(crate) fn script_mem_release(status: i32) {
     *MEM_RELEASE_SCRIPT.lock().unwrap() = status;
-}
-
-/// 设置下一次 `kcore_endpoint_call` 的 `(transport, method)` 返回。
-pub(crate) fn script_call(transport: i32, method: i32) {
-    *CALL_SCRIPT.lock().unwrap() = (transport, method);
-}
-
-/// 设置下一次成功调用要写进 `output` 的字节（不足补零、超出截断，消费一次）。
-pub(crate) fn script_call_reply(reply: &[u8]) {
-    *CALL_REPLY.lock().unwrap() = Some(reply.to_vec());
-}
-
-/// 设置下一次 `kcore_endpoint_bind` 的成功回复（`status = 0`）。
-pub(crate) fn script_bind(mechanism: u32, api: usize, ctx: usize) {
-    *BIND_SCRIPT.lock().unwrap() = (0, mechanism, api, ctx);
-}
-
-/// 设置下一次 `kcore_endpoint_bind` 的失败回复（`-Errno`）。
-pub(crate) fn script_bind_error(status: i32) {
-    *BIND_SCRIPT.lock().unwrap() = (status, 0, 0, 0);
-}
-
-/// 最近一次调用的快照（`reset_script` 后为 `None`）。
-pub(crate) fn last_call() -> Option<CallRecord> {
-    LAST_CALL.lock().unwrap().clone()
-}
-
-/// 最近一次 bind 的快照（`reset_script` 后为 `None`）。
-pub(crate) fn last_bind() -> Option<BindRecord> {
-    LAST_BIND.lock().unwrap().clone()
 }
 
 /// 设置下一次 `kcore_endpoint_publish` 的返回状态（`0` = staged 成功）。
@@ -366,85 +306,30 @@ pub extern "C" fn kcore_heap_dealloc(ptr: *mut u8, size: usize, align: usize) ->
     0
 }
 
-/// Core `kcore_endpoint_bind` 的替身：按脚本返回 `(status, mechanism, api, ctx)`；
-/// 成功时写 `*out_mechanism`（GATE 不写 api/ctx，与 Core 契约一致），并记录入参。
+// Unused historical transports are not mocked as business implementations.
 #[unsafe(no_mangle)]
 pub extern "C" fn kcore_endpoint_bind(
-    endpoint: u64,
-    contract: u64,
-    abi: u64,
-    out_mechanism: *mut u32,
-    out_api: *mut usize,
-    out_ctx: *mut usize,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: *mut u32,
+    _: *mut usize,
+    _: *mut usize,
 ) -> i32 {
-    use crate::generated::abi::KCORE_ENDPOINT_MECHANISM_GATE;
-    let (status, mechanism, api, ctx) = *BIND_SCRIPT.lock().unwrap();
-    *LAST_BIND.lock().unwrap() = Some(BindRecord {
-        endpoint,
-        contract,
-        abi,
-    });
-    if out_mechanism.is_null() || out_api.is_null() || out_ctx.is_null() {
-        return -14; // EFAULT
-    }
-    if status != 0 {
-        return status;
-    }
-    // SAFETY: 三个 out 在上面已校验非空；调用方（SDK）保证可写。
-    unsafe {
-        core::ptr::write_unaligned(out_mechanism, mechanism);
-        if mechanism != KCORE_ENDPOINT_MECHANISM_GATE {
-            core::ptr::write_unaligned(out_api, api);
-            core::ptr::write_unaligned(out_ctx, ctx);
-        }
-    }
-    0
+    crate::Errno::ENOTSUP.code()
 }
-
-/// Core `kcore_endpoint_call` 的替身：按脚本返回传输状态；transport == 0 时把
-/// method status 写入 `*out_status`，并按脚本把回复写进 `output`（没有脚本回复时，
-/// block capacity 调用回填固定值——那是 block 测试既有的契约）。
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn kcore_endpoint_call(
-    endpoint: u64,
-    method: u32,
-    args: *const u8,
-    args_len: usize,
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    output_len: usize,
-    out_status: *mut i32,
+    _: u64,
+    _: u32,
+    _: *const u8,
+    _: usize,
+    _: *const u8,
+    _: usize,
+    _: *mut u8,
+    _: usize,
+    _: *mut i32,
 ) -> i32 {
-    use crate::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
-    let (transport, status) = *CALL_SCRIPT.lock().unwrap();
-    *LAST_CALL.lock().unwrap() = Some(CallRecord {
-        endpoint,
-        method,
-        args: copy_region(args, args_len),
-        input: copy_region(input, input_len),
-        output_len,
-    });
-    if transport == 0 && status == 0 && !output.is_null() {
-        let scripted = CALL_REPLY.lock().unwrap().take();
-        if let Some(reply) = scripted {
-            // 截断到 output 容量（与 Core 的窗口语义一致）。
-            let len = reply.len().min(output_len);
-            // SAFETY: output 非空、调用方保证 output_len 字节可写。
-            unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), output, len) };
-        } else if method == KCOMP_BLOCK_METHOD_CAPACITY && output_len == KCOMP_BLOCK_CAPACITY_LEN {
-            // 模拟 provider 回填 capacity = 0x0102_0304_0506_0708（LE）。
-            let reply = 0x0102_0304_0506_0708u64.to_le_bytes();
-            // SAFETY: 输出窗口由调用方保证长度 = CAPACITY_LEN 且可写。
-            unsafe {
-                core::ptr::copy_nonoverlapping(reply.as_ptr(), output, KCOMP_BLOCK_CAPACITY_LEN)
-            };
-        }
-    }
-    if transport == 0 && !out_status.is_null() {
-        // SAFETY: out_status 非空；调用方保证可写。
-        unsafe { core::ptr::write_unaligned(out_status, status) };
-    }
-    transport
+    crate::Errno::ENOTSUP.code()
 }

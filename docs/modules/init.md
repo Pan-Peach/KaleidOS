@@ -19,8 +19,8 @@
    默认策略选择第 0 个，枚举顺序属于本启动 profile；增加第二张盘不使根选择歧义。
    可用 config ABI `0x494E_4954_524F_4F54` + 4 字节 native-endian u32 指定序号，
    不要求字节对齐。指定非零序号不存在返回 ENODEV；默认无盘进入纯 console 会话。
-4. 创建FatFs：LE config为block EndpointId u64、control ComponentId u32、flags=1 u32。
-   flags=1仅发布IPC；init作为真实创建祖先显式grant Block给Fat。运行任务让listener就绪。
+4. 创建FatFs：LE config为block EndpointId u64、control ComponentId u32、reserved=0 u32。
+   Fat仅发布IPC，config fingerprint以 filesystem schema 为准；init作为真实创建祖先显式grant Block给Fat。运行任务让listener就绪。
 5. 创建VFS：control u32、mount count u32、FS EndpointId列表u64；grant Fat给VFS。
    VFS在自己的Server Task中mount/root，把Remote Fat挂到`/fat`，Local始终存在。
 6. init的有限Task通过VfsBinding取root/release确认bootstrap结果，写回原子状态。

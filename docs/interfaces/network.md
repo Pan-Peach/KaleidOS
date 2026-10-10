@@ -71,13 +71,13 @@ Truncate 复制前缀后消费整包。没有包才返回 Pending。Whole 返回
 ```text
 personality / 普通组件
   → SDK NetworkBinding → TcpSocket / UdpSocket（绑定 + 不透明 ID）
-  → NetworkApi C table / Gate flat frame
-  → NetworkService<NetworkInstance> → NetworkProvider
+  → generated IPC client → Endpoint Request/Reply
+  → Server Handler → NetworkProvider
   → Engine 同步点 → Stack 对象表 / 端口 / 路由 / 私有存储池
   → 每接口 DeviceStack（smoltcp Interface + SocketSet）
 ```
 
-一个实例发布一个 network 服务 endpoint；每个连接不再单独注册 Core endpoint。
+计划一个实例发布一个 network IPC endpoint（当前未发布）；每个连接不再单独注册 Core endpoint。
 端口名和设备 / 地址 / 路由 / 存储容量由组合配置选择，不自动发现默认网络栈。
 create 配置 wire 尚待定稿。
 
@@ -97,7 +97,7 @@ create 配置 wire 尚待定稿。
 
 Stack / SocketContext / smoltcp handle / 存储借用都是 provider 内部细节。
 服务工厂可以同时创建 TCP 和 UDP；具体协议操作在调用方仍挂在相应代理上。
-Core 在 bind 时选择 Direct / Gate，SDK 不自行降级，也不把旧 ID 重绑到新实例。
+计划 SDK 只接受 IPC binding，不自行降级，也不把旧 ID 重绑到新实例。
 部署与 binding 作用域见 `docs/architecture/deployment.md`。
 
 ## 3. 身份、状态与生命周期
@@ -153,8 +153,8 @@ reset / 协议超时是错误。发送成功只表示复制入本组件 TX，不
 等容量恢复也必须通知受影响端点，不能只盯某个 backend 的 can_send。
 最终释放先安排通知再撤销观察者；在途通知可导致额外唤醒，不能当成操作完成。
 
-**Busy 与 Pending 不同。** Engine 锁竞争返回 Busy，尚未执行操作；Core Gate
-拒绝并发进入可能返回 Transport(EBUSY)。两者都应在调用方让出执行机会后重试，
+**Busy 与 Pending 不同。** Engine 锁竞争返回 Busy，尚未执行操作；传输失败保留为 Transport。
+Busy 应在调用方让出执行机会后重试，
 不能等待 socket 事件解决，也不能映射成没有唤醒来源的 Pending。
 取消、超时、信号以及同时等待多个对象的策略由调用方实现。普通 park 没有
 默认 deadline；跨组件 unpark / 显式 timer 仍是待实现依赖。
@@ -163,7 +163,7 @@ reset / 协议超时是错误。发送成功只表示复制入本组件 TX，不
 
 服务入口和 worker 经实例唯一 Engine 同步点访问状态，只有 worker 调用协议
 poll。锁必须为非阻塞尝试：失败返回 Busy / worker yield；持有期间不能 park、
-yield 或调用其他组件。Gate 服务栈也不能用“入队后睡眠”等 worker 回复。
+yield 或调用其他组件。Server Task 与 worker 的等待不能持有 Engine 锁。
 临界区有界，批处理达到预算后解锁并重新调度。当前 Engine 仍是占位，没有 Sync 承诺。
 
 driver binding 由 worker 独占。锁外收帧到 worker buffer，锁内送入 SmoltcpDevice
@@ -178,15 +178,16 @@ budget 耗尽或临界区 Busy 时不能睡等 socket 事件。协议 deadline �
 提交后的通知失败不得把已经入队的数据报告成 Pending，让 caller 重复发送；
 必须记录服务 / 端点故障并处理剩余通知。通知存储容量应在提交之前检查。
 
-## 6. Direct / Gate 与错误
+## 6. 计划 IPC Wire 与错误
 
-Direct 使用生成的 NetworkApi table + opaque ctx；Gate 使用既有 flat frame。
-布局、field 编码和逐方法 args/input/output 形状见 `abi/network.toml` 的字段
-说明和 METHOD 常量。Gate 所有整数逐字段 LE 编码，不复制 C padding / Rust enum。
+旧 NetworkApi function table 与 Gate 分发占位已删除。当前没有可运行的 network Endpoint，
+以下为后续协议要求：在 `abi/network.toml` 补全 method AST，经现有生成器生成 C/Rust
+client/codec/dispatch。所有整数逐字段 LE 编码，不复制 C padding / Rust enum；
+值结构和 METHOD 常量已声明，完整方法形状与 IPC 接线仍未实现。
 NetworkAddress 用高低两个 u64 表示 IP 数值：IPv4 192.0.2.1 为 high=0、
 low=0xc0000201；IPv6 高 64 位在 high。地址字节转换须显式做，不能对整个对象 transmute。
 
-- 方法返回 0 时输出有效；负值时不读输出。TCP receive 的 Gate output 由
+- 方法返回 0 时输出有效；负值时不读输出。TCP receive 的计划 Wire output 由
   NetworkStreamRead 头和 payload 容量组成；UDP receive 用 NetworkDatagram 头。
   payload 有效长度以头内 copied / count 为准，不超过容量。
 - 只有 tcp_accept / tcp_send / tcp_receive / udp_send_to / udp_receive 的
@@ -195,9 +196,9 @@ low=0xc0000201；IPv6 高 64 位在 high。地址字节转换须显式做，不�
   未知 phase / flags、非法长度等为 InvalidReply；不把未知负 errno 静默归一化。
   provider 内部依赖错误不能冒充本次外层 Core 的 Transport 错误。
 - C 指针只借用本次调用，零长度 payload 允许空指针；结构与 out 参数必须有效，
-  输出不得与输入 / 参数别名。Gate 先校验完整 frame 形状和所有字段再操作对象，
+  输出不得与输入 / 参数别名。Server 先校验完整 frame 形状和所有字段再操作对象，
   无效请求不能产生部分状态修改。未使用字段 / reserved 为零，未知编码拒绝。
-- 单次 payload 上限见 IO_MAX；两种 transport 同义。UDP 还受实际协议大小限制，
+- 单次 payload 上限见 IO_MAX，定稿 method AST 时还须满足现有 IPC envelope 上限。UDP 还受实际协议大小限制，
   超限返回 EMSGSIZE。未实现模式明确失败，不按另一种模式默默成功。
 
 personality 负责 fd / HANDLE、进程复制与继承、sockaddr 布局、错误表示、阻塞规则、

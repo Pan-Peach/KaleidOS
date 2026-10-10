@@ -17,12 +17,12 @@
 | `scheduler_rr` | `os/components/scheduler_rr/` | Rust `.kcomp` | 轮转 `SchedulerPolicy` 参考实现；每 CPU cursor 保存上次提议的 TaskId，按候选 id 后继轮转，避免列表排除 outgoing 时的下标饥饿；游标属于实例，只提议 TaskId |
 | `driver_prober` | `os/components/driver_prober/` | Rust `.kcomp` | opaque compatible 粗匹配；create config 下发 device/结果端口，成功后 pull probe.result；完成全部候选；同驱动/设备去重，已 Match 设备不交后续候选 |
 | `virtio_blk` | `os/components/drivers/virtio_blk/` | Rust `.kcomp` | 每实例 claim 一个 VirtIO-MMIO 设备；sector 0 传输健康检查后发布 block.device/probe.result；不解释格式签名，RV32 LBA 溢出明确拒绝 |
-| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs + block.device diskio；root / 单段 lookup / node_info，ASCII 8.3；节点表含根共 8 槽，挂载期间驻留、卸载失效；实例级 try-lock 串行库状态/文件表/节点表，竞争 EBUSY、handle 与 node token 分别单调不复用；语义与 wire 见 [filesystem schema](../../abi/filesystem.toml) |
-| `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 `kcomp_filesystem_api`，实例级 try-lock，handle 不复用）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
-| `vfs` | `os/components/filesystems/vfs/` | Rust `.kcomp` 骨架 | Namespace / File service 内部类型与操作占位；create 返回 `-ENOTSUP`，尚无服务 endpoint。现状与手写入口见 [`vfs.md`](vfs.md) |
+| `fatfs` | `os/components/filesystems/fatfs/` | C `.kcomp` | 只读 FatFs + IPC block.device diskio；唯一 filesystem IPC Server；root / 单段 lookup / node_info，ASCII 8.3；节点表含根共 64 槽，挂载期间驻留、卸载失效；实例级 try-lock 串行库状态/文件表/节点表，竞争 EBUSY、handle 与 node token 分别单调不复用；语义与 wire 见 [filesystem schema](../../abi/filesystem.toml) |
+| `littlefs` | `os/components/filesystems/littlefs/` | C `.kcomp` | littlefs 文件系统服务（对外只读 filesystem IPC Server，实例级 try-lock，handle 不复用）；包 third_party `lfs.c` + `lfs_util.c`，`block.device` 适配（read/prog/erase/sync，erase = 整块写 0xFF）；mount 内 format+mount+自检（写读校验，走 prog/erase） |
+| `vfs` | `os/components/filesystems/vfs/` | Rust `.kcomp` | 单一 Namespace/OpenFile，LocalFs/RemoteFs 混合只读挂载与 IPC Server；ksh/ELF 已消费。现状与入口见 [`vfs.md`](vfs.md) |
 | `posix` | `os/components/personalities/posix/` | Rust `.kcomp` | RV64/MMU 普通用户进程族，fork/exec/wait、console 与只读 posix.process endpoint 已接；通用 VFS/fd 仍骨架，见 [`posix.md`](posix.md) |
 | `netstack` | `os/components/network/netstack/` | Rust `.kcomp` 骨架 | TCP / UDP 服务契约与 SDK 代理、私有 smoltcp / 帧 adapter / worker 占位；操作为 `todo!()`，bind / create 拒绝。见 [`netstack.md`](netstack.md) |
-| `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；Direct `ctx` 指向携带本实例 state 的 per-instance provider |
+| `ram_blk_rw` | `os/components/tests/drivers/ram_blk_rw/` | Rust `.kcomp` | **可写、per-instance** RAM 块设备（`ram_blk` 的可写对偶）：每实例经 `kcore_memory_acquire` 取独立零初始化缓冲；owned IPC Server Task 持本实例 state，协议边界不发布指针 |
 | `kcomp_smoke` | `os/components/tests/kcomp_smoke/` | Rust `.kcomp` | SDK 参考 smoke：经白名单打印 `[smoke] hex=<n>` |
 | `kcomp_c_smoke` | `os/components/tests/kcomp_c_smoke/` | C `.kcomp` | 最小 freestanding C 组件：`#include "kcomp.h"` + SDK C 运行时 |
 | `kcomp_panic` | `os/components/tests/kcomp_panic/` | Rust `.kcomp` | 在 create 里故意 panic，端到端验证 panic containment |
@@ -42,7 +42,7 @@
 
 - **C 作者面**：`include/kcomp.h`（umbrella，只 include 生成物 + 契约说明）、`include/generated/kcomp_abi.h`（`kcore_*` / 生命周期入口 / `block.device` / `filesystem` 的 C 声明，schema 单一来源）、`include/errno.h`、`include/string.h`、`include/inttypes.h`（freestanding shim 声明；`inttypes.h` 因 littlefs 的 `lfs_util.h` 无条件 include 它而补）。
 - **C 运行时**：`c/kcomp_rt.c`——freestanding **weak** `memcpy` / `memset` / `memmove` / `memcmp` / `strlen` / `strchr` / `strcpy` / `strspn` / `strcspn`（C 组件私有携带；只实现组件真正引用到的原语，不朝 libc 扩张；后三个为 littlefs 引入）。
-- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `kcomp_services!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`endpoint.rs`（typed `Endpoint<C>`）、`block.rs`（`block.device` 契约类型 + provider 包装，声明本体 re-export 生成物）、`filesystem.rs`、`probe.rs`（`DriverCreateConfig` 扁平编解码 / `ProbeReply` / `ProbeResult` 契约 + pull / publish helper）、`generated/{abi,block,filesystem,errno,probe}.rs`（schema 生成物）、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → per-image 部署 adapter，create 前选择 K 共享堆 / I 私有堆）、`heap.rs`（私有执行域的 freestanding C 分配器 facade；`c/kcomp_heap_runtime.c` 生产消费，host 测试驱动真实 C 实现；契约见 `docs/architecture/memory-and-heap.md` §6）。
+- **Rust 面**（`src/`）：`lib.rs`（`kcomp_instance_create!` / `kcomp_instance_destroy!` / `kcomp_services!` / `klog!` 宏 + 重导出）、`abi.rs`（`kcore_*` facade）、`binding.rs`（typed service binding）、`endpoint.rs`（typed `Endpoint<C>`）、`block.rs`（契约类型、生成 Provider trait、IPC-only client/server）、`filesystem.rs`（生成 Provider 与 IPC-only client）、`probe.rs`（`DriverCreateConfig` 扁平编解码 / `ProbeReply` / `ProbeResult` 契约 + pull / publish helper）、`generated/`（schema 定义与六个 Contract 的 C/Rust Wire client/codec/dispatch）、`dma.rs`（`DmaDirection`）、`errno.rs`（`Errno` / `Result`）、`logging.rs`、`panic.rs`（组件私有 `#[panic_handler]`）、`alloc.rs`（feature `alloc` 的 `GlobalAlloc` → per-image 部署 adapter，create 前选择 K 共享堆 / I 私有堆）、`heap.rs`（私有执行域的 freestanding C 分配器 facade；`c/kcomp_heap_runtime.c` 生产消费，host 测试驱动真实 C 实现；契约见 `docs/architecture/memory-and-heap.md` §6）。
 - **ABI 目标**：稳定窄 C ABI（`kcore_*` 白名单）；target `riscv64gc-unknown-none-elf` / `riscv32imac-unknown-none-elf`。Rust ABI 永不成为组件 ABI。
 
 ## `.kcomp` 流水线（端到端）
@@ -92,4 +92,8 @@
 | `scripts/build/package.py` | 组件构建与 newc 打包；boot 经 KALEIDOS_INITPKG 内嵌 |
 | `os/core/build.rs` | 转发 trace 容量与 bench commit，不构建 fixture |
 
-执行域可移植性由 `tests/kcomp_heap` 与 `tests/kcomp_domain_service` 两个真实工件验证：前者覆盖 K/I 的 C/Rust 分配，后者通过相同 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，含跨页缓冲、嵌套、panic/stale 与循环重入。它们只验证堆和扁平服务，不代表 Isolated 硬件驱动或任务已可用。
+执行域可移植性由 `tests/kcomp_heap` 与 `tests/kcomp_domain_service` 两个真实工件验证：前者覆盖 K/I 的 C/Rust 分配，后者通过专用 test-only `domain.test` 同步 provider/consumer 覆盖 K/K、K/I、I/K、I/I，含跨页缓冲、嵌套、panic/stale 与循环重入。它们只验证堆和扁平服务，不代表 Isolated 硬件驱动或任务已可用。
+
+普通业务链路仅发布 `port=0, api=NULL, ctx=NULL` 的 IPC Endpoint；Block/Filesystem SDK 无旧 Backend。
+`tests/domain_wire.rs` 是同步隔离诊断的专用契约，测试真实 AS copy/故障/重入，不作为业务兼容路径。
+checksum 与 scheduler PolicyCall 的同步生命周期/准入测试保留；这些测试通过不能推导 IsolatedNative 持久 Task IPC。

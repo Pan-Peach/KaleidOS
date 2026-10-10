@@ -50,16 +50,13 @@ pub const KCOMP_DRIVER_CREATE_NAME_MAX: usize = 256;
 /// 生成）必须与它不同——保留名不得被动态名字占用。
 pub const KCOMP_PROBE_RESULT_NAME: &[u8] = b"probe.result";
 
-/// exact ABI fingerprint（8 字节 ASCII "PROBRSLT" 的大端读数）。
-pub const KCOMP_PROBE_RESULT_ABI: u64 = 0x5052_4F42_5253_4C54;
+/// exact ABI fingerprint（8 字节 ASCII "PROBIPCS" 的大端读数）。
+pub const KCOMP_PROBE_RESULT_ABI: u64 = 0x5052_4F42_4950_4353;
 
 /// `probe.result` 的 endpoint 契约身份（`kcore_endpoint_lookup` / `_validate` 的
 /// `contract` 参数）。数值 = 8 字节 ASCII tag `b"PRBCONTR"` 的大端读数（与
 /// `BLKCONTR` / `VFSCONTR` 同一约定）。
 pub const KCOMP_PROBE_RESULT_CONTRACT: u64 = 0x5052_4243_4F4E_5452;
-
-/// `RESULT` 的方法号：args 空 / input 空 / output 恰好 `KCOMP_PROBE_RESULT_OUTPUT_LEN`。
-pub const KCOMP_PROBE_RESULT_METHOD_RESULT: u32 = 0;
 
 /// `RESULT` 的 output 长度：`outcome` i32 LE + `detail` u32 LE。
 pub const KCOMP_PROBE_RESULT_OUTPUT_LEN: usize = 8;
@@ -69,3 +66,7 @@ pub const KCOMP_PROBE_OUTCOME_MATCH: i32 = 0;
 
 /// 结果 outcome：driver 检查后拒绝该设备（无残留 claim、无 block endpoint）。
 pub const KCOMP_PROBE_OUTCOME_NO_MATCH: i32 = 1;
+
+pub const KCOMP_PROBE_RESULT_METHOD_RESULT: u32 = 0;
+
+pub const KCOMP_PROBE_RESULT_METHOD_SHUTDOWN: u32 = 1;

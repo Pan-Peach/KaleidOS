@@ -5,6 +5,7 @@
 #include "generated/filesystem_wire.h"
 #include "generated/vfs_wire.h"
 #include "generated/posix_wire.h"
+#include "generated/probe_wire.h"
 #include "methods_wire.h"
 #include <assert.h>
 #include <stdio.h>
@@ -18,6 +19,10 @@ static size_t unhex(const char *text, uint8_t *bytes) {
     size_t n=strlen(text)/2; assert(n<=2048);
     for(size_t i=0;i<n;++i) { unsigned b; assert(sscanf(text+2*i,"%2x",&b)==1); bytes[i]=(uint8_t)b; } return n;
 }
+int32_t kcomp_probe_wire_handle_result(void *ctx, struct kcomp_probe_wire_result_reply *r) {
+    (void)ctx; ++calls; *r=(struct kcomp_probe_wire_result_reply){1,0x01020304}; return 0;
+}
+int32_t kcomp_probe_wire_handle_shutdown(void *ctx) { (void)ctx; ++calls; return 0; }
 int32_t kcomp_posix_wire_handle_status(void *ctx, struct kcomp_posix_wire_status_reply *r) {
     (void)ctx; ++calls; *r=(struct kcomp_posix_wire_status_reply){1,1792,0}; return 0;
 }
@@ -89,6 +94,7 @@ static int32_t dispatch(const uint8_t *bytes, size_t n, uint8_t *output, size_t 
     if(!strcmp(contract,"block")) return kcomp_block_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"echo")) return kcomp_echo_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"filesystem")) return kcomp_filesystem_wire_dispatch(NULL,&r,output,len);
+    if(!strcmp(contract,"probe")) return kcomp_probe_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"posix")) return kcomp_posix_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"vfs")) return kcomp_vfs_wire_dispatch(NULL,&r,output,len);
     return kcomp_methods_wire_dispatch(NULL,&r,output,len);
@@ -121,7 +127,10 @@ int main(int argc,char **argv) {
         printf("status=%d calls=%zu output=",status,calls); hex(output,n); puts(""); return 0;
     }
     int32_t status=0,transport;
-    if(!strcmp(contract,"posix")) {
+    if(!strcmp(contract,"probe")) {
+        if(!strcmp(argv[3],"shutdown")) transport=kcomp_probe_wire_shutdown(7,&status);
+        else { struct kcomp_probe_wire_result_reply r; transport=kcomp_probe_wire_result(7,&r,&status); }
+    } else if(!strcmp(contract,"posix")) {
         if(!strcmp(argv[3],"shutdown")) transport=kcomp_posix_wire_shutdown(7,&status);
         else { struct kcomp_posix_wire_status_reply r; transport=kcomp_posix_wire_status(7,&r,&status); }
     }

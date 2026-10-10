@@ -427,12 +427,12 @@ fn component_contract_literals_are_pinned() {
     // block.device：名字 + 指纹（数值可当 8 字节大端 ASCII 读出来）+ sector 单位。
     assert_eq!(
         generated_block::KCOMP_BLOCK_DEVICE_ABI,
-        0x424C_4F43_4B44_4556,
+        0x424C_4B49_5043_524F,
         "block.device ABI 指纹值漂移"
     );
     assert_eq!(
         &generated_block::KCOMP_BLOCK_DEVICE_ABI.to_be_bytes(),
-        b"BLOCKDEV",
+        b"BLKIPCRO",
         "block.device ABI 指纹不再是 ASCII tag"
     );
     assert_eq!(generated_block::KCOMP_BLOCK_DEVICE_NAME, b"block.device");
@@ -459,8 +459,12 @@ fn component_contract_literals_are_pinned() {
     // filesystem：名字 + 指纹 + 只读 open flag。
     assert_eq!(
         generated_filesystem::KCOMP_FILESYSTEM_ABI,
-        0xEC25_B01F_768A_394D,
+        0x4653_4950_4352_4F31,
         "filesystem ABI 指纹值漂移"
+    );
+    assert_eq!(
+        generated_filesystem::KCOMP_LITTLEFS_CREATE_CONFIG_ABI,
+        0x4C49_5454_4C45_4950
     );
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_NAME, b"filesystem");
     assert_eq!(
@@ -498,7 +502,7 @@ fn component_contract_literals_are_pinned() {
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_METHOD_SHUTDOWN, 11);
     assert_eq!(
         generated_filesystem::KCOMP_FATFS_CREATE_CONFIG_ABI,
-        0x45D2_189A_CF06_73BE
+        0x4641_5446_5349_5043
     );
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_HANDLE_LEN, 8);
     assert_eq!(generated_filesystem::KCOMP_FILESYSTEM_FLAGS_LEN, 4);

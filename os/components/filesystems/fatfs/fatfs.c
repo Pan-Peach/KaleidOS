@@ -1,13 +1,4 @@
-/* fatfs.c —— FatFs 组件的**生命周期**：create / destroy + endpoint 发布。
- *
- * 业务后端（只读 FAT 文件系统语义）在 fatfs_backend.c；Gate 的扁平 method switch
- * 在 fatfs_service.c。本文件把两者接起来：
- *
- *   create  → alloc state → bind block endpoint（Core 选定机制）→ attach 磁盘胶水
- *           → 发布 filesystem endpoint（api/ctx = Direct 的 function table，
- *             port = Gate token）
- *   destroy → 逻辑停止（不回收 state）
- */
+/* fatfs lifecycle: bind exact IPC Block endpoint, publish IPC-only FS, start owned Server. */
 #include "kcomp.h"
 #include "diskio_kaleidos.h"
 #include "fatfs_internal.h"
@@ -21,30 +12,17 @@
  *              `kcore_endpoint_lookup` 解析后交付；本组件**不做**全局名字发现，
  *              没有 endpoint 就没有块设备。
  *
- * `config_abi` 是布局指纹（8 字节 ASCII "FATFSCFG" 的大端读数）：对不上直接拒绝
+ * `config_abi` 是布局指纹（8 字节 ASCII "FATFSIPC" 的大端读数）：对不上直接拒绝
  * 创建，不静默按空配置跑。组合方（init / CoreTest）的 create config 定义见
  * `os/components/tests/core_test/src/runtime/filesystem.rs`（同一布局、同一指纹）。 */
 struct fatfs_create_config
 {
     uint64_t endpoint;
     uint32_t control;
-    uint32_t flags;
+    uint32_t reserved;
 };
 
 #define FATFS_CREATE_CONFIG_ABI KCOMP_FATFS_CREATE_CONFIG_ABI
-
-/* Direct transport：endpoint 发布时作为 api/ctx 交付的 `#[repr(C)]` function table。
- * 同一份业务实现也服务 Gate（fatfs_service.c 的扁平 method switch）。 */
-static const struct kcomp_filesystem_api fatfs_api = {
-    .mount = fatfs_mount,
-    .unmount = fatfs_unmount,
-    .open = fatfs_open,
-    .close = fatfs_close,
-    .read = fatfs_read,
-    .root = fatfs_root,
-    .lookup = fatfs_lookup,
-    .node_info = fatfs_node_info,
-};
 
 const uint64_t kcomp_abi = KCOMP_ABI;
 
@@ -75,8 +53,8 @@ int32_t kcomp_instance_create(
     const uint8_t *bytes = args->config;
     config.endpoint = kcomp_ipc_u64(bytes);
     config.control = kcomp_ipc_u32(bytes + 8);
-    config.flags = kcomp_ipc_u32(bytes + 12);
-    if (config.flags > 1) return -EINVAL;
+    config.reserved = kcomp_ipc_u32(bytes + 12);
+    if (config.reserved || !config.control) return -EINVAL;
 
     /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
     struct kcore_memory_view state_region;
@@ -87,9 +65,7 @@ int32_t kcomp_instance_create(
     }
     struct fatfs_state *state = (struct fatfs_state *)(uintptr_t)state_region.base;
 
-    /* bind block endpoint：Core exact-compare contract + abi、校验存活，并按
-     * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
-     * 不选择、也看不到机制。 */
+    /* Binding verifies the exact IPC endpoint; composer grants send rights. */
     int32_t result = kcomp_block_bind(
         config.endpoint,
         KCOMP_BLOCK_DEVICE_CONTRACT,
@@ -103,7 +79,6 @@ int32_t kcomp_instance_create(
 
     state->alive = 1;
     state->control = config.control;
-    state->ipc_only = config.flags;
 
     result = fatfs_disk_attach(&state->block_binding);
     if (result < 0)
@@ -112,20 +87,16 @@ int32_t kcomp_instance_create(
         return result;
     }
 
-    /* 发布 filesystem endpoint（staged：Core 在 create 返回 0 后原子提交）：
-     * port_name = 契约名（单例固定名，组合策略据此发现），contract = 契约身份，
-     * port = 本 provider 的 Gate dispatch token；api/ctx = Direct 的 function
-     * table + state（Core 只存、bind 时按机制交付）。两条 transport 都提供，
-     * **不选择**。 */
+    /* Staged publication commits only after successful create. */
     result = kcore_endpoint_publish(
         (const uint8_t *)KCOMP_FILESYSTEM_NAME,
         sizeof(KCOMP_FILESYSTEM_NAME) - 1,
         KCOMP_FILESYSTEM_CONTRACT,
         KCOMP_IFACE_SERVICE,
         KCOMP_FILESYSTEM_ABI,
-        state->ipc_only ? 0 : FATFS_PORT,
-        state->ipc_only ? NULL : &fatfs_api,
-        state->ipc_only ? NULL : state);
+        0,
+        NULL,
+        NULL);
 
     if (result < 0)
     {
@@ -162,7 +133,7 @@ int32_t kcomp_instance_destroy(void *opaque_state)
 
     fatfs_disk_detach();
 
-    /* endpoint / binding 的 ctx 可能仍被消费者缓存；只逻辑停止，不回收 state。 */
+    /* Published Native backing remains resident after logical retirement. */
     fatfs_leave(state);
     FATFS_LOG_LINE("[fatfs] destroy");
     return 0;

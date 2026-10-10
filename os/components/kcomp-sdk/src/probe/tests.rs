@@ -166,10 +166,6 @@ fn result_port_name_is_attempt_suffixed_and_distinct_from_reserved() {
 #[test]
 fn probe_reply_wire_encoding_is_outcome_then_detail() {
     let reply = ProbeReply::no_match(0xAA55);
-    let bytes = reply.encode();
-    assert_eq!(&bytes[0..4], &ProbeReply::NO_MATCH.to_le_bytes());
-    assert_eq!(&bytes[4..8], &0xAA55u32.to_le_bytes());
-    assert_eq!(ProbeReply::decode(bytes), reply);
     assert_eq!(reply.outcome_name(), "NoMatch");
 
     assert_eq!(ProbeReply::matched().outcome_name(), "Match");
@@ -179,75 +175,25 @@ fn probe_reply_wire_encoding_is_outcome_then_detail() {
     assert_eq!(failed.outcome_name(), "Error");
 }
 
-/// Given：一次已校验的 `probe.result` endpoint；When：pull；
-/// Then：`RESULT` 方法 / args 与 input 空 / 8 字节输出，reply 按契约解码。
-#[test]
-fn pull_result_calls_result_method_with_empty_frame() {
-    let _guard = test_support::lock();
-    test_support::reset_script();
-    test_support::script_call(0, 0);
-    test_support::script_call_reply(&ProbeReply::matched().encode());
-    let endpoint = Endpoint::<ProbeResult>::from_id(7).expect("stub validate accepts probe");
-
-    let reply = pull_result(endpoint).unwrap();
-
-    assert_eq!(reply, ProbeReply::matched());
-    let call = test_support::last_call().expect("stub recorded the pull");
-    assert_eq!(call.method, KCOMP_PROBE_RESULT_METHOD_RESULT);
-    assert!(call.args.is_empty());
-    assert!(call.input.is_empty());
-    assert_eq!(call.output_len, ProbeReply::ENCODED_LEN);
-}
-
-/// Given：传输 / 方法 / 无意义回复；Then：三分类必须可区分（与 block 后端一致）。
-#[test]
-fn pull_result_separates_transport_method_and_invalid_reply() {
-    let _guard = test_support::lock();
-    let endpoint = Endpoint::<ProbeResult>::from_id(7).expect("stub validate accepts probe");
-
-    test_support::reset_script();
-    test_support::script_call(Errno::ENOENT.code(), 0);
-    assert_eq!(
-        pull_result(endpoint),
-        Err(InvokeError::Transport(Errno::ENOENT))
-    );
-
-    test_support::reset_script();
-    test_support::script_call(0, Errno::EIO.code());
-    assert_eq!(pull_result(endpoint), Err(InvokeError::Method(Errno::EIO)));
-
-    test_support::reset_script();
-    test_support::script_call(0, 7);
-    assert_eq!(pull_result(endpoint), Err(InvokeError::InvalidReply));
-}
-
 /// Given：provider 发布结果端口；When：`publish_result_endpoint`；
-/// Then：契约身份 / 端口 token / 空 Direct table 原样交给 Core，ctx 原样传递。
+/// Then：契约身份与 IPC-only marker 原样交给 Core。
 #[test]
 fn publish_result_endpoint_forwards_identity_to_core() {
     let _guard = test_support::lock();
     test_support::reset_script();
     test_support::script_publish(0);
-    let mut state = 0u8;
-    let ctx = (&mut state as *mut u8).cast::<()>();
-
-    // SAFETY: state 是本帧内的存储，发布调用期间有效（host 替身只记录指针）。
-    unsafe { publish_result_endpoint(NAME, 2, ctx) }.unwrap();
+    publish_result_endpoint(NAME).unwrap();
 
     let publish = test_support::last_publish().expect("stub recorded the publish");
     assert_eq!(publish.port_name, NAME);
     assert_eq!(publish.contract, KCOMP_PROBE_RESULT_CONTRACT);
     assert_eq!(publish.abi, KCOMP_PROBE_RESULT_ABI);
     assert_eq!(publish.kind, InterfaceKind::Service.as_u32());
-    assert_eq!(publish.port, 2);
+    assert_eq!(publish.port, 0);
     assert_eq!(publish.api, 0, "结果契约没有 Direct function table");
-    assert_eq!(publish.ctx, ctx as usize);
+    assert_eq!(publish.ctx, 0);
 
     test_support::reset_script();
     test_support::script_publish(Errno::EEXIST.code());
-    // SAFETY: 同上一次调用；host 替身直接返回脚本状态。
-    assert_eq!(
-        unsafe { publish_result_endpoint(NAME, 2, ctx) },
-        Err(Errno::EEXIST)
-    );
+    assert_eq!(publish_result_endpoint(NAME), Err(Errno::EEXIST));
 }

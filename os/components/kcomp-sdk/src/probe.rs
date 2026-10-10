@@ -21,8 +21,7 @@
 //! - [`DriverCreateConfig`]：**扁平字节**（无嵌套指针）的 assignment config，
 //!   经 `KcompCreateArgs.config` 进入 driver；driver **绝不**回调 prober。
 //! - [`ProbeResult`]：driver 在 create 期间 staged publish 的结果端口；
-//!   只有 **Gate** transport（结果只在 create 成功后拉取一次，不需要 Direct
-//!   function table）。
+//!   只有 Endpoint IPC；结果可以重复读取，composer 显式授权 consumer。
 //!
 //! # 错误分类
 //!
@@ -31,7 +30,6 @@
 //! 永不混淆。
 
 use crate::abi;
-use crate::call;
 use crate::endpoint::{Contract, Endpoint, InvokeError};
 use crate::errno::{Errno, Result};
 use crate::generated::abi::InterfaceKind;
@@ -48,7 +46,7 @@ pub use crate::generated::probe::{
 // 契约：probe.result（provider: 候选驱动；consumer: driver_prober 自己）
 // -----------------------------------------------------------------------
 
-/// `probe.result` 契约（KIND = Service；只有 Gate transport）。
+/// `probe.result` 契约（KIND = Service；只有 IPC transport）。
 pub struct ProbeResult;
 
 impl Contract for ProbeResult {
@@ -71,8 +69,6 @@ pub struct ProbeReply {
 }
 
 impl ProbeReply {
-    /// wire 长度（= `KCOMP_PROBE_RESULT_OUTPUT_LEN`）。
-    pub const ENCODED_LEN: usize = KCOMP_PROBE_RESULT_OUTPUT_LEN;
     /// outcome 编码：driver 接受该设备（attach + publication 均已成功）。
     pub const MATCH: i32 = KCOMP_PROBE_OUTCOME_MATCH;
     /// outcome 编码：driver 检查后拒绝该设备（无残留 claim、无 block endpoint）。
@@ -107,22 +103,6 @@ impl ProbeReply {
             Self::MATCH => "Match",
             Self::NO_MATCH => "NoMatch",
             _ => "Error",
-        }
-    }
-
-    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
-        let outcome = self.outcome.to_le_bytes();
-        let detail = self.detail.to_le_bytes();
-        [
-            outcome[0], outcome[1], outcome[2], outcome[3], detail[0], detail[1], detail[2],
-            detail[3],
-        ]
-    }
-
-    pub const fn decode(bytes: [u8; Self::ENCODED_LEN]) -> Self {
-        Self {
-            outcome: i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            detail: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         }
     }
 }
@@ -279,55 +259,22 @@ pub fn result_port_name(attempt: u32, out: &mut [u8]) -> Result<usize> {
     Ok(total)
 }
 
-/// provider 侧：发布本实例的 `probe.result` endpoint（**Gate transport**）。
-///
-/// 结果只在 create 返回 0 之后被拉取一次，因此没有 Direct function table：
-/// `api` 永远为空。发布本身是 staged 的（`kcomp_instance_create` 期间只记录
-/// pending；create 返回 0 后 Core 原子提交）。
-///
-/// # Safety
-///
-/// `ctx` 必须是本 provider 实例存活期内地址稳定的 opaque state——Core 只存指针、
-/// 不解引用；Gate 分派会把它原样交给 `kcomp_service_dispatch`。
-pub unsafe fn publish_result_endpoint(port_name: &[u8], port: u32, ctx: *mut ()) -> Result<()> {
-    // SAFETY: 调用方保证 ctx 的实例生命周期（见 Safety）；`api` 为 null 表示本
-    // 契约不提供 Direct transport（bind 选 Direct 时 Core 以 ENOTSUP 显式拒绝）。
-    let status = unsafe {
-        abi::kcore_endpoint_publish(
-            port_name.as_ptr(),
-            port_name.len(),
-            <ProbeResult as Contract>::ID,
-            <ProbeResult as Contract>::KIND.as_u32(),
-            <ProbeResult as Contract>::ABI,
-            port,
-            core::ptr::null(),
-            ctx,
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(Errno::from_code(status))
-    }
+/// Staged IPC-only result endpoint. The provider keeps its state inside its image.
+pub fn publish_result_endpoint(port_name: &[u8]) -> Result<()> {
+    crate::endpoint::publish_ipc::<ProbeResult>(port_name)
 }
 
-/// consumer 侧（prober）：拉取一次结果（`RESULT` 方法；args / input 空）。
+/// Read the same provider's immutable result; never reconnect an old endpoint.
 pub fn pull_result(
     endpoint: Endpoint<ProbeResult>,
 ) -> core::result::Result<ProbeReply, InvokeError> {
-    let mut reply = [0u8; ProbeReply::ENCODED_LEN];
-    match call::endpoint_call(
-        endpoint.id(),
-        KCOMP_PROBE_RESULT_METHOD_RESULT,
-        &[],
-        &[],
-        &mut reply,
-    ) {
-        Err(errno) => Err(InvokeError::Transport(errno)),
-        Ok(0) => Ok(ProbeReply::decode(reply)),
-        Ok(status) if status < 0 => Err(InvokeError::Method(Errno::from_code(status))),
-        Ok(_) => Err(InvokeError::InvalidReply),
-    }
+    let reply = crate::generated::probe_wire::result(endpoint.id())?;
+    Ok(ProbeReply::new(reply.outcome, reply.detail))
+}
+
+/// Retire the result observer; a separate Block Server may still be running.
+pub fn shutdown(endpoint: Endpoint<ProbeResult>) -> core::result::Result<(), InvokeError> {
+    crate::generated::probe_wire::shutdown(endpoint.id())
 }
 
 #[cfg(test)]

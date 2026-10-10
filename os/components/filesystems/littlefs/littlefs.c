@@ -1,20 +1,8 @@
-/* littlefs.c —— littlefs 组件的**生命周期**：create / destroy + endpoint 发布。
- *
- * 业务后端（只读 littlefs 文件系统语义）在 littlefs_backend.c；Gate 的扁平
- * method switch 在 littlefs_service.c；宿主回调（lfs_config → block.device）在
- * lfs_adapter.c。本文件把三者接起来：
- *
- *   create  → alloc state → bind block endpoint（Core 选定机制）→ 填 lfs_config
- *           → 发布 filesystem endpoint（api/ctx = Direct 的 function table，
- *             port = Gate token）
- *   destroy → 逻辑停止（不回收 state）
- *
- * 挂载不在 create 里做：块调用契约要求 task 上下文，而 create 是 Core 的组件
- * init 边界；消费者经 filesystem 服务调 mount 时才真正 lfs_mount / format。
- */
+/* littlefs lifecycle: bind exact IPC Block endpoint, publish IPC-only FS, start owned Server. */
 #include "kcomp.h"
 #include "lfs_adapter.h"
 #include "littlefs_internal.h"
+#include "kcomp_ipc.h"
 #include <errno.h>
 
 /* create config（组合策略提供；Core 视为不透明字节）。
@@ -23,55 +11,16 @@
  *              `kcore_endpoint_lookup` 解析后交付；本组件**不做**全局名字发现，
  *              没有 endpoint 就没有块设备。
  *
- * `config_abi` 是布局指纹（8 字节 ASCII "LITTLECS" 的大端读数）：对不上直接拒绝
+ * `config_abi` 是布局指纹（8 字节 ASCII "LITTLEIP" 的大端读数）：对不上直接拒绝
  * 创建，不静默按空配置跑。 */
 struct littlefs_create_config
 {
     uint64_t endpoint;
+    uint32_t control;
+    uint32_t reserved;
 };
 
-#define LITTLEFS_CREATE_CONFIG_ABI UINT64_C(0x4C4954544C454353)
-
-/* 本 provider 尚未实现节点契约；函数表保持完整，显式拒绝。 */
-static int32_t unsupported_root(void *ctx, uint64_t *out_node)
-{
-    (void)ctx;
-    if (out_node == NULL)
-        return -EINVAL;
-    *out_node = 0;
-    return -ENOTSUP;
-}
-
-static int32_t unsupported_lookup(void *ctx, uint64_t parent, const uint8_t *name,
-                                   size_t name_len, uint32_t encoding, uint64_t *out_node)
-{
-    (void)parent; (void)encoding;
-    if (name == NULL || name_len == 0 || name_len > KCOMP_FILESYSTEM_NAME_MAX)
-        return -EINVAL;
-    return unsupported_root(ctx, out_node);
-}
-
-static int32_t unsupported_node_info(void *ctx, uint64_t node, uint32_t *out_kind)
-{
-    (void)ctx; (void)node;
-    if (out_kind == NULL)
-        return -EINVAL;
-    *out_kind = 0;
-    return -ENOTSUP;
-}
-
-/* Direct transport：endpoint 发布时作为 api/ctx 交付的 `#[repr(C)]` function
- * table。同一份业务实现也服务 Gate（littlefs_service.c 的扁平 method switch）。 */
-static const struct kcomp_filesystem_api littlefs_api = {
-    .mount = littlefs_mount,
-    .unmount = littlefs_unmount,
-    .open = littlefs_open,
-    .close = littlefs_close,
-    .read = littlefs_read,
-    .root = unsupported_root,
-    .lookup = unsupported_lookup,
-    .node_info = unsupported_node_info,
-};
+#define LITTLEFS_CREATE_CONFIG_ABI KCOMP_LITTLEFS_CREATE_CONFIG_ABI
 
 const uint64_t kcomp_abi = KCOMP_ABI;
 
@@ -96,8 +45,9 @@ int32_t kcomp_instance_create(
         return -EINVAL;
     }
 
-    const struct littlefs_create_config *config =
-        (const struct littlefs_create_config *)args->config;
+    const uint8_t *bytes = args->config;
+    struct littlefs_create_config config = {kcomp_ipc_u64(bytes), kcomp_ipc_u32(bytes+8), kcomp_ipc_u32(bytes+12)};
+    if (config.reserved || !config.control) return -EINVAL;
 
     /* 取一段 backing（首次交付零初始化）；失败 = -errno。构造期清理由组件负责。 */
     struct kcore_memory_view state_region;
@@ -108,11 +58,9 @@ int32_t kcomp_instance_create(
     }
     struct littlefs_state *state = (struct littlefs_state *)(uintptr_t)state_region.base;
 
-    /* bind block endpoint：Core exact-compare contract + abi、校验存活，并按
-     * (caller, provider) 执行域**一次性选定机制**（Direct / Gate）——组件只执行，
-     * 不选择、也看不到机制。 */
+    /* Binding verifies the exact IPC endpoint; composer grants send rights. */
     int32_t result = kcomp_block_bind(
-        config->endpoint,
+        config.endpoint,
         KCOMP_BLOCK_DEVICE_CONTRACT,
         KCOMP_BLOCK_DEVICE_ABI,
         &state->block_binding);
@@ -127,21 +75,16 @@ int32_t kcomp_instance_create(
     littlefs_adapter_init(state);
 
     state->alive = 1;
+    state->control = config.control;
 
-    /* 发布 filesystem endpoint（staged：Core 在 create 返回 0 后原子提交）：
-     * port_name = 契约名（单例固定名，组合策略据此发现），contract = 契约身份，
-     * port = 本 provider 的 Gate dispatch token；api/ctx = Direct 的 function
-     * table + state（Core 只存、bind 时按机制交付）。两条 transport 都提供，
-     * **不选择**。 */
+    /* Staged publication commits only after successful create. */
     result = kcore_endpoint_publish(
         (const uint8_t *)KCOMP_FILESYSTEM_NAME,
         sizeof(KCOMP_FILESYSTEM_NAME) - 1,
         KCOMP_FILESYSTEM_CONTRACT,
         KCOMP_IFACE_SERVICE,
         KCOMP_FILESYSTEM_ABI,
-        LITTLEFS_PORT,
-        &littlefs_api,
-        state);
+        0, NULL, NULL);
 
     if (result < 0)
     {
@@ -150,6 +93,11 @@ int32_t kcomp_instance_create(
     }
 
     *out_state = state;
+    uint32_t task = 0;
+    result = kcore_task_create(littlefs_server, state, &task);
+    if (!result) result = kcore_task_start(task);
+    /* Once a Task retains arg, failed Native backing remains resident. */
+    if (result) return result;
     LITTLEFS_LOG_LINE("[littlefs] endpoint published");
 
     return 0;

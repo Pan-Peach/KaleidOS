@@ -35,31 +35,18 @@ static struct state_type state;
 static uint64_t current;
 
 #ifdef TEST_FATFS
-int32_t kcomp_service_dispatch(void *, uint32_t, uint32_t, const struct kcomp_call_frame *);
-static uint32_t mechanism;
-static const struct kcomp_filesystem_api api = {
-    .mount = fatfs_mount, .unmount = fatfs_unmount, .open = fatfs_open,
-    .read = fatfs_read, .close = fatfs_close,
-    .root = fatfs_root, .lookup = fatfs_lookup, .node_info = fatfs_node_info,
-};
-
 int32_t kcore_endpoint_bind(uint64_t endpoint, uint64_t contract, uint64_t abi,
-                             uint32_t *out_mechanism, size_t *out_api, size_t *out_ctx)
-{
-    assert(endpoint == 1 && contract == KCOMP_FILESYSTEM_CONTRACT && abi == KCOMP_FILESYSTEM_ABI);
-    *out_mechanism = mechanism;
-    *out_api = (size_t)&api;
-    *out_ctx = (size_t)&state;
-    return 0;
+    uint32_t *mechanism, size_t *api, size_t *ctx) {
+    assert(endpoint==1 && contract==KCOMP_FILESYSTEM_CONTRACT && abi==KCOMP_FILESYSTEM_ABI);
+    *mechanism=KCORE_ENDPOINT_MECHANISM_IPC; *api=0; *ctx=0; return 0;
 }
-
-int32_t kcore_endpoint_call(uint64_t endpoint, uint32_t method, const uint8_t *args,
-                            size_t args_len, const uint8_t *input, size_t input_len,
-                            uint8_t *output, size_t output_len, int32_t *out_status)
-{
-    assert(endpoint == 1 && mechanism == KCORE_ENDPOINT_MECHANISM_GATE);
-    struct kcomp_call_frame frame = {args, args_len, input, input_len, output, output_len};
-    *out_status = kcomp_service_dispatch(&state, FATFS_PORT, method, &frame);
+int32_t kcomp_ipc_invoke(uint64_t endpoint, uint32_t method, const void *args_raw,
+    size_t args_len, const void *input, size_t input_len, void *output_raw,
+    size_t output_len, int32_t *status) {
+    const uint8_t *args=args_raw; uint8_t *output=output_raw;
+    assert(endpoint==1);
+    struct kcomp_ipc_request request={method,args,args_len,input,input_len,output_len};
+    *status=kcomp_filesystem_wire_dispatch(&state,&request,output,output_len);
     return 0;
 }
 
@@ -77,9 +64,8 @@ static struct kcomp_call_result lookup(const struct kcomp_filesystem_binding *bi
 
 static void test_lookup(void)
 {
-    /* Both SDK transports reach the production backend and the real FatFs library. */
-    for (mechanism = KCORE_ENDPOINT_MECHANISM_DIRECT;
-         mechanism <= KCORE_ENDPOINT_MECHANISM_GATE; ++mechanism) {
+    /* Generated IPC dispatch reaches the actual backend and upstream library. */
+    {
         struct kcomp_filesystem_binding binding;
         assert(kcomp_filesystem_bind(1, KCOMP_FILESYSTEM_CONTRACT, KCOMP_FILESYSTEM_ABI, &binding) == 0);
         uint64_t root = 0, file = 0, alias = 0, dir1 = 0, dir2 = 0, child1 = 0, child2 = 0;
@@ -174,16 +160,18 @@ static void test_lookup(void)
     uint8_t args[12] = {0}, output[8];
     memset(output, 0xa5, sizeof(output));
     uint64_t saved = state.last_node;
-    struct kcomp_call_frame frame = {args, 11, (const uint8_t *)"N1", 2, output, 8};
-    assert(kcomp_service_dispatch(&state, FATFS_PORT, KCOMP_FILESYSTEM_METHOD_LOOKUP, &frame) == -EINVAL);
+    struct kcomp_ipc_request frame = {KCOMP_FILESYSTEM_METHOD_LOOKUP, args, 11, (const uint8_t *)"N1", 2, 8};
+    assert(kcomp_filesystem_wire_dispatch(&state, &frame, output, frame.output_len) == -EINVAL);
     frame.args_len = 12; frame.output_len = 7;
-    assert(kcomp_service_dispatch(&state, FATFS_PORT, KCOMP_FILESYSTEM_METHOD_LOOKUP, &frame) == -EINVAL);
+    assert(kcomp_filesystem_wire_dispatch(&state, &frame, output, frame.output_len) == -EINVAL);
     frame.output_len = 8; frame.args = NULL;
-    assert(kcomp_service_dispatch(&state, FATFS_PORT, KCOMP_FILESYSTEM_METHOD_LOOKUP, &frame) == -EINVAL);
+    assert(kcomp_filesystem_wire_dispatch(&state, &frame, output, frame.output_len) == -EINVAL);
     frame.args_len = 0; frame.input_len = 1;
-    assert(kcomp_service_dispatch(&state, FATFS_PORT, KCOMP_FILESYSTEM_METHOD_ROOT, &frame) == -EINVAL);
+    frame.method=KCOMP_FILESYSTEM_METHOD_ROOT;
+    assert(kcomp_filesystem_wire_dispatch(&state, &frame, output, frame.output_len) == -EINVAL);
     frame.args = args; frame.args_len = 8; frame.input_len = 0; frame.output_len = 3;
-    assert(kcomp_service_dispatch(&state, FATFS_PORT, KCOMP_FILESYSTEM_METHOD_NODE_INFO, &frame) == -EINVAL);
+    frame.method=KCOMP_FILESYSTEM_METHOD_NODE_INFO;
+    assert(kcomp_filesystem_wire_dispatch(&state, &frame, output, frame.output_len) == -EINVAL);
     assert(state.last_node == saved);
     for (size_t i = 0; i < sizeof(output); ++i) assert(output[i] == 0xa5);
     uint64_t node = 0; uint32_t kind = 0;
@@ -203,7 +191,7 @@ static void test_lookup(void)
     assert(fatfs_mount(&state) == -EOVERFLOW && !state.mounted);
     state.last_node = saved;
     assert(fatfs_mount(&state) == 0);
-    puts("provider lookup/direct/gate/stale/capacity PASS");
+    puts("provider lookup/ipc-codec/stale/capacity PASS");
 }
 #endif
 

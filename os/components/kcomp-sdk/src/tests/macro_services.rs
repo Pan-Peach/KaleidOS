@@ -6,27 +6,34 @@
 //! compile-fail harness，也不引新依赖）。
 
 use crate::abi::KcompCallFrame;
-use crate::block::dispatch::dispatch as block_dispatch;
-use crate::block::tests_support::BlockMock;
 use crate::errno::Errno;
-use crate::generated::block::KCOMP_BLOCK_METHOD_READ;
+use crate::frame::Call;
+const TEST_READ: u32 = 1;
+struct State;
+fn dispatch(_state: &State, method: u32, call: Call<'_>) -> i32 {
+    if method != TEST_READ {
+        return Errno::ENOSYS.code();
+    }
+    call.output.fill(0xa5);
+    0
+}
 
 const BLOCK_PORT: u32 = 3;
 const OTHER_PORT: u32 = 4;
 
-static DEVICE: BlockMock = BlockMock::new(8, None);
+static DEVICE: State = State;
 
 crate::kcomp_services! {
-    state: BlockMock;
-    BLOCK_PORT => block_dispatch::<BlockMock>,
-    OTHER_PORT => block_dispatch::<BlockMock>,
+    state: State;
+    BLOCK_PORT => dispatch,
+    OTHER_PORT => dispatch,
 }
 
 /// port switch：选中的 port → 契约 adapter（provider 真被调用）；未知 port /
 /// 未知 method → `-ENOSYS`（能力缺失档位，不是 panic）。
 #[test]
 fn port_switch_routes_to_the_contract_adapter() {
-    let state = &DEVICE as *const BlockMock as *mut ();
+    let state = &DEVICE as *const State as *mut ();
     let args = 1u64.to_le_bytes();
     let mut output = [0u8; 512];
     let frame = KcompCallFrame {
@@ -39,13 +46,13 @@ fn port_switch_routes_to_the_contract_adapter() {
     };
 
     assert_eq!(
-        kcomp_service_dispatch(state, BLOCK_PORT, KCOMP_BLOCK_METHOD_READ, &frame),
+        kcomp_service_dispatch(state, BLOCK_PORT, TEST_READ, &frame),
         0
     );
     assert_eq!(output, [0xA5; 512]);
 
     assert_eq!(
-        kcomp_service_dispatch(state, 99, KCOMP_BLOCK_METHOD_READ, &frame),
+        kcomp_service_dispatch(state, 99, TEST_READ, &frame),
         Errno::ENOSYS.code()
     );
     assert_eq!(
@@ -61,7 +68,7 @@ fn null_state_is_rejected_before_any_dereference() {
         kcomp_service_dispatch(
             core::ptr::null_mut(),
             BLOCK_PORT,
-            KCOMP_BLOCK_METHOD_READ,
+            TEST_READ,
             core::ptr::null(),
         ),
         Errno::EINVAL.code()

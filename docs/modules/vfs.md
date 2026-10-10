@@ -8,7 +8,7 @@
 独立 `vfs.kcomp` 的 Server Task 通过 Request/Reply 提供只读路径与文件服务。
 一个 Namespace/OpenFile 同时管理静态 Rust LocalFs 和独立 C FatFs 的 RemoteFs。
 组件内部使用 trait、Arc、Box 和普通方法，跨镜像只传有界 LE 消息。
-init 显式组合 FatFs→VFS→ksh，cat 与 ELF 文件读取使用同一 VFS；virtio Block已为IPC-only；RAM fixtures仍旧绑定，Block SDK保留三Backend。
+init 显式组合 FatFs→VFS→ksh，cat 与 ELF 文件读取使用同一 VFS；VirtIO 与 RAM Block、Fat/little 和 Block/FS SDK 都已 IPC-only。
 
 create 的配置由 `abi/vfs.toml` 定义：control ComponentId、0..2 个 filesystem EndpointId。
 Local 文件 `/local/README.TXT` 总可用，远程卷依次挂在 `/fat` 与 `/second`。

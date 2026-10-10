@@ -1,6 +1,6 @@
 # KABI Request/Reply 方法生成
 
-`abi/block.toml`、`abi/echo.toml`、`abi/filesystem.toml`、`abi/vfs.toml`、`abi/posix.toml` 的 `[[method]]` 是当前 IPC 方法结构的权威。
+`abi/block.toml`、`abi/echo.toml`、`abi/filesystem.toml`、`abi/vfs.toml`、`abi/posix.toml`、`abi/probe.toml` 的 `[[method]]` 是当前 IPC 方法结构的权威。
 既有 `tools/kabi/kabi_gen.py` 生成 C/Rust 方法编号、typed client、Provider 接口、
 LE 编解码、长度 validator 和 dispatcher。生成物是提交物，普通构建不运行生成器。
 Core 不读取业务 schema；使用现有 Endpoint、Exchange 和 SDK envelope。
@@ -35,7 +35,7 @@ output 的 `matches = "input"` 只允许相同显式界限，表示两缓冲长�
 客户端返回原始 i32 与 typed reply，语义有效性由 facade 判定。C handler 是镜像内普通函数，不发布 function table。
 
 Rust Block Provider 接口直接重导出生成 trait；VirtIO Server 使用生成 dispatcher。
-Rust/C Block IPC 分支使用生成 client；多扇区拆分、LBA 溢出与 DMA 纪律保持手写。
+Rust/C Block 唯一 IPC 路径使用生成 client；多扇区拆分、LBA 溢出与 DMA 纪律保持手写。
 Echo 的普通请求使用生成 client/handler；原始生命周期/Exchange 控制探针仍属测试。
 Server listen/receive/wait、reply 失败补偿、owner、资源对象和状态转换不由生成器推断。
 
@@ -49,23 +49,24 @@ synthetic flush 仅添加 schema 和业务 handler/test，无生产 Block flush�
 
 FatFs Server 的 IPC validator/dispatch 与 RemoteFs 的 client 已生成。FatFs 节点详情
 业务返回 typed 字段，由生成 dispatcher 编码；FIL owner、shutdown 与 canceled-open
-rollback 保持在 Server。旧 C backend 签名仍有本地薄 adapter，legacy table/Gate 未删。
+rollback 保持在 Server。C backend 签名保留镜像内薄 adapter；Fat/little 的旧 table/Gate 已删。
 
 VFS 的固定结构、client、validator 和 dispatch 已生成。Service 仅实现业务 Handler，
 保留单一 Namespace/OpenFile、owner、Undo；runtime 使用共享 shutdown validator 和状态 codec。
 SDK facade 保留 domain-status 判定、短读和便利引用清理，不再手写 Wire 方法 switch。
 
-当前停点：Echo/Block/Filesystem/VFS/Posix IPC 的机械协议胶水已经生成。旧 Block Direct/Gate
-仍有真实私有域和回归消费者。新增普通 IPC 方法的
-生成物无需手改，但旧通道退出前，整个 Block SDK 仍未达到最终的一套业务机制验收。
-后续实施范围见 [迁移清单](component-communication-migration.md)。
+当前停点：Echo/Block/Filesystem/VFS/Posix/Probe 的机械协议胶水已经生成。
+Block/Filesystem 的 C/Rust SDK、RAM/Fat/little Provider 只使用 IPC，普通方法不再维护旧通道。
+IsolatedNative 的同步诊断使用专用 test-only domain.test，不参与普通业务协议演进；其真实 IPC 尚未实现。
+新增方法通常编辑 schema、业务 Handler 与语义测试，再生成/验证；新业务所有权、错误映射、
+分块策略或便利 facade 仍可能需要手写。后续范围见 [迁移清单](component-communication-migration.md)。
 
 ## 本阶段维护成本对照
 
 | 编辑任务 | 基线人工维护点 | 当前 IPC 路径 |
 |---|---|---|
-| 普通 Block 方法 | schema method 常量、Rust IPC branch/dispatch、C IPC codec，以及 Direct/Gate table/client/dispatch | schema + Handler + 语义测试；两语言 codec/client/dispatch 自动生成，旧通道仍需迁移 |
-| Filesystem 方法 | schema 常量、Fat IPC/Gate decoder、RemoteFs 手写 client；旧 Rust/C FS adapters | schema + Handler + 语义测试；Fat IPC/RemoteFs 同源，legacy 仍有真实消费者 |
+| 普通 Block 方法 | schema method 常量、Rust IPC branch/dispatch、C IPC codec，以及 Direct/Gate table/client/dispatch | schema + Handler + 语义测试；两语言 codec/client/dispatch 自动生成，无旧通道编辑点 |
+| Filesystem 方法 | schema 常量、Fat IPC/Gate decoder、RemoteFs 手写 client；旧 Rust/C FS adapters | schema + Handler + 语义测试；Fat/little IPC/RemoteFs 同源，无旧通道编辑点 |
 | VFS 固定方法 | schema 常量、SDK 编码/解码、Service 长度检查/解码/回复、runtime 特殊 shape | schema + Handler + 语义测试；便利 facade 或新业务生命周期仍可能需要手写 |
 
 VFS 这一步的生产手写 SDK/Service/runtime 合计净 -36 行，生成器净 +115 行，
@@ -77,7 +78,7 @@ VFS 这一步的生产手写 SDK/Service/runtime 合计净 -36 行，生成器�
 raw Direct/Gate/IPC 串行重测及限制见[审计更新](component-communication-audit.md#10-授权实施后的更新)；
 该探针没有计入 generated codec，不能据生成器迁移宣称性能提高。
 CoreTest 另记录真实 VirtIO 512字节/4KiB读吞吐，包含SDK分块和generated Block调用；
-原来没有吞吐探针，不能计算重构前后比例。Isolated IPC 与普通旧通道退出尚未完成。
+原来没有吞吐探针，不能计算重构前后比例。普通业务旧通道已退出；Isolated IPC 与 Core 同步机制退出尚未完成。
 
 Posix 这一步完整删除该 Contract 的旧 Direct table、Gate dispatcher 和 SDK 两个 Backend。
 status/shutdown 均由 schema 生成 C/Rust client/dispatch；原子退出状态与 live 检查保持手写。
@@ -85,3 +86,8 @@ status/shutdown 均由 schema 生成 C/Rust client/dispatch；原子退出状态
 新增一个 observer Task 是实际运行成本，shutdown 后退出；Core 新增状态/锁为零。
 真实 QEMU 的 ELF/fork/exec/wait、timer、旧 Endpoint、shutdown/stop 与 OOM 恢复覆盖这条链。
 极端 OOM 下既有 Core destroy 临时栈仍可能分配失败；不能由逻辑退役推导物理回收。
+
+Probe result/shutdown 也由 schema 生成；DriverCreateConfig 的名称/设备配置 codec 是创建语义，仍保持手写。
+Block/Filesystem/Probe fingerprint 已协调替换；Fat/little config 使用 schema 常量，16字节 LE
+包含明确 control owner 和 reserved=0，不保留旧 flags/函数表兼容。
+当前生成物29文件；新增 Probe 的 C/Rust 字节级 golden 与 malformed frame 断言复用既有验证入口。

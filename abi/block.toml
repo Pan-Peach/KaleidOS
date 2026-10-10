@@ -1,63 +1,4 @@
-# KABI schema — block：`block.device` 组件间契约（provider: 驱动如 virtio_blk；
-# consumer: FS 如 FatFs）。
-#
-# 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
-#   os/components/kcomp-sdk/include/generated/kcomp_abi.h   C 结构 / 常量 + 布局 _Static_assert
-#   os/components/kcomp-sdk/src/generated/block.rs          SDK-Rust 镜像 + `const _` 布局断言
-#
-# 手写部分（facade，不在本文件范围）：契约类型 `BlockDevice` / provider wrapper
-# （`kcomp-sdk/src/block.rs`）、`InterfaceAbi` newtype（`binding.rs`）。
-# 组件间契约**不是** Core 导出：Core 只把 publish 进来的 api / ctx 当不透明指针
-# 存着，不认识契约语义，所以名字是 `kcomp_*`（组件面），不是 `kcore_*`。
-#
-# Endpoint 调用路径（`kcore_endpoint_call`，method 语义由本契约定义）：
-#
-#   capacity(0)：args 空、input 空、output 恰好 8 字节（LE `u64`）→ 0 / -errno
-#   read(1)    ：args 恰好 8 字节（LE `u64` lba）、input 空、output 非零且 512 的
-#                整数倍（transfer 长度就是 `output_len`，没有单独编码的长度）
-#   write(2)   ：args 恰好 8 字节（LE `u64` lba）、input 非零且 512 的整数倍
-#                （transfer 长度就是 `input_len`）、output 空
-#
-# 方法号 / 长度 / contract 身份都是本文件生成的常量（C / SDK-Rust 同源）。
-
-[[struct]]
-name = "BlockDeviceApi"
-c_name = "kcomp_block_device_api"
-size_ptrs = 3
-doc = """
-BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
-
-# 契约（两个实现能否互通，全看这几条）
-
-- **单位**：`lba` 以 **512 字节 sector** 计；`len` 是**字节数**，必须是 sector 大小的整数倍。
-- **同步 / 阻塞**：`read` / `write` 阻塞到本次传输完成。当前实现（virtio_blk）轮询设备，因此调用方**不得**处于不能阻塞的上下文。
-- **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
-- **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
-- **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。用 `BlockDeviceService` 发布的 provider 由 SDK 统一挡下（provider 不会被调用）；手写 table 的 provider 需自行保证同语义。
-- **buffer**：Direct 接口的 `buf` 指向 Core 可见 RAM；Gate 前端接受 caller 本域切片，Isolated 出站由 Core 搬运为共享 Core 缓冲，provider 只在同步调用内借用。
-
-# `buf` 裸指针是刻意的临时选择（不是最终设计）
-
-裸指针只是本次调用的访问表示，不是内存 authority。跨 AS 的 Gate 不把 caller 私有指针交给 provider，而由 Core 搬运扁平输入/输出字节。此 CPU transport 不构成 DMA mapping 或 DMA 静默证明；硬件 provider 仍须用 Core 的 DMA allocation/mapping 机制管理设备可达 backing，不能保留调用缓冲。
-
-契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size / ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。
-"""
-
-[[struct.field]]
-name = "capacity_sectors"
-type = "fn(ctx: *mut void) -> u64"
-doc = "设备容量（单位：512 字节 sector）。"
-
-[[struct.field]]
-name = "read"
-type = "fn(ctx: *mut void, lba: u64, buf: *mut u8, len: usize) -> i32"
-doc = "从 `lba` 读 `len` 字节到 `buf`（单位 / 阻塞 / 上下文见契约文档）。"
-
-[[struct.field]]
-name = "write"
-type = "fn(ctx: *mut void, lba: u64, buf: *const u8, len: usize) -> i32"
-doc = "从 `buf` 写 `len` 字节到 `lba`（单位 / 阻塞 / 上下文见契约文档）。"
-
+# BlockDevice Endpoint Request/Reply protocol. One generated C/Rust protocol.
 [[const]]
 name = "KCOMP_BLOCK_DEVICE_NAME"
 type = "string"
@@ -68,9 +9,9 @@ doc = "接口的稳定名字（publish / bind 必须逐字节一致）。"
 [[const]]
 name = "KCOMP_BLOCK_DEVICE_ABI"
 type = "u64"
-value = "0x424C_4F43_4B44_4556"
+value = "0x424C_4B49_5043_524F"
 targets = "c,sdk-rust"
-doc = "exact ABI fingerprint：8 字节 ASCII \"BLOCKDEV\" 的大端读数。"
+doc = "exact ABI fingerprint：8 字节 ASCII \"BLKIPCRO\" 的大端读数。"
 
 [[const]]
 name = "KCOMP_BLOCK_DEVICE_SECTOR"

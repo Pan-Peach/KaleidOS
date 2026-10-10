@@ -47,7 +47,7 @@ const RESOURCE_IRQ: u64 = 1;
 const RESOURCE_DMA: u64 = 2;
 
 /// `EndpointBind` 的 mechanism 编码（Core `trace::abi::mechanism_code` 的镜像）。
-pub const MECHANISM_DIRECT: u64 = 0;
+pub const MECHANISM_IPC: u64 = 2;
 
 /// 操作前取续读游标：`next_seq` = 下一条事件的 seq（读侧从它开始就不会看到旧事件）。
 /// stats 读不到时返回 `u64::MAX`（扫描读不到任何记录 → 断言失败）：**失败要关闭**，
@@ -94,7 +94,7 @@ fn scan(from: u64, mut visit: impl FnMut(&TraceRecordAbi)) {
 ///
 /// 这是 Core 在 bind 时选定调用机制的**唯一可观测点**（运行期不再重决策），
 /// 用来替代旧 runner "业务调用没有 gate dispatch 日志"的差分证据：
-/// 业务读的绑定机制必须是 [`MECHANISM_DIRECT`]。
+/// 业务读的绑定机制必须是 [`MECHANISM_IPC`]。
 pub fn binds(from: u64, mut visit: impl FnMut(u64, u64)) {
     scan(from, |record| {
         if record.kind == KIND_ENDPOINT_BIND {

@@ -14,7 +14,7 @@ pub use kcomp_sdk::network::{
     TransportProtocol,
 };
 
-/// provider 内部静态分发；对外契约是 SDK NetworkProvider / NetworkApi。
+/// provider 内部静态分发；对外契约是 SDK NetworkProvider 与未来 IPC 协议。
 pub trait InetSocket {
     fn info(&self) -> SocketInfo;
     fn events(&self) -> SocketEvents;

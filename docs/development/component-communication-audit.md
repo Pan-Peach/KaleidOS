@@ -2,7 +2,7 @@
 
 > 核对日期：2026-10-09。起始工作树干净，工作分支 `develop`，HEAD 与成功 fetch 后的
 > `origin/develop` 均为 `2e10304c389fb6ab1b5815a97575199b62aa0c4b`。
-> 第 1–9 节保留首次审计快照；之后用户授权直接实现，生产迁移与重测见第 10 节及 STATUS。
+> 第 1–9 节保留首次审计快照；之后用户授权直接实现，生产迁移与重测见第 10–11 节及 STATUS。
 > 本文是事实与证据，不代替 architecture/interfaces 契约，也不表示整体 Cleanup 完成。
 > 旧 `63384b5` 审计及旧性能表属于历史，可从 Git 历史读取；不再用其“未实现”判断现状。
 
@@ -323,3 +323,128 @@ checked IPC copy/import；全部普通 Direct/Gate 删除。第1–9节的旧“
 生产手写+620/-677（净-57，含cfg(test)与注释）；生成物+2522/-147（净+2375）；
 生成器+511/-5（净+506）；schema+428/-181（净+247）；独立测试+1370/-53（净+1317）。
 删除未编译/无引用的VFS stream.rs旧草图29行。以上是文本规模，不能换算成维护成本或性能。
+
+## 11. 普通业务 IPC-only Cleanup
+
+2026-10-10，本阶段从 `develop` / `origin/develop`
+`fe752c0f5acabe3f9bafb39fc041451bcf9401d0` 的干净工作树开始。
+用户授权直接实现并提交推送，进一步明确先统一 IPC、优化后置。
+第1–9节是最初审计，第10节是上一提交停点；当前事实以下节为准。
+
+```mermaid
+flowchart TD
+    S[唯一 Contract Schema] --> G[现有 KABI Generator]
+    G --> R[Rust typed client / Wire]
+    G --> C[C typed client / Wire]
+    R --> E[Core Endpoint / Exchange]
+    C --> E
+    E --> T[Provider owned Server Task]
+    T --> D[generated dispatch]
+    D --> H[镜像内业务 Handler]
+    H --> B[业务状态 / 库 / 设备]
+```
+
+已实现：两个 RAM Block Provider 与 littlefs 改为 owned Server Task；FatFs 只发布 IPC，
+删除 flags=0/1 双入口、旧表及 Gate wrapper；probe.result 的 result/shutdown 加入 method schema，
+VirtIO 新增结果 Server，prober 在真实 Task 显式 grant 并等待 listener 就绪。
+结果可重复读取，shutdown 只关闭结果端口；Match 实例的独立 Block Server 继续运行。
+Block/Filesystem 的 Rust/C SDK 删除 Direct/Gate Backend、表与旧 dispatcher，只保留固定 Endpoint
+和 generated client；不增加自动授权/重试/重新绑定。未发布服务的 NetworkApi/NetworkService
+占位删除，netstack 仍 ENOTSUP，不计为已实现网络服务。
+
+| 普通 Contract / Provider | 当前跨组件入口 | 删除内容 / 保留语义 |
+|---|---|---|
+| block.device：VirtIO、RAM、可写 RAM | IPC-only | 无 BlockDeviceApi/BlockDeviceService；C/Rust 单路径；512字节拆分、容量、checked LBA、部分完成、claim/DMA 保留 |
+| filesystem：FatFs、littlefs | IPC-only | 无 FileSystemApi、旧 backend/dispatcher、Gate；生成 C handlers 调普通库函数；owner、取消 open 回滚、退出 reaper 保留 |
+| probe.result：VirtIO → prober/CoreTest | IPC-only | 旧同步 Gate 删除；result/shutdown 同源 C/Rust 生成 |
+| vfs、posix.process、echo | IPC-only（上一停点已迁） | 不重做单一 Namespace/OpenFile；LocalFs 内部调用保留 |
+
+Fat/little create config 统一为16字节 LE：Block EndpointId u64、control ComponentId u32、
+reserved=0 u32；fingerprint 协调替换，明确拒绝旧 config。Block/FS/Probe fingerprint 也原地替换，
+不保留 ABI 兼容别名。Fat 的 provider-relative path open 现由生成 IPC OPEN 方法提供，
+与 open_node 同样绑定 verified Component/Task 并处理取消；未新建路径/对象模型。
+littlefs 的 mount/format/selftest/path-open/read/close 与多实例介质语义迁移，
+root/lookup/node_info/node_details/open_node/read_at 仍 ENOTSUP，Remote Node 属于后续业务功能。
+
+普通协议边界不再发布函数指针或 ctx。Core EndpointRegistry/Exchange、Task/lifecycle/grant
+真相不变，新增 Registry、Core 状态、锁均为零。RAM、little、probe 每实例增加 owned Server Task
+和栈，是实际运行成本；普通 stop 仍拒绝 live Task，Native backing 驻留规则不变。
+
+保留的同步机制：scheduler PolicyCall、checksum 生命周期/准入对照与私有域硬件诊断。
+`kcomp_domain_service` 使用专用 test-only `domain.test`，Wire/API 权威位于 `tests/domain_wire.rs`；
+它不再导入普通 Block SDK，仍验证真实 K/K、K/I、I/K、I/I 的 AS copy、故障、stale 与重入。
+Core `Mechanism::Direct/Gate`、endpoint_call、api/ctx、has_direct_exports 与 containment/AS
+不能因普通 SDK 删除而直接删掉。IsolatedNative 持久 Task、受检 IPC import/copy 与退出等待清理
+仍未实现；SandboxedNative 未实现。阶段 C 与普通业务 SDK 的删除完成，D/Core E 未完成。
+
+### 维护点与代码规模
+
+| 指标 | 初审基线 | 当前事实 |
+|---|---|---|
+| Block 方法协议结构手写文件 | 8文件，另4个业务 Provider及至少3处语义测试 | 1 schema；四个 Provider/业务测试仍按能力实现；codec/client/dispatch 由生成器完成 |
+| Block 客户端传输路径 | Rust3 + C3 | Rust1 + C1，均 IPC |
+| FS Provider 入口 | Fat table/Gate/IPC，little table/Gate | 每 Provider 1个 IPC Server |
+| SDK FS/RAM 的额外状态 | Backend/api/ctx，RAM per-instance Service 分配 | 固定 Endpoint，RAM Service 分配删除；真实 owned Task 增加 |
+| Core 状态/锁 | 现有 Registry/Exchange/Task 锁 | 新增0；必要的同步诊断状态尚保留 |
+| 新服务通信概念 | table/Gate/IPC/手写 frame | Contract/Endpoint/Binding/Handler；授权和生命周期仍须理解 |
+
+以新增 flush 为例：schema 添加普通 method，Provider 实现 generated Handler，补语义测试并运行生成器。
+synthetic flush 已证明不需改 emitter、C/Rust Wire client 或 dispatch。生产 Block 没有新增 flush。
+若还要求 `BlockBinding::flush` 与 umbrella C 的便利名称，则 Rust facade、C header/facade 的薄包装
+仍需手写（最多3个额外文件），不能声称整个 SDK 公共便利面已经完全自动生成。
+分块、资源所有权、错误映射和状态转换也不是生成能力。相比基线，已不需要同时编辑三套传输。
+
+相对 `fe752c0` 按路径 numstat（含新增文件）：生产手写 +579/-3358，净-2779；
+生成物 +195/-296，净-101；schema +41/-317，净-276；生成器 +9/-20，净-11；
+独立测试/fixture +630/-2276，净-1646。分类包含注释和源内 cfg(test)，不是执行覆盖率。
+删除的测试主要针对已不存在的 Backend/表/decoder；行为、错误、IPC 生命周期、真实隔离对照保留。
+文档另计，不以生成行数或测试数量减少作为成功标准。
+
+### 当前门禁
+
+- `make abi-gen/abi-check`：29生成文件一致，KABI selftest 通过。
+- `make check`（含 fmt/clippy、test-host、工具与双架构交叉构建）：通过；Core host574 PASS/6 ignored、SDK49 PASS。
+- 生成 C/Rust Wire7项及实际 C SDK/FS Provider3项：通过；C Block 覆盖 capacity、多块读写、非法长度、LBA 溢出、部分完成与拒绝 legacy binding。
+- `make test-qemu`：RV64 default/no-block各112 checks，RV32各90 checks；shell 与 init 全部场景通过，含真 FAT、双 FAT、cat/exec 与 RV64 OOM。
+- `make test-arch`：RV64/RV32各43/43、SMP3/3；私有 AS 同步诊断仍通过，不称作 I IPC 验证。
+- RV32 S-mode NoMMU 私有 profile：default/no-block各90 checks与shell通过；I装载明确 ENOTSUP，未验证 M-mode 或 PMP/MPU。
+
+日志 `/tmp/kaleidos-cleanup-{check-final,qemu-final,arch-final,nommu-final,abi-final,codec-final}.log`；
+NoMMU resolved profile 为 `build/tests/cleanup-nommu/.config`。host transport mock 仅证明 codec/库/状态，
+实际 K Task、SMP wake、endpoint失效、cancel/late reply/退出由系统回归证明。
+
+### 性能记录（优化后置）
+
+整套门禁结束后串行重跑现有 default CoreTest，不并行启动其他验证；同为10MHz、
+4 warmup / 31 batch / 每batch32次、trace mask2047。下表为512字节 raw transport
+整批 ticks median/p95，前列引用第10节的上一停点，不包含 generated codec。
+
+| arch | transport | 上一停点 | 当前 cleanup |
+|---|---|---:|---:|
+| RV64 | Direct（诊断） | 52 / 53 | 55 / 56 |
+| RV64 | Gate（诊断） | 1087 / 1141 | 1098 / 1132 |
+| RV64 | IPC | 16962 / 17158 | 19508 / 20638 |
+| RV32 | Direct（诊断） | 76 / 76 | 80 / 80 |
+| RV32 | Gate（诊断） | 652 / 672 | 663 / 684 |
+| RV32 | IPC | 6254 / 6360 | 7298 / 7331 |
+
+IPC median 这次比上一样本 RV64 +15.0%、RV32 +16.7%；明确记录观测退化。
+Core transport 实现本阶段未改，但 Server Task 数与调用拓扑改变；没有足够重复测量或
+调度/copy分项归因，不能断言根因或保证这些比例稳定。IPC 相对 Direct/Gate 的成本仍明显更高。
+
+真实 VirtIO 的512字节/4KiB read，走公开 BlockBinding、generated client 与512字节拆分；
+单位 bytes/s，同样从31批 median计算：
+
+| arch | bytes | 上一停点 | 当前 cleanup | 当前 median/p95 ticks |
+|---|---:|---:|---:|---:|
+| RV64 | 512 | 6408260 | 6763540 | 24224 / 26592 |
+| RV64 | 4096 | 6442087 | 6750616 | 194163 / 215081 |
+| RV32 | 512 | 6155927 | 5776336 | 28364 / 32920 |
+| RV32 | 4096 | 6146141 | 5762799 | 227445 / 299876 |
+
+RV64吞吐这次 +5%左右，RV32约 -6%；不把单次 QEMU 样本视为优化或稳定回归比例。
+没有原 Direct/Gate 完整 FS/Block 吞吐基线，不能由 raw latency 推算其真实业务吞吐。
+仍为有界副本、Task 切换、512字节拆分，无 shared-memory/零拷贝/透明 local dispatch；
+按用户要求暂不优化，也不重新引入业务函数表。未测 write吞吐、真机、trace-off 或长稳压测。
+证据 `/tmp/kaleidos-cleanup-perf-{rv64,rv32}.log`，对应 guest日志在 `build/tests/cleanup-perf/logs/`；
+两个 default 场景再次完整通过。

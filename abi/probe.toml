@@ -8,7 +8,7 @@
 #      `kcore_component_create` 的 `KcompCreateArgs.config` 进入 driver 的 create；
 #      driver 绝不回调 prober。
 #   2. `probe.result` endpoint：driver 在 create 期间 staged publish 的结果端口；
-#      prober 在 create 返回 0 之后**拉取一次**（`kcore_endpoint_call`，Gate 路径），
+#      prober 在 create 返回 0 之后授权自己并经 IPC **拉取结果**，
 #      然后用自己的普通函数调用更新自己的 cursor。
 #
 # 生成物（提交物，不要手改；`make abi-gen` 重生成，`make abi-check` 校验）：
@@ -43,20 +43,9 @@
 # probe.result（`KCOMP_PROBE_RESULT_CONTRACT` 的 endpoint）
 # ---------------------------------------------------------------------------
 #
-# method 语义（`kcore_endpoint_call` 的扁平 frame；Gate 路径）：
-#
-#   RESULT(0)：args 空、input 空、output **恰好 8 字节**：
-#              outcome : i32 LE  —— 0 = Match，1 = NoMatch，<0 = 创建失败（value = -Errno）
-#              detail  : u32 LE  —— 驱动定义的观测值（Match/NoMatch 时为设备身份读数等）
-#              返回 0 / -errno（方法状态，不是传输状态）。
-#
-# 该契约**只有 Gate transport**：结果只在 create 返回 0 之后被拉取一次，不需要
-# Direct function table（publish 时 `api` 允许为空）。prober 不 bind，直接调
-# `kcore_endpoint_call`；任何绑定路径若选 Direct，Core 会以 `-ENOTSUP` 显式拒绝，
-# **绝不静默降级**。
-#
-# 结果**按实例**保存（driver 的 create 写进自己的 instance state，经
-# `kcomp_service_dispatch` 回放）——不得是组件全局的“最后一次结果”。
+# RESULT(0)：空参数与 input，reply = outcome i32 LE + detail u32 LE。
+# SHUTDOWN(1)：空请求/回复；退出结果 Server Task，关闭端口，不关闭独立 Block Server。
+# 结果存于实例私有 state，可重复读取。composer 显式 grant consumer，普通调用只走 IPC。
 
 [[struct]]
 name = "KcompDriverCreateConfig"
@@ -147,9 +136,9 @@ doc = """
 [[const]]
 name = "KCOMP_PROBE_RESULT_ABI"
 type = "u64"
-value = "0x5052_4F42_5253_4C54"
+value = "0x5052_4F42_4950_4353"
 targets = "c,sdk-rust"
-doc = "exact ABI fingerprint（8 字节 ASCII \"PROBRSLT\" 的大端读数）。"
+doc = "exact ABI fingerprint（8 字节 ASCII \"PROBIPCS\" 的大端读数）。"
 
 [[const]]
 name = "KCOMP_PROBE_RESULT_CONTRACT"
@@ -162,12 +151,21 @@ doc = """
 `BLKCONTR` / `VFSCONTR` 同一约定）。
 """
 
-[[const]]
-name = "KCOMP_PROBE_RESULT_METHOD_RESULT"
+[[method]]
+name = "result"
+id = 0
+symbol = "KCOMP_PROBE_RESULT_METHOD_RESULT"
+[[method.reply]]
+name = "outcome"
+type = "i32"
+[[method.reply]]
+name = "detail"
 type = "u32"
-value = "0"
-targets = "c,sdk-rust"
-doc = "`RESULT` 的方法号：args 空 / input 空 / output 恰好 `KCOMP_PROBE_RESULT_OUTPUT_LEN`。"
+
+[[method]]
+name = "shutdown"
+id = 1
+symbol = "KCOMP_PROBE_RESULT_METHOD_SHUTDOWN"
 
 [[const]]
 name = "KCOMP_PROBE_RESULT_OUTPUT_LEN"

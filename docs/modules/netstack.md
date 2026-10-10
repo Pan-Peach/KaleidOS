@@ -11,17 +11,18 @@
 path dependency；禁用默认 features、std、alloc 和宿主设备后端。骨架编译面为
 Ethernet、IPv4 / IPv6、TCP / UDP；未来协议选配仍以 `.config` / Kconfig 为真相。
 
-已声明服务 schema / 生成的 C table、SDK consumer 代理 / provider trait、
+已声明服务身份/值结构与方法号、SDK consumer 代理 / provider trait、
 NetworkInstance 分发以及内部对象 / smoltcp adapter。操作体均为 `todo!()`，
 **调用会 panic**。SDK bind 和组件 create / destroy 返回 ENOTSUP；没有发布 endpoint
-或启动 worker。Engine 没有同步实现 / Sync 承诺，C adapters / Gate 编解码也未实现。
+或启动 worker。Engine 没有同步实现 / Sync 承诺，IPC method schema/client/Server 尚未接线。
+未使用的旧 NetworkApi table 与 NetworkService 发布/Gate 占位已删除。
 构建、类型检查与 packer 只证明接口和镜像形状，不是网络功能验证。
 
-声明的调用链：
+后续拟实现的调用链（当前 bind/create 明确拒绝）：
 
 ```text
 其他组件：Endpoint<Network>.bind() → NetworkBinding → TcpSocket / UdpSocket
-  → C table / Gate frame → NetworkService<NetworkInstance>
+  → generated IPC client → Endpoint Request/Reply → Server Handler
   → NetworkProvider → Engine → Stack → 内部 connection / listener / UDP
   → 每接口 DeviceStack（Interface + SocketSet）→ SmoltcpDevice 本地 staging
 
@@ -55,9 +56,9 @@ Core 仍只提供任务 / 生命周期 / 硬件机制，不加入网络语义或
 
 | 位置 | 内容 |
 |---|---|
-| `abi/network.toml` | 服务身份、exact fingerprint、C table / wire 与方法号 |
+| `abi/network.toml` | 服务身份、exact fingerprint、值结构与方法号；method AST 尚未定稿 |
 | `os/components/kcomp-sdk/src/network/client.rs` | NetworkBinding、TcpSocket / UdpSocket、InetSocket、Subscription |
-| `os/components/kcomp-sdk/src/network/provider.rs` | NetworkProvider、发布 / Gate 分发占位 |
+| `os/components/kcomp-sdk/src/network/provider.rs` | 镜像内 NetworkProvider 业务 trait |
 | `os/components/kcomp-sdk/src/network/types.rs` | 地址、状态、事件、流 / 数据报结果 |
 | `os/components/kcomp-sdk/src/network/examples.rs` | TCP 客户端、TCP 服务端、UDP 查询类型检查用例 |
 | `src/service.rs` | NetworkInstance / Engine、全部服务方法的分发占位 |
@@ -88,7 +89,7 @@ Core 仍只提供任务 / 生命周期 / 硬件机制，不加入网络语义或
 
 ## 尚未接线与检查
 
-NetDevice / 网卡 provider、服务 C / Gate adapters、实例 create 配置、Engine 同步、
+NetDevice / 网卡 provider、生成 IPC 方法与 Server handlers、实例 create 配置、Engine 同步、
 协议操作、跨组件 unpark / 组件 timer 均待手写。当前 Core unpark 仍限同 owner，
 骨架没有伪造新 Core 导出。DNS / DHCP / TLS 和 personality socket 接线不在此阶段。
 

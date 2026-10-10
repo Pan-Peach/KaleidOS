@@ -7,7 +7,7 @@
 
 - **组件身份与生命周期**：`ComponentId`（唯一的一等运行时身份）、`ComponentState`、`Registry`；状态机 `Declared → Resolved → Starting → Ready → Stopping → Stopped`，任意 → `Failed`。`ComponentId` 永不复用。
 - **已加载程序（loaded）**：`registry::ComponentRecord` 1:1 直接持有 `loaded: LoadedComponent`（`base` / `create` / `destroy` / `service_dispatch` / `text_size` / `memory`（常驻 MemoryLease））与 `name`——每次 instantiate 独立放段 / 重定位，`.data` / `.bss` 私有；没有 `ComponentImageId` / `ImageTable` 二级身份。
-- **Contract / Endpoint 真相（唯一绑定真相）**：`EndpointRegistry` 记录谁在哪个端口发布了哪个契约（`endpoint.rs`）；`EndpointId` 单调、绝不回收 / 重定向，provider 停止 / 失败 → 它的全部 endpoint 永久 `Invalid`。`bind` 是 Core 选定调用机制（Direct / Gate）的唯一选择点，并落 `TraceEvent::EndpointBind`。
+- **Contract / Endpoint 真相（唯一绑定真相）**：`EndpointRegistry` 记录谁在哪个端口发布了哪个契约（`endpoint.rs`）；`EndpointId` 单调、绝不回收 / 重定向，provider 停止 / 失败 → 它的全部 endpoint 永久 `Invalid`。`bind` 是 Core 校验调用机制（IPC-only 普通服务；同步策略/诊断为 Direct/Gate）的唯一选择点，并落 `TraceEvent::EndpointBind`。
 - **导出 ABI**：`kcore_*` 白名单（清单以 `abi/core.toml` 为准）的实现与解析。
 - **加载编排**：cpio store 解析 → ELF 段放置 / 重定位 → 入口校验。
 - **失败与退出**：`fail_component`（mark + revoke + quarantine）与 `stop_component`（`Stopping` / `Stopped`）。

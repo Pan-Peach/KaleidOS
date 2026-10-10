@@ -19,6 +19,16 @@ class Providers(unittest.TestCase):
                             "-o", str(binary)], check=True)
             subprocess.run([str(binary)], check=True, timeout=10)
 
+    def test_c_block_ipc_splitting_overflow_and_partial_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "block"
+            subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            "-fsanitize=undefined", "-fno-sanitize-recover=undefined",
+                            "-iquote", str(SDK), str(ROOT / "tests/components/block_client.c"),
+                            str(ROOT / "os/components/kcomp-sdk/c/kcomp_block.c"),
+                            "-o", str(binary)], check=True)
+            subprocess.run([str(binary)], check=True, timeout=10)
+
     def test_production_providers_serialize_io_and_reject_stale_handles(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -64,4 +74,4 @@ class Providers(unittest.TestCase):
                                             capture_output=True, text=True, timeout=10)
                     self.assertIn("interleaving PASS", result.stdout)
                     if fs == "fatfs":
-                        self.assertIn("lookup/direct/gate/stale/capacity PASS", result.stdout)
+                        self.assertIn("lookup/ipc-codec/stale/capacity PASS", result.stdout)

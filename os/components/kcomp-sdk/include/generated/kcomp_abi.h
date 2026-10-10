@@ -551,38 +551,11 @@ int32_t kcore_ipc_close(uint64_t endpoint);
 /* 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。 */
 int32_t kcore_component_current(uint32_t *out);
 
-/* BlockDevice 的 `#[repr(C)]` function table（provider/consumer 共享布局）。
- * 
- * # 契约（两个实现能否互通，全看这几条）
- * 
- * - **单位**：`lba` 以 **512 字节 sector** 计；`len` 是**字节数**，必须是 sector 大小的整数倍。
- * - **同步 / 阻塞**：`read` / `write` 阻塞到本次传输完成。当前实现（virtio_blk）轮询设备，因此调用方**不得**处于不能阻塞的上下文。
- * - **调用上下文**：只在 **task 上下文**调用；禁止 trap / 中断上下文。
- * - **返回约定**：`0` = 成功，`-Errno` = 失败（与 `kcore_*` 导出一致）。
- * - **非法参数**：`buf` 为 null / `len == 0` / `len` 非 512 的整数倍 → `-EINVAL`。用 `BlockDeviceService` 发布的 provider 由 SDK 统一挡下（provider 不会被调用）；手写 table 的 provider 需自行保证同语义。
- * - **buffer**：Direct 接口的 `buf` 指向 Core 可见 RAM；Gate 前端接受 caller 本域切片，Isolated 出站由 Core 搬运为共享 Core 缓冲，provider 只在同步调用内借用。
- * 
- * # `buf` 裸指针是刻意的临时选择（不是最终设计）
- * 
- * 裸指针只是本次调用的访问表示，不是内存 authority。跨 AS 的 Gate 不把 caller 私有指针交给 provider，而由 Core 搬运扁平输入/输出字节。此 CPU transport 不构成 DMA mapping 或 DMA 静默证明；硬件 provider 仍须用 Core 的 DMA allocation/mapping 机制管理设备可达 backing，不能保留调用缓冲。
- * 
- * 契约刻意保持最小：只有 capacity_sectors / read / write；flush / sector_size / ioctl 等不在本轮，等真实需求（如 FS 落盘屏障）出现再定。 */
-struct kcomp_block_device_api {
-    /* 设备容量（单位：512 字节 sector）。 */
-    uint64_t (*capacity_sectors)(void *ctx);
-    /* 从 `lba` 读 `len` 字节到 `buf`（单位 / 阻塞 / 上下文见契约文档）。 */
-    int32_t (*read)(void *ctx, uint64_t lba, uint8_t *buf, size_t len);
-    /* 从 `buf` 写 `len` 字节到 `lba`（单位 / 阻塞 / 上下文见契约文档）。 */
-    int32_t (*write)(void *ctx, uint64_t lba, const uint8_t *buf, size_t len);
-};
-_Static_assert(sizeof(struct kcomp_block_device_api) == 3 * sizeof(void *), "kcomp_block_device_api layout drift");
-_Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kcomp_block_device_api alignment drift");
-
 /* 接口的稳定名字（publish / bind 必须逐字节一致）。 */
 #define KCOMP_BLOCK_DEVICE_NAME "block.device"
 
-/* exact ABI fingerprint：8 字节 ASCII "BLOCKDEV" 的大端读数。 */
-#define KCOMP_BLOCK_DEVICE_ABI UINT64_C(0x424C4F434B444556)
+/* exact ABI fingerprint：8 字节 ASCII "BLKIPCRO" 的大端读数。 */
+#define KCOMP_BLOCK_DEVICE_ABI UINT64_C(0x424C4B495043524F)
 
 /* 契约单位：1 sector = 512 字节（`read` / `write` 的 `len` 必须是它的整数倍）。 */
 #define KCOMP_BLOCK_DEVICE_SECTOR 512
@@ -604,40 +577,11 @@ _Static_assert(_Alignof(struct kcomp_block_device_api) == _Alignof(void *), "kco
 
 #define KCOMP_BLOCK_METHOD_WRITE UINT32_C(2)
 
-/* `filesystem` provider/consumer function table（**Direct** transport 的共享布局）。
- * 
- * 同一个 ABI 指纹下的另一种 transport（Gate / 扁平方法编码）见 `abi/filesystem.toml`
- * 头部的 Endpoint 调用路径说明：provider 的 `kcomp_service_dispatch` 按 `method`
- * 分派到同一份业务后端（就是本 table 的方法）；两条 transport 的语义逐方法一致。
- * 
- * 第一阶段刻意保持最小、只读：provider 把实现对象保持私有，caller 只拿到不透明的
- * u64 file handle 与节点 token（provider 侧具体格式如 FatFs 对 caller 不可见）。 */
-struct kcomp_filesystem_api {
-    /* 挂载该 filesystem 实例（provider 自己决定具体语义）。 */
-    int32_t (*mount)(void *ctx);
-    /* 卸载该 filesystem 实例。 */
-    int32_t (*unmount)(void *ctx);
-    /* `path` 是以 NUL 结尾的、相对于该 filesystem root 的路径；`flags` 见 `KCOMP_FILESYSTEM_OPEN_READ`。 */
-    int32_t (*open)(void *ctx, const char *path, uint32_t flags, uint64_t *out_handle);
-    /* 关闭一个 open 返回的 handle。 */
-    int32_t (*close)(void *ctx, uint64_t handle);
-    /* 从 handle 当前位置读 `len` 字节；实际读到的字节数写回 `out_read`。 */
-    int32_t (*read)(void *ctx, uint64_t handle, uint8_t *buf, size_t len, size_t *out_read);
-    /* 返回当前 FS 实例的根节点 token。 */
-    int32_t (*root)(void *ctx, uint64_t *out_node);
-    /* 在目录 parent 中查找名字，返回节点 token。 */
-    int32_t (*lookup)(void *ctx, uint64_t parent, const uint8_t *name, size_t name_len, uint32_t encoding, uint64_t *out_node);
-    /* 查询节点的类型等元数据。 */
-    int32_t (*node_info)(void *ctx, uint64_t node, uint32_t *out_kind);
-};
-_Static_assert(sizeof(struct kcomp_filesystem_api) == 8 * sizeof(void *), "kcomp_filesystem_api layout drift");
-_Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp_filesystem_api alignment drift");
-
 /* filesystem 服务的稳定 endpoint 名字（publish / bind 必须逐字节一致）。 */
 #define KCOMP_FILESYSTEM_NAME "filesystem"
 
-/* exact ABI fingerprint（8 字节 ASCII "FSNODERO" 的大端读数）。 */
-#define KCOMP_FILESYSTEM_ABI UINT64_C(0xEC25B01F768A394D)
+/* exact ABI fingerprint（8 字节 ASCII "FSIPCRO1" 的大端读数）。 */
+#define KCOMP_FILESYSTEM_ABI UINT64_C(0x4653495043524F31)
 
 /* 第一阶段只读文件访问。flags 是 ABI 编码，不直接暴露 FatFs 的 FA_*。 */
 #define KCOMP_FILESYSTEM_OPEN_READ UINT32_C(0x00000001)
@@ -646,7 +590,7 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
  * `kcore_endpoint_lookup` / `kcore_endpoint_validate` / `kcore_endpoint_bind` 的
  * `contract` 参数）。数值 = 8 字节 ASCII tag `b"VFSCONTR"` 的大端读数（与 block 的
  * `BLKCONTR` 同一约定）。**契约身份与 ABI 指纹是两个不同的值**：前者标识"哪个
- * endpoint 契约"，后者标识"function table / 扁平编码的逐位布局"。 */
+ * endpoint 契约"，后者标识"IPC Wire 协议的逐位布局"。 */
 #define KCOMP_FILESYSTEM_CONTRACT UINT64_C(0x564653434F4E5452)
 
 /* `read` / `close` 的 `args` 区与 `open` 的 `output` 区长度：一个 LE `u64` handle（没有其它编码）。 */
@@ -672,8 +616,11 @@ _Static_assert(_Alignof(struct kcomp_filesystem_api) == _Alignof(void *), "kcomp
 /* 原生名字字节；FatFs lookup 当前仅支持 ASCII 8.3，大小写不敏感。 */
 #define KCOMP_FILESYSTEM_ENCODING_BYTES UINT32_C(1)
 
-/* LE block EndpointId u64, control ComponentId u32, flags u32. flags 1 = IPC-only, 0 = migration test Direct/Gate + IPC. */
-#define KCOMP_FATFS_CREATE_CONFIG_ABI UINT64_C(0x45D2189ACF0673BE)
+/* LE block EndpointId u64, control ComponentId u32, reserved-zero u32; IPC-only. */
+#define KCOMP_FATFS_CREATE_CONFIG_ABI UINT64_C(0x4641544653495043)
+
+/* LE block EndpointId u64, control ComponentId u32, reserved-zero u32; IPC-only. */
+#define KCOMP_LITTLEFS_CREATE_CONFIG_ABI UINT64_C(0x4C4954544C454950)
 
 #define KCOMP_FILESYSTEM_METHOD_MOUNT UINT32_C(0)
 
@@ -972,7 +919,7 @@ _Static_assert(offsetof(struct kcomp_vfs_dir_reply, reserved) == 52, "kcomp_vfs_
 
 #define KCOMP_VFS_METHOD_SHUTDOWN UINT32_C(13)
 
-/* family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；Gate 各整数 LE 编码，port 也是整数。 */
+/* family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；IPC 各整数 LE 编码，port 也是整数。 */
 struct kcomp_network_address {
     uint32_t family;
     uint16_t port;
@@ -1063,50 +1010,6 @@ _Static_assert(offsetof(struct kcomp_network_datagram, interface) == 48, "kcomp_
 _Static_assert(offsetof(struct kcomp_network_datagram, copied) == 52, "kcomp_network_datagram.copied offset drift");
 _Static_assert(offsetof(struct kcomp_network_datagram, original_len) == 56, "kcomp_network_datagram.original_len offset drift");
 _Static_assert(offsetof(struct kcomp_network_datagram, consumed) == 60, "kcomp_network_datagram.consumed offset drift");
-
-/* 有界非阻塞服务 table；输出只在成功时有效。task 上下文调用，禁止 park / IRQ 调用 / 保留 buffer。 */
-struct kcomp_network_api {
-    /* 创建 Idle TCP；缓冲由服务分配，未绑定。 */
-    int32_t (*tcp_open)(void *ctx, uint32_t family, uint64_t *out_socket);
-    /* 创建未绑定 UDP；服务拥有 buffers / inbox。 */
-    int32_t (*udp_open)(void *ctx, uint32_t family, uint64_t *out_socket);
-    /* 预留端口，port=0 分配临时端口；不延迟到 listen/connect 才检查冲突。 */
-    int32_t (*socket_bind)(void *ctx, uint64_t socket, const struct kcomp_network_address *local);
-    /* Idle 开始握手；未绑定时自动选端口，成功不表示连接建立。 */
-    int32_t (*tcp_connect)(void *ctx, uint64_t socket, const struct kcomp_network_address *peer);
-    /* 同一 ID / 端口由 Idle 转 Listening；limit>0；失败保持原状态。 */
-    int32_t (*tcp_listen)(void *ctx, uint64_t socket, uint32_t pending_limit);
-    /* 无已建立连接返回 EAGAIN；成功交付独立 ID，失败不消费排队连接。 */
-    int32_t (*tcp_accept)(void *ctx, uint64_t socket, uint64_t *out_socket);
-    /* 纯状态快照；不清除错误。 */
-    int32_t (*tcp_status)(void *ctx, uint64_t socket, struct kcomp_network_tcp_status *out_status);
-    /* 部分写合法；背压 EAGAIN，无保留 caller buffer；入队不代表 ACK。 */
-    int32_t (*tcp_send)(void *ctx, uint64_t socket, const uint8_t *data, size_t len, uint32_t *out_sent);
-    /* 无数据 EAGAIN，排空 FIN 后 end=1；reset 是错误。 */
-    int32_t (*tcp_receive)(void *ctx, uint64_t socket, uint8_t *buffer, size_t len, struct kcomp_network_stream_read *out_read);
-    /* 排空 TX 后发 FIN，RX 保留；不释放对象。 */
-    int32_t (*tcp_finish_send)(void *ctx, uint64_t socket);
-    /* 中止连接 / 必要的 RST，状态仍可查询。 */
-    int32_t (*tcp_abort)(void *ctx, uint64_t socket);
-    /* 未绑定时自动选端口；整包入队或 EAGAIN。EAGAIN 不提交首次自动绑定。 */
-    int32_t (*udp_send_to)(void *ctx, uint64_t socket, const struct kcomp_network_address *peer, const uint8_t *data, size_t len);
-    /* mode Peek=0 / Whole=1 / Truncate=2；无包 EAGAIN，Whole 短缓冲成功返回所需长度且不消费。 */
-    int32_t (*udp_receive)(void *ctx, uint64_t socket, uint32_t mode, uint8_t *buffer, size_t len, struct kcomp_network_datagram *out_datagram);
-    /* family=0 解除过滤；只影响后续包，保留已有 inbox。 */
-    int32_t (*udp_set_receive_peer)(void *ctx, uint64_t socket, const struct kcomp_network_address *peer);
-    /* 查询实际绑定，不执行 poll。 */
-    int32_t (*socket_info)(void *ctx, uint64_t socket, struct kcomp_network_socket_info *out_info);
-    /* 查询已发布快照，不消费事件。 */
-    int32_t (*socket_events)(void *ctx, uint64_t socket, struct kcomp_network_events *out_events);
-    /* 登记和快照原子提交；变化后通知 task，调用方须重试操作再 park。 */
-    int32_t (*socket_subscribe)(void *ctx, uint64_t socket, uint32_t task, uint64_t *out_subscription, struct kcomp_network_events *out_events);
-    /* 撤销精确 ID；可能有在途无害唤醒，旧 ID 永不指向新登记。 */
-    int32_t (*socket_unsubscribe)(void *ctx, uint64_t subscription);
-    /* 逻辑退役，通知并撤销观察者；服务稍后完成协议清理，不要求 caller 等待。 */
-    int32_t (*socket_release)(void *ctx, uint64_t socket);
-};
-_Static_assert(sizeof(struct kcomp_network_api) == 19 * sizeof(void *), "kcomp_network_api layout drift");
-_Static_assert(_Alignof(struct kcomp_network_api) == _Alignof(void *), "kcomp_network_api alignment drift");
 
 /* 契约名；实例端口名由组合者选择。 */
 #define KCOMP_NETWORK_NAME "network"
@@ -1253,16 +1156,13 @@ _Static_assert(offsetof(struct kcomp_driver_create_config, endpoint_name_len) ==
  * 生成）必须与它不同——保留名不得被动态名字占用。 */
 #define KCOMP_PROBE_RESULT_NAME "probe.result"
 
-/* exact ABI fingerprint（8 字节 ASCII "PROBRSLT" 的大端读数）。 */
-#define KCOMP_PROBE_RESULT_ABI UINT64_C(0x50524F4252534C54)
+/* exact ABI fingerprint（8 字节 ASCII "PROBIPCS" 的大端读数）。 */
+#define KCOMP_PROBE_RESULT_ABI UINT64_C(0x50524F4249504353)
 
 /* `probe.result` 的 endpoint 契约身份（`kcore_endpoint_lookup` / `_validate` 的
  * `contract` 参数）。数值 = 8 字节 ASCII tag `b"PRBCONTR"` 的大端读数（与
  * `BLKCONTR` / `VFSCONTR` 同一约定）。 */
 #define KCOMP_PROBE_RESULT_CONTRACT UINT64_C(0x505242434F4E5452)
-
-/* `RESULT` 的方法号：args 空 / input 空 / output 恰好 `KCOMP_PROBE_RESULT_OUTPUT_LEN`。 */
-#define KCOMP_PROBE_RESULT_METHOD_RESULT UINT32_C(0)
 
 /* `RESULT` 的 output 长度：`outcome` i32 LE + `detail` u32 LE。 */
 #define KCOMP_PROBE_RESULT_OUTPUT_LEN 8
@@ -1272,6 +1172,10 @@ _Static_assert(offsetof(struct kcomp_driver_create_config, endpoint_name_len) ==
 
 /* 结果 outcome：driver 检查后拒绝该设备（无残留 claim、无 block endpoint）。 */
 #define KCOMP_PROBE_OUTCOME_NO_MATCH 1
+
+#define KCOMP_PROBE_RESULT_METHOD_RESULT UINT32_C(0)
+
+#define KCOMP_PROBE_RESULT_METHOD_SHUTDOWN UINT32_C(1)
 
 /* `scheduler.policy` 契约的 endpoint 端口名（组合期 discover 用；provider 实例内唯一）。
  * 名字不是全局身份：Core 只按 `(provider, port_name, contract)` 发现，绝不按名字

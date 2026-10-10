@@ -67,12 +67,8 @@ use hal::{CoreHal, DEVICE_ID, MMIO_BASE, device_id, rollback_attachment, unmap_r
 use kcomp_sdk::abi;
 use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDevice, BlockDeviceProvider};
 use kcomp_sdk::errno::{Errno, Result};
-use kcomp_sdk::frame::Call;
-use kcomp_sdk::probe::{
-    self, DriverCreateConfig, KCOMP_PROBE_RESULT_METHOD_RESULT, KCOMP_PROBE_RESULT_OUTPUT_LEN,
-    ProbeReply,
-};
-use kcomp_sdk::{kcomp_instance_create, kcomp_instance_destroy, kcomp_services, klog};
+use kcomp_sdk::probe::{self, DriverCreateConfig, ProbeReply, ProbeResult};
+use kcomp_sdk::{kcomp_instance_create, kcomp_instance_destroy, klog};
 use spin::Mutex;
 use state::{VirtioBlkState, alloc_state, free_state};
 use virtio_drivers::{
@@ -91,10 +87,6 @@ const VIRTIO_MMIO_DEVICE_ID_OFFSET: u32 = 0x008;
 const VIRTIO_MMIO_STATUS_OFFSET: u32 = 0x070;
 
 const VIRTIO_ID_BLOCK: u32 = 2;
-
-/// Gate dispatch token：`block.device` 契约（provider 私有；组合策略不需要知道）。
-/// Gate dispatch token：`probe.result` 契约。
-const PROBE_RESULT_PORT: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // 状态（设备本体在 static；DMA 记账 / 设备身份的 HAL 细节在 `hal.rs`；
@@ -141,27 +133,72 @@ extern "C" fn block_server(_arg: *mut ()) {
     kcomp_sdk::management::exit_task();
 }
 
-/// `probe.result` 的 `RESULT` 方法：把本实例的 8 字节回复写进 output。
-///
-/// 结果只属于本实例（report-only 实例也各有自己的 state），prober 在 create 返回
-/// 0 之后拉取一次。
-fn dispatch_probe_result(state: &VirtioBlkState, method: u32, call: Call<'_>) -> i32 {
-    if method != KCOMP_PROBE_RESULT_METHOD_RESULT {
-        return Errno::ENOSYS.code();
+impl kcomp_sdk::generated::probe_wire::Provider for VirtioBlkState {
+    fn result(&self) -> Result<kcomp_sdk::generated::probe_wire::ResultReply> {
+        Ok(kcomp_sdk::generated::probe_wire::ResultReply {
+            outcome: self.result.outcome,
+            detail: self.result.detail,
+        })
     }
-    if !call.args.is_empty()
-        || !call.input.is_empty()
-        || call.output.len() != KCOMP_PROBE_RESULT_OUTPUT_LEN
-    {
-        return Errno::EINVAL.code();
+    fn shutdown(&self) -> Result<()> {
+        Ok(())
     }
-    call.output.copy_from_slice(&state.result);
-    0
 }
 
-kcomp_services! {
-    state: VirtioBlkState;
-    PROBE_RESULT_PORT => dispatch_probe_result,
+extern "C" fn result_server(arg: *mut ()) {
+    // create fully initializes state before starting this fixed-CPU Task.
+    let state = unsafe { &*arg.cast::<VirtioBlkState>() };
+    let owner = kcomp_sdk::management::current_component().unwrap();
+    let endpoint =
+        kcomp_sdk::endpoint::Endpoint::<ProbeResult>::lookup(owner, &state.name[..state.name_len])
+            .unwrap();
+    let _ = serve_result(state, endpoint.id());
+    kcomp_sdk::management::exit_task();
+}
+
+fn serve_result(state: &VirtioBlkState, endpoint: u64) -> Result<()> {
+    use kcomp_sdk::{generated::probe_wire, ipc};
+    ipc::listen(endpoint)?;
+    let mut bytes = [0; ipc::MESSAGE_MAX];
+    loop {
+        let (receipt, _, _, len) = match ipc::receive(endpoint, &mut bytes) {
+            Ok(message) => message,
+            Err(Errno::EAGAIN) => {
+                ipc::wait_receive(endpoint)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let request = match ipc::service::Request::decode(&bytes[..len]) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = ipc::reply(receipt, &error.code().to_le_bytes());
+                continue;
+            }
+        };
+        let mut reply = [0; ipc::MESSAGE_MAX];
+        let status = probe_wire::dispatch(state, &request, &mut reply[4..4 + request.output]);
+        let _ = ipc::service::reply(receipt, status, &mut reply[..4 + request.output]);
+        if request.method == kcomp_sdk::generated::probe::KCOMP_PROBE_RESULT_METHOD_SHUTDOWN
+            && status == 0
+        {
+            return ipc::close(endpoint);
+        }
+    }
+}
+
+fn start_result_server(state: *mut VirtioBlkState) -> Result<()> {
+    let mut task = 0;
+    let rc = unsafe { abi::kcore_task_create(result_server, state.cast(), &mut task) };
+    if rc != 0 {
+        return Err(Errno::from_code(rc));
+    }
+    let rc = unsafe { abi::kcore_task_start(task) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_code(rc))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +224,7 @@ kcomp_instance_create!(|args, out_state| {
     );
 
     // (2) 每实例 state：报告数据 + attached 标记（构造期清理由组件负责）。
-    let state = alloc_state();
+    let state = alloc_state(assignment.endpoint_name);
     if state.is_null() {
         klog!("virtio_blk: state allocation failed");
         return Errno::ENOMEM.code();
@@ -222,20 +259,17 @@ kcomp_instance_create!(|args, out_state| {
         // report-only 实例：释放 claim、不发布 block endpoint；只发布结果端口。
         let _ = unsafe { abi::kcore_device_release(device_id) };
         // SAFETY: state 由本实例 create 分配、存活期地址稳定。
-        unsafe { (*state).result = ProbeReply::no_match(virtio_device_id).encode() };
-        if let Err(error) = unsafe {
-            probe::publish_result_endpoint(
-                assignment.endpoint_name,
-                PROBE_RESULT_PORT,
-                state.cast(),
-            )
-        } {
+        unsafe { (*state).result = ProbeReply::no_match(virtio_device_id) };
+        if let Err(error) = probe::publish_result_endpoint(assignment.endpoint_name) {
             klog!("virtio_blk: publish probe.result failed (rc={})", error);
             unsafe { free_state(state) };
             return error.code();
         }
         // SAFETY: out_state 由 Core 保证可写。
         unsafe { *out_state = state.cast::<()>() };
+        if let Err(error) = start_result_server(state) {
+            return error.code();
+        }
         klog!("virtio_blk: probe.result published (outcome=1)");
         return 0;
     }
@@ -296,7 +330,7 @@ kcomp_instance_create!(|args, out_state| {
     //     state，两个 endpoint 都 staged publish；任一失败都回滚（create 非 0 =
     //     Core 丢弃全部 pending，prober 记为 creation failure）。
     // SAFETY: state 由本实例 create 分配、存活期地址稳定。
-    unsafe { (*state).result = ProbeReply::matched().encode() };
+    unsafe { (*state).result = ProbeReply::matched() };
     if let Err(error) = kcomp_sdk::endpoint::publish_ipc::<BlockDevice>(BLOCK_DEVICE_NAME) {
         klog!("virtio_blk: publish block.device failed (rc={})", error);
         drop(blk);
@@ -304,11 +338,7 @@ kcomp_instance_create!(|args, out_state| {
         unsafe { free_state(state) };
         return error.code();
     }
-    // SAFETY: state 由本实例 create 分配、存活期内地址稳定（Core 只存、不解引用；
-    // Gate 分派把它原样交回 `dispatch_probe_result`）。
-    if let Err(error) = unsafe {
-        probe::publish_result_endpoint(assignment.endpoint_name, PROBE_RESULT_PORT, state.cast())
-    } {
+    if let Err(error) = probe::publish_result_endpoint(assignment.endpoint_name) {
         klog!("virtio_blk: publish probe.result failed (rc={})", error);
         drop(blk);
         rollback_attachment(device_id);
@@ -324,6 +354,9 @@ kcomp_instance_create!(|args, out_state| {
     unsafe { *out_state = state.cast::<()>() };
     if let Err(error) = kcomp_sdk::management::start_task(block_server) {
         // A Created Task may retain its image; failed Native backing stays resident.
+        return error.code();
+    }
+    if let Err(error) = start_result_server(state) {
         return error.code();
     }
     klog!("virtio_blk: probe.result published (outcome=0)");

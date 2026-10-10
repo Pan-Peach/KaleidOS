@@ -1,8 +1,6 @@
 /* littlefs_backend.c —— littlefs 的**业务后端**（只读 littlefs 文件系统语义）。
  *
- * Direct 的 `#[repr(C)]` function table（littlefs.c）与 Gate 的扁平 method switch
- * （littlefs_service.c）调用**同一份**实现；业务代码不感知部署。每个业务方法成功时
- * 打一行 `[littlefs] <op>`——QEMU runner 用它对照 Gate 入口日志做差分断言。
+ * 业务只在本镜像调用；跨组件入口为生成式 IPC Server。
  *
  * 挂载策略（与 FatFs 同构）：`lfs_mount` 失败（未格式化）→ `lfs_format` → 再
  * `lfs_mount`；成功后跑一次自检（写已知内容、只读读回、逐字节校验），既证明

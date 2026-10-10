@@ -1,8 +1,7 @@
 /* fatfs_backend.c —— FatFs 的**业务后端**（只读 FAT 文件系统语义）。
  *
- * Direct 的 `#[repr(C)]` function table（fatfs.c）与 Gate 的扁平 method switch
- * （fatfs_service.c）调用**同一份**实现；业务代码不感知部署。每个业务方法成功时打
- * 一行 `[fatfs] <op>`——QEMU runner 用它对照 Gate 入口日志做差分断言。
+ * Generated IPC handlers call these ordinary local C functions. The backend
+ * owns format, nodes, files and serialization; no private layout crosses an endpoint.
  */
 #include "kcomp.h"
 #include "fatfs_internal.h"

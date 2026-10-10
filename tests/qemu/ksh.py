@@ -13,9 +13,9 @@ def run(proc, collect, send, failure, fatal_markers, isolated=True):
         if not ok:
             raise failure(f"ksh command {line!r}: missing {expected!r}\n" + "\n".join(output))
 
-    # Published Direct ctx cannot be destroyed without a release protocol.
-    # Standalone shell has no composed VFS; legacy FS endpoints are not a fallback.
-    command("unload littlefs", ["DirectExports"])
+    # A running IPC Server must retire before its component can stop.
+    # Standalone shell has no composed VFS.
+    command("unload littlefs", ["OwnsLiveTasks"])
     command("load ksh", ["load ksh: OK", "KaleidOS ksh"])
     # Let the sole shell task yield to the monitor anchor before new input.
     # The monitor must resume it rather than consume the next command itself.

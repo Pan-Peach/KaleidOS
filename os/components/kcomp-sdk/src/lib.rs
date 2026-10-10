@@ -11,11 +11,11 @@
 //!    同一个镜像的 `Vec` / `Box` 不需要判断执行域。
 //!
 //! 其余模块：typed [`endpoint`]、flat [`frame`] 视图、[`block`]（契约 + provider
-//! wrapper + Core 在 bind 时选定的 Direct / Gate 调用后端）、[`scheduler`]
+//! trait + IPC-only client/server）、[`scheduler`]
 //! （Gate-only；consumer = Core）、[`call`]、`dma`、`logging`、`panic`、[`mem`]。
 //! 外部路径（`abi` / `DmaDirection` / `log` / `console_write_byte`）保持不变。
-//! [`kcomp_services!`] 生成 image 级 port switch（`kcomp_service_dispatch`）；
-//! method switch 由契约自己的适配器（如 [`block::dispatch`]）手写。
+//! [`kcomp_services!`] 为同步策略/诊断生成 image 级 port switch（`kcomp_service_dispatch`）；
+//! 普通业务 methods/codec/dispatch 由 KABI schema 生成。
 //!
 //! # panic adapter（本 crate 存在的关键理由）
 //!
@@ -164,14 +164,14 @@ macro_rules! kcomp_instance_destroy {
 /// ```text
 /// kcomp_sdk::kcomp_services! {
 ///     state: DeviceState;
-///     BLOCK_PORT => block::dispatch::<DeviceState>,
+///     TEST_PORT => test_dispatch,
 /// }
 /// ```
 ///
 /// 展开成 `match port { BLOCK_PORT => handler(state, method, call), _ => ENOSYS }`。
 ///
 /// - **只做 port switch**：契约自己的 method switch 由 handler 手写（block 用
-///   `block::dispatch`）；宏不发明协议、不解析 frame。
+///   test fixture dispatcher）；宏不发明协议、不解析 frame。
 /// - **不发布 endpoint**：发布名 / 时机来自 create config 与组合策略，publication
 ///   是 staged 的；本宏只看 provider 定义的 `port` token。
 /// - **端口 pattern 重复 = 编译错误**（逐对 `const` 断言，不静默覆盖）。

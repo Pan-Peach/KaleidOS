@@ -1,6 +1,6 @@
 # ADR：一个 VFS 的 Local / Remote 后端
 
-> 状态：**KernelNative 混合 VFS 已实现**。LocalFs、Remote FatFs、独立 VFS Server Task、SDK 与 ksh/exec 已接线；virtio Block 已 IPC-only；Block SDK/RAM/littlefs 尚未统一，私有域 IPC 未实现。现行权威是 [filesystem](../interfaces/filesystem.md)、[VFS wire](../interfaces/vfs.md)、[模块现状](../modules/vfs.md)；本 ADR 记录决策，验证见 STATUS。前置依据见 [参考系统](reference-systems.md)、[源码审计](component-communication-audit.md) 与 [IPC ADR](ipc-request-reply-adr.md)。
+> 状态：**KernelNative 混合 VFS 已实现**。LocalFs、Remote FatFs、独立 VFS Server Task、SDK 与 ksh/exec 已接线；virtio Block 已 IPC-only；Block SDK/RAM/littlefs 已统一 IPC，私有域 IPC 未实现。现行权威是 [filesystem](../interfaces/filesystem.md)、[VFS wire](../interfaces/vfs.md)、[模块现状](../modules/vfs.md)；本 ADR 记录决策，验证见 STATUS。前置依据见 [参考系统](reference-systems.md)、[源码审计](component-communication-audit.md) 与 [IPC ADR](ipc-request-reply-adr.md)。
 
 ## 1. 决策
 
@@ -133,4 +133,4 @@ virtio Block 已具备 Server Task，正常启动 `VFS → Fat → Block` 均能
 
 当前只支持 Bytes、只读文件/目录；没有 symlink、命名流、目录列举、权限/share/delete 或 namespace 运行期并发修改。Weak cache 保持活跃路径位置一致，不证明 rename/传播/bind mount 语义。
 
-CoreTest 真 C FatFs + 两个独立 Block 实例验证混合挂载、verified Task 权限、取消 open 回滚、退出回收、Provider 失效/重启与 IPC-only stop。init runner 用 virtio FAT 镜像验证 Local/Remote 路径与 ksh/exec。证据与阶段限制见 [STATUS §3.29](../../STATUS.md#329-endpoint-requestreply-与混合-vfs--experimental)。virtio Block 为IPC+同步轮询，SDK三Backend、RAM/littlefs和新IPC私有域尚待收敛；本轮整套门禁失败见专项审计，不能宣称全通信重构完成。
+CoreTest 真 C FatFs + 两个独立 Block 实例验证混合挂载、verified Task 权限、取消 open 回滚、退出回收、Provider 失效/重启与 IPC-only stop。init runner 用 virtio FAT 镜像验证 Local/Remote 路径与 ksh/exec。证据与阶段限制见 [STATUS §3.29](../../STATUS.md#329-endpoint-requestreply-与混合-vfs--experimental)。VirtIO Block 为IPC+同步设备轮询，RAM/littlefs/Probe 与 Block/FS SDK 已统一 IPC。完整 check、双架构 QEMU/Arch 与 RV32 NoMMU 回归通过；IsolatedNative 持久 Task IPC 仍未实现，不能宣称跨域通信重构完成。

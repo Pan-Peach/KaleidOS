@@ -6,7 +6,8 @@
 KernelNative Task Request/Reply 的窄契约见 [IPC](ipc.md)。IPC-only 发布由
 `port=0, api=NULL, ctx=NULL` 表示，bind 在 exact/live 校验后只允许 K/K，返回 Ipc=2
 与零 api/ctx；涉及 Isolated/Sandboxed 显式拒绝。原始 IPC 入口不自动 legacy bind，
-submit 每次复验域和 grant。下文 Direct/Gate 矩阵继续描述历史发布，不能覆盖这个例外；
+submit 每次复验域和 grant。当前全部普通业务服务使用上述 IPC-only 发布。下文 Direct/Gate 矩阵描述保留的同步策略/诊断发布，
+普通 Block/Filesystem SDK 不接受这些历史 binding；
 持久私有域 Task 与新跨 AS IPC 尚未实现，不能退回裸指针隐藏缺口。
 
 > 与 `docs/architecture/component-lifecycle.md` 在"同一份组件代码能否跨执行域原样运行"上冲突时，**以本文件为准**：`component-lifecycle.md` §9"代码页去重是未来的 loader / MM 优化，不是 ABI / 生命周期承诺"的结论**由本文件补充**（见 §6、§8）。本文件不否认它的现状描述，而是把目标写清楚，并把缺口显式登记。
@@ -14,6 +15,8 @@ submit 每次复验域和 grant。下文 Direct/Gate 矩阵继续描述历史发
 ---
 
 ## 1. 分离概念与职责图
+
+本节至§3的 Direct/Gate 图描述仍受 Core 支持的同步策略/诊断机制；普通业务的单一 IPC 路径见§4–5。
 
 组件实例、执行域、接口契约与交互机制分别描述身份、部署环境、语义与双方关系。
 Artifact 是程序字节，Endpoint 是一次发布；它们不另建组件生命周期。
@@ -124,7 +127,7 @@ grant capability，不能把可发现当作不可信组件的访问授权。
 
 行 = caller 的执行域，列 = callee 的执行域。单元格 = **合法机制**。`rejected` 表示该组合**必须被 Core 显式拒绝**。
 
-> **实现状态**：K/K Direct（及显式 Gate）、K→I、I→K、I→I Gate 均已接线；Sandbox 参与的调用仍显式拒绝。ArchTest `isolated-domain-service` 在 RV64/RV32 以同一工件、同一 SDK `block.device` 前端验证四种组合、嵌套、panic、stale 与循环重入。
+> **实现状态**：K/K Direct（及显式 Gate）、K→I、I→K、I→I Gate 均已接线；Sandbox 参与的调用仍显式拒绝。ArchTest `isolated-domain-service` 在 RV64/RV32 以同一工件、专用 test-only `domain.test` 同步前端验证四种组合、嵌套、panic、stale 与循环重入。
 
 | caller ↓ \ callee → | KernelNative | IsolatedNative | SandboxedNative |
 |---|---|---|---|
@@ -176,107 +179,53 @@ Direct binding 携带的是 `(api, ctx)` 两个**裸指针**，只在 provider �
 |---|---|---|---|
 | **服务前端（typed frontend）** | consumer 看到的强类型入口，如 `block.read(lba, &mut buf)` | SDK（`os/components/kcomp-sdk/src/block.rs` 一类） | **域无关**；**不持有裸可调用物**；业务代码**永不见** method number / frame / mode 分支 |
 | **业务后端（business backend）** | provider 的**真实**实现，如 VirtIO 读盘 | provider 组件内部 | 被**各部署的本地入口 / adapter** 调用；自身**不感知**部署 |
-| **调用后端（call backend，在 SDK）** | Core 在 bind 时**已固定**的机制 | SDK 私有 | 持有机制专有信息：同域 native = vtable + ctx；跨域 = Core call-gate handle |
+| **调用后端（call backend，在 SDK）** | Core 在 bind 时**已固定**的机制 | SDK 私有 | 普通 SDK 仅持固定 Endpoint；保留的同步诊断才持 api/ctx 或 Core call-gate handle |
 
-**目标调用链：**
+**普通业务调用链：**
 
 ```text
-consumer 业务代码
-   │  block.read(lba, &mut buf)         ← typed 前端，域无关
-   ▼
-服务前端（typed frontend）
-   │  调用后端（call backend，SDK 私有，机制已在 bind 时由 Core 固定）
-   ▼
-┌─ Direct：直接调 provider function table（api, ctx），稳态零 Core 介入
-├─ Gate  ：Core call gate（provider principal + per-call stack + panic containment）
-└─ syscall-IPC：ecall → Core → dispatch
-   ▼
-provider local entry（按部署的本地入口 / adapter）
-   ▼
-业务后端（同一份真实 read 实现，不按部署重写）
+consumer → typed SDK Binding → generated client / Wire
+  → Core Endpoint / Exchange → owned Server Task
+  → generated dispatch → Provider 业务 Handler → reply
 ```
 
-**关键不变量：** 从 consumer 业务代码到业务后端的**语义路径**在三种部署下**完全相同**；变的只有中间那段"调用后端 + 本地入口"。**同一份 consumer 代码不得出现 `if mode == ...`**。
-
-> **API / ctx 保留为 Native Direct transport。** 同域 Direct 的 binding 携带 `api`（`#[repr(C)]` function table）+ `ctx`（provider opaque state），由 `EndpointRegistry::bind` 在选定 Direct 时交付。绑定身份是 **`EndpointId`**（provider + port_name + contract）：一个端口名不再对应"全局唯一的 provider 槽"，provider 停止 / 失败即永久失效、绝不重定向。
+普通 `.kcomp` 边界共用一套稳定 Wire；组件内部可直接调用普通函数或 Rust trait。
+Core 只管理 endpoint、权限、请求终态、执行域和调度，不解析业务方法或对象。
+同步 PolicyCall 和保留的隔离/生命周期诊断使用下文历史调用矩阵；没有普通业务 SDK Backend 分支。
+后续同信任域优化必须复用同一 Contract 和 Handler；当前未实现透明 local dispatch。
 
 ---
 
-## 5. BlockDevice 例子
+## 5. 当前 BlockDevice 例子
 
-契约（`abi/block.toml`）：`block.device`，ABI = `0x424C_4F43_4B44_4556`（ASCII `"BLOCKDEV"`），function table 三个方法：`capacity_sectors` / `read` / `write`，单位 512 字节 sector。
+契约及 exact fingerprint 的唯一权威是 [block.toml](../../abi/block.toml)：
+`capacity_sectors` / `read` / `write`，单位512字节。BlockDeviceApi 与 BlockDeviceService 已删除。
 
-### 5.1 Rust 前端草案（consumer 侧，域无关）
+Rust consumer：
 
 ```rust
-// 业务代码：不出现 method number、不出现 frame、不出现 mode 分支
-fn load_superblock(blk: &BlockDeviceHandle, lba: u64, buf: &mut [u8]) -> Result<()> {
-    blk.read(lba, buf)          // typed 前端
-}
-
-// SDK 提供的强类型句柄：内部持**调用后端**，不持裸可调用物
-pub struct BlockDeviceHandle {
-    backend: CallBackend,       // SDK 私有：Direct { api, ctx } | Gate { endpoint }
-}
-
-impl BlockDeviceHandle {
-    pub fn read(&self, lba: u64, buf: &mut [u8]) -> Result<()> {
-        // 机制已由 Core 在 bind 时固定；这里只"实现"，不"选择"
-        self.backend.block_read(lba, buf)
-    }
-}
+let block = BlockBinding::connect(endpoint)?;
+block.read(lba, &mut buffer)?;
 ```
 
-### 5.2 C 前端草案（同一份 consumer 代码）
+C consumer：
 
 ```c
-/* 业务代码：与 Rust 版同形，不按 mode 分支 */
-static int load_superblock(kcomp_block_device *blk, uint64_t lba,
-                           uint8_t *buf, size_t len) {
-    return kcomp_block_read(blk, lba, buf, len);   /* typed 前端 */
-}
+struct kcomp_block_binding block;
+int32_t rc = kcomp_block_bind(endpoint, KCOMP_BLOCK_DEVICE_CONTRACT,
+                            KCOMP_BLOCK_DEVICE_ABI, &block);
+/* rc == 0 后，普通真实 Task 可调用；composer 另行 grant send rights。 */
+struct kcomp_call_result result = kcomp_block_read(&block, lba, buffer, len);
 ```
 
-### 5.3 provider 的按部署本地入口
+两语言 facade 都只保存固定 endpoint，非零512倍数与 last-LBA checked overflow 在提交前验证；
+多块拆分成512字节消息。业务错误与传输错误分开，后续扇区失败不回滚先前完成的 I/O。
+Provider 只实现 generated Provider 的业务方法，发布 IPC Endpoint 并启动 Server；
+VirtIO/RAM 的 Server 复用 SDK `block::server::serve`。DLL式函数表、业务 Gate dispatcher 均不再需要。
 
-业务后端只有一份；每个部署提供一个**本地入口 / adapter**（运行环境提供，业务后端不重写）：
-
-```c
-/* 业务后端：provider 的真实实现，不感知部署 */
-int32_t virtio_block_read(void *state, uint64_t lba, uint8_t *buf, size_t len);
-
-/* Direct 部署：SDK 生成的 repr(C) function table 直接指向 adapter，
-   adapter 收窄入参后调业务后端（现状 `BlockDeviceService` 就是这个形状） */
-static const kcomp_block_device_api BLOCK_API = {
-    .capacity_sectors = adapter_capacity,
-    .read             = adapter_read,      /* → virtio_block_read */
-    .write            = adapter_write,
-};
-
-/* Gate / syscall 部署：Core 调用的 image 级统一入口 */
-int32_t kcomp_service_dispatch(void *instance_state, uint32_t port,
-                               uint32_t method, const kcomp_call_frame *frame) {
-    if (port != PORT_BLOCK) return -ENOSYS;
-    return block_dispatch(instance_state, method, frame);  /* → virtio_block_read */
-}
-```
-
-> 现状锚点：`kcomp_service_dispatch` 已经是组件 ABI 的**可选** image 级入口（`abi/component.toml:114-142`），`kcore_endpoint_call` 经它分派（`os/core/src/component/call.rs`）。Direct 的 function table 形状见 `BlockDeviceService`（`os/components/kcomp-sdk/src/block.rs:114-167`）。
-
-### 5.4 扁平调用帧（args / input / output）
-
-Gate / syscall 的调用帧是**扁平**的（`abi/component.toml:40-77`）：
-
-```text
-KcompCallFrame（kcomp_call_frame）
-  args    : *const u8   args_len   : usize    ← 标量参数区（SDK 编解码，Core 不解析）
-  input   : *const u8   input_len  : usize    ← 输入负载（只读）
-  output  : *mut   u8   output_len : usize    ← 输出负载（可写）
-```
-
-- 六个字段**全部指针宽**（`size_ptrs = 6`）：RV32 为 24 B、RV64 为 48 B；同一 ISA 内按字段跨执行域搬运，不能跨 XLEN 直接复制结构；**没有嵌套 raw pointer**，标量参数编码在 `args` 的扁平字节区里。
-- `method` / `port` 是独立标量参数（`kcomp_service_dispatch`），Core **从不解释**语义。
-- Direct 路径**不用这个 frame**：直接调 function table，参数就是普通的 C 参数。这正是 Direct 快的原因。
+保留的同步诊断使用 `KcompCallFrame`（定义见 [component.toml](../../abi/component.toml)）：
+三个指针/长度对由 Core 跨 AS 验证搬运；它不再是普通 Block/FS 协议的兼容通道。
+这些真实硬件诊断必须保留，直到 IsolatedNative 持久 Task/IPC 替代通过。
 
 ---
 

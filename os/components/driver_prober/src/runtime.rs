@@ -191,7 +191,20 @@ extern "C" fn dispatch_task(arg: *mut ()) {
                         attempt,
                         endpoint.id()
                     );
-                    match probe::pull_result(endpoint) {
+                    let owner = kcomp_sdk::management::current_component().unwrap();
+                    let end = unsafe { abi::kcore_now() + abi::kcore_timebase_hz() * 10 };
+                    let granted = loop {
+                        match kcomp_sdk::ipc::grant(endpoint.id(), owner) {
+                            Err(Errno::ENOTCONN) if unsafe { abi::kcore_now() } < end => {
+                                let _ = kcomp_sdk::management::yield_task();
+                            }
+                            result => break result,
+                        }
+                    };
+                    match granted
+                        .map_err(kcomp_sdk::endpoint::InvokeError::Transport)
+                        .and_then(|()| probe::pull_result(endpoint))
+                    {
                         Ok(reply) => reply,
                         Err(error) => {
                             kcomp_sdk::klog!(

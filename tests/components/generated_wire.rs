@@ -1,6 +1,6 @@
 //! Actual generated clients/dispatchers and SDK envelope; only Core transport is fake.
 use kcomp_sdk::generated::{
-    block_wire, echo_wire, filesystem_wire as fs, posix_wire as posix, vfs_wire as vfs,
+    block_wire, echo_wire, probe_wire as probe, filesystem_wire as fs, posix_wire as posix, vfs_wire as vfs,
 };
 use kcomp_sdk::vfs::*;
 pub use kcomp_sdk::{Errno, Result, endpoint, ipc};
@@ -192,6 +192,13 @@ impl fs::Provider for Handler {
         Ok(())
     }
 }
+impl probe::Provider for Handler {
+    fn result(&self) -> Result<probe::ResultReply> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(probe::ResultReply { outcome: 1, detail: 0x01020304 })
+    }
+    fn shutdown(&self) -> Result<()> { CALLS.fetch_add(1, Ordering::Relaxed); Ok(()) }
+}
 impl posix::Provider for Handler {
     fn status(&self) -> Result<posix::StatusReply> {
         CALLS.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +285,7 @@ fn dispatch(bytes: &[u8], output: &mut [u8]) -> i32 {
         Err(e) => return e.code(),
     };
     match std::env::args().nth(2).unwrap().as_str() {
+        "probe" => probe::dispatch(&Handler, &request, output),
         "posix" => posix::dispatch(&Handler, &request, output),
         "block" => block_wire::dispatch(&Handler, &request, output),
         "echo" => echo_wire::dispatch(&Handler, &request, output),
@@ -431,6 +439,10 @@ fn main() {
         return;
     }
     let result = match args[2].as_str() {
+        "probe" => {
+            if args[3] == "shutdown" { probe::shutdown(7) }
+            else { probe::result(7).map(|reply| assert_eq!(reply.detail, 0x01020304)) }
+        }
         "posix" => {
             if args[3] == "shutdown" {
                 posix::shutdown(7)

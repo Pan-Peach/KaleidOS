@@ -1,7 +1,7 @@
 //! 网络服务契约草案；使用示例见 `docs/interfaces/network.md`。
 //!
 //! consumer 只依赖 SDK，不依赖 netstack / smoltcp。Rust 值只在各自镜像内使用，
-//! 边界为 `abi/network.toml` 的 C table / LE frame。bind 暂返回 ENOTSUP；
+//! 边界计划使用生成式 IPC；当前只有 `abi/network.toml` 的值类型与方法编号。bind 暂返回 ENOTSUP；
 //! 其他操作仍为 todo!()，不能发布或调用可用的网络服务。
 
 mod client;
@@ -9,7 +9,7 @@ mod provider;
 mod types;
 
 pub use client::{InetSocket, NetworkBinding, Subscription, TcpSocket, UdpSocket};
-pub use provider::{NetworkProvider, NetworkService};
+pub use provider::NetworkProvider;
 pub use types::*;
 
 use crate::abi::InterfaceKind;

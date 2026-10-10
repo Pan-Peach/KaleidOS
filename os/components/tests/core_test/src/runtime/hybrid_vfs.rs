@@ -361,13 +361,14 @@ fn create_fat(owner: u32, block: u64) -> kcomp_sdk::Result<u32> {
     let mut config = [0; 16];
     config[..8].copy_from_slice(&block.to_le_bytes());
     config[8..12].copy_from_slice(&owner.to_le_bytes());
-    config[12..].copy_from_slice(&1u32.to_le_bytes());
-    management::create(
+    let fat = management::create(
         b"fatfs",
         management::ExecutionDomain::KernelNative,
         KCOMP_FATFS_CREATE_CONFIG_ABI,
         &config,
-    )
+    )?;
+    ipc::grant(block, fat)?;
+    Ok(fat)
 }
 fn compose(owner: u32) -> kcomp_sdk::Result<Graph> {
     let mut blocks = [0; 2];
@@ -375,6 +376,7 @@ fn compose(owner: u32) -> kcomp_sdk::Result<Graph> {
     let mut endpoints = [0; 2];
     for index in 0..2 {
         blocks[index] = management::load(b"ram_blk", management::ExecutionDomain::KernelNative)?;
+        management::run_tasks()?;
         let block = Endpoint::<BlockDevice>::lookup(blocks[index], BLOCK_DEVICE_NAME)?;
         fats[index] = create_fat(owner, block.id())?;
         endpoints[index] = Endpoint::<FileSystem>::lookup(fats[index], FILESYSTEM_NAME)?.id();

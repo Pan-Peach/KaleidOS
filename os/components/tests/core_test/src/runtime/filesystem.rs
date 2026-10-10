@@ -1,38 +1,15 @@
-//! 文件系统集成场景：CoreTest 以 SDK filesystem client 直接扮演消费者。
-//!
-//! - **block chain**：`ram_blk`（只读 FAT12 合成 provider）→ 组合期解析
-//!   `block.device` endpoint → `fatfs`（create config 只带 EndpointId）→
-//!   `filesystem` endpoint。CoreTest 显式经 Core call gate 各探针一次（证明
-//!   provider 的 `kcomp_service_dispatch` 真实可用），再 `bind` + `mount` /
-//!   `open` / `read` / `close` / `unmount` 读 `0:/HELLO.TXT` 并**逐字节**比对。
-//! - **littlefs multi-instance**：2×（`ram_blk_rw` → `littlefs`），两个独立
-//!   provider、两个独立 `EndpointId`、两个独立文件系统实例；各自 mount（内部
-//!   format + selftest）并从自己的 filesystem endpoint 读回 selftest 文件。
-//! - **littlefs isolation**：把实例 A 的**原始存储**整段擦成 0xFF 后，A 的
-//!   selftest 文件不再读得出，而 B 的实例仍逐字节正确——两个实例的状态不共享。
-//! - **component multi-instance（block 级直证）**：同一 `ram_blk_rw` artifact 的
-//!   两个实例，各自对同一扇区写不同 pattern——A 的写不出现在 B 的读回里、B 的写
-//!   不影响 A，不经文件系统直接证明 per-instance backing 不共享（身份断言走 trace）。
-//!
-//! 全部在 task context 执行（块调用契约要求 task；消费者必须是 task）。task 只把
-//! 结果写回 [`State`]，报告在 create 上下文里、调度返回后统一发出。
-//!
-//! 机制证据：组件内看不到 provider 的日志，因此读 trace 的 `EndpointBind` 事件
-//! ——业务绑定必须是 **Direct**（[`trace::MECHANISM_DIRECT`]），显式探针不产生
-//! bind 事件。
+//! Real IPC storage chains: RAM/VirtIO → FatFs/littlefs → filesystem consumers.
+//! Checks native content, independent instances, stale handles and explicit send rights.
+//! Every blocking operation runs in a real Task; the anchor reports results afterwards.
 
 use core::ffi::CStr;
 
 use kcomp_sdk::abi::{self, KcompCreateArgs};
 use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDevice};
-use kcomp_sdk::call;
 use kcomp_sdk::endpoint::Endpoint;
 use kcomp_sdk::filesystem::client::FileSystemBinding;
 use kcomp_sdk::filesystem::{FILESYSTEM_NAME, FILESYSTEM_OPEN_READ, FileSystem};
-use kcomp_sdk::generated::block::{KCOMP_BLOCK_CAPACITY_LEN, KCOMP_BLOCK_METHOD_CAPACITY};
-use kcomp_sdk::generated::filesystem::{
-    KCOMP_FATFS_CREATE_CONFIG_ABI as FATFS_CREATE_CONFIG_ABI, KCOMP_FILESYSTEM_METHOD_MOUNT,
-};
+use kcomp_sdk::generated::filesystem::KCOMP_FATFS_CREATE_CONFIG_ABI as FATFS_CREATE_CONFIG_ABI;
 use kcomp_sdk::klog;
 
 use super::report::Checks;
@@ -44,16 +21,7 @@ const BLOCK_PROVIDER_RW: &[u8] = b"ram_blk_rw";
 const FATFS: &[u8] = b"fatfs";
 const LITTLEFS: &[u8] = b"littlefs";
 
-/// 组合策略交付的 create config：只带组合期解析出的 opaque `EndpointId`。
-///
-/// 布局必须与 `fatfs.c` / `littlefs.c` 的 `struct *_create_config` 逐字节一致；
-/// `config_abi` 是布局指纹（8 字节 ASCII 的大端读数），对不上由 consumer 拒绝创建。
-#[repr(C)]
-struct EndpointCreateConfig {
-    endpoint: u64,
-}
-
-const LITTLEFS_CREATE_CONFIG_ABI: u64 = 0x4C49_5454_4C45_4353; // "LITTLECS"
+use kcomp_sdk::generated::filesystem::KCOMP_LITTLEFS_CREATE_CONFIG_ABI as LITTLEFS_CREATE_CONFIG_ABI;
 
 /// `ram_blk` 的合成 FAT12 卷里 `HELLO.TXT` 的内容（与 provider 的 `fat12.rs` 一致）。
 const HELLO_PATH: &CStr = c"0:/HELLO.TXT";
@@ -77,14 +45,14 @@ pub struct State {
     pub physical_chain: bool,
     /// block chain 全链成功（含精确内容）。
     pub block_chain: bool,
-    /// block chain 的业务绑定机制是 Direct（block + filesystem）。
-    pub block_chain_direct: bool,
+    /// block chain 的业务绑定机制是 IPC（block + filesystem）。
+    pub block_chain_ipc: bool,
     /// littlefs 两条链都挂载成功、selftest 文件都读得出、身份两两不同。
     pub littlefs_multi: bool,
     /// littlefs 两实例的存储互不相干。
     pub littlefs_isolation: bool,
-    /// littlefs 业务绑定机制是 Direct（block + filesystem）。
-    pub littlefs_direct: bool,
+    /// littlefs 业务绑定机制是 IPC（block + filesystem）。
+    pub littlefs_ipc: bool,
     /// 同一 `ram_blk_rw` artifact 的两个实例（block 级）存储互不相干。
     pub component_multi_instance: bool,
 }
@@ -107,10 +75,8 @@ fn create(image: &[u8]) -> Option<u32> {
         .then_some(instance)
 }
 
-/// 创建“只带 EndpointId”的实例（config 布局与 ABI 指纹由调用方给出）。
+/// Create with an explicit Block endpoint, control owner and reserved=0 LE config.
 fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<u32> {
-    let config = EndpointCreateConfig { endpoint };
-    // FatFs must decode opaque bytes even when the payload is not u64-aligned.
     #[repr(align(8))]
     struct UnalignedConfig([u8; 17]);
     let mut bytes = UnalignedConfig([0; 17]);
@@ -122,21 +88,34 @@ fn create_with_endpoint(image: &[u8], config_abi: u64, endpoint: u64) -> Option<
     );
     let args = KcompCreateArgs {
         config_abi,
-        config: if image == FATFS {
-            bytes.0[1..].as_ptr().cast()
-        } else {
-            (&config as *const EndpointCreateConfig).cast()
-        },
-        config_len: if image == FATFS {
-            16
-        } else {
-            core::mem::size_of::<EndpointCreateConfig>()
-        },
+        config: bytes.0[1..].as_ptr().cast(),
+        config_len: 16,
     };
+    // Start the Block listener before granting the new filesystem, which may wait on it.
+    let owner = kcomp_sdk::management::current_component().ok()?;
+    if !grant_ready(endpoint, owner) {
+        return None;
+    }
     let mut instance = 0u32;
-    (unsafe { abi::kcore_component_create(image.as_ptr(), image.len(), 0, &args, &mut instance) }
-        == 0)
-        .then_some(instance)
+    if unsafe { abi::kcore_component_create(image.as_ptr(), image.len(), 0, &args, &mut instance) }
+        != 0
+    {
+        return None;
+    }
+    kcomp_sdk::ipc::grant(endpoint, instance).ok()?;
+    Some(instance)
+}
+
+fn grant_ready(endpoint: u64, owner: u32) -> bool {
+    let end = unsafe { abi::kcore_now() + abi::kcore_timebase_hz() * 10 };
+    loop {
+        match kcomp_sdk::ipc::grant(endpoint, owner) {
+            Err(kcomp_sdk::Errno::ENOTCONN) if unsafe { abi::kcore_now() } < end => {
+                let _ = kcomp_sdk::management::yield_task();
+            }
+            result => return result.is_ok(),
+        }
+    }
 }
 
 /// 经 filesystem 绑定精确读回内容，同时检查关闭后的旧句柄不会复活。
@@ -211,7 +190,7 @@ fn blocks_independent(a: &Endpoint<BlockDevice>, b: &Endpoint<BlockDevice>) -> b
 }
 
 /// block chain：provider → fatfs → filesystem endpoint → 精确内容。
-/// 返回 (全链成功, 绑定机制全 Direct)。
+/// 返回 (全链成功, 绑定机制全 IPC)。
 fn block_chain() -> (bool, bool) {
     // (1) provider：ram_blk 在自己的 create 里发布 block endpoint。
     let Some(provider) = create(BLOCK_PROVIDER) else {
@@ -223,17 +202,12 @@ fn block_chain() -> (bool, bool) {
         return (false, false);
     };
 
-    // (2) Gate 探针：显式经 Core call gate 调一次 capacity（证明 provider 的
-    //     kcomp_service_dispatch 真实可用）。
-    let mut capacity = [0u8; KCOMP_BLOCK_CAPACITY_LEN];
-    let block_gate = call::endpoint_call(
-        block_endpoint.id(),
-        KCOMP_BLOCK_METHOD_CAPACITY,
-        &[],
-        &[],
-        &mut capacity,
-    ) == Ok(0)
-        && u64::from_le_bytes(capacity) > 0;
+    let owner = kcomp_sdk::management::current_component().unwrap();
+    let block_capacity = grant_ready(block_endpoint.id(), owner)
+        && block_endpoint
+            .bind()
+            .and_then(|b| b.capacity_sectors())
+            .is_ok();
 
     // 机制证据窗口：block 绑定（fatfs 内部）与 filesystem 绑定（本处）都在窗口内。
     let window = trace::cursor();
@@ -249,14 +223,7 @@ fn block_chain() -> (bool, bool) {
         return (false, false);
     };
 
-    // (4) filesystem Gate 探针：显式经 Core call gate mount 一次（fatfs mount 幂等）。
-    let fs_gate = call::endpoint_call(
-        fs_endpoint.id(),
-        KCOMP_FILESYSTEM_METHOD_MOUNT,
-        &[],
-        &[],
-        &mut [],
-    ) == Ok(0);
+    let fs_ready = grant_ready(fs_endpoint.id(), owner);
 
     // (5) 消费者角色：bind（Core 选定机制）→ mount → open → read → close → unmount。
     let Ok(binding) = fs_endpoint.bind() else {
@@ -267,26 +234,26 @@ fn block_chain() -> (bool, bool) {
         && read_exact(&binding, HELLO_PATH, HELLO_CONTENT)
         && binding.unmount().is_ok();
 
-    // (6) 机制证据：两条业务绑定都必须 Direct（旧 runner 的“无 gate dispatch”断言）。
+    // (6) 机制证据：两条业务绑定都必须 IPC（旧 runner 的“无 gate dispatch”断言）。
     let block_id = block_endpoint.id();
     let fs_id = fs_endpoint.id();
-    let mut block_direct = false;
-    let mut fs_direct = false;
+    let mut block_ipc = false;
+    let mut fs_ipc = false;
     trace::binds(window, |endpoint, mechanism| {
-        if mechanism == trace::MECHANISM_DIRECT {
-            block_direct |= endpoint == block_id;
-            fs_direct |= endpoint == fs_id;
+        if mechanism == trace::MECHANISM_IPC {
+            block_ipc |= endpoint == block_id;
+            fs_ipc |= endpoint == fs_id;
         }
     });
 
     (
-        (block_gate && fs_gate && content),
-        (block_direct && fs_direct),
+        (block_capacity && fs_ready && content),
+        (block_ipc && fs_ipc),
     )
 }
 
 /// littlefs 多实例 + 隔离 + block 级多实例直证。
-/// 返回 (多实例成功, 存储隔离成立, 绑定机制 Direct, block 级两实例独立)。
+/// 返回 (多实例成功, 存储隔离成立, 绑定机制 IPC, block 级两实例独立)。
 fn littlefs_multi() -> (bool, bool, bool, bool) {
     let window = trace::cursor();
     let mut providers = [0u32; CHAINS];
@@ -326,20 +293,29 @@ fn littlefs_multi() -> (bool, bool, bool, bool) {
         bindings[chain] = Some(binding);
     }
 
-    // (2) mount：chain 0 额外经 Core call gate 探针一次（Gate transport 可用），
-    //     两条链都经绑定 mount（内部 format + selftest）。
+    // (5) 机制证据：chain 0 的 block / filesystem 业务绑定必须 IPC。
+    let mut block_ipc = false;
+    let mut fs_ipc = false;
+    if let (Some(block), Some(fs)) = (block_endpoints[0], fs_endpoints[0]) {
+        trace::binds(window, |endpoint, mechanism| {
+            if mechanism == trace::MECHANISM_IPC {
+                block_ipc |= endpoint == block.id();
+                fs_ipc |= endpoint == fs.id();
+            }
+        });
+    }
+
+    let mut declared = [0u32; CHAINS * 2];
+    let declared_count = trace::declared_components(window, &mut declared);
+    let declared_both = declared[..declared_count].contains(&providers[0])
+        && declared[..declared_count].contains(&providers[1]);
+    let lifecycle_both = trace::component_lifecycle(window, providers[0] as i32)
+        && trace::component_lifecycle(window, providers[1] as i32);
+
     let mut mounted = wired;
-    match fs_endpoints[0] {
-        Some(endpoint) => {
-            mounted &= call::endpoint_call(
-                endpoint.id(),
-                KCOMP_FILESYSTEM_METHOD_MOUNT,
-                &[],
-                &[],
-                &mut [],
-            ) == Ok(0);
-        }
-        None => mounted = false,
+    let owner = kcomp_sdk::management::current_component().unwrap();
+    for endpoint in fs_endpoints.iter().flatten() {
+        mounted &= grant_ready(endpoint.id(), owner);
     }
     for binding in &bindings {
         match binding {
@@ -364,18 +340,6 @@ fn littlefs_multi() -> (bool, bool, bool, bool) {
         && block_endpoints[0].map(|e| e.id()) != block_endpoints[1].map(|e| e.id())
         && fs_endpoints[0].map(|e| e.id()) != fs_endpoints[1].map(|e| e.id());
     let multi = wired && mounted && selftest && distinct;
-
-    // (5) 机制证据：chain 0 的 block / filesystem 业务绑定必须 Direct。
-    let mut block_direct = false;
-    let mut fs_direct = false;
-    if let (Some(block), Some(fs)) = (block_endpoints[0], fs_endpoints[0]) {
-        trace::binds(window, |endpoint, mechanism| {
-            if mechanism == trace::MECHANISM_DIRECT {
-                block_direct |= endpoint == block.id();
-                fs_direct |= endpoint == fs.id();
-            }
-        });
-    }
 
     // (6) 隔离：把实例 0 的**原始存储**整段擦成 0xFF——文件系统 A 的内容必须
     //     不再读得出，而实例 1 的文件系统必须逐字节不受影响（状态不共享）。
@@ -415,21 +379,16 @@ fn littlefs_multi() -> (bool, bool, bool, bool) {
     //     provider 的同一扇区读写——共享 backing 会让 A 的写出现在 B 的读回里。
     let multi_instance = match (block_endpoints[0], block_endpoints[1]) {
         (Some(a), Some(b)) => {
-            let mut declared = [0u32; CHAINS * 2];
-            let declared_count = trace::declared_components(window, &mut declared);
-            let declared_both = declared[..declared_count].contains(&providers[0])
-                && declared[..declared_count].contains(&providers[1]);
             declared_both
+                && lifecycle_both
                 && providers[0] != providers[1]
-                && trace::component_lifecycle(window, providers[0] as i32)
-                && trace::component_lifecycle(window, providers[1] as i32)
                 && a.id() != b.id()
                 && blocks_independent(&a, &b)
         }
         _ => false,
     };
 
-    (multi, isolation, block_direct && fs_direct, multi_instance)
+    (multi, isolation, block_ipc && fs_ipc, multi_instance)
 }
 
 /// 场景 task：全部文件系统集成动作都在 task context 里跑。
@@ -437,13 +396,13 @@ extern "C" fn task(arg: *mut ()) {
     // SAFETY: `arg` 是 create 里写入 `*out_state` 的 State 的 filesystem 字段，
     // 实例存活期间地址稳定；本任务是唯一写者（单 CPU、无并发）。
     let state = unsafe { &mut *(arg as *mut State) };
-    let (block_chain_ok, block_chain_direct) = block_chain();
+    let (block_chain_ok, block_chain_ipc) = block_chain();
     state.block_chain = block_chain_ok;
-    state.block_chain_direct = block_chain_direct;
+    state.block_chain_ipc = block_chain_ipc;
     let (multi, isolation, direct, multi_instance) = littlefs_multi();
     state.littlefs_multi = multi;
     state.littlefs_isolation = isolation;
-    state.littlefs_direct = direct;
+    state.littlefs_ipc = direct;
     state.component_multi_instance = multi_instance;
 
     unsafe { kcomp_sdk::abi::kcore_task_exit() };
@@ -553,9 +512,9 @@ pub fn spawn(state: *mut State) {
 pub fn report(checks: &mut Checks, state: &State) {
     checks.group("filesystem chain");
     checks.check("block-chain", state.block_chain);
-    checks.check("block-chain-direct", state.block_chain_direct);
+    checks.check("block-chain-ipc", state.block_chain_ipc);
     checks.check("littlefs-multi-instance", state.littlefs_multi);
     checks.check("littlefs-isolation", state.littlefs_isolation);
     checks.check("component-multi-instance", state.component_multi_instance);
-    checks.check("littlefs-direct", state.littlefs_direct);
+    checks.check("littlefs-ipc", state.littlefs_ipc);
 }

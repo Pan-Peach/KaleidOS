@@ -1,9 +1,9 @@
 # KaleidOS 状态与计划
 
-更新：2026-10-09。基线 develop `2e10304c389f` 已有 KernelNative IPC、混合
+更新：2026-10-10。基线 develop `2e10304c389f` 已有 KernelNative IPC、混合
 Local/Remote Fat VFS、virtio Block IPC-only 与 ksh/ELF 主链。用户授权后已实现
-Echo/Block/Filesystem/VFS/Posix scalar/buffer/固定结构方法生成并接入真实服务，修复已审计回归；完整 check/host/
-QEMU/Arch 门禁通过。普通旧通道安全退出仍未完成，见§3.29。Isolated新IPC、Sandbox、
+Echo/Block/Filesystem/VFS/Posix/Probe scalar/buffer/固定结构方法生成并接入真实服务，修复已审计回归；完整 check/host/
+QEMU/Arch 门禁通过。普通业务 SDK/Provider 已统一 IPC；Core 同步隔离诊断与策略入口仍保留，见§3.29。Isolated新IPC、Sandbox、
 通用VFS文件fd/libc startup和完整物理回收未实现，K链不证明私有域能力。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
@@ -180,7 +180,7 @@ Stop 在 registry 准入锁内检查 live Task 与 Gate/policy/IRQ 在途执行�
 
 ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 abi，只比 contract 与存活，交付 opaque capability。exact contract 加 abi 加存活的校验在 `kcore_endpoint_validate`（对已持有的 id，C ABI 可达，SDK `Endpoint<C>::from_id` 已接）和 `kcore_endpoint_bind`（第一步就走同一个 `EndpointRegistry::lookup`）。`deployment.md` §7.4/§11 已同步这一落点，裸 lookup 只发现 id。
 
-现有 K/I 矩阵均已派发：K/K Direct、K→I / I→K / I→I Gate。SDK `block.device` 同一工件验证；Sandbox 仍显式拒绝。
+现有 K/I 矩阵均已派发：K/K Direct、K→I / I→K / I→I Gate。专用 test-only `domain.test` 工件验证同步跨域调用；普通 Block SDK 已仅支持 IPC。Sandbox 仍显式拒绝。
 
 下一步：新接口（NetDevice、Clock、RNG 等）继续走同一条 bind 路径；补齐各接口的扁平 wire adapter。
 
@@ -206,16 +206,16 @@ ABI 校验的落点要说清楚。`kcore_endpoint_lookup` 的发现路径不带 
 
 缺口：只有 virtio，还是 QEMU virt 的 MMIO 变体；没有 PCIe/USB/NVMe/网卡；没有 UART driver component（`driver-model.md` 明说未实现）；没有真机；没有热插拔或驱动更换事务。
 
-网络骨架：`os/components/network/netstack/` 是独立 Rust `.kcomp`，以 `third_party/smoltcp` submodule（v0.14.0，0BSD）作为私有 no_std / no-alloc 后端。已按 TCP 客户端 / 服务端 / UDP 查询用例声明 `abi/network.toml`、SDK NetworkBinding / TcpSocket / UdpSocket 和 NetworkProvider / NetworkInstance 分发；内部 connection / listener 分开，bind → listen 保留同一 ID / 端口，存储由服务分配。服务与 worker 经 Engine 共享状态，worker 独占协议推进，网卡调用在锁外；Busy 与网络 Pending 分开。业务 / 同步 / C-Gate adapters 仍待手写；SDK bind 和组件 create / destroy 返回 `-ENOTSUP`，无服务 endpoint。NetDevice / 网卡、跨组件 unpark 与 timer 尚未接线；契约见 `docs/interfaces/network.md`，代码见 `docs/modules/netstack.md`。
+网络骨架：`os/components/network/netstack/` 是独立 Rust `.kcomp`，以 `third_party/smoltcp` submodule（v0.14.0，0BSD）作为私有 no_std / no-alloc 后端。已按 TCP 客户端 / 服务端 / UDP 查询用例声明 `abi/network.toml`、SDK NetworkBinding / TcpSocket / UdpSocket 和 NetworkProvider / NetworkInstance 分发；内部 connection / listener 分开，bind → listen 保留同一 ID / 端口，存储由服务分配。服务与 worker 经 Engine 共享状态，worker 独占协议推进，网卡调用在锁外；Busy 与网络 Pending 分开。业务 / 同步 / 生成 IPC 方法与 Server 接线仍未实现；未使用的旧 NetworkApi 表与 NetworkService Gate 占位已删除。SDK bind 和组件 create / destroy 返回 `-ENOTSUP`，无服务 endpoint。NetDevice / 网卡、跨组件 unpark 与 timer 尚未接线；契约见 `docs/interfaces/network.md`，代码见 `docs/modules/netstack.md`。
 
 下一步：定稿 `NetDevice` 契约与网卡 provider，手写 netstack adapter / 原语；事件驱动先补跨组件 unpark 与显式 timer 登记 / 取消，普通 park 不新增隐式 deadline。USB 走 TinyUSB，前提是同步原语。TLS 走 Mbed TLS，前提是 RNG/Clock/Socket。真机 bring-up 时补 SD/eMMC 与以太网，顺序见第 7 节。
 
-#### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED（只读；通信收敛未完成）
+#### 3.19 文件系统服务 `▰▰▰▰▱` IMPLEMENTED（只读；普通业务 IPC-only）
 
 FatFs、littlefs 是两个独立 C `.kcomp`，显式消费 Block。littlefs mount 失败才 format，
-随后自检；legacy open/read/close 与双实例介质隔离回归保留，节点接口仍 ENOTSUP。
+随后自检；open/read/close 经 IPC 与双实例介质隔离回归保留，节点接口仍 ENOTSUP。
 FatFs 已有 root/lookup/node_info/node_details/open_node/read_at；64 个挂载期 borrowed
-Node、8 个独立 FIL open；默认 init 使用 IPC-only FatFs，legacy 测试仍保留表/Gate。
+Node、8 个独立 FIL open；FatFs/littlefs 都仅发布 IPC Endpoint，旧表/Gate 已删除。
 Provider 状态已有 try-enter 串行纪律，不能继续称 files 表无同步。
 
 VFS create、Rust SDK、LocalFs/RemoteFs、统一 Namespace/Path/OpenFile 与 owned Server
@@ -225,8 +225,8 @@ init 真实 virtio FAT/双盘/Local/Remote 路径及 RV64 exec 本轮通过。
 模块事实见 [VFS](docs/modules/vfs.md)，完整当前门禁与剩余迁移见 §3.29。
 
 缺口：littlefs Remote Node、目录枚举/写/share/delete/ACL、两级缓存与通用 POSIX fd；
-C/Rust FS legacy frontend 仍两 Backend，Block 三 Backend，method codec 尚未生成。
-下一步先恢复基线失败与 KABI/SDK 收敛，不重复实现已接通 VFS。lwext4 仍候选，许可另审。
+Block/FS 的 C/Rust SDK 只保留生成 IPC 方法与薄业务 facade。
+下一步补私有域 Task/IPC；littlefs Remote Node 是独立业务功能缺口。lwext4 仍候选，许可另审。
 
 ### SDK、测试与观测
 
@@ -377,7 +377,7 @@ session 仲裁、通用 VFS / execve 路径、文件 fd、管道或 Win32。`exe
 #### 3.28 init `▰▰▰▰▱` IMPLEMENTED（最小启动编排）
 
 现状：普通KernelNative init选择RR并运行driver_prober，明确选择IPC-only Block，
-创建FatFs（LE config、control、flags=1）和VFS，显式安装Block→Fat→VFS→ksh grants。
+创建FatFs（LE config、control、reserved=0）和VFS，显式安装Block→Fat→VFS→ksh grants。
 真实Task检查根挂载，ksh消费VFS Endpoint及选定根路径。无块盘仍有Local namespace；
 坏FAT使init Failed回monitor。没有全图回滚/级联卸载；实现见docs/modules/init.md。
 
@@ -401,26 +401,30 @@ wake/退出/取消；Local+Remote FatFs、VFS runtime/SDK、ksh cat/ELF；virtio
 实际链路是 VFS → Fat Server → Block Server，设备由 driver 自己的 Task 身份操作。
 Node 是 borrowed mount-lifetime 身份，open 才 owning；不是早期每-node lease 草案。
 
-最新实施门禁：make abi-gen/abi-check（27生成文件）、make check（含test-host）通过；
+最新实施门禁：make abi-gen/abi-check（29生成文件）、make check（含test-host）通过；
 make test-qemu：RV64 default/no-block各112 checks、RV32各90 checks与shell通过；
 init RV64五场景/RV32四场景全部通过。make test-arch：RV64/RV32各43/43、SMP3/3通过。
 4项C/Rust envelope测试及7项generated方法测试通过，无expectedFailure。
 私有 RV32 S-mode NoMMU：default/no-block 各90 checks与shell通过；I域装载明确ENOTSUP。
 生产修补包括policy拒绝优先级与decoder容量校验；测试修补把driver I/O放真实Task，
-独立legacy fixture adapter解除未支持的IPC import依赖；没有扩展I白名单。
+独立 domain.test 同步诊断 fixture 解除普通 Block SDK 与未支持 IPC import 的耦合；没有扩展I白名单。
 
-收敛状态：Phase A专项审计完成；B已实现Echo/Block/Filesystem/VFS/Posix method AST、整数LE、bounded buffer、固定嵌套结构、
-C/Rust client/validator/dispatch，接入VirtIO/Fat/VFS Server、RemoteFs和VFS SDK。
-posix.process已迁独立IPC Server，移除Direct表/Gate分发/SDK两Backend，
-显式shutdown后stop与旧Endpoint失效由CoreTest验证；详见 [方法生成](docs/development/kabi-methods.md)。C仍有Block三Backend、FS双入口、
-RAM/little/probe旧通道；D私有Task/import/copy尚缺；E普通业务Direct/Gate未删。
-F文档/测试随实施更新，不等于整体Cleanup完成。Core新增账本/锁为零。 posix observer每实例增加一个真实Server Task，
-shutdown后退役；OOM下destroy栈分配失败的既有Core限制仍存在，ksh不更改已提交的wait status。
+收敛状态：Phase A专项审计完成；B已实现Echo/Block/Filesystem/VFS/Posix/Probe六个 Contract 的方法生成，
+C/Rust client/validator/dispatch 同源。C已迁移两个 RAM Provider、littlefs、FatFs 全部入口与 probe.result，
+Block/FS C/Rust SDK 不再有 Direct/Gate Backend，旧 BlockDeviceApi/FileSystemApi 与 Provider 普通 Gate 已删除。
+保留分块、checked LBA、DMA、FIL owner/reaper、取消 open 回滚及混合 VFS 对象模型。
+新 little/Fat create config 为16字节 LE：Block EndpointId、control ComponentId、reserved=0；
+exact fingerprint 协调替换，不接受旧 config 或业务函数表。Probe result/shutdown 也由 schema 生成。
+未发布服务的 network 骨架删除旧函数表/分发占位，仍 ENOTSUP。
+D私有Task/import/copy尚缺；E剩余 Core Direct/Gate 只服务策略/诊断/生命周期回归，不能提前删除。
+F同步文档与测试；详见 [方法生成](docs/development/kabi-methods.md) 与 [专项审计 §11](docs/development/component-communication-audit.md#11-普通业务-ipc-only-cleanup)。
+Core新增账本/锁为零。RAM、littlefs、probe.result 每实例增加真实 Server Task；probe shutdown 后退出，
+已匹配设备的 Block Task 继续服务；普通 stop 仍拒绝 live Task。Native backing 仍驻留，OOM 下 destroy 栈分配的既有限制不变。
 
 限制：KernelNative同特权可信；Isolated新IPC/持久Task/跨AS copy、Sandbox、deadline/
 强制终止/通知与物理回收未实现。旧Gate必须保留到真实I替代门禁满足。
 Echo fixture确定性验证远端Task先于create完成的启动窗口，等待Endpoint提交后listen。
-下一步：逐组迁移RAM/little/probe普通服务，补私有域IPC后删除旧通道。
+下一步：接通并真实验证私有域 IPC，再审计 Core 同步调用和保活状态的删除；性能优化后置。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
@@ -980,7 +984,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | C | 服务组合：BlockDevice → Filesystem → 更高消费者，Core 不理解 FS 语义 | PARTIAL | `fatfs`/`littlefs` 已绑 `block.device`，CoreTest `block-chain`/`littlefs-multi-instance`/`littlefs-isolation`；只读混合VFS/namespace/OpenFile已接，通用POSIX fd与两级缓存未有，通信收敛见§3.29 |
 | D | Task 运行时：Runnable→Running→Blocked→(wake)Runnable→Exited 加 timer/preemption | NOT-SATISFIED | TaskTable permit、host 调度集成与 RV64 远端 wake 已通过；RR 三常驻任务的下标饥饿已修复；preemption（`on_timer_tick` 是 `todo!()` 且未接线）仍缺失 |
 | E | POSIX 原型：process semantic state → AddressSpace → 多个 Core Task，PCB/fd/signal 留在 personality | PARTIAL | RV64 普通用户 task/AS/trap、fork/exec/wait 与 console 已接；通用 VFS fd、线程/signal 与文件完成协议仍缺 |
-| F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的真实 SDK `block.device` provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
+| F | 执行域：同一 service contract 至少在 KernelNative + IsolatedNative 上验证，Sandbox 后加 | PARTIAL | 同一 `kcomp_domain_service.kcomp` 的专用 test-only `domain.test` 同步 provider/consumer 覆盖 K/K、K/I、I/K、I/I，组件自行发布；嵌套/故障/stale/重入已验证。Sandbox 与硬件设备/任务能力尚缺 |
 | G | 真机：至少一块 QEMU RISC-V virt 之外的真 Linux-class RISC-V 板 | NOT-SATISFIED | 零真机代码与配置 |
 | H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | RV32 S-mode/NoMMU 私有 profile 已通过 CoreTest；M-mode 启动失败，无 MCU 真机 |
 
@@ -997,7 +1001,7 @@ RV64 普通用户 task 与 AS 已关联，不能继续当作零实现缺口。
 - 本阶段明确不做（原路线图的"明确不做"清单并入本文，与 `AGENTS.md` 一致）：真正动态加载、运行期组件热插拔 / Runtime Graph / 依赖解析器、热迁移、复杂 IPC、微内核模式、Wasm runtime、WIT/IDL、完整 capability 系统、完整 POSIX、Linux syscall 兼容、复杂 VFS、复杂 SMP 调度、形式化证明、完整 driver framework、完整依赖解析器。NOT IMPLEMENTED / PLANNED。
 - 尚未完成方向（方向，不是承诺的里程碑，没有排期）：多 profile（`game` / `unix`(POSIX personality) / `micro` / `debug`）与 UserAddressSpace 执行域；Wasm 执行后端（`scheduler.wasm` 等，是组件的一种执行方式，与执行域正交，Core/Arch 保持 native Rust）；热替换（在 drain 协调协议之后向无感替换演进：quiesce → stop → unbind → reset → replace → bind → start；不做 live state migration）；内存物理回收（完整 buddy、通用 Core heap、完整 panic recovery；phase 1 只做资源归属撤销与 quarantine，不承诺共享堆字节回收，也不承诺对抗隔离）；验证工具链（Kani / Loom / Miri / Verus 与 Test Scheduler / Hunt Mode）；第三方库调包（见第 8 节）。
 - 内存物理回收与 instance 退役回收：不承诺，逻辑死亡、物理驻留。NOT IMPLEMENTED。
-- NoMMU：RV32 S-mode私有profile已实际boot；本轮IPC/hybrid分组通过但整套driver失败，默认CI仍未纳入。M-mode不由此推导通过。
+- NoMMU：RV32 S-mode私有profile已实际boot；本轮完整CoreTest default/no-block各90 checks和shell通过，默认CI仍未纳入。M-mode不由此推导通过。
 - M-mode（`PRIVILEGE_MACHINE`）启动：Kconfig 可选、代码可编译，但没有 defconfig、没有 boot harness、不在任何测试或 CI 里构建。PLANNED / 未验证。
 - AArch64 / x86_64 / LoongArch：`os/arch/src/<isa>` 与 `os/boot/<isa>` 同形骨架已落地（`encoding`/`elf`/`console`/`cpu`/`smp`/`trap`/`context`/`mmu`，实现体 `todo!()`），能编译、未启动、未验证。NOT IMPLEMENTED（骨架）。
 - 真机支持（VisionFive 2、ESP32-C3 等）：零代码与配置，纯路线图。PLANNED。

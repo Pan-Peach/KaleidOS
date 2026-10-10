@@ -11,23 +11,24 @@
 use kcomp_sdk::abi::MemoryView;
 use kcomp_sdk::errno::Errno;
 use kcomp_sdk::mem;
-use kcomp_sdk::probe::ProbeReply;
+use kcomp_sdk::probe::{KCOMP_DRIVER_CREATE_NAME_MAX, ProbeReply};
 
-/// 每实例状态：`kcomp_instance_create` 分配、写回 `out_state`，经
-/// `kcomp_service_dispatch` 的 `instance_state` 回放。
+/// 每实例状态：`kcomp_instance_create` 分配、写回 `out_state`，由结果 Server Task 借用，构造期复制端口名。
 #[repr(C)]
 pub(crate) struct VirtioBlkState {
     /// 本实例是否真的 attach 了设备。report-only 实例恒 `false`——它的 destroy
     /// 绝不碰全局设备状态（否则会复位已 attach 实例的设备）。
     pub(crate) attached: bool,
     /// `probe.result` 的 8 字节回复（outcome i32 LE + detail u32 LE）。
-    pub(crate) result: [u8; ProbeReply::ENCODED_LEN],
+    pub(crate) result: ProbeReply,
+    pub(crate) name: [u8; KCOMP_DRIVER_CREATE_NAME_MAX],
+    pub(crate) name_len: usize,
     /// 本 state 的 backing 窗口（acquire 交付，构造期失败清理时原样交回）。
     pub(crate) region: MemoryView,
 }
 
 /// 构造期分配每实例 state（失败返回 NULL）。
-pub(crate) fn alloc_state() -> *mut VirtioBlkState {
+pub(crate) fn alloc_state(name: &[u8]) -> *mut VirtioBlkState {
     let view = match mem::mem_alloc(
         core::mem::size_of::<VirtioBlkState>() as u64,
         core::mem::align_of::<VirtioBlkState>() as u64,
@@ -44,11 +45,15 @@ pub(crate) fn alloc_state() -> *mut VirtioBlkState {
             state,
             VirtioBlkState {
                 attached: false,
-                result: ProbeReply::creation_failed(Errno::EIO).encode(),
+                result: ProbeReply::creation_failed(Errno::EIO),
+                name: [0; KCOMP_DRIVER_CREATE_NAME_MAX],
+                name_len: name.len(),
                 region: view,
             },
         );
     }
+    // create config is borrowed only during create; the Task needs its own copy.
+    unsafe { (&mut (*state).name)[..name.len()].copy_from_slice(name) };
     state
 }
 

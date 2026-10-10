@@ -14,7 +14,7 @@
 | Service / Contract | 提供什么能力、请求何时完成、失败如何表达 | 接口契约与 provider |
 | Endpoint | 哪个实例发布的哪个端口 | Core 发布真相 |
 | Binding | consumer 如何使用确切 endpoint、有效期到哪里 | Core 交付调用窗口，SDK 保存；无独立 binding registry |
-| Transport | 请求如何到达 provider | Direct / Synchronous Gate / KernelNative Request/Reply；Wasm host call 是未来路径 |
+| Transport | 请求如何到达 provider | 普通业务为 KernelNative Request/Reply；同步策略/隔离诊断保留 Direct/Gate；私有域 IPC 是待实现路径 |
 | Execution Model | 谁处理请求、是否排队、能否等待、怎样并发 | provider 的 adapter / Runtime |
 | ExecutionDomain | 特权级、地址空间、可用 import 与保护条件 | 组合方提议，Core 验证并提交 |
 | Session | 一次 open / connection / stream 的业务状态 | provider / 服务组件，不默认成为 Core endpoint |
@@ -36,19 +36,21 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
   → Core 验证实例 / owner / 生命周期 / exact ABI / 部署能力
   → consumer 建立确切 endpoint 的 binding
 
-请求数据路径：consumer → SDK binding
-  ├─ Direct → provider 本地入口
-  ├─ IPC    → Core 拥有副本 → Provider Server Task receive / reply
-  └─ Gate   → Core 验证并同步进入 provider 本地入口
-                ↓
-       Inline 业务处理，或 Runtime 入队 → owned Worker
+普通业务请求：consumer → generated SDK client
+  → Core Endpoint / Exchange 验证授权、拥有有界副本
+  → Provider owned Server Task receive → generated dispatch
+  → 镜像内业务 Handler → reply → caller collect
+
+特殊同步入口：scheduler PolicyCall、隔离/生命周期诊断
+  → Core 同步准入 / containment / 必要的 AS 切换
+
 ```
 
 组合策略不参与每次高频读写。Core 保存 publication、实例状态、资源归属和部署真相，
 不理解 root 磁盘、mount 路径、默认 FS、重试策略或客户端应当连接哪个 provider。
 组合层的连接记录引用 Core 身份，不复制一份实例或 endpoint 存活真相。
 
-当前 bind 按两端执行域确定机制；**显式 transport preference 是候选**，不是现有配置项。
+普通业务 IPC-only publication 的 bind 只接受当前已支持的执行域；遗留诊断 bind 按两端执行域确定同步机制。**显式 transport preference 是候选**，不是现有配置项。
 若真实消费者需要，应由组合层提出需求，Core 验证可行性并交付；SDK 不自行降级。
 选择 provider 与选择 transport 分开，不通过「取全局第一个」消除多 provider 歧义。
 
@@ -56,11 +58,11 @@ Native/Wasm 是代码执行后端，本文的 Inline/Queued 则描述请求处�
 
 | 组合 | 执行者与完成方式 | 当前边界 |
 |---|---|---|
-| Direct + Inline | caller 的栈直接运行 provider 方法，同步返回 | 已有；不切 principal，不提供独立 panic 边界 |
-| Gate + Inline | Core 管理的同步服务栈执行 dispatcher，同步返回 | 已有；不是独立 Server Task 的 receive/reply |
+| Direct + Inline | caller 的栈直接运行 provider 方法，同步返回 | 保留诊断；普通业务 SDK 不接受该 binding |
+| Gate + Inline | Core 管理的同步服务栈执行 dispatcher，同步返回 | 保留隔离/生命周期诊断与窄同步机制；普通业务已退出 |
 | Direct + Queued | 本地入口提交，owned Worker 处理 | 组件侧候选；唤醒 Worker 的 owner 条件必须满足 |
 | Gate + Queued | 同步入口由 Runtime 入队，owned Worker 处理 | 业务完成协议仍为候选 |
-| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative Echo/virtio Block/Fat/VFS 已接线；私有域 Task IPC 未实现 |
+| IPC + Server Task | Core 搬运有界副本，指定 Task 接收/回复，caller 可 park | KernelNative Echo/Block/Fat/little/VFS/Posix/Probe 已接线；私有域 Task IPC 未实现 |
 
 Inline 表示执行者没有被移交，**不自动表示可阻塞或线程安全**。当前 Gate 栈不可
 yield / park / exit；Direct 仅在合法 Task 边界及服务契约允许时可能使用 caller 的调度

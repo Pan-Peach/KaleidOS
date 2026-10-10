@@ -61,15 +61,14 @@ fn compose(root_ordinal: u32) -> Result<()> {
     kcomp_sdk::klog!("init: scheduler ready");
 
     management::load(b"driver_prober", ExecutionDomain::KernelNative)?;
-    // The current prober has one finite, non-yielding dispatch task. run_tasks
-    // is not a join; an asynchronous prober will need a completion contract.
+    // The prober has one finite dispatch Task and pulls IPC results. run_tasks
+    // drains runnable work; it does not join an arbitrary future background prober.
     management::run_tasks()?;
     let owner = management::current_component()?;
     let filesystem = if let Some(block) = root_endpoint(root_ordinal)? {
         let mut config = [0; 16];
         config[..8].copy_from_slice(&block.to_le_bytes());
         config[8..12].copy_from_slice(&owner.to_le_bytes());
-        config[12..].copy_from_slice(&1u32.to_le_bytes());
         let fat = management::create(
             b"fatfs",
             ExecutionDomain::KernelNative,

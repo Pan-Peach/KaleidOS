@@ -93,6 +93,8 @@ class KabiMethods(unittest.TestCase):
                   ("vfs", "stream", 64, 9, struct.pack("<Q",42), b"", bytes(8)+struct.pack("<QQQQIIQQ",3,4,1,23,0,0,0,0))]
         cases += [("posix", "status", 12, 0, b"", b"", struct.pack("<III",1,1792,0)),
                   ("posix", "shutdown", 0, 1, b"", b"", b"")]
+        cases += [("probe", "result", 8, 0, b"", b"", struct.pack("<iI",1,0x01020304)),
+                  ("probe", "shutdown", 0, 1, b"", b"", b"")]
         for contract, arg, capacity, method, args, input_, output in cases:
             with self.subTest(contract=contract, arg=arg):
                 request = struct.pack("<IIII", method, len(output), len(args), len(input_))+args+input_
@@ -104,7 +106,9 @@ class KabiMethods(unittest.TestCase):
     def test_shape_errors_do_not_execute_handler(self):
         def frame(method, capacity, args=b"", input_=b""):
             return struct.pack("<IIII", method, capacity, len(args), len(input_))+args+input_
-        frames = [("block", frame(1, 512, b"1234567"), 512, -22),
+        frames = [("probe", frame(0, 7), 7, -22),
+                  ("probe", frame(1, 0, b"x"), 0, -22),
+                  ("block", frame(1, 512, b"1234567"), 512, -22),
                   ("block", frame(1, 511, bytes(8)), 511, -22),
                   ("block", frame(0, 7), 7, -22),
                   ("block", frame(0, 8), 7, -22),

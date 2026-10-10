@@ -86,10 +86,10 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
         (*state).filesystem.physical_blocks = [0; 2];
         (*state).filesystem.physical_chain = false;
         (*state).filesystem.block_chain = false;
-        (*state).filesystem.block_chain_direct = false;
+        (*state).filesystem.block_chain_ipc = false;
         (*state).filesystem.littlefs_multi = false;
         (*state).filesystem.littlefs_isolation = false;
-        (*state).filesystem.littlefs_direct = false;
+        (*state).filesystem.littlefs_ipc = false;
         (*state).filesystem.component_multi_instance = false;
         (*state).driver.prober_id = -1;
         (*state).driver.cursor = 0;

@@ -2315,6 +2315,8 @@ OUTPUTS: Tuple[Output, ...] = (
     Output("wire-rust", "os/components/kcomp-sdk/src/generated/filesystem_wire.rs", ("filesystem.toml",)),
     Output("wire-c", "os/components/kcomp-sdk/include/generated/filesystem_wire.h", ("filesystem.toml",), guard="KCOMP_FILESYSTEM_WIRE_H"),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/probe.rs", ("probe.toml",)),
+    Output("wire-rust", "os/components/kcomp-sdk/src/generated/probe_wire.rs", ("probe.toml",)),
+    Output("wire-c", "os/components/kcomp-sdk/include/generated/probe_wire.h", ("probe.toml",), guard="KCOMP_PROBE_WIRE_H"),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/vfs.rs", ("vfs.toml",)),
     Output("wire-rust", "os/components/kcomp-sdk/src/generated/vfs_wire.rs", ("vfs.toml",)),
     Output("wire-c", "os/components/kcomp-sdk/include/generated/vfs_wire.h", ("vfs.toml",), guard="KCOMP_VFS_WIRE_H"),
@@ -2728,16 +2730,12 @@ doc = "I/O error"
     absent = [const for const in core.constants if const.name == "ABSENT"][0]
     assert absent.value == 2 ** 64 - 1
 
-    # —— block / filesystem schema：组件间契约（function table + 常量）——
+    # —— block / filesystem schema：唯一 IPC 方法与常量——
     block, filesystem = load_schemas(["abi/block.toml", "abi/filesystem.toml"])
-    assert len(block.structs) == 1 and block.structs[0].size_ptrs == 3
-    assert [field.name for field in block.structs[0].fields] == [
-        "capacity_sectors",
-        "read",
-        "write",
-    ]
+    assert not block.structs
+    assert len(block.methods) == 3
     block_abi = [const for const in block.constants if const.name == "KCOMP_BLOCK_DEVICE_ABI"][0]
-    assert block_abi.value == 0x424C_4F43_4B44_4556
+    assert block_abi.value == 0x424C_4B49_5043_524F
     block_consts = {const.name: const.value for const in block.constants}
     assert block_consts["KCOMP_BLOCK_DEVICE_CONTRACT"] == 0x424C_4B43_4F4E_5452
     assert block_consts["KCOMP_BLOCK_METHOD_CAPACITY"] == 0
@@ -2745,21 +2743,12 @@ doc = "I/O error"
     assert block_consts["KCOMP_BLOCK_METHOD_WRITE"] == 2
     assert block_consts["KCOMP_BLOCK_LBA_LEN"] == 8
     assert block_consts["KCOMP_BLOCK_CAPACITY_LEN"] == 8
-    assert len(filesystem.structs) == 1 and filesystem.structs[0].size_ptrs == 8
-    assert [field.name for field in filesystem.structs[0].fields] == [
-        "mount",
-        "unmount",
-        "open",
-        "close",
-        "read",
-        "root",
-        "lookup",
-        "node_info",
-    ]
+    assert not filesystem.structs
+    assert len(filesystem.methods) == 12
     filesystem_abi = [
         const for const in filesystem.constants if const.name == "KCOMP_FILESYSTEM_ABI"
     ][0]
-    assert filesystem_abi.value == 0xEC25_B01F_768A_394D
+    assert filesystem_abi.value == 0x4653_4950_4352_4F31
     filesystem_consts = {const.name: const.value for const in filesystem.constants}
     assert filesystem_consts["KCOMP_FILESYSTEM_CONTRACT"] == 0x5646_5343_4F4E_5452
     assert filesystem_consts["KCOMP_FILESYSTEM_METHOD_MOUNT"] == 0

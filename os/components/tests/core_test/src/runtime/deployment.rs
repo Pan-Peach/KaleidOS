@@ -3,15 +3,18 @@ use super::{report::Checks, trace};
 use kcomp_sdk::{
     Errno,
     abi::ExecutionDomain,
-    block::{BLOCK_DEVICE_NAME, BlockDevice, client::BlockBinding},
     endpoint::{Endpoint, InvokeError},
     management,
 };
 
-fn bind(id: u32) -> Option<BlockBinding> {
-    Endpoint::<BlockDevice>::lookup(id, BLOCK_DEVICE_NAME)
+#[path = "../../../domain_contract.rs"]
+mod domain;
+use domain::LegacyBind;
+
+fn bind(id: u32) -> Option<domain::Binding> {
+    Endpoint::<domain::DomainService>::lookup(id, domain::DOMAIN_NAME)
         .ok()?
-        .bind()
+        .legacy_bind()
         .ok()
 }
 

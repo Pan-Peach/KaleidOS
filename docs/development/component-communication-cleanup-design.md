@@ -1,7 +1,7 @@
 # KABI 协议方法生成：可手写的小模块方案
 
 > 2026-10-09，用户进一步授权直接实现。基线 `2e10304c389f` 没有 method 生成能力；
-> 当前 Echo/Block/Filesystem/VFS/Posix 的 client/dispatch 与固定结构 LE codec 已实现，语法与限制见
+> 当前 Echo/Block/Filesystem/VFS/Posix/Probe 的 client/dispatch 与固定结构 LE codec 已实现，语法与限制见
 > [现行方法生成](kabi-methods.md)。此页保留设计依据与执行域的后续小模块方案。
 > 维护点与真实失败见 [专项审计](component-communication-audit.md)；门禁见
 > [迁移清单](component-communication-migration.md)。此页是建议，不是现行 ABI。
@@ -135,8 +135,8 @@ typed handler。runtime 的 grant/reaper/控制 shutdown/drain 留在 runtime；
 
 ## 6. 执行域、生命周期与可验证边界
 
-三 Backend 的依赖耦合已经让 legacy I fixture 携带不允许的 IPC import。
-短期修补选独立的 test-only legacy adapter，让该工件继续验证真实 Gate，并对 UNDEF
+基线三 Backend 的依赖耦合曾让 I fixture 携带不允许的 IPC import。
+现已删除普通 SDK 旧 Backend，并以专用 test-only domain.test 继续验证真实 Gate；对 UNDEF
 清单做回归。不同 `.kcomp` 的 import 面必须按实际链接结果检查，不能仅看源分支未执行。
 不得为修补此问题把 IPC 字符串加入 I 白名单：当前没有范围 copy 与持久域 Task。
 
@@ -146,8 +146,8 @@ Task switch 真正进入/返回正确 AS；再接 IPC imports 的受检 copy-in/
 DomainTaskRegistry。跨 AS range/copy 可复用旧 Gate 验证思路，不能保留临时借用 VA
 到排队请求。K/K、K/I、I/K、I/I 在 RV64/Sv39、RV32/Sv32 分别实测。
 
-普通消费者还包括probe.result与posix.process退出状态observer；它们须纳入generated
-协议与真实Task调用，CoreTest锚点轮询不能直接换成等待IPC。
+普通消费者 probe.result 与 posix.process 退出状态 observer 已纳入 generated
+协议与真实 Task 调用，CoreTest锚点轮询不能直接换成等待IPC。
 全部普通消费者替代后，才能删除 Direct table/SDK legacy 分支与业务 Gate。
 EndpointRegistry/Exchange、containment/AS、Task/owner、同步 PolicyCall 保留；
 backing 居留和 DMA 静默条件按原契约，不宣称移除裸表后自动获得热卸载。

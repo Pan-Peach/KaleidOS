@@ -2,7 +2,8 @@
 # docs/interfaces/network.md 定义语义；本文件是布局 / 数值 / method 的唯一来源。
 # 方法返回 0 / -errno；尝试操作的 -EAGAIN = Pending；-EBUSY = 同步点竞争，未执行。
 # 所有指针只借用本次调用；Rust 对象 / enum / smoltcp 类型均不跨边界。
-# Gate 逐字段 LE 编码，无 padding；Direct 用 C table。未知值 / reserved 拒绝。
+# Future service uses generated IPC LE codecs, no business function table.
+# No network endpoint or IPC handler is implemented yet.
 
 [[struct]]
 name = "NetworkAddress"
@@ -10,7 +11,7 @@ c_name = "kcomp_network_address"
 size = 24
 align = 8
 targets = "c,sdk-rust"
-doc = "family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；Gate 各整数 LE 编码，port 也是整数。"
+doc = "family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；IPC 各整数 LE 编码，port 也是整数。"
 
 [[struct.field]]
 name = "family"
@@ -191,108 +192,6 @@ offset = 56
 name = "consumed"
 type = "u32"
 offset = 60
-
-[[struct]]
-name = "NetworkApi"
-c_name = "kcomp_network_api"
-size_ptrs = 19
-targets = "c,sdk-rust"
-doc = "有界非阻塞服务 table；输出只在成功时有效。task 上下文调用，禁止 park / IRQ 调用 / 保留 buffer。"
-
-[[struct.field]]
-name = "tcp_open"
-type = "fn(ctx: *mut void, family: u32, out_socket: *mut u64) -> i32"
-doc = "创建 Idle TCP；缓冲由服务分配，未绑定。"
-
-[[struct.field]]
-name = "udp_open"
-type = "fn(ctx: *mut void, family: u32, out_socket: *mut u64) -> i32"
-doc = "创建未绑定 UDP；服务拥有 buffers / inbox。"
-
-[[struct.field]]
-name = "socket_bind"
-type = "fn(ctx: *mut void, socket: u64, local: *const NetworkAddress) -> i32"
-doc = "预留端口，port=0 分配临时端口；不延迟到 listen/connect 才检查冲突。"
-
-[[struct.field]]
-name = "tcp_connect"
-type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress) -> i32"
-doc = "Idle 开始握手；未绑定时自动选端口，成功不表示连接建立。"
-
-[[struct.field]]
-name = "tcp_listen"
-type = "fn(ctx: *mut void, socket: u64, pending_limit: u32) -> i32"
-doc = "同一 ID / 端口由 Idle 转 Listening；limit>0；失败保持原状态。"
-
-[[struct.field]]
-name = "tcp_accept"
-type = "fn(ctx: *mut void, socket: u64, out_socket: *mut u64) -> i32"
-doc = "无已建立连接返回 EAGAIN；成功交付独立 ID，失败不消费排队连接。"
-
-[[struct.field]]
-name = "tcp_status"
-type = "fn(ctx: *mut void, socket: u64, out_status: *mut NetworkTcpStatus) -> i32"
-doc = "纯状态快照；不清除错误。"
-
-[[struct.field]]
-name = "tcp_send"
-type = "fn(ctx: *mut void, socket: u64, data: *const u8, len: usize, out_sent: *mut u32) -> i32"
-doc = "部分写合法；背压 EAGAIN，无保留 caller buffer；入队不代表 ACK。"
-
-[[struct.field]]
-name = "tcp_receive"
-type = "fn(ctx: *mut void, socket: u64, buffer: *mut u8, len: usize, out_read: *mut NetworkStreamRead) -> i32"
-doc = "无数据 EAGAIN，排空 FIN 后 end=1；reset 是错误。"
-
-[[struct.field]]
-name = "tcp_finish_send"
-type = "fn(ctx: *mut void, socket: u64) -> i32"
-doc = "排空 TX 后发 FIN，RX 保留；不释放对象。"
-
-[[struct.field]]
-name = "tcp_abort"
-type = "fn(ctx: *mut void, socket: u64) -> i32"
-doc = "中止连接 / 必要的 RST，状态仍可查询。"
-
-[[struct.field]]
-name = "udp_send_to"
-type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress, data: *const u8, len: usize) -> i32"
-doc = "未绑定时自动选端口；整包入队或 EAGAIN。EAGAIN 不提交首次自动绑定。"
-
-[[struct.field]]
-name = "udp_receive"
-type = "fn(ctx: *mut void, socket: u64, mode: u32, buffer: *mut u8, len: usize, out_datagram: *mut NetworkDatagram) -> i32"
-doc = "mode Peek=0 / Whole=1 / Truncate=2；无包 EAGAIN，Whole 短缓冲成功返回所需长度且不消费。"
-
-[[struct.field]]
-name = "udp_set_receive_peer"
-type = "fn(ctx: *mut void, socket: u64, peer: *const NetworkAddress) -> i32"
-doc = "family=0 解除过滤；只影响后续包，保留已有 inbox。"
-
-[[struct.field]]
-name = "socket_info"
-type = "fn(ctx: *mut void, socket: u64, out_info: *mut NetworkSocketInfo) -> i32"
-doc = "查询实际绑定，不执行 poll。"
-
-[[struct.field]]
-name = "socket_events"
-type = "fn(ctx: *mut void, socket: u64, out_events: *mut NetworkEvents) -> i32"
-doc = "查询已发布快照，不消费事件。"
-
-[[struct.field]]
-name = "socket_subscribe"
-type = "fn(ctx: *mut void, socket: u64, task: u32, out_subscription: *mut u64, out_events: *mut NetworkEvents) -> i32"
-doc = "登记和快照原子提交；变化后通知 task，调用方须重试操作再 park。"
-
-[[struct.field]]
-name = "socket_unsubscribe"
-type = "fn(ctx: *mut void, subscription: u64) -> i32"
-doc = "撤销精确 ID；可能有在途无害唤醒，旧 ID 永不指向新登记。"
-
-[[struct.field]]
-name = "socket_release"
-type = "fn(ctx: *mut void, socket: u64) -> i32"
-doc = "逻辑退役，通知并撤销观察者；服务稍后完成协议清理，不要求 caller 等待。"
 
 [[const]]
 name = "KCOMP_NETWORK_NAME"
