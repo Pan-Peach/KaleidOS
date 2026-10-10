@@ -704,7 +704,23 @@ extern "C" fn lifecycle_client(arg: *mut ()) {
                 break;
             }
         } else {
-            if ipc::call(ep, &[STOP], &mut []) != Ok(0) {
+            let request = if round % 10 == 4 || round % 10 == 5 {
+                // Accepted work yields until notification; queued work has not
+                // yet run when stop commits. Both must retain a successful reply.
+                let payload = if round % 10 == 4 { GRACEFUL } else { 42 };
+                let Ok(request) = ipc::submit(ep, &[payload]) else {
+                    passed = false;
+                    break;
+                };
+                if round % 10 == 4 {
+                    let _ = management::yield_task();
+                }
+                Some((request, payload))
+            } else {
+                None
+            };
+            let first = unsafe { abi::kcore_component_stop(id) };
+            if first != Errno::EBUSY.code() || ipc::submit(ep, &[]) != Err(Errno::ENOENT) {
                 passed = false;
                 break;
             }
@@ -721,6 +737,17 @@ extern "C" fn lifecycle_client(arg: *mut ()) {
                     passed = false;
                     break;
                 }
+            }
+            if let Some((request, payload)) = request {
+                let mut output = [0; 8];
+                if ipc::collect(request, &mut output) != Ok(1) || output[0] != payload {
+                    passed = false;
+                    break;
+                }
+            }
+            if unsafe { abi::kcore_component_stop(id) } != 0 {
+                passed = false;
+                break;
             }
         }
         let reclaimed = unsafe { abi::kcore_component_reclaim(id) };
@@ -829,6 +856,163 @@ pub fn lifecycle_group(checks: &mut Checks) {
     );
     // A timeout may leave execution pending on another CPU. Keep the argument
     // backing until confirmed exit; never lend a short-lived create-stack local.
+    if done {
+        let _ = mem::mem_release(region);
+    }
+}
+
+fn stop_until(id: u32, expected: i32) -> bool {
+    let end = deadline();
+    loop {
+        let code = unsafe { abi::kcore_component_stop(id) };
+        if code == expected {
+            return true;
+        }
+        if code != Errno::EBUSY.code() || unsafe { abi::kcore_now() } >= end {
+            return false;
+        }
+        if management::yield_task().is_err() {
+            return false;
+        }
+    }
+}
+fn force_until(id: u32) -> bool {
+    let end = deadline();
+    loop {
+        let code = unsafe { abi::kcore_component_force_stop(id) };
+        if code == 0 {
+            return true;
+        }
+        if code != Errno::EBUSY.code() || unsafe { abi::kcore_now() } >= end {
+            return false;
+        }
+        if management::yield_task().is_err() {
+            return false;
+        }
+    }
+}
+extern "C" fn graceful_client(arg: *mut ()) {
+    use management::ExecutionDomain::{
+        IsolatedNative as I, KernelNative as K, SandboxedNative as U,
+    };
+    let result = unsafe { &*arg.cast::<LifecycleResult>() };
+    let owner = management::current_component().unwrap();
+    let private = management::load(b"__runtime_capability_probe_missing", I) == Err(Errno::ENOENT);
+    let mut passed = true;
+    for domain in [K, I, U] {
+        if (domain != K && !private) || (domain == U && cfg!(target_arch = "riscv32")) {
+            continue;
+        }
+        let cpus: u32 = if private && cfg!(target_arch = "riscv64") {
+            2
+        } else {
+            1
+        };
+        for cpu in 0..cpus {
+            for mode in 0u32..=if domain == U { 3 } else { 2 } {
+                let mut config = [0; 24];
+                config[..4].copy_from_slice(&owner.to_le_bytes());
+                config[4..8].copy_from_slice(&cpu.to_le_bytes());
+                config[16..20].copy_from_slice(&mode.to_le_bytes());
+                config[20..24].copy_from_slice(&2u32.to_le_bytes());
+                let Ok(id) = management::create(b"kcomp_echo", domain, CONFIG_ABI, &config) else {
+                    passed = false;
+                    break;
+                };
+                let mut ep = 0;
+                if unsafe {
+                    abi::kcore_endpoint_lookup(id, NAME.as_ptr(), NAME.len(), CONTRACT, &mut ep)
+                } != 0
+                    || ready_call(ep, &[42], &mut [0; 8]) != Ok(1)
+                {
+                    passed = false;
+                    break;
+                }
+                let Ok(request) = ipc::submit(ep, &[GRACEFUL]) else {
+                    passed = false;
+                    break;
+                };
+                let _ = management::yield_task();
+                let expected = if mode == 0 { 0 } else { Errno::EIO.code() };
+                if !stop_until(id, expected)
+                    || ipc::collect(request, &mut [0; 8]) != Ok(1)
+                    || super::component_state(id) != Some(if mode == 0 { 5 } else { 6 })
+                    || unsafe { abi::kcore_component_stop(id) }
+                        != if mode == 0 { 0 } else { Errno::EINVAL.code() }
+                    || ipc::submit(ep, &[]) != Err(Errno::ENOENT)
+                {
+                    passed = false;
+                    break;
+                }
+                if domain != K
+                    && (!force_until(id) || unsafe { abi::kcore_component_reclaim(id) } != 0)
+                {
+                    passed = false;
+                    break;
+                }
+            }
+            if !passed {
+                break;
+            }
+        }
+        if !passed {
+            break;
+        }
+        // Cooperative code which ignores stop remains Stopping for a finite
+        // observation window; explicit Force cancels its saved execution.
+        let Some((id, ep)) = domain_provider(domain, owner, 0) else {
+            passed = false;
+            break;
+        };
+        if ready_call(ep, &[IGNORE_STOP], &mut []) != Ok(0) {
+            passed = false;
+            break;
+        }
+        let end = unsafe { abi::kcore_now() + abi::kcore_timebase_hz() / 50 };
+        let mut attempts = 0;
+        while unsafe { abi::kcore_now() } < end {
+            if unsafe { abi::kcore_component_stop(id) } != Errno::EBUSY.code() {
+                passed = false;
+                break;
+            }
+            attempts += 1;
+            let _ = management::yield_task();
+        }
+        if attempts == 0
+            || !passed
+            || super::component_state(id) != Some(4)
+            || !force_until(id)
+            || (domain != K && unsafe { abi::kcore_component_reclaim(id) } != 0)
+        {
+            passed = false;
+            break;
+        }
+        kcomp_sdk::klog!(
+            "[graceful] domain={:?} multi-task/destroy/timeout: PASS",
+            domain
+        );
+    }
+    result.result.store(u32::from(passed), Ordering::Release);
+    management::exit_task();
+}
+pub fn graceful_group(checks: &mut Checks) {
+    let region = mem::mem_alloc(
+        core::mem::size_of::<LifecycleResult>() as u64,
+        core::mem::align_of::<LifecycleResult>() as u64,
+    )
+    .unwrap();
+    let result = region.base as *mut LifecycleResult;
+    unsafe {
+        result.write(LifecycleResult {
+            result: AtomicU32::new(0),
+        });
+    }
+    let done =
+        start(graceful_client, result.cast()).is_some_and(|task| finish_with_budget(task, 60));
+    checks.check(
+        "component-graceful-drain",
+        done && unsafe { (*result).result.load(Ordering::Acquire) } == 1,
+    );
     if done {
         let _ = mem::mem_release(region);
     }

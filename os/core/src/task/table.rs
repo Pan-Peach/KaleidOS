@@ -98,12 +98,30 @@ impl TaskTable {
     ///
     /// `Exited` 是唯一终态：`yield` 只提交 `Runnable`、不会"自然退出"，
     /// 所以除 `Exited` 外的一切状态（`Created`/`Runnable`/`Running`/`Blocked`）
-    /// 都算未完成。停止编排（`component/exit.rs::stop_component`）用它做拒绝门；
-    /// 它不提供 join / 等待，也不改变任何任务状态。
+    /// 都算未完成。本查询不改变任务状态；停止推进还需 execution_retired 离场确认。
     pub fn has_live_tasks(&self, owner: ComponentId) -> bool {
         self.tasks
             .iter()
             .any(|(_, record)| record.owner() == owner && record.state() != TaskState::Exited)
+    }
+
+    /// Notify cooperative cleanup without aborting already published execution.
+    /// A permit covers stop-before-park. Never-started contexts own no business
+    /// work and can retire without entering the component.
+    pub(crate) fn notify_stop(&mut self, owner: ComponentId) {
+        for record in self.tasks.values_mut().filter(|r| r.owner() == owner) {
+            match record.state() {
+                TaskState::Created if record.execution_retired => {
+                    record.set_state(TaskState::Exited)
+                }
+                TaskState::Blocked => {
+                    record.set_state(TaskState::Runnable);
+                    record.set_park_pending(true);
+                }
+                TaskState::Runnable | TaskState::Running(_) => record.set_park_pending(true),
+                _ => {}
+            }
+        }
     }
 
     /// Lifecycle cancellation of saved or never-started execution. A Running
@@ -306,6 +324,36 @@ mod tests {
     fn setup() -> test_support::Guard<'static> {
         test_support::ensure_init();
         test_support::GUARD.lock()
+    }
+
+    #[test]
+    fn stop_notification_preserves_published_work_and_covers_early_park() {
+        let _heap = setup();
+        let mut table = TaskTable::new();
+        let dormant = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        let blocked = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        let running = table.create(OWNER, ENTRY, core::ptr::null_mut()).unwrap();
+        let other = table
+            .create(OTHER_OWNER, ENTRY, core::ptr::null_mut())
+            .unwrap();
+        for task in [blocked, running] {
+            table.start(OWNER, task).unwrap();
+            table
+                .transition(task, TaskState::Running(CpuId::from_raw(0)))
+                .unwrap();
+        }
+        table.transition(blocked, TaskState::Blocked).unwrap();
+        table.notify_stop(OWNER);
+        assert_eq!(table.get(dormant).unwrap().state(), TaskState::Exited);
+        assert_eq!(table.get(blocked).unwrap().state(), TaskState::Runnable);
+        assert_eq!(
+            table.get(running).unwrap().state(),
+            TaskState::Running(CpuId::from_raw(0))
+        );
+        assert!(table.get(running).unwrap().park_pending());
+        assert!(table.get(blocked).unwrap().park_pending());
+        assert_eq!(table.get(other).unwrap().state(), TaskState::Created);
+        assert!(!table.get(other).unwrap().park_pending());
     }
 
     #[test]

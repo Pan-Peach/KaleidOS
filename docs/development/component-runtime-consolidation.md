@@ -2,8 +2,8 @@
 
 > 审计/实施建议，2026-10-10；本地 develop HEAD
 > `7e3a3ed1da2e503d0acb74892dea50c977957b73`，起始工作区干净，未 fetch。
-> §1–§6 保留首次审计/方案及当时证据；用户随后授权生产实现，当前代码与最新验证见 §7。
-> 一般 Stop drain、S-mode 强杀与完整回收核算仍未完成，不从旧 PASS 推断这些能力。
+> §1–§6 保留首次审计/方案及当时证据；用户随后授权生产实现，当前代码与最新验证见 §7–§9。
+> 当前 Graceful 通知/drain 见 §9；S-mode 强杀与完整回收核算仍未完成，不从旧 PASS 推断这些能力。
 > 身份不变，普通业务 IPC-only 已有，不重新实现组件系统。
 
 契约分别在[生命周期 §11](../architecture/component-lifecycle.md#11-runtime-完整化当前与目标)、
@@ -356,7 +356,7 @@ Image/Instance Registry、资源容器、业务 Wire 或 DMA 恢复框架。§1�
 - **Removed Complexity**：删除 K-only IPC 拒绝；不用 provider 解引用 caller 私有地址、SUM 或第二份业务 Wire；I/U 不扩充生成器职责。
 - **Non-goals**：IPC timeout、业务 Session、无复制优化、shared ring、自动授权。raw submit 没有 fingerprint 参数，exact 校验仍在 typed validate/bind。
 - **Tests**：九格往返、private NULL/Core VA IPC/Task 输出 EFAULT 后原 receipt 仍可 reply，无孤立 Task；原 Exchange caller/server/reply 顺序与1000槽位复用。host 不证明跨 AS。
-- **Result**：同一 Exchange 已支持 I/U，逐页检查私有映射，U 要求 USER。锁序 registry→endpoint→Task 身份检查（释放 Task 锁）→AS pin→Exchange；wake/park 在全部锁释放后。Stopping 新 Task/IPC/backing 准入被拒绝；一般 Graceful cleanup Task 仍未开放。
+- **Result**：同一 Exchange 已支持 I/U，逐页检查私有映射，U 要求 USER。锁序 registry→endpoint→Task 身份检查（释放 Task 锁）→AS pin→Exchange；wake/park 在全部锁释放后。Stopping 新 Task/IPC/backing 准入被拒绝；当时一般 Graceful cleanup Task 未开放；后续已补，见 §9。
 
 ### 7.3 Force、实际离场与 CPU-only 物理 reclaim（L2/M1/I3/U3 部分完成）
 
@@ -419,7 +419,7 @@ retained_peak=192页；U读0x80200000触发cause13，CPU1 busy的first=-16/stop=
 
 | 小任务 | 文件 / 前置 | 验收与风险 |
 |---|---|---|
-| 一般 Graceful 通知/drain/有限推进 | `exit.rs/registry.rs/task/mod.rs/export/ipc.rs`；保留当前无live Task stop | 已有Task可仅为清理恢复、禁止新授权；重复stop/destroy failure/panic/stop-reply首终态、有限deadline；避免重新放开Stopping普通work |
+| 一般 Graceful 通知/drain/有限推进（后续已实现，见 §9） | `exit.rs/registry.rs/task/mod.rs/export/ipc.rs` | 已有Task可仅为清理恢复、禁止新授权；重复stop/destroy failure/panic/stop-reply首终态、有限deadline；避免重新放开Stopping普通work |
 | precise reclaim accounting | `registry.rs/endpoint.rs/memory/{slab,address_space}.rs`现有只读投影与CoreTest | backing/页表/Task实体分别为零；tombstone/容量/slab物理净增逐一核算；1000轮不接受不明余量 |
 | OOM/失败阶段注入 | `isolated_load/isolated_lifecycle/backing/task/mod/address_space`及host/ArchTest | before declare/root/map/exclude/task/output/destroy各失败有owner、safe release或retained原因；不将Rust alloc abort假装可恢复OOM |
 | SMP copy/unmap/stop-reply竞态 | `export/ipc.rs/access.rs/reclaim.rs`与CoreTest/ArchTest | 两CPU端到端无重复终态/UAF，临界区无反向锁；已有pin/ack只是机制证据 |
@@ -430,7 +430,7 @@ retained_peak=192页；U读0x80200000触发cause13，CPU1 busy的first=-16/stop=
 | DMA驱动生命周期 | 现有`device/dma/virtio`，后续Phase6 | quiesce/reset有证据前保持Quarantine，不阻塞CPU-only；没有实现IOMMU或恢复框架 |
 
 本阶段输出可以用于继续小补丁验收；不将这份CPU-only实现称作完整的全部生命周期/
-故障隔离承诺。一般Graceful、精确保留核算、原生浮点现场和完整并发/OOM矩阵是明确未完成项。
+故障隔离承诺。当时一般Graceful与精确保留核算未完成，后续见 §8–§9；原生浮点现场和完整并发/OOM矩阵仍未完成。
 
 浮点验收依据 [RISC-V psABI §1.3/§2.2](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/)
 （2026-10-10核对）：硬件浮点ABI对fs0–fs11有按ABI_FLEN保存的要求，fcsr有线程存储期。
@@ -518,6 +518,88 @@ AS manager的保留容量、计划Vec和已登记Exchange缓冲在场景前已�
 
 本轮增加1个查询入口、1个88字节整数结构和各既有表的只读投影；后端接口新增
 一个frames诊断方法（NoMMU为0）。没有新状态表、资源管理器、路由实现或业务IDL职责。
-一般Graceful drain、OOM/并发竞态、FP现场、远端shootdown与DMA恢复仍未实现。
+该计量补丁没有实现一般Graceful drain（后续见 §9）；OOM/并发完整矩阵、FP现场、远端shootdown与DMA恢复仍未实现。
 
-本轮增量尚未提交，前一批提交为`87b86be`；third_party无改动。
+计量补丁已提交为`2f9d44b`，前一批提交为`87b86be`；third_party无改动。
+
+## 9. Graceful Stop/drain 实施
+
+- **Problem**：`2f9d44b` 的 Stop 对 live Task/inflight 直接 EBUSY 并保持 Ready；
+  `may_run` 同时控制调度与新授权，Stopping 的 Task 无法回来清理。测试通过业务
+  STOP 提前退出 Server，无法证明 Core 发起通用 Graceful。重复 Stop 为 EINVAL。
+- **Invariant**：关闭准入先于 drain；已有请求首终态不被覆盖、receipt 不提前复用；
+  未实际切栈离场不得 destroy/free；destroy 只认领一次；Failed 优先且不能回到 Stopped。
+  权限来自真实 Task/owner，不从消息取得；不影响其他实例的 Task/Endpoint/backing。
+- **Minimal Change**：Registry 保留 may_run 的新准入，增 may_execute 清理调度谓词，
+  ComponentRecord 只增加 destroy_started 位；TaskTable 通知既有 owner Task 并留 permit；
+  Exchange 的原 Server 增 draining 位；exit.rs 非等待推进与离场检查；endpoint 仅允许
+  owner cleanup 解析；IPC 对拆除/回复开放窄门禁。新增一个只读 `kcore_task_stop_requested`
+  标量 C ABI，经 I Core bridge/U ecall 接线；SDK 只增加薄包装。POSIX Server 空 wait
+  返回错误时正常退出，避免把正常停止当作 panic。详细规则就地写[生命周期 §11.2](../architecture/component-lifecycle.md#112-graceful-stop)。
+- **Reuse**：现有 Stopping/Stopped、Task owner/state/permit/execution_retired、Registry
+  inflight/lifecycle pin、Endpoint 身份、Exchange 首终态与静态槽、原 destroy containment
+  和 U timer runner。没有新 Registry、通知队列、timer waiter、业务 wire 或 SDK 框架。
+- **Removed Complexity**：普通 Echo 的资源压力路径不再先发送业务 STOP；通用停止
+  不再要求作者另写终止 RPC。保留旧 STOP 作为 IPC close/业务退出测试，保留 Gate 硬件
+  与 Direct ctx pin 回归。Stop/Task/IPC 准入条件各有明确职责，不为内部步骤增加状态。
+- **Non-goals**：S-mode 任意抢占/挂死 destroy watchdog、DMA reset/recovery、父子级联
+  Stop、逐资源 Pending/TimedOut 结构、浮点现场与远端 TLB shootdown。caller 设截止
+  时间，EBUSY 仍 Stopping，不自动升级 Force；K/I 同步 destroy 依赖可信有界实现。
+- **Tests**：Host 覆盖 queued/accepted drain、新 submit/grant 拒绝、consumer 取消与
+  reply 两种顺序、receipt 归还、empty wait 一次唤醒、并发 destroy 单认领、Exited 与
+  离场 ack 分离；既有 IRQ/Gate 计数测试现在验证阻止 destroy 而不阻止关闭准入。
+  CoreTest 同一 Echo K/I/U、Server+2 worker、RV64 CPU0/CPU1，覆盖 destroy 非零/panic、U-mode busy destroy 截止、
+  重复 Stop、20ms 内多次 EBUSY 后显式 Force。1000 轮私有域覆盖 idle、queued、
+  accepted、fault/force/reclaim，严格物理页/逻辑对象核算继续成立。ArchTest 保留真实
+  Gate/权限/退出/fault 回归，host fake 不作为私有域或 SMP 证据。
+- **Result**：上述逻辑与测试已实现。实际执行结果在下方记录；S-mode 不合作执行仍
+  不能保证强杀，destroy watchdog 与完整并发/OOM、逐资源诊断仍是缺口。
+
+### 9.1 成熟实现取舍
+
+参考 [Linux man-pages 6.13 signal(7)](https://kernel.googlesource.com/pub/scm/docs/man-pages/man-pages/+/refs/tags/man-pages-6.13/man/man7/signal.7)
+的可处理终止与不可处理 SIGKILL 区别，以及
+[Fuchsia ComponentController（当前官方 runner reference）](https://fuchsia.dev/reference/fidl/fuchsia.component.runner/)
+的 Stop、等待 runner 结束、超时后管理方 Kill，再拆除 namespace 的顺序。
+采用“合作通知 / 实际执行结束确认 / 管理者显式升级”的分工；不照搬 POSIX signal
+队列/handler 或 FIDL controller 协议。Linux 用户进程和 Fuchsia runner 的强杀前提
+不能推导出 KaleidOS S-mode 的抢占或隔离能力。Fuchsia 文档包含 HEAD-only 事件，
+这里只参考 Stop/Kill 生命周期分工，不宣称实现其完整 controller/escrow。
+
+已有 IPC slot/receipt 足以拒绝新 work 并保留旧 reply，避免第一步一律 close 使所有
+合法请求取消；Core 不解释业务 method。队列为空即通知 Server，其他 worker 查询
+同一个状态并响应唤醒。没有业务 session/drain policy 注册表，也不增加 ConnectionId。
+
+### 9.2 实际验证
+
+2026-10-10，所有命令退出 0（验证时 Graceful 补丁尚未提交，起始 HEAD 为 `2f9d44b`）：
+
+| 命令 | 实际结果 / 验证层次 |
+|---|---|
+| `make check` | PASS：fmt、Clippy、ABI/Kconfig、全部 host、RV64 build/RV32 check；Core 589 PASS、6 ignored |
+| `make test-host` | PASS：Core 589 PASS、6 ignored；新增 7 个真实生产 truth logic 用例，其他库/tool/fixture 回归通过 |
+| `make test-qemu` | PASS：RV64 default/no-block 各 120，RV32 各 94；shell 与 init RV64 五场景/RV32 四场景全部通过 |
+| `make test-arch` | PASS：RV64/RV32 各 43/43、RV64 SMP 3/3；原 Gate/权限/fault/跨 AS 硬件回归保留 |
+| `make O=build/tests/runtime-nommu-rv32 _test-qemu-one` | PASS：default/no-block 各 91；K Graceful 可用，I/U 不适用；3 个既有跨 AS dead-code warning，不是隔离证据 |
+
+实际串口样例：
+`build/tests/qemu-rv64/logs/coretest-rv64-default-fbbqn0kb.log`，
+`build/tests/qemu-rv32/logs/coretest-rv32-default-087cg03d.log`。
+两者记录各支持域 `[graceful] ... multi-task/destroy/timeout: PASS`；RV64 的 U busy
+mode=3 在 Server/worker 分别放 CPU0、CPU1 的两种部署下均经 timer 截止；destroy
+由 CPU0 管理 Task 触发，stop 返回 EIO/Failed 后可 force/reclaim，不声称验证了 CPU1 上的 destroy。
+K/I 未测试永久 S-mode 忙循环，因为当前协作调度不能保证返回；没有把它登记为可强杀。
+
+四个 MMU 场景仍完成 1000 轮；每轮排空 AS、私有映射、表页、Core/API 栈、IPC request
+和 exclusion。首个停止请求之后新 Endpoint 调用已拒绝，已排队/接受结果仍可收取。
+样例最终 `unaccounted=0`；RV64 的显式保留仍为 192 页，RV32 113 页（Registry/Endpoint
+容量与名称 slab，分项见 §8），不是物理页全部回到加载前。Graceful group 里的 K
+实例 image/Task tombstone 保持驻留，发生在 1000 轮基线之前，不能把它们说成已批量回收。
+
+中途验证发现两项测试问题并修正：停止中 Task create 的现有 RequesterNotReady errno
+是 EAGAIN，fixture 最初错写 EPERM；旧 Gate host 使用虚构未注册 caller，新停止门禁
+会提前拒绝，现改用注册的 Ready 实例。没有放宽生产身份/准入检查或内存计量容差。
+
+最终 `git diff --check`、生成物一致性与修改文档本地链接检查通过。完整 Stop/Reply/
+Force 多 CPU 交错、copy/unmap/OOM 注入尚未穷尽；S-mode 同步 destroy deadline 无法
+保证打断，逐资源保留诊断/DMA 仍在后续清单，不能由这些 PASS 推导。

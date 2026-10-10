@@ -575,8 +575,8 @@ extern "C" fn kcore_component_stop(component: u32) -> i32 {
         let Some(caller) = RequestContext::ambient() else {
             return Errno::EPERM.code();
         };
-        if let Some(denied) = deny_if_failed(caller.component) {
-            return denied;
+        if !crate::component::may_run(caller.component) {
+            return Errno::EPERM.code();
         }
         if let Some(denied) = deny_if_isolated(caller.component) {
             return denied;
@@ -1150,6 +1150,41 @@ extern "C" fn kcore_task_unpark(id: u32) -> i32 {
     })
 }
 
+extern "C" fn kcore_task_stop_requested() -> i32 {
+    if crate::component::isolated_api::active() {
+        return crate::component::isolated_api::on_core(|| kcore_task_stop_requested())
+            .unwrap_or_else(Errno::code);
+    }
+    with_core_critical(|| {
+        let Some(ctx) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        let Some(id) = ctx.task else {
+            return Errno::EPERM.code();
+        };
+        if crate::component::containment::task_switch_forbidden()
+            || sched::current_task() != Some(id)
+        {
+            return Errno::EPERM.code();
+        }
+        let registry = registry::get_registry().lock();
+        let table = task::get_task_table().lock();
+        if table.get(id).is_none_or(|r| {
+            r.owner() != ctx.component || r.state() != TaskState::Running(crate::smp::current_cpu())
+        }) {
+            return Errno::EPERM.code();
+        }
+        match registry.get(ctx.component).map(|r| r.state) {
+            Some(crate::component::ComponentState::Stopping) => 1,
+            Some(
+                crate::component::ComponentState::Starting
+                | crate::component::ComponentState::Ready,
+            ) => 0,
+            _ => Errno::EPERM.code(),
+        }
+    })
+}
+
 /// 退出：Running → Exited + 调度切换。**控制权永不回到本任务**——若还有
 /// Runnable 任务则它们接管；全部退出后回到调度器锚点（调 `kcore_sched_run`
 /// 的上下文）。返回 0 / `-Errno`。
@@ -1601,6 +1636,24 @@ mod tests {
 
     use super::*;
     use crate::component::{containment, load::ComponentLoadError};
+
+    #[test]
+    fn stop_query_requires_real_running_task_and_rejects_lifecycle_identity() {
+        let _boundary = crate::component::containment::test_boundary_lock();
+        let _heap = crate::memory::test_support::GUARD.lock();
+        crate::memory::test_support::ensure_init();
+        crate::task::init();
+        crate::component::registry::init();
+        crate::component::containment::enter_anchor();
+        assert_eq!(kcore_task_stop_requested(), Errno::EPERM.code());
+        let id = registry::test_support::ready(b"stop_query");
+        crate::component::containment::with_test_init_boundary(Some(id), || {
+            assert_eq!(kcore_task_stop_requested(), Errno::EPERM.code());
+        });
+        crate::component::containment::enter_task(TaskId::from_raw(u32::MAX), id);
+        assert_eq!(kcore_task_stop_requested(), Errno::EPERM.code());
+        crate::component::containment::enter_anchor();
+    }
 
     #[test]
     fn lifecycle_entries_reject_task_switches_without_losing_principal() {

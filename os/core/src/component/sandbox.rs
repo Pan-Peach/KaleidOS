@@ -28,6 +28,7 @@ pub(crate) const IMPORTS: &[&[u8]] = &[
     b"kcore_task_start_on",
     b"kcore_task_yield",
     b"kcore_task_exit",
+    b"kcore_task_stop_requested",
     b"kcore_panic_escape",
     b"kcore_endpoint_publish",
     b"kcore_endpoint_lookup",

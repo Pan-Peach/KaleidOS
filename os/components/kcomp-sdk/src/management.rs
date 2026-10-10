@@ -139,6 +139,14 @@ pub fn start_task(entry: abi::KcompTaskEntry) -> Result<u32> {
     Ok(id)
 }
 
+pub fn stop_requested() -> Result<bool> {
+    match unsafe { abi::kcore_task_stop_requested() } {
+        0 => Ok(false),
+        1 => Ok(true),
+        code => Err(crate::Errno::from_code(code)),
+    }
+}
+
 pub fn yield_task() -> Result<()> {
     let code = unsafe { abi::kcore_task_yield() };
     if code == 0 {

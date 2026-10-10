@@ -320,7 +320,7 @@ fn gate_stop_race(state: *mut State) -> Option<()> {
     }
     // Provider owns no tasks. CPU1 is executing its Gate on a consumer task.
     let busy = unsafe { abi::kcore_component_stop(provider) } == Errno::EBUSY.code()
-        && super::deployment::state(provider) == Some(3);
+        && super::component_state(provider) == Some(4);
     shared.control[1].store(1, Ordering::Release);
     if !await_exit(task)
         || !busy
@@ -344,7 +344,7 @@ fn gate_stop_race(state: *mut State) -> Option<()> {
         )
     } != Errno::ENOENT.code()
         || status != 123
-        || unsafe { abi::kcore_component_stop(provider) } != Errno::EINVAL.code()
+        || unsafe { abi::kcore_component_stop(provider) } != 0
     {
         return None;
     }

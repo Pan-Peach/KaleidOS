@@ -52,7 +52,7 @@ reply、cancel、端口 close/Provider failure 在同一锁下竞争首个终态
 raw submit 的调用者必须 collect 或退出。IPC 没有请求 timer deadline；Component Force 单独撤销服务并等待真实执行离场。
 
 caller Task 退出丢弃其结果，queued 请求立即退役，accepted receipt 保留至 server 归还。
-Server Task 退出会关闭其端口；Provider 停止/失败关闭所有端口并以 ENOTCONN 完成尚无
+Server Task 退出会关闭其端口；Provider 完成停止/失败关闭所有端口并以 ENOTCONN 完成尚无
 终态的请求。已成功回复保留首个结果，允许存活 caller 收取；旧 endpoint 永不重定向。
 关闭 transport 不替 Provider 回收业务 Session；创建对象后 caller 丢失回复的清理必须由
 对应业务协议解决。VFS/FatFs 的创建类方法检查 reply 结果并回滚；两者还在后续请求
@@ -84,7 +84,7 @@ QEMU 覆盖 RV64 跨 CPU 往返及 RV32 同 CPU，比较旧 Direct/Gate 的 trac
 
 ## 私有执行域接通
 
-Task/import/runner/copy 已实现，一般 Graceful cleanup/drain 与完整竞态矩阵仍缺。
+Task/import/runner/copy 与 Graceful cleanup/drain 已实现；完整竞态矩阵仍缺。
 `access::Pinned` 持 AS 表锁覆盖完整检查、copy 与 Exchange 提交；所有输出验证先于消费。
 
 业务 Contract/Handler 与现有 Wire 不变：K 经窄 C ABI，I 经 Core 栈/root 桥接，
@@ -99,11 +99,13 @@ caller 私有 VA，不依赖 SUM。除 payload 外，request id、consumer、len
 无法收取的 submit。锁/借用顺序需与 Task/AS teardown 一起设计，不能只有一次
 validate 后锁外使用可能被 unmap/free 的 PA。消息仍只存 Core-owned 副本。
 
-停止初期沿用 close 的首终态/cancel-and-drain：成功 reply 保留供活 caller collect；
-其余请求终结 ENOTCONN；关闭 receipt 不表示 provider 已停止处理自己的副本。
-Task/callback 离场仍由[生命周期](component-lifecycle.md#11-runtime-完整化当前与目标)确认。
-Graceful 已有 Task 的 cleanup 允许 cancel/collect/释放等拆除操作，拒绝新 submit/listen/
-grant；目前 transaction 的 may_run 门禁不能支持此目标。
+Graceful Stopping 关闭新 listen/grant/submit，既有 Server 标为 draining，queued/
+accepted 入站请求仍可 receive/reply；空 receive/wait 返回 ENOTCONN 并唤醒等待者。
+只有 owner 经 cleanup 解析可访问其仍 Live 的端口，外部 resolve/lookup/submit 已拒绝。
+consumer 的未终结出站请求取消 ECANCELED，collect/cancel/reply/close 可由 cleanup
+Task 执行。accepted receipt 仍占槽，直到晚 reply 或 close；成功回复保留首终态。
+Task exit/最终 stop/Force 仍复用永久 close；close 不表示业务副本已停止访问镜像。
+实际离场与 destroy 规则见[生命周期](component-lifecycle.md#112-graceful-stop)。
 
 raw IPC 每次复验 endpoint 活性和 grant；exact ABI 当前在 typed validate/bind，
 submit ABI 本身不携带 contract/fingerprint，Core 不解析业务 envelope。私有域使用

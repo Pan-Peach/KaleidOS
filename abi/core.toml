@@ -686,12 +686,14 @@ name = "kcore_component_stop"
 ret = "i32"
 category = "Component lifecycle"
 doc = """
-请求优雅停止实例，复用 monitor 的 Stop 编排；只支持 KernelNative caller。
-需要组件执行身份，IRQ / Gate / policy 上下文拒绝。目标必须 Ready；有未退出 Task、
-Gate / policy / IRQ 在途执行，或 Native 已发布 Direct 表时返回 EBUSY，拒绝不改状态。
-检查与 Stopping 提交共用准入事务；锁外调用 destroy。成功为 Stopped；destroy
-失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
-KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。
+非等待式优雅停止推进，只支持活 KernelNative 管理 caller。
+首次 Ready → Stopping 关闭新 authority / Task / Endpoint / IPC 准入，唤醒已有 Task；
+已有入站请求可以 receive/reply，出站未完成请求取消但可 collect。Task 可执行清理。
+尚有 Task / 执行未真实离场返回 EBUSY（保持 Stopping）；调用方设截止时间重试，
+超时可显式 force。排空后只认领一次 destroy；成功 Stopped，重复 stop 返回 0。
+destroy 错误或 panic 为 Failed，不重试。Native Direct 表无 release 协议，首次拒绝
+EBUSY 并保持 Ready。K/I S-mode destroy 无抢占 watchdog，仍需可信有界实现。
+IRQ / Gate / policy 上下文拒绝。本操作不引入跨组件管理权限或父子 owner 账本。
 """
 [[function.param]]
 name = "component"
@@ -808,6 +810,12 @@ owner 调用；相关任务表锁路径必须防止 IRQ 重入死锁。`TaskId` 
 [[function.param]]
 name = "id"
 type = "u32"
+
+[[function]]
+name = "kcore_task_stop_requested"
+ret = "i32"
+category = "Component task"
+doc = "真实当前 Task 的 owner 已 Stopping 返回 1；Starting/Ready 返回 0；非 Task/错误身份返回 EPERM。只读停止通知，K/I/U 同一接口，不改变执行或授予权限。"
 
 [[function]]
 name = "kcore_task_exit"

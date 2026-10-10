@@ -251,7 +251,7 @@ pub fn endpoint_call(
     // 也不会改写 caller 的任务归属。
     let caller_task = ambient.as_ref().and_then(|ctx| ctx.task);
     if let Some(caller) = caller {
-        if crate::component::is_failed(caller) {
+        if !crate::component::may_run(caller) {
             return Err(CallError::CallerFailed);
         }
         let domain = endpoint::instance_domain(&registry::get_registry().lock(), caller);
@@ -277,7 +277,7 @@ pub(super) fn dispatch(
 ) -> Result<(), CallError> {
     // (1) 身份门禁：无 principal / 已 Failed → EPERM（与其它 acquiring 入口一致）。
     let caller = caller.ok_or(CallError::NoCaller)?;
-    if crate::component::is_failed(caller) {
+    if !crate::component::may_run(caller) {
         return Err(CallError::CallerFailed);
     }
 
@@ -534,14 +534,14 @@ mod tests {
     const CONTRACT: u64 = 0xCA11_0001;
     const ABI: u64 = 0xCA11_0002;
     const PORT: u32 = 7;
-    /// 调用方任务 owner：不要求是注册实例（`deny_if_failed` 只拦已 Failed 的
-    /// caller——身份不是权限，本层不发明额外门禁）。
-    const CALLER: ComponentId = ComponentId::from_raw(0x00C0_FFEE);
-    /// 嵌套生命周期边界的 owner：高位 id（真实 `declare` 序列到不了这里），
-    /// 避免与并行用例在全局 registry 里留下的 `Failed` 记录串扰——`dispatch`
-    /// 先查 `is_failed(caller)`，用 `ComponentId::from_raw(5)` 之类的小 id 会
-    /// 依赖测试执行顺序（偶发 `CallerFailed`）。
-    const NESTED_INIT: ComponentId = ComponentId::from_raw(0x00C0_FFEF);
+    fn caller_id() -> ComponentId {
+        static CALLER: spin::Once<ComponentId> = spin::Once::new();
+        *CALLER.call_once(|| ready_provider(b"call_caller", None, core::ptr::null_mut()))
+    }
+    fn nested_init() -> ComponentId {
+        static OWNER: spin::Once<ComponentId> = spin::Once::new();
+        *OWNER.call_once(|| ready_provider(b"call_nested_init", None, core::ptr::null_mut()))
+    }
 
     /// dispatcher 调用计数（"provider 从未被调用"的断言依据）。模块内测试由
     /// `containment::test_boundary_lock` 串行化，快照/比较是确定的。
@@ -677,7 +677,7 @@ mod tests {
     /// 建立 caller 边界（task 身份）并初始化全局真相；返回 heap guard。
     fn enter_caller(task: u32) {
         containment::enter_anchor();
-        containment::enter_task(TaskId::from_raw(task), CALLER);
+        containment::enter_task(TaskId::from_raw(task), caller_id());
     }
 
     // -- 1. 调用必须经 service 边界（host fake 不执行入口体） -------------------
@@ -1158,7 +1158,7 @@ mod tests {
         let before = DISPATCH_CALLS.load(Ordering::SeqCst);
         let mut out_status = 0i32;
 
-        containment::with_irq_scope(ComponentId::from_raw(0xBEEF), || {
+        containment::with_irq_scope(provider, || {
             let error = endpoint_call(
                 endpoint,
                 0,
@@ -1175,7 +1175,7 @@ mod tests {
             assert_eq!(Errno::from(error), Errno::EINVAL);
 
             // 藏在嵌套生命周期边界之下同样拒绝（top-guard-only 检查会漏掉）。
-            containment::with_test_init_boundary(Some(NESTED_INIT), || {
+            containment::with_test_init_boundary(Some(nested_init()), || {
                 let error = endpoint_call(
                     endpoint,
                     0,
@@ -1305,7 +1305,7 @@ mod tests {
         assert_eq!(registry::get_registry().lock().active_calls(provider), 0);
         // caller 边界仍在：provider 的逻辑死亡没有波及 caller 的任务归属。
         let ambient = crate::resource::RequestContext::ambient().expect("caller boundary intact");
-        assert_eq!(ambient.component, CALLER);
+        assert_eq!(ambient.component, caller_id());
         assert_eq!(ambient.task, Some(TaskId::from_raw(24)));
         // provider 的 endpoint 永久失效。
         let reg = registry::get_registry().lock();

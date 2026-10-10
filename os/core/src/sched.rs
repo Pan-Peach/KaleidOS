@@ -234,7 +234,7 @@ fn collect_claimable_for(cpu: CpuId) -> Vec<TaskId> {
     let reg = registry::get_registry().lock();
     candidates
         .into_iter()
-        .filter(|(_, owner)| reg.may_run(*owner))
+        .filter(|(_, owner)| reg.may_execute(*owner))
         .map(|(id, _)| id)
         .collect()
 }
@@ -246,18 +246,18 @@ pub(crate) fn has_claimable_for(cpu: CpuId) -> bool {
     let _irq = IrqSaveGuard::new();
     let reg = registry::get_registry().lock();
     task::get_task_table().lock().iter().any(|(_, r)| {
-        r.state() == TaskState::Runnable && r.claimable_by(cpu) && reg.may_run(r.owner())
+        r.state() == TaskState::Runnable && r.claimable_by(cpu) && reg.may_execute(r.owner())
     })
 }
 
 /// Commit-time 门禁：任务 owner 此刻是否仍允许运行。
 ///
 /// `collect_runnable` 只过滤一次候选；在真正把 CPU 交给某个任务前，Core 用同一条
-/// 真相（`Registry::may_run`）再验证一次——`pick_next` 可能隔离了一个失败组件，
+/// 真相（`Registry::may_execute`）再验证一次——`pick_next` 可能隔离了一个失败组件，
 /// 而它恰好是候选任务的 owner。owner 已死 → 绝不 commit。
 fn owner_still_runnable(id: TaskId) -> bool {
     let owner = task::get_task_table().lock().get(id).map(|r| r.owner());
-    owner.is_some_and(crate::component::may_run)
+    owner.is_some_and(|owner| registry::get_registry().lock().may_execute(owner))
 }
 
 /// 选择调度策略（`kcore_sched_set_policy` 的 Core 实现）：把 `endpoint` 提交为
@@ -564,13 +564,13 @@ fn schedule_next_with_guard(
             return Err(SchedError::InvalidTransition);
         }
         if let Some(id) = next
-            && table.get(id).is_none_or(|r| !reg.may_run(r.owner()))
+            && table.get(id).is_none_or(|r| !reg.may_execute(r.owner()))
         {
             next = None;
         }
         let mut after = after.clone();
         if let Some(id) = from
-            && table.get(id).is_some_and(|r| !reg.may_run(r.owner()))
+            && table.get(id).is_some_and(|r| !reg.may_execute(r.owner()))
         {
             after = Some(TaskState::Exited);
         }
@@ -776,7 +776,7 @@ pub fn unpark_task(
         if record.owner() != requester {
             return Err(task::TaskError::WrongOwner);
         }
-        if !registry.may_run(requester) {
+        if !registry.may_execute(requester) {
             return Err(task::TaskError::RequesterNotReady);
         }
         let outcome = table.unpark(requester, task_id)?;
@@ -1737,7 +1737,7 @@ mod tests {
 
         let provider = ready_component(b"sched_gate_provider");
         let endpoint = EndpointId::from_raw(1);
-        let nested_owner = ComponentId::from_raw(0x00C0_FFEE);
+        let nested_owner = ready_component(b"sched_nested_owner");
 
         containment::with_test_policy_boundary(provider, endpoint, || {
             // 调度操作：run / yield / exit 一律拒绝（调度帧正挂起）。

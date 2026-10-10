@@ -17,7 +17,7 @@
 - `mod.rs`：`ComponentId`、`ComponentState::can_transition`、`is_failed`、`may_run`。
 - `registry.rs`：`Registry`、`ComponentRecord`（`name: Vec<u8>` + `loaded: LoadedComponent`）、`RegistryError`；`declare` / `resolve` / `begin_start` / `finish_start` / `begin_stop` / `finish_stop` / `mark_failed` / `record_instance_state`；全局 `get_registry`。
 - `abi.rs`：`InterfaceAbi`（exact fingerprint）、`InterfaceKind`（生成物 re-export）。
-- `load.rs`：`ComponentLoadError`、`current_component()` / `with_current()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：分派到 `create_kernel_native` / `create_isolated_native` / `create_sandboxed_native`（前两者分别走 `loader.rs` / `isolated_lifecycle.rs`；Sandbox 装载前返回 `-ENOTSUP`）。**每次调用都重新 instantiate**（独立放段 / 重定位），同名 artifact 可并存多个组件；能力不足 / 支持面之外的 import → 装载前显式拒绝。见 `deployment.md` §6.2/§7.1/§10。
+- `load.rs`：`ComponentLoadError`、`current_component()` / `with_current()`、`load_and_start(name, kind)`、`create_component(name, args, kind)`。`kind` 是**部署请求**：分派到 `create_kernel_native` / `create_isolated_native` / `create_sandboxed_native`（前两者分别走 `loader.rs` / `isolated_lifecycle.rs`；Sandbox 复用私有 loader 和 U runner，仅 RV64 S/MMU 支持）。**每次调用都重新 instantiate**（独立放段 / 重定位），同名 artifact 可并存多个组件；能力不足 / 支持面之外的 import → 装载前显式拒绝。见 `deployment.md` §6.2/§7.1/§10。
 - `sandbox.rs`：RV64 `.kcomp` U runner、USER thunk 与 trap/timer 路由；`export/sandbox.rs` 将白名单 C ABI 分派到已有 Core API。无 personality/POSIX 语义；其他目标显式拒绝。
 - `loader.rs`：`load_component()`、`LoadedComponent`、`LoaderError`；解析 ELF、放置段、应用重定位、解析 `kcomp_instance_create` / `kcomp_instance_destroy` / `kcomp_abi`。
 - `elf.rs`：架构中立 ELF ET_REL 解析（`ElfObject`、`ElfError`、`ElfClass`、`Section`、`Symbol`、`Relocation`）。
@@ -28,7 +28,7 @@
 - `export/query.rs`：console 输入与 component / endpoint / device 只读值投影；名称完整拷贝，设备描述及 owner / quarantine 只复制值，不交付私有指针。
 - `export.rs`：`kcore_*` 导出 ABI 实现（清单以 `abi/core.toml` 为准）与 `resolve(name) -> Option<usize>`。
 - `failure.rs`：`fail_component`、`revoke_authority_and_unbind`。
-- `exit.rs`：`stop_component`、`ComponentStopError`。
+- `exit.rs`：`stop_component` 非等待推进、owned Task 通知与实际离场确认、一次 destroy、`ComponentStopError`；`registry.rs::may_execute/claim_destroy` 与 Exchange draining 在原表记录停止事实。
 - `isolated.rs`：私有 AS 进入的 Core 侧准备（`PreparedTransition`、`EntryArgs`、`prepare`、`enter`、`ComponentFault`、`FaultPolicy`、`install` / `register_fault_policy`）+ **普通 trap 路径的异常钩子**（`on_exception`：按活动跨 AS 现场归因、默认拒绝恢复、放弃经 trampoline 交回 Core 延续）；进入参数（组件入口 `a0..a3`）由 Core 解释、arch 只搬运。**生产调用方 = `isolated_lifecycle.rs`**（Isolated 的 create / destroy / service dispatch 都经这里）；`prepare` 在锁内校验并取出 `Copy` 描述符，`enter` 在锁外组装 **per-invocation** trampoline 记录（CrossAsContext LIFO 链）。
 - `isolated_load.rs`：**按域装载**：`PlacedImage` / `PlacedSegment` / `IsolatedLoadError`、`place(blob)` / `place_artifact(name)` / `map_into(handle, image)` / `map_mappings(handle, &mappings)`，以及组件登记用的 `PlacedImage::mappings()` / `into_loaded_component()`。每个 ALLOC 段拿到**自己的页对齐范围**（text = R+X、rodata = R、data/bss = R+W），import 白名单（诊断 / 只读、panic、私有 backing 与 endpoint API）解析到共享 Core 低别名，显式拒绝出窗 / 重叠 / 不可表达权限 / 非 2 的幂对齐 / 白名单外 import；**可选 `kcomp_service_dispatch` 解析成实例域 VA**（必须落在 R+X 段内）；重定位复用 `loader.rs` 的私有 ELF API（按域 base 重算，绝不复用 KernelNative 放段结果）。ArchTest 在 RV64/RV32 QEMU 直接驱动机制用例，生产消费方是 `isolated_lifecycle.rs`。
 - `isolated_lifecycle.rs`：I/U 共用私有实例生命周期；先声明 image owner 再发布 backing，I 经 trampoline、U 经 sandbox runner 跑 create/destroy。所有已发布失败窗口保留到显式 reclaim；旧同步 Gate dispatch 仅供诊断。
@@ -41,14 +41,14 @@
 - **不做物理 unload / refcount 回收**：`Stopped` / `Failed` 记录留 tombstone，段内存不回收，`ComponentId` 不复用。
 - **无 ABI 版本兼容**：`kcomp_abi` 是 exact 指纹，不自动生成、不做兼容协商；陈旧 `.kcomp` 不保证可加载。
 - **失败路径不调 `kcomp_instance_destroy`**（崩溃的模块不值得信任）；`Failed` 只走 `fail_component`。
-- 无 `UnexpectedExit` 独立终态（意外退出统一 `Failed`）；无实例退役 / 段内存回收；无 drain variant（live Task / Gate、policy、IRQ 执行或 Native Direct 发布均拒绝停止）。
+- 无 `UnexpectedExit` 独立终态（意外退出统一 `Failed`）；Graceful 非等待推进/drain 与 I/U CPU-only reclaim 已接线；Native Direct 引用仍保活，S-mode 不保证非协作执行强杀。
 - **panic recovery ≠ fault isolation**：KernelNative 组件仍可能写坏 Core 内存 / UB / 持锁死亡，这是协作式 containment，不是对抗隔离。
 
 ## 代码在哪
 
 本轮[Runtime审计](../../development/component-runtime-consolidation.md)补全停止/回收缺口与
 逐文件任务；[生命周期§11](../../architecture/component-lifecycle.md#11-runtime-完整化当前与目标)
-是未实现目标，不能将其Graceful drain/Force/Reclaimed语义当作当前模块能力。
+区分当前 Graceful/Force/私有 reclaim 与尚未实现的抢占、DMA 静默和逐资源诊断。
 
 | 文件 | 内容 |
 |---|---|

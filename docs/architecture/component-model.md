@@ -316,19 +316,11 @@ KernelNative 仍可能破坏 Core 内存 / UB / 带锁死亡；Isolated 的条�
 
 ### 5.2 退出语义
 
-`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线：Core 侧唯一汇合点 = `component/exit.rs::stop_component`，生产调用方 = monitor `unload <name>` 与 `kcore_component_stop`。顺序：
-
-```text
-1. 拒绝门（提交之前；拒绝不改 Core 真相）：非 Ready；Native Direct publication；未退出任务；Core-managed inflight
-2. begin_stop             Ready → Stopping：任务 run 门禁 + publish 拒绝
-3. kcomp_instance_destroy Core-owned 隔离栈；ambient identity = 被停止实例
-4. Core 兜底              撤销归属（device quarantine / DMA 停车）+ 失效 provider endpoint
-5. finish_stop            Stopping → Stopped（记录保留）
-```
-
-失败路径刻意不调用 destroy；destroy 非零、panic 或栈分配失败均进入 Failed，不重试。
-一般 drain、Direct release、S-mode 退出超时/看门狗仍缺；RV64 Sandbox 停止与私有 CPU-only reclaim 已接，范围以生命周期/部署契约为准。
-细节见冻结契约；不在概念页另维护一套门禁或终态规则。
+`Stopping` / `Stopped` 与 `kcomp_instance_destroy` 已接线，唯一汇合点是
+`component/exit.rs::stop_component`。先关闭新工作、通知已有 Task、排空 IPC 和实际
+执行，再一次认领 destroy；未排空返回 EBUSY 保持 Stopping，重复 Stopped 返回 0。
+Force 跳过 destroy；逻辑失效和物理回收分别证明。精确门禁、失败与域保证统一见
+[生命周期 §11](component-lifecycle.md#11-runtime-完整化当前与目标)，本页不复制规则表。
 
 ## 6. Ownership Tree 与 Dependency DAG —— 两种关系，绝不混淆
 

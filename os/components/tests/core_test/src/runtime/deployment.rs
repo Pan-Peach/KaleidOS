@@ -49,17 +49,7 @@ fn relay(provider: u32, target: u32) -> bool {
     binding.write(u64::MAX - 1, &input).is_ok()
 }
 
-pub(super) fn state(id: u32) -> Option<u32> {
-    let mut name = [0; 64];
-    let mut ordinal = 0;
-    while let Some(info) = management::component_nth(ordinal, &mut name).ok()? {
-        if info.id == id {
-            return Some(info.state);
-        }
-        ordinal += 1;
-    }
-    None
-}
+use super::component_state as state;
 
 fn services(checks: &mut Checks) -> Option<()> {
     use ExecutionDomain::{IsolatedNative as I, KernelNative as K};

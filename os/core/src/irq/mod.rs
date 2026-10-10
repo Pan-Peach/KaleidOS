@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_callback_blocks_stop_after_route_release() {
+    fn admitted_callback_blocks_destroy_after_stop_and_route_release() {
         let _serial = IRQ_TEST_LOCK.lock();
         let _machine = crate::machine::test_support::GUARD.lock();
         install_test_irq_table();
@@ -301,12 +301,13 @@ mod tests {
         assert!(prepare_callback(42).is_some());
         irq::get_table().lock().revoke_owner(owner);
         let mut reg = crate::component::registry::get_registry().lock();
+        reg.begin_stop(owner).unwrap();
         assert_eq!(
-            reg.begin_stop(owner),
+            reg.claim_destroy(owner),
             Err(crate::component::registry::RegistryError::Busy)
         );
         reg.finish_call(owner);
-        reg.begin_stop(owner).unwrap();
+        reg.claim_destroy(owner).unwrap();
         drop(reg);
         irq::get_table()
             .lock()

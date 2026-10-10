@@ -476,12 +476,14 @@ uint32_t kcore_component_count(void);
 int32_t kcore_component_create(const uint8_t *image_name, size_t image_name_len, uint32_t domain, const struct KcompCreateArgs *args, uint32_t *out_instance);
 /* 请求按 domain 部署默认配置的组件。返回 ComponentId raw / -errno；Core 验证并提交，不静默降级。 */
 int32_t kcore_component_load(const uint8_t *name, size_t len, uint32_t domain);
-/* 请求优雅停止实例，复用 monitor 的 Stop 编排；只支持 KernelNative caller。
- * 需要组件执行身份，IRQ / Gate / policy 上下文拒绝。目标必须 Ready；有未退出 Task、
- * Gate / policy / IRQ 在途执行，或 Native 已发布 Direct 表时返回 EBUSY，拒绝不改状态。
- * 检查与 Stopping 提交共用准入事务；锁外调用 destroy。成功为 Stopped；destroy
- * 失败为 Failed，不重试。没有 Direct release 协议，因此拒绝销毁已暴露 ctx 的实例。
- * KernelNative 是受信部署，本操作不引入跨组件管理权限或父子 owner 账本。 */
+/* 非等待式优雅停止推进，只支持活 KernelNative 管理 caller。
+ * 首次 Ready → Stopping 关闭新 authority / Task / Endpoint / IPC 准入，唤醒已有 Task；
+ * 已有入站请求可以 receive/reply，出站未完成请求取消但可 collect。Task 可执行清理。
+ * 尚有 Task / 执行未真实离场返回 EBUSY（保持 Stopping）；调用方设截止时间重试，
+ * 超时可显式 force。排空后只认领一次 destroy；成功 Stopped，重复 stop 返回 0。
+ * destroy 错误或 panic 为 Failed，不重试。Native Direct 表无 release 协议，首次拒绝
+ * EBUSY 并保持 Ready。K/I S-mode destroy 无抢占 watchdog，仍需可信有界实现。
+ * IRQ / Gate / policy 上下文拒绝。本操作不引入跨组件管理权限或父子 owner 账本。 */
 int32_t kcore_component_stop(uint32_t component);
 /* 逻辑撤销后跳过 destroy。真实 Task 离场未确认时返回 EBUSY，保留所有 backing；U-mode timer 返回，S-mode 不承诺抢占。KernelNative 已发布 Direct 表时逻辑失效后返回 ENOTSUP，裸引用保持驻留。只允许活 KernelNative 管理上下文。 */
 int32_t kcore_component_force_stop(uint32_t component);
@@ -511,6 +513,10 @@ int32_t kcore_task_park(void);
  * owner 调用；相关任务表锁路径必须防止 IRQ 重入死锁。`TaskId` 是 identity，不是权限。
  * 组件自己维护等待队列与条件。 */
 int32_t kcore_task_unpark(uint32_t id);
+/* -- Component task -- */
+/* 真实当前 Task 的 owner 已 Stopping 返回 1；Starting/Ready 返回 0；非 Task/错误身份返回 EPERM。只读停止通知，K/I/U 同一接口，不改变执行或授予权限。 */
+int32_t kcore_task_stop_requested(void);
+/* -- Task control -- */
 int32_t kcore_task_exit(void);
 int32_t kcore_task_state(uint32_t id);
 /* -- Panic containment -- */

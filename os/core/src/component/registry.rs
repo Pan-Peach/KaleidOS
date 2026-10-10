@@ -67,6 +67,8 @@ pub struct ComponentRecord {
     /// 未返回的 lifecycle / Gate / policy / IRQ 执行；Direct 不经 Core，不计入。
     pub inflight: u32,
     pub(crate) reclaimed: bool,
+    /// Claimed once under registry + Task drain; failure never retries destroy.
+    pub(crate) destroy_started: bool,
 }
 
 // `instance_state` 是组件 opaque 指针：Registry 只存取、永不解引用。
@@ -84,7 +86,7 @@ pub enum RegistryError {
     NotReady,
     /// `begin_call`：`inflight` 计数溢出（u32）；拒绝且不改计数。
     CallOverflow,
-    /// Stop 准入：仍有未返回的 Core-managed 执行。
+    /// Destroy 认领：已有 Core-managed 执行或 destroy 尚未归还。
     Busy,
     /// id 空间耗尽（单调递增）。
     IdExhausted,
@@ -130,6 +132,7 @@ impl Registry {
             instance_state: core::ptr::null_mut(),
             inflight: 0,
             reclaimed: false,
+            destroy_started: false,
         });
         // 出生也入 trace：否则"只声明未 resolve"的实例在事件流里不可见，
         // 而"失败组件是否被回收"这类断言需要看到它从哪来。
@@ -214,20 +217,8 @@ impl Registry {
         self.transition(id, ComponentState::Ready)
     }
 
-    /// Ready → Stopping：开始优雅停止。
-    ///
-    /// 合法边由 [`ComponentState::can_transition`] 唯一定义；生产调用方是
-    /// `component/exit.rs::stop_component`（在确认实例不拥有未退出任务之后）。
-    /// 提交后 `may_run` 立即不再放行该实例的任务——"停止中仍等待任务收尾"不在
-    /// 本版语义内（drain variant 明确未实现）。
+    /// Close admission first; existing calls and Tasks may drain in Stopping.
     pub fn begin_stop(&mut self, id: ComponentId) -> Result<(), RegistryError> {
-        let record = self.get(id).ok_or(RegistryError::NotFound)?;
-        if !record.state.can_transition(ComponentState::Stopping) {
-            return Err(RegistryError::InvalidTransition);
-        }
-        if record.inflight != 0 {
-            return Err(RegistryError::Busy);
-        }
         self.transition(id, ComponentState::Stopping)
     }
 
@@ -274,14 +265,34 @@ impl Registry {
             .is_some_and(|r| r.state == ComponentState::Failed)
     }
 
-    /// 该实例拥有的任务是否允许运行。
+    /// 新 work / authority 的准入（调度使用 may_execute）。
     ///
     /// 只有活着的实例（`Starting` = `kcomp_instance_create` 执行期、`Ready`）
-    /// 可以运行任务；`Failed`、`Stopping`、`Stopped` 实例的任务必须从 runnable
-    /// 候选中剔除，并在 commit 前再次验证。
+    /// 可以获得新 work；Stopping 只允许已有执行收尾。
     pub fn may_run(&self, id: ComponentId) -> bool {
         self.get(id)
             .is_some_and(|r| matches!(r.state, ComponentState::Starting | ComponentState::Ready))
+    }
+
+    /// Existing execution may resume to drain and clean up; never grants new work.
+    pub(crate) fn may_execute(&self, id: ComponentId) -> bool {
+        self.may_run(id)
+            || self
+                .get(id)
+                .is_some_and(|r| r.state == ComponentState::Stopping)
+    }
+
+    /// Caller holds the Task table too and has proved actual execution drain.
+    pub(crate) fn claim_destroy(&mut self, id: ComponentId) -> Result<(), RegistryError> {
+        let record = self.record_mut(id)?;
+        if record.state != ComponentState::Stopping {
+            return Err(RegistryError::NotReady);
+        }
+        if record.inflight != 0 || record.destroy_started {
+            return Err(RegistryError::Busy);
+        }
+        record.destroy_started = true;
+        Self::count_execution(record)
     }
 
     /// 开始一次 consumer→provider 调用记账（checked increment）。
@@ -735,7 +746,8 @@ mod tests {
         reg.finish_start(id).unwrap();
         assert!(reg.may_run(id), "Ready runs work");
         reg.begin_stop(id).unwrap();
-        assert!(!reg.may_run(id), "Stopping must not run work");
+        assert!(!reg.may_run(id), "Stopping rejects new work");
+        assert!(reg.may_execute(id), "Stopping permits existing cleanup");
         reg.finish_stop(id).unwrap();
         assert!(!reg.may_run(id), "Stopped must not run work");
         reg.mark_failed(id).unwrap();
@@ -768,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_call_admission_cannot_both_commit() {
+    fn stop_and_call_admission_preserve_prior_execution_but_close_future_work() {
         use std::sync::{Arc, Barrier};
         for _ in 0..128 {
             let mut reg = Registry::new();
@@ -794,8 +806,8 @@ mod tests {
             let stopped = reg.lock().begin_stop(id);
             let called = call.join().unwrap();
             match (called, stopped) {
-                (Ok(()), Err(RegistryError::Busy)) => {
-                    assert_eq!(reg.lock().get(id).unwrap().state, ComponentState::Ready);
+                (Ok(()), Ok(())) => {
+                    assert_eq!(reg.lock().get(id).unwrap().state, ComponentState::Stopping);
                     assert_eq!(reg.lock().active_calls(id), 1);
                 }
                 (Err(RegistryError::NotReady), Ok(())) => {
@@ -805,6 +817,33 @@ mod tests {
                 result => panic!("inconsistent admission: {result:?}"),
             }
         }
+    }
+
+    #[test]
+    fn concurrent_destroy_claim_is_once_and_failed_never_retries() {
+        use std::sync::{Arc, Barrier};
+        let mut reg = Registry::new();
+        let id = ready(&mut reg);
+        reg.begin_stop(id).unwrap();
+        let reg = Arc::new(spin::Mutex::new(reg));
+        let barrier = Arc::new(Barrier::new(2));
+        let remote = reg.clone();
+        let gate = barrier.clone();
+        let thread = std::thread::spawn(move || {
+            gate.wait();
+            remote.lock().claim_destroy(id)
+        });
+        barrier.wait();
+        let local = reg.lock().claim_destroy(id);
+        let remote = thread.join().unwrap();
+        assert_eq!(usize::from(local.is_ok()) + usize::from(remote.is_ok()), 1);
+        let mut reg = reg.lock();
+        assert_eq!(reg.active_calls(id), 1);
+        reg.finish_call(id);
+        assert_eq!(reg.claim_destroy(id), Err(RegistryError::Busy));
+        reg.mark_failed(id).unwrap();
+        assert!(!reg.may_execute(id));
+        assert_eq!(reg.claim_destroy(id), Err(RegistryError::NotReady));
     }
 
     /// `begin_call` 溢出必须拒绝且不改计数。

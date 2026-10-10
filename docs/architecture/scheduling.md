@@ -75,7 +75,7 @@ personality 提议执行 deadline，Core 保留更早的已有 deadline 并交 t
 
 ## 7. Runtime 停止与私有 AS
 
-本节 Task/AS 接线与离场确认已经实现；一般 Graceful drain、S-mode 抢占与远端 shootdown 仍是目标。
+本节 Task/AS 接线与离场确认已经实现；Graceful drain 已实现；S-mode 抢占与远端 shootdown 仍是目标。
 Task 的 owner 仍是 ComponentId；私有组件 Task 关联 ComponentRecord 中既有 AS，
 Task/AS 生命周期提交复验 owner、domain、AS handle 与 CPU。不复制实例表，不把
 personality PID 带进 Core。最小初期固定 CPU；I 私有业务栈逐 Task 分配，Core kernel
@@ -83,8 +83,9 @@ stack/context 保持 Core root 下有效。调度前后 root、栈、trap、IRQ 
 一致恢复；只在 RiscvContext 添加 satp 字段或开放 import 不构成接通。
 
 停止需要两个不同谓词：新 work 准入关闭；Graceful 期间已有 Task 仍能为清理而恢复。
-现行 may_run 同时用于资源准入和 runnable 选择，必须在原机制内分开这两种判断，
-不能简单允许所有 Stopping 操作。Force/Failed 禁止返回组件业务代码。
+may_run 保持 Starting/Ready 的新资源准入；may_execute 允许已有 Stopping Task
+恢复清理。stop 通知唤醒 Blocked 并保留提前 park permit，worker 用真实当前 Task
+停止查询协作退出。Force/Failed 禁止返回组件业务代码。
 
 `commit_switch` 先提交 Exited/current，再在锁外 context_switch；CPU 此时可能仍写
 旧 context、使用旧栈。已增加 per-CPU departing 与 Task.execution_retired，incoming stack 在

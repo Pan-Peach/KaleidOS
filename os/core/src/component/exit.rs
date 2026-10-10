@@ -1,56 +1,9 @@
-//! 组件停止（graceful stop）的 Core 编排。
-//!
-//! 与 [`super::failure`]（forced containment）对称：本模块是**优雅停止**的唯一
-//! 汇合点——`Ready → Stopping → Stopped`，中途调用组件的销毁入口
-//! `kcomp_instance_destroy(state)`。生产调用方是 monitor 与 `kcore_component_stop`。
-//!
-//! # 停止顺序（拒绝门在任何提交之前；拒绝不改 Core 真相）
-//!
-//! ```text
-//! 1. 同一准入事务：Ready、无未退出任务 / 在途执行 / Native Direct 发布
-//!    （不存在 → NotFound；非 Ready → NotReady）；
-//! 2. registry.begin_stop(id)      Ready → Stopping：提交"不再接受新 work"
-//! 3. 调用 kcomp_instance_destroy(state)  必需导出；按执行域选 Core 栈 / 私有 AS
-//! 4. Core 兜底                     revoke authority + 永久失效 provider
-//!                                  endpoints（与 failure 路径共用，见 `failure.rs`）
-//! 5. registry.finish_stop(id)     Stopping → Stopped（终态）
-//! ```
-//!
-//! 为什么任务检查必须在 `begin_stop` **之前**：`may_run` 只允许 `Starting`/`Ready`，
-//! 一旦提交 `Stopping`，该实例的任务就再也不可能被调度回来收尾——"先停后等任务"
-//! 是自相矛盾的顺序。`yield` 只提交 `Runnable`（不是 `Exited`），任务不会"自然
-//! 退出"，所以本版不做等待，也不提供 drain variant / task-stop / join。
-//!
-//! # 身份、栈与门禁
-//!
-//! - **执行上下文**：KernelNative 的 destroy 跑在 Core-owned 临时栈上（与 create
-//!   对称，见 [`containment::call_component_destroy`]）；Isolated 的 destroy 跑在
-//!   该实例的私有 AS 内经 跨 AS trampoline（`isolated_lifecycle::destroy`），两者
-//!   按 `ComponentRecord::execution_domain` 分派，**绝不静默互换**。
-//! - **身份**：入口的 ambient identity = **被停止的实例**（`EscapeKind::Exit`），
-//!   不是发起 stop 的 monitor / 其他组件，也不是 `load::current_component()`。
-//!   这是本文件与 `containment` 协同保证的契约（host 测试锁定）。
-//! - **入口可以释放 authority**：`release` / `revoke` 与已持有 handle 的操作
-//!   不受生命周期门禁限制（见 `export.rs` 的门禁说明），销毁入口能在 `Stopping`
-//!   状态下自行释放资源；入口返回后 Core 仍兜底撤销一切**剩余** authority（多撤
-//!   不少撤；设备宁可进 quarantine 也不留悬空授权）。反向地，入口在 `Stopping`
-//!   期间调用 `kcore_device_claim` / `kcore_dma_alloc` 等仍会成功，随后被第 4 步
-//!   兜底撤销——现有 export 门禁只拦 `Failed`。
-//! - **失败路径刻意不调用本入口**（Linux 类比：崩溃的模块不值得信任）：
-//!   [`super::failure::fail_component`] 直接 `mark_failed` + 同一兜底，不经过
-//!   本文件。代价：组件侧的设备收尾（stop DMA / reset / mask IRQ）在失败路径上
-//!   不会发生，Core 的 revoke + quarantine 是唯一兜底（见
-//!   `docs/architecture/component-model.md` §5.2）。
-//! - destroy 入口同步跑在调用者上下文中，无 watchdog；挂死的入口会挂住 stop
-//!   （KernelNative 协作式信任，与 create 同）。
-//!
-//! # destroy 失败语义
-//!
-//! - `kcomp_instance_destroy` 返回非零 → 实例置 `Failed`（不是 `Stopped`），
-//!   **保留内存**（state 存储不回收），Core containment 兜底；
-//! - panic → 由 Destroy 边界容纳（`CallOutcome::Panicked`）→ 同上；
-//! - **绝不自动重试析构**；`Failed` 是终态，tombstone 保留。`Stopped` 记录同样
-//!   保留；私有域后续可显式 reclaim，K image 保持驻留。
+//! Cooperative stop progression: close admission, notify and drain existing
+//! execution, then claim destroy exactly once. EBUSY means Stopping is retained;
+//! callers choose a finite deadline and explicitly escalate to force if desired.
+//! Existing Tasks can resume cleanup; no new resource / task / IPC admission.
+//! Never infer CPU departure from Exited alone. Native S-mode destroy is trusted
+//! cooperative code (no watchdog); U destroy uses the existing bounded runner.
 
 use crate::component::containment::{self, CallOutcome};
 use crate::component::endpoint::ExecutionDomain;
@@ -67,14 +20,14 @@ use crate::component::{ComponentId, failure};
 pub enum ComponentStopError {
     /// 实例不存在（未声明；无 unload）。errno 语义：`ENOENT`。
     NotFound,
-    /// 实例不在 `Ready`：只有 `Ready` 有完整、已提交的初始化状态可停止。
-    /// 重复 stop（`Stopping` / `Stopped`）与 `Failed` 实例都落到这里。
+    /// 非 Ready/Stopping/Stopped；未构造或 Failed 不进入 destroy。
+    /// Failed 或未构造完成的实例落到这里；Stopping 可继续推进，Stopped 幂等。
     /// errno 语义：`EINVAL`（状态机拒绝转换）。
     NotReady,
-    /// 实例仍拥有未退出的任务，拒绝停止（小方案不做 join / 不等待）。
+    /// Stopping 已提交，等待所属 Task 退出并实际离场。
     /// errno 语义：`EBUSY`（in use）。
     OwnsLiveTasks,
-    /// Gate / policy / IRQ 尚未返回；拒绝且保持 Ready。
+    /// 已有 Gate / policy / IRQ 或 destroy 尚未返回；保持 Stopping。
     ActiveExecutions,
     /// Native 已发布 Direct 表，无 release 协议，不能销毁可能外借的 ctx。
     DirectExports,
@@ -89,42 +42,51 @@ pub enum ComponentStopError {
     StateRejected,
 }
 
-/// 优雅停止一个组件实例：small option 的完整编排（顺序见模块文档）。
-///
-/// 成功 = `Stopped`（记录保留）；失败 = 拒绝（真相不变）或销毁入口失败（`Failed`）。
-/// `kcomp_instance_destroy` 是**必需导出**（loader 保证每个 image 都有）。
+/// Non-waiting stop progression. Stopped is idempotent; Failed never destroys.
 pub fn stop_component(id: ComponentId) -> Result<(), ComponentStopError> {
-    // 步骤 1：拒绝门。必须在任何提交之前——拒绝不得改变 Core 真相。
-    // Registry → endpoint/task admission covers publication, execution and
-    // task creation through the Stopping commit, including remote callers.
-    {
-        let _irq = crate::irq::IrqSaveGuard::new();
+    let wakes = {
         let mut registry = registry::get_registry().lock();
         let record = registry.get(id).ok_or(ComponentStopError::NotFound)?;
-        if record.state != crate::component::ComponentState::Ready {
-            return Err(ComponentStopError::NotReady);
+        match record.state {
+            crate::component::ComponentState::Stopped => return Ok(()),
+            crate::component::ComponentState::Ready => {
+                if record.execution_domain == ExecutionDomain::KernelNative
+                    && crate::component::endpoint::get_endpoints()
+                        .lock()
+                        .has_direct_exports(id)
+                {
+                    return Err(ComponentStopError::DirectExports);
+                }
+                registry
+                    .begin_stop(id)
+                    .map_err(|_| ComponentStopError::StateRejected)?;
+                crate::task::get_task_table().lock().notify_stop(id);
+                Some(crate::component::exchange::get().lock().begin_stop(id))
+            }
+            crate::component::ComponentState::Stopping => None,
+            _ => return Err(ComponentStopError::NotReady),
         }
-        if record.execution_domain == ExecutionDomain::KernelNative
-            && crate::component::endpoint::get_endpoints()
-                .lock()
-                .has_direct_exports(id)
-        {
-            return Err(ComponentStopError::DirectExports);
+    };
+    if let Some(wakes) = wakes {
+        crate::component::exchange::wake(wakes.into_iter().flatten());
+        for cpu in crate::smp::online_cpus().iter() {
+            let _ = crate::sched::request_reschedule(cpu);
         }
+    }
+    {
+        // The one destroy claimant excludes Task creation/start, scheduling
+        // re-entry and concurrent stop/force/reclaim through registry admission.
+        let mut registry = registry::get_registry().lock();
         let table = crate::task::get_task_table().lock();
-        if table.has_live_tasks(id) {
+        if table.iter().any(|(_, r)| {
+            r.owner() == id && (r.state() != crate::task::TaskState::Exited || !r.execution_retired)
+        }) {
             return Err(ComponentStopError::OwnsLiveTasks);
         }
-        if let Err(error) = registry.begin_stop(id) {
-            return Err(match error {
-                RegistryError::NotFound => ComponentStopError::NotFound,
-                RegistryError::Busy => ComponentStopError::ActiveExecutions,
-                _ => ComponentStopError::NotReady,
-            });
-        }
-        registry
-            .pin_lifecycle(id)
-            .map_err(|_| ComponentStopError::StateRejected)?;
+        registry.claim_destroy(id).map_err(|e| match e {
+            RegistryError::Busy => ComponentStopError::ActiveExecutions,
+            _ => ComponentStopError::NotReady,
+        })?;
     }
 
     let _execution = crate::component::load::LifecycleExecution(id);
@@ -288,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_refuses_gate_execution_without_owned_tasks() {
+    fn stop_closes_admission_while_gate_execution_drains() {
         let _heap = setup();
         let id = ready_component(b"exit_gate", 0);
         registry::get_registry().lock().begin_call(id).unwrap();
@@ -297,10 +259,9 @@ mod tests {
             Err(ComponentStopError::ActiveExecutions)
         );
         let mut reg = registry::get_registry().lock();
-        assert_eq!(reg.get(id).unwrap().state, ComponentState::Ready);
+        assert_eq!(reg.get(id).unwrap().state, ComponentState::Stopping);
         assert_eq!(reg.active_calls(id), 1);
         reg.finish_call(id);
-        reg.begin_stop(id).unwrap();
         assert_eq!(reg.begin_call(id), Err(RegistryError::NotReady));
     }
 
@@ -348,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_refuses_when_instance_owns_unfinished_task() {
+    fn stop_notifies_published_task_and_retains_stopping() {
         // Given：Ready 组件 + 一个属于它的 Created 任务。
         let _heap = setup();
         let id = ready_component(b"exit_live_task", destroy_hook_ok as *const () as usize);
@@ -357,14 +318,18 @@ mod tests {
             .create(id, 0x1000, core::ptr::null_mut())
             .unwrap();
 
-        // When：请求停止。
+        crate::task::get_task_table()
+            .lock()
+            .start(id, task)
+            .unwrap();
+        // Published work may still need to run its cooperative cleanup.
         let result = stop_component(id);
 
-        // Then：拒绝、真相不变（仍 Ready），任务不被改动（无 join / 无 kill）。
+        // Then：关闭新准入，已发布 Task 保留 Runnable 以合作收尾。
         assert_eq!(result, Err(ComponentStopError::OwnsLiveTasks));
         assert_eq!(
             registry::get_registry().lock().get(id).unwrap().state,
-            ComponentState::Ready
+            ComponentState::Stopping
         );
         assert_eq!(
             crate::task::get_task_table()
@@ -372,7 +337,7 @@ mod tests {
                 .get(task)
                 .unwrap()
                 .state(),
-            TaskState::Created
+            TaskState::Runnable
         );
 
         // 清理：移除任务（Drop 归还 kstack 区域）。
@@ -400,6 +365,47 @@ mod tests {
     }
 
     #[test]
+    fn exited_task_requires_departure_ack_before_destroy() {
+        let _boundary = containment::test_boundary_lock();
+        let _heap = setup();
+        let id = ready_component(b"exit_ack", destroy_hook_ok as *const () as usize);
+        let task = {
+            let mut table = crate::task::get_task_table().lock();
+            let task = table.create(id, 0x1000, core::ptr::null_mut()).unwrap();
+            table.start(id, task).unwrap();
+            table
+                .transition(task, TaskState::Running(crate::machine::CpuId::from_raw(0)))
+                .unwrap();
+            table.transition(task, TaskState::Exited).unwrap();
+            table.get_mut(task).unwrap().execution_retired = false;
+            task
+        };
+        assert_eq!(stop_component(id), Err(ComponentStopError::OwnsLiveTasks));
+        assert!(
+            !registry::get_registry()
+                .lock()
+                .get(id)
+                .unwrap()
+                .destroy_started
+        );
+        crate::task::get_task_table()
+            .lock()
+            .get_mut(task)
+            .unwrap()
+            .execution_retired = true;
+        assert_eq!(stop_component(id), Ok(()));
+        assert_eq!(stop_component(id), Ok(()));
+        assert!(
+            registry::get_registry()
+                .lock()
+                .get(id)
+                .unwrap()
+                .destroy_started
+        );
+        crate::task::get_task_table().lock().remove(task).unwrap();
+    }
+
+    #[test]
     fn destroy_identity_is_the_stopped_instance() {
         // Given：`call_component_destroy` 安装的 Exit 边界（fake 后端切不了上下文，
         // 用 containment 的测试边界复现同一 guard）。
@@ -419,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn double_stop_is_refused_and_keeps_stopped() {
+    fn double_stop_is_idempotent_and_keeps_stopped() {
         // 同 `stop_drives_ready_to_stopped_through_destroy_entry`：成功的 stop 会
         // 安装 Exit 边界，必须持 BOUNDARY 锁。
         let _boundary = containment::test_boundary_lock();
@@ -428,8 +434,8 @@ mod tests {
         let id = ready_component(b"exit_double_stop", destroy_hook_ok as *const () as usize);
         assert_eq!(stop_component(id), Ok(()));
 
-        // When / Then：二次停止被规则表拒绝，真相保持 Stopped。
-        assert_eq!(stop_component(id), Err(ComponentStopError::NotReady));
+        // When / Then：二次停止幂等，不再次执行 destroy。
+        assert_eq!(stop_component(id), Ok(()));
         assert_eq!(
             registry::get_registry().lock().get(id).unwrap().state,
             ComponentState::Stopped

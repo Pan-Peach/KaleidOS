@@ -175,7 +175,9 @@ extern "C" fn server(arg: *mut ()) {
         let (receipt, _, _, length) = match ipc::receive(endpoint, &mut request) {
             Ok(message) => message,
             Err(Errno::EAGAIN) => {
-                ipc::wait_receive(endpoint).unwrap();
+                if ipc::wait_receive(endpoint).is_err() {
+                    break;
+                }
                 continue;
             }
             Err(_) => break,

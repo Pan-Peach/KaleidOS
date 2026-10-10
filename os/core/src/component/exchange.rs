@@ -17,6 +17,7 @@ struct Server {
     owner: ComponentId,
     task: TaskId,
     waiting: bool,
+    draining: bool,
     consumers: [Option<ComponentId>; GRANT_LIMIT],
 }
 struct Slot {
@@ -116,6 +117,7 @@ impl Exchange {
             owner,
             task,
             waiting: false,
+            draining: false,
             consumers: [None; GRANT_LIMIT],
         });
         Ok(())
@@ -131,6 +133,9 @@ impl Exchange {
             .iter_mut()
             .find(|s| s.endpoint == endpoint)
             .ok_or(Errno::ENOTCONN)?;
+        if server.draining {
+            return Err(Errno::ENOTCONN);
+        }
         if server.owner != owner {
             return Err(Errno::EACCES);
         }
@@ -153,6 +158,9 @@ impl Exchange {
         input: &[u8],
     ) -> Result<(u64, Option<TaskId>)> {
         let server = self.server(endpoint)?;
+        if server.draining {
+            return Err(Errno::ENOTCONN);
+        }
         if !server.consumers.contains(&Some(consumer)) {
             return Err(Errno::EACCES);
         }
@@ -227,12 +235,17 @@ impl Exchange {
         if self.server(endpoint)?.task != task {
             return Err(Errno::EACCES);
         }
+        let empty = if self.server(endpoint)?.draining {
+            Errno::ENOTCONN
+        } else {
+            Errno::EAGAIN
+        };
         let slot = self
             .slots
             .iter_mut()
             .filter(|s| s.id != 0 && s.endpoint == endpoint && !s.accepted && s.terminal.is_none())
             .min_by_key(|s| s.id)
-            .ok_or(Errno::EAGAIN)?;
+            .ok_or(empty)?;
         if output.len() < slot.len {
             return Err(Errno::EMSGSIZE);
         }
@@ -319,10 +332,36 @@ impl Exchange {
                 .iter_mut()
                 .find(|s| s.endpoint == endpoint)
                 .unwrap();
+            if !pending && server.draining {
+                return Err(Errno::ENOTCONN);
+            }
             server.waiting = !pending;
             Ok(!pending)
         }
     }
+    /// Quiesce incoming services and cancel this consumer's unfinished calls.
+    /// Accepted/queued incoming work and successful replies keep their identity.
+    pub(crate) fn begin_stop(&mut self, owner: ComponentId) -> Wakes {
+        let mut wakes = [None; ENDPOINT_LIMIT + SLOTS];
+        for server in self.servers.iter_mut().filter(|s| s.owner == owner) {
+            server.draining = true;
+            if server.waiting {
+                *wakes.iter_mut().find(|w| w.is_none()).unwrap() = Some(server.task);
+                server.waiting = false;
+            }
+        }
+        for slot in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.id != 0 && s.consumer == owner)
+        {
+            if let Some(task) = slot.finish(Errno::ECANCELED.code()) {
+                *wakes.iter_mut().find(|w| w.is_none()).unwrap() = Some(task);
+            }
+        }
+        wakes
+    }
+
     fn close_into(&mut self, endpoint: EndpointId, wake: &mut Wakes) {
         self.servers.retain(|s| {
             if s.endpoint != endpoint {

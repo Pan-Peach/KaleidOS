@@ -25,6 +25,7 @@ fn caller() -> Result<(ComponentId, TaskId), Errno> {
 fn transaction<T>(
     endpoint: Option<EndpointId>,
     own: bool,
+    cleanup: bool,
     f: impl FnOnce(
         ComponentId,
         TaskId,
@@ -36,12 +37,21 @@ fn transaction<T>(
     let _irq = IrqSaveGuard::new();
     let registry = registry::get_registry().lock();
     let record = registry.get(owner).ok_or(Errno::EPERM)?;
-    if !registry.may_run(owner) {
+    if !(if cleanup {
+        registry.may_execute(owner)
+    } else {
+        registry.may_run(owner)
+    }) {
         return Err(Errno::EPERM);
     }
     let endpoints = endpoint::get_endpoints().lock();
     if let Some(id) = endpoint {
-        let provider = endpoints.resolve(&registry, id).map_err(Errno::from)?;
+        let provider = if cleanup && own {
+            endpoints.resolve_cleanup(&registry, id, owner)
+        } else {
+            endpoints.resolve(&registry, id)
+        }
+        .map_err(Errno::from)?;
         if own && provider.owner != owner {
             return Err(Errno::EACCES);
         }
@@ -81,6 +91,7 @@ pub(super) extern "C" fn kcore_ipc_listen(endpoint: u64) -> i32 {
         status(transaction(
             Some(EndpointId::from_raw(endpoint)),
             true,
+            false,
             |owner, task, state, _| state.listen(owner, task, EndpointId::from_raw(endpoint)),
         ))
     })
@@ -130,6 +141,7 @@ pub(super) extern "C" fn kcore_ipc_submit(
         match transaction(
             Some(EndpointId::from_raw(endpoint)),
             false,
+            false,
             |owner, task, state, buffers| {
                 output(buffers, request)?;
                 let mut local = [0; exchange::MESSAGE_MAX];
@@ -164,6 +176,7 @@ pub(super) extern "C" fn kcore_ipc_receive(
         status(transaction(
             Some(EndpointId::from_raw(endpoint)),
             true,
+            true,
             |_, task, state, buffers| {
                 buffers.validate(bytes as usize, capacity, true)?;
                 output(buffers, request)?;
@@ -187,7 +200,7 @@ pub(super) extern "C" fn kcore_ipc_reply(request: u64, bytes: *const u8, len: us
         if let Err(e) = buffer(bytes as usize, len) {
             return e.code();
         }
-        match transaction(None, false, |_, task, state, buffers| {
+        match transaction(None, false, true, |_, task, state, buffers| {
             let mut local = [0; exchange::MESSAGE_MAX];
             buffers.read(bytes as usize, &mut local[..len])?;
             state.reply(task, request, &local[..len])
@@ -211,7 +224,7 @@ pub(super) extern "C" fn kcore_ipc_collect(
         if let Err(e) = buffer(bytes as usize, capacity) {
             return e.code();
         }
-        status(transaction(None, false, |_, task, state, buffers| {
+        status(transaction(None, false, true, |_, task, state, buffers| {
             buffers.validate(bytes as usize, capacity, true)?;
             output(buffers, length)?;
             output(buffers, completion)?;
@@ -228,6 +241,7 @@ pub(super) extern "C" fn kcore_ipc_wait(endpoint: u64, request: u64) -> i32 {
         match transaction(
             (request == 0).then_some(EndpointId::from_raw(endpoint)),
             true,
+            true,
             |_, task, state, _| state.wait(task, EndpointId::from_raw(endpoint), request),
         ) {
             Ok(true) => status(sched::park_current()),
@@ -238,7 +252,9 @@ pub(super) extern "C" fn kcore_ipc_wait(endpoint: u64, request: u64) -> i32 {
 }
 pub(super) extern "C" fn kcore_ipc_cancel(request: u64) -> i32 {
     core_call(move || {
-        match transaction(None, false, |_, task, state, _| state.cancel(task, request)) {
+        match transaction(None, false, true, |_, task, state, _| {
+            state.cancel(task, request)
+        }) {
             Ok(wake) => {
                 exchange::wake(wake);
                 0
@@ -257,7 +273,7 @@ pub(super) extern "C" fn kcore_ipc_close(endpoint: u64) -> i32 {
         let registry = registry::get_registry().lock();
         let mut endpoints = endpoint::get_endpoints().lock();
         let id = EndpointId::from_raw(endpoint);
-        let record = match endpoints.resolve(&registry, id) {
+        let record = match endpoints.resolve_cleanup(&registry, id, owner) {
             Ok(r) => r,
             Err(e) => return Errno::from(e).code(),
         };

@@ -15,6 +15,18 @@
 //! （`kcore_sched_run` 的契约上下文），因此场景结果先写进 [`State`] 的对应字段，
 //! 调度返回后再统一发报告行。
 
+pub(super) fn component_state(id: u32) -> Option<u32> {
+    let mut name = [0; 64];
+    let mut ordinal = 0;
+    while let Some(info) = kcomp_sdk::management::component_nth(ordinal, &mut name).ok()? {
+        if info.id == id {
+            return Some(info.state);
+        }
+        ordinal += 1;
+    }
+    None
+}
+
 mod boot;
 mod c_frontend;
 mod convergence;
@@ -146,6 +158,7 @@ kcomp_sdk::kcomp_instance_create!(|_args, out_state| {
     });
     ipc::group(&mut checks);
     ipc::domain_group(&mut checks);
+    ipc::graceful_group(&mut checks);
     ipc::lifecycle_group(&mut checks);
     hybrid_vfs::group(&mut checks);
     #[cfg(target_arch = "riscv64")]

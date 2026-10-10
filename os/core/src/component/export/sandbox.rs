@@ -32,6 +32,7 @@ fn dispatch_inner(name: &[u8], a: [usize; 8]) -> Result<usize, Errno> {
         b"kcore_task_create" => kcore_task_create(a[0], a[1] as *mut (), a[2] as *mut u32),
         b"kcore_task_start" => kcore_task_start(a[0] as u32),
         b"kcore_task_start_on" => kcore_task_start_on(a[0] as u32, a[1] as u32),
+        b"kcore_task_stop_requested" => kcore_task_stop_requested(),
         b"kcore_task_yield" => kcore_task_yield(),
         b"kcore_memory_acquire" => {
             let registry = registry::get_registry().lock();

@@ -281,3 +281,81 @@ fn thousand_endpoint_lifetimes_retire_receipts_without_redirecting() {
         previous_request = id;
     }
 }
+
+#[test]
+fn graceful_drain_keeps_queued_and_accepted_requests_but_closes_admission() {
+    let mut s = setup();
+    let a = s.submit(CONSUMER, A, EP, &[1]).unwrap().0;
+    s.receive(SERVER, EP, &mut [0; 8]).unwrap();
+    let b = s.submit(CONSUMER, B, EP, &[2]).unwrap().0;
+    s.begin_stop(OWNER);
+    assert_eq!(
+        s.submit(CONSUMER, TaskId::from_raw(102), EP, &[]),
+        Err(Errno::ENOTCONN)
+    );
+    assert_eq!(s.grant(OWNER, EP, OWNER), Err(Errno::ENOTCONN));
+    assert_eq!(s.receive(B, EP, &mut [0; 8]), Err(Errno::EACCES));
+    assert_eq!(s.receive(SERVER, EP, &mut [0; 8]).unwrap().0, b);
+    assert_eq!(s.receive(SERVER, EP, &mut []), Err(Errno::ENOTCONN));
+    assert_eq!(s.wait(SERVER, EP, 0), Err(Errno::ENOTCONN));
+    s.reply(SERVER, b, &[4]).unwrap();
+    s.reply(SERVER, a, &[3]).unwrap();
+    s.close(EP);
+    assert_eq!(s.collect(A, a, &mut [0; 8]), Ok((0, 1)));
+    assert_eq!(s.collect(B, b, &mut [0; 8]), Ok((0, 1)));
+    assert_eq!(s.runtime_stats(), (0, 0));
+}
+
+#[test]
+fn graceful_consumer_cancellation_preserves_first_terminal_and_receipt() {
+    for reply_first in [false, true] {
+        let mut s = setup();
+        let id = s.submit(CONSUMER, A, EP, &[]).unwrap().0;
+        s.receive(SERVER, EP, &mut []).unwrap();
+        assert_eq!(s.wait(A, EP, id), Ok(true));
+        if reply_first {
+            assert_eq!(s.reply(SERVER, id, &[]), Ok(Some(A)));
+        }
+        let wakes = s.begin_stop(CONSUMER);
+        assert_eq!(
+            wakes.into_iter().flatten().collect::<Vec<_>>(),
+            if reply_first {
+                Vec::new()
+            } else {
+                alloc::vec![A]
+            }
+        );
+        assert_eq!(
+            s.collect(A, id, &mut []),
+            Ok((
+                if reply_first {
+                    0
+                } else {
+                    Errno::ECANCELED.code()
+                },
+                0
+            ))
+        );
+        if !reply_first {
+            assert_eq!(s.runtime_stats().1, 1, "receipt pins canceled slot");
+            assert_eq!(s.reply(SERVER, id, &[]), Err(Errno::ECANCELED));
+        }
+        assert_eq!(s.runtime_stats().1, 0);
+    }
+}
+
+#[test]
+fn graceful_idle_wait_is_woken_once_and_cannot_repark_transport() {
+    let mut s = setup();
+    assert_eq!(s.wait(SERVER, EP, 0), Ok(true));
+    assert_eq!(
+        s.begin_stop(OWNER)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        alloc::vec![SERVER]
+    );
+    assert!(s.begin_stop(OWNER).into_iter().flatten().next().is_none());
+    assert_eq!(s.wait(SERVER, EP, 0), Err(Errno::ENOTCONN));
+    assert_eq!(s.receive(SERVER, EP, &mut []), Err(Errno::ENOTCONN));
+}

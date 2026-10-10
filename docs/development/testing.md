@@ -175,7 +175,7 @@ CoreTest `runtime/convergence.rs` 编排 test-only `kcomp_checksum`，同一 art
 RV32 单 CPU 协作运行。Consumer 错误 unpark provider-owned task 必须 EACCES。
 
 同一 fixture 的 Gate-only 模式没有 Worker / Direct 表。RV64 CPU1 在 consumer Task
-内执行 Gate，CPU0 Stop 返回 EBUSY 且仍 Ready；返回后 Stop 成功，旧 endpoint 拒绝，
+内执行 Gate，CPU0 Stop 返回 EBUSY 且保持 Stopping；返回后 Stop 成功，旧 endpoint 拒绝，
 重新创建获得新身份。host 的 128 轮 begin_call/begin_stop 竞争只证明锁和状态机，
 QEMU 场景才证明真实双 CPU 在途调用。命令为 `make test-qemu`。
 
@@ -225,3 +225,15 @@ NoMMU 的 public load 能力前置拒绝表示 private 场景不适用，不计�
 IPC server/request及alias exclusion回基线，并核对Component/Endpoint tombstone、
 名称槽和Vec/slab物理页净增；严格零未解释差额，不设容差。最新计量证据见
 [报告 §8](component-runtime-consolidation.md#8-回收计量补丁在87b86be之后)。
+
+## Graceful drain 回归
+
+`runtime/ipc.rs` 的 component-graceful-drain 使用同一 Echo 工件与公开 API，覆盖
+K/I/U、两个 cleanup worker 加 Server、RV64 CPU0/CPU1、destroy 非零/panic、重复
+Stop 和有限 20ms 观察后显式 Force。K 全域可运行；I 需 S/MMU，U 仅 RV64 S/MMU。
+旧 Endpoint 不重用，私有失败实例只在实际离场后 reclaim。Server 在 Stopping 中
+检查新 Task/backing/listen/grant/submit 被拒绝，正常 reply 仍成功。
+1000 轮私有域压力直接由 Core Stop，交替覆盖 idle waiter、queued/accepted 请求，
+不先发送业务 STOP；既有故障与 U busy Force 仍覆盖。每轮回收计量严格回到声明基线。
+Host 证明 Exchange 首终态、receipt 保留、通知/park 与一次 destroy 认领；跨 AS/SMP
+实际执行和 backing 回收由 QEMU 证明。命令及实际结果见 Runtime 报告 §9。

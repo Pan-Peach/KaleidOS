@@ -19,6 +19,17 @@ fn target() -> u64 {
     (u64::from(TARGET[1].load(Ordering::Relaxed)) << 32)
         | u64::from(TARGET[0].load(Ordering::Relaxed))
 }
+static DESTROY_MODE: AtomicU32 = AtomicU32::new(0);
+static DESTROY_COUNT: AtomicU32 = AtomicU32::new(0);
+static CLEANUP_WORKERS: AtomicU32 = AtomicU32::new(0);
+extern "C" fn cleanup_worker(_arg: *mut ()) {
+    CLEANUP_WORKERS.fetch_add(1, Ordering::AcqRel);
+    while !management::stop_requested().unwrap() {
+        management::yield_task().unwrap();
+    }
+    CLEANUP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    management::exit_task();
+}
 static STARTED: AtomicU32 = AtomicU32::new(0);
 extern "C" fn server(_arg: *mut ()) {
     STARTED.store(1, Ordering::Release);
@@ -45,8 +56,20 @@ extern "C" fn server(_arg: *mut ()) {
         let (request, consumer, _task, len) = match ipc::receive(endpoint, &mut bytes) {
             Ok(message) => message,
             Err(Errno::EAGAIN) => {
-                ipc::wait_receive(endpoint).unwrap();
+                match ipc::wait_receive(endpoint) {
+                    Ok(()) => {}
+                    Err(Errno::ENOTCONN) => {
+                        assert!(management::stop_requested().unwrap());
+                        management::exit_task();
+                    }
+                    Err(Errno::ENOENT) => management::exit_task(),
+                    Err(error) => panic!("echo wait: {:?}", error),
+                }
                 continue;
+            }
+            Err(Errno::ENOTCONN) => {
+                assert!(management::stop_requested().unwrap());
+                management::exit_task();
             }
             Err(Errno::ENOENT) => management::exit_task(),
             Err(error) => panic!("echo receive: {:?}", error),
@@ -57,6 +80,30 @@ extern "C" fn server(_arg: *mut ()) {
                 let mut output = [0; ipc::MESSAGE_MAX];
                 let len = ipc::call(target(), payload, &mut output).unwrap();
                 ipc::reply(request, &output[..len]).unwrap();
+            }
+            [IGNORE_STOP] => {
+                ipc::reply(request, &[]).unwrap();
+                loop {
+                    management::yield_task().unwrap();
+                }
+            }
+            [GRACEFUL] => {
+                while !management::stop_requested().unwrap() {
+                    management::yield_task().unwrap();
+                }
+                let mut task = 0;
+                assert_eq!(
+                    unsafe { abi::kcore_task_create(server, core::ptr::null_mut(), &mut task) },
+                    Errno::EAGAIN.code()
+                );
+                assert_eq!(ipc::listen(endpoint), Err(Errno::EPERM));
+                assert_eq!(ipc::grant(endpoint, owner), Err(Errno::EPERM));
+                assert_eq!(ipc::submit(endpoint, &[]), Err(Errno::EPERM));
+                assert!(matches!(
+                    kcomp_sdk::mem::mem_alloc(4096, 4096),
+                    Err(Errno::EPERM)
+                ));
+                ipc::reply(request, &[GRACEFUL]).unwrap();
             }
             [INVALID_BUFFER] => {
                 let mut probe = 0;
@@ -144,17 +191,41 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
         return Errno::EFAULT.code();
     }
     let args = unsafe { &*args };
-    if args.config_abi != CONFIG_ABI || !matches!(args.config_len, 8 | 16) || args.config.is_null()
+    if args.config_abi != CONFIG_ABI
+        || !matches!(args.config_len, 8 | 16 | 24)
+        || args.config.is_null()
     {
         return Errno::EINVAL.code();
     }
     let bytes = unsafe { core::slice::from_raw_parts(args.config.cast::<u8>(), args.config_len) };
     let consumer = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let cpu = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if bytes.len() == 16 {
-        let target = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    if bytes.len() >= 16 {
+        let target = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         TARGET[0].store(target as u32, Ordering::Relaxed);
         TARGET[1].store((target >> 32) as u32, Ordering::Relaxed);
+    }
+    if bytes.len() == 24 {
+        DESTROY_MODE.store(
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+        let workers = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        if workers > 2 {
+            return Errno::EINVAL.code();
+        }
+        for _ in 0..workers {
+            let mut task = 0;
+            let code =
+                unsafe { abi::kcore_task_create(cleanup_worker, core::ptr::null_mut(), &mut task) };
+            if code != 0 {
+                return code;
+            }
+            let code = unsafe { abi::kcore_task_start_on(task, cpu) };
+            if code != 0 {
+                return code;
+            }
+        }
     }
     CONSUMER.store(consumer, Ordering::Relaxed);
     unsafe { out_state.write(core::ptr::null_mut()) };
@@ -195,4 +266,23 @@ kcomp_sdk::kcomp_instance_create!(|args, out_state| {
     }
     0
 });
-kcomp_sdk::kcomp_instance_destroy!(|_state| { 0 });
+kcomp_sdk::kcomp_instance_destroy!(|_state| {
+    assert_eq!(
+        DESTROY_COUNT.fetch_add(1, Ordering::AcqRel),
+        0,
+        "destroy twice"
+    );
+    assert_eq!(
+        CLEANUP_WORKERS.load(Ordering::Acquire),
+        0,
+        "worker still active"
+    );
+    match DESTROY_MODE.load(Ordering::Relaxed) {
+        1 => Errno::EIO.code(),
+        2 => panic!("injected destroy panic"),
+        3 => loop {
+            core::hint::spin_loop();
+        },
+        _ => 0,
+    }
+});

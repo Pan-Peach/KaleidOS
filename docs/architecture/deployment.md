@@ -265,7 +265,7 @@ I/U 拒绝共享 Core heap、设备/DMA/IRQ 与组件创建 import；U 也拒绝
 ### 6.3 依赖排序的缺口清单
 
 已接通 load → private Task → Core IPC adapter → own Server Task → stop/force →
-显式 CPU-only reclaim。剩余先补一般 Graceful 通知/drain、OOM/竞态矩阵与精确保留
+显式 CPU-only reclaim。Graceful 通知/drain 已补；剩余为 OOM/竞态矩阵与精确保留
 核算，再考虑 remote TLB shootdown、RV32 U 和设备部署；路由仅设计，不是前置。
 
 ## 7. 已有 / 目标 / 缺口（逐条，带 `file:line`）
@@ -397,7 +397,7 @@ U 非协作忙循环与远端 CPU 停止测试。ArchTest 保留原 K/I Gate、R
 | I | RV64/RV32 S/MMU `.kcomp` create/destroy、持久 Task、私有 heap、IPC | `isolated_lifecycle.rs`、`isolated_api.rs`；不隔离特权，不能强杀不让出的 S Task |
 | U | RV64 S/MMU `.kcomp` relocation、USER 段/栈/thunk、create/destroy、Task/IPC | `sandbox.rs`、`export/sandbox.rs`；timer 返回 Core；设备/DMA/IRQ/Gate 不支持 |
 | IPC | RV64 K/I/U 九格、RV32 K/I 四格 | `export/ipc.rs`、`access.rs`；验证输出并 pin AS 后提交与 copy |
-| Graceful | live Task/inflight/Direct 时 EBUSY；无 live Task 才执行一次 destroy | 目前 Echo 由业务 STOP 先退 Server；一般 Core 通知/drain 尚缺 |
+| Graceful | Stopping 关闭新准入，已有 Task/IPC 排空后一次 destroy；重复 Stopped 返回 0 | K/I/U 同一停止查询；未离场 EBUSY；Native Direct 首次拒绝；S destroy 需可信有界 |
 | Force | 逻辑撤销、skip destroy、cancel saved Task；实际运行未离场 EBUSY | `reclaim.rs`；U timer 有真实 SMP 回归；K/I 无有限时间强杀保证 |
 | Reclaim | 私有 CPU-only 已证明静止时撤 root、表页、独占 extents、Task 栈 | 全局私有域安全点；重试幂等；保留 Component/Endpoint tombstone |
 | DMA/Device | 保持已有 Quarantine | 本轮不新增设备静默/reset/IOMMU 能力 |

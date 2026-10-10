@@ -523,6 +523,28 @@ impl EndpointRegistry {
         Ok(record)
     }
 
+    /// Only the owner may access its existing live transport while stopping.
+    /// Discovery, new submit and grant still use resolve (Ready only).
+    pub(crate) fn resolve_cleanup(
+        &self,
+        components: &Registry,
+        id: EndpointId,
+        owner: ComponentId,
+    ) -> Result<EndpointRecord, EndpointError> {
+        let record = *self
+            .endpoints
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or(EndpointError::EndpointNotFound)?;
+        if record.state != EndpointState::Live {
+            return Err(EndpointError::EndpointDead);
+        }
+        if record.owner != owner || !components.may_execute(owner) {
+            return self.resolve(components, id);
+        }
+        Ok(record)
+    }
+
     /// consumer 按 `EndpointId` 解析：存活校验（[`Self::resolve`]）+ contract / abi
     /// 精确匹配，返回 `Copy` 记录（Core 验证后才交付；绝不交付死 endpoint）。
     pub fn lookup(

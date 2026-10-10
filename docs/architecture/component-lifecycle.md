@@ -3,7 +3,7 @@
 > **状态：已冻结。** 本文件是组件身份、生命周期与入口 ABI 的**唯一依据**；与 `docs/architecture/component-model.md` 冲突时以本文件为准。
 
 身份与入口 ABI 已冻结：每次 instantiate 从一个 `.kcomp` artifact 得到一个完整、独立、拥有自己可写镜像状态的 `ComponentId`。
-§1–§10 描述当前契约；§11 保留完整化目标与剩余缺口。已实现 I/U CPU-only Force 与显式 reclaim 的范围见 §11.1，不能推导一般 Graceful drain 或 S-mode 抢占已完成。
+§1–§10 描述当前契约；§11 保留完整化目标与剩余缺口。已实现 I/U CPU-only Force、显式 reclaim 与 Graceful drain 的范围见 §11.1–§11.2；S-mode 抢占仍未完成。
 
 ---
 
@@ -296,8 +296,8 @@ ENOTSUP，不声称裸调用已排空。Reclaim 对 K 返回 ENOTSUP；I/U 必�
 成功清除实体 backing/AS/Task，保留身份并设置内部 reclaimed 标记，重复 reclaim 成功。
 不需要新 ComponentState。页表/别名恢复失败保守保留；调用者不能从 force 返回值推导
 物理回收。当前没有完整的逐资源 retained reason 结构化 API。
-U 每 10ms timer 返回 Core 复验状态；K/I 不保证非协作执行可强杀。一般 Graceful
-通知/cleanup Task/drain 协议仍是下述目标；Echo 测试先以业务 STOP 退出 Server。
+U 每 10ms timer 返回 Core 复验状态；K/I 不保证非协作执行可强杀。Graceful 通知、
+cleanup Task 和 IPC drain 已实现，语义见下节；物理回收仍是独立显式操作。
 
 Component 是资源生命周期的基本归属单位；复用 `ComponentRecord.loaded`、AS、
 Task owner、Endpoint owner 和现有设备表，不增加 Image/Instance Registry。
@@ -316,36 +316,45 @@ UnknownDma、AliasRestoreFailed、PageTableTeardownMissing 与 DestroyFailure。
 
 ### 11.2 Graceful Stop
 
-现有 Stop 仍是无等待操作：live Task / inflight / Native Direct 发布即 EBUSY，
-重复 Stop 返回 EINVAL。目标按以下依赖推进，顺序允许组件清理需求的局部调整：
+当前 `kcore_component_stop` 是非等待式推进；调用方用有限 deadline 重试 EBUSY，
+超时保持 Stopping 并自行选择继续等待或显式 Force。Core 不无限等待、不自动升级。
+K 管理上下文可停止 K/I/U；I/U 没有停止其他实例的 import。沿用同一 ComponentId：
 
-1. registry 准入事务认领一次 Stop，提交 Ready → Stopping；同时拒绝新 Task、
-   publish、grant、submit 与 backing/device/DMA 获取。已认领 Stop 不再次运行 destroy。
-2. 通知已有 Task 停止。最小候选是 Core 停止谓词 + owner 内 wake，组件在自己的
-   Server/Worker 循环清理并退出；不引入 Unix signal 或通用事件框架。
-   **必须同时修改调度准入**：现有 `may_run(Stopping)==false` 无法让这些 Task 收尾。
-   仅 Graceful 的已有 Task 可在清理期间恢复；不能让 Stopping 重新获取普通授权。
-3. 初期采用 cancel-and-drain：关闭所有服务 Endpoint，已有成功 reply 保留首个结果，
-   其余请求完成 ENOTCONN；accepted receipt 的业务执行仍须排空。consumer 的未结请求
-   取消/放弃，移除 send grant。close 只终结 transport，不回滚已执行的业务。
-   以后若有真实需求，再支持“拒绝新 submit、保留 accepted reply”的独立排空模式。
-4. 从 Task kernel stack 返回到 Core；等待所有 owner Task、同步 Gate/policy/IRQ、
-   copy 与 AS 进入引用退出。`Exited` 提交在切栈前，必须有 incoming-stack 完成确认，
-   不能此时删除 TaskRecord。回收确认前，旧 context / return address 保活。
-5. 执行排空后在实例域运行一次 destroy；生命周期入口不属于普通 RPC。保留私有
-   lifecycle 栈与 ABI 窗口直至入口返回 Core；destroy 不能 yield/park/exit。
-6. 撤销残余 IRQ/DMA/device/Endpoint，满足[内存回收条件](memory-and-heap.md#9-runtime-回收矩阵目标与基线)后释放独占资源，最后提交 Stopped。
+1. 首次 Ready → Stopping 在 registry 准入锁内提交；同一锁保护 Task、Endpoint、
+   grant、submit 与 backing/device/DMA 新授权。Native Direct 表仍 EBUSY 且保持 Ready，
+   因为 Core 无法撤销外借表/ctx。已经准入的 Gate/policy/IRQ 可以返回，不准再进入。
+2. `may_run` 只管新准入，`may_execute` 允许 Starting/Ready/Stopping 的已有 Task。
+   通知把 owner 的 Blocked Task 变为 Runnable，并留下 park permit 覆盖 stop-before-park。
+   Created 且从未发布的执行直接退役；已发布 Runnable/Running 必须合作清理/退出。
+   `kcore_task_stop_requested` 从真实当前 Running Task/owner 查询 Stopping（1/0），
+   K/I/U 同一接口，非 Task 或错误身份 EPERM；不引入 signal/回调或通用事件系统。
+3. Exchange 在同一 registry 事务将 owner 的 Server 标为 draining；新 submit/grant
+   被拒绝，已有 queued/accepted 入站请求可 receive/reply。空 receive/wait 返回
+   ENOTCONN 通知 Server 排空；已登记 waiter 被唤醒。仅 owner 可经 cleanup 解析访问
+   其仍 Live 的端口，外部发现/validate/submit 因 Stopping 返回 ENOENT，不静默重连。
+   正常 reply 保留首终态，存活 caller 可在 stop/reclaim 后 collect Core 副本。
+   consumer 的未终结出站请求取消为 ECANCELED，允许自己 collect；accepted receipt
+   继续占槽，晚 reply 丢弃并退役。已完成回复不被取消覆盖。最终 Task exit/兜底 close
+   使旧 Endpoint 永久 Invalid，并以 ENOTCONN 终结剩余请求；不回滚业务副作用。
+4. 尚有 owned Task 未 Exited **或未 execution_retired**，返回 EBUSY；已有 inflight
+   未归还或别的 stop 已认领 destroy 也返回 EBUSY。不释放任何可能仍被访问的栈/AS。
+   Task exit 提交与实际切栈分离：incoming-stack 保存/root 恢复确认是必要条件。
+5. 无活跃 Task/执行后，在 registry→task 事务用 ComponentRecord 的 destroy_started
+   一次认领并 pin lifecycle；锁外按实例域执行 destroy。生命周期入口不可 yield/park/exit，
+   不能获新资源；可以释放已有 backing/权限。非零、panic、Core 栈 OOM 均 Failed，
+   不再析构。并发 Force/Failed 优先，入口 pin 未归还前不能 reclaim。
+6. destroy 成功后撤销剩余 IRQ/DMA/device/Endpoint，提交 Stopped；重复 Stop 返回 0。
+   私有资源另按[回收条件](memory-and-heap.md#9-runtime-回收矩阵目标与基线)显式 reclaim。
+   Failed/未构造实例 Stop 返回 EINVAL；Force 跳过 destroy。终态和回收结果分别报告。
 
-Stop 不在 Core 锁内等待、执行 destroy 或调用业务；并发 Task 创建、IPC submit 与
-资源获取均须持 registry 锁复验，再在各自表提交。维持现有局部锁序，不能在 AS/PLAN
-锁内反向获取 registry/task。destroy 成功与 finish_stop 竞争 Failed 时，Failed 优先，
-不能重新变为 Stopped，也不能再次析构。
+Stop 不在锁内等待或调用组件。所有 copy/API 与 Task/AS 拆除沿用局部锁序，不能在
+AS/PLAN 锁内反取 registry/task。Task 忽略通知或重新 park 可以一直保持 Stopping；
+有限重试的 EBUSY 是执行未排空的可观察结果，不能改成虚假的 Stopped。
 
-初期 Stop 使用非阻塞推进/查询与调用方有限 deadline，不在 Core 加 timer waiter 队列。
-deadline 到期返回 Pending/TimedOut 和阻塞原因，实例留 Stopping；默认不自动升级 Force。
-在没有可调度 lifecycle Task 或安全抢占之前，K/I destroy 挂死无法保证调用返回：
-有界 destroy 是可信组件前提，deadline **不能**中断同步入口。U destroy 可在完成真实
-U trap/deadline 后受控中止。当前 Stop ABI 只有 i32，新增结果需 schema/fingerprint 协调替换。
+K/I 同步 S-mode destroy 没有抢占 watchdog：可信有界 destroy 是前提，调用方 deadline
+不能中断挂死的入口。U destroy 经真实 timer/trap 的现有 1 秒 lifecycle 限制受控中止，
+归入 Failed，跳过后续不可信清理。当前只有 i32 + Component/Task 状态观察，没有
+逐资源阻塞原因或独立 TimedOut ABI；本轮不为其新增状态/结果框架。
 
 ### 11.3 Forced Stop 与失败
 
@@ -369,7 +378,7 @@ U-mode 则需真实 timer/IPI trap 回 Core task stack、stop 检查及“禁止
 | Task 不退出 | deadline 后 Pending/TimedOut；K/I 不声称已强杀，保留被访问 backing |
 | destroy 返回错误 / panic | Failed；不重试、不继续业务；只回收独立证明安全的 Core 资源，裸状态保留 |
 | 两 CPU Stop | registry 内一次认领；第二请求观察同一结果/进行中，不第二次 destroy |
-| 重复 Stop | 现行 EINVAL 保持；目标查询/推进复用结果，不引入第二生命周期 |
+| 重复 Stop | Stopping 推进/EBUSY；Stopped 返回 0；Failed EINVAL，不再 destroy |
 | Stop 与 Failed | Failed 不回滚；Force 优先关闭准入；若 destroy 已开始，不能从远端释放其栈/镜像 |
 | Stop 与 Exit / Reply | Exchange 锁串行首终态；Task 状态与切栈完成分别确认；不重复 wake/collect/free |
 | Create 失败 / commit 失败 | 未构造不 destroy；已启动 Task 也要排空，不能因 create 失败直接释放镜像 |
