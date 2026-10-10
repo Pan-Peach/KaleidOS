@@ -162,12 +162,6 @@ const _: () = {
     assert!(core::mem::offset_of!(VfsDirReply, reserved) == 52);
 };
 
-/// args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。
-pub const KCOMP_VFS_METHOD_RETAIN_PATH: u32 = 11;
-
-/// args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。
-pub const KCOMP_VFS_METHOD_RELEASE_PATH: u32 = 12;
-
 /// 稳定契约名，实例端口名由组合配置选择。
 pub const KCOMP_VFS_NAME: &[u8] = b"vfs";
 
@@ -285,44 +279,36 @@ pub const KCOMP_VFS_DIR_HEADER_LEN: usize = 64;
 /// 一个 LE u64 打开实例 token。
 pub const KCOMP_VFS_FILE_LEN: usize = 8;
 
-/// root 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_ROOT: u32 = 0;
-
-/// resolve 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_RESOLVE: u32 = 1;
-
-/// node_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_NODE_INFO: u32 = 2;
-
-/// read_dir 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_READ_DIR: u32 = 3;
-
-/// open 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_OPEN: u32 = 4;
-
-/// retain 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_RETAIN: u32 = 5;
-
-/// read 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_READ: u32 = 6;
-
-/// read_at 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_READ_AT: u32 = 7;
-
-/// set_position 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_SET_POSITION: u32 = 8;
-
-/// stream_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_STREAM_INFO: u32 = 9;
-
-/// close 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。
-pub const KCOMP_VFS_METHOD_CLOSE: u32 = 10;
-
 /// 每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。
 pub const KCOMP_VFS_REPLY_STATUS_LEN: usize = 8;
 
 /// LE control ComponentId u32, count u32, then 0..2 filesystem EndpointId u64; mounts /fat and /second. Local /local always exists.
 pub const KCOMP_VFS_CREATE_CONFIG_ABI: u64 = 0x82BE_46A1_09CF_753D;
 
-/// Only configured control consumer: args/input empty, output status[8]; close files, invalidate endpoint, exit Server Task.
+pub const KCOMP_VFS_METHOD_ROOT: u32 = 0;
+
+pub const KCOMP_VFS_METHOD_RESOLVE: u32 = 1;
+
+pub const KCOMP_VFS_METHOD_NODE_INFO: u32 = 2;
+
+pub const KCOMP_VFS_METHOD_READ_DIR: u32 = 3;
+
+pub const KCOMP_VFS_METHOD_OPEN: u32 = 4;
+
+pub const KCOMP_VFS_METHOD_RETAIN: u32 = 5;
+
+pub const KCOMP_VFS_METHOD_READ: u32 = 6;
+
+pub const KCOMP_VFS_METHOD_READ_AT: u32 = 7;
+
+pub const KCOMP_VFS_METHOD_SET_POSITION: u32 = 8;
+
+pub const KCOMP_VFS_METHOD_STREAM_INFO: u32 = 9;
+
+pub const KCOMP_VFS_METHOD_CLOSE: u32 = 10;
+
+pub const KCOMP_VFS_METHOD_RETAIN_PATH: u32 = 11;
+
+pub const KCOMP_VFS_METHOD_RELEASE_PATH: u32 = 12;
+
 pub const KCOMP_VFS_METHOD_SHUTDOWN: u32 = 13;

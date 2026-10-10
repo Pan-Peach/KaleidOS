@@ -3,6 +3,8 @@
 #include "generated/block_wire.h"
 #include "generated/echo_wire.h"
 #include "generated/filesystem_wire.h"
+#include "generated/vfs_wire.h"
+#include "generated/posix_wire.h"
 #include "methods_wire.h"
 #include <assert.h>
 #include <stdio.h>
@@ -16,6 +18,32 @@ static size_t unhex(const char *text, uint8_t *bytes) {
     size_t n=strlen(text)/2; assert(n<=2048);
     for(size_t i=0;i<n;++i) { unsigned b; assert(sscanf(text+2*i,"%2x",&b)==1); bytes[i]=(uint8_t)b; } return n;
 }
+int32_t kcomp_posix_wire_handle_status(void *ctx, struct kcomp_posix_wire_status_reply *r) {
+    (void)ctx; ++calls; *r=(struct kcomp_posix_wire_status_reply){1,1792,0}; return 0;
+}
+int32_t kcomp_posix_wire_handle_shutdown(void *ctx) { (void)ctx; ++calls; return 0; }
+static struct kcomp_vfs_path token(void) { return (struct kcomp_vfs_path){1,2,3,4}; }
+int32_t kcomp_vfs_wire_handle_root(void *ctx, struct kcomp_vfs_wire_root_reply *r) { (void)ctx; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->token=token(); return 0; }
+int32_t kcomp_vfs_wire_handle_resolve(void *ctx, struct kcomp_vfs_lookup options, const uint8_t *input, size_t len, struct kcomp_vfs_wire_resolve_reply *r) {
+    (void)ctx; (void)input; (void)len; assert(options.start.entry==2); ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->token=token(); return 0; }
+int32_t kcomp_vfs_wire_handle_node_info(void *ctx, struct kcomp_vfs_path path, struct kcomp_vfs_wire_node_info_reply *r) {
+    (void)ctx; (void)path; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->info=(struct kcomp_vfs_node_info){1,0,0,0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_read_dir(void *ctx, struct kcomp_vfs_path path, uint64_t cursor, uint8_t *output, size_t len, struct kcomp_vfs_wire_read_dir_reply *r) {
+    (void)ctx; (void)path; (void)cursor; (void)output; (void)len; (void)r; ++calls; return -ENOTSUP; }
+int32_t kcomp_vfs_wire_handle_open(void *ctx, struct kcomp_vfs_open_request options, const uint8_t *input, size_t len, struct kcomp_vfs_wire_open_reply *r) {
+    (void)ctx; (void)input; (void)len; assert(options.path.entry==2); ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->file=42; return 0; }
+int32_t kcomp_vfs_wire_handle_retain(void *ctx, uint64_t file, struct kcomp_vfs_wire_retain_reply *r) { (void)ctx; (void)file; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_read(void *ctx, uint64_t file, uint8_t *output, size_t len, struct kcomp_vfs_wire_read_reply *r) {
+    (void)ctx; (void)file; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->actual=len<3?len:3; memcpy(output,"abc",r->actual); return 0; }
+int32_t kcomp_vfs_wire_handle_read_at(void *ctx, uint64_t file, uint64_t offset, uint8_t *output, size_t len, struct kcomp_vfs_wire_read_at_reply *r) {
+    (void)ctx; (void)file; (void)offset; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->actual=len<3?len:3; memcpy(output,"abc",r->actual); return 0; }
+int32_t kcomp_vfs_wire_handle_set_position(void *ctx, uint64_t file, uint64_t offset, struct kcomp_vfs_wire_set_position_reply *r) { (void)ctx; (void)file; (void)offset; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_stream_info(void *ctx, uint64_t file, struct kcomp_vfs_wire_stream_info_reply *r) {
+    (void)ctx; (void)file; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; r->info=(struct kcomp_vfs_stream_info){{3,4,1},23,0,0,0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_close(void *ctx, uint64_t file, struct kcomp_vfs_wire_close_reply *r) { (void)ctx; (void)file; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_retain_path(void *ctx, struct kcomp_vfs_path path, struct kcomp_vfs_wire_retain_path_reply *r) { (void)ctx; (void)path; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_release_path(void *ctx, struct kcomp_vfs_path path, struct kcomp_vfs_wire_release_path_reply *r) { (void)ctx; (void)path; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
+int32_t kcomp_vfs_wire_handle_shutdown(void *ctx, struct kcomp_vfs_wire_shutdown_reply *r) { (void)ctx; ++calls; r->reply_status=(struct kcomp_vfs_reply_status){0,0}; return 0; }
 int32_t kcomp_filesystem_wire_handle_mount(void *ctx) { (void)ctx; ++calls; return 0; }
 int32_t kcomp_filesystem_wire_handle_unmount(void *ctx) { (void)ctx; ++calls; return 0; }
 int32_t kcomp_filesystem_wire_handle_open(void *ctx, uint32_t flags, const uint8_t *input, size_t len,
@@ -61,6 +89,8 @@ static int32_t dispatch(const uint8_t *bytes, size_t n, uint8_t *output, size_t 
     if(!strcmp(contract,"block")) return kcomp_block_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"echo")) return kcomp_echo_wire_dispatch(NULL,&r,output,len);
     if(!strcmp(contract,"filesystem")) return kcomp_filesystem_wire_dispatch(NULL,&r,output,len);
+    if(!strcmp(contract,"posix")) return kcomp_posix_wire_dispatch(NULL,&r,output,len);
+    if(!strcmp(contract,"vfs")) return kcomp_vfs_wire_dispatch(NULL,&r,output,len);
     return kcomp_methods_wire_dispatch(NULL,&r,output,len);
 }
 int32_t kcore_ipc_submit(uint64_t endpoint, const uint8_t *bytes, size_t len, uint64_t *id) {
@@ -70,7 +100,9 @@ int32_t kcore_ipc_submit(uint64_t endpoint, const uint8_t *bytes, size_t len, ui
 }
 int32_t kcore_ipc_collect(uint64_t id, uint8_t *bytes, size_t capacity, size_t *len, int32_t *completion) {
     assert(id==1); size_t n=kcomp_ipc_u32(request+4); assert(capacity>=n+4); memset(bytes,0,n+4);
-    int32_t status=dispatch(request,request_len,bytes+4,n); kcomp_ipc_put32(bytes,(uint32_t)status);
+    int32_t status=dispatch(request,request_len,bytes+4,n);
+    if(failure && !strcmp(failure,"domain")) { status=-4095; kcomp_vfs_wire_put_vfs_reply_status(bytes+4,(struct kcomp_vfs_reply_status){5,0}); }
+    kcomp_ipc_put32(bytes,(uint32_t)status);
     printf("reply="); hex(bytes,n+4); puts(""); *len=n+4; *completion=0; return 0;
 }
 int32_t kcore_ipc_wait(uint64_t ep,uint64_t id) { (void)ep; (void)id; abort(); }
@@ -78,12 +110,33 @@ int32_t kcore_ipc_cancel(uint64_t id) { (void)id; abort(); }
 int main(int argc,char **argv) {
     assert(argc>=5); contract=argv[2]; failure=argc>5?argv[5]:NULL;
     uint8_t input[2048],output[2048]={0}; size_t n=(size_t)strtoul(argv[4],NULL,10); assert(n<=sizeof(output));
+    if(!strcmp(argv[1],"codec")) {
+        struct kcomp_vfs_lookup value;
+        int32_t status=kcomp_vfs_wire_decode_vfs_lookup(input,unhex(argv[3],input),&value);
+        if(!status) status=kcomp_vfs_wire_encode_vfs_lookup(output,n,value);
+        printf("status=%d output=",status); hex(output,n); puts(""); return 0;
+    }
     if(!strcmp(argv[1],"dispatch")) {
         int32_t status=dispatch(input,unhex(argv[3],input),output,n);
         printf("status=%d calls=%zu output=",status,calls); hex(output,n); puts(""); return 0;
     }
     int32_t status=0,transport;
-    if(!strcmp(contract,"filesystem")) {
+    if(!strcmp(contract,"posix")) {
+        if(!strcmp(argv[3],"shutdown")) transport=kcomp_posix_wire_shutdown(7,&status);
+        else { struct kcomp_posix_wire_status_reply r; transport=kcomp_posix_wire_status(7,&r,&status); }
+    }
+    else if(!strcmp(contract,"vfs")) {
+        if(!strcmp(argv[3],"root")) { struct kcomp_vfs_wire_root_reply r; transport=kcomp_vfs_wire_root(7,&r,&status); if(status==-4095) assert(r.reply_status.domain==5); }
+        else if(!strcmp(argv[3],"resolve")) { struct kcomp_vfs_wire_resolve_reply r;
+            struct kcomp_vfs_lookup options={token(),token(),6,0,1,0}; transport=kcomp_vfs_wire_resolve(7,options,(const uint8_t *)"fat/HELLO.TXT",13,&r,&status); }
+        else if(!strcmp(argv[3],"info")) { struct kcomp_vfs_wire_node_info_reply r; transport=kcomp_vfs_wire_node_info(7,token(),&r,&status); }
+        else if(!strcmp(argv[3],"open")) { struct kcomp_vfs_wire_open_reply r;
+            struct kcomp_vfs_open_request options={token(),1,1,0,0}; transport=kcomp_vfs_wire_open(7,options,NULL,0,&r,&status); }
+        else if(!strcmp(argv[3],"close")) { struct kcomp_vfs_wire_close_reply r; transport=kcomp_vfs_wire_close(7,42,&r,&status); }
+        else if(!strcmp(argv[3],"stream")) { struct kcomp_vfs_wire_stream_info_reply r; transport=kcomp_vfs_wire_stream_info(7,42,&r,&status); }
+        else { struct kcomp_vfs_wire_read_at_reply r; transport=kcomp_vfs_wire_read_at(7,42,7,output,n,&r,&status); }
+    }
+    else if(!strcmp(contract,"filesystem")) {
         if(!strcmp(argv[3],"root")) { struct kcomp_filesystem_wire_root_reply r; transport=kcomp_filesystem_wire_root(7,&r,&status); }
         else if(!strcmp(argv[3],"lookup")) { struct kcomp_filesystem_wire_lookup_reply r;
             transport=kcomp_filesystem_wire_lookup(7,42,1,(const uint8_t *)"HELLO.TXT",9,&r,&status); }

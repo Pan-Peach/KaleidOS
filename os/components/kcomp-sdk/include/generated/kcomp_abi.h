@@ -821,12 +821,6 @@ _Static_assert(offsetof(struct kcomp_vfs_dir_reply, name_len) == 44, "kcomp_vfs_
 _Static_assert(offsetof(struct kcomp_vfs_dir_reply, flags) == 48, "kcomp_vfs_dir_reply.flags offset drift");
 _Static_assert(offsetof(struct kcomp_vfs_dir_reply, reserved) == 52, "kcomp_vfs_dir_reply.reserved offset drift");
 
-/* args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。 */
-#define KCOMP_VFS_METHOD_RETAIN_PATH UINT32_C(11)
-
-/* args 为 32 字节 VfsPath，input 空，output 8 字节回复 status。 */
-#define KCOMP_VFS_METHOD_RELEASE_PATH UINT32_C(12)
-
 /* 稳定契约名，实例端口名由组合配置选择。 */
 #define KCOMP_VFS_NAME "vfs"
 
@@ -944,46 +938,38 @@ _Static_assert(offsetof(struct kcomp_vfs_dir_reply, reserved) == 52, "kcomp_vfs_
 /* 一个 LE u64 打开实例 token。 */
 #define KCOMP_VFS_FILE_LEN 8
 
-/* root 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_ROOT UINT32_C(0)
-
-/* resolve 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_RESOLVE UINT32_C(1)
-
-/* node_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_NODE_INFO UINT32_C(2)
-
-/* read_dir 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_READ_DIR UINT32_C(3)
-
-/* open 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_OPEN UINT32_C(4)
-
-/* retain 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_RETAIN UINT32_C(5)
-
-/* read 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_READ UINT32_C(6)
-
-/* read_at 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_READ_AT UINT32_C(7)
-
-/* set_position 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_SET_POSITION UINT32_C(8)
-
-/* stream_info 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_STREAM_INFO UINT32_C(9)
-
-/* close 的扁平方法号；长度与字段见 docs/interfaces/vfs.md。 */
-#define KCOMP_VFS_METHOD_CLOSE UINT32_C(10)
-
 /* 每个 Gate 方法 output 最前面恰好 8 字节回复 status，业务 payload 紧随其后。 */
 #define KCOMP_VFS_REPLY_STATUS_LEN 8
 
 /* LE control ComponentId u32, count u32, then 0..2 filesystem EndpointId u64; mounts /fat and /second. Local /local always exists. */
 #define KCOMP_VFS_CREATE_CONFIG_ABI UINT64_C(0x82BE46A109CF753D)
 
-/* Only configured control consumer: args/input empty, output status[8]; close files, invalidate endpoint, exit Server Task. */
+#define KCOMP_VFS_METHOD_ROOT UINT32_C(0)
+
+#define KCOMP_VFS_METHOD_RESOLVE UINT32_C(1)
+
+#define KCOMP_VFS_METHOD_NODE_INFO UINT32_C(2)
+
+#define KCOMP_VFS_METHOD_READ_DIR UINT32_C(3)
+
+#define KCOMP_VFS_METHOD_OPEN UINT32_C(4)
+
+#define KCOMP_VFS_METHOD_RETAIN UINT32_C(5)
+
+#define KCOMP_VFS_METHOD_READ UINT32_C(6)
+
+#define KCOMP_VFS_METHOD_READ_AT UINT32_C(7)
+
+#define KCOMP_VFS_METHOD_SET_POSITION UINT32_C(8)
+
+#define KCOMP_VFS_METHOD_STREAM_INFO UINT32_C(9)
+
+#define KCOMP_VFS_METHOD_CLOSE UINT32_C(10)
+
+#define KCOMP_VFS_METHOD_RETAIN_PATH UINT32_C(11)
+
+#define KCOMP_VFS_METHOD_RELEASE_PATH UINT32_C(12)
+
 #define KCOMP_VFS_METHOD_SHUTDOWN UINT32_C(13)
 
 /* family 4/6；family=0 表示缺省字段且其余为零。flags=1 为本地 wildcard，IP 两半为零；其他 flags 拒绝。IPv6 为高低各 64 位整数；IPv4 用 ip_low 低 32 位，其余零。最高有效位是地址首位；Gate 各整数 LE 编码，port 也是整数。 */
@@ -1205,13 +1191,6 @@ _Static_assert(offsetof(struct kcomp_posix_create_config, argc) == 4, "kcomp_pos
 _Static_assert(offsetof(struct kcomp_posix_create_config, envc) == 8, "kcomp_posix_create_config.envc offset drift");
 _Static_assert(offsetof(struct kcomp_posix_create_config, reserved) == 12, "kcomp_posix_create_config.reserved offset drift");
 
-struct kcomp_posix_process_api {
-    /* exited=0/1; wait_status valid iff exited; live counts tasks not yet exited. No scheduling. */
-    int32_t (*status)(void *ctx, uint32_t *out_exited, uint32_t *out_wait_status, uint32_t *out_live);
-};
-_Static_assert(sizeof(struct kcomp_posix_process_api) == 1 * sizeof(void *), "kcomp_posix_process_api layout drift");
-_Static_assert(_Alignof(struct kcomp_posix_process_api) == _Alignof(void *), "kcomp_posix_process_api alignment drift");
-
 /* Exact immutable-image config fingerprint. Old VFS-only skeleton config rejected. */
 #define KCOMP_POSIX_CREATE_CONFIG_ABI UINT64_C(0x504F534958494D47)
 
@@ -1222,8 +1201,12 @@ _Static_assert(_Alignof(struct kcomp_posix_process_api) == _Alignof(void *), "kc
 
 #define KCOMP_POSIX_PROCESS_CONTRACT UINT64_C(0x504F53495850524F)
 
-/* Read-only family status: Direct C table; Gate method 0 empty input, 12-byte LE reply. */
-#define KCOMP_POSIX_PROCESS_ABI UINT64_C(0x50524F4353544154)
+/* IPC family status and explicit shutdown; no cross-component function table. */
+#define KCOMP_POSIX_PROCESS_ABI UINT64_C(0x50524F4349504353)
+
+#define KCOMP_POSIX_METHOD_STATUS UINT32_C(0)
+
+#define KCOMP_POSIX_METHOD_SHUTDOWN UINT32_C(1)
 
 /* `DriverCreateConfig` 的**固定头部**（本文件顶部定义完整布局）：
  * 

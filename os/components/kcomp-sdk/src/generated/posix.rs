@@ -19,23 +19,6 @@ const _: () = {
     assert!(core::mem::offset_of!(PosixCreateConfig, reserved) == 12);
 };
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct PosixProcessApi {
-    /// exited=0/1; wait_status valid iff exited; live counts tasks not yet exited. No scheduling.
-    pub status: unsafe extern "C" fn(
-        ctx: *mut (),
-        out_exited: *mut u32,
-        out_wait_status: *mut u32,
-        out_live: *mut u32,
-    ) -> i32,
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<PosixProcessApi>() == core::mem::size_of::<usize>());
-    assert!(core::mem::align_of::<PosixProcessApi>() == core::mem::align_of::<usize>());
-};
-
 /// Exact immutable-image config fingerprint. Old VFS-only skeleton config rejected.
 pub const KCOMP_POSIX_CREATE_CONFIG_ABI: u64 = 0x504F_5349_5849_4D47;
 
@@ -46,5 +29,9 @@ pub const KCOMP_POSIX_PROCESS_NAME: &[u8] = b"posix.process";
 
 pub const KCOMP_POSIX_PROCESS_CONTRACT: u64 = 0x504F_5349_5850_524F;
 
-/// Read-only family status: Direct C table; Gate method 0 empty input, 12-byte LE reply.
-pub const KCOMP_POSIX_PROCESS_ABI: u64 = 0x5052_4F43_5354_4154;
+/// IPC family status and explicit shutdown; no cross-component function table.
+pub const KCOMP_POSIX_PROCESS_ABI: u64 = 0x5052_4F43_4950_4353;
+
+pub const KCOMP_POSIX_METHOD_STATUS: u32 = 0;
+
+pub const KCOMP_POSIX_METHOD_SHUTDOWN: u32 = 1;

@@ -48,6 +48,7 @@ class KabiMethods(unittest.TestCase):
         sdk = ROOT / "os/components/kcomp-sdk"
         cls.binaries = [cls.directory / "c", cls.directory / "rust"]
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=undefined",
+                        "-fno-sanitize-recover=undefined",
                         "-iquote", str(sdk / "include"), "-iquote", str(cls.directory),
                         str(ROOT / "tests/components/generated_wire.c"), str(sdk / "c/kcomp_ipc.c"),
                         "-o", str(cls.binaries[0])], check=True)
@@ -80,6 +81,18 @@ class KabiMethods(unittest.TestCase):
                   ("filesystem", "read_at", 7, 10, struct.pack("<QQ",42,7), b"", struct.pack("<Q",3)+b"abc"+bytes(4)),
                   ("filesystem", "read_at", 0, 10, struct.pack("<QQ",42,7), b"", bytes(8)),
                   ("filesystem", "close", 0, 3, struct.pack("<Q",42), b"", b"")]
+        token = struct.pack("<QQQQ", 1, 2, 3, 4)
+        cases += [("vfs", "root", 40, 0, b"", b"", bytes(8)+token),
+                  ("vfs", "resolve", 40, 1, token*2+struct.pack("<IIII",6,0,1,0),
+                   b"fat/HELLO.TXT", bytes(8)+token),
+                  ("vfs", "info", 32, 2, token, b"", bytes(8)+struct.pack("<IIIIQ",1,0,0,0,0)),
+                  ("vfs", "open", 16, 4, token+struct.pack("<IIII",1,1,0,0), b"", bytes(8)+struct.pack("<Q",42)),
+                  ("vfs", "read_at", 7, 7, struct.pack("<QQ",42,7), b"", bytes(8)+struct.pack("<Q",3)+b"abc"+bytes(4)),
+                  ("vfs", "read_at", 0, 7, struct.pack("<QQ",42,7), b"", bytes(16)),
+                  ("vfs", "close", 8, 10, struct.pack("<Q",42), b"", bytes(8)),
+                  ("vfs", "stream", 64, 9, struct.pack("<Q",42), b"", bytes(8)+struct.pack("<QQQQIIQQ",3,4,1,23,0,0,0,0))]
+        cases += [("posix", "status", 12, 0, b"", b"", struct.pack("<III",1,1792,0)),
+                  ("posix", "shutdown", 0, 1, b"", b"", b"")]
         for contract, arg, capacity, method, args, input_, output in cases:
             with self.subTest(contract=contract, arg=arg):
                 request = struct.pack("<IIII", method, len(output), len(args), len(input_))+args+input_
@@ -104,6 +117,13 @@ class KabiMethods(unittest.TestCase):
                    ("filesystem", frame(10, 7, bytes(16)), 7, -22),
                    ("filesystem", frame(10, 521, bytes(16)), 521, -22),
                    ("filesystem", frame(6, 8, bytes(12)), 8, -22)]
+        frames += [("vfs", frame(0, 39), 39, -22),
+                   ("vfs", frame(1, 40, bytes(79)), 40, -22),
+                   ("vfs", frame(4, 16, bytes(48), bytes(256)), 16, -22),
+                   ("vfs", frame(7, 15, bytes(16)), 15, -22),
+                   ("vfs", frame(7, 529, bytes(16)), 529, -22)]
+        frames += [("posix", frame(0,11),11,-22), ("posix", frame(1,1),1,-22),
+                   ("posix", frame(0,12,bytes(1)),12,-22)]
         for contract, request, capacity, status in frames:
             with self.subTest(contract=contract, request=request[:16]):
                 expected = f'status={status} calls=0 output={bytes(capacity).hex()}'
@@ -116,6 +136,20 @@ class KabiMethods(unittest.TestCase):
         self.assertEqual(result[0], result[1])
         self.assertTrue(result[0].endswith("transport=0 method=-5 calls=1"))
         self.assertEqual(self.run_both("client", "block", "7", 511), ["transport=0 method=-22 calls=0"]*2)
+
+    def test_error_reply_preserves_domain_and_raw_business_status(self):
+        request = struct.pack("<IIII",0,40,0,0)
+        reply = struct.pack("<iIIQQQQ",-4095,5,0,1,2,3,4)
+        expected = f'request={request.hex()}\nreply={reply.hex()}\ntransport=0 method=-4095 calls=1'
+        self.assertEqual(self.run_both("client","vfs","root",40,"domain"), [expected]*2)
+
+    def test_nested_codec_exact_lengths_and_non_native_byte_order(self):
+        value = struct.pack("<QQQQQQQQIIII", *range(1,9),0x12345678,9,1,0)
+        self.assertEqual(self.run_both("codec","vfs",value.hex(),80),
+                         [f'status=0 output={value.hex()}']*2)
+        for input_, length in ((value[:-1],80),(value+b"x",80),(value,79),(value,81),(b"",80)):
+            self.assertEqual(self.run_both("codec","vfs",input_.hex(),length),
+                             [f'status=-22 output={bytes(length).hex()}']*2)
 
     def test_schema_rejects_unsafe_types_and_ambiguous_methods(self):
         base = '[[method]]\nname = "read"\nid = 1\nsymbol = "READ"\n'
@@ -131,6 +165,12 @@ class KabiMethods(unittest.TestCase):
             invalid.append(base + f'[[method.args]]\nname = "lba"\ntype = "{type_}"\n')
         for name in ("for", "impl", "input", "wire_args"):
             invalid.append(base + f'[[method.args]]\nname = "{name}"\ntype = "u64"\n')
+        structure = ('[[struct]]\nname = "Value"\nc_name = "value"\nsize = 8\nalign = 8\n'
+                     'targets = "c,sdk-rust"\n[[struct.field]]\nname = "data"\ntype = "TYPE"\noffset = 0\n')
+        for type_ in ("Value", "*mut u8", "usize", "bool"):
+            invalid.append(structure.replace("TYPE", type_) + base +
+                           '[[method.args]]\nname = "value"\ntype = "Value"\n')
+        invalid += [base+'mutable = 1\n', base+'reply_on_error = "yes"\n']
         for text in invalid:
             with self.subTest(text=text):
                 self.schema_path.write_text(text)

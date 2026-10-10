@@ -10,7 +10,14 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use kcomp_sdk::{Errno, abi, console::Console, management};
+use kcomp_sdk::{
+    Errno, abi,
+    console::Console,
+    endpoint::{Endpoint, publish_ipc},
+    generated::posix_wire as wire,
+    ipc, management,
+    posix::PosixProcess,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -108,69 +115,101 @@ pub fn start(profile: Profile) -> Result<*mut Family, Errno> {
         state: State::Running,
         waiting: false,
     });
-    // Publish a read-only observer; it never creates work or schedules on a Gate stack.
-    let result = unsafe {
-        abi::kcore_endpoint_publish(
-            kcomp_sdk::posix::KCOMP_POSIX_PROCESS_NAME.as_ptr(),
-            kcomp_sdk::posix::KCOMP_POSIX_PROCESS_NAME.len(),
-            kcomp_sdk::posix::KCOMP_POSIX_PROCESS_CONTRACT,
-            abi::InterfaceKind::Service as u32,
-            kcomp_sdk::posix::KCOMP_POSIX_PROCESS_ABI,
-            0,
-            &PROCESS_API as *const _ as *const (),
-            &*family as *const Family as *mut (),
-        )
-    };
-    if result != 0 {
+    // No user code can run until both observer and initial Task are admitted.
+    let result = publish_ipc::<PosixProcess>(kcomp_sdk::posix::KCOMP_POSIX_PROCESS_NAME);
+    if let Err(error) = result {
         let _ = unsafe { abi::kcore_user_discard(task) };
-        return Err(Errno::from_code(result));
+        return Err(error);
     }
-    if let Err(error) = check(unsafe { abi::kcore_task_start(task) }) {
+    let mut observer = 0;
+    if let Err(error) = check(unsafe {
+        abi::kcore_task_create(server, &*family as *const Family as *mut (), &mut observer)
+    }) {
         let _ = unsafe { abi::kcore_user_discard(task) };
+        return Err(error);
+    }
+    if let Err(error) = check(unsafe { abi::kcore_task_start(observer) })
+        .and_then(|_| check(unsafe { abi::kcore_task_start(task) }))
+    {
+        let _ = unsafe { abi::kcore_user_discard(task) };
+        // Both Tasks are fixed to this CPU; create never yields, so neither
+        // can dereference the state before failed-create retirement.
         return Err(error);
     }
     let _ = Box::into_raw(process);
     Ok(Box::into_raw(family))
 }
 
-unsafe extern "C" fn status(
-    ctx: *mut (),
-    out_exited: *mut u32,
-    out_status: *mut u32,
-    out_live: *mut u32,
-) -> i32 {
-    if ctx.is_null() || out_exited.is_null() || out_status.is_null() || out_live.is_null() {
-        return Errno::EFAULT.code();
+impl wire::Provider for Family {
+    fn status(&self) -> Result<wire::StatusReply, Errno> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(Errno::ESRCH);
+        }
+        let exited = self.exited.load(Ordering::Acquire);
+        Ok(wire::StatusReply {
+            exited: u32::from(exited),
+            wait_status: self.status.load(Ordering::Relaxed),
+            live: self.live.load(Ordering::Acquire),
+        })
     }
-    let family = unsafe { &*ctx.cast::<Family>() };
-    if !family.alive.load(Ordering::Acquire) {
-        return Errno::ESRCH.code();
+    fn shutdown(&self) -> Result<(), Errno> {
+        if self.live.load(Ordering::Acquire) != 0 {
+            return Err(Errno::EBUSY);
+        }
+        Ok(())
     }
-    let exited = family.exited.load(Ordering::Acquire);
-    unsafe {
-        out_exited.write_unaligned(u32::from(exited));
-        out_status.write_unaligned(family.status.load(Ordering::Relaxed));
-        out_live.write_unaligned(family.live.load(Ordering::Acquire));
-    }
-    0
 }
-static PROCESS_API: kcomp_sdk::posix::PosixProcessApi =
-    kcomp_sdk::posix::PosixProcessApi { status };
-pub fn dispatch(family: &Family, method: u32, call: kcomp_sdk::frame::Call<'_>) -> i32 {
-    if method != 0 {
-        return Errno::ENOSYS.code();
+
+extern "C" fn server(arg: *mut ()) {
+    // State is instance-owned and remains resident after native logical stop.
+    let family = unsafe { &*arg.cast::<Family>() };
+    let owner = management::current_component().unwrap();
+    let endpoint =
+        Endpoint::<PosixProcess>::lookup(owner, kcomp_sdk::posix::KCOMP_POSIX_PROCESS_NAME)
+            .unwrap()
+            .id();
+    ipc::listen(endpoint).unwrap();
+    let mut request = [0; ipc::MESSAGE_MAX];
+    let mut reply = [0; ipc::MESSAGE_MAX];
+    loop {
+        let (receipt, _, _, length) = match ipc::receive(endpoint, &mut request) {
+            Ok(message) => message,
+            Err(Errno::EAGAIN) => {
+                ipc::wait_receive(endpoint).unwrap();
+                continue;
+            }
+            Err(_) => break,
+        };
+        reply.fill(0);
+        let (status, output, shutdown) = match ipc::service::Request::decode(&request[..length]) {
+            Ok(message) => {
+                let status = wire::dispatch(
+                    family,
+                    &message,
+                    &mut reply
+                        [ipc::service::REPLY_HEADER..ipc::service::REPLY_HEADER + message.output],
+                );
+                (
+                    status,
+                    message.output,
+                    status == 0 && message.method == kcomp_sdk::posix::KCOMP_POSIX_METHOD_SHUTDOWN,
+                )
+            }
+            Err(error) => (error.code(), 0, false),
+        };
+        // A late/canceled status query owns no new business resource.
+        let _ = ipc::service::reply(
+            receipt,
+            status,
+            &mut reply[..ipc::service::REPLY_HEADER + output],
+        );
+        if shutdown {
+            family.alive.store(false, Ordering::Release);
+            let _ = ipc::close(endpoint);
+            break;
+        }
     }
-    if !call.args.is_empty() || !call.input.is_empty() || call.output.len() != 12 {
-        return Errno::EINVAL.code();
-    }
-    if !family.alive.load(Ordering::Acquire) {
-        return Errno::ESRCH.code();
-    }
-    let exited = family.exited.load(Ordering::Acquire);
-    call.output[..4].copy_from_slice(&u32::from(exited).to_le_bytes());
-    call.output[4..8].copy_from_slice(&family.status.load(Ordering::Relaxed).to_le_bytes());
-    call.output[8..].copy_from_slice(&family.live.load(Ordering::Acquire).to_le_bytes());
-    0
+    management::exit_task();
 }
 
 impl Process {

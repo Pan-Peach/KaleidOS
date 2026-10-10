@@ -31,8 +31,6 @@ kcomp_sdk::kcomp_instance_destroy!(|state| {
         return Errno::EBUSY.code();
     }
     family.alive.store(false, Ordering::Release);
-    // Direct observer ctx remains resident after logical teardown.
+    // Native published backing remains resident after logical teardown.
     0
 });
-const PROCESS_PORT: u32 = 0;
-kcomp_sdk::kcomp_services!(state: Family; PROCESS_PORT => crate::execution::dispatch);

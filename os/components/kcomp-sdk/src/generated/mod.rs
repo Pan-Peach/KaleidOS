@@ -10,6 +10,8 @@ pub mod filesystem;
 pub mod filesystem_wire;
 pub mod network;
 pub mod posix;
+pub mod posix_wire;
 pub mod probe;
 pub mod scheduler;
 pub mod vfs;
+pub mod vfs_wire;

@@ -19,7 +19,10 @@ const FORK: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/for
 const TARGET: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/target"));
 const TIMER: &[u8] = include_bytes!(concat!(env!("KALEIDOS_EXEC_FIXTURES"), "/timer"));
 
-fn family(images: &[(&[u8], &[u8])], argv: &[&[u8]]) -> kcomp_sdk::Result<posix::ProcessBinding> {
+fn family(
+    images: &[(&[u8], &[u8])],
+    argv: &[&[u8]],
+) -> kcomp_sdk::Result<(u32, posix::ProcessBinding)> {
     let config = posix::encode(images, argv, &[])?;
     let id = management::create(
         b"posix",
@@ -27,7 +30,18 @@ fn family(images: &[(&[u8], &[u8])], argv: &[&[u8]]) -> kcomp_sdk::Result<posix:
         posix::KCOMP_POSIX_CREATE_CONFIG_ABI,
         &config,
     )?;
-    Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?.bind()
+    let endpoint = Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?;
+    let consumer = management::current_component()?;
+    loop {
+        match kcomp_sdk::ipc::grant(endpoint.id(), consumer) {
+            Err(kcomp_sdk::Errno::ENOTCONN) => management::yield_task()?,
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
+    Ok((id, endpoint.bind()?))
 }
 fn wait(binding: &posix::ProcessBinding) -> u32 {
     let start = unsafe { abi::kcore_now() };
@@ -35,6 +49,11 @@ fn wait(binding: &posix::ProcessBinding) -> u32 {
     loop {
         let status = binding.status().expect("process status");
         if status.exited && status.live == 0 {
+            binding.shutdown().expect("close completed observer");
+            assert!(
+                binding.status().is_err(),
+                "closed observer accepted a new query"
+            );
             return status.wait_status;
         }
         assert!(
@@ -69,12 +88,18 @@ extern "C" fn suite(arg: *mut ()) {
         ("protect", PROTECT, 11, &[b"/main".as_slice()][..]),
         ("text-write", TEXT, 11, &[b"/main".as_slice()][..]),
     ] {
-        let binding = family(&[(b"/main", image)], args).expect("spawn user ELF");
+        let (id, binding) = family(&[(b"/main", image)], args).expect("spawn user ELF");
         assert_eq!(wait(&binding), expected, "unexpected user result: {name}");
+        assert_eq!(
+            unsafe { abi::kcore_component_stop(id) },
+            0,
+            "observer Task leaked after shutdown"
+        );
+        assert!(binding.status().is_err(), "old endpoint revived after stop");
         kcomp_sdk::klog!("[user-probe] {name}: PASS");
     }
     result.fetch_or(1, Ordering::Release);
-    let binding = family(
+    let (id, binding) = family(
         &[
             (b"/fork", FORK),
             (b"/target", TARGET),
@@ -84,9 +109,14 @@ extern "C" fn suite(arg: *mut ()) {
     )
     .expect("spawn fork/exec family");
     assert_eq!(wait(&binding), 0, "fork/exec/rollback/wait failed");
+    assert_eq!(unsafe { abi::kcore_component_stop(id) }, 0);
     kcomp_sdk::klog!("[user-probe] fork-exec-wait: PASS");
     result.fetch_or(2, Ordering::Release);
-    let binding = family(&[(b"/timer", TIMER)], &[b"/timer"]).expect("spawn no-ecall loop");
+    let (id, binding) = family(&[(b"/timer", TIMER)], &[b"/timer"]).expect("spawn no-ecall loop");
+    assert!(
+        matches!(binding.shutdown(), Err(kcomp_sdk::Errno::EBUSY)),
+        "live family shutdown admitted"
+    );
     management::yield_task().expect("schedule userspace");
     assert!(
         !binding.status().unwrap().exited,
@@ -94,6 +124,7 @@ extern "C" fn suite(arg: *mut ()) {
     );
     kcomp_sdk::klog!("[user-probe] timer-service-alive: PASS");
     assert_eq!(wait(&binding), 0);
+    assert_eq!(unsafe { abi::kcore_component_stop(id) }, 0);
     kcomp_sdk::klog!("[user-probe] timer-return: PASS");
     kcomp_sdk::klog!("[user-probe] all: PASS");
     result.fetch_or(4, Ordering::Release);

@@ -10,12 +10,8 @@ impl Contract for PosixProcess {
     const ABI: u64 = KCOMP_POSIX_PROCESS_ABI;
     const KIND: abi::InterfaceKind = abi::InterfaceKind::Service;
 }
-enum Backend {
-    Direct(*const PosixProcessApi, *mut ()),
-    Gate(u64),
-}
 pub struct ProcessBinding {
-    backend: Backend,
+    endpoint: Endpoint<PosixProcess>,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessStatus {
@@ -25,59 +21,32 @@ pub struct ProcessStatus {
 }
 impl Endpoint<PosixProcess> {
     pub fn bind(&self) -> Result<ProcessBinding> {
-        let (mut mechanism, mut api, mut ctx) = (0, 0, 0);
-        let code = unsafe {
-            abi::kcore_endpoint_bind(
-                self.id(),
-                PosixProcess::ID,
-                PosixProcess::ABI,
-                &mut mechanism,
-                &mut api,
-                &mut ctx,
-            )
-        };
-        if code != 0 {
-            return Err(Errno::from_code(code));
-        }
-        let backend = match mechanism {
-            abi::KCORE_ENDPOINT_MECHANISM_DIRECT if api != 0 => {
-                Backend::Direct(api as *const _, ctx as *mut ())
-            }
-            abi::KCORE_ENDPOINT_MECHANISM_GATE => Backend::Gate(self.id()),
-            _ => return Err(Errno::EIO),
-        };
-        Ok(ProcessBinding { backend })
+        Ok(ProcessBinding { endpoint: *self })
     }
 }
 impl ProcessBinding {
     pub fn status(&self) -> Result<ProcessStatus> {
-        let (mut exited, mut wait_status, mut live) = (0, 0, 0);
-        let code = match self.backend {
-            Backend::Direct(api, ctx) => unsafe {
-                ((*api).status)(ctx, &mut exited, &mut wait_status, &mut live)
-            },
-            Backend::Gate(endpoint) => {
-                let mut reply = [0; 12];
-                let code = crate::call::endpoint_call(endpoint, 0, &[], &[], &mut reply)?;
-                if code == 0 {
-                    exited = u32::from_le_bytes(reply[..4].try_into().unwrap());
-                    wait_status = u32::from_le_bytes(reply[4..8].try_into().unwrap());
-                    live = u32::from_le_bytes(reply[8..].try_into().unwrap());
-                }
-                code
-            }
-        };
-        if code != 0 {
-            return Err(Errno::from_code(code));
-        }
-        if exited > 1 {
-            return Err(Errno::EIO);
+        let reply =
+            crate::generated::posix_wire::status(self.endpoint.id()).map_err(invoke_error)?;
+        if reply.exited > 1 {
+            return Err(Errno::EPROTO);
         }
         Ok(ProcessStatus {
-            exited: exited == 1,
-            wait_status,
-            live,
+            exited: reply.exited == 1,
+            wait_status: reply.wait_status,
+            live: reply.live,
         })
+    }
+    /// Only an authorized consumer can close an already completed family.
+    pub fn shutdown(&self) -> Result<()> {
+        crate::generated::posix_wire::shutdown(self.endpoint.id()).map_err(invoke_error)
+    }
+}
+fn invoke_error(error: crate::endpoint::InvokeError) -> Errno {
+    match error {
+        crate::endpoint::InvokeError::Transport(error)
+        | crate::endpoint::InvokeError::Method(error) => error,
+        crate::endpoint::InvokeError::InvalidReply => Errno::EPROTO,
     }
 }
 #[cfg(feature = "alloc")]

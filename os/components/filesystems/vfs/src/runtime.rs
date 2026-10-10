@@ -9,8 +9,13 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use kcomp_sdk::{
-    abi, ipc, management,
-    vfs::{codec::*, *},
+    abi,
+    generated::vfs_wire as wire,
+    ipc, management,
+    vfs::{
+        codec::{u32_at, u64_at},
+        *,
+    },
 };
 struct State {
     endpoints: Vec<u64>,
@@ -110,10 +115,8 @@ extern "C" fn server(arg: *mut ()) {
         let outcome = if shutdown {
             if consumer != state.control {
                 Err(Error::EACCES)
-            } else if !request.args.is_empty() || !request.input.is_empty() || output.len() != 8 {
-                Err(Error::EINVAL)
             } else {
-                Ok(None)
+                wire::validate(&request).map(|_| None)
             }
         } else {
             match &mut service {
@@ -130,8 +133,14 @@ extern "C" fn server(arg: *mut ()) {
         };
         // Always return a valid VFS status header, even for business errors.
         if output.len() >= 8 {
-            put32(output, 0, 0);
-            put32(output, 4, 0);
+            wire::encode_vfs_reply_status(
+                &VfsReplyStatus {
+                    domain: 0,
+                    reserved: 0,
+                },
+                &mut output[..8],
+            )
+            .unwrap();
         }
         let committed = ipc::service::reply(
             receipt,

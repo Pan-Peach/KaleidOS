@@ -24,6 +24,7 @@
 //! prober 是组件、不是 Core：CoreTest 不重复它的目录/策略判断，只断言"它做了
 //! 什么"能被 Core 观测到的部分。
 
+extern crate alloc;
 use kcomp_sdk::abi::{self, KcompCreateArgs};
 use kcomp_sdk::block::{BLOCK_DEVICE_NAME, BlockDevice};
 use kcomp_sdk::endpoint::Endpoint;
@@ -213,6 +214,43 @@ fn attach_serves(endpoint: Endpoint<BlockDevice>) -> bool {
         && binding.read(capacity, &mut sector).is_err()
         && binding.read(1u64 << 32, &mut sector).is_err()
         && binding.write(1u64 << 32, &sector).is_err()
+}
+
+/// Real VirtIO read samples through the public SDK, including 512-byte IPC
+/// splitting. QEMU/trace timings are observations, never a performance gate.
+fn measure_reads(endpoint: Endpoint<BlockDevice>) {
+    let binding = endpoint.bind().expect("measure live Block endpoint");
+    let hz = unsafe { abi::kcore_timebase_hz() };
+    for bytes in [512, 4096] {
+        let mut output = alloc::vec![0; bytes];
+        let mut samples = [0u64; 31];
+        for batch in 0..35 {
+            let begin = unsafe { abi::kcore_now() };
+            for _ in 0..32 {
+                binding.read(0, &mut output).expect("real VirtIO read");
+            }
+            let elapsed = unsafe { abi::kcore_now() }.saturating_sub(begin);
+            if batch >= 4 {
+                samples[batch - 4] = elapsed;
+            }
+        }
+        samples.sort_unstable();
+        let median = samples[15];
+        let rate = if median == 0 {
+            0
+        } else {
+            hz * (bytes * 32) as u64 / median
+        };
+        klog!(
+            "[block-read-sample] bytes={} hz={} batches=31 operations_per_batch=32 requests_per_operation={} median={} p95={} bytes_per_second={} trace=profile",
+            bytes,
+            hz,
+            bytes / SECTOR,
+            median,
+            samples[29],
+            rate
+        );
+    }
 }
 
 /// 设备归属：attached 的设备被 driver 持有（claim → `-EBUSY`），其余候选已释放
@@ -438,6 +476,9 @@ fn run(state: &mut State) {
     // 被拒绝的第二次 attachment 不得复位已 attach 的设备：它仍能读盘。
     let still_serves = attached_endpoint.is_some_and(attach_serves);
     state.multi_ok = multi_ok && still_serves;
+    if state.multi_ok {
+        measure_reads(attached_endpoint.expect("validated live block endpoint"));
+    }
 }
 
 extern "C" fn task(arg: *mut ()) {

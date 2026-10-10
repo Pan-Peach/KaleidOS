@@ -53,15 +53,25 @@ targets = "c,sdk-rust"
 [[const]]
 name = "KCOMP_POSIX_PROCESS_ABI"
 type = "u64"
-value = "0x5052_4F43_5354_4154"
+value = "0x5052_4F43_4950_4353"
 targets = "c,sdk-rust"
-doc = "Read-only family status: Direct C table; Gate method 0 empty input, 12-byte LE reply."
-[[struct]]
-name = "PosixProcessApi"
-c_name = "kcomp_posix_process_api"
-size_ptrs = 1
-targets = "c,sdk-rust"
-[[struct.field]]
+doc = "IPC family status and explicit shutdown; no cross-component function table."
+
+[[method]]
 name = "status"
-type = "fn(ctx: *mut void, out_exited: *mut u32, out_wait_status: *mut u32, out_live: *mut u32) -> i32"
-doc = "exited=0/1; wait_status valid iff exited; live counts tasks not yet exited. No scheduling."
+id = 0
+symbol = "KCOMP_POSIX_METHOD_STATUS"
+[[method.reply]]
+name = "exited"
+type = "u32"
+[[method.reply]]
+name = "wait_status"
+type = "u32"
+[[method.reply]]
+name = "live"
+type = "u32"
+
+[[method]]
+name = "shutdown"
+id = 1
+symbol = "KCOMP_POSIX_METHOD_SHUTDOWN"

@@ -477,11 +477,29 @@ fn exec(argv: &[&[u8]]) -> kcomp_sdk::Result<()> {
         posix::KCOMP_POSIX_CREATE_CONFIG_ABI,
         &config,
     )?;
-    let process =
-        Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?.bind()?;
+    let endpoint = Endpoint::<posix::PosixProcess>::lookup(id, posix::KCOMP_POSIX_PROCESS_NAME)?;
+    let consumer = management::current_component()?;
+    loop {
+        match kcomp_sdk::ipc::grant(endpoint.id(), consumer) {
+            Err(Errno::ENOTCONN) => management::yield_task()?,
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
+    let process = endpoint.bind()?;
     loop {
         let status = process.status()?;
         if status.exited && status.live == 0 {
+            process.shutdown()?;
+            let stopped = unsafe { kcomp_sdk::abi::kcore_component_stop(id) };
+            if stopped != 0 {
+                // The program's wait status is already committed. In memory
+                // pressure Core can fail to allocate its destroy stack and
+                // retire the instance as Failed; this does not change exit(0).
+                kcomp_sdk::klog!("posix: family {} stop failed rc={}", id, stopped);
+            }
             let mut out = Console;
             if status.wait_status & 127 != 0 {
                 let _ = writeln!(out, "exec: signal={}", status.wait_status & 127);

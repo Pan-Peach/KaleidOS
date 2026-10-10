@@ -2,7 +2,7 @@
 
 > 核对日期：2026-10-09。起始工作树干净，工作分支 `develop`，HEAD 与成功 fetch 后的
 > `origin/develop` 均为 `2e10304c389fb6ab1b5815a97575199b62aa0c4b`。
-> 本轮按 Cleanup 请求仅修改文档与测试；生产实现、schema 和生成器保持基线。
+> 第 1–9 节保留首次审计快照；之后用户授权直接实现，生产迁移与重测见第 10 节及 STATUS。
 > 本文是事实与证据，不代替 architecture/interfaces 契约，也不表示整体 Cleanup 完成。
 > 旧 `63384b5` 审计及旧性能表属于历史，可从 Git 历史读取；不再用其“未实现”判断现状。
 
@@ -258,3 +258,68 @@ filesystem 接口页把 namespace 当空骨架。旧里程碑另加历史标记�
 优先级：先修复上述基线门禁与 import 耦合；再用 Echo + Block read 小 patch 验证
 schema→C/Rust client/dispatch；随后 RAM/FS/little/probe/posix.process 逐组迁移，补 I IPC，再删旧业务
 机制。详细改动边界、回退点、保留理由见迁移计划，不进行一次性 ABI/Core 重写。
+
+## 10. 授权实施后的更新
+
+本阶段从 develop `d3e7a55fb33641561cc23d36d24f185c0ef33054` 推进 VFS/Posix 迁移；
+2026-10-10 提交前 fetch 确认远端仍在该基线，未覆盖用户改动。
+下述结果来自对应源码的工作树验证；本阶段交付提交可从本文件的 Git 历史定位。
+
+已实施事实：Echo/Block/Filesystem/VFS/Posix 共用 KABI 生成 C/Rust client/codec/validator/
+dispatch；固定嵌套结构有精确长度 LE codec；Fat IPC、RemoteFs、VFS 与 Posix 已接入。
+Posix 删除旧业务 Direct table、Gate dispatcher 和两 Backend；完成族 shutdown 后可 stop。
+Core registry/Exchange/锁新增为零；Posix 每实例一个新 Server Task，完成后显式退出。
+新增方法的实际维护点及分步骤规模见 [方法生成](kabi-methods.md#本阶段维护成本对照)。
+
+门禁：check（含 host/fmt/clippy/tools 与交叉构建）、27生成文件 abi-check、
+完整 RV64/RV32 CoreTest 与 init/ksh、ArchTest RV64/RV32 43/43、SMP3/3、
+RV32 NoMMU 两场景90 checks均通过。C/Rust envelope4项、generated方法7项通过。
+日志 `/tmp/kaleidos-posix-ipc-{check-complete,qemu-final,arch,nommu,abi-complete}.log`。
+新测试含 live-family shutdown 拒绝、公开 stop 与旧 binding 失效；OOM 程序退出成功后
+既有 Core destroy 栈分配可能失败，Core 标 Failed，ksh 记录清理错误并保留真实 wait status。
+这没有实现物理回收。
+
+以下串行重测在其他门禁结束后进行，仍为同一 raw transport 探针、trace=2047、
+4 warmup / 31 batch / 每 batch32次 / 10MHz，单位仍为整批 ticks median/p95。
+它没有计入 generated method codec，不能用它证明 generated frontend 性能。
+
+| arch | bytes | Direct | Gate | IPC |
+|---|---:|---:|---:|---:|
+| RV64 | 0 | 10 / 17 | 1081 / 1115 | 16800 / 17198 |
+| RV64 | 8 | 25 / 25 | 1082 / 1112 | 16864 / 17175 |
+| RV64 | 64 | 26 / 26 | 1084 / 1125 | 16821 / 17805 |
+| RV64 | 512 | 52 / 53 | 1087 / 1141 | 16962 / 17158 |
+| RV32 | 0 | 9 / 13 | 564 / 593 | 6257 / 6324 |
+| RV32 | 8 | 23 / 23 | 595 / 630 | 6253 / 6351 |
+| RV32 | 64 | 29 / 29 | 609 / 629 | 6226 / 6304 |
+| RV32 | 512 | 76 / 76 | 652 / 672 | 6254 / 6360 |
+
+相对第7节512字节样本，IPC median RV64 -0.7%、RV32 -7.6%，Gate RV64 +9.2%、
+RV32 -4.0%。并行验证的一次 RV64 IPC p95 为67751，串行样本降到17158；这表明
+测试环境会显著影响观测，尚不足以归因具体瓶颈、宣称改善或排除真实性能回归。
+原始串行日志 `/tmp/kaleidos-posix-ipc-perf-{rv64,rv32}.log` 引用具体 guest日志。
+
+未完成：RAM/littlefs/probe 和普通 SDK 旧通道；IsolatedNative 持久 Task/AS switching/
+checked IPC copy/import；全部普通 Direct/Gate 删除。第1–9节的旧“未生成”和失败
+属于审计时事实，不能据此重做已完成工作，也不能据新增IPC通过宣称最终验收完成。
+
+真实 VirtIO Block 读取的新样本（同CPU K-native、trace=profile），通过公开 BlockBinding；
+每组4次warmup、31个batch、每batch32次read(0)，4KiB调用实际拆成8条512字节请求。
+吞吐由 median batch 的实际读取字节数计算；QEMU/host缓存/trace条件下的观测，不是真机峰值。
+
+| arch | read bytes | median ticks | p95 ticks | bytes/s |
+|---|---:|---:|---:|---:|
+| RV64 | 512 | 25567 | 26973 | 6408260 |
+| RV64 | 4096 | 203462 | 224062 | 6442087 |
+| RV32 | 512 | 26615 | 26948 | 6155927 |
+| RV32 | 4096 | 213259 | 262849 | 6146141 |
+
+重构前没有该吞吐探针，不能计算吞吐回归比例。源为 CoreTest runtime/driver.rs，
+日志 `/tmp/kaleidos-block-perf-{rv64-final,rv32-final,nommu}.log`；全部两拓扑回归通过。
+未测write吞吐、trace-off或真实磁盘；测试不写介质、不增加资源权限、不设性能PASS阈值。
+4KiB几乎没有吞吐增益，符合当前逐512字节请求形状；未分解copy/调度/设备各自占比。
+
+从审计起始 `2e10304c` 到当前工作树（含未跟踪生成物）按路径numstat统计：
+生产手写+620/-677（净-57，含cfg(test)与注释）；生成物+2522/-147（净+2375）；
+生成器+511/-5（净+506）；schema+428/-181（净+247）；独立测试+1370/-53（净+1317）。
+删除未编译/无引用的VFS stream.rs旧草图29行。以上是文本规模，不能换算成维护成本或性能。

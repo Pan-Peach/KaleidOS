@@ -135,7 +135,6 @@ fn canceled_opens(vfs: &VfsBinding, path: VfsPath) -> bool {
     codec::put32(&mut request, 4, 16);
     codec::put32(&mut request, 8, 48);
     codec::put_open(
-        &mut request[16..],
         &VfsOpenRequest {
             path,
             access: KCOMP_VFS_ACCESS_READ,
@@ -143,7 +142,9 @@ fn canceled_opens(vfs: &VfsBinding, path: VfsPath) -> bool {
             stream_kind: KCOMP_VFS_STREAM_DEFAULT,
             encoding: 0,
         },
-    );
+        &mut request[16..],
+    )
+    .unwrap();
     // Exceed both the VFS table and FatFs open budget. A lost creation reply
     // must roll back its Path/Open reference before the next served request.
     for _ in 0..40 {

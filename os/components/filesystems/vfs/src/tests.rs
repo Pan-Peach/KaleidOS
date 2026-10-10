@@ -280,9 +280,9 @@ fn wire_service_references_owner_shape_and_canceled_creation() {
         .dispatch(7, 70, &root_request, &mut root_bytes)
         .unwrap()
         .unwrap();
-    let token = path(&root_bytes[8..]);
+    let token = path(&root_bytes[8..]).unwrap();
     let mut args = [0; 32];
-    put_path(&mut args, &token);
+    put_path(&token, &mut args).unwrap();
     let release = Request {
         method: KCOMP_VFS_METHOD_RELEASE_PATH,
         args: &args,
@@ -323,10 +323,9 @@ fn wire_service_references_owner_shape_and_canceled_creation() {
     service
         .dispatch(7, 70, &root_request, &mut root_bytes)
         .unwrap();
-    let root = path(&root_bytes[8..]);
+    let root = path(&root_bytes[8..]).unwrap();
     let mut lookup_bytes = [0; 80];
     put_lookup(
-        &mut lookup_bytes,
         &VfsLookup {
             start: root,
             root,
@@ -335,7 +334,9 @@ fn wire_service_references_owner_shape_and_canceled_creation() {
             encoding: KCOMP_VFS_ENCODING_BYTES,
             reserved: 0,
         },
-    );
+        &mut lookup_bytes,
+    )
+    .unwrap();
     let resolve = Request {
         method: KCOMP_VFS_METHOD_RESOLVE,
         args: &lookup_bytes,
@@ -343,10 +344,9 @@ fn wire_service_references_owner_shape_and_canceled_creation() {
         output: 40,
     };
     service.dispatch(7, 70, &resolve, &mut root_bytes).unwrap();
-    let found = path(&root_bytes[8..]);
+    let found = path(&root_bytes[8..]).unwrap();
     let mut open_args = [0; 48];
     put_open(
-        &mut open_args,
         &VfsOpenRequest {
             path: found,
             access: KCOMP_VFS_ACCESS_READ,
@@ -354,7 +354,9 @@ fn wire_service_references_owner_shape_and_canceled_creation() {
             stream_kind: 0,
             encoding: 0,
         },
-    );
+        &mut open_args,
+    )
+    .unwrap();
     let open_request = Request {
         method: KCOMP_VFS_METHOD_OPEN,
         args: &open_args,

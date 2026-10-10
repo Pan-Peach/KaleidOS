@@ -34,8 +34,12 @@ yield 或 park；不从 per-CPU trap 栈调度，不使用 SUM 解引用用户�
 它没有目录、cwd、权限或 VFS namespace 语义。
 
 SDK `posix::encode` 构造配置；`management::create` 创建进程族；`posix.process`
-endpoint 的 Direct C table / Gate method 0 只返回初始进程是否退出、wait status 与
-live 进程数，回调不创建任务、不调度、不 park。布局与 exact 指纹以 schema 为准。
+endpoint 使用独立 Server Task 和 generated IPC method 0，返回初始进程是否退出、
+wait status 与 live 进程数；没有 Direct table、Gate dispatcher 或 SDK Backend 分支。
+composer 在 server listen 后通过 Core grant 授权 consumer，未授权调用按现有 IPC 门禁拒绝。
+method 1 shutdown 在 live 非零时返回 EBUSY；完成后回复、关闭 Exchange listener 并退出
+observer Task。客户端便利方法由同一 schema 生成的协议封装承载。
+exact 指纹原地更新为 `0x5052_4F43_4950_4353`，不保留旧别名；C/Rust 字节测试覆盖两方法。
 
 ksh 的 `exec 0:/APP.ELF [args...]` 经真实 filesystem provider 的 open/read/close
 读取镜像，再以 `/main` 为镜像 key 创建这个 profile。它是 shell 的组合策略；
@@ -46,8 +50,11 @@ ksh 的 `exec 0:/APP.ELF [args...]` 经真实 filesystem provider 的 open/read/
 
 wait 消费一次 zombie 状态；无效 status 指针不会提前消费 zombie。退出记录与已经
 发布的内存 backing 保持驻留，成功 exec 的旧 backing 也保留；这不是物理回收机制。
-未启动装载失败可以 discard staging task。组件只在 live 数为 0 时逻辑停止，observer
-ctx 保持驻留，旧 binding 返回 ESRCH。
+未启动装载失败可以 discard staging task。组件只在 live 数为 0 且 observer shutdown 后逻辑停止；旧 Endpoint 不重绑新实例。
+ksh 和 CoreTest 消费者在观察结束后 shutdown，再通过公开 Core stop 退役实例。
+CoreTest 检查 live shutdown 拒绝、正常内存下 stop 成功和旧 binding 失效。
+极端 OOM 可能分配不到 Core destroy 临时栈，stop 返回 EIO 并将实例标为 Failed；
+ksh 记录该清理错误，仍报告已提交的程序 wait status。物理 backing 保留，未承诺回收。
 
 `process.rs` / `fd.rs` / `usermem.rs` / `syscall.rs` 中通用 VFS 语义模型仍是骨架；
 当前运行期为 `execution.rs`、镜像配置为 `image.rs`、装载器为 `exec.rs`。

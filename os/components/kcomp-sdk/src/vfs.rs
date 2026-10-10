@@ -5,8 +5,10 @@
 //! 不支持的目录枚举、写入和命名流返回 ENOTSUP。
 
 use crate::abi::InterfaceKind;
+use crate::endpoint::InvokeError;
 use crate::endpoint::{Contract, Endpoint};
 use crate::errno::Errno;
+use crate::generated::vfs_wire as wire;
 
 pub use crate::generated::vfs::KCOMP_VFS_NAME as VFS_NAME;
 pub use crate::generated::vfs::*;
@@ -49,142 +51,79 @@ impl VfsBinding {
     pub fn bind(endpoint: Endpoint<Vfs>) -> crate::Result<Self> {
         Ok(Self { endpoint })
     }
-    fn invoke(&self, method: u32, args: &[u8], input: &[u8], output: &mut [u8]) -> VfsResult<()> {
-        let status = crate::ipc::service::invoke(self.endpoint.id(), method, args, input, output)
-            .map_err(VfsError::Transport)?;
-        if output.len() < 8 || codec::u32_at(output, 4) != 0 {
-            return Err(VfsError::InvalidReply);
-        }
-        let domain = codec::u32_at(output, 0);
-        if domain > KCOMP_VFS_STATUS_NO_DATA_STREAM || (status == 0 && domain != 0) {
-            return Err(VfsError::InvalidReply);
-        }
-        if status == 0 {
-            Ok(())
-        } else if domain != 0 {
-            Err(VfsError::Domain {
-                errno: status,
-                detail: domain,
-            })
-        } else {
-            Err(VfsError::Method(status))
-        }
-    }
     pub fn root(&self) -> VfsResult<VfsPath> {
-        let mut out = [0; 40];
-        self.invoke(KCOMP_VFS_METHOD_ROOT, &[], &[], &mut out)?;
-        Ok(codec::path(&out[8..]))
+        let (status, reply) = wire::root(self.endpoint.id()).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        Ok(reply.token)
     }
     /// Composition control only; drains opens and ends the owned server Task.
     pub fn shutdown(&self) -> VfsResult<()> {
-        self.invoke(KCOMP_VFS_METHOD_SHUTDOWN, &[], &[], &mut [0; 8])
+        let (status, reply) = wire::shutdown(self.endpoint.id()).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn resolve(&self, request: &VfsLookup, path: &[u8]) -> VfsResult<VfsPath> {
-        let mut args = [0; 80];
-        codec::put_lookup(&mut args, request);
-        let mut out = [0; 40];
-        self.invoke(KCOMP_VFS_METHOD_RESOLVE, &args, path, &mut out)?;
-        Ok(codec::path(&out[8..]))
+        let (status, reply) =
+            wire::resolve(self.endpoint.id(), *request, path).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        Ok(reply.token)
     }
     pub fn retain_path(&self, path: &VfsPath) -> VfsResult<()> {
-        self.path_operation(KCOMP_VFS_METHOD_RETAIN_PATH, path)
+        let (status, reply) = wire::retain_path(self.endpoint.id(), *path).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn release_path(&self, path: &VfsPath) -> VfsResult<()> {
-        self.path_operation(KCOMP_VFS_METHOD_RELEASE_PATH, path)
-    }
-    fn path_operation(&self, method: u32, path: &VfsPath) -> VfsResult<()> {
-        let mut args = [0; 32];
-        codec::put_path(&mut args, path);
-        self.invoke(method, &args, &[], &mut [0; 8])
+        let (status, reply) =
+            wire::release_path(self.endpoint.id(), *path).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn node_info(&self, path: &VfsPath) -> VfsResult<VfsNodeInfo> {
-        let mut args = [0; 32];
-        codec::put_path(&mut args, path);
-        let mut out = [0; 32];
-        self.invoke(KCOMP_VFS_METHOD_NODE_INFO, &args, &[], &mut out)?;
-        Ok(VfsNodeInfo {
-            kind: codec::u32_at(&out, 8),
-            valid: codec::u32_at(&out, 12),
-            link_count: codec::u64_at(&out, 16),
-            name_encoding: codec::u32_at(&out, 24),
-            case_rule: codec::u32_at(&out, 28),
-        })
+        let (status, reply) = wire::node_info(self.endpoint.id(), *path).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        Ok(reply.info)
     }
     pub fn open(&self, request: &VfsOpenRequest, name: &[u8]) -> VfsResult<u64> {
-        let mut args = [0; 48];
-        codec::put_open(&mut args, request);
-        let mut out = [0; 16];
-        self.invoke(KCOMP_VFS_METHOD_OPEN, &args, name, &mut out)?;
-        let id = codec::u64_at(&out, 8);
-        if id == 0 {
+        let (status, reply) =
+            wire::open(self.endpoint.id(), *request, name).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        if reply.file == 0 {
             Err(VfsError::InvalidReply)
         } else {
-            Ok(id)
+            Ok(reply.file)
         }
     }
     pub fn retain(&self, file: u64) -> VfsResult<()> {
-        self.invoke(
-            KCOMP_VFS_METHOD_RETAIN,
-            &file.to_le_bytes(),
-            &[],
-            &mut [0; 8],
-        )
+        let (status, reply) = wire::retain(self.endpoint.id(), file).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn close(&self, file: u64) -> VfsResult<()> {
-        self.invoke(
-            KCOMP_VFS_METHOD_CLOSE,
-            &file.to_le_bytes(),
-            &[],
-            &mut [0; 8],
-        )
+        let (status, reply) = wire::close(self.endpoint.id(), file).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn set_position(&self, file: u64, offset: u64) -> VfsResult<()> {
-        let mut args = [0; 16];
-        codec::put64(&mut args, 0, file);
-        codec::put64(&mut args, 8, offset);
-        self.invoke(KCOMP_VFS_METHOD_SET_POSITION, &args, &[], &mut [0; 8])
-    }
-    fn read_method(&self, method: u32, args: &[u8], buffer: &mut [u8]) -> VfsResult<usize> {
-        let count = buffer.len().min(512);
-        let mut out = [0; 528];
-        self.invoke(method, args, &[], &mut out[..16 + count])?;
-        let actual = codec::u64_at(&out, 8);
-        if actual > count as u64 {
-            return Err(VfsError::InvalidReply);
-        }
-        let actual = actual as usize;
-        buffer[..actual].copy_from_slice(&out[16..16 + actual]);
-        Ok(actual)
+        let (status, reply) =
+            wire::set_position(self.endpoint.id(), file, offset).map_err(invoke_error)?;
+        complete(status, reply)
     }
     pub fn read(&self, file: u64, buffer: &mut [u8]) -> VfsResult<usize> {
-        self.read_method(KCOMP_VFS_METHOD_READ, &file.to_le_bytes(), buffer)
+        let count = buffer.len().min(512);
+        let mut output = [0; 512];
+        let (status, reply) =
+            wire::read(self.endpoint.id(), file, &mut output[..count]).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        copy_read(buffer, &output[..count], reply.actual)
     }
     pub fn read_at(&self, file: u64, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
-        let mut args = [0; 16];
-        codec::put64(&mut args, 0, file);
-        codec::put64(&mut args, 8, offset);
-        self.read_method(KCOMP_VFS_METHOD_READ_AT, &args, buffer)
+        let count = buffer.len().min(512);
+        let mut output = [0; 512];
+        let (status, reply) = wire::read_at(self.endpoint.id(), file, offset, &mut output[..count])
+            .map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        copy_read(buffer, &output[..count], reply.actual)
     }
     pub fn stream_info(&self, file: u64) -> VfsResult<VfsStreamInfo> {
-        let mut out = [0; 64];
-        self.invoke(
-            KCOMP_VFS_METHOD_STREAM_INFO,
-            &file.to_le_bytes(),
-            &[],
-            &mut out,
-        )?;
-        Ok(VfsStreamInfo {
-            stream: VfsStream {
-                fs: codec::u64_at(&out, 8),
-                node: codec::u64_at(&out, 16),
-                stream: codec::u64_at(&out, 24),
-            },
-            size: codec::u64_at(&out, 32),
-            allocated_size: codec::u64_at(&out, 40),
-            valid_data_length: codec::u64_at(&out, 48),
-            valid: codec::u32_at(&out, 56),
-            reserved: codec::u32_at(&out, 60),
-        })
+        let (status, reply) = wire::stream_info(self.endpoint.id(), file).map_err(invoke_error)?;
+        complete(status, reply.reply_status)?;
+        Ok(reply.info)
     }
     pub fn read_dir(
         &self,
@@ -223,4 +162,38 @@ impl VfsBinding {
         let _ = self.release_path(&found);
         opened
     }
+}
+
+fn invoke_error(error: InvokeError) -> VfsError {
+    match error {
+        InvokeError::Transport(errno) => VfsError::Transport(errno),
+        InvokeError::Method(errno) => VfsError::Method(errno.code()),
+        InvokeError::InvalidReply => VfsError::InvalidReply,
+    }
+}
+fn complete(status: i32, reply: VfsReplyStatus) -> VfsResult<()> {
+    if reply.reserved != 0
+        || reply.domain > KCOMP_VFS_STATUS_NO_DATA_STREAM
+        || (status == 0 && reply.domain != 0)
+    {
+        return Err(VfsError::InvalidReply);
+    }
+    if status == 0 {
+        Ok(())
+    } else if reply.domain != 0 {
+        Err(VfsError::Domain {
+            errno: status,
+            detail: reply.domain,
+        })
+    } else {
+        Err(VfsError::Method(status))
+    }
+}
+fn copy_read(buffer: &mut [u8], output: &[u8], actual: u64) -> VfsResult<usize> {
+    if actual > output.len() as u64 {
+        return Err(VfsError::InvalidReply);
+    }
+    let actual = actual as usize;
+    buffer[..actual].copy_from_slice(&output[..actual]);
+    Ok(actual)
 }

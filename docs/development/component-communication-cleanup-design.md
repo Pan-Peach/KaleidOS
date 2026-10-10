@@ -1,8 +1,8 @@
 # KABI 协议方法生成：可手写的小模块方案
 
 > 2026-10-09，用户进一步授权直接实现。基线 `2e10304c389f` 没有 method 生成能力；
-> 当前 Echo/Block 的 scalar/bounded-buffer client/dispatch 已实现，语法与限制见
-> [现行方法生成](kabi-methods.md)。此页仍保留后续 FS/VFS/执行域的小模块方案。
+> 当前 Echo/Block/Filesystem/VFS/Posix 的 client/dispatch 与固定结构 LE codec 已实现，语法与限制见
+> [现行方法生成](kabi-methods.md)。此页保留设计依据与执行域的后续小模块方案。
 > 维护点与真实失败见 [专项审计](component-communication-audit.md)；门禁见
 > [迁移清单](component-communication-migration.md)。此页是建议，不是现行 ABI。
 
@@ -68,7 +68,7 @@ max = 512
 input 长度；Block capacity 固定 u64，Block read 固定 LBA + 512 字节输出，write 镜像。
 只支持一个明确的 length equality 引用，不做通用表达式语言。
 
-下一小 patch 才支持命名固定结构：按已有 schema 的字段顺序展开 LE codec；native
+已支持命名固定结构：按已有 schema 的字段顺序展开 LE codec；native
 repr(C) 布局断言继续存在，wire 不用 memcpy/结构 cast，不引入隐式 C padding。
 VfsPath 32、Lookup 80、OpenRequest 48 等当前 wire 保持字节一致，先迁现有形状。
 

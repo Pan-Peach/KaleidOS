@@ -683,10 +683,12 @@ class Function:
 class WireField:
     name: str
     type: str
+    fields: Tuple["WireField", ...] = ()
+    c_name: str = ""
 
     @property
     def size(self) -> int:
-        return int(self.type[1:]) // 8
+        return sum(item.size for item in self.fields) if self.fields else int(self.type[1:]) // 8
 
 
 @dataclass(frozen=True)
@@ -706,6 +708,8 @@ class Method:
     output: WireBuffer
     output_matches_input: bool
     infallible: bool
+    mutable: bool
+    reply_on_error: bool
 
     @property
     def args_size(self) -> int:
@@ -862,7 +866,7 @@ def _build_schema(data: dict, path: str, banner: str, known: Optional[Set[str]] 
     objects = tuple(_build_object(table, path, known) for table in object_tables)
     constants = tuple(_build_constant(table, path, known) for table in const_tables)
     functions = tuple(_build_function(table, path, known) for table in function_tables)
-    methods = tuple(_build_method(table, path) for table in _table_list(data, "method", path))
+    methods = tuple(_build_method(table, path, structs) for table in _table_list(data, "method", path))
     for key in ("name", "id", "symbol"):
         values = [getattr(method, key) for method in methods]
         if len(set(values)) != len(values):
@@ -896,7 +900,24 @@ def _build_schema(data: dict, path: str, banner: str, known: Optional[Set[str]] 
     )
 
 
-def _wire_fields(table: dict, key: str, path: str) -> Tuple[WireField, ...]:
+def _wire_field(name: str, type_: str, structs: Dict[str, Struct], path: str,
+                visiting: Tuple[str, ...] = ()) -> WireField:
+    if type_ in INTEGER_PRIMITIVES - {"usize"}:
+        return WireField(name, type_)
+    if type_ not in structs or type_ in visiting:
+        raise KabiError("%s: unknown or recursive wire type %s" % (path, type_))
+    struct = structs[type_]
+    if struct.size_ptrs is not None or not struct.fields or not {"c", "sdk-rust"} <= set(struct.targets):
+        raise KabiError("%s: wire struct %s must contain fixed values for C and Rust" % (path, type_))
+    fields = []
+    for item in struct.fields:
+        if not isinstance(item.type, (Prim, Named)):
+            raise KabiError("%s: pointer/function in wire struct %s" % (path, type_))
+        fields.append(_wire_field(item.name, item.type.name, structs, path, visiting + (type_,)))
+    return WireField(name, type_, tuple(fields), struct.c_name)
+
+
+def _wire_fields(table: dict, key: str, path: str, structs: Dict[str, Struct]) -> Tuple[WireField, ...]:
     fields = []
     for item in _table_list(table, key, path):
         _reject_unknown(item, ("name", "type"), "method.%s" % key, path)
@@ -915,9 +936,7 @@ def _wire_fields(table: dict, key: str, path: str) -> Tuple[WireField, ...]:
                     "status", "method_status", "args", "bytes", "result", "value", "transport"}
         if not _IDENT_RE.fullmatch(name) or name in reserved or name.startswith("wire_"):
             raise KabiError("%s: invalid/reserved wire field %r" % (path, name))
-        if type_ not in INTEGER_PRIMITIVES - {"usize"}:
-            raise KabiError("%s: wire field %s requires a fixed-width integer, got %s" % (path, name, type_))
-        fields.append(WireField(name, type_))
+        fields.append(_wire_field(name, type_, structs, path))
     if len({item.name for item in fields}) != len(fields):
         raise KabiError("%s: duplicate wire field" % path)
     return tuple(fields)
@@ -939,8 +958,8 @@ def _wire_buffer(table: dict, key: str, path: str) -> WireBuffer:
     return WireBuffer(minimum, maximum)
 
 
-def _build_method(table: dict, path: str) -> Method:
-    _reject_unknown(table, ("name", "id", "symbol", "args", "reply", "input", "output", "infallible"),
+def _build_method(table: dict, path: str, structs: Sequence[Struct] = ()) -> Method:
+    _reject_unknown(table, ("name", "id", "symbol", "args", "reply", "input", "output", "infallible", "mutable", "reply_on_error"),
                     "method", path)
     name = _required_string(table, "name", "method", path)
     symbol = _required_string(table, "symbol", "method", path)
@@ -958,10 +977,15 @@ def _build_method(table: dict, path: str) -> Method:
     infallible = table.get("infallible", False)
     if not isinstance(infallible, bool):
         raise KabiError("%s: method infallible must be boolean" % path)
-    method = Method(name, id_, symbol, _wire_fields(table, "args", path),
-                    _wire_fields(table, "reply", path), _wire_buffer(table, "input", path),
+    mutable = table.get("mutable", False)
+    reply_on_error = table.get("reply_on_error", False)
+    if not isinstance(mutable, bool) or not isinstance(reply_on_error, bool):
+        raise KabiError("%s: mutable/reply_on_error must be boolean" % path)
+    named = {struct.name: struct for struct in structs}
+    method = Method(name, id_, symbol, _wire_fields(table, "args", path, named),
+                    _wire_fields(table, "reply", path, named), _wire_buffer(table, "input", path),
                     _wire_buffer(table, "output", path),
-                    table.get("output", {}).get("matches") == "input", infallible)
+                    table.get("output", {}).get("matches") == "input", infallible, mutable, reply_on_error)
     if method.output_matches_input and (method.input != method.output or "input" not in table):
         raise KabiError("%s: matching input/output need identical explicit bounds" % path)
     # Reuse the existing envelope authority, including for standalone synthetic
@@ -1891,6 +1915,43 @@ def _wire_reply_name(method: Method) -> str:
     return "".join(part.capitalize() for part in method.name.split("_")) + "Reply"
 
 
+def _wire_codec_name(type_: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type_).lower()
+
+
+def _wire_named_fields(methods: Sequence[Method]) -> List[WireField]:
+    named = {}
+    def visit(item: WireField) -> None:
+        for child in item.fields:
+            visit(child)
+        if item.fields:
+            named[item.type] = item
+    for method in methods:
+        for item in method.args + method.reply:
+            visit(item)
+    return list(named.values())
+
+
+def _wire_leaf_types(item: WireField) -> Set[str]:
+    return set().union(*(_wire_leaf_types(child) for child in item.fields)) if item.fields else {item.type}
+
+
+def _wire_c_type(item: WireField) -> str:
+    return "struct " + item.c_name if item.fields else C_PRIMITIVES[item.type]
+
+
+def _wire_rust_decode(item: WireField, bytes_: str, error: str) -> str:
+    if item.fields:
+        return "decode_%s(%s).map_err(|_| %s)?" % (_wire_codec_name(item.type), bytes_, error)
+    return "%s::from_le_bytes(%s.try_into().map_err(|_| %s)?)" % (item.type, bytes_, error)
+
+
+def _wire_rust_encode(item: WireField, value: str, bytes_: str, error: str) -> str:
+    if item.fields:
+        return "encode_%s(&%s, &mut %s).map_err(|_| %s)?;" % (_wire_codec_name(item.type), value, bytes_, error)
+    return "%s.copy_from_slice(&%s.to_le_bytes());" % (bytes_, value)
+
+
 def _wire_reply_type(method: Method) -> str:
     if not method.reply:
         return "()"
@@ -1937,6 +1998,28 @@ class WireRustEmitter(Emitter):
         schema, = schemas
         lines = [banner_rust(_banner_sources(schemas)),
                  "use crate::{Errno, Result, endpoint::InvokeError, ipc::service};"]
+        named = _wire_named_fields(schema.methods)
+        if named:
+            lines.append("use crate::generated::%s::{%s};" % (schema.name, ", ".join(item.type for item in named)))
+        for item in named:
+            codec = _wire_codec_name(item.type)
+            lines += ["pub fn decode_%s(bytes: &[u8]) -> Result<%s> {" % (codec, item.type),
+                      "    if bytes.len() != %d { return Err(Errno::EINVAL); }" % item.size,
+                      "    Ok(%s {" % item.type]
+            offset = 0
+            for child in item.fields:
+                decode = _wire_rust_decode(child, "bytes[%d..%d]" % (offset, offset + child.size) if not child.fields
+                                           else "&bytes[%d..%d]" % (offset, offset + child.size), "Errno::EINVAL")
+                lines.append("        %s: %s," % (child.name, decode))
+                offset += child.size
+            lines += ["    })", "}", "pub fn encode_%s(value: &%s, bytes: &mut [u8]) -> Result<()> {" % (codec, item.type),
+                      "    if bytes.len() != %d { return Err(Errno::EINVAL); }" % item.size]
+            offset = 0
+            for child in item.fields:
+                lines.append("    " + _wire_rust_encode(child, "value.%s" % child.name,
+                              "bytes[%d..%d]" % (offset, offset + child.size), "Errno::EINVAL"))
+                offset += child.size
+            lines += ["    Ok(())", "}"]
         for method in schema.methods:
             if len(method.reply) > 1:
                 lines += ["#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
@@ -1948,7 +2031,7 @@ class WireRustEmitter(Emitter):
             ret = _wire_reply_type(method)
             if not method.infallible:
                 ret = "Result<%s>" % ret
-            params = ["&self"] + _wire_rust_params(method)
+            params = ["&mut self" if method.mutable else "&self"] + _wire_rust_params(method)
             lines.append("    fn %s(%s) -> %s;" % (method.name, ", ".join(params), ret))
         lines += ["}", "/// Validate before borrowing buffers or executing business logic.",
                   "pub fn validate(request: &service::Request<'_>) -> Result<()> {",
@@ -1964,8 +2047,11 @@ class WireRustEmitter(Emitter):
                   "    if invalid { Err(Errno::EINVAL) } else { Ok(()) }", "}"]
         for method in schema.methods:
             params = ["endpoint: u64"] + _wire_rust_params(method)
+            ret = _wire_reply_type(method)
+            if method.reply_on_error:
+                ret = "(i32, %s)" % ret
             lines.append("pub fn %s(%s) -> core::result::Result<%s, InvokeError> {" %
-                         (method.name, ", ".join(params), _wire_reply_type(method)))
+                         (method.name, ", ".join(params), ret))
             input_len = "input.len()" if method.input.maximum else "0"
             output_len = "output.len()" if method.output.maximum else "0"
             shape = _wire_shape(method, str(method.args_size), input_len, output_len, "rust")
@@ -1974,7 +2060,7 @@ class WireRustEmitter(Emitter):
             lines.append("    let %swire_args = [0u8; %d];" % ("mut " if method.args else "", method.args_size))
             offset = 0
             for item in method.args:
-                lines.append("    wire_args[%d..%d].copy_from_slice(&%s.to_le_bytes());" % (offset, offset + item.size, item.name))
+                lines.append("    " + _wire_rust_encode(item, item.name, "wire_args[%d..%d]" % (offset, offset + item.size), "InvokeError::InvalidReply"))
                 offset += item.size
             wire_len = ("%d + %s" % (method.reply_size, output_len) if method.reply_size and method.output.maximum
                         else str(method.reply_size) if method.reply_size else output_len)
@@ -1982,19 +2068,22 @@ class WireRustEmitter(Emitter):
                       "    let wire_len = %s;" % wire_len,
                       "    let wire_status = service::invoke(endpoint, %d, &wire_args, %s, &mut wire_reply[..wire_len])" %
                       (method.id, "input" if method.input.maximum else "&[]"),
-                      "        .map_err(InvokeError::Transport)?;",
-                      "    if wire_status < 0 { return Err(InvokeError::Method(Errno::from_code(wire_status))); }"]
+                      "        .map_err(InvokeError::Transport)?;"]
+            if not method.reply_on_error:
+                lines.append("    if wire_status < 0 { return Err(InvokeError::Method(Errno::from_code(wire_status))); }")
             if method.output.maximum:
                 lines.append("    output.copy_from_slice(&wire_reply[%d..wire_len]);" % method.reply_size)
             offset = 0
             for item in method.reply:
-                lines.append("    let %s = %s::from_le_bytes(wire_reply[%d..%d].try_into().map_err(|_| InvokeError::InvalidReply)?);" %
-                             (item.name, item.type, offset, offset + item.size))
+                bytes_ = "wire_reply[%d..%d]" % (offset, offset + item.size)
+                lines.append("    let %s = %s;" % (item.name, _wire_rust_decode(item,
+                             "&" + bytes_ if item.fields else bytes_, "InvokeError::InvalidReply")))
                 offset += item.size
             value = "()" if not method.reply else method.reply[0].name if len(method.reply) == 1 else "%s { %s }" % (
                 _wire_reply_name(method), ", ".join(item.name for item in method.reply))
-            lines += ["    Ok(%s)" % value, "}"]
-        lines += ["pub fn dispatch<P: Provider>(provider: &P, request: &service::Request<'_>, output: &mut [u8]) -> i32 {",
+            lines += ["    Ok(%s)" % ("(wire_status, %s)" % value if method.reply_on_error else value), "}"]
+        provider = "&mut P" if any(method.mutable for method in schema.methods) else "&P"
+        lines += ["pub fn dispatch<P: Provider>(provider: %s, request: &service::Request<'_>, output: &mut [u8]) -> i32 {" % provider,
                   "    let result = (|| -> Result<()> {", "        validate(request)?;",
                   "        if output.len() != request.output { return Err(Errno::EINVAL); }",
                   "        match request.method {"]
@@ -2002,8 +2091,9 @@ class WireRustEmitter(Emitter):
             lines.append("            %d => {" % method.id)
             offset = 0
             for item in method.args:
-                lines.append("                let %s = %s::from_le_bytes(request.args[%d..%d].try_into().map_err(|_| Errno::EINVAL)?);" %
-                             (item.name, item.type, offset, offset + item.size))
+                bytes_ = "request.args[%d..%d]" % (offset, offset + item.size)
+                lines.append("                let %s = %s;" % (item.name, _wire_rust_decode(item,
+                             "&" + bytes_ if item.fields else bytes_, "Errno::EINVAL")))
                 offset += item.size
             args = [item.name for item in method.args]
             if method.input.maximum:
@@ -2015,7 +2105,7 @@ class WireRustEmitter(Emitter):
             offset = 0
             for item in method.reply:
                 value = "wire_result" if len(method.reply) == 1 else "wire_result.%s" % item.name
-                lines.append("                output[%d..%d].copy_from_slice(&%s.to_le_bytes());" % (offset, offset + item.size, value))
+                lines.append("                " + _wire_rust_encode(item, value, "output[%d..%d]" % (offset, offset + item.size), "Errno::EINVAL"))
                 offset += item.size
             lines.append("            }")
         lines += ["            _ => return Err(Errno::ENOSYS),", "        }", "        Ok(())", "    })();",
@@ -2031,9 +2121,12 @@ class WireCEmitter(Emitter):
         prefix = "kcomp_%s_wire" % schema.name
         lines = [banner_c(_banner_sources(schemas)), "#ifndef " + output.guard, "#define " + output.guard,
                  '#include "kcomp_ipc.h"', '#include "errno.h"']
+        named = _wire_named_fields(schema.methods)
+        if named:
+            lines.append('#include "generated/kcomp_abi.h"')
         # Explicit byte operations: no host endianness, unaligned cast, padding,
         # pointer field, or implementation-defined unsigned-to-signed conversion.
-        types = sorted({item.type for method in schema.methods for item in method.args + method.reply})
+        types = sorted(set().union(*(_wire_leaf_types(item) for method in schema.methods for item in method.args + method.reply)))
         for type_ in types:
             size = int(type_[1:]) // 8
             unsigned = "uint%d_t" % (size * 8)
@@ -2048,10 +2141,30 @@ class WireCEmitter(Emitter):
                 lines.append("    return value;")
             lines += ["}", "static inline void %s_put_%s(uint8_t *bytes, %s value) {" % (prefix, type_, ctype),
                       "    for (size_t i = 0; i < %d; ++i) bytes[i] = (uint8_t)((%s)value >> (8 * i));" % (size, unsigned), "}"]
+        for item in named:
+            codec = _wire_codec_name(item.type)
+            lines += ["static inline %s %s_get_%s(const uint8_t *bytes) {" % (_wire_c_type(item), prefix, codec),
+                      "    %s value;" % _wire_c_type(item)]
+            offset = 0
+            for child in item.fields:
+                lines.append("    value.%s = %s_get_%s(bytes + %d);" % (child.name, prefix, _wire_codec_name(child.type), offset))
+                offset += child.size
+            lines += ["    return value;", "}",
+                      "static inline void %s_put_%s(uint8_t *bytes, %s value) {" % (prefix, codec, _wire_c_type(item))]
+            offset = 0
+            for child in item.fields:
+                lines.append("    %s_put_%s(bytes + %d, value.%s);" % (prefix, _wire_codec_name(child.type), offset, child.name))
+                offset += child.size
+            lines += ["}", "static inline int32_t %s_decode_%s(const uint8_t *bytes, size_t len, %s *value) {" % (prefix, codec, _wire_c_type(item)),
+                      "    if (!bytes || !value || len != %d) return -EINVAL;" % item.size,
+                      "    *value = %s_get_%s(bytes); return 0;" % (prefix, codec), "}",
+                      "static inline int32_t %s_encode_%s(uint8_t *bytes, size_t len, %s value) {" % (prefix, codec, _wire_c_type(item)),
+                      "    if (!bytes || len != %d) return -EINVAL;" % item.size,
+                      "    %s_put_%s(bytes, value); return 0;" % (prefix, codec), "}"]
         for method in schema.methods:
             if method.reply:
                 lines += ["struct %s_%s_reply {" % (prefix, method.name)]
-                lines += ["    %s %s;" % (C_PRIMITIVES[item.type], item.name) for item in method.reply]
+                lines += ["    %s %s;" % (_wire_c_type(item), item.name) for item in method.reply]
                 lines.append("};")
         lines += ["static inline int32_t %s_validate(const struct kcomp_ipc_request *request) {" % prefix,
                   "    if (!request || (request->args_len && !request->args) || (request->input_len && !request->input)) return -EINVAL;",
@@ -2063,7 +2176,7 @@ class WireCEmitter(Emitter):
             lines.append("    case %d: return %s%s ? -EINVAL : 0;" % (method.id, guard, shape))
         lines += ["    default: return -ENOSYS;", "    }", "}"]
         for method in schema.methods:
-            params = ["%s %s" % (C_PRIMITIVES[item.type], item.name) for item in method.args]
+            params = ["%s %s" % (_wire_c_type(item), item.name) for item in method.args]
             if method.input.maximum:
                 params += ["const uint8_t *input", "size_t input_len"]
             if method.output.maximum:
@@ -2090,14 +2203,14 @@ class WireCEmitter(Emitter):
                       "    uint8_t wire_reply[%d] = {0};" % max(1, method.reply_size + method.output.maximum)]
             offset = 0
             for item in method.args:
-                lines.append("    %s_put_%s(wire_args + %d, %s);" % (prefix, item.type, offset, item.name))
+                lines.append("    %s_put_%s(wire_args + %d, %s);" % (prefix, _wire_codec_name(item.type), offset, item.name))
                 offset += item.size
             lines += ["    int32_t transport = kcomp_ipc_invoke(endpoint, %d, wire_args, %d, %s, %s, wire_reply, %d + %s, method_status);" %
                       (method.id, method.args_size, "input" if method.input.maximum else "NULL", input_len, method.reply_size, output_len),
-                      "    if (transport || *method_status) return transport;"]
+                      "    if (%s) return transport;" % ("transport" if method.reply_on_error else "transport || *method_status")]
             offset = 0
             for item in method.reply:
-                lines.append("    reply->%s = %s_get_%s(wire_reply + %d);" % (item.name, prefix, item.type, offset))
+                lines.append("    reply->%s = %s_get_%s(wire_reply + %d);" % (item.name, prefix, _wire_codec_name(item.type), offset))
                 offset += item.size
             if method.output.maximum:
                 lines.append("    for (size_t i = 0; i < output_len; ++i) output[i] = wire_reply[%d + i];" % method.reply_size)
@@ -2114,7 +2227,7 @@ class WireCEmitter(Emitter):
             args = ["ctx"]
             offset = 0
             for item in method.args:
-                args.append("%s_get_%s(request->args + %d)" % (prefix, item.type, offset))
+                args.append("%s_get_%s(request->args + %d)" % (prefix, _wire_codec_name(item.type), offset))
                 offset += item.size
             if method.input.maximum:
                 args += ["request->input", "request->input_len"]
@@ -2127,7 +2240,7 @@ class WireCEmitter(Emitter):
             lines.append("        if (status) return status;")
             offset = 0
             for item in method.reply:
-                lines.append("        %s_put_%s(output + %d, reply.%s);" % (prefix, item.type, offset, item.name))
+                lines.append("        %s_put_%s(output + %d, reply.%s);" % (prefix, _wire_codec_name(item.type), offset, item.name))
                 offset += item.size
             lines += ["        return 0;", "    }"]
         lines += ["    default: return -ENOSYS;", "    }", "}", "#endif"]
@@ -2203,8 +2316,12 @@ OUTPUTS: Tuple[Output, ...] = (
     Output("wire-c", "os/components/kcomp-sdk/include/generated/filesystem_wire.h", ("filesystem.toml",), guard="KCOMP_FILESYSTEM_WIRE_H"),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/probe.rs", ("probe.toml",)),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/vfs.rs", ("vfs.toml",)),
+    Output("wire-rust", "os/components/kcomp-sdk/src/generated/vfs_wire.rs", ("vfs.toml",)),
+    Output("wire-c", "os/components/kcomp-sdk/include/generated/vfs_wire.h", ("vfs.toml",), guard="KCOMP_VFS_WIRE_H"),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/network.rs", ("network.toml",)),
     Output("sdk-rust", "os/components/kcomp-sdk/src/generated/posix.rs", ("posix.toml",)),
+    Output("wire-rust", "os/components/kcomp-sdk/src/generated/posix_wire.rs", ("posix.toml",)),
+    Output("wire-c", "os/components/kcomp-sdk/include/generated/posix_wire.h", ("posix.toml",), guard="KCOMP_POSIX_WIRE_H"),
     Output(
         "sdk-rust",
         "os/components/kcomp-sdk/src/generated/scheduler.rs",
@@ -2577,11 +2694,15 @@ doc = "I/O error"
     user_trap = next(struct for struct in core.structs if struct.name == "UserTrap")
     assert user_trap.size64 == 88 and user_trap.size32 == 88 and user_trap.align == 8
     posix = load_schema("abi/posix.toml")
-    process_api = next(struct for struct in posix.structs if struct.name == "PosixProcessApi")
-    one_pointer = RustEmitter()._struct(process_api)
+    assert not any(struct.name == "PosixProcessApi" for struct in posix.structs)
+    assert [(method.name, method.id, method.reply_size) for method in posix.methods] == [
+        ("status", 0, 12), ("shutdown", 1, 0)]
+    frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
+    # Keep the single-pointer layout regression independent of business tables.
+    one_pointer = RustEmitter()._struct(Struct("OnePointer", "one_pointer", "",
+                                             frame.fields[:1], size_ptrs=1))
     assert "== core::mem::size_of::<usize>()" in one_pointer
     assert "1 *" not in one_pointer
-    frame = [struct for struct in component.structs if struct.name == "KcompCallFrame"][0]
     assert frame.c_name == "kcomp_call_frame" and frame.size_ptrs == 6
     assert [field.name for field in frame.fields] == [
         "args",

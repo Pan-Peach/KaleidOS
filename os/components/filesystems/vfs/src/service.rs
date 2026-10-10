@@ -6,10 +6,7 @@ use crate::{
     provider::{FsIdentity, NodeKind},
 };
 use alloc::vec::Vec;
-use kcomp_sdk::{
-    ipc::service::Request,
-    vfs::{codec::*, *},
-};
+use kcomp_sdk::{generated::vfs_wire as wire, ipc::service::Request, vfs::*};
 const LIMIT: usize = 32;
 struct PathRef {
     token: VfsPath,
@@ -160,183 +157,223 @@ impl Service {
         request: &Request<'_>,
         out: &mut [u8],
     ) -> Result<Option<Undo>> {
-        // Validate complete shape before calling a backend or mutating a table.
-        let expected = match request.method {
-            KCOMP_VFS_METHOD_ROOT => (0, 40),
-            KCOMP_VFS_METHOD_RESOLVE => (80, 40),
-            KCOMP_VFS_METHOD_NODE_INFO => (32, 32),
-            KCOMP_VFS_METHOD_OPEN => (48, 16),
-            KCOMP_VFS_METHOD_RETAIN | KCOMP_VFS_METHOD_CLOSE => (8, 8),
-            KCOMP_VFS_METHOD_SET_POSITION => (16, 8),
-            KCOMP_VFS_METHOD_STREAM_INFO => (8, 64),
-            KCOMP_VFS_METHOD_RETAIN_PATH | KCOMP_VFS_METHOD_RELEASE_PATH => (32, 8),
-            KCOMP_VFS_METHOD_READ => (8, out.len()),
-            KCOMP_VFS_METHOD_READ_AT => (16, out.len()),
-            KCOMP_VFS_METHOD_READ_DIR => return Err(Error::ENOTSUP),
-            _ => return Err(Error::ENOSYS),
+        out.fill(0);
+        let mut handler = Handler {
+            service: self,
+            consumer,
+            task,
+            undo: None,
         };
-        if request.args.len() != expected.0
-            || out.len() != expected.1
-            || request.output != out.len()
-            || out.len() < 8
-            || ((request.method == KCOMP_VFS_METHOD_READ
-                || request.method == KCOMP_VFS_METHOD_READ_AT)
-                && !(16..=528).contains(&out.len()))
-            || (!matches!(
-                request.method,
-                KCOMP_VFS_METHOD_RESOLVE | KCOMP_VFS_METHOD_OPEN
-            ) && !request.input.is_empty())
-        {
+        let status = wire::dispatch(&mut handler, request, out);
+        if status != 0 {
+            return Err(Error::from_code(status));
+        }
+        Ok(handler.undo)
+    }
+}
+
+// Verified caller identity and cancellation compensation stay local to VFS.
+struct Handler<'a> {
+    service: &'a mut Service,
+    consumer: u32,
+    task: u32,
+    undo: Option<Undo>,
+}
+fn reply_status() -> VfsReplyStatus {
+    VfsReplyStatus {
+        domain: 0,
+        reserved: 0,
+    }
+}
+impl wire::Provider for Handler<'_> {
+    fn root(&mut self) -> Result<wire::RootReply> {
+        let token =
+            self.service
+                .give_path(self.consumer, self.task, self.service.namespace.root())?;
+        self.undo = Some(Undo::Path(token));
+        Ok(wire::RootReply {
+            reply_status: reply_status(),
+            token,
+        })
+    }
+    fn resolve(&mut self, options: VfsLookup, input: &[u8]) -> Result<wire::ResolveReply> {
+        if options.reserved != 0 || options.flags & !7 != 0 {
             return Err(Error::EINVAL);
         }
-        out.fill(0);
-        match request.method {
-            KCOMP_VFS_METHOD_ROOT => {
-                let token = self.give_path(consumer, task, self.namespace.root())?;
-                put_path(&mut out[8..], &token);
-                Ok(Some(Undo::Path(token)))
-            }
-            KCOMP_VFS_METHOD_RESOLVE => {
-                let request_lookup = lookup(request.args);
-                if request_lookup.reserved != 0 || request_lookup.flags & !7 != 0 {
-                    return Err(Error::EINVAL);
-                }
-                if request_lookup.encoding != KCOMP_VFS_ENCODING_BYTES {
-                    return Err(if request_lookup.encoding == KCOMP_VFS_ENCODING_UTF16 {
-                        Error::ENOTSUP
-                    } else {
-                        Error::EINVAL
-                    });
-                }
-                let start = self.paths[self.path_index(consumer, task, &request_lookup.start)?]
-                    .path
-                    .clone();
-                let root = self.paths[self.path_index(consumer, task, &request_lookup.root)?]
-                    .path
-                    .clone();
-                let found = self.namespace.resolve(
-                    &LookupContext {
-                        start: &start,
-                        root: &root,
-                        beneath: request_lookup.flags & KCOMP_VFS_LOOKUP_BENEATH_START != 0,
-                        cross_mounts: request_lookup.flags & KCOMP_VFS_LOOKUP_CROSS_MOUNTS != 0,
-                    },
-                    request.input,
-                )?;
-                let token = self.give_path(consumer, task, found)?;
-                put_path(&mut out[8..], &token);
-                Ok(Some(Undo::Path(token)))
-            }
-            KCOMP_VFS_METHOD_RETAIN_PATH | KCOMP_VFS_METHOD_RELEASE_PATH => {
-                let token = path(request.args);
-                let index = self.path_index(consumer, task, &token)?;
-                if request.method == KCOMP_VFS_METHOD_RELEASE_PATH {
-                    self.release_path(consumer, task, &token)?;
-                    Ok(None)
-                } else {
-                    self.paths[index].refs = self.paths[index]
-                        .refs
-                        .checked_add(1)
-                        .ok_or(Error::EOVERFLOW)?;
-                    Ok(Some(Undo::Path(token)))
-                }
-            }
-            KCOMP_VFS_METHOD_NODE_INFO => {
-                let token = path(request.args);
-                let index = self.path_index(consumer, task, &token)?;
-                let metadata = self.paths[index].path.node().metadata()?;
-                put32(
-                    out,
-                    8,
-                    if metadata.kind == NodeKind::Directory {
-                        KCOMP_VFS_NODE_DIRECTORY
-                    } else {
-                        KCOMP_VFS_NODE_REGULAR
-                    },
-                );
-                // No fabricated link count, permissions or directory case rules.
-                Ok(None)
-            }
-            KCOMP_VFS_METHOD_OPEN => {
-                let options = open(request.args);
-                if options.access & !7 != 0 || options.share & !7 != 0 {
-                    return Err(Error::EINVAL);
-                }
-                if options.access != KCOMP_VFS_ACCESS_READ
-                    || options.share != KCOMP_VFS_SHARE_READ
-                    || options.stream_kind != KCOMP_VFS_STREAM_DEFAULT
-                {
-                    return Err(Error::ENOTSUP);
-                }
-                if options.encoding != 0 || !request.input.is_empty() {
-                    return Err(Error::EINVAL);
-                }
-                let index = self.path_index(consumer, task, &options.path)?;
-                if self.files.len() == LIMIT {
-                    return Err(Error::EMFILE);
-                }
-                let id = self.next_file;
-                let next = id.checked_add(1).ok_or(Error::ENOSPC)?;
-                let file = OpenFile::open(&self.paths[index].path)?;
-                self.next_file = next;
-                self.files.push(FileRef {
-                    id,
-                    consumer,
-                    task,
-                    refs: 1,
-                    file,
-                });
-                put64(out, 8, id);
-                Ok(Some(Undo::File(id)))
-            }
-            method => {
-                let id = u64_at(request.args, 0);
-                let index = self.file_index(consumer, task, id)?;
-                match method {
-                    KCOMP_VFS_METHOD_RETAIN => {
-                        self.files[index].refs = self.files[index]
-                            .refs
-                            .checked_add(1)
-                            .ok_or(Error::EOVERFLOW)?;
-                        return Ok(Some(Undo::RetainFile(id)));
-                    }
-                    KCOMP_VFS_METHOD_CLOSE => {
-                        self.close(consumer, task, id)?;
-                    }
-                    KCOMP_VFS_METHOD_SET_POSITION => {
-                        self.files[index]
-                            .file
-                            .set_position(u64_at(request.args, 8))?;
-                    }
-                    KCOMP_VFS_METHOD_READ | KCOMP_VFS_METHOD_READ_AT => {
-                        let actual = if method == KCOMP_VFS_METHOD_READ {
-                            self.files[index].file.read(&mut out[16..])?
-                        } else {
-                            self.files[index]
-                                .file
-                                .read_at(u64_at(request.args, 8), &mut out[16..])?
-                        };
-                        put64(out, 8, actual as u64);
-                    }
-                    KCOMP_VFS_METHOD_STREAM_INFO => {
-                        let node = self.files[index].file.node();
-                        let identity = node.identity();
-                        let metadata = node.metadata()?;
-                        let fs = self
-                            .filesystems
-                            .iter()
-                            .position(|fs| *fs == identity.fs)
-                            .ok_or(Error::EIO)? as u64
-                            + 1;
-                        put64(out, 8, fs);
-                        put64(out, 16, identity.node);
-                        put64(out, 24, 1);
-                        put64(out, 32, metadata.size);
-                    }
-                    _ => return Err(Error::ENOSYS),
-                }
-                Ok(None)
-            }
+        if options.encoding != KCOMP_VFS_ENCODING_BYTES {
+            return Err(if options.encoding == KCOMP_VFS_ENCODING_UTF16 {
+                Error::ENOTSUP
+            } else {
+                Error::EINVAL
+            });
         }
+        let start = self.service.paths[self.service.path_index(
+            self.consumer,
+            self.task,
+            &options.start,
+        )?]
+        .path
+        .clone();
+        let root =
+            self.service.paths[self
+                .service
+                .path_index(self.consumer, self.task, &options.root)?]
+            .path
+            .clone();
+        let found = self.service.namespace.resolve(
+            &LookupContext {
+                start: &start,
+                root: &root,
+                beneath: options.flags & KCOMP_VFS_LOOKUP_BENEATH_START != 0,
+                cross_mounts: options.flags & KCOMP_VFS_LOOKUP_CROSS_MOUNTS != 0,
+            },
+            input,
+        )?;
+        let token = self.service.give_path(self.consumer, self.task, found)?;
+        self.undo = Some(Undo::Path(token));
+        Ok(wire::ResolveReply {
+            reply_status: reply_status(),
+            token,
+        })
+    }
+    fn retain_path(&mut self, token: VfsPath) -> Result<VfsReplyStatus> {
+        let index = self.service.path_index(self.consumer, self.task, &token)?;
+        self.service.paths[index].refs = self.service.paths[index]
+            .refs
+            .checked_add(1)
+            .ok_or(Error::EOVERFLOW)?;
+        self.undo = Some(Undo::Path(token));
+        Ok(reply_status())
+    }
+    fn release_path(&mut self, token: VfsPath) -> Result<VfsReplyStatus> {
+        self.service
+            .release_path(self.consumer, self.task, &token)?;
+        Ok(reply_status())
+    }
+    fn node_info(&mut self, token: VfsPath) -> Result<wire::NodeInfoReply> {
+        let index = self.service.path_index(self.consumer, self.task, &token)?;
+        let metadata = self.service.paths[index].path.node().metadata()?;
+        // Unknown metadata remains explicitly invalid, not fabricated.
+        let info = VfsNodeInfo {
+            kind: if metadata.kind == NodeKind::Directory {
+                KCOMP_VFS_NODE_DIRECTORY
+            } else {
+                KCOMP_VFS_NODE_REGULAR
+            },
+            valid: 0,
+            link_count: 0,
+            name_encoding: 0,
+            case_rule: 0,
+        };
+        Ok(wire::NodeInfoReply {
+            reply_status: reply_status(),
+            info,
+        })
+    }
+    fn open(&mut self, options: VfsOpenRequest, input: &[u8]) -> Result<wire::OpenReply> {
+        if options.access & !7 != 0 || options.share & !7 != 0 {
+            return Err(Error::EINVAL);
+        }
+        if options.access != KCOMP_VFS_ACCESS_READ
+            || options.share != KCOMP_VFS_SHARE_READ
+            || options.stream_kind != KCOMP_VFS_STREAM_DEFAULT
+        {
+            return Err(Error::ENOTSUP);
+        }
+        if options.encoding != 0 || !input.is_empty() {
+            return Err(Error::EINVAL);
+        }
+        let index = self
+            .service
+            .path_index(self.consumer, self.task, &options.path)?;
+        if self.service.files.len() == LIMIT {
+            return Err(Error::EMFILE);
+        }
+        let id = self.service.next_file;
+        let next = id.checked_add(1).ok_or(Error::ENOSPC)?;
+        let file = OpenFile::open(&self.service.paths[index].path)?;
+        self.service.next_file = next;
+        self.service.files.push(FileRef {
+            id,
+            consumer: self.consumer,
+            task: self.task,
+            refs: 1,
+            file,
+        });
+        self.undo = Some(Undo::File(id));
+        Ok(wire::OpenReply {
+            reply_status: reply_status(),
+            file: id,
+        })
+    }
+    fn retain(&mut self, file: u64) -> Result<VfsReplyStatus> {
+        let index = self.service.file_index(self.consumer, self.task, file)?;
+        self.service.files[index].refs = self.service.files[index]
+            .refs
+            .checked_add(1)
+            .ok_or(Error::EOVERFLOW)?;
+        self.undo = Some(Undo::RetainFile(file));
+        Ok(reply_status())
+    }
+    fn close(&mut self, file: u64) -> Result<VfsReplyStatus> {
+        self.service.close(self.consumer, self.task, file)?;
+        Ok(reply_status())
+    }
+    fn set_position(&mut self, file: u64, offset: u64) -> Result<VfsReplyStatus> {
+        let index = self.service.file_index(self.consumer, self.task, file)?;
+        self.service.files[index].file.set_position(offset)?;
+        Ok(reply_status())
+    }
+    fn read(&mut self, file: u64, output: &mut [u8]) -> Result<wire::ReadReply> {
+        let index = self.service.file_index(self.consumer, self.task, file)?;
+        let actual = self.service.files[index].file.read(output)? as u64;
+        Ok(wire::ReadReply {
+            reply_status: reply_status(),
+            actual,
+        })
+    }
+    fn read_at(&mut self, file: u64, offset: u64, output: &mut [u8]) -> Result<wire::ReadAtReply> {
+        let index = self.service.file_index(self.consumer, self.task, file)?;
+        let actual = self.service.files[index].file.read_at(offset, output)? as u64;
+        Ok(wire::ReadAtReply {
+            reply_status: reply_status(),
+            actual,
+        })
+    }
+    fn stream_info(&mut self, file: u64) -> Result<wire::StreamInfoReply> {
+        let index = self.service.file_index(self.consumer, self.task, file)?;
+        let node = self.service.files[index].file.node();
+        let identity = node.identity();
+        let metadata = node.metadata()?;
+        let fs = self
+            .service
+            .filesystems
+            .iter()
+            .position(|fs| *fs == identity.fs)
+            .ok_or(Error::EIO)? as u64
+            + 1;
+        let info = VfsStreamInfo {
+            stream: VfsStream {
+                fs,
+                node: identity.node,
+                stream: 1,
+            },
+            size: metadata.size,
+            allocated_size: 0,
+            valid_data_length: 0,
+            valid: 0,
+            reserved: 0,
+        };
+        Ok(wire::StreamInfoReply {
+            reply_status: reply_status(),
+            info,
+        })
+    }
+    fn read_dir(&mut self, _: VfsPath, _: u64, _: &mut [u8]) -> Result<wire::ReadDirReply> {
+        Err(Error::ENOTSUP)
+    }
+    fn shutdown(&mut self) -> Result<VfsReplyStatus> {
+        // Only runtime's verified control branch may stop the service.
+        Err(Error::EACCES)
     }
 }

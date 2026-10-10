@@ -4,7 +4,7 @@
 
 ## 1. 决策与适用范围
 
-普通独立 `.kcomp` 服务推荐统一到 **Endpoint + Core 拥有的有界消息副本 + Provider Server Task + 一次性回复凭据**。Rust/C SDK 在其上封装同步 call；Provider 只实现一个请求处理入口，不同时发布业务 Direct table 和 Gate dispatcher。单镜像内部保持普通函数、trait、Arc。Echo、默认Fat/VFS与virtio Block的K链已接；本轮method生成/旧通道退出仍待实施，见[专项设计](component-communication-cleanup-design.md)。
+普通独立 `.kcomp` 服务推荐统一到 **Endpoint + Core 拥有的有界消息副本 + Provider Server Task + 一次性回复凭据**。Rust/C SDK 在其上封装同步 call；Provider 只实现一个请求处理入口，不同时发布业务 Direct table 和 Gate dispatcher。单镜像内部保持普通函数、trait、Arc。Echo、默认Fat/VFS与virtio Block的K链已接；Echo/Block/FS/VFS/Posix方法生成已接入；Posix旧表/Gate已删，其他旧消费者与私有域替代仍待迁移，见[现行方法生成](kabi-methods.md)。
 
 Core 只负责 Endpoint 活性、发送权限、消息长度/归属、Request 生命周期、Task 等待和一次完成；不认识 Session、inode、FILE_OBJECT、block lba。初版不做通用 handle table、CSpace、共享内存、零拷贝、notification、多 server 调度框架。内部的 request/reply 记录不是 provider 对象注册表。
 

@@ -2,7 +2,7 @@
 
 更新：2026-10-09。基线 develop `2e10304c389f` 已有 KernelNative IPC、混合
 Local/Remote Fat VFS、virtio Block IPC-only 与 ksh/ELF 主链。用户授权后已实现
-Echo/Block/Filesystem scalar/buffer 方法生成并接入真实服务，修复已审计回归；完整 check/host/
+Echo/Block/Filesystem/VFS/Posix scalar/buffer/固定结构方法生成并接入真实服务，修复已审计回归；完整 check/host/
 QEMU/Arch 门禁通过。普通旧通道安全退出仍未完成，见§3.29。Isolated新IPC、Sandbox、
 通用VFS文件fd/libc startup和完整物理回收未实现，K链不证明私有域能力。
 
@@ -37,7 +37,7 @@ KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组�
 ```text
 Applications / System Personality        ksh 可 exec 静态 RV64 ELF；最小 POSIX fork/exec/wait；Win32/WASI 是未来
         │
-Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；VFS Local 对象可用，服务未接线
+Services / Devices（组件图组合的产物）     最小 FS 服务已有（fatfs/littlefs）；Local/Remote 混合 VFS 服务已接线
         │
 Components（策略/服务/驱动 .kcomp）         scheduler_rr, driver_prober, virtio_blk, fatfs, littlefs
         │
@@ -392,7 +392,7 @@ session 仲裁、通用 VFS / execve 路径、文件 fd、管道或 Win32。`exe
 2026-10-09 Cleanup 核对：起始 HEAD 与 fetch 后 origin/develop 均为
 `2e10304c389fb6ab1b5815a97575199b62aa0c4b`，起始工作树干净。
 现行传输见 [IPC](docs/architecture/ipc.md)；事实/维护点/性能/门禁见
-[专项审计](docs/development/component-communication-audit.md)，待实施小 patch 见
+[专项审计](docs/development/component-communication-audit.md)，设计依据见
 [KABI 设计](docs/development/component-communication-cleanup-design.md) 与
 [文件级迁移](docs/development/component-communication-migration.md)。
 
@@ -401,24 +401,26 @@ wake/退出/取消；Local+Remote FatFs、VFS runtime/SDK、ksh cat/ELF；virtio
 实际链路是 VFS → Fat Server → Block Server，设备由 driver 自己的 Task 身份操作。
 Node 是 borrowed mount-lifetime 身份，open 才 owning；不是早期每-node lease 草案。
 
-最新实施门禁：make abi-gen/abi-check（23生成文件）、make check（含test-host）通过；
+最新实施门禁：make abi-gen/abi-check（27生成文件）、make check（含test-host）通过；
 make test-qemu：RV64 default/no-block各112 checks、RV32各90 checks与shell通过；
 init RV64五场景/RV32四场景全部通过。make test-arch：RV64/RV32各43/43、SMP3/3通过。
-4项C/Rust envelope测试及5项generated方法测试通过，无expectedFailure。
+4项C/Rust envelope测试及7项generated方法测试通过，无expectedFailure。
 私有 RV32 S-mode NoMMU：default/no-block 各90 checks与shell通过；I域装载明确ENOTSUP。
 生产修补包括policy拒绝优先级与decoder容量校验；测试修补把driver I/O放真实Task，
 独立legacy fixture adapter解除未支持的IPC import依赖；没有扩展I白名单。
 
-收敛状态：Phase A专项审计完成；B已实现Echo/Block/Filesystem method AST、整数LE、bounded buffer、
-C/Rust client/validator/dispatch，接入VirtIO/Fat Server与RemoteFs；命名结构、VFS自身待做。
-详见 [方法生成](docs/development/kabi-methods.md)。C仍有Block三Backend、FS双入口、
+收敛状态：Phase A专项审计完成；B已实现Echo/Block/Filesystem/VFS/Posix method AST、整数LE、bounded buffer、固定嵌套结构、
+C/Rust client/validator/dispatch，接入VirtIO/Fat/VFS Server、RemoteFs和VFS SDK。
+posix.process已迁独立IPC Server，移除Direct表/Gate分发/SDK两Backend，
+显式shutdown后stop与旧Endpoint失效由CoreTest验证；详见 [方法生成](docs/development/kabi-methods.md)。C仍有Block三Backend、FS双入口、
 RAM/little/probe旧通道；D私有Task/import/copy尚缺；E普通业务Direct/Gate未删。
-F文档/测试随实施更新，不等于整体Cleanup完成。Core新增账本/锁为零。
+F文档/测试随实施更新，不等于整体Cleanup完成。Core新增账本/锁为零。 posix observer每实例增加一个真实Server Task，
+shutdown后退役；OOM下destroy栈分配失败的既有Core限制仍存在，ksh不更改已提交的wait status。
 
 限制：KernelNative同特权可信；Isolated新IPC/持久Task/跨AS copy、Sandbox、deadline/
 强制终止/通知与物理回收未实现。旧Gate必须保留到真实I替代门禁满足。
 Echo fixture确定性验证远端Task先于create完成的启动窗口，等待Endpoint提交后listen。
-下一步：VFS固定结构及client/dispatch，逐组迁移普通服务，补私有域IPC后删除旧通道。
+下一步：逐组迁移RAM/little/probe普通服务，补私有域IPC后删除旧通道。
 
 ## 4. 结构热点（按对 Core 冻结的威胁排序）
 
