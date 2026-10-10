@@ -615,6 +615,42 @@ pub struct AddressSpaceManager<B: AddressSpaceBackend> {
 }
 
 impl<B: AddressSpaceBackend> AddressSpaceManager<B> {
+    pub fn runtime_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let (mut mapped_pages, mut table_pages, mut metadata_pages) =
+            (0, 0, crate::memory::vec_heap_pages(&self.spaces));
+        let mut slab_bytes = crate::memory::vec_slab_bytes(&self.spaces);
+        let mut slab_objects = usize::from(slab_bytes != 0);
+        for space in &self.spaces {
+            mapped_pages += space
+                .mappings
+                .iter()
+                .map(|m| m.physical_range.size / crate::memory::ALLOC_GRANULE)
+                .sum::<usize>();
+            let (pages, capacity) = space.backend.page_table_stats();
+            table_pages += pages;
+            // Same allocation shape as the backend's Vec<usize>, without
+            // constructing or owning a second list of frames.
+            metadata_pages += crate::memory::array_heap_pages::<usize>(capacity);
+            metadata_pages += crate::memory::vec_heap_pages(&space.mappings)
+                + crate::memory::vec_heap_pages(&space.shared);
+            let bytes = [
+                crate::memory::array_slab_bytes::<usize>(capacity),
+                crate::memory::vec_slab_bytes(&space.mappings),
+                crate::memory::vec_slab_bytes(&space.shared),
+            ];
+            slab_objects += bytes.iter().filter(|&&size| size != 0).count();
+            slab_bytes += bytes.iter().sum::<usize>();
+        }
+        (
+            self.spaces.len(),
+            mapped_pages,
+            table_pages,
+            metadata_pages,
+            slab_objects,
+            slab_bytes,
+        )
+    }
+
     pub const fn empty() -> Self {
         Self {
             spaces: alloc::vec::Vec::new(),
@@ -886,6 +922,10 @@ mod active {
     type ActiveSpaces = AddressSpaceManager<AddressSpaceImpl>;
 
     static SPACES: spin::Mutex<ActiveSpaces> = spin::Mutex::new(ActiveSpaces::empty());
+
+    pub fn runtime_stats() -> (usize, usize, usize, usize, usize, usize) {
+        SPACES.lock().runtime_stats()
+    }
 
     /// 当前 profile 是否具备私有地址空间能力——直接问**已选中的 backend**
     /// （trait 可用 ≠ 隔离能力：NoMMU 也实现 `AddressSpaceBackend`）。
@@ -1179,7 +1219,8 @@ pub use active::{
     create_isolated_address_space_for, exclude_identity_alias_from_live_spaces, find_free_range,
     isolation_capable, map, mapping_exact, prepare_activation, prepare_transition,
     private_mappings, private_range_has_permission, range_has_permission, reclaim,
-    restore_identity_alias_to_live_spaces, retire, shared_executable_at, translate, unmap,
+    restore_identity_alias_to_live_spaces, retire, runtime_stats, shared_executable_at, translate,
+    unmap,
 };
 
 /// 无后端构建（host test）：没有可用的私有地址空间实现——能力恒为 `false`，
@@ -1194,6 +1235,17 @@ pub use active::{
 )))]
 pub fn isolation_capable() -> bool {
     false
+}
+
+#[cfg(not(any(
+    feature = "vm-nommu",
+    all(
+        feature = "vm-mmu",
+        any(target_arch = "riscv32", target_arch = "riscv64")
+    )
+)))]
+pub fn runtime_stats() -> (usize, usize, usize, usize, usize, usize) {
+    (0, 0, 0, 0, 0, 0)
 }
 
 /// 无后端构建（host）：没有可用的共享映射私有 AS——显式失败。

@@ -75,6 +75,13 @@ impl Default for Exchange {
     }
 }
 impl Exchange {
+    pub(crate) fn runtime_stats(&self) -> (usize, usize) {
+        (
+            self.servers.len(),
+            self.slots.iter().filter(|s| s.id != 0).count(),
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             servers: Vec::with_capacity(ENDPOINT_LIMIT),

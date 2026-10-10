@@ -388,7 +388,7 @@ Drop。root 创建失败可回收该 owner 的独占 image。stack/window/thunk/
 
 ### 7.5 最新实际验证与证据范围
 
-命令在当前 develop 工作区执行，私有 resolved profile 不修改用户 `.config`。
+以下是首批实现提交 `87b86be` 前的验证快照；私有 resolved profile 不修改用户 `.config`。
 
 | 命令 | 最新结果 | 日志 / 层次 |
 |---|---|---|
@@ -410,12 +410,12 @@ slab metadata 会增长；目前只观察物理页总数与 Task 数，不逐一
 RV64 default 具体样本：1000轮，Task基线90，累计returned_pages=2349500，
 retained_peak=192页；U读0x80200000触发cause13，CPU1 busy的first=-16/stop=0/reclaim=0。
 该192页尚未精确归因，不能据此签发无泄漏结论。66个Markdown文件的383个本地文件/anchor链接检查与
-`git diff --check`通过；third_party无改动，未提交或推送。
+`git diff --check`通过；third_party无改动。这批实现已按用户指令提交为 `87b86be`，未推送。
 
 ### 7.6 尚需落地的任务与停止条件
 
 按 §3 的 Problem/Invariant/Minimal Change/Reuse/Removed Complexity/Non-goals/Tests
-继续推进；以下没有登记为完成能力：
+继续推进；下表是首批提交时的剩余项，受控CPU-only计量后续结果见§8：
 
 | 小任务 | 文件 / 前置 | 验收与风险 |
 |---|---|---|
@@ -435,3 +435,89 @@ retained_peak=192页；U读0x80200000触发cause13，CPU1 busy的first=-16/stop=
 浮点验收依据 [RISC-V psABI §1.3/§2.2](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/)
 （2026-10-10核对）：硬件浮点ABI对fs0–fs11有按ABI_FLEN保存的要求，fcsr有线程存储期。
 结合当前只保存整数的Context，浮点跨Task支持仍有缺口；这不是整数Echo回归的已验证能力。
+
+
+## 8. 回收计量补丁（在87b86be之后）
+
+- **Problem**：首批1000轮只知道净保留192页，无法区分tombstone/Vec容量/slab与私有资源残留；Task count与reclaim成功不是完整的物理占用核对。
+- **Invariant**：只读投影既有对象，不增加资源/实例/逐malloc账本；小对象共享slab页只能计一次，映射长度不能冒充独占backing；统计不作为free或强杀依据。子表分别取锁，并发时不是全局原子快照。只有live KernelNative管理上下文可调用，不增加I/U import。
+- **Minimal Change**：`abi/core.toml`新增一个88字节整数结构和`kcore_runtime_stats`；`export.rs`汇总现有Registry/Endpoint/Task/AS/Exchange/Plan/slab，Sv32/Sv39只投影既有frames长度/容量；现有CoreTest压力补资源基线和物理差额断言。无新crate、模块或业务Wire；生成器只更新自测条目数，职责不变。
+- **Reuse**：buddy layout取整、slab链表、各Vec capacity、AS私有mapping与backend frames、Task栈lease、Exchange既有slot。临时快照全在栈上、不分配、不保存历史对象。大对象buddy物理页按已有分配形状计算，小对象页数直接扫描slab，拒绝用requested字节猜页占用。
+- **Removed Complexity**：去掉“净增大概是缓存”的解释；没有为了计量添加每实例内存账本或allocator事件注册表。tombstone本身与名称仍保留，未实施压缩/删除或隐藏占用。
+- **Non-goals**：全系统并发原子内存账、配额、Core所有malloc归因、POSIX/DMA回收、Graceful drain、FP与shootdown实现；统计不暴露Core地址。
+- **Tests**：host验证slab共享页/槽/释放、large layout对应真实buddy消耗、null/无上下文/Failed/私有上下文拒绝且out不变；既有Sv32/Sv39 teardown补table计数，unmap后仍占用。QEMU每轮真IPC后AS/mapping/table/Task/栈/server/request/exclusion回到基线；每轮恰好多一个Component、reclaimed记录、Endpoint与名称，恰好两个小名称槽；物理残差必须严格为0，不设置容差。RV64两个名称共24 class字节/轮、RV32共20，来源是现有word最小class。
+- **Result**：统计与严格测试已接线，逐轮零未解释物理差额、资源回基线与小槽迁移核对通过；计量分项与命令见§8.3。首批§7的192页尚未归因结论是当时事实，当前增量不回写成此前已证明。
+
+### 8.1 参考方案与选择
+
+2026-10-10核对在线rolling文档（不视为KaleidOS已有机制）：[Linux slab诊断文档](https://cdn.kernel.org/doc/html/latest/admin-guide/mm/slab.html)
+与[Fuchsia object_get_info](https://fuchsia.dev/reference/syscalls/object_get_info)。Linux区分
+slab页/对象与损耗，完整分配追踪需要额外debug配置；Fuchsia区分物理free、kernel heap、
+page-table等类别，说明各项不一定恰好组成total。这里采用类别分离和只读查询，拒绝引入
+Linux完整allocation追踪或Fuchsia对象体系。KaleidOS的严格等式只在受控CPU-only压力
+场景、子表无外部变化且各可回收资源回基线时成立，不推广成所有负载的全局所有权证明。
+
+
+### 8.2 扩容迁移与计量等式
+
+追加名称槽断言后，RV32在第3轮拒绝了一次错误的测试预期（guest日志
+`build/tests/qemu-rv32/logs/coretest-rv32-default-24m5c51t.log`）：Endpoint names Vec
+从1024字节slab槽扩容为buddy大对象，旧槽被释放。实际物理差额为0，slab对象增长
+为6个名称减1个旧Vec槽，class字节增长为60减1024。不能将这次迁移误判为泄漏，
+也不能放宽为容差。因此新增两个只读元数据小槽投影，来自同一现有Vec capacity，
+不改变分配器，不保存历史。各轮检查：
+
+```text
+free_before - free_after = large_metadata_pages_delta + slab_pages_delta
+slab_objects_delta = 2 * completed_rounds + metadata_slab_objects_delta
+slab_bytes_delta = name_slot_bytes * completed_rounds + metadata_slab_bytes_delta
+```
+
+metadata小槽不含独立名称，包含Registry/Endpoint/AS/Plan及backend frames Vec。
+它们已包含在全局slab数中，仅用于差分核对，不能再向物理页等式重复相加。
+Vec扩容从slab进入buddy时，小槽减少、大对象页增加，两个层次分别精确观察。
+每轮另检查所有可回收资源回基线与预期新增tombstone，不以这些等式代替执行排空。
+
+
+### 8.3 最新实际计量与验证
+
+CPU-only受控default场景的真实QEMU样本（1000轮）：
+
+| 项 | RV64基线→最终 | RV32基线→最终 |
+|---|---|---|
+| free pages | 516898→516706 | 258513→258400 |
+| Component元数据buddy页 | 4→128（+124） | 2→64（+62） |
+| Endpoint元数据buddy页 | 2→64（+62） | 1→48（+47） |
+| slab物理页 | 16→22（+6） | 16→20（+4） |
+| AS/mapping/table/request/exclusion | 全部0→0 | 全部0→0 |
+| Task/Core+API栈页 | 90/360→90/360 | 72/288→72/288 |
+| Exchange Server | 16→16 | 16→16 |
+| Component记录/reclaimed记录 | 43/10→1043/1010 | 33/3→1033/1003 |
+| Endpoint/名称记录 | 40/40→1040/1040 | 30/30→1030/1030 |
+| slab对象/class字节 | 300/36528→2300/60528 | 264/30172→2263/49148 |
+| 元数据小槽/class字节（已包含于slab） | 4/1536→4/1536 | 6/2880→5/1856 |
+
+RV64 **192=124+62+6** 页；RV32 **113=62+47+4** 页，逐轮残差严格为0。
+每轮两个名称是预期保留；RV32的名称共20000 class字节，减去旧Vec槽1024字节，
+得到slab增长18976字节与1999个对象。没有把slab页逐名称重复归因。
+AS manager的保留容量、计划Vec和已登记Exchange缓冲在场景前已热身并保持基线。
+这些记录没有驻留私有image/backing/table/Task栈；仍有明确的身份tombstone和名称。
+不承诺tombstone压缩，也不把当前结果推广成S-mode任意故障、DMA或并发全局原子计量。
+
+样本日志：`build/tests/qemu-rv64/logs/coretest-rv64-default-7lu3n6oc.log`，
+`build/tests/qemu-rv32/logs/coretest-rv32-default-u6ycfr63.log`。各轮资源与计量分别打印
+短行，避免SDK的256字节日志缓冲截掉证据。没有真机验证。
+
+| 命令 | 结果 | 日志 |
+|---|---|---|
+| `make check` | PASS，exit0；kernel582 passed/6 ignored | `/tmp/kaleidos-accounting-final-check.log` |
+| `make test-host` | PASS，exit0；kernel582 passed/6 ignored | `/tmp/kaleidos-accounting-final-host.log` |
+| `make test-qemu` | PASS，exit0；RV64 default/no-block各119，RV32各93，shell/init全过 | `/tmp/kaleidos-accounting-final-qemu.log` |
+| `make test-arch` | PASS，exit0；RV64/RV32各43/43，SMP3/3 | `/tmp/kaleidos-accounting-final-arch.log` |
+| `make O=build/tests/runtime-nommu-rv32 _test-qemu-one` | PASS，exit0；default/no-block各90 | `/tmp/kaleidos-accounting-final-nommu.log` |
+
+本轮增加1个查询入口、1个88字节整数结构和各既有表的只读投影；后端接口新增
+一个frames诊断方法（NoMMU为0）。没有新状态表、资源管理器、路由实现或业务IDL职责。
+一般Graceful drain、OOM/并发竞态、FP现场、远端shootdown与DMA恢复仍未实现。
+
+本轮增量尚未提交，前一批提交为`87b86be`；third_party无改动。

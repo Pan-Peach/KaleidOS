@@ -85,6 +85,10 @@ impl AddressSpaceBackend for Sv39AddressSpace {
             self.table.release(free);
         }
     }
+
+    fn page_table_stats(&self) -> (usize, usize) {
+        self.table.stats()
+    }
 }
 
 #[cfg(all(feature = "vm-mmu", target_arch = "riscv32"))]
@@ -161,5 +165,9 @@ impl AddressSpaceBackend for Sv32AddressSpace {
         unsafe {
             self.table.release(free);
         }
+    }
+
+    fn page_table_stats(&self) -> (usize, usize) {
+        self.table.stats()
     }
 }

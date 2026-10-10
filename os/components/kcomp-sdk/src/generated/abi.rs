@@ -381,6 +381,86 @@ const _: () = {
     assert!(core::mem::offset_of!(UserTrap, arg5) == 80);
 };
 
+/// 只读 Runtime 诊断，来自既有资源表与 allocator，不新增所有权账本。
+/// 单位 pages 为当前物理分配粒度。各子表分别取锁；并发时不是全系统原子快照，
+/// 不能用作释放依据。仅 live KernelNative 管理上下文可调用。
+/// metadata_pages 只含独占大对象 buddy allocation；小对象物理页统一在 slab_pages，不能重复相加。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStatsAbi {
+    /// buddy 空闲物理页。
+    pub free_pages: u32,
+    /// 现有 slab 链表占用物理页；共享页只计一次。
+    pub slab_pages: u32,
+    /// slab 已占用对象槽数量。
+    pub slab_objects: u32,
+    /// slab 已占用槽的 class 字节总数，不是请求字节或配额。
+    pub slab_bytes: u32,
+    /// 所有 ComponentRecord，含 tombstone。
+    pub component_records: u32,
+    /// 已完成显式 reclaim 的 ComponentRecord。
+    pub reclaimed_components: u32,
+    /// Registry Vec 与名称的大对象 buddy 页；小名称计入 slab。
+    pub component_metadata_pages: u32,
+    /// 所有 EndpointRecord，含 invalid tombstone。
+    pub endpoint_records: u32,
+    /// 发现名记录，含失效实例。
+    pub endpoint_names: u32,
+    /// Endpoint 各 Vec 与名称的大对象 buddy 页。
+    pub endpoint_metadata_pages: u32,
+    /// 现有 AS 对象，含 Retired。
+    pub address_spaces: u32,
+    /// 私有映射长度除以物理页大小的和；不是唯一 backing 所有权计量。
+    pub private_mapping_pages: u32,
+    /// 现有 AS backend 独占页表页；不含 boot 自持 root。
+    pub page_table_pages: u32,
+    /// AS manager、映射 Vec 和 backend frames Vec 的大对象 buddy 页。
+    pub space_metadata_pages: u32,
+    /// 现有 TaskRecord，包括 Exited。
+    pub tasks: u32,
+    /// TaskRecord 持有的 Core/API 栈 lease 页；私有栈计入私有映射。
+    pub task_stack_pages: u32,
+    /// Exchange 已登记服务数。
+    pub ipc_servers: u32,
+    /// Exchange 非零 request/receipt slot 数；含尚未 collect 的终态。
+    pub ipc_requests: u32,
+    /// 共享映射计划当前保留的私有 backing 排除项。
+    pub exclusions: u32,
+    /// 共享映射计划与排除 Vec 的大对象 buddy 页。
+    pub mapping_metadata_pages: u32,
+    /// Registry/Endpoint/AS/Plan各Vec当前占用的小对象槽，含backend frames Vec；不含独立名称。
+    pub metadata_slab_objects: u32,
+    /// 上述Vec小对象槽的class字节；包含于slab_bytes，用于核对扩容跨slab/buddy的迁移，不能重复相加。
+    pub metadata_slab_bytes: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<RuntimeStatsAbi>() == 88);
+    assert!(core::mem::align_of::<RuntimeStatsAbi>() == 4);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, free_pages) == 0);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, slab_pages) == 4);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, slab_objects) == 8);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, slab_bytes) == 12);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, component_records) == 16);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, reclaimed_components) == 20);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, component_metadata_pages) == 24);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, endpoint_records) == 28);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, endpoint_names) == 32);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, endpoint_metadata_pages) == 36);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, address_spaces) == 40);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, private_mapping_pages) == 44);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, page_table_pages) == 48);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, space_metadata_pages) == 52);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, tasks) == 56);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, task_stack_pages) == 60);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, ipc_servers) == 64);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, ipc_requests) == 68);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, exclusions) == 72);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, mapping_metadata_pages) == 76);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, metadata_slab_objects) == 80);
+    assert!(core::mem::offset_of!(RuntimeStatsAbi, metadata_slab_bytes) == 84);
+};
+
 /// IRQ 投递回调：`ctx` 原样回传，Core 不解引用。
 pub type IrqHandler = extern "C" fn(ctx: *mut ());
 
@@ -897,4 +977,9 @@ unsafe extern "C" {
     /// 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。
     #[link_name = "kcore_component_current"]
     pub fn kcore_component_current(out: *mut u32) -> i32;
+    // -- System query --
+    /// 读既有 Runtime 资源与物理分配统计；成功0，空out为EFAULT，非live KernelNative上下文为EPERM。
+    /// 不返回地址、不授予权限、不参与回收判定；并发观察语义见 RuntimeStatsAbi。
+    #[link_name = "kcore_runtime_stats"]
+    pub fn kcore_runtime_stats(out: *mut RuntimeStatsAbi) -> i32;
 }

@@ -4,7 +4,7 @@
 Local/Remote Fat VFS、virtio Block IPC-only 与 ksh/ELF 主链。用户授权后已实现
 Echo/Block/Filesystem/VFS/Posix/Probe scalar/buffer/固定结构方法生成并接入真实服务，修复已审计回归；完整 check/host/
 QEMU/Arch 门禁通过。普通业务 SDK/Provider 已统一 IPC；Core 同步隔离诊断与策略入口仍保留，见§3.29。
-通用VFS文件fd/libc startup、一般Graceful drain与完整回收核算仍缺；新增I/U CPU-only Task/IPC/Force/reclaim及1000轮真实回归见§3.30。
+通用VFS文件fd/libc startup、一般Graceful drain与并发/失败保留诊断仍缺；新增I/U CPU-only Task/IPC/Force/reclaim及1000轮真实回归见§3.30。
 
 RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固定 CPU 放置、Core 原子提交、远端 park/wake、AP idle 调度与 BSP 安全点均已接线。职责定案见 `docs/architecture/scheduling.md`。不包含 work stealing、迁移、抢占或第二 ISA 调度。
 
@@ -18,7 +18,7 @@ RV64 已进入真实 KernelNative 组件任务调度：每 CPU containment、固
 
 ## 0. 一句话
 
-KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS 文件 fd / libc startup、一般 Graceful drain、精确保留核算与 DMA 物理回收仍是主要缺口（I/U CPU-only 已接，§3.30）。
+KaleidOS 是一台能在 QEMU 启动、能交互观察、能加载 `.kcomp` 组件的 RISC-V 内核（RV64 支持协作式 SMP）。Core 的基本词汇（`TaskId` / `PhysicalRange` / `ComponentId` / `DeviceId` / `EndpointId` / `ExecutionDomain`）已经立住，`propose → validate → commit` 路径可用。现在还没有多个差异足够大的上层负载来把 Core 逼到定型，所以离 freeze-candidate 还有距离。block/wake 原语已可用；RV64 普通用户 task 已关联私有 AS；通用 VFS 文件 fd / libc startup、一般 Graceful drain、并发/失败保留诊断与 DMA 物理回收仍是主要缺口（I/U CPU-only 已接，§3.30）。
 
 底座侧 RISC-V 的 CPU 身份、启动、IPI 与 per-CPU 执行现场已接通组件调度。第二 ISA 的现状见模块文档，本轮不扩展它的实现或测试范围。
 
@@ -230,7 +230,7 @@ Block/FS 的 C/Rust SDK 只保留生成 IPC 方法与薄业务 facade。
 
 #### 3.20 SDK / C ABI / Rust ABI `▰▰▰▰▱` IMPLEMENTED
 
-现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；72 个 `kcore_*` 导出（含九项 IPC 与 current principal 查询）；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
+现状：`abi/*.toml` 是单一来源，生成 C 头与 Rust 镜像；75 个 `kcore_*` 导出（含九项 IPC、current principal、Force/reclaim 与只读 Runtime 统计）；组件 ABI 是窄 C ABI，Rust ABI 永远是私有实现；SDK 私有携带 C runtime。可选 `kcomp_runtime_init` 在业务 create 前选择 K 共享堆 / I 私有堆，Rust `Vec/Box` 与 C `malloc/free` 共用部署 adapter。`make abi-check` 重生成后逐文件比对，`kcomp_abi_drift.rs` 冻结入口面与绝对数值；QEMU CoreTest `c-frontend` 加机器级 `load kcomp_c_smoke`，ArchTest `isolated-heap` 验证同工件的分配后端。
 
 缺口：没有 ABI 版本兼容，靠 exact fingerprint 加协调替换；KABI 尚不生成业务 method codec/client/dispatch，C/Rust 仍需人工同步。组件外链只允许 `kcore_*`；SDK 不朝 libc 或共享 runtime 扩张。
 
@@ -442,8 +442,10 @@ create/destroy 执行。显式 reclaim 只在所属 Task 已离场、无 infligh
 安全点时归还独占 image/heap/stack、Task Core/API 栈和页表页；成功幂等、身份保留。
 
 测试：真实 1000 轮 load/IPC/graceful 或受控 fault/force/reclaim/stale，每轮 Task
-数量恢复且物理页增加。常驻净增包含 tombstone/allocator metadata，但精确分项尚缺，
-本轮不宣称零不明泄漏认证。门禁与具体计数以报告 §7 为准。
+数量恢复且物理页增加。后续只读`kcore_runtime_stats`复用既有表，区分slab页/槽、
+元数据Vec容量与真实AS/映射/页表/栈/IPC对象；受控1000轮以严格差分等式核对，
+首批192页的分项与最新证据见[报告 §8](docs/development/component-runtime-consolidation.md#8-回收计量补丁在87b86be之后)。
+这不等于所有负载的全局并发内存账；首批门禁快照见报告 §7。
 
 仍缺：一般 Graceful 通知/drain/有限推进、请求 deadline、结构化逐资源 retained reason、
 远端 TLB shootdown、全面 OOM/stop-reply/copy-unmap 竞争、RV32 U、设备域部署、K/I 原生浮点现场保存/验证。
@@ -501,7 +503,7 @@ P4 执行域/隔离 —— RV64 K/I/U、RV32 K/I IPC 已验证；ASID、RV32 U�
 
 近期主线为[Runtime实施任务](docs/development/component-runtime-consolidation.md#3-文件级实施任务)：
 已完成I/U持久Task/IPC/CPU-only回收与1000轮场景；下一步补一般Graceful drain、
-精确保留核算与并发/OOM矩阵。DMA恢复后续；路由仅文档。
+并发/OOM矩阵与逐资源保留原因；受控CPU-only计量见报告§8。DMA恢复后续；路由仅文档。
 下面保留文件负载依赖事实，上层新功能不优先于Runtime完整化。
 
 职责见 [服务执行](docs/architecture/service-execution.md)，源码问题与实验条件见
@@ -1019,7 +1021,7 @@ freeze 的判据不是数功能，而是多个差异很大的上层负载能只�
 | H | 不同机器类别：RV64 Linux-class 加 RV32 NoMMU embedded/MCU 共用同一套小 Core | NOT-SATISFIED | RV32 S-mode/NoMMU 私有 profile 已通过 CoreTest；M-mode 启动失败，无 MCU 真机 |
 
 结论：A/B/C/E/F 是 PARTIAL，D/G/H 未满足。Core 还没到 freeze-candidate。
-下一步缺口是一般Graceful、精确回收核算、组合/文件对象/完成语义，以及真机与异构机器验证；
+下一步缺口是一般Graceful、并发/失败保留诊断、组合/文件对象/完成语义，以及真机与异构机器验证；
 RV64 普通用户 task 与 AS 已关联，不能继续当作零实现缺口。
 
 ## 11. 明确未做

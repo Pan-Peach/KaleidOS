@@ -18,6 +18,7 @@
 - `KernelAllocator`（Core `GlobalAlloc`，KernelNative 经窄 heap ABI 共享；面向组件的内存面是 `kcore_memory_acquire/release`（域视图），**不引入 Core 侧账本**，见 `docs/architecture/memory-and-heap.md`）。
 - 常量：`ALLOC_GRANULE = 4096`（物理分配粒度）、`HEAP_ORDER = 32`、`HEAP_MIN_ORDER = 12`。
 - `MemoryLease`、`MemoryError`。
+- `kcore_runtime_stats` 只读统计投影既有表；slab链表页/占用槽与Vec大对象buddy页分开计数，无新增owner或malloc账本。字段与并发观察边界见[内存契约 §9](../../architecture/memory-and-heap.md#9-runtime-回收矩阵目标与基线)。
 - `address_space`：`KernelAddressSpace<B>`、`AddressSpaceManager<B>`、`AddressSpaceId`、`AddressSpaceHandle`、`AddressSpaceState`（`Ready` / `Retired`）、`Mapping`、`MapError`、`IsolatedPrepareError`、`PreparedActivation`（Core 内激活描述符，不经任何 `kcore_*` 导出）、`kernel_mappings`（共享 Core 映射计划 + 私有 backing 别名排除）；生命周期 API：`map` / `unmap` / `find_free_range`（VA 提议）/ `mapping_exact`（精确区间查询）/ `translate` / `prepare_activation` / `prepare_transition`（私有 AS 切换准备——校验入口 / 栈 + 落 激活准备 + 取描述符）/ `retire` / `adopt`（接管既有 backend 的 hook；boot root 尚未接线）；并重导出 `arch::vm::{AddressSpaceBackend, MappingPermission, PhysicalRange, VirtualRange}`。
 
 ## 明确不做

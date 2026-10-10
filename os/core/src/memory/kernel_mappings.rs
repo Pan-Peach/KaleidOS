@@ -325,6 +325,21 @@ pub fn shared_mappings() -> Result<Vec<Mapping>, super::address_space::MapError>
         .map_err(Into::into)
 }
 
+pub(crate) fn runtime_stats() -> (usize, usize, usize, usize) {
+    PLAN.lock().as_ref().map_or((0, 0, 0, 0), |plan| {
+        let slab_bytes = [
+            super::vec_slab_bytes(&plan.entries),
+            super::vec_slab_bytes(&plan.exclusions),
+        ];
+        (
+            plan.exclusions.len(),
+            super::vec_heap_pages(&plan.entries) + super::vec_heap_pages(&plan.exclusions),
+            slab_bytes.iter().filter(|&&bytes| bytes != 0).count(),
+            slab_bytes.iter().sum(),
+        )
+    })
+}
+
 /// Keep root construction in the same transaction as backing publication and
 /// release. A snapshot installed later could otherwise restore a stale alias.
 #[cfg(any(

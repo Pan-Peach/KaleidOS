@@ -2672,7 +2672,7 @@ doc = "I/O error"
 
     # —— core / component schema：known-answer checks ——
     component, core = load_schemas(["abi/component.toml", "abi/core.toml"])
-    assert len(core.functions) == 74
+    assert len(core.functions) == 75
     core_exports = {func.name for func in core.functions}
     assert {"kcore_component_current"} | {
         "kcore_ipc_" + name for name in
@@ -2692,7 +2692,7 @@ doc = "I/O error"
     ]
     assert len([func for func in core.functions if len(func.core_params) != len(func.params)]) == 0
     assert len([func for func in core.functions if func.core_params != func.params]) == 3
-    assert len(core.structs) == 7 and len(component.structs) == 3
+    assert len(core.structs) == 8 and len(component.structs) == 3
     user_trap = next(struct for struct in core.structs if struct.name == "UserTrap")
     assert user_trap.size64 == 88 and user_trap.size32 == 88 and user_trap.align == 8
     posix = load_schema("abi/posix.toml")

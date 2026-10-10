@@ -160,6 +160,10 @@ impl Sv32PageTable {
         self.root_ppn
     }
 
+    pub fn stats(&self) -> (usize, usize) {
+        (self.frames.len(), self.frames.capacity())
+    }
+
     fn table(ppn: usize) -> &'static [Pte; ENTRIES] {
         unsafe { &*((ppn << 12) as *const [Pte; ENTRIES]) }
     }
@@ -360,6 +364,7 @@ mod tests {
         let _guard = super::super::test_pool::guard();
         super::super::test_pool::init_low();
         let mut table = Sv32PageTable::new(super::super::test_pool::alloc).unwrap();
+        assert_eq!(table.stats().0, 1);
         let range = VirtualRange {
             base: 0x2000_0000,
             size: VM_PAGE_SIZE,
@@ -375,7 +380,9 @@ mod tests {
                 MappingPermission::READ | MappingPermission::WRITE,
             )
             .unwrap();
+        assert_eq!(table.stats().0, 2, "root plus leaf table");
         table.unmap_range(range).unwrap();
+        assert_eq!(table.stats().0, 2, "unmap does not free table pages");
         let owned = table.frames.clone();
         FREED.lock().unwrap().clear();
         unsafe {

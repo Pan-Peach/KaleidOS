@@ -86,6 +86,12 @@ pub trait AddressSpaceBackend {
     /// `arch::riscv::trampoline`）。
     fn prepare_activation(&self) -> Self::Activation;
 
+    /// Read-only diagnostics: independently owned table pages and capacity of
+    /// their address Vec. Leaf backing is excluded; non-table backends use zero.
+    fn page_table_stats(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// # Safety
     /// No CPU may activate or retain execution in this root. All translations
     /// must be drained before returning its exclusively owned page-table pages.

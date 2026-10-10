@@ -336,6 +336,35 @@ pub struct EndpointRegistry {
 }
 
 impl EndpointRegistry {
+    pub(crate) fn runtime_stats(&self) -> (usize, usize, usize, usize, usize) {
+        let slab_bytes = [
+            crate::memory::vec_slab_bytes(&self.endpoints),
+            crate::memory::vec_slab_bytes(&self.contracts),
+            crate::memory::vec_slab_bytes(&self.names),
+            crate::memory::vec_slab_bytes(&self.pending),
+        ];
+        (
+            self.endpoints.len(),
+            self.names.len(),
+            crate::memory::vec_heap_pages(&self.endpoints)
+                + crate::memory::vec_heap_pages(&self.contracts)
+                + crate::memory::vec_heap_pages(&self.names)
+                + crate::memory::vec_heap_pages(&self.pending)
+                + self
+                    .names
+                    .iter()
+                    .map(|n| crate::memory::vec_heap_pages(&n.name))
+                    .sum::<usize>()
+                + self
+                    .pending
+                    .iter()
+                    .map(|p| crate::memory::vec_heap_pages(&p.port_name))
+                    .sum::<usize>(),
+            slab_bytes.iter().filter(|&&bytes| bytes != 0).count(),
+            slab_bytes.iter().sum(),
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             endpoints: Vec::new(),

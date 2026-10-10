@@ -192,4 +192,18 @@ caller 在 provider backing 回收后 collect；它不应要求 provider image �
 验收按资源分层：逻辑活跃数量、精确 backing extent、可用物理页、页表页、保留原因、
 预期 tombstone/缓存分别计数。允许 Core slab 常驻缓存，但每个新增保留必须有归属与
 界限。1000 轮 host Exchange 只验证槽位。另有真实 I/U 1000 轮 reclaim，逐轮 Task 数恢复且
-可用物理页增加；观察到的常驻净增尚未按 tombstone/slab 精确核算，不能作为零不明泄漏认证。
+可用物理页增加。首批保留192页尚未归因；后续计量补丁和最新证据见
+[Runtime报告 §8](../development/component-runtime-consolidation.md#8-回收计量补丁在87b86be之后)。
+
+只读观察入口 `kcore_runtime_stats`（布局唯一来源 `abi/core.toml`）投影既有
+Registry/Endpoint/Task/AS/Exchange/共享映射计划与slab。不建立内存owner账本，
+不发资源身份，不记录malloc事件；仅live KernelNative管理上下文可调用。
+`metadata_pages`是各Vec容量按现有buddy layout分配形状取整得到的独占页；
+small object共享页统一计入`slab_pages`，不能按各名称分别向上取整再重复相加。
+`metadata_slab_objects/bytes`只投影上述元数据Vec的小对象槽，不含独立名称；
+用于区分Vec扩容从slab进入buddy时的旧槽释放，已经包含在全局slab数量中。
+`private_mapping_pages`只描述私有映射长度，不等于唯一物理backing量；
+`page_table_pages`只数现有AS backend的独占frames，不含boot自持root或叶子backing。
+子表分别取锁，无动态分配；并发时不是全系统原子快照，不能用于回收判定。
+受控压力在各可回收资源回基线后核对free页减少是否严格等于metadata/slab页增长；
+非零差额必须失败并报告，不能解释为测试误差。一般并发/DMA等场景仍需各自证明。

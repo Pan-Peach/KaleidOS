@@ -486,6 +486,86 @@ extern "C" fn kcore_component_count() -> u32 {
     with_core_critical(|| registry::get_registry().lock().len() as u32)
 }
 
+extern "C" fn kcore_runtime_stats(out: *mut crate::generated::abi::RuntimeStatsAbi) -> i32 {
+    with_core_critical(|| {
+        if out.is_null() {
+            return Errno::EFAULT.code();
+        }
+        let Some(caller) = RequestContext::ambient() else {
+            return Errno::EPERM.code();
+        };
+        if !crate::component::may_run(caller.component)
+            || deny_if_isolated(caller.component).is_some()
+        {
+            return Errno::EPERM.code();
+        }
+        // No allocation, no locks held across subtable queries. This is an
+        // observation, never a proof of execution drain or ownership release.
+        let (components, reclaimed, component_pages, component_slots, component_bytes) =
+            registry::get_registry().lock().runtime_stats();
+        let (endpoints, names, endpoint_pages, endpoint_slots, endpoint_bytes) =
+            endpoint::get_endpoints().lock().runtime_stats();
+        let (spaces, mapped, tables, space_pages, space_slots, space_bytes) =
+            memory::address_space::runtime_stats();
+        let (tasks, stacks) = {
+            let table = task::get_task_table().lock();
+            (
+                table.len(),
+                table
+                    .iter()
+                    .map(|(_, r)| {
+                        r.memory
+                            .as_ref()
+                            .map_or(0, |m| m.size() / memory::ALLOC_GRANULE)
+                            + r.api_stack
+                                .as_ref()
+                                .map_or(0, |m| m.size() / memory::ALLOC_GRANULE)
+                    })
+                    .sum::<usize>(),
+            )
+        };
+        let (servers, requests) = super::exchange::get().lock().runtime_stats();
+        let (exclusions, mapping_pages, mapping_slots, mapping_bytes) =
+            memory::kernel_mappings::runtime_stats();
+        let (slab_pages, slab_objects, slab_bytes) = memory::slab_stats();
+        let free_pages = memory::free_block_counts()
+            .iter()
+            .enumerate()
+            .skip(memory::HEAP_MIN_ORDER)
+            .map(|(order, &blocks)| blocks * (1usize << (order - memory::HEAP_MIN_ORDER)))
+            .sum::<usize>();
+        let value = crate::generated::abi::RuntimeStatsAbi {
+            free_pages: free_pages as u32,
+            slab_pages: slab_pages as u32,
+            slab_objects: slab_objects as u32,
+            slab_bytes: slab_bytes as u32,
+            component_records: components as u32,
+            reclaimed_components: reclaimed as u32,
+            component_metadata_pages: component_pages as u32,
+            endpoint_records: endpoints as u32,
+            endpoint_names: names as u32,
+            endpoint_metadata_pages: endpoint_pages as u32,
+            address_spaces: spaces as u32,
+            private_mapping_pages: mapped as u32,
+            page_table_pages: tables as u32,
+            space_metadata_pages: space_pages as u32,
+            tasks: tasks as u32,
+            task_stack_pages: stacks as u32,
+            ipc_servers: servers as u32,
+            ipc_requests: requests as u32,
+            exclusions: exclusions as u32,
+            mapping_metadata_pages: mapping_pages as u32,
+            metadata_slab_objects: (component_slots + endpoint_slots + space_slots + mapping_slots)
+                as u32,
+            metadata_slab_bytes: (component_bytes + endpoint_bytes + space_bytes + mapping_bytes)
+                as u32,
+        };
+        // KernelNative shares trusted Core memory; private imports are rejected.
+        unsafe { out.write_unaligned(value) };
+        0
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Category 5：Component lifecycle（v2；语义入口，非裸 registry mutation）
 // ---------------------------------------------------------------------------
@@ -1474,6 +1554,51 @@ pub fn resolve(name: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_stats_rejects_absent_failed_and_private_contexts_without_output() {
+        use crate::component::containment;
+        use crate::generated::abi::RuntimeStatsAbi;
+        let _boundary = containment::test_boundary_lock();
+        containment::enter_anchor();
+        let mut out = unsafe { core::mem::MaybeUninit::<RuntimeStatsAbi>::zeroed().assume_init() };
+        out.free_pages = u32::MAX;
+        let original = out;
+        assert_eq!(
+            kcore_runtime_stats(core::ptr::null_mut()),
+            Errno::EFAULT.code()
+        );
+        assert_eq!(kcore_runtime_stats(&mut out), Errno::EPERM.code());
+        assert_eq!(out, original);
+        registry::init();
+        for domain in [
+            ExecutionDomain::IsolatedNative,
+            ExecutionDomain::SandboxedNative,
+            ExecutionDomain::KernelNative,
+        ] {
+            let id = {
+                let mut registry = registry::get_registry().lock();
+                let id = registry
+                    .declare(
+                        b"stats-denied",
+                        registry::test_support::test_loaded(0, None),
+                        domain,
+                    )
+                    .unwrap();
+                registry.resolve(id).unwrap();
+                registry.begin_start(id).unwrap();
+                registry.finish_start(id).unwrap();
+                if domain == ExecutionDomain::KernelNative {
+                    registry.mark_failed(id).unwrap();
+                }
+                id
+            };
+            containment::with_test_init_boundary(Some(id), || {
+                assert_eq!(kcore_runtime_stats(&mut out), Errno::EPERM.code());
+                assert_eq!(out, original);
+            });
+        }
+    }
+
     use super::*;
     use crate::component::{containment, load::ComponentLoadError};
 

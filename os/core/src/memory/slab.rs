@@ -96,6 +96,24 @@ pub(super) struct SlabAllocator {
 }
 
 impl SlabAllocator {
+    /// Read existing pages under the allocator lock; no side counters or
+    /// allocation ledger. Bytes are occupied class slots, not requested sizes.
+    pub(super) fn stats(&self) -> (usize, usize, usize) {
+        let (mut pages, mut objects, mut bytes) = (0, 0, 0);
+        for &head in &self.class_heads {
+            let mut base = head;
+            while base != 0 {
+                let page = unsafe { &*(base as *const SlabPage) };
+                let used = usize::from(page.object_count - page.free_count);
+                pages += 1;
+                objects += used;
+                bytes += used * page.class_size;
+                base = page.next_page;
+            }
+        }
+        (pages, objects, bytes)
+    }
+
     pub(super) const fn new() -> Self {
         Self {
             class_heads: [0; CLASS_COUNT],
@@ -402,5 +420,23 @@ mod tests {
 
         assert!(slab.alloc(24).is_none());
         assert!(slab.alloc(MAX_SLAB_CLASS * 2).is_none());
+    }
+
+    #[test]
+    fn stats_distinguish_objects_from_shared_pages_and_release() {
+        let _guard = setup();
+        let mut slab = SlabAllocator::new();
+        assert_eq!(slab.stats(), (0, 0, 0));
+        let first = slab.alloc(32).unwrap();
+        let second = slab.alloc(32).unwrap();
+        let other = slab.alloc(64).unwrap();
+        assert_eq!(slab.stats(), (2, 3, 128));
+        assert_eq!(slab.stats(), (2, 3, 128), "observation has no side effects");
+        slab.dealloc(first.as_ptr(), 32);
+        assert_eq!(slab.stats(), (2, 2, 96));
+        slab.dealloc(second.as_ptr(), 32);
+        assert_eq!(slab.stats(), (1, 1, 64));
+        slab.dealloc(other.as_ptr(), 64);
+        assert_eq!(slab.stats(), (0, 0, 0));
     }
 }

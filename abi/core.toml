@@ -1985,3 +1985,160 @@ doc = "返回最内层 Core 执行边界的 ComponentId；身份不是 authority
 [[function.param]]
 name = "out"
 type = "*mut u32"
+
+[[struct]]
+name = "RuntimeStatsAbi"
+c_name = "kcore_runtime_stats"
+size = 88
+align = 4
+doc = """
+只读 Runtime 诊断，来自既有资源表与 allocator，不新增所有权账本。
+单位 pages 为当前物理分配粒度。各子表分别取锁；并发时不是全系统原子快照，
+不能用作释放依据。仅 live KernelNative 管理上下文可调用。
+metadata_pages 只含独占大对象 buddy allocation；小对象物理页统一在 slab_pages，不能重复相加。
+"""
+
+[[struct.field]]
+name = "free_pages"
+type = "u32"
+offset = 0
+doc = "buddy 空闲物理页。"
+
+[[struct.field]]
+name = "slab_pages"
+type = "u32"
+offset = 4
+doc = "现有 slab 链表占用物理页；共享页只计一次。"
+
+[[struct.field]]
+name = "slab_objects"
+type = "u32"
+offset = 8
+doc = "slab 已占用对象槽数量。"
+
+[[struct.field]]
+name = "slab_bytes"
+type = "u32"
+offset = 12
+doc = "slab 已占用槽的 class 字节总数，不是请求字节或配额。"
+
+[[struct.field]]
+name = "component_records"
+type = "u32"
+offset = 16
+doc = "所有 ComponentRecord，含 tombstone。"
+
+[[struct.field]]
+name = "reclaimed_components"
+type = "u32"
+offset = 20
+doc = "已完成显式 reclaim 的 ComponentRecord。"
+
+[[struct.field]]
+name = "component_metadata_pages"
+type = "u32"
+offset = 24
+doc = "Registry Vec 与名称的大对象 buddy 页；小名称计入 slab。"
+
+[[struct.field]]
+name = "endpoint_records"
+type = "u32"
+offset = 28
+doc = "所有 EndpointRecord，含 invalid tombstone。"
+
+[[struct.field]]
+name = "endpoint_names"
+type = "u32"
+offset = 32
+doc = "发现名记录，含失效实例。"
+
+[[struct.field]]
+name = "endpoint_metadata_pages"
+type = "u32"
+offset = 36
+doc = "Endpoint 各 Vec 与名称的大对象 buddy 页。"
+
+[[struct.field]]
+name = "address_spaces"
+type = "u32"
+offset = 40
+doc = "现有 AS 对象，含 Retired。"
+
+[[struct.field]]
+name = "private_mapping_pages"
+type = "u32"
+offset = 44
+doc = "私有映射长度除以物理页大小的和；不是唯一 backing 所有权计量。"
+
+[[struct.field]]
+name = "page_table_pages"
+type = "u32"
+offset = 48
+doc = "现有 AS backend 独占页表页；不含 boot 自持 root。"
+
+[[struct.field]]
+name = "space_metadata_pages"
+type = "u32"
+offset = 52
+doc = "AS manager、映射 Vec 和 backend frames Vec 的大对象 buddy 页。"
+
+[[struct.field]]
+name = "tasks"
+type = "u32"
+offset = 56
+doc = "现有 TaskRecord，包括 Exited。"
+
+[[struct.field]]
+name = "task_stack_pages"
+type = "u32"
+offset = 60
+doc = "TaskRecord 持有的 Core/API 栈 lease 页；私有栈计入私有映射。"
+
+[[struct.field]]
+name = "ipc_servers"
+type = "u32"
+offset = 64
+doc = "Exchange 已登记服务数。"
+
+[[struct.field]]
+name = "ipc_requests"
+type = "u32"
+offset = 68
+doc = "Exchange 非零 request/receipt slot 数；含尚未 collect 的终态。"
+
+[[struct.field]]
+name = "exclusions"
+type = "u32"
+offset = 72
+doc = "共享映射计划当前保留的私有 backing 排除项。"
+
+[[struct.field]]
+name = "mapping_metadata_pages"
+type = "u32"
+offset = 76
+doc = "共享映射计划与排除 Vec 的大对象 buddy 页。"
+
+[[struct.field]]
+name = "metadata_slab_objects"
+type = "u32"
+offset = 80
+doc = "Registry/Endpoint/AS/Plan各Vec当前占用的小对象槽，含backend frames Vec；不含独立名称。"
+
+[[struct.field]]
+name = "metadata_slab_bytes"
+type = "u32"
+offset = 84
+doc = "上述Vec小对象槽的class字节；包含于slab_bytes，用于核对扩容跨slab/buddy的迁移，不能重复相加。"
+
+[[function]]
+name = "kcore_runtime_stats"
+ret = "i32"
+category = "System query"
+c_category = "System query"
+doc = """
+读既有 Runtime 资源与物理分配统计；成功0，空out为EFAULT，非live KernelNative上下文为EPERM。
+不返回地址、不授予权限、不参与回收判定；并发观察语义见 RuntimeStatsAbi。
+"""
+[[function.param]]
+name = "out"
+type = "*mut RuntimeStatsAbi"

@@ -294,6 +294,81 @@ _Static_assert(offsetof(struct kcore_user_trap, arg3) == 64, "kcore_user_trap.ar
 _Static_assert(offsetof(struct kcore_user_trap, arg4) == 72, "kcore_user_trap.arg4 offset drift");
 _Static_assert(offsetof(struct kcore_user_trap, arg5) == 80, "kcore_user_trap.arg5 offset drift");
 
+/* 只读 Runtime 诊断，来自既有资源表与 allocator，不新增所有权账本。
+ * 单位 pages 为当前物理分配粒度。各子表分别取锁；并发时不是全系统原子快照，
+ * 不能用作释放依据。仅 live KernelNative 管理上下文可调用。
+ * metadata_pages 只含独占大对象 buddy allocation；小对象物理页统一在 slab_pages，不能重复相加。 */
+struct kcore_runtime_stats {
+    /* buddy 空闲物理页。 */
+    uint32_t free_pages;
+    /* 现有 slab 链表占用物理页；共享页只计一次。 */
+    uint32_t slab_pages;
+    /* slab 已占用对象槽数量。 */
+    uint32_t slab_objects;
+    /* slab 已占用槽的 class 字节总数，不是请求字节或配额。 */
+    uint32_t slab_bytes;
+    /* 所有 ComponentRecord，含 tombstone。 */
+    uint32_t component_records;
+    /* 已完成显式 reclaim 的 ComponentRecord。 */
+    uint32_t reclaimed_components;
+    /* Registry Vec 与名称的大对象 buddy 页；小名称计入 slab。 */
+    uint32_t component_metadata_pages;
+    /* 所有 EndpointRecord，含 invalid tombstone。 */
+    uint32_t endpoint_records;
+    /* 发现名记录，含失效实例。 */
+    uint32_t endpoint_names;
+    /* Endpoint 各 Vec 与名称的大对象 buddy 页。 */
+    uint32_t endpoint_metadata_pages;
+    /* 现有 AS 对象，含 Retired。 */
+    uint32_t address_spaces;
+    /* 私有映射长度除以物理页大小的和；不是唯一 backing 所有权计量。 */
+    uint32_t private_mapping_pages;
+    /* 现有 AS backend 独占页表页；不含 boot 自持 root。 */
+    uint32_t page_table_pages;
+    /* AS manager、映射 Vec 和 backend frames Vec 的大对象 buddy 页。 */
+    uint32_t space_metadata_pages;
+    /* 现有 TaskRecord，包括 Exited。 */
+    uint32_t tasks;
+    /* TaskRecord 持有的 Core/API 栈 lease 页；私有栈计入私有映射。 */
+    uint32_t task_stack_pages;
+    /* Exchange 已登记服务数。 */
+    uint32_t ipc_servers;
+    /* Exchange 非零 request/receipt slot 数；含尚未 collect 的终态。 */
+    uint32_t ipc_requests;
+    /* 共享映射计划当前保留的私有 backing 排除项。 */
+    uint32_t exclusions;
+    /* 共享映射计划与排除 Vec 的大对象 buddy 页。 */
+    uint32_t mapping_metadata_pages;
+    /* Registry/Endpoint/AS/Plan各Vec当前占用的小对象槽，含backend frames Vec；不含独立名称。 */
+    uint32_t metadata_slab_objects;
+    /* 上述Vec小对象槽的class字节；包含于slab_bytes，用于核对扩容跨slab/buddy的迁移，不能重复相加。 */
+    uint32_t metadata_slab_bytes;
+};
+_Static_assert(sizeof(struct kcore_runtime_stats) == 88, "kcore_runtime_stats layout drift");
+_Static_assert(_Alignof(struct kcore_runtime_stats) == 4, "kcore_runtime_stats alignment drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, free_pages) == 0, "kcore_runtime_stats.free_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, slab_pages) == 4, "kcore_runtime_stats.slab_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, slab_objects) == 8, "kcore_runtime_stats.slab_objects offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, slab_bytes) == 12, "kcore_runtime_stats.slab_bytes offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, component_records) == 16, "kcore_runtime_stats.component_records offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, reclaimed_components) == 20, "kcore_runtime_stats.reclaimed_components offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, component_metadata_pages) == 24, "kcore_runtime_stats.component_metadata_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, endpoint_records) == 28, "kcore_runtime_stats.endpoint_records offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, endpoint_names) == 32, "kcore_runtime_stats.endpoint_names offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, endpoint_metadata_pages) == 36, "kcore_runtime_stats.endpoint_metadata_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, address_spaces) == 40, "kcore_runtime_stats.address_spaces offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, private_mapping_pages) == 44, "kcore_runtime_stats.private_mapping_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, page_table_pages) == 48, "kcore_runtime_stats.page_table_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, space_metadata_pages) == 52, "kcore_runtime_stats.space_metadata_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, tasks) == 56, "kcore_runtime_stats.tasks offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, task_stack_pages) == 60, "kcore_runtime_stats.task_stack_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, ipc_servers) == 64, "kcore_runtime_stats.ipc_servers offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, ipc_requests) == 68, "kcore_runtime_stats.ipc_requests offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, exclusions) == 72, "kcore_runtime_stats.exclusions offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, mapping_metadata_pages) == 76, "kcore_runtime_stats.mapping_metadata_pages offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, metadata_slab_objects) == 80, "kcore_runtime_stats.metadata_slab_objects offset drift");
+_Static_assert(offsetof(struct kcore_runtime_stats, metadata_slab_bytes) == 84, "kcore_runtime_stats.metadata_slab_bytes offset drift");
+
 /* IRQ 投递回调：`ctx` 原样回传，Core 不解引用。 */
 typedef void (*IrqHandler)(void *ctx);
 
@@ -554,6 +629,10 @@ int32_t kcore_ipc_close(uint64_t endpoint);
 /* -- Component identity -- */
 /* 返回最内层 Core 执行边界的 ComponentId；身份不是 authority，无组件上下文 EPERM；out 空 EFAULT。 */
 int32_t kcore_component_current(uint32_t *out);
+/* -- System query -- */
+/* 读既有 Runtime 资源与物理分配统计；成功0，空out为EFAULT，非live KernelNative上下文为EPERM。
+ * 不返回地址、不授予权限、不参与回收判定；并发观察语义见 RuntimeStatsAbi。 */
+int32_t kcore_runtime_stats(struct kcore_runtime_stats *out);
 
 /* 接口的稳定名字（publish / bind 必须逐字节一致）。 */
 #define KCOMP_BLOCK_DEVICE_NAME "block.device"

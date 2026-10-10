@@ -355,6 +355,38 @@ pub fn free_block_counts() -> [usize; HEAP_ORDER] {
     HEAP.lock().free_block_counts()
 }
 
+/// Physical pages occupied by a Vec's large Core-heap allocation. Small
+/// objects share slab pages and are counted once by slab_stats instead.
+pub(crate) fn vec_heap_pages<T>(items: &alloc::vec::Vec<T>) -> usize {
+    array_heap_pages::<T>(items.capacity())
+}
+
+pub(crate) fn array_heap_pages<T>(capacity: usize) -> usize {
+    let layout = Layout::array::<T>(capacity).expect("existing allocation layout");
+    if layout.size() == 0 || slab::slab_class(layout).is_some() {
+        return 0;
+    }
+    layout
+        .size()
+        .max(layout.align())
+        .max(ALLOC_GRANULE)
+        .next_power_of_two()
+        / ALLOC_GRANULE
+}
+
+pub(crate) fn array_slab_bytes<T>(capacity: usize) -> usize {
+    let layout = Layout::array::<T>(capacity).expect("existing allocation layout");
+    slab::slab_class(layout).unwrap_or(0)
+}
+
+pub(crate) fn vec_slab_bytes<T>(items: &alloc::vec::Vec<T>) -> usize {
+    array_slab_bytes::<T>(items.capacity())
+}
+
+pub(crate) fn slab_stats() -> (usize, usize, usize) {
+    SLABS.lock().stats()
+}
+
 // ---------------------------------------------------------------------------
 // Tests（host，借用 std 内存做 backing）
 // ---------------------------------------------------------------------------
@@ -365,6 +397,38 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_vec_projection_matches_actual_allocator_page_consumption() {
+        let _guard = test_support::GUARD.lock();
+        test_support::ensure_init();
+        assert_eq!(array_heap_pages::<u8>(0), 0);
+        assert_eq!(array_slab_bytes::<u8>(0), 0);
+        assert_eq!(array_slab_bytes::<u8>(1024), 1024);
+        assert_eq!(array_slab_bytes::<u8>(1025), 0);
+        assert_eq!(array_heap_pages::<u8>(1025), 1);
+        assert_eq!(
+            array_heap_pages::<u8>(1024),
+            0,
+            "small objects share slab pages"
+        );
+        let layout = Layout::array::<u64>(600).unwrap();
+        let before = free_block_counts();
+        let ptr = unsafe { KernelAllocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        let after = free_block_counts();
+        let pages = |counts: [usize; HEAP_ORDER]| {
+            counts
+                .iter()
+                .enumerate()
+                .skip(HEAP_MIN_ORDER)
+                .map(|(order, blocks)| blocks * (1usize << (order - HEAP_MIN_ORDER)))
+                .sum::<usize>()
+        };
+        assert_eq!(pages(before) - pages(after), array_heap_pages::<u64>(600));
+        unsafe { KernelAllocator.dealloc(ptr, layout) };
+        assert_eq!(free_block_counts(), before);
+    }
 
     #[test]
     fn resident_backing_is_not_recycled_by_drop() {

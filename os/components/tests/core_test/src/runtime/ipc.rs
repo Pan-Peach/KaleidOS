@@ -560,6 +560,66 @@ pub fn domain_group(checks: &mut Checks) {
 struct LifecycleResult {
     result: AtomicU32,
 }
+
+fn runtime_stats() -> Option<abi::RuntimeStatsAbi> {
+    let mut value = core::mem::MaybeUninit::uninit();
+    (unsafe { abi::kcore_runtime_stats(value.as_mut_ptr()) } == 0)
+        .then(|| unsafe { value.assume_init() })
+}
+
+fn metadata_pages(stats: &abi::RuntimeStatsAbi) -> i64 {
+    i64::from(stats.component_metadata_pages)
+        + i64::from(stats.endpoint_metadata_pages)
+        + i64::from(stats.space_metadata_pages)
+        + i64::from(stats.mapping_metadata_pages)
+        + i64::from(stats.slab_pages)
+}
+
+fn same_reclaimable_resources(before: &abi::RuntimeStatsAbi, after: &abi::RuntimeStatsAbi) -> bool {
+    before.address_spaces == after.address_spaces
+        && before.private_mapping_pages == after.private_mapping_pages
+        && before.page_table_pages == after.page_table_pages
+        && before.tasks == after.tasks
+        && before.task_stack_pages == after.task_stack_pages
+        && before.ipc_servers == after.ipc_servers
+        && before.ipc_requests == after.ipc_requests
+        && before.exclusions == after.exclusions
+}
+
+fn log_runtime_stats(round: u32, unaccounted: i64, stats: &abi::RuntimeStatsAbi) {
+    kcomp_sdk::klog!(
+        "[runtime-accounting] round={} free={} slab={}/{}/{} comp={}/{} comp_pages={} ep={}/{} ep_pages={} meta_slab={}/{} unaccounted={}",
+        round,
+        stats.free_pages,
+        stats.slab_pages,
+        stats.slab_objects,
+        stats.slab_bytes,
+        stats.component_records,
+        stats.reclaimed_components,
+        stats.component_metadata_pages,
+        stats.endpoint_records,
+        stats.endpoint_names,
+        stats.endpoint_metadata_pages,
+        stats.metadata_slab_objects,
+        stats.metadata_slab_bytes,
+        unaccounted
+    );
+    kcomp_sdk::klog!(
+        "[runtime-resources] round={} as={} mapped={} tables={} as_meta={} tasks={} stacks={} servers={} requests={} exclusions={} plan_meta={}",
+        round,
+        stats.address_spaces,
+        stats.private_mapping_pages,
+        stats.page_table_pages,
+        stats.space_metadata_pages,
+        stats.tasks,
+        stats.task_stack_pages,
+        stats.ipc_servers,
+        stats.ipc_requests,
+        stats.exclusions,
+        stats.mapping_metadata_pages
+    );
+}
+
 extern "C" fn lifecycle_client(arg: *mut ()) {
     use management::ExecutionDomain::{IsolatedNative as I, SandboxedNative as U};
     let result = unsafe { &*arg.cast::<LifecycleResult>() };
@@ -569,6 +629,20 @@ extern "C" fn lifecycle_client(arg: *mut ()) {
     let mut retained_peak = 0u32;
     let initial = unsafe { abi::kcore_free_page_count() };
     let task_count = unsafe { abi::kcore_task_count() };
+    let Some(baseline) = runtime_stats() else {
+        management::exit_task();
+    };
+    // The two intentional small allocations per tombstone are the artifact
+    // and endpoint names. Slab slot size follows the existing word minimum.
+    let name_bytes = (b"kcomp_echo"
+        .len()
+        .max(core::mem::size_of::<usize>())
+        .next_power_of_two()
+        + NAME
+            .len()
+            .max(core::mem::size_of::<usize>())
+            .next_power_of_two()) as u32;
+    log_runtime_stats(0, 0, &baseline);
     for round in 0..1000 {
         let domain = if cfg!(target_arch = "riscv64") && round % 2 == 1 {
             U
@@ -651,12 +725,32 @@ extern "C" fn lifecycle_client(arg: *mut ()) {
         }
         let reclaimed = unsafe { abi::kcore_component_reclaim(id) };
         let after = unsafe { abi::kcore_free_page_count() };
+        let Some(stats) = runtime_stats() else {
+            passed = false;
+            break;
+        };
+        let unaccounted = i64::from(baseline.free_pages)
+            - i64::from(stats.free_pages)
+            - (metadata_pages(&stats) - metadata_pages(&baseline));
         if reclaimed != 0
             || unsafe { abi::kcore_component_reclaim(id) } != 0
             || ipc::submit(ep, &[]) != Err(Errno::ENOENT)
             || unsafe { abi::kcore_task_count() } != task_count
             || after <= before
+            || !same_reclaimable_resources(&baseline, &stats)
+            || stats.component_records != baseline.component_records + round + 1
+            || stats.reclaimed_components != baseline.reclaimed_components + round + 1
+            || stats.endpoint_records != baseline.endpoint_records + round + 1
+            || stats.endpoint_names != baseline.endpoint_names + round + 1
+            || i64::from(stats.slab_objects) - i64::from(baseline.slab_objects)
+                != 2 * i64::from(round + 1) + i64::from(stats.metadata_slab_objects)
+                    - i64::from(baseline.metadata_slab_objects)
+            || i64::from(stats.slab_bytes) - i64::from(baseline.slab_bytes)
+                != i64::from(name_bytes * (round + 1)) + i64::from(stats.metadata_slab_bytes)
+                    - i64::from(baseline.metadata_slab_bytes)
+            || unaccounted != 0
         {
+            log_runtime_stats(round + 1, unaccounted, &stats);
             passed = false;
             break;
         }
@@ -671,6 +765,7 @@ extern "C" fn lifecycle_client(arg: *mut ()) {
                 returned,
                 retained_peak
             );
+            log_runtime_stats(round + 1, unaccounted, &stats);
         }
     }
     if passed && cfg!(target_arch = "riscv64") {

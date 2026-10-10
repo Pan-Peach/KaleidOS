@@ -379,6 +379,22 @@ impl Registry {
         self.records.len()
     }
 
+    pub(crate) fn runtime_stats(&self) -> (usize, usize, usize, usize, usize) {
+        let slab_bytes = crate::memory::vec_slab_bytes(&self.records);
+        (
+            self.records.len(),
+            self.records.iter().filter(|r| r.reclaimed).count(),
+            crate::memory::vec_heap_pages(&self.records)
+                + self
+                    .records
+                    .iter()
+                    .map(|r| crate::memory::vec_heap_pages(&r.name))
+                    .sum::<usize>(),
+            usize::from(slab_bytes != 0),
+            slab_bytes,
+        )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

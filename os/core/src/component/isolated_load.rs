@@ -988,6 +988,7 @@ mod tests {
             b"kcore_heap_dealloc",
             b"kcore_sched_run",
             b"kcore_component_create",
+            b"kcore_runtime_stats",
             b"kcore_device_claim",
             b"kcore_dma_alloc",
             b"kcore_irq_register",

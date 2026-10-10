@@ -220,4 +220,8 @@ image/stack/heap extent、页表页与可用物理页、预期tombstone/缓存�
 物理页。U 无 yield 忙循环以及远端 CPU1 的 timer 停止另行验证。runner 的 report
 预算为300秒，场景 Task 参数使用持久 backing，超时不释放尚可能使用的参数。
 NoMMU 的 public load 能力前置拒绝表示 private 场景不适用，不计隔离PASS。
-最新结果、精确保留核算缺口见 [报告 §7](component-runtime-consolidation.md#7-授权后的生产实现与验证)。
+首批结果见 [报告 §7](component-runtime-consolidation.md#7-授权后的生产实现与验证)。
+后续压力通过公开`kcore_runtime_stats`逐轮检查AS、mapping、table、Task栈、
+IPC server/request及alias exclusion回基线，并核对Component/Endpoint tombstone、
+名称槽和Vec/slab物理页净增；严格零未解释差额，不设容差。最新计量证据见
+[报告 §8](component-runtime-consolidation.md#8-回收计量补丁在87b86be之后)。
